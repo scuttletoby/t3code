@@ -1549,7 +1549,7 @@
     },
     {
       "name": "elevated by swap nearly full",
-      "why": "600 of 4096 MB swap free is under 15%.",
+      "why": "600 of 4096 MB swap free is under 15%, and it fell from 800 MB at the last read: by 200 MB, more than swapFillingMb (64), so swap is filling.",
       "facts": "measured-host-now",
       "patch": {
         "swap": {
@@ -1563,6 +1563,90 @@
       "expect": {
         "level": "elevated",
         "reason": "elevated"
+      },
+      "previous": {
+        "level": "ok",
+        "calmSinceMs": null,
+        "swapFreeMb": 800
+      },
+      "nowMs": 1000000
+    },
+    {
+      "name": "full swap of cold pages is not a signal",
+      "why": "600 of 4096 MB swap free (under 15%) but 600 MB at the last read too: nothing is being pushed out, so not elevated, and calm: the 60 s wait since 1000000 ms has passed, so ok.",
+      "facts": "measured-host-now",
+      "patch": {
+        "swap": {
+          "totalMb": 4096,
+          "freeMb": 600
+        }
+      },
+      "previous": {
+        "level": "elevated",
+        "calmSinceMs": 1000000,
+        "swapFreeMb": 600
+      },
+      "nowMs": 1060000,
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "level": "ok",
+        "calmSinceMs": null,
+        "admit": true
+      }
+    },
+    {
+      "name": "swap trend not known yet keeps the wait but never ends it",
+      "why": "Previous state without a swap read (a restart): the swap trend is unknown. The read is otherwise calm, so the 60 s wait (since 1000000) goes on, but it ends only on a read that can see whether swap is filling: still elevated at 60 s.",
+      "facts": "measured-host-now",
+      "previous": {
+        "level": "elevated",
+        "calmSinceMs": 1000000
+      },
+      "nowMs": 1060000,
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "level": "elevated",
+        "calmSinceMs": 1000000
+      }
+    },
+    {
+      "name": "swap filling is never calm",
+      "why": "Swap free 2150 MB, 2300 MB at the last read: it fell by 150 MB, more than swapFillingMb (64). Above 15% free, so not elevated by swap, but not calm: the wait starts over.",
+      "facts": "measured-host-now",
+      "previous": {
+        "level": "elevated",
+        "calmSinceMs": 1000000,
+        "swapFreeMb": 2300
+      },
+      "nowMs": 1060000,
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "level": "elevated",
+        "calmSinceMs": null
+      }
+    },
+    {
+      "name": "swap shrinking by the filling limit is not filling",
+      "why": "Swap free 2150 MB, 2214 MB at the last read: it fell by exactly swapFillingMb (64), which is not more than it, so calm and ok after the 60 s wait.",
+      "facts": "measured-host-now",
+      "previous": {
+        "level": "elevated",
+        "calmSinceMs": 1000000,
+        "swapFreeMb": 2214
+      },
+      "nowMs": 1060000,
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "level": "ok",
+        "admit": true
       }
     },
     {
@@ -1711,11 +1795,12 @@
     },
     {
       "name": "elevated to ok waits: calm starts",
-      "why": "Calm readings after elevated start the 60 s wait.",
+      "why": "Calm readings after elevated start the 60 s wait. Swap free is 2150 MB as at the last read: not filling.",
       "facts": "measured-host-now",
       "previous": {
         "level": "elevated",
-        "calmSinceMs": null
+        "calmSinceMs": null,
+        "swapFreeMb": 2150
       },
       "nowMs": 1000000,
       "ask": {
@@ -1733,7 +1818,8 @@
       "facts": "measured-host-now",
       "previous": {
         "level": "elevated",
-        "calmSinceMs": 1000000
+        "calmSinceMs": 1000000,
+        "swapFreeMb": 2150
       },
       "nowMs": 1059999,
       "ask": {
@@ -1750,7 +1836,8 @@
       "facts": "measured-host-now",
       "previous": {
         "level": "elevated",
-        "calmSinceMs": 1000000
+        "calmSinceMs": 1000000,
+        "swapFreeMb": 2150
       },
       "nowMs": 1060000,
       "ask": {
@@ -1867,7 +1954,8 @@
       "facts": "measured-host-now",
       "previous": {
         "level": "elevated",
-        "calmSinceMs": 2000000
+        "calmSinceMs": 2000000,
+        "swapFreeMb": 2150
       },
       "nowMs": 1000000,
       "ask": {
@@ -2317,6 +2405,43 @@
         "admitted": [4],
         "stoppedBy": ["ceiling"]
       }
+    },
+    {
+      "name": "job core share: default jobs on 2.78 cores",
+      "why": "2.78 cores are 278 centi-cores, 90% of them 250: one default job (250 centi-cores) fits exactly, a second would need 500. The job floor is 0 here, so it does not admit the second either.",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 2.78 },
+      "floors": { "agent": 2, "job": 0 },
+      "fill": [{ "kind": "job-default", "count": 3 }],
+      "expect": { "admitted": [1], "stoppedBy": ["cores"] }
+    },
+    {
+      "name": "job core share: servers on 1.12 cores",
+      "why": "1.12 cores are 112 centi-cores, 90% of them 100: one server (100 centi-cores) fits exactly, a second would need 200.",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 1.12 },
+      "floors": { "agent": 2, "job": 0 },
+      "fill": [{ "kind": "job-server", "count": 3 }],
+      "expect": { "admitted": [1], "stoppedBy": ["cores"] }
+    },
+    {
+      "name": "job core share: a typecheck on 0.34 cores with its cost free exactly",
+      "why": "0.34 cores are 34 centi-cores, 90% of them 30: a typecheck (30 centi-cores) fits exactly. Margin 1209, so 4281 MB available leave 3072 MB free: its whole start cost. One more centi-core or MB and it waits (job floor 0 here).",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 0.34, "availableMb": 4281 },
+      "floors": { "agent": 2, "job": 0 },
+      "ask": { "kind": "job-typecheck" },
+      "expect": { "admit": true, "reason": "fits", "freeMb": 3072, "costMb": 3072 }
+    },
+    {
+      "name": "calm needs available at 150% of the margin",
+      "why": "Margin 1209: calm needs 1813.5 MB available, so 1813 MB is not calm (though above the elevated line, the margin): after elevated the 60 s wait does not start.",
+      "facts": "host-12gb-idle",
+      "patch": { "availableMb": 1813 },
+      "previous": { "level": "elevated", "calmSinceMs": null },
+      "nowMs": 1000000,
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "elevated", "calmSinceMs": null }
     }
   ]
 }

@@ -24,6 +24,8 @@ import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 import * as McpProfileTurnCheck from "./mcpProfileTurnCheck.ts";
 import * as PullRequestWatchSlot from "./pullRequestWatchSlot.ts";
+import * as RemoteTaskPrompts from "./remoteTaskPrompts.ts";
+import * as RemoteTaskPromptWakes from "./remoteTaskPromptWakes.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
 import * as WorkerWakeSlots from "./workerWakeSlots.ts";
 
@@ -96,6 +98,10 @@ export const layerRoutes = Layer.mergeAll(
   ForkFeatures.layer,
   // Linked threads a parent here launched but whose task the last stop lost: one reminder each.
   DelegatedOrphanScan.layer,
+  // GET /api/fork/task-prompts: a task's open prompts here, for its parent's machine; its token only.
+  RemoteTaskPrompts.layer,
+  // A parent here whose task on a linked machine waits there on a prompt: woken once per prompt.
+  RemoteTaskPromptWakes.layer,
 );
 
 /**

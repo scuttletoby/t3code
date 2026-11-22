@@ -1,0 +1,48 @@
+name: doc-check
+description: >-
+  Doc rules for the Markdown files agents read: size budgets for instruction files, no history in them, every
+  relative link resolves, no dated reports added to the repository. Rules from the project's optional config, read at
+  the base commit. Fails on a broken rule; warns near a budget. Usage: README.md next to this file.
+inputs:
+  config:
+    description: The project's JSON config (optional file; README "Config"), a plain path, read at the base commit.
+    required: false
+    default: .github/doc-check.json
+  base:
+    description: >-
+      The base commit: the files changed since merge-base(base, HEAD) are checked. Needs both commits fetched
+      (fetch-depth 0). Empty on a pull request: the event's base. Empty elsewhere: an error, unless mode is all.
+    required: false
+    default: ""
+  mode:
+    description: "changed (the default): the files the change adds or modifies; all: every tracked file the config selects."
+    required: false
+    default: changed
+  path:
+    description: Where the repository is checked out (actions/checkout's path).
+    required: false
+    default: "."
+runs:
+  using: composite
+  steps:
+    # Only code from this action's folder (the caller's pinned SHA) runs; nothing from the checkout. Before any git
+    # call, the checkout's .git config must be one actions/checkout writes (fork-ci git-clean).
+    - name: Refuse a git config actions/checkout does not write (fork-ci git-clean)
+      shell: bash
+      env:
+        CHECKOUT_PATH: ${{ inputs.path }}
+      run: exec python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path "$CHECKOUT_PATH" --require
+    - name: Doc rules
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        BASE: ${{ inputs.base || github.event.pull_request.base.sha }}
+        MODE: ${{ inputs.mode }}
+        CHECKOUT_PATH: ${{ inputs.path }}
+      run: |
+        cd "$CHECKOUT_PATH"
+        case "$MODE" in
+          all) exec python3 -I "$GITHUB_ACTION_PATH/doc_check.py" --config "$CONFIG" --all ;;
+          changed) exec python3 -I "$GITHUB_ACTION_PATH/doc_check.py" --config "$CONFIG" --base "$BASE" ;;
+          *) echo "::error::doc-check: mode must be changed or all, not '$MODE'"; exit 2 ;;
+        esac

@@ -143,7 +143,8 @@ SPEC = {
     'testPatterns': (list, [], _regexes),
     'ignorePatterns': (list, list(DEFAULT_IGNORE), _regexes),
 }
-SECTION_SPEC = {'sweep': (dict, machine_file.REQUIRED, None), 'queue': (dict, None, None)}  # queue: heavy_queue.py
+SECTION_SPEC = {'sweep': (dict, machine_file.REQUIRED, None), 'queue': (dict, None, None),  # heavy_queue.py
+                'capacity': (dict, None, None)}                                               # heavy_facts.py
 LOOK_SPEC = dict(SECTION_SPEC, sweep=(dict, None, None))       # heavy leftovers: no sweep settings is the defaults
 
 

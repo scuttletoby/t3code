@@ -33,6 +33,7 @@ import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
+import { Playtest } from "../playtest/PlaytestLayer.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -164,6 +165,7 @@ const serverLayer = <S>(shared: Layer.Layer<S>) => {
               return { enabled: false, waits: [], checks: [] };
             }),
         }),
+        Layer.mock(Playtest)({ filePath: "unused" }),
         Layer.mock(RemoteDelegation.RemoteDelegation)({}),
         Layer.mock(PeerForwarding.PeerForwarding)({}),
         Layer.mock(ProjectService.ProjectService)({}),
@@ -293,9 +295,13 @@ describe("the T3 tool filter on /mcp", () => {
         expect(grouped(yield* list("prs"))).toEqual({ waits: [], prs: true });
         const waits = yield* list("waits");
         expect(grouped(waits)).toEqual({ waits: WAIT_TOOLS, prs: false });
-        const outsideWaits = (name: string) =>
-          McpT3ToolFilter.T3_TOOL_GROUPS.get(name) !== "pull-requests";
-        expect(waits).toEqual(all.filter(outsideWaits));
+        const inWaits = (name: string) =>
+          ["waits", "ungrouped"].includes(McpT3ToolFilter.T3_TOOL_GROUPS.get(name) ?? "");
+        expect(waits).toEqual(all.filter(inWaits));
+        // `playtest` lives in the waits toolkit but has its own group: keeping `waits` hides it.
+        expect(McpT3ToolFilter.T3_TOOL_GROUPS.get("playtest")).toBe("playtest");
+        expect(all).toContain("playtest");
+        expect(waits).not.toContain("playtest");
         expect(grouped(yield* list("none"))).toEqual({ waits: [], prs: false });
         // An outside client of this machine has no profile: only upstream's own rules apply (the
         // wait tools that act as the calling thread are hidden from a client with none).

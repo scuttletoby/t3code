@@ -5,7 +5,9 @@
 
 import {
   DEFAULT_SERVER_SETTINGS,
+  EnvironmentId,
   ForkServerSettingsFields,
+  ProjectId,
   ProviderDriverKind,
   ServerSettings,
 } from "@t3tools/contracts";
@@ -168,4 +170,99 @@ it("refuses a user's change to any field of a whole-locked handoff or modelPolic
     const write = settings.vetWrite(current, { ...current, modelPolicy }, { modelPolicy });
     assert.deepEqual(write, { _tag: "Locked", path: "modelPolicy" }, JSON.stringify(modelPolicy));
   }
+});
+
+// Placement (row P2): a policy locks it as a whole value, labels and never groups included, so no
+// one but the policy's owner relabels the machine or switches the mode. A bad value (`null` too)
+// reads as off, so the policy takes no lock of one field inside it, as for `modelPolicy`.
+const placementUser: ServerSettings = {
+  ...DEFAULT_SERVER_SETTINGS,
+  placement: {
+    ...DEFAULT_SERVER_SETTINGS.placement,
+    mode: "enforce",
+    labels: ["gpu"],
+    never: [["ci-runner", "owner-logins"]],
+  },
+};
+
+it("locks placement whole, so neither the mode nor a label can change", () => {
+  const value: ServerSettings["placement"] = {
+    mode: "advise",
+    labels: ["ci-runner"],
+    factsCommand: "",
+    never: [["ci-runner", "owner-logins"]],
+    weights: {},
+  };
+  const result = makeManagedSettings({ placement: { value, locked: true } });
+  if (result._tag !== "Valid") assert.fail(result.reason);
+  const applied = result.settings.applyLocks(placementUser);
+  assert.deepEqual(applied.placement, value);
+  const patches: ReadonlyArray<Partial<ServerSettings["placement"]>> = [
+    { mode: "enforce" },
+    { labels: ["gpu"] },
+    { factsCommand: "/usr/local/bin/placement-facts" },
+    { never: [] },
+    { weights: { [EnvironmentId.make("env-1")]: "prefer" } },
+  ];
+  for (const patch of patches) {
+    const write = result.settings.vetWrite(
+      applied,
+      { ...applied, placement: { ...applied.placement, ...patch } },
+      { placement: patch },
+    );
+    assert.deepEqual(write, { _tag: "Locked", path: "placement" }, JSON.stringify(patch));
+  }
+});
+
+it("refuses a lock of any one placement field, naming the whole setting to lock", () => {
+  for (const [path, value] of [
+    ["placement.mode", "off"],
+    ["placement.labels", ["gpu"]],
+    ["placement.factsCommand", ""],
+    ["placement.never", []],
+    ["placement.weights", {}],
+  ] as const) {
+    const result = makeManagedSettings({ [path]: { value, locked: true } });
+    assert.strictEqual(result._tag, "Invalid", path);
+    if (result._tag === "Invalid")
+      assert.match(result.reason, /manage "placement" as a whole/, path);
+  }
+});
+
+it("lists placement as one manageable path, none inside it", () => {
+  const paths = listManageableSettings().map(([path]) => path);
+  assert.include(paths, "placement");
+  assert.include(paths, "placementNeeds");
+  assert.deepEqual(
+    paths.filter((path) => path.startsWith("placement.")),
+    [],
+  );
+});
+
+// Placement needs (row P2): a policy locks `placementNeeds` as a whole list, and the lock reaches
+// each project's own needs, as for every key a project overrides; a bad stored value goes too.
+it("locks placementNeeds on the server and in each project that sets its own", () => {
+  const result = makeManagedSettings({ placementNeeds: { value: ["gpu"], locked: true } });
+  if (result._tag !== "Valid") assert.fail(result.reason);
+  const project = ProjectId.make("project-1");
+  const user: ServerSettings = {
+    ...DEFAULT_SERVER_SETTINGS,
+    placementNeeds: { unreadable: "gpu", problem: "Expected array" },
+    projectSettingsOverrides: { [project]: { placementNeeds: [] } },
+  };
+  const applied = result.settings.applyLocks(user);
+  assert.deepEqual(applied.placementNeeds, ["gpu"]);
+  assert.deepEqual(applied.projectSettingsOverrides[project]?.placementNeeds, ["gpu"]);
+  const server = result.settings.vetWrite(
+    applied,
+    { ...applied, placementNeeds: [] },
+    { placementNeeds: [] },
+  );
+  assert.deepEqual(server, { _tag: "Locked", path: "placementNeeds" });
+  const inProject = result.settings.vetWrite(
+    applied,
+    { ...applied, projectSettingsOverrides: { [project]: { placementNeeds: [] } } },
+    { projectSettingsOverrides: { [project]: { placementNeeds: [] } } },
+  );
+  assert.strictEqual(inProject._tag, "Locked");
 });

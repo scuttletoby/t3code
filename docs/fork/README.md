@@ -56,6 +56,8 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`         | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
 | [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}` | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
+| [`server.placement`](#serverplacement)                                       | `{"mode":"off"}`            | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
+| [`server.placementNeeds`](#serverplacementneeds)                             | `[]`                        | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 | [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`         | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                    | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
 | [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
@@ -70,9 +72,10 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                     | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                     | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 
 For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
-only `mode`; their other fields are tuning that does nothing while the switch is off.
+and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
 
 ## Each setting
 
@@ -248,9 +251,10 @@ a staging site) while the agent changes it, round after round, without a pull re
 T3 runs the project's adapter, four kinds of step only the person sets: `claim` takes the target,
 `renew` keeps the claim alive, `push` (one or more named steps) sends a round to the target, and
 `release` puts the target back. Each step is a program given by its absolute path with fixed
-arguments, run without a shell; T3 passes the session's facts as environment variables. Nothing
-starts a session yet: the session store and the worker (renew, the idle and time limits, ends for
-gone threads) are there, and the tool and the thread controls come in later pull requests. The steps' contract is in [playtest.md](playtest.md).
+arguments, run without a shell; T3 passes the session's facts as environment variables. An agent
+starts, pushes, checks and ends its thread's session with the `playtest` tool (its own tool group, `playtest`); the
+thread controls come in a later pull request. The steps' contract and the tool are in
+[playtest.md](playtest.md).
 
 In the app: **Settings → Fork**, section Playtest: the switch (it stays off until all four steps are
 set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
@@ -433,6 +437,61 @@ saves them; they are not the setting's default, so a file without rows keeps mea
   }
 }
 ```
+
+### `server.placement`
+
+What this machine has, and how it places delegated work on linked machines. Only the settings are in
+the fork so far; nothing reads them yet (later placement rows add the facts, the rules and the
+wiring). Fields, each with its default:
+
+- `mode`: `off` (an agent picks a machine as upstream's do), `advise` or `enforce`.
+- `labels`: `[]`. What this machine has, as free words (`"gpu"`, `"ci-runner"`, `"owner-logins"`):
+  each is one word of at most 64 characters, at most 64 labels. They are stored trimmed and
+  lower-cased (`"GPU"` is `"gpu"`), a repeat dropped. There is no Unicode normalisation: `café`
+  written with a combining accent and without one are two labels.
+- `factsCommand`: `""`. Empty, or the absolute path of one program on this server's OS (`/…` on
+  Linux and macOS; `C:\…` or `\\server\…` on Windows). It is a path, never a command line: a
+  space is part of the path, and no shell runs it. A relative path or a control character is not
+  valid; a save that sets another OS's path is refused, and placing reads one in the file as `off` (below).
+  Exit 0 means free for work, and each line it prints is one more label; any other exit or a timeout
+  means not available.
+- `never`: `[]`. Label groups that must not meet on one machine, such as
+  `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
+  lower-casing (`["GPU", "gpu"]` is one label, so not a group).
+- `weights`: `{}`. Linked machine id (one word, no spaces) to `prefer`, `normal`, `less` or
+  `manual` (upstream's load-balancing words); a machine without one is `normal`.
+
+A value that is not valid (a bad field, a wrong type, a field this build does not know) reads as
+`off`, with a warning in the log and the reason kept beside it for Settings to show; the rest of the
+file still loads. The person's text is kept as written until the key is saved. A `factsCommand`
+that is not a full path on this server's OS (a hand edit) is not converted by the load: Settings
+shows it as written. Placing work reads `placement` only through the server's
+`readPlacementForThisOs` (`apps/server/src/fork/placementRead.ts`), which reads it as `off`, kept
+as written with the reason, each time; the machine that runs `factsCommand` checks the path again
+before it runs it. A save that names only some fields keeps
+the others; over a kept unreadable value only a save of every field is taken (it replaces the text),
+and a partial one is refused ("placement is not valid; save the whole setting"), so it cannot drop a
+`never` group. A newer build's field reads as `off` here and is kept through saves of other keys; a
+save of `placement` on this build drops it. Only a person changes it: no agent tool can, and a
+managed policy can lock it as a whole value (not one field inside it, as for `modelPolicy`).
+"Person-only" means no T3 tool takes it; an agent with a shell can still edit the settings file or
+call the settings RPC, as for `modelPolicy`.
+
+```json
+{
+  "placement": { "mode": "advise", "labels": ["gpu"], "never": [["ci-runner", "owner-logins"]] }
+}
+```
+
+### `server.placementNeeds`
+
+Labels a machine must have to take a project's work, for each project without its own
+(`projectOverride.placementNeeds`). Same label rules as `placement.labels`. Default `[]`: no needs.
+A value that is not valid fails closed: that work goes to no machine ("this project's
+placementNeeds setting is not valid: …; fix it in Settings"), never to any machine as `[]` would.
+The reason is kept beside it and logged, and the person's text is written back unchanged by saves
+of other settings until this key is saved, which replaces it. A managed policy can lock it as a
+whole list; the lock also holds each project's own needs.
 
 ### `server.agentSlots`
 
@@ -674,11 +733,29 @@ memory readings and only records what it would have answered: one log line per d
 last result with counts under `slotRule` in `wait_list`. It never changes or delays a decision; a
 reading that fails or takes over 2 seconds counts as "unreadable". While switched off the gate keeps
 no records of new agents, so the rule counts each agent allowed in the last `startGraceSeconds` as
-starting. Without `mode`, a switched-on
-gate is `"fixed"` (a file from an older build decides exactly as before) and a switched-off one is
-`"observe"`; a mode this build does not know (from a newer build) is `"fixed"`. Not "off" for that
-reason: with the default the server reads memory files at each `delegate_task`; `"mode": "fixed"`
-stops it.
+starting. `"enforce"`: the capacity rule decides. Every agent still starting owes its full cost
+(two starts in one second both count, and a held slot owes a writer's), costs come from the rule
+file (light 384 MB, writer 768 MB), and an agent's kind comes from its task `role` (`research`,
+`review` and `design` are light, anything else or no role is a writer). A role can be wrong: a
+running agent that uses more than a light cost counts as a writer, and so does one whose memory
+cannot be read, whatever its role (it is taken to use a light cost already, so it is never counted
+twice). The floors (2 agents, 1 job) always start, whatever the readings, unless real readings say
+"severe". The agent ceiling is 3 per core, at most 64, only on Linux with cgroup v2, agents in their
+own scopes and the kernel's OOM counter; anywhere else it stays at 10 agents and 4 jobs. After an
+OOM kill (`oom_kill` in `/proc/vmstat` rises) or with swap under 10% free and filling, the gate falls
+back to at most 10 agents and 4 jobs. A kill inside an agents' slice also raises each agent cost by
+25% (a kill elsewhere, such as a build box at its own cap, does not; where the slices cannot be
+read, at most 2 raises). Ten minutes of calm, whole readings lift the fallback and take one raise
+off; each further calm spell takes off one more. The gate reads the machine every 30 seconds as
+well as at each ask. A restarted server starts in the fallback and at "elevated", which lifts
+after about a minute of calm readings (no stall, memory above the margin, swap not filling: swap
+that is full of old pages does not count). Readings that fail count as "elevated": the floors still
+start, and after 2 minutes without a whole reading agents are counted against the fixed 10 until one
+comes back. Settings that cannot be read give the fixed 10 too (with a warning), never no limit.
+Typed limits (`maxPerMachine`, ...) still apply while `enabled`. Without `mode`, a
+switched-on gate is `"fixed"` (a file from an older build decides exactly as before) and a
+switched-off one is `"enforce"`; a mode this build does not know (from a newer build) is `"fixed"`.
+`"mode": "fixed"` turns the rule off and stops the memory reads at each `delegate_task`.
 
 ### `server.headlessUsageRefreshInterval`
 
@@ -822,14 +899,44 @@ through, and a fork of a thread whose parent cannot be read is refused. On
 another machine, a fork, a change to a scheduled task and `run_scheduled_task_now` are refused for
 such a thread, as a thread started there gets that machine's profile.
 
-Only Claude threads apply a profile's outside servers. A Codex thread, or one on any other
-provider, would get every outside MCP server whatever its profile says (T3's own tool groups apply
-on every provider, above). So its turn is not started when its profile leaves out any outside
-server ([#672](https://github.com/scuttletoby/t3code/issues/672)): the machine that
+A Codex thread applies the profile's `servers` too. Codex runs one app-server for all of an
+instance's threads, so T3 sets the servers per thread, as it sets its own `t3-code` entry: when it
+loads a thread (starts, resumes or forks it), it asks that app-server which MCP servers are set up
+for the thread's folder (Codex's `config.toml`, a project's `.codex/config.toml`, and servers added
+by `-c mcp_servers…` in the Codex launch arguments) and gives that thread
+`mcp_servers.<name>.enabled = false` for each one the profile leaves out, and `features.apps = false`
+unless the profile names `codex_apps` (Codex's connectors server, which it adds with a ChatGPT
+sign-in and which that list never shows). T3's own servers stay. Other threads on the same
+app-server keep their own sets. Codex's own sub-agents copy their parent's loaded config, these
+settings included. Before each turn (and before a goal is set running) T3 reads the thread's live
+servers from Codex and does not start the turn, saying why and how to go on (pick `all` for the
+thread, or fix the profile), when one the profile leaves out is still switched on. Turns Codex
+starts on its own (a goal's next turn, a sub-agent's turn) are checked as they start: one that
+fails is stopped, the goal is paused, and the turn ends failed with the reason. A turn fails this
+check when the profile was narrowed while Codex had the thread loaded (Codex reads a thread's
+config only as it loads it, so the change counts once it loads the thread again: after it has been
+idle a while, or after T3 restarts) and for a server a Codex plugin adds, which T3 cannot switch off
+this way. A turn is also refused when the profile is missing or broken, Codex's servers cannot be listed, a server's name cannot be written as a config key, the
+thread is not in T3's store, or (once any thread on that app-server has a narrower profile) Codex
+asks to load or run a thread T3 cannot match to one of its own. Codex answers the server list only
+once the thread's servers have started, and T3 waits up to 30 seconds for each read: a kept server
+slower to start than that refuses the turn, which can be sent again once it is up. When a resume is
+refused (for example a read failed once), T3 does not move the thread to a fresh Codex session,
+which would lose its history: the turn fails, and sending it again resumes the thread. A thread on
+`all` sends Codex nothing extra, but T3 still works out its profile from the settings and the
+thread store at each load and turn, so a thread missing from the store refuses there too. A turn already running when the profile is narrowed keeps its servers
+until it ends. A Codex thread's T3 tool groups are cut on T3's own server, as on every provider
+(above); each Codex turn fixes them as it starts, also one Codex starts on its own (a goal's next
+turn, a sub-agent's turn, which uses its parent's T3 thread).
+
+Only Claude and Codex threads apply a profile's outside servers. A thread on any other provider
+would get every outside MCP server whatever its profile says (T3's own tool groups apply on every
+provider, above). So its turn is not started when its profile leaves out any outside server
+([#672](https://github.com/scuttletoby/t3code/issues/672)): the machine that
 runs the turn checks the thread's profile as the turn starts (also a resumed turn, and a compaction,
 which some providers run as a `/compact` prompt) and refuses it, saying why and how to go on (switch
-the thread to a Claude instance, or pick `all`, or a profile whose servers are `"all"`, for it). A
-profile whose `servers` is `"all"` and whose `t3Tools` is a list runs on every provider. That covers every way a thread gets there: a
+the thread to a Claude or Codex instance, or pick `all`, or a profile whose servers are `"all"`, for
+it). A profile whose `servers` is `"all"` and whose `t3Tools` is a list runs on every provider. That covers every way a thread gets there: a
 thread switched to another provider (`t3_thread_configure`, or in the app), a thread made by
 `t3_thread_launch` in a project whose profile is narrower, a task delegated on this machine (a child
 gets its parent's profile, or `mcpSubagentProfile`), and a task another machine sent, also one from
@@ -893,6 +1000,25 @@ role as before, and the server log says so.
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
 ```
+
+In the app: **Settings → Fork**, section MCP profiles. It lists `all` and `t3-only` (read-only)
+and each named profile, and adds, edits and deletes named ones: `servers` is all or a list of
+names (the editor offers the names other profiles use and takes any other; no list of the
+machine's servers reaches the app yet), `t3Tools` all or a list of groups. `request_secret`,
+`send_to_user` and `tool_search` always stay. A built-in name cannot be taken, and a profile that
+the default, the sub-agent rule, a project or a thread pick names cannot be deleted: the panel
+says which, and offers to clear the thread picks that name it; the server refuses such a delete
+too, naming who uses the profile. An entry this version cannot read
+(fields from a newer build) shows as broken and cannot be edited there, only deleted; one that
+names T3 tool groups this version does not know shows as from a newer version, the same way. The
+default profile and the sub-agent rule have the usual project-override control, and each thread's
+pick is listed by title, changed or cleared. Adding a pick saves nothing until a profile is
+chosen next to the thread id; the panel says what the pick gives the thread, and when that is more
+than the parent's cut-down set (a pick is never cut down to the parent's). A blank pick from a hand
+edit shows as broken, as it is ignored, and can be cleared. Every save sends only the entries it changes (a pick
+names one thread), so another profile or another thread's pick is never overwritten, and a change
+applies from the thread's next message. A client without permission to change settings sees the
+rows but cannot use them; the server refuses such a save anyway.
 
 Only the person can change MCP profile settings; agents cannot.
 
@@ -977,11 +1103,12 @@ Only the person can change it; agents cannot. `mode` is `off` (the default: upst
 settings apply as they are), `handoff` (upstream's idle compaction then skips the thread, so
 only the handoff acts on it), or `compact` (the same as `off`, so one thread can opt out
 of its project's `handoff`). `threads` maps a thread id to a mode and wins over `mode` (at most
-500). `source` says who writes the handoff: `agent` (the old session, in one turn; `instructions`
-replaces the built-in text) or `command` (a program given as `command`, run without a shell in the
-project folder; it must only read and be safe to run twice; its output is the handoff). The `agent`
-source does not write a handoff yet; until it does, its handoffs use T3's state and the recent
-conversation only. `sizeTokens` (150,000) is the size backstop, `idleTokens` (75,000; `0` never) the
+500). `source` says who writes the handoff: `none` (the default: T3's state and the recent
+conversation only), `agent` (the old session, in one turn; `instructions` replaces the built-in
+text) or `command` (a program given as `command`, run without a shell in the project folder; it
+must only read and be safe to run twice; its output is the handoff). Settings saved before `none`
+existed have no `source` and read as `none`, so they start no write turns until `agent` is chosen.
+`sizeTokens` (150,000) is the size backstop, `idleTokens` (75,000; `0` never) the
 smallest idle thread handed off before its cache expires, and `modelSelection` the new session's
 model (not set: the thread's current one). A save with a bad value, a field T3 does not know (a
 typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
@@ -1054,6 +1181,15 @@ to the server's value. A thread's own mode in the project's or the server's `thr
 either `mode`, the project's entry first. A project save that leaves this key out (an
 older client) keeps the stored value; only `null` clears it (also when written by hand, as for
 `playtest`, including the change for old files).
+
+### `projectOverride.placementNeeds`
+
+A project's own needs, for example `["gpu"]`. It replaces the server's `placementNeeds` for that
+project as a whole; `[]` says the project needs nothing. Not set: the server's. A project value that
+is not valid fails closed as the server's does: that project's work goes to no machine (never the
+server's needs, never none), and its text is kept. A project save that leaves this key out (an older
+client) keeps the stored value, and one that sends back the kept text unchanged keeps it too (other
+text is refused); only `null` clears it, as for `playtest`.
 
 ### A setting the fork removed
 

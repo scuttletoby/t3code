@@ -1,9 +1,10 @@
 /**
- * Fork: off Claude a turn would get every outside MCP server, so it refuses at start when its
- * profile leaves one out or cannot be worked out; every such turn (also a resume or a compaction)
- * fixes its thread's T3 tool groups (mcpT3ToolFilter.ts). Claude fixes them in claudeMcpProfile.ts.
+ * Fork: every turn start (also resume, compaction) fixes its thread's T3 tool groups for
+ * mcpT3ToolFilter.ts, on every driver but Claude (claudeMcpProfile.ts fixes its own). Outside
+ * `MCP_PROFILE_DRIVERS` the turn also refuses when its profile leaves out an outside server.
+ * A profile that cannot be worked out refuses on every wrapped driver.
  */
-import { MCP_PROFILE_ALL, type ProviderDriverKind } from "@t3tools/contracts";
+import { MCP_PROFILE_ALL, ProviderDriverKind } from "@t3tools/contracts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as Effect from "effect/Effect";
@@ -52,21 +53,30 @@ const withOverrides = <T extends object>(source: T, overrides: Partial<T>): T =>
   });
 };
 
-/** Whether threads on this driver apply MCP profiles; any other is checked at each turn start. */
+/** Whether threads on this driver apply a profile's outside servers themselves. */
 const appliesMcpProfiles = (driver: ProviderDriverKind): boolean => MCP_PROFILE_DRIVERS.has(driver);
+
+/**
+ * Drivers that fix their threads' T3 tool groups themselves, as each query opens
+ * (claudeMcpProfile.ts), and so are not wrapped here. Every other driver's turns are.
+ */
+const FIXES_OWN_T3_TOOL_SETS: ReadonlySet<ProviderDriverKind> = new Set([
+  ProviderDriverKind.make("claudeAgent"),
+]);
 
 const refusalReason = (resolved: McpProfileResolved, instance: ProviderInstance): string => {
   // A parent's profile (here, or the one another machine carried) can cut even `all` down.
   const profile = resolved.narrowedByParent
     ? `("${resolved.name}", cut down to its parent thread's)`
     : `"${resolved.name}"`;
-  return `This thread's MCP profile ${profile} leaves out some outside MCP servers, and ${instance.driverKind} (provider instance ${instance.instanceId}) does not apply a profile's outside servers (only Claude does), so this turn was not started: it would get every outside MCP server. Switch the thread to a Claude instance, or pick "${MCP_PROFILE_ALL}" (or a profile whose servers are "all") for this thread in Settings.`;
+  return `This thread's MCP profile ${profile} leaves out some outside MCP servers, and ${instance.driverKind} (provider instance ${instance.instanceId}) does not apply a profile's outside servers (only Claude and Codex do), so this turn was not started: it would get every outside MCP server. Switch the thread to a Claude or Codex instance, or pick "${MCP_PROFILE_ALL}" (or a profile whose servers are "all") for this thread in Settings.`;
 };
 
 /**
- * Fixes the thread's T3 tool groups for this turn, then nothing when the profile keeps every
- * outside server; otherwise the refusal. A profile that cannot be worked out refuses with the
- * resolver's reason, as it does on Claude, and keeps only the tools every profile keeps.
+ * Fixes the thread's T3 tool groups for this turn, then nothing when the driver applies outside
+ * servers itself (Codex) or the profile keeps every one; otherwise the refusal. A profile that
+ * cannot be worked out refuses with the resolver's reason, as it does on Claude, and keeps only the
+ * tools every profile keeps.
  */
 const checkTurnProfile = Effect.fn("McpProfileTurnCheck.check")(function* (
   profileFor: ProfileFor,
@@ -81,7 +91,7 @@ const checkTurnProfile = Effect.fn("McpProfileTurnCheck.check")(function* (
     Effect.onInterrupt(() => Effect.sync(() => forgetT3ToolSet(thread.id))),
   );
   fixT3ToolSet(thread.id, t3ToolSetOf(resolved));
-  if (resolved.profile.servers === "all") return;
+  if (appliesMcpProfiles(instance.driverKind) || resolved.profile.servers === "all") return;
   return yield* new ClaudeMcpProfileError({ reason: refusalReason(resolved, instance) });
 });
 
@@ -108,7 +118,7 @@ const makeWrap = (profileFor: ProfileFor) => {
         Effect.andThen(run(input)),
       );
   return (instance: ProviderInstance): ProviderInstance => {
-    if (appliesMcpProfiles(instance.driverKind)) return instance;
+    if (FIXES_OWN_T3_TOOL_SETS.has(instance.driverKind)) return instance;
     const known = wrapped.get(instance);
     if (known !== undefined) return known;
     const adapter = instance.orchestrationAdapter;
@@ -135,7 +145,7 @@ const makeWrap = (profileFor: ProfileFor) => {
 };
 
 /**
- * Upstream's registry with every instance outside `MCP_PROFILE_DRIVERS` checked at turn start.
+ * Upstream's registry with every instance but Claude's checked at turn start.
  * Asks for the thread store and the settings service, so a server wired without them is a type
  * error, not a check that reads every thread as `all`.
  */

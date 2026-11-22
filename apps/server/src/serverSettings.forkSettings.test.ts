@@ -301,6 +301,37 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork MCP profile
       }).pipe(Effect.provide(layerServerSettings())),
   );
 
+  it.effect("refuses deleting a profile a thread still picks, and writes nothing", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const start = {
+        ...FULL_FILE,
+        mcpProfiles: { lean: { servers: [], t3Tools: [] } },
+        mcpThreadProfiles: { t1: "lean" },
+      };
+      yield* fs.writeFileString(config.settingsPath, JSON.stringify(start));
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      // A second client, or one with stale settings, deletes it without clearing the pick.
+      const error = yield* service
+        .updateSettings(decodePatch({ mcpProfiles: { lean: null } }))
+        .pipe(Effect.flip);
+      assert.instanceOf(error.cause, ForkSettingsWriteError);
+      assert.strictEqual(
+        (error.cause as Error).message,
+        'MCP profile "lean" cannot be deleted: it is in use by the pick for thread t1. Change those first.',
+      );
+      const kept = (yield* readFile) as { mcpProfiles: Record<string, unknown> };
+      assert.deepStrictEqual(Object.keys(kept.mcpProfiles), ["lean"]);
+      // Cleared in the same save, it goes; the same save again changes nothing and is taken.
+      const both = decodePatch({ mcpProfiles: { lean: null }, mcpThreadProfiles: { t1: null } });
+      yield* service.updateSettings(both);
+      yield* service.updateSettings(both);
+      const file = (yield* readFile) as Record<string, unknown>;
+      assert.isFalse("mcpProfiles" in file && Object.keys(file.mcpProfiles as object).length > 0);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
   it.effect("keeps a project's MCP profile when an older client saves the project without it", () =>
     Effect.gen(function* () {
       const start = {

@@ -169,6 +169,12 @@
         "const spawnSync = forkSpawnSync; // Fork: the Rosetta limit above"
       ]
     },
+    "scripts/build-desktop-artifact.ts": {
+      "why": "#822: without signing secrets electron-builder finds no identity and signs nothing, so the shipped macOS app keeps only the linker signature of Electron's own executable, which seals none of the renamed bundle, and `codesign --verify --deep --strict` fails on it (\"code has no resources but signature indicates they must be present\"). For an unsigned build the fork's line sets identity \"-\" and the sign hook scripts/fork-codesign.cjs, which runs `codesign --force --deep --sign -` as electron-builder's last change to the bundle, before the zip and dmg are made from it. Signed builds keep upstream's line and scripts/sign-macos.ts. fork-release.yml's verify_mac_signature job checks the app in each shipped zip and dmg. Tested in scripts/fork-codesign.test.ts. Drop this seam when upstream ad-hoc signs unsigned macOS builds, or when the fork signs with a Developer ID (#803).",
+      "added": [
+        "...(signed ? {} : { identity: \"-\", sign: path.join(repoRoot, \"scripts/fork-codesign.cjs\") }),"
+      ]
+    },
     "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts": {
       "why": "MCP profiles part 2: a Claude thread's MCP profile is applied to its session (strict MCP mode or an allowlist of outside servers, from apps/server/src/fork/claudeMcpProfile.ts), is part of the live-query key, refuses the turn when it cannot be applied, and adds a PreToolUse hook (merged into the adapter's hooks) that refuses a call to a server outside the profile. Additions only; tested in apps/server/src/fork/claudeMcpProfile.adapter.test.ts.",
       "added": [
@@ -187,14 +193,10 @@
     },
     "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts": {
       "why": "MCP profiles part 5: each Codex thread gets its profile's outside MCP servers switched off in its own per-thread config (mcp_servers.<name>.enabled = false for every server Codex's config/read lists for the thread's folder that the profile leaves out, launch-argument servers included; T3's own entries stay), and a turn is refused, saying why and the fix, when the thread's live servers (mcpServerStatus/list) still include one outside its profile. The adapter's app-server client factory is wrapped by apps/server/src/fork/codexMcpProfile.ts; the overrides travel per request, so other threads on the shared app-server keep their own sets. Additions only; tested in apps/server/src/fork/codexMcpProfile.test.ts.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "import * as CodexMcpProfile from \"../../fork/codexMcpProfile.ts\"; // Fork: MCP profiles",
-          "...(yield* CodexMcpProfile.profiledClientFactory(clientFactory)), // Fork: MCP profiles"
-        ]
-      }
+      "added": [
+        "import * as CodexMcpProfile from \"../../fork/codexMcpProfile.ts\"; // Fork: MCP profiles",
+        "...(yield* CodexMcpProfile.profiledClientFactory(clientFactory)), // Fork: MCP profiles"
+      ]
     },
     "apps/server/src/orchestration-v2/ProviderTurnStartService.ts": {
       "why": "MCP profiles part 2: a Claude turn its MCP profile refuses never reached Claude, like the other refusals in this list.",
@@ -338,6 +340,123 @@
           "...EnvironmentFacts.ResultFields, // Fork (P3): facts out"
         ]
       }
+    },
+    "apps/web/src/components/threadActionMenu.logic.ts": {
+      "why": "The thread menu gets \"Hand off now\" (handoff, HO5): one more menu id, one optional state field the menu's callers fill, and the item spread into the list; the item and its rules are in fork/handoff/handoffMenu.ts. The thread menu gets the MCP profile entry (MCP profile design PR 3): the thread's effective profile and, for a client that may change settings, the owner's pick or clear. One more menu id type, one optional state field the menu's callers fill, and the entry spread into the list before Copy; the entry and its rules are in fork/mcpProfile/threadMcpProfile.logic.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
+          "| typeof ForkHandoffMenu.HAND_OFF_NOW; // Fork (HO5)",
+          "readonly forkHandoff?: ForkHandoffMenu.HandoffMenuState; // Fork (HO5)",
+          "...ForkHandoffMenu.handOffNowItems(state.forkHandoff, resolve), // Fork (HO5)",
+          "import * as ForkMcpMenu from \"./fork/mcpProfile/threadMcpProfile.logic\"; // Fork (MCP profile)",
+          "| ForkMcpMenu.McpProfileMenuId // Fork (MCP profile)",
+          "readonly forkMcpProfile?: ForkMcpMenu.McpProfileMenuState | undefined; // Fork (MCP profile)",
+          "...ForkMcpMenu.mcpProfileMenuItems(state.forkMcpProfile), // Fork (MCP profile)"
+        ]
+      }
+    },
+    "apps/web/src/hooks/useThreadActionMenu.ts": {
+      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" before it builds the menu and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The thread menu's hook fills the MCP profile entry's state as it builds the menu and hands the entry's clicks to the fork, which saves that one thread's pick (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The state is read synchronously, so the menu still opens at once.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffMenu from \"../components/fork/handoff/handoffMenu\"; // Fork (HO5)",
+          "forkHandoff: await ForkHandoffMenu.readHandoffMenuState(threadRef), // Fork (HO5)",
+          "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
+          "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
+          "import * as ForkMcp from \"../components/fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
+          "forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)",
+          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, action)) return; // Fork (MCP profile)"
+        ]
+      }
+    },
+    "apps/web/src/components/Sidebar.tsx": {
+      "why": "The sidebar builds its own thread menu: it reads the handoff state for \"Hand off now\" before the menu opens (the menu is built in a callback that does not await) and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The sidebar builds its own thread menu: it fills the MCP profile entry's state and hands the entry's clicks to the fork, like the thread menu's hook (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
+          "const forkHandoff = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
+          "forkHandoff, // Fork (HO5)",
+          "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
+          "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
+          "import * as ForkMcp from \"./fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
+          "forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)",
+          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, clicked.value)) return; // Fork (MCP profile)"
+        ]
+      }
+    },
+    "apps/web/src/components/ChatView.tsx": {
+      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import { useForkHandoffWaitingItems } from \"./fork/handoff/useForkHandoffWaitingItems\"; // Fork (HO5)",
+          "const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)",
+          "...forkHandoffWaitingItems, // Fork (HO5)",
+          "...forkHandoffWaitingItems, // Fork (HO5)"
+        ]
+      }
+    },
+    "apps/web/src/components/chat/TimelineUserMessageRow.tsx": {
+      "why": "A handoff's first message shows the handoff divider in place of \"New session\" (handoff, HO5): a scope around upstream's fresh-session row tells that row which message it is (fork/handoff/handoffDivider.tsx). JSX children cannot end in a // comment, so a JSX comment line marks the two tags.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffDivider from \"../fork/handoff/handoffDivider\"; // Fork (HO5)",
+          "{/* Fork (HO5): a handoff's first message shows the handoff divider. */}",
+          "<ForkHandoffDivider.Scope row={row}>",
+          "</ForkHandoffDivider.Scope>"
+        ]
+      }
+    },
+    "apps/web/src/components/chat/V2LifecycleRow.tsx": {
+      "why": "Upstream's fresh-session row shows the handoff divider's label when its scope (TimelineUserMessageRow.tsx) marks a handoff (handoff, HO5; fork/handoff/handoffDivider.tsx).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffDivider from \"../fork/handoff/handoffDivider\"; // Fork (HO5)",
+          "const forkHandoffLabel = ForkHandoffDivider.useLabel(); // Fork (HO5)",
+          "if (forkHandoffLabel) return <TimelineSystemDivider label={forkHandoffLabel} icon={EraserIcon} />; // Fork (HO5)"
+        ]
+      }
+    },
+    "packages/provider-acp/src/server/adapter.ts": {
+      "why": "Fix for #846 (an upstream bug, not reported upstream). At a turn's end the ACP adapter caches the provider thread as active; usage and session info an agent (Kiro, Kimi) sends after the prompt settles re-send that snapshot session-scoped, which the server writes unguarded, so a race with the run's final write can leave an ended thread active. The cached snapshot is settled (idle) like the server's final write; a broken thread keeps upstream's error. One override line after upstream's status line, so no upstream line changes.",
+      "added": [
+        "// Fork: settled like the run's final write, since later usage updates re-send this.",
+        "...(threadDisposition === \"broken\" ? {} : { status: \"idle\" as const }),"
+      ]
+    },
+    "packages/provider-cursor/src/server/adapter.ts": {
+      "why": "Fix for #846, the same race as the ACP adapter: at a turn's end the Cursor adapter caches the provider thread as active, and background-shell updates after the turn re-send it session-scoped. The cached snapshot is settled (idle) like the server's final write. One override line after upstream's status line, so no upstream line changes.",
+      "added": [
+        "// Fork: settled like the run's final write, since later shell updates re-send this.",
+        "...(input.threadDisposition === \"broken\" ? {} : { status: \"idle\" as const }),"
+      ]
+    },
+    "apps/server/src/orchestration-v2/Adapters/AcpAdapterV2.test.ts": {
+      "why": "Fix for #846: upstream's late usage_update test also checks that the re-sent snapshot is idle, not active.",
+      "added": [
+        "assert.equal(late.providerThread.status, \"idle\"); // Fork: not busy after the turn"
+      ]
+    },
+    "packages/provider-cursor/src/server/adapter.test.ts": {
+      "why": "Fix for #846: upstream's background-shell test also checks that the snapshot later shell updates re-send is idle, not active.",
+      "added": [
+        "// Fork: later shell updates re-send this snapshot, so it must not say busy.",
+        "const settled = events.findLast((event) => event.type === \"provider_thread.updated\");",
+        "assert.ok(settled?.type === \"provider_thread.updated\");",
+        "assert.equal(settled.providerThread.status, \"idle\");"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -363,7 +482,7 @@
     "apps/server/src/orchestration-v2/ThreadLaunchService.ts": 13,
     "apps/server/src/orchestration-v2/runtimeLayer.test.ts": 259,
     "apps/server/src/orchestration-v2/runtimeLayer.ts": 28,
-    "apps/server/src/processRunner.ts": 35,
+    "apps/server/src/processRunner.ts": 8,
     "apps/server/src/provider/ProviderRegistry.test.ts": 14,
     "apps/server/src/provider/ProviderRegistry.ts": 10,
     "apps/server/src/provider/providerMaintenanceRunner.test.ts": 1,

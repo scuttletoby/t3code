@@ -233,10 +233,10 @@ describe("capacity rule", () => {
     const first = capacityDecision(CAPACITY_RULE, {
       facts: calm,
       ask: { kind: "agent-light" },
-      previous: { level: "elevated", calmSinceMs: null },
+      previous: { level: "elevated", calmSinceMs: null, swapFreeMb: 4096 },
       nowMs: 5_000,
     });
-    expect(first.pressure).toEqual({ level: "elevated", calmSinceMs: 5_000 });
+    expect(first.pressure).toEqual({ level: "elevated", calmSinceMs: 5_000, swapFreeMb: 4096 });
     const second = capacityDecision(CAPACITY_RULE, {
       facts: calm,
       ask: { kind: "agent-light" },
@@ -244,5 +244,50 @@ describe("capacity rule", () => {
       nowMs: 65_000,
     });
     expect(second).toMatchObject({ admit: true, level: "ok", pressure: { calmSinceMs: null } });
+  });
+
+  it("learns the swap trend on the first read: the calm wait starts there, ends on a known trend", () => {
+    // Full swap of old cold pages (300 of 4096 MB free), nothing stalling: never a signal by itself.
+    const coldSwap = facts({ swap: { totalMb: 4096, freeMb: 300 } });
+    const first = capacityDecision(CAPACITY_RULE, {
+      facts: coldSwap,
+      ask: { kind: "agent-light" },
+      previous: { level: "elevated", calmSinceMs: null },
+      nowMs: 0,
+    });
+    // No swap read before: the trend is unknown. The calm wait starts; the read is kept for the next.
+    expect(first.pressure).toEqual({ level: "elevated", calmSinceMs: 0, swapFreeMb: 300 });
+    // A read with no trend never ends the wait, however long it has run.
+    const unknown = capacityDecision(CAPACITY_RULE, {
+      facts: coldSwap,
+      ask: { kind: "agent-light" },
+      previous: { level: "elevated", calmSinceMs: 0 },
+      nowMs: 600_000,
+    });
+    expect(unknown.pressure).toMatchObject({ level: "elevated", calmSinceMs: 0 });
+    const second = capacityDecision(CAPACITY_RULE, {
+      facts: coldSwap,
+      ask: { kind: "agent-light" },
+      previous: first.pressure,
+      nowMs: 1_000,
+    });
+    expect(second.pressure.calmSinceMs).toBe(0);
+    const third = capacityDecision(CAPACITY_RULE, {
+      facts: coldSwap,
+      ask: { kind: "agent-light" },
+      previous: second.pressure,
+      nowMs: CAPACITY_RULE.pressure.elevatedClearSeconds * 1000,
+    });
+    expect(third).toMatchObject({ admit: true, level: "ok" });
+    // The same swap filling by more than `swapFillingMb` since the last read: elevated at once.
+    const filling = capacityDecision(CAPACITY_RULE, {
+      facts: facts({
+        swap: { totalMb: 4096, freeMb: 300 - CAPACITY_RULE.pressure.swapFillingMb - 1 },
+      }),
+      ask: { kind: "agent-light" },
+      previous: third.pressure,
+      nowMs: 70_000,
+    });
+    expect(filling.level).toBe("elevated");
   });
 });
