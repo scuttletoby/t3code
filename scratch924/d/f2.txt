@@ -1,0 +1,3 @@
+scratch file two for issue 924
+another line
+and one more
