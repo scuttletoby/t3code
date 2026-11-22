@@ -13,28 +13,28 @@ import {
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { Effect } from "effect";
 
+import { threadRolesSaveProblem } from "./threadRoleTargets.ts";
+
 /** Fails when saving `next` over `current` would bring in a fork setting or interval that cannot apply. */
-export function check(
+export const check = Effect.fn("ForkSettingsWrite.check")(function* (
   current: ServerSettings,
   next: ServerSettings,
   settingsPath: string,
-): Effect.Effect<void, ServerSettingsError> {
-  return Effect.flatMap(HostProcess.Platform, (platform) => {
-    const problem =
-      forkSettingsWriteProblem(current, next) ??
-      playtestProgramProblem(current, next, platform) ??
-      placementFactsCommandSaveProblem(current, next, platform);
-    return problem === undefined
-      ? Effect.void
-      : Effect.fail(
-          new ServerSettingsError({
-            settingsPath,
-            operation: "normalize",
-            cause: new ForkSettingsWriteError({ problem }),
-          }),
-        );
+) {
+  const platform = yield* HostProcess.Platform;
+  const problem =
+    forkSettingsWriteProblem(current, next) ??
+    playtestProgramProblem(current, next, platform) ??
+    placementFactsCommandSaveProblem(current, next, platform) ??
+    // Reads the threads a new role pointer names, so it runs last (fork/threadRoleTargets.ts).
+    (yield* threadRolesSaveProblem(current, next));
+  if (problem === undefined) return;
+  return yield* new ServerSettingsError({
+    settingsPath,
+    operation: "normalize",
+    cause: new ForkSettingsWriteError({ problem }),
   });
-}
+});
 
 /** `update`, then {@link check} on what it returns. */
 export const withCheck =
