@@ -579,13 +579,17 @@ names it, and the head check's summary lists it as `not a lens report` (a
 account, held pull requests with no one seeing why). A lens whose report has no
 marker has therefore posted nothing: a required lens still has no read, and the
 head check fails on that. If it holds an open finding (a `blocker:` or `major:`
-line that is not `none`, or NOT SAFE, as the findings rules below read them) it
+line that is not `none`, or NOT SAFE, as the findings rules below read them,
+with its first two lines read as a heading and its title line, and
+`not safe to merge` on any line outside a fenced code block read as NOT SAFE) it
 is most likely a real report with a broken header, so it blocks like a broken
 lens report, keyed by that comment, whatever an older or newer read of that lens
 says: an older clean read never wins over it. Its reason says to post a NEW
 comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>`
 (editing the marker into the old comment does not count: an edited comment
-reads nothing) and to delete the old one or start it with `not a lens:`. Lenses check their
+reads nothing) and to delete the old one or edit it to start with `not a lens`
+and a colon. It also stops holding once edited so it holds no open finding: the
+same people could delete it, and the gate keeps no history. Lenses check their
 comment with the review kit's `check` before posting (fork-kit/review). A
 comment that is no report but holds a marker says so on its first line,
 `not a lens: ...`. That clears it unless one of
@@ -625,7 +629,8 @@ that comment. Posting the report again the right way adds a new
 read and leaves the old comment blocking, and hiding it is not enough either.
 The ways out: delete it, edit its first line to `not a lens: ...` with no lens
 header line left in it and any `read at <sha>` quoted with `>`, or post an
-override for the head.
+override for the head. One without the marker also stops holding once it is
+edited so it holds no open finding (the same people could delete it).
 
 These shapes were measured on this repository's 677 pull request comments by
 people (November 2026, before the lens marker rule): 25 are flagged, before and

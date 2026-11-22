@@ -72,6 +72,8 @@ export const NO_MARKER =
 export const REPOST =
   "post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the " +
   "marker into an old comment does not count)";
+/** The one way out of a held comment (lens.HELD_WAY_OUT): delete it or opt it out. */
+const HELD_WAY_OUT = "delete the old one or edit it to start with `not a lens` and a colon";
 /**
  * reportProblem's kinds (lens.BROKEN, HELD, NOT_LENS): a lens report (with the marker) that is not one valid read; a
  * comment without the marker that holds an open finding (both block); one without either (no report, never blocks).
@@ -284,11 +286,11 @@ export function reportProblem(
   const problem = looksProblem(body, overridePrefix);
   if (!problem) return null;
   if (hasMarker(body)) return [problem, "broken"];
-  const found = readFindings(body)[0];
+  const found = readFindings(body, true)[0]; // no header: the title line and NOT SAFE prose count
   if (found.length > 0) {
     return [
-      `${NO_MARKER}, but it holds an open ${found[0]![0]}: ${REPOST}, and delete this one or start it with ` +
-        `\`not a lens:\`; it looks like one: ${problem}`,
+      `${NO_MARKER}, but it holds an open ${found[0]![0]}: ${REPOST}, and ${HELD_WAY_OUT}; it looks like one: ` +
+        problem,
       "held",
     ];
   }

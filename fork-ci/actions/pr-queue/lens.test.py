@@ -271,12 +271,19 @@ class Marker(unittest.TestCase):
     READ = f'lens: correctness · reviewer: x · read at: {SHA_B}\nstate: fine\nblocker: none\nmajor: none'
     NEAR = ('## Lens A\nblocker: none\nmajor: none', '## Lens correctness\nsafe to merge: yes', 'lgtm, safe to merge',
             'covered: a.py\nchecks: ran the tests', 'The merge-path lens: nothing found',
-            '## Lens A, round 2\nblocker: none\nmajor: none\nminor: a typo')
+            '## Lens A, round 2\nblocker: none\nmajor: none\nminor: a typo',
+            '## Lens A, round 2\n\ncovered: x\nchecks: y\n\nThe old code was not safe to run twice.',   # no "to merge"
+            '## Lens A, round 2\n\ncovered: x\n\n```\nNot safe to merge: an example\n```')                # in a fence
     HELD = ('## Lens correctness, round 2\nblocker: a re-run loses data\nmajor: none',
             '**Lens correctness** (round 2)\nverdict: not safe to merge',
             'NOT SAFE to merge (code lens, round 2)\nmore below',
             'Code lens, round 2\nsafe to merge: no\nmajor: the retry drops a row', '## Lens A\nmajor: x is cut',
-            'covered: a.py\nchecks: ran them\nfinding: blocker a.py:3 loses data')
+            'covered: a.py\nchecks: ran them\nfinding: blocker a.py:3 loses data',
+            # round 2: NOT SAFE on the line under the heading (the title line), or in a sentence further down
+            '## Lens correctness, round 2\n\n**NOT SAFE to merge**\n\ncovered: x\nchecks: y',
+            '## Merge-path review\n\nNOT SAFE TO MERGE\n\ncovered: x\nchecks: y',
+            '## Lens merge-path, round 2\n\nNot safe to merge: the gate passes an unread head.',
+            '## Lens correctness, round 2\n\ncovered: x\nchecks: y\n\nNot safe to merge: the gate passes an unread head.')
     BROKEN = (f'Here is my review.\n{READ}',                                   # the header not on the first line
               f'{READ}\nlens: state · reviewer: x · read at: {SHA_B}',         # two lenses in one comment
               'lens: <name> · reviewer: x · read at: <sha>\nmajor: none',     # a placeholder name: names no lens
@@ -326,7 +333,7 @@ class Marker(unittest.TestCase):
                 looks, now = self.r.looks_problem(post(body)), self.r.lens_problem(post(body))
                 if lens.has_marker(body):
                     self.assertEqual(now, looks)
-                elif looks and review_judge.findings(body):   # an open finding without the marker blocks as before
+                elif looks and review_judge.findings(body, unmarked=True):   # an open finding without the marker blocks
                     self.assertTrue(now.startswith(lens.NO_MARKER) and now.endswith(f'; it looks like one: {looks}'))
                 else:
                     self.assertIsNone(now)
@@ -354,6 +361,43 @@ class Marker(unittest.TestCase):
                     self.assertEqual(self.r.not_lens_reports(p), [])
                     self.assertEqual(self.r.lens_scan(p)[1], [('correctness', SHA_B)], 'no round of its own')
                 self.assertEqual(self.lines, [], 'a blocking entry is in the verdict, not only in the log')
+
+    def test_not_safe_under_the_heading_or_in_a_sentence_holds(self):   # issue #865 round 2: main blocked these
+        for body in self.HELD[-4:]:
+            with self.subTest(body=body):
+                self.assertEqual(review_judge.findings(body), [], 'read as a marked report, no finding: the old hole')
+                self.assertEqual(review_judge.findings(body, unmarked=True)[0][0], 'blocker')
+                self.assertEqual(self.r.report_problem(post(body))[1], lens.HELD)
+                p = pr(post(self.READ), post(body, url='https://github.test/c2', when='2026-01-02T00:00:00Z'))
+                self.assertEqual(self.r.reviewed_head(p)[:2], (True, None), 'an older clean read never wins')
+                self.assertEqual(self.r.reviewed_head(p), self.r.reviewed_head(p), 'run again: the same answer')
+        self.assertEqual(review_judge.findings(self.NEAR[-2], unmarked=True), [], 'not safe to run twice: no verdict')
+        self.assertEqual(review_judge.findings(self.NEAR[-1], unmarked=True), [], 'in a code block: an example')
+
+    def test_a_held_comment_edited_to_hold_no_open_finding_stops_holding(self):   # the same as deleting it
+        for body in (self.HELD[0], self.HELD[-1]):
+            with self.subTest(body=body):
+                edited = (body.replace('a re-run loses data', 'none') if 'blocker:' in body
+                          else body.replace('Not safe to merge', 'Safe to merge'))
+                p = pr(post(self.READ), post(edited, url='https://github.test/c2', when='2026-01-02T00:00:00Z',
+                                             includesCreatedEdit=True))
+                self.assertEqual(self.r.reviewed_head(p), (True, SHA_B, 'every lens read it'))
+                self.assertEqual([w for w, _ in self.r.not_lens_reports(p)], ['https://github.test/c2'])
+
+    def test_the_queue_posts_a_held_reason_readable_and_lens_free(self):   # round 2: it read "lens-  · reviewer:"
+        for text in (lens.REPOST_PLAIN, lens.HELD_WAY_OUT):
+            self.assertEqual(lens.no_lens_text(text, keep_markdown=True), text)
+        for body in (self.HELD[0], self.HELD[-1]):
+            with self.subTest(body=body):
+                why = self.r.lens_problem(post(body))
+                self.assertIn(lens.REPOST, why)
+                out = lens.no_lens_text(' '.join(why.split()))
+                self.assertIn(lens.REPOST_PLAIN, out)
+                self.assertNotIn('lens-  ·', out)
+                self.assertIn(lens.HELD_WAY_OUT.replace('`', ''), out, 'the way out stays readable')
+                self.assertNotIn('not a lens-', out)
+                self.assertTrue(lens._lens_free(out), out)
+                self.assertIsNone(self.r.looks_problem(post(out)), 'the queue comment never looks like a report')
 
     def test_an_unmarked_report_with_an_open_finding_posted_twice_holds_twice(self):
         p = pr(post(self.READ), post(self.HELD[0], url='https://github.test/c2', when='2026-01-02T00:00:00Z'),

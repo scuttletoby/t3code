@@ -87,6 +87,15 @@ HELD = 'no lens marker, open finding'
 # How a lens fixes a report without the marker, for the reasons (the queue posts them through no_lens_text).
 REPOST = ('post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the '
           'marker into an old comment does not count)')
+# REPOST as the queue posts it (no_lens_text): the header described, not written, so the queue's comment never looks
+# like a lens report, and nothing in it is garbled by the cleaning.
+REPOST_PLAIN = ('post a NEW comment whose first line is the lens header as the format doc writes it (`lens`, a colon, '
+                'the lens name, the reviewer and the full sha it read); editing the marker into an old comment does '
+                'not count')
+# The one way out of a comment without the marker that holds an open finding (kind HELD), in its reason and in the head
+# check's: it holds until then (or until it is edited so it holds no open finding, which is the same as deleting it).
+# Lens-free as written (no `lens:`): the queue posts it.
+HELD_WAY_OUT = 'delete the old one or edit it to start with `not a lens` and a colon'
 OK_CONCLUSIONS = ('SUCCESS', 'SKIPPED', 'NEUTRAL')
 STRANGER_SCAN = 4096   # characters of a post that does not count read to decide whether to log it
 
@@ -299,16 +308,24 @@ def no_lens_text(text, keep_markdown=False):
     the queue quotes into a comment (gh errors): no `read at`, no lens field (`lens:`, `lens=`, `lens —`, `lens –`),
     no `safe to merge`. keep_markdown: the
     queue's own advice (a command in backticks, a `<sha>` placeholder) stays as written when, read without its markdown
-    either way (clean_inline narrow or not), it holds none of these; otherwise it is cleaned like any other text."""
+    either way (clean_inline narrow or not), it holds none of these; otherwise it is cleaned like any other text. A
+    REPOST in the text (a held reason) is posted as REPOST_PLAIN, as written, when the whole stays free of them."""
+    if REPOST in text:
+        out = REPOST_PLAIN.join(no_lens_text(part, keep_markdown) for part in text.split(REPOST))
+        if _lens_free(out):
+            return out
+    if keep_markdown and _lens_free(text):   # the reader cleans the text as written once, either way
+        return text
     plain = clean_inline(text)
-    if keep_markdown and _no_lens_forms(plain) == plain:   # the reader cleans the text as written once, either way
-        narrow = clean_inline(text, narrow=True)
-        if _no_lens_forms(narrow) == narrow:
-            return text
     # Cleaned text is cleaned AGAIN by the reader, and nested markup (`lens<<a>b>=`, `lens[[](z)](w)=`) left by one
     # pass would turn into a field on the second (issue #303). So the `<` `>` `[` `]` one pass left become blanks: with
     # none of them, another pass (either way) changes nothing.
     return _no_lens_forms(re.sub(r'[<>\[\]]', ' ', plain))
+
+
+def _lens_free(text):
+    """No lens form no_lens_text names in the text read without its markdown either way (clean_inline narrow or not)."""
+    return all(_no_lens_forms(clean_inline(text, narrow)) == clean_inline(text, narrow) for narrow in (False, True))
 
 
 def _no_lens_forms(text):
@@ -399,10 +416,10 @@ class Review:
         if has_marker(body):
             return problem, BROKEN
         import review_judge   # noqa: PLC0415 - review_judge imports this module
-        found = review_judge.findings(body)
+        found = review_judge.findings(body, unmarked=True)   # no header: the title line and NOT SAFE prose count
         if found:
-            return (f'{NO_MARKER}, but it holds an open {found[0][0]}: {REPOST}, and delete this one or start it with '
-                    f'`not a lens:`; it looks like one: {problem}'), HELD
+            return (f'{NO_MARKER}, but it holds an open {found[0][0]}: {REPOST}, and {HELD_WAY_OUT}; it looks like one: '
+                    f'{problem}'), HELD
         return f'{NO_MARKER}; it looks like one: {problem}', NOT_LENS
 
     def lens_problem(self, post):

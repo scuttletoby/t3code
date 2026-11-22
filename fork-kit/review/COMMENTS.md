@@ -4,9 +4,11 @@ A lens posts its report as one pull request comment. The merge gate (`fork-ci/ac
 with fixed rules. A comment that carries the lens marker (below) is a lens report, and the gate fails closed on it: one
 that is not exactly one valid read blocks the head. A comment without the marker that looks like a report is no lens
 report and never reads. It blocks only when it holds an open finding (a `blocker:` or `major:` line that is not
-`none`, or NOT SAFE): then it is most likely a real report with a broken header, so it holds the head whatever an older
-or newer read of that lens says, until it is deleted or starts with `not a lens:`. One with no open finding never
-blocks, and the gate's summary names it `not a lens report` with the reason.
+`none`, NOT SAFE on its first two lines or a `verdict:` line, or `not safe to merge` on any line outside a fenced code
+block): then it is most likely a real report with a broken header, so it holds the head whatever an older or newer
+read of that lens says, until it is deleted, starts with `not a lens:`, or is edited so it holds no open finding (the
+same people could delete it). One with no open finding never blocks, and the gate's summary names it
+`not a lens report` with the reason.
 This page shows the format with examples. The rules themselves are the gate's code and its README (sections
 [Lens comments](../../fork-ci/actions/pr-queue/README.md#lens-comments) and
 [Review rules](../../fork-ci/actions/pr-queue/README.md#review-rules)); the gate's test vectors
@@ -321,6 +323,20 @@ The gate reads: `reads nothing, no lens marker`
 ## Lens A
 blocker: a second run loses the saved rows
 major: none
+```
+
+Without the marker the line under the heading is read as a title line, and `not safe to merge` anywhere outside a
+fenced code block is NOT SAFE, so this blocks too.
+
+The gate reads: `reads nothing, no lens marker`
+
+```text
+## Lens A, round 2
+
+**NOT SAFE to merge**
+
+covered: the retry path
+checks: ran the tests
 ```
 
 A note between rounds (for example from the orchestrator, after it checked a fix diff) opts out with `not a lens:`

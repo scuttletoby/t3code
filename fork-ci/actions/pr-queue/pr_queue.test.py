@@ -619,6 +619,19 @@ class Update(Base):
         self.assertIn('checks', why)
         self.assertTrue(needs.startswith('Needs a lens read'), needs)
 
+    def test_a_held_reason_is_posted_readable(self):   # issue #865 round 2: it read "first line is lens-  · reviewer:"
+        f = self.fake()
+        self.q.gh = self.q.gh_write = f
+        r = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',))
+        held = r.lens_problem({'body': '## Lens code, round 2\nblocker: a re-run loses data', 'author': {'login': 'x'}})
+        self.assertIn(lens.REPOST, held)
+        self.assertEqual(run_quiet(self.q.leave_off, 7, f'{lens.NO_HEADER} (url, {held})')[0], 0)
+        why = f.comments[0].split('\n')[0]
+        self.assertIn(lens.REPOST_PLAIN, why)
+        self.assertIn(lens.HELD_WAY_OUT.replace('`', ''), why)
+        self.assertNotIn('lens-  ·', why)
+        self.assertIsNone(r.looks_problem({'body': f.comments[0]}), 'the queue comment never looks like a report')
+
     def test_a_failed_comment_keeps_the_state(self):   # still OFF and silent: the run fails, the next run says it
         f = self.fake('resolved', fail=('comment',))
         self.assertEqual(self.update(f)[0], Q.SILENT)

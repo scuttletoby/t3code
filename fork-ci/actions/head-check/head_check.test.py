@@ -435,6 +435,35 @@ class Rules(unittest.TestCase):
                 self.assertTrue(why.startswith(H.marker_hint(1)), why)
                 self.assertNotIn('required-lenses', why)
 
+    def test_not_safe_under_the_heading_or_in_a_sentence_still_fails(self):   # issue #865 round 2: main blocked these
+        for body in (f'## {LENS.title()} merge-path, round 2\n\nNot safe to merge: the gate passes an unread head.',
+                     '## Merge-path review\n\nNOT SAFE TO MERGE\n\ncovered: x\nchecks: y',
+                     f'## {LENS.title()} correctness, round 2\n\n**NOT SAFE to merge**\n\ncovered: x\nchecks: y',
+                     f'## {LENS.title()} correctness, round 2\n\ncovered: x\nchecks: y\n\nNot safe to merge: no.'):
+            for required in ('correctness', ''):
+                with self.subTest(body=body, required=required):
+                    comments = [self.p.lens('correctness', A), self.p.post(body)]
+                    ok, why, rows = self.verdict(comments, required=required)
+                    self.assertFalse(ok, 'a clean read of the head never lets it through')
+                    self.assertNotIn(lens.NOT_LENS, ' '.join(name for name, _, _ in rows))
+                    self.assertEqual(self.verdict(comments, required=required), (ok, why, rows), 'run again')
+        prose = (f'## {LENS.title()} correctness, round 2\n\ncovered: x\nchecks: y\n\n'
+                 'The old code was not safe to run twice.')
+        ok, why, rows = self.verdict([self.p.lens('correctness', A), self.p.post(prose)], required='correctness')
+        self.assertTrue(ok, why)
+        self.assertEqual([good for _, good, _ in rows], [True, H.WARN])
+
+    def test_a_held_reason_says_the_fix_and_the_way_out_once(self):   # round 2: "post a NEW comment" was there twice
+        body = f'## {LENS.title()} correctness, round 2\nblocker: a re-run loses data\nmajor: none'
+        for required in ('correctness', 'correctness\nsecurity', ''):
+            with self.subTest(required=required):
+                ok, why, rows = self.verdict([self.p.lens('correctness', A), self.p.post(body)], required=required)
+                self.assertFalse(ok)
+                self.assertTrue(why.startswith(H.marker_hint(1, ['held'])), why)
+                self.assertEqual((why.count('post a NEW comment'), why.count(lens.HELD_WAY_OUT)), (1, 1), why)
+                self.assertNotIn(lens.NO_MARKER, why, 'a held comment is named by where it is; its row says why')
+                self.assertEqual(sum(lens.NO_MARKER in name for name, _, _ in rows), 1, rows)
+
     def test_a_deleted_comment_counts_no_more(self):   # deleted: GitHub no longer lists it
         look_alike = self.p.post(f'read at: {A[:7]}')
         good = self.p.lens('correctness', A)

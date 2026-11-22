@@ -214,11 +214,12 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False, rules_name_l
     reads = review.lens_reads(pr)
     reviewed, read, why = review.reviewed_head(pr)
     missing = [name for key, name in required.items() if key not in reads]
-    found = ', '.join(sorted(reads)) or 'none'
     # comments that look like a lens report but carry no lens marker and hold no open finding: no report, so they pass;
     # named in a WARN row, never silent. Those that hold an open finding block: NO_HEADER entries of reads (held).
     notes = [(f'{lens.NOT_LENS} ({where})', WARN, why) for where, why in review.not_lens_reports(pr)]
     held = review.unmarked_held(pr)
+    why = short_held(why, held)   # the reason names a held comment by where it is: the fix is said once, first
+    found = short_held(', '.join(sorted(reads)), held) or 'none'
     if not reads and not required:
         return True, 'no lens comments and no required lens: nothing to compare', notes
     ok, how = same_change(checkout, head, read) if reviewed and read else (False, None)
@@ -235,20 +236,28 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False, rules_name_l
     rows += notes
     if missing:
         if notes or held:   # the fix first: a look-alike is most likely the report, so no config hint
-            return False, (f'{marker_hint(len(notes) + len(held))}. Required lens without a read: '
+            return False, (f'{marker_hint(len(notes) + len(held), held)}. Required lens without a read: '
                            f'{", ".join(missing)}; lenses found: {found}'), rows
         where = ' or the review rules of the config' if rules_name_lenses else ''
         return False, (f'required lens without a read: {", ".join(missing)}. No counted lens comment has that name: '
                        f'check it in required-lenses (one name per line){where}; lenses found: {found}'), rows
     if not read:
-        return False, (f'{marker_hint(len(held))}; each that holds an open finding blocks until it is deleted or '
-                       f'starts with `not a lens:`. {why}' if held else why), rows
+        return False, (f'{marker_hint(len(held), held)}. {why}' if held else why), rows
     return ok, how, rows
 
 
-def marker_hint(count):
-    """The fix for comments that look like a lens report but carry no lens marker, first in a failure reason."""
-    return f'{count} comment(s) look like a lens report but carry no lens marker: {lens.REPOST}'
+def marker_hint(count, held=()):
+    """The fix for comments that look like a lens report but carry no lens marker, first in a failure reason; with
+    held ones (unmarked_held), the way out of those too (lens.HELD_WAY_OUT, the one wording)."""
+    out = f'{count} comment(s) look like a lens report but carry no lens marker: {lens.REPOST}'
+    return f'{out}, and {lens.HELD_WAY_OUT} (one that holds an open finding blocks until then)' if held else out
+
+
+def short_held(text, held):
+    """text with each held comment's long reason (its NO_HEADER key) cut to where it is: its row says the rest."""
+    for where, why in held:
+        text = text.replace(f'{where}, {why}', where)
+    return text
 
 
 def escape(text):

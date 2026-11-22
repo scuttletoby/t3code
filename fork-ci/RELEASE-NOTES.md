@@ -21,11 +21,14 @@ it (Markdown stripped, in code blocks and quotes too). A lens report that is not
 before. A comment that only looks like one without the marker (a `## Lens A` heading, `safe to merge`, `covered:` and
 `checks:` lines) and holds no open finding no longer blocks: the run log and the head check's summary name it as
 `not a lens report` (a `WARN` row) with the reason. One without the marker that holds an open finding (a `blocker:` or
-`major:` line that is not `none`, or NOT SAFE, as the findings rules read them) still blocks, as before, whatever an
-older or newer read of that lens says: it is most likely a real report with a broken header. Its reason, first in the
-head check's, says to post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>`
-(editing the marker in does not count) and to delete the old one or start it with `not a lens:`. Comments with the
-marker read exactly as before. T3's copy (`apps/server/src/fork/reviewRules`) and the review
+`major:` line that is not `none`, NOT SAFE on its first two lines or a `verdict:` line, or `not safe to merge` on any
+line outside a fenced code block) still blocks, as before, whatever an older or newer read of that lens says: it is
+most likely a real report with a broken header. Its reason, first in the head check's, says to post a NEW comment
+whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker in does not count) and to
+delete the old one or edit it to start with `not a lens` and a colon; it also stops holding once edited so it holds
+no open finding (the same people could delete it). The queue posts that reason with the header described in words,
+so its comment never looks like a lens report. The head check's check run on the pull request shows the
+`not a lens report` row as `warn` too. Comments with the marker read exactly as before. T3's copy (`apps/server/src/fork/reviewRules`) and the review
 kit's `check` read the same rule from the shared vectors.
 
 **Upgrade:** a lens report written without the marker now counts for nothing, so a lens that posts one has not
