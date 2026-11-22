@@ -66,9 +66,13 @@ export const runFactsCommand = Effect.fn("FactsCommand.run")(function* (factsCom
     })
     .pipe(Effect.result);
   if (result._tag === "Failure") {
-    return notAvailable(`factsCommand could not run (${result.failure._tag})`);
+    const failure = result.failure;
+    // A program a signal ends (the OOM killer, a kill) has no exit code to read.
+    return failure._tag === "ProcessReadError" && failure.stream === "exitCode"
+      ? notAvailable("factsCommand was stopped by a signal")
+      : notAvailable(`factsCommand could not run (${failure._tag})`);
   }
-  const { code, stdout, stderr, timedOut } = result.success;
+  const { code, stdout, stderr, stdoutTruncated, timedOut } = result.success;
   if (timedOut) {
     return notAvailable(
       `factsCommand did not answer within ${Duration.toSeconds(FACTS_COMMAND_TIMEOUT)} seconds`,
@@ -80,7 +84,10 @@ export const runFactsCommand = Effect.fn("FactsCommand.run")(function* (factsCom
       `factsCommand exited with ${code === null ? "no code" : `code ${code}`}${said === undefined ? "" : `: ${said}`}`,
     );
   }
-  const labels = canonicalPlacementLabels(stdout.split(/\r?\n/u)).filter(isLabel);
+  const lines = stdout.split(/\r?\n/u);
+  // Output cut at the limit: its last line may be part of a label ("gpu" of "gpu-large").
+  if (stdoutTruncated) lines.pop();
+  const labels = canonicalPlacementLabels(lines).filter(isLabel);
   return {
     available: true,
     labels: labels.slice(0, FACTS_COMMAND_LABELS_MAX),

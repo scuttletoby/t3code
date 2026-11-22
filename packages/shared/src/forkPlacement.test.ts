@@ -760,7 +760,7 @@ describe("the state question (design section 7, rows with no I/O)", () => {
           order: ["here"],
         });
         expect(lone.kind === "picked" && lone.why).toBe(
-          "here passes every hard rule; its CPU and memory were not sampled, so it is picked only because no machine ranks.",
+          "here passes every hard rule; its CPU use was not measured, so it is picked only because no machine ranks.",
         );
         // Runs again: the same answer.
         expect(place([here({ facts: f })], { mode })).toEqual(lone);
@@ -772,7 +772,26 @@ describe("the state question (design section 7, rows with no I/O)", () => {
       // Its hard rules still apply: a full gate, or needs it lacks, refuse it.
       expect(place([here({ facts: noHost({ slotsFree: 0 }) })]).kind).toBe("none");
       expect(place([here({ facts: f })], { task: task({ needs: ["gpu"] }) }).kind).toBe("none");
+      // Upstream's own limits still hold: manual (only when named) or an unknown weight word.
+      for (const weight of ["manual", "most" as never] as const) {
+        const result = place([here({ facts: f, weight })]);
+        expect(result.kind).toBe("none");
+        expect(result.kind === "none" ? result.verdicts[0]?.unranked : null).toBe(
+          weight === "manual"
+            ? "Set to manual: used only when named."
+            : 'Its weight word "most" is not one of prefer, normal, less or manual.',
+        );
+      }
     }
+    // With memory sampled but CPU not: 5 % free or less is left out, as upstream's score does.
+    const nearlyFull = withHost({
+      cpuUtilization: null,
+      availableMemoryBytes: 0.02 * host.totalMemoryBytes,
+    });
+    expect(place([here({ facts: nearlyFull })])).toMatchObject({
+      kind: "none",
+      verdicts: [{ unranked: "Upstream's score leaves it out (free memory 5 % or less)." }],
+    });
   });
 
   it("a broken needs value fits no machine: named, here, or without facts", () => {

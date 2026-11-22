@@ -1303,8 +1303,10 @@ When the slot gate cannot be read (its count read fails or takes longer than its
 gate is not running, or the settings cannot be read), `placement` says `available: false` with a
 reason and gives no count, so an agent never sees a guessed "slots free". A linked machine on an
 older T3 leaves both fields out, which means "no facts", never a failed read. The host sample has its
-own limit (2 seconds), and it and the slot count are read at the same time, so a slow sampler leaves
-out `hostResources` without delaying `placement`. Facts are never stored: each read measures again.
+own limit (2 seconds), and it and the slot count are read at the same time. With agent slots off, a
+slow sampler leaves out `hostResources` without delaying `placement`. With them on, the gate's own
+count reads the same sample for its memory floor, so a hung sampler also gives `placement` "not
+available" (the gate could not count) after 6 seconds, the same answer the gate gives at launch. Facts are never stored: each read measures again.
 The gate's status read does its own clean-up first (it drops used-up slot holds of waits, the same
 step `wait_list` runs); the facts read gives that status read at most 6 seconds (the gate's own
 count limit plus one), so a read can take that long on a busy machine, and it changes nothing but
@@ -1318,8 +1320,10 @@ When placement reads a linked machine's answer (`factsFromAnswer` in the same fi
 with these schemas: neither field is "no facts", as above; an answer they refuse is "facts not
 valid", and the machine is refused, even when it is named. This machine with no CPU and memory
 sample (no sampler, or one that cannot measure CPU) is still a place for work when every other
-rule passes, ranked last, because its own slot gate checks again at launch; a linked machine
-without them is not.
+rule passes, ranked last; a linked machine without them is not. Its weight still counts (`manual`
+or an unknown word keeps it out), and so does upstream's 5 % free-memory limit when memory was
+measured. With agent slots on, its gate checks again at launch; with them off, nothing checks,
+as in upstream's own launch on this machine.
 
 ## Install the fork today
 

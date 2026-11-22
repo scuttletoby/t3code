@@ -85,6 +85,17 @@ describe("factsCommand: checked again on the host that runs it", () => {
     }),
   );
 
+  it.effect("output cut at its limit: the last, maybe partial, line is not a label", () =>
+    Effect.gen(function* () {
+      const cut = recording({ stdout: "ci-runner\ngpu-large\ngpu", stdoutTruncated: true });
+      expect(yield* runFactsCommand("/x/facts").pipe(on("linux", cut.layer))).toEqual({
+        available: true,
+        labels: ["ci-runner", "gpu-large"],
+      });
+      expect(cut.asked[0]?.maxOutputBytes).toBe(16 * 1024);
+    }),
+  );
+
   it.effect("empty: none asked, available with no labels", () =>
     Effect.gen(function* () {
       const { asked, layer } = recording();
@@ -126,6 +137,21 @@ describe("factsCommand: checked again on the host that runs it", () => {
         available: false,
         reason: "factsCommand could not run (ProcessSpawnError)",
       });
+      const killed = Layer.mock(ProcessRunner.ProcessRunner)({
+        run: (input) =>
+          Effect.fail(
+            new ProcessRunner.ProcessReadError({
+              command: input.command,
+              argumentCount: 0,
+              stream: "exitCode",
+              cause: new Error("SIGKILL"),
+            } as never),
+          ),
+      });
+      expect(yield* runFactsCommand("/x/facts").pipe(on("linux", killed))).toEqual({
+        available: false,
+        reason: "factsCommand was stopped by a signal",
+      });
     }),
   );
 });
@@ -143,26 +169,38 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
       return path;
     };
 
-    it.live("a path with a space and shell signs runs as one path; its lines are labels", () =>
-      Effect.gen(function* () {
-        const dir = scratch();
-        const marker = NodePath.join(dir, "MARK");
-        // A shell would split this path at the space and run `touch MARK` after the `;`.
-        const path = script(
-          dir,
-          `with space;touch ${marker}`,
-          ['echo " GPU "', 'echo "two words"', "echo gpu", "echo Cuda", "exit 0"].join("\n"),
-        );
-        const result = yield* runFactsCommand(path).pipe(Effect.provide(layer));
-        expect(result).toEqual({ available: true, labels: ["gpu", "cuda"] });
-        expect(NodeFS.existsSync(marker)).toBe(false);
-        // Runs again: the same answer, nothing left behind.
-        expect(yield* runFactsCommand(path).pipe(Effect.provide(layer))).toEqual(result);
-        NodeFS.rmSync(dir, { recursive: true, force: true });
-      }),
+    it.live(
+      "a path with a space and shell signs runs as one path, no arguments; lines are labels",
+      () =>
+        Effect.gen(function* () {
+          const dir = scratch();
+          // A shell would split this path at the space and the `;`, so the program would not start.
+          // `args-0` shows it got no arguments; `$0` is the whole path, space and `;` included.
+          const path = script(
+            dir,
+            "with space;echo hacked",
+            [
+              'echo " GPU "',
+              'echo "two words"',
+              "echo gpu",
+              "echo Cuda",
+              'echo "args-$#"',
+              `[ "$0" = "${NodePath.join(dir, "with space;echo hacked", "facts")}" ] && echo whole-path`,
+              "exit 0",
+            ].join("\n"),
+          );
+          const result = yield* runFactsCommand(path).pipe(Effect.provide(layer));
+          expect(result).toEqual({
+            available: true,
+            labels: ["gpu", "cuda", "args-0", "whole-path"],
+          });
+          // Runs again: the same answer.
+          expect(yield* runFactsCommand(path).pipe(Effect.provide(layer))).toEqual(result);
+          NodeFS.rmSync(dir, { recursive: true, force: true });
+        }),
     );
 
-    it.live("a non-zero exit or a missing program is not available", () =>
+    it.live("a non-zero exit, a missing program or a signal is not available", () =>
       Effect.gen(function* () {
         const dir = scratch();
         const busy = script(dir, "busy", "echo gpu\necho 'all slots used' >&2\nexit 2");
@@ -177,6 +215,11 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
         expect(missing.available === false && missing.reason).toContain(
           "factsCommand could not run",
         );
+        const killed = script(dir, "killed", "echo gpu\nkill -9 $$");
+        expect(yield* runFactsCommand(killed).pipe(Effect.provide(layer))).toEqual({
+          available: false,
+          reason: "factsCommand was stopped by a signal",
+        });
         NodeFS.rmSync(dir, { recursive: true, force: true });
       }),
     );

@@ -10,8 +10,11 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -45,7 +48,7 @@ const snapshotOf = (running: number): OrchestrationV2ThreadShellSnapshot => ({
 });
 
 const readOver = (
-  world: { readonly running: number; readonly freeMb: number },
+  world: { readonly running: number; readonly freeMb: number; readonly hostHangs?: boolean },
   agentSlots: Record<string, unknown>,
 ) =>
   EnvironmentFacts.read.pipe(
@@ -58,7 +61,7 @@ const readOver = (
               read: Effect.succeed(snapshotOf(world.running)),
             }),
             Layer.mock(HostResources.HostResources)({
-              read: Effect.succeed(sample(world.freeMb)),
+              read: world.hostHangs ? Effect.never : Effect.succeed(sample(world.freeMb)),
             }),
           ),
         ),
@@ -114,6 +117,27 @@ it.effect("the real gate with slots off: available, no counts", () =>
       available: true,
       reason: EnvironmentFacts.REASON_SLOTS_OFF,
       factsAt: 0,
+    });
+  }),
+);
+
+it.effect("a hung sampler with slots on: no host facts, and the gate's count is not given", () =>
+  Effect.gen(function* () {
+    // The gate reads the same sample for its memory floor, so it waits too: placement says it
+    // could not count (not available), never a guessed count. Placement then refuses this machine,
+    // as the gate would at launch. With slots off the fallback applies (the engine's tests).
+    const slots = { enabled: true, maxPerMachine: 3, minFreeMemoryMb: 1000 };
+    const fiber = yield* readOver({ running: 0, freeMb: 4000, hostHangs: true }, slots).pipe(
+      Effect.forkChild,
+    );
+    yield* TestClock.adjust(Duration.sum(SlotGate.COUNT_READ_TIMEOUT, Duration.seconds(1)));
+    const { placement, hostResources } = yield* Fiber.join(fiber);
+    expect(hostResources).toBeUndefined();
+    expect(placement).toEqual({
+      labels: [],
+      available: false,
+      reason: EnvironmentFacts.REASON_GATE_UNREAD,
+      factsAt: expect.any(Number),
     });
   }),
 );

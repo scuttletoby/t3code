@@ -206,10 +206,9 @@ type Check = (machine: PlacementMachine, task: PlacementTask, now: number) => st
 const labelsOf = (machine: PlacementMachine) => machine.facts?.placement?.labels;
 
 /**
- * This machine, whose own CPU and memory could not be sampled (no sampler, a failed read, or CPU
- * not measured yet). Its slot gate checks its own capacity again at launch, so a sampler failure
- * does not stop all delegation: it passes H2 and H8 without them and is tried after every ranked
- * machine. A linked machine without them is still refused.
+ * This machine without a CPU sample (no sampler, a failed read, CPU not measured yet). A sampler
+ * failure here does not stop all delegation: it passes H2 and H8 without one and is tried after
+ * every ranked machine (`fitsAsFallback`). A linked machine without one is still refused.
  */
 const isHereWithoutHostFacts = (machine: PlacementMachine) =>
   machine.here &&
@@ -354,7 +353,8 @@ const H8: Check = (machine) => {
       return `Free memory ${Math.floor(freeMb)} MB is below the machine's floor of ${floor} MB.`;
     }
   }
-  // Here without a sample: its own slot gate checks again at launch (`isHereWithoutHostFacts`).
+  // Here without a sample: with slots on, its gate checks again at launch; with them off, nothing
+  // does, as in upstream's own here-first launch (`isHereWithoutHostFacts`).
   // `host` is always set past this line (checked above); the second test only narrows its type.
   if (hereWithoutHost || host === undefined) return null;
   const cpu = host.cpuUtilization;
@@ -437,15 +437,25 @@ const rankWithUpstream = (machines: ReadonlyArray<PlacementMachine>, now: number
 };
 
 /** Why upstream's score left out a machine that passed every hard rule. */
+/** Upstream's memory limit: 5 % free or less is left out. Unknown (no sample) is not low. */
+const isLowOnMemory = (machine: PlacementMachine) => {
+  const host = machine.facts?.hostResources;
+  return host !== undefined && host.availableMemoryBytes / host.totalMemoryBytes <= 0.05;
+};
+
+const isUsableWeight = (machine: PlacementMachine) =>
+  machine.weight === undefined || (isWeightWord(machine.weight) && machine.weight !== "manual");
+
+/** The fallback keeps every limit upstream's score could check: weight and, if sampled, memory. */
+const fitsAsFallback = (machine: PlacementMachine) =>
+  isHereWithoutHostFacts(machine) && isUsableWeight(machine) && !isLowOnMemory(machine);
+
 const unrankedReason = (machine: PlacementMachine) => {
   if (machine.weight === "manual") return "Set to manual: used only when named.";
   if (machine.weight !== undefined && !isWeightWord(machine.weight)) {
     return `Its weight word "${String(machine.weight)}" is not one of prefer, normal, less or manual.`;
   }
-  const host = machine.facts?.hostResources;
-  if (host !== undefined && host.availableMemoryBytes / host.totalMemoryBytes <= 0.05) {
-    return "Upstream's score leaves it out (free memory 5 % or less).";
-  }
+  if (isLowOnMemory(machine)) return "Upstream's score leaves it out (free memory 5 % or less).";
   return "Upstream's score leaves it out.";
 };
 
@@ -510,9 +520,9 @@ export const choosePlacement = (input: PlacementInput): PlacementResult => {
   const failuresOf = machines.map((machine) => checkHardRules(machine, task, now));
   const fitting = machines.filter((_, index) => failuresOf[index]?.length === 0);
   const ranked = rankWithUpstream(fitting, now);
-  // Here without a host sample (a sampler failure) is the fallback after every ranked machine.
+  // Here without a CPU sample (a sampler failure) is the fallback after every ranked machine.
   const fallback = fitting.filter(
-    (machine) => isHereWithoutHostFacts(machine) && !ranked.includes(machine.environmentId),
+    (machine) => fitsAsFallback(machine) && !ranked.includes(machine.environmentId),
   );
   const order = [...ranked, ...fallback.map((machine) => machine.environmentId)];
   const verdicts: MachineVerdict[] = machines.map((machine, index) => {
@@ -550,7 +560,7 @@ export const choosePlacement = (input: PlacementInput): PlacementResult => {
     why:
       ranked.length > 0
         ? `${best} passes every hard rule and ranks first of ${order.length} by upstream's score.`
-        : `${best} passes every hard rule; its CPU and memory were not sampled, so it is picked only because no machine ranks.`,
+        : `${best} passes every hard rule; its CPU use was not measured, so it is picked only because no machine ranks.`,
     verdicts,
   };
 };
