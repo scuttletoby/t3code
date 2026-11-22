@@ -140,6 +140,38 @@ function interpreterTarget(
   return { kind: "none" };
 }
 
+/** env's long options that take a value; `getopt` also takes any unique start of their names. */
+const ENV_LONG_WITH_VALUE = ["unset", "argv0"];
+/** env's options this check cannot follow: -S splits a string into a command, -C changes folder. */
+const ENV_LONG_UNFOLLOWABLE = ["split-string", "chdir"];
+/** env's short options that take a value (GNU -u -S -C, newer GNU -a; BSD -P -L), attached or next. */
+const ENV_SHORT_WITH_VALUE = new Set(["u", "a", "S", "C", "P", "L"]);
+const ENV_SHORT_UNFOLLOWABLE = new Set(["S", "C"]);
+
+/**
+ * What one word before env's program is: an option of env's (one whose value is the next word,
+ * or one this check cannot follow) or `undefined` (a NAME=value pair or the program). Short options
+ * may be grouped and take their value attached (`-iS'cmd'`), long ones may be shortened
+ * (`--split=cmd`), as GNU env reads them.
+ */
+const envOption = (arg: string): "flag" | "valueNext" | "unfollowable" | undefined => {
+  if (arg === "--") return "flag";
+  if (arg.startsWith("--")) {
+    const [name = "", value] = arg.slice(2).split(/=(.*)/su);
+    const isStartOf = (full: string) => full.startsWith(name);
+    if (ENV_LONG_UNFOLLOWABLE.some(isStartOf)) return "unfollowable";
+    return ENV_LONG_WITH_VALUE.some(isStartOf) && value === undefined ? "valueNext" : "flag";
+  }
+  if (!arg.startsWith("-") || arg === "-") return arg === "-" ? "flag" : undefined;
+  for (let at = 1; at < arg.length; at += 1) {
+    const letter = arg[at]!;
+    if (ENV_SHORT_UNFOLLOWABLE.has(letter)) return "unfollowable";
+    // The rest of the word is this option's value, or, when nothing is left, the next word is.
+    if (ENV_SHORT_WITH_VALUE.has(letter)) return at === arg.length - 1 ? "valueNext" : "flag";
+  }
+  return "flag";
+};
+
 /** Why one command cannot be saved, or `undefined`. */
 const commandProblem = Effect.fn("HandoffCommandSaveCheck.commandProblem")(function* (
   { where, argv }: PlacedCommand,
@@ -164,16 +196,12 @@ const commandProblem = Effect.fn("HandoffCommandSaveCheck.commandProblem")(funct
     let index = 0;
     while (index < args.length) {
       const arg = args[index]!;
-      if (
-        arg === "-S" ||
-        arg.startsWith("--split-string") ||
-        arg === "-C" ||
-        arg.startsWith("--chdir")
-      ) {
+      const option = envOption(arg);
+      if (option === "unfollowable") {
         return `${where} gives env "${arg}", which this check cannot follow: run the program by its full path, without env.`;
       }
-      if (arg === "-u" || arg === "--unset") index += 2;
-      else if (arg.startsWith("-") || /^[^=]+=/u.test(arg)) index += 1;
+      if (option === "valueNext") index += 2;
+      else if (option === "flag" || /^[^=]+=/u.test(arg)) index += 1;
       else break;
     }
     const rest = args.slice(index);

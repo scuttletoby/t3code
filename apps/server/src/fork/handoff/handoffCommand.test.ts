@@ -45,6 +45,15 @@ const projectAt = (root: string | null) =>
       ),
   });
 
+/**
+ * The keys CI's test runner puts into every process it starts. `vp run test:cached` traces the
+ * files each test reads: it preloads a library into each child and adds these again on every
+ * exec, also after `env -i`, so a command run under it sees them although the server passed
+ * nothing. Ignored only while this test itself runs under that tracer; nowhere else.
+ */
+const TEST_TRACER_ENV_KEYS: ReadonlyArray<string> =
+  process.env.FSPY_PAYLOAD === undefined ? [] : ["LD_PRELOAD", "FSPY_PAYLOAD"];
+
 const services = ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer));
 
 /** Runs `command` in a fresh temporary project folder; the source times out at `timeoutSeconds`. */
@@ -96,6 +105,7 @@ describe("handoffCommand", () => {
         ...HANDOFF_COMMAND_ENV_KEYS,
         HANDOFF_THREAD_ENV,
         HANDOFF_PROJECT_ENV,
+        ...TEST_TRACER_ENV_KEYS,
       ]);
       assert.deepStrictEqual(
         Object.keys(printed).filter((key) => !allowed.has(key)),

@@ -171,8 +171,10 @@ The new session's first message has these parts:
      - for any program: an argument ending in a script ending (`.py`, `.sh`, …) by a relative
        path, or by a full path that is missing; a full-path argument that is a file inside a
        checkout;
-     - `env` running a program by name (found on the `PATH`), or with `-S` or `-C`; otherwise the
-       program after `env`'s options and settings is checked as above;
+     - `env` running a program by name (found on the `PATH`), or with `-S` or `-C` however they
+       are written (`-S'cmd'`, grouped as `-iS'cmd'`, `--split-string`, `--split=cmd`, `--chdir`);
+       otherwise the program after `env`'s options (`-u NAME` and `-a NAME` skip their value) and
+       settings is checked as above;
      - programs that run what a file in their working folder says: `make`, `just`, `rake`, `npm`,
        `npx`, `pnpm`, `yarn`, `cargo`, `go`, `gradle`, `mvn`, `ant`, `task`, `tox`, `nox`,
        `poetry`, `pipenv`, `uv`, `composer`.

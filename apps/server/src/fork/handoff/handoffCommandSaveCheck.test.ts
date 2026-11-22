@@ -199,6 +199,39 @@ describe("handoff command save check (#785)", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("refuses env's -S and -C however they are written, and follows env's -a (#785)", () =>
+    Effect.gen(function* () {
+      const at = yield* layout;
+      const env = at("outside/bin/env");
+      const refused: ReadonlyArray<readonly [ReadonlyArray<string>, string]> = [
+        // GNU env runs these: -S attached to its string, or grouped after other short options.
+        [[env, "-S/usr/bin/python3 -m notes"], 'gives env "-S/usr/bin/python3 -m notes"'],
+        [[env, "-iS/usr/bin/python3 -m notes"], 'gives env "-iS/usr/bin/python3 -m notes"'],
+        [[env, "-i", "-vS", "/usr/bin/python3 -m notes"], 'gives env "-vS"'],
+        [[env, "--split=/usr/bin/python3 -m notes"], 'gives env "--split=/usr/bin/python3'],
+        [[env, "--s", "/usr/bin/python3 -m notes"], 'gives env "--s"'],
+        [[env, "-C/tmp", at("outside/run")], 'gives env "-C/tmp"'],
+        [[env, "-iC", "/tmp", at("outside/run")], 'gives env "-iC"'],
+        [[env, "--ch=/tmp", at("outside/run")], 'gives env "--ch=/tmp"'],
+        // -a takes the next word as the program's name: the program is the word after it.
+        [[env, "-a", at("outside/run"), at("repo/scripts/handoff")], "inside the git checkout"],
+        [[env, "--argv0", "x", at("repo/scripts/handoff")], "inside the git checkout"],
+        [[env, "-ia", "x", at("repo/scripts/handoff")], "inside the git checkout"],
+      ];
+      for (const [command, problem] of refused) {
+        assert.include(yield* problemOf(withCommand(command)), problem, command.join(" "));
+      }
+      // An S or C that is the value of -u (a variable's name) is no -S or -C.
+      for (const command of [
+        [env, "-uSHELL", at("outside/run")],
+        [env, "-iuCDPATH", at("outside/run")],
+        [env, "--unset=S", at("outside/run")],
+      ]) {
+        assert.strictEqual(yield* problemOf(withCommand(command)), undefined, command.join(" "));
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("checks a project's command; leaves one already stored at the same place", () =>
     Effect.gen(function* () {
       const at = yield* layout;

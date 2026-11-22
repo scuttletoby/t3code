@@ -28,6 +28,23 @@ class Case(fx.Case):
         self.scratch = self.mkdir('scratch')
         self.archive = self.path('state', 'kept')
 
+    def run_cleaner(self, cfg, really=True, **over):
+        self.settle()
+        return super().run_cleaner(cfg, really, **over)
+
+    def settle(self):
+        """Waits until the clock the delete reads (rules.clock: on Linux the coarse one, a tick of 1-10 ms) is past
+        the last change the test made under the scratch root. The delete stops on an inode time at or after its
+        last check, so a folder the test changed in the same tick as that check (made, or half deleted by an earlier
+        run) read as changed since: the run failed now and then (on a 4 ms tick, in most runs). Real sessions are days
+        old; a file made during the run is still caught (test_a_file_made_after_the_last_check_...)."""
+        newest = max([os.lstat(self.scratch).st_ctime if os.path.lexists(self.scratch) else 0] +
+                     [os.lstat(os.path.join(where, name)).st_ctime
+                      for where, dirs, files in os.walk(self.scratch) for name in dirs + files])
+        deadline = time.monotonic() + 1
+        while self.c.rules.clock() <= newest and time.monotonic() < deadline:
+            time.sleep(0.001)
+
     def scfg(self, keep=None, **scratch):
         section = {'enabled': True, 'root': self.scratch, 'keepFirst': {'archive': self.archive, **(keep or {})}, **scratch}
         return self.cfg(agentScratch=section)
