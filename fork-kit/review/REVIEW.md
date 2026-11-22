@@ -95,5 +95,18 @@ rule order would let a lighter rule take a heavier rule's paths.
 
 The general rules (tiers by path, the state question and the failure table, one or two independent lenses, twin lens
 names, rounds and the nit-only quick check, minors, attacks with tests, the comment format) are the kit's, so a
-project does not keep its own copy. A project's adapter skill is a few lines: it points at [SKILL.md](SKILL.md) and
-adds only its domain lenses and commands.
+project does not keep its own copy.
+
+## The adapter skill
+
+A project's own review skill is a thin adapter. It links the kit's [SKILL.md](SKILL.md) and
+[COMMENTS.md](COMMENTS.md) at the fork's `ci/vN` tag the project's gate pins (README.md, "Which fork version"), and
+moves that link when the pin moves. It never copies the kit's rules, and it never changes one: a rule that should
+differ is changed in the kit. It adds only project facts:
+
+- its tier names and examples, and how they map onto critical, normal and light;
+- its commands: build and test, posting a comment, a check of a posted comment (ready and push are the queue
+  config's, above);
+- its domain lenses: the lens prompt files that hold their attack lists, and their test harnesses and end-to-end
+  scenarios;
+- its labels (risk labels for filed issues), its outside reviewers, and any effort raised for critical code.

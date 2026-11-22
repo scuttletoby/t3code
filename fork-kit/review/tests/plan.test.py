@@ -144,6 +144,8 @@ class Plan(Project):
                 self.assertIn(f'minors: {review_kit.MINORS[want]}\n', out)
                 self.assertNotIn(review_kit.MINORS[other], out)
         self.assertIn('minors: minors not fixed when the pull request stops go into one follow-up issue', out)
+        # #1011: the issue it files carries the project's risk labels.
+        self.assertIn("linked on it, with the project's risk labels\n", out)
 
     def test_settings_change_runners_rounds_and_minors(self):
         self.config()

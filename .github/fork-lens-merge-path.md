@@ -12,8 +12,10 @@ the files it touches; run its tests.
 - This repository is public: nothing personal (names, addresses, paths of a
   person's machine, tokens) in files, commits or comments.
 
-Write the report as one comment in the pull request's conversation, never as
-inline review comments: findings there are not read. Its first line is exactly
+Write the report as one comment in the pull request's conversation. The gate
+reads each comment alone (an inline review comment counts too, as its own
+comment): a finding in another comment, or in a review's inline comments, is
+not part of this report. Its first line is exactly
 
     lens: merge-path · reviewer: <who> · read at: <the full 40-character head sha>
 

@@ -48,7 +48,8 @@ DEFAULTS = {
     'minors': 'same-round',
     'state_question': STATE_QUESTION,
 }
-MINORS = {'issue': 'minors not fixed when the pull request stops go into one follow-up issue, linked on it',
+MINORS = {'issue': 'minors not fixed when the pull request stops go into one follow-up issue, linked on it, with the '
+                   'project\'s risk labels',
           # The one place the kit states the same-round rule; SKILL.md, REVIEW.md and docs point here.
           'same-round': 'a minor or nit is fixed in the same pull request when it is small and in scope (in the fix round '
                         'that is running, adding no lens round), else dropped with a one-line reason under "Left" in the '
