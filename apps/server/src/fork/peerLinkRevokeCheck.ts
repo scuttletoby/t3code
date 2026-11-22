@@ -23,27 +23,41 @@ export const confirm = Effect.fn("PeerLinks.confirmRevoked")(
     resolved: PeerLinks.ResolvedPeerLink,
   ) {
     const client = HttpClient.withScope(httpClient);
-    const mcp = (request: HttpClientRequest.HttpClientRequest) =>
-      client.execute(HttpClientRequest.bearerToken(request, resolved.token));
-    const initialized = yield* mcp(
-      HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
-        HttpClientRequest.setHeader("accept", "application/json, text/event-stream"),
-        HttpClientRequest.bodyJsonUnsafe(ForkLinkRevoke.initializeSession),
+    const withToken = (request: HttpClientRequest.HttpClientRequest) =>
+      HttpClientRequest.bearerToken(request, resolved.token);
+    // The session served only this check; the peer would keep it in memory. It is ended when
+    // the check stops, however it stops (a timeout, the caller going away), with its own bound.
+    const end = (sessionId: string) =>
+      httpClient
+        .execute(
+          withToken(
+            HttpClientRequest.delete(`${resolved.url}/mcp`).pipe(
+              HttpClientRequest.setHeaders({
+                "mcp-session-id": sessionId,
+                "mcp-protocol-version": ForkLinkRevoke.PROTOCOL_VERSION,
+              }),
+            ),
+          ),
+        )
+        .pipe(Effect.timeout(PeerLinks.probeTimeout(resolved.url)), Effect.ignore);
+    const initialized = yield* Effect.uninterruptibleMask((restore) =>
+      restore(
+        client.execute(
+          withToken(
+            HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
+              HttpClientRequest.setHeader("accept", "application/json, text/event-stream"),
+              HttpClientRequest.bodyJsonUnsafe(ForkLinkRevoke.initializeSession),
+            ),
+          ),
+        ),
+      ).pipe(
+        Effect.tap((response) => {
+          const sessionId = response.headers["mcp-session-id"];
+          return sessionId === undefined ? Effect.void : Effect.addFinalizer(() => end(sessionId));
+        }),
       ),
     );
     if (initialized.status === 401) return yield* links.recordRevoked(resolved.link);
-    const sessionId = initialized.headers["mcp-session-id"];
-    // The session served only this check; the peer would keep it in memory.
-    if (sessionId !== undefined) {
-      yield* mcp(
-        HttpClientRequest.delete(`${resolved.url}/mcp`).pipe(
-          HttpClientRequest.setHeaders({
-            "mcp-session-id": sessionId,
-            "mcp-protocol-version": ForkLinkRevoke.PROTOCOL_VERSION,
-          }),
-        ),
-      );
-    }
   },
   // Nothing is logged: a failed request carries the token.
   (effect, _links, _httpClient, resolved) =>

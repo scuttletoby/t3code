@@ -92,13 +92,35 @@ class BoxApi extends HttpApi.make("environment")
   .add(EnvironmentHttpApi.groups.mcpOAuth)
   .add(EnvironmentHttpApi.groups.peerLink) {}
 
-/** What the laptop's fetch answers in the box's place, once: `rpc` is a `/mcp` JSON-RPC method. */
-interface Answer {
-  readonly path: string;
-  readonly rpc?: string;
-  readonly status: number;
-  readonly error?: string;
+/** A request the laptop's fetch holds: `reached` as it arrives, passed on once `release` resolves. */
+interface Hold {
+  readonly reached: () => void;
+  readonly release: Promise<void>;
 }
+
+/**
+ * What the laptop's fetch answers in the box's place, once: `rpc` is a `/mcp` JSON-RPC method.
+ * With `hold` it answers nothing itself: the request waits, then goes to the box, or is aborted.
+ */
+type Answer = {
+  readonly path: string;
+  readonly method?: string;
+  readonly rpc?: string;
+} & (
+  | { readonly status: number; readonly error?: string; readonly hold?: undefined }
+  | { readonly hold: Hold }
+);
+
+/** A hold the test reaches and releases; one never released is a box that never answers. */
+const held = () => {
+  const reached = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  return {
+    hold: { reached: () => reached.resolve(), release: release.promise },
+    reached: Effect.promise(() => reached.promise),
+    release: Effect.sync(() => release.resolve()),
+  };
+};
 
 /** The box: its descriptor, MCP OAuth, `/mcp`, client pairing and one thread to read. */
 const serveBox = Effect.gen(function* () {
@@ -185,11 +207,25 @@ const serveBox = Effect.gen(function* () {
         : undefined;
     const label = [request.method, path, rpc].filter((part) => part !== undefined).join(" ");
     const index = answers.findIndex(
-      (answer) => answer.path === path && (answer.rpc === undefined || answer.rpc === rpc),
+      (answer) =>
+        answer.path === path &&
+        (answer.method === undefined || answer.method === request.method) &&
+        (answer.rpc === undefined || answer.rpc === rpc),
     );
-    if (index !== -1) {
-      const [answer] = answers.splice(index, 1);
-      seen.push(`${label} ${answer!.status}`);
+    const [answer] = index === -1 ? [] : answers.splice(index, 1);
+    if (answer?.hold !== undefined) {
+      answer.hold.reached();
+      const aborted = new Promise<"aborted">((resolve) =>
+        request.signal.addEventListener("abort", () => {
+          seen.push(`${label} aborted`);
+          resolve("aborted");
+        }),
+      );
+      if ((await Promise.race([answer.hold.release, aborted])) === "aborted") {
+        throw new DOMException("The request was aborted.", "AbortError");
+      }
+    } else if (answer !== undefined) {
+      seen.push(`${label} ${answer.status}`);
       // The pairing route's refusals are typed errors; the others name their reason.
       const body =
         path === PAIRING_ROUTE
@@ -197,8 +233,8 @@ const serveBox = Effect.gen(function* () {
               _tag: "EnvironmentHttpUnauthorizedError",
               message: "Only a linked environment's session is accepted here.",
             }
-          : { error: answer!.error ?? "invalid_token" };
-      return Response.json(body, { status: answer!.status });
+          : { error: answer.error ?? "invalid_token" };
+      return Response.json(body, { status: answer.status });
     }
     const response = await handler(request);
     seen.push(`${label} ${response.status}`);
@@ -372,6 +408,64 @@ it.effect("a 401 whose fresh session gets no answer leaves the link as it was", 
       const after = Option.getOrThrow(yield* a.links.get(box.environmentId)).expiresAt;
       expect(DateTime.formatIso(after)).toBe(DateTime.formatIso(before));
       expect(yield* a.statuses).toEqual(["reachable"]);
+    }),
+  ),
+);
+
+it.effect("a 401 whose fresh session never answers stops the check at its bound", () =>
+  withLink((b, a) =>
+    Effect.gen(function* () {
+      // The box refuses the read, then never answers the check: the read still ends.
+      const silent = held();
+      b.answers.push({ path: PEER_LINK_THREAD_STREAM_ROUTE, status: 401 });
+      b.answers.push({ path: "/mcp", rpc: "initialize", hold: silent.hold });
+      const reading = yield* a.readFails.pipe(Effect.forkChild);
+      yield* silent.reached;
+      yield* TestClock.adjust(PeerLinks.probeTimeout(BOX_URL));
+      expect(yield* Fiber.join(reading)).toBe("rejected");
+      expect(b.seen.slice(1)).toEqual([`${STREAM} 401`, "POST /mcp initialize aborted"]);
+      expect(yield* a.statuses).toEqual(["reachable"]);
+    }),
+  ),
+);
+
+it.effect("a check stopped after the box accepted its fresh session still ends that session", () =>
+  withLink((b, a) =>
+    Effect.gen(function* () {
+      // The read goes away (its thread view closed) while the check ends the session it started.
+      const ending = held();
+      b.answers.push({ path: PEER_LINK_THREAD_STREAM_ROUTE, status: 401 });
+      b.answers.push({ path: "/mcp", method: "DELETE", hold: ending.hold });
+      const reading = yield* a.readFails.pipe(Effect.forkChild);
+      yield* ending.reached;
+      reading.interruptUnsafe();
+      yield* ending.release;
+      expect(Exit.hasInterrupts(yield* Fiber.await(reading))).toBe(true);
+      expect(b.seen.slice(1)).toEqual([
+        `${STREAM} 401`,
+        "POST /mcp initialize 200",
+        "DELETE /mcp 204",
+      ]);
+      expect(yield* a.statuses).toEqual(["reachable"]);
+    }),
+  ),
+);
+
+it.effect("a link a read ends drops the session an agent's call kept for it", () =>
+  withLink((b, a) =>
+    Effect.gen(function* () {
+      expect(yield* a.noop).toEqual({});
+      yield* b.revokeLink;
+      expect(yield* a.readFails).toBe("rejected");
+      expect(yield* a.statuses).toEqual(["expired"]);
+      yield* TestClock.adjust(Duration.minutes(1));
+      const pairing = yield* b.auth.issuePairingCredential();
+      yield* a.links.link({ url: BOX_URL, pairingCode: pairing.credential, access: "full-access" });
+
+      // The new link's first call starts its own session, not the ended link's.
+      b.seen.length = 0;
+      expect(yield* a.noop).toEqual({});
+      expect(b.seen.filter((line) => line.includes("/mcp"))[0]).toBe("POST /mcp initialize 200");
     }),
   ),
 );

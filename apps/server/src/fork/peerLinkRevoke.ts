@@ -48,6 +48,15 @@ const refusedOnFreshSession = new OrchestratorMcpFailure({
     "The linked environment accepted this link but refused the call (HTTP 401). Try again shortly.",
 });
 
+type Forget = (environmentId: EnvironmentId) => Effect.Effect<void>;
+
+/**
+ * PeerMcpClient's `forget`, per PeerLinks service (keyed by its `recordRevoked`), so a link ended
+ * by a thread read or a client pairing (peerLinkRevokeCheck.ts) drops the session ids an agent's
+ * calls kept for it too, as one an agent's call ends does.
+ */
+const forgetters = new WeakMap<object, Array<Forget>>();
+
 /**
  * PeerLinks' side: `record` ends a link the peer turned away, and `notEnded` keeps a renewal
  * that answers a call made before the refusal from moving that link's end out again.
@@ -56,10 +65,12 @@ export const makeLinkRevokes = (sql: SqlClient.SqlClient) => {
   // The ended link's linked_at, per environment. A renewal in flight needs it only while this
   // process runs: a restart ends every call that could still bring one back.
   const ended = new Map<EnvironmentId, string>();
+  const forgets: Array<Forget> = [];
   const record = Effect.fn("PeerLinks.recordRevoked")(
     function* (link: PeerLink) {
       const linkedAt = DateTime.formatIso(link.linkedAt);
       ended.set(link.environmentId, linkedAt);
+      yield* Effect.forEach(forgets, (forget) => forget(link.environmentId), { discard: true });
       const now = DateTime.formatIso(yield* DateTime.now);
       // Only the link the refused call resolved: one made again since keeps its own end.
       yield* sql`
@@ -75,6 +86,7 @@ export const makeLinkRevokes = (sql: SqlClient.SqlClient) => {
     const linkedAt = ended.get(environmentId);
     return linkedAt === undefined ? sql.literal("") : sql`AND linked_at <> ${linkedAt}`;
   };
+  forgetters.set(record, forgets);
   return { record, notEnded };
 };
 
@@ -102,6 +114,7 @@ export const makeRefusals = (deps: {
       sessions,
       (current) => new Map([...current].filter(([key]) => !key.startsWith(`${environmentId} `))),
     );
+  forgetters.get(links.recordRevoked)?.push(forget);
 
   /**
    * The peer refused to start a session: starts one more right away. Refused again with 401, the
