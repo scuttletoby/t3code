@@ -138,6 +138,15 @@ class Check(unittest.TestCase):
             with self.subTest(wrap=wrap):
                 self.assertIn('no state', self.verdict(body))
 
+    def test_the_state_rule_is_the_gates(self):
+        """What counts as a state line is gate code (review_judge.has_state_line), not a second copy in the kit, so
+        the kit and the gate read one rule when the gate starts enforcing `state_line` (#797)."""
+        self.assertIs(review_kit.has_state_line, review_judge.has_state_line)
+        for line, answered in (('state: fine', True), ('**State:** fine', True), ('- state: fine', True),
+                               ('state:', False), ('state:   ', False), ('the state is fine', False)):
+            with self.subTest(line=line):
+                self.assertIs(review_judge.has_state_line(f'lens: code\n{line}\n'), answered)
+
     def test_a_major_fails(self):
         body = CLEAN.replace('major: none', 'major: x is cut')
         self.assertEqual(self.m.check(body, 'tool ready --head', SHA)[0], 1)
@@ -222,11 +231,6 @@ MUTATIONS = {
                             'ok = GOOD <= set(words)', (Check, 'test_another_head_fails')),
     'a state line is needed': ("words.append('state' if has_state_line(body) else 'no state')",
                                "words.append('state')", (Check, 'test_a_missing_state_line_fails')),
-    'a state line needs an answer': (r"STATE_RE = re.compile(r'state\s*:\s*\S', re.I)",
-                                     r"STATE_RE = re.compile(r'state\s*:', re.I)",
-                                     (Check, 'test_an_empty_state_line_is_no_state')),
-    'a state line outside code and quotes': ('for raw in lens.plain_lines(body))', 'for raw in body.splitlines())',
-                                             (Check, 'test_a_state_line_in_a_code_block_or_quote_is_no_state')),
     'a short sha is no read': ("if not lens.FULL_SHA.fullmatch(sha or ''):", 'if not sha:',
                                (Doc, 'test_every_example_reads_as_it_says')),
     'the gate flags a looking comment': ('if review.lens_problem(post):', 'if False:',
@@ -234,6 +238,17 @@ MUTATIONS = {
     'every example is compared': ('if got != said:', 'if False:', (Doc, 'test_a_broken_example_fails')),
     'the head is lowercased': ("sha != head.lower()", 'sha != head',
                                (Check, 'test_the_head_is_matched_whatever_its_case')),
+}
+
+# rule: (text in the gate's review_judge.py, the text that breaks it, the kit test that must then fail): the kit
+# reads these rules from the gate, so a broken gate rule must fail the kit's own tests too.
+JUDGE = os.path.join(REPO, 'fork-ci', 'actions', 'pr-queue', 'review_judge.py')
+GATE_MUTATIONS = {
+    'a state line needs an answer': (r"STATE_RE = re.compile(r'state\s*:\s*\S', re.I)",
+                                     r"STATE_RE = re.compile(r'state\s*:', re.I)",
+                                     (Check, 'test_an_empty_state_line_is_no_state')),
+    'a state line outside code and quotes': ('for raw in lens.plain_lines(body))', 'for raw in body.splitlines())',
+                                             (Check, 'test_a_state_line_in_a_code_block_or_quote_is_no_state')),
 }
 
 
@@ -469,6 +484,59 @@ class SkillFormat(unittest.TestCase):
         comments = ' '.join(kit_text('COMMENTS.md').split())
         self.assertIn('on `yes` it still posts the override for the fix head', comments)
 
+    def test_the_skill_says_what_happens_to_a_fix_past_the_last_round(self):
+        """A fix after the last lens round that is not nit-only gets no new round: the orchestrator checks it and
+        posts the override, and a blocker or major left over counts as stuck (#914)."""
+        skill = ' '.join(kit_text('SKILL.md').split())
+        for words in ('A fix after the last lens round (`lens_rounds` used up) that is not nit-only',
+                      'gets no new lens round: the orchestrator checks that fix diff itself and posts the override for '
+                      'the fix head',
+                      'A blocker or major left over counts as stuck'):
+            with self.subTest(says=words):
+                self.assertIn(words, skill)
+
+    def test_the_docs_say_which_override_counts_as_the_gate_reads_it(self):
+        """The gate counts an override only from the configured author association, never edited and not hidden
+        (lens.Review.override_sha); the skill and COMMENTS.md say all three (#914)."""
+        review = review_kit.reader('tool ready --head')
+        post = lens_pr(f'tool ready --head {SHA}: read the fix diff and its tests')['comments'][0]
+        self.assertEqual(review.override_sha(post), SHA)
+        for name, change in (('edited', {'includesCreatedEdit': True}), ('hidden', {'isMinimized': True}),
+                             ('another association', {'authorAssociation': 'CONTRIBUTOR'})):
+            with self.subTest(override=name):
+                self.assertIsNone(review.override_sha({**post, **change}))
+        skill = ' '.join(kit_text('SKILL.md').split())
+        self.assertIn('it counts only from the configured author association, the queue config\'s '
+                      '`override.author_association`, and only while it is never edited and not hidden', skill)
+        comments = ' '.join(kit_text('COMMENTS.md').split())
+        self.assertIn('counts only from the configured author association, never edited and not hidden', comments)
+
+    def test_the_docs_say_to_run_the_kit_at_the_pinned_release(self):
+        """The kit imports the gate's code from its own checkout, so the docs say to run it at the release the
+        project's gate pins (#797)."""
+        readme = kit_text('README.md')
+        self.assertIn('\n## Which fork version\n', readme)
+        self.assertIn('run the kit from a checkout at the pinned release', ' '.join(readme.split()))
+        for name in ('SKILL.md', 'REVIEW.md'):
+            with self.subTest(doc=name):
+                self.assertIn('Run the kit from a fork checkout at the release the project\'s gate pins (README.md, '
+                              '"Which fork version")', ' '.join(kit_text(name).split()))
+
+    def test_review_md_says_which_decides_the_runner(self):
+        """REVIEW.md says whether its file or T3's review rules setting decides the runner (#797). It says nothing in
+        T3 reads the setting yet; when T3's docs stop saying so, this fails and REVIEW.md must be read again."""
+        review = ' '.join(kit_text('REVIEW.md').split())
+        for words in ("**This file or T3's review rules setting:**", 'Nothing in T3 reads it yet, so today this file '
+                      'decides', "T3's setting the lenses T3 starts on that machine",
+                      'this file every lens an agent starts by hand from the skill and what `plan` prints',
+                      'the gate does not read either'):
+            with self.subTest(says=words):
+                self.assertIn(words, review)
+        with open(os.path.join(REPO, 'docs', 'fork', 'README.md'), encoding='utf-8') as f:
+            t3 = ' '.join(f.read().split())
+        self.assertIn('`reviewRules`', t3)
+        self.assertIn('Nothing reads it yet', t3)
+
     def test_the_skill_says_whichever_is_higher(self):
         """review_round takes the higher of the change count and the round marker, never the sum."""
         self.assertEqual(review_judge.review_round([('code', 'a' * 40), ('code r3', 'a' * 40)]), 3)
@@ -488,6 +556,22 @@ class RedCheck(unittest.TestCase):
                 result = unittest.TestResult()
                 cls(test).run(result)
                 self.assertFalse(result.wasSuccessful(), f'{test} still passes with the rule {rule!r} broken')
+
+    def test_each_gate_rule_the_kit_reads_has_a_kit_test_that_fails_without_it(self):
+        with open(JUDGE, encoding='utf-8') as f:
+            source = f.read()
+        for rule, (text, broken, (base, test)) in GATE_MUTATIONS.items():
+            with self.subTest(rule=rule):
+                self.assertEqual(source.count(text), 1, f'the red check for {rule!r} no longer matches the gate')
+                judge = types.ModuleType('review_judge_broken')
+                judge.__file__ = JUDGE
+                exec(compile(source.replace(text, broken), JUDGE, 'exec'), judge.__dict__)
+                kit = load(inspect.getsource(review_kit))
+                kit.has_state_line = judge.has_state_line
+                cls = type('Broken', (base,), {'m': kit})
+                result = unittest.TestResult()
+                cls(test).run(result)
+                self.assertFalse(result.wasSuccessful(), f'{test} still passes with the gate rule {rule!r} broken')
 
 
 if __name__ == '__main__':
