@@ -13,6 +13,13 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue: what counts as a `state:` line is gate code (#797)
+
+`review_judge.has_state_line` holds the rule for a lens report's `state:` line (an answer after the colon, outside code
+blocks and quotes). The gate still parses `state_line` without enforcing it, so nothing a caller sees changes. The
+review kit (fork-kit/review) now imports this rule and the gate's `head_check.changed_paths` instead of its own
+copies, so run the kit from a checkout at the release the gate pins (kit README, "Which fork version").
+
 ### pr-queue and head-check: every rule hit gives its lenses (#82)
 
 With a `review` block in `enforce`, the required lenses are now the lenses of every rule a changed path counted for,

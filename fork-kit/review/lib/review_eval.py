@@ -313,7 +313,12 @@ def cost(c, out):
         for f in sorted(glob.glob(pattern)):
             m = RUN_RE.match(_first_user_text(f).lstrip())   # the run's own session starts with its RUN-ID line
             if m and m.group(1) in runs:
-                files.setdefault(m.group(1), []).append(f)
+                # ... and the sub-agents it started are its cost too: Claude Code keeps them beside the session file,
+                # in <session>/subagents/*.jsonl. Each file once, however many patterns find it.
+                subs = os.path.join(glob.escape(f[:-len('.jsonl')]), 'subagents', '*.jsonl')
+                for g in [f, *(sorted(glob.glob(subs)) if f.endswith('.jsonl') else [])]:
+                    if g not in files.setdefault(m.group(1), []):
+                        files[m.group(1)].append(g)
     result = {}
     for rid, fs in sorted(files.items()):
         usage, times, model = {}, [], None
@@ -368,6 +373,36 @@ def mean(xs):
     return round(statistics.mean(xs), 3) if xs else None
 
 
+def _list_of(v, ok):
+    """Left out (or null), or a list whose every item is ok."""
+    return v is None or (isinstance(v, list) and all(ok(x) for x in v))
+
+
+def scores_of(path, name):
+    """The `reviews` object of a judge's scores.json, each entry checked against the shape judge_prompt.txt asks for:
+    `found` a list of truth ids, `findings` a list of objects whose `verdict` is text. Problem naming what is wrong
+    (never a traceback): a hand-edited or half-written file is judged again, not read halfway."""
+    s = load_json(path, f'the scores of case {name}')
+    bad = None
+    if not isinstance(s, dict) or not isinstance(s.get('reviews'), dict):
+        bad = 'it is not an object with a "reviews" object'
+    else:
+        for review, r in sorted(s['reviews'].items()):
+            if not isinstance(r, dict):
+                bad = f'{review} is not an object'
+            elif not _list_of(r.get('found'), lambda x: isinstance(x, str)):
+                bad = f'{review}: "found" is not a list of truth ids'
+            elif not _list_of(r.get('findings'), lambda f: isinstance(f, dict)
+                              and isinstance(f.get('verdict', ''), (str, type(None)))):
+                bad = f'{review}: "findings" is not a list of objects with a text "verdict"'
+            if bad:
+                break
+    if bad:
+        raise Problem(f'case {name}: {path} is not in the shape judge_prompt.txt asks for ({bad}): judge the case '
+                      f'again')
+    return s['reviews']
+
+
 def analyze(c, cases, out):
     runmap_ = {r['id']: r for r in read_runs(c)}
     jpath = gt(c, 'judgemap.json')
@@ -380,12 +415,12 @@ def analyze(c, cases, out):
         if name not in cases or not os.path.exists(p):
             skipped.append(name)
             continue
-        s = load_json(p, f'the scores of case {name}')
+        reviews = scores_of(p, name)
         t = ids(cases, name)
         bm, every = set(t['blocker_major']), set(itertools.chain(*t.values()))
         judged.append(name)
         for review, rid in sorted(jm[name].items()):
-            r = (s.get('reviews') or {}).get(review)
+            r = reviews.get(review)
             if not isinstance(r, dict) or rid not in runmap_:
                 raise Problem(f'case {name}: scores.json has no entry for {review} (or the run map lost {rid}): judge '
                               f'the case again')
