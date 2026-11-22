@@ -634,8 +634,12 @@ def gpu_wall(c):
     """(wall, what, why or None): whether the machine file's `gpu` turns GPU access on, and whether T3's unit on disk
     says the same (systemd runs it as on disk: the units wall; T3 restarted since: the restart wall)."""
     on = c['gpu']
+    # The unit skips ("-") whichever is missing, so T3 still runs: a note naming each, not a failure. No /dev/dxg:
+    # WSL gives this distro no GPU; no lib or drivers folder (a WSL update moved them, say): CUDA cannot load.
+    missing = [p for p in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers') if not k.lstat(p)]
     what = ('GPU access is on (machine file "gpu": true): /dev/dxg, and /usr/lib/wsl/lib and /usr/lib/wsl/drivers '
-            'read-only' + ('' if k.lstat('/dev/dxg') else ' (this distro has no /dev/dxg: WSL gives it no GPU)')
+            'read-only' + (missing and ' (this distro has no ' + ', no '.join(missing) +
+                           ': the unit skips what is missing, so GPU jobs fail)' or '')
             if on else 'GPU access is off (no "gpu": true in the machine file): no /dev/dxg, /usr/lib/wsl hidden')
     try:
         with open(k.ROOT + k.UNIT_DIRS[0] + '/' + k.UNIT, encoding='utf-8', errors='replace') as f:

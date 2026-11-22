@@ -332,9 +332,19 @@ class Gpu(Case):
         self.assertTrue(line.startswith('PASS  gpu  GPU access is on'), out)
         for path in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers'):
             self.assertIn(path, line)
-        self.assertIn('no /dev/dxg', line)   # the fake distro has none: said, not a failure (T3 still runs)
+        # The fake distro has none of the three: each is named, a note, not a failure (T3 still runs, "-" skips it)
+        for path in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers'):
+            self.assertIn('no ' + path, line)
         self.write('/dev/dxg', '')
-        self.assertNotIn('no /dev/dxg', self.gpu_line(self.check()[1]))
+        self.write('/usr/lib/wsl/lib/', '')
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        line = self.gpu_line(out)
+        self.assertNotIn('no /dev/dxg', line)
+        self.assertNotIn('no /usr/lib/wsl/lib', line)
+        self.assertIn('no /usr/lib/wsl/drivers', line)   # e.g. a WSL update moved the driver store
+        self.write('/usr/lib/wsl/drivers/', '')
+        self.assertNotIn('this distro has no', self.gpu_line(self.check()[1]))
 
     def test_unit_differs_from_the_setting(self):
         for written, now in ((False, True), (True, False)):
@@ -352,14 +362,23 @@ class Gpu(Case):
                 self.assertIn('pc-agents setup', self.gpu_line(out))
 
     def test_half_a_gpu_unit_fails(self):
-        """A unit with only some of the GPU lines (an edit) is neither: it fails, with the setting on or off."""
-        for setting in (True, False):
-            with self.subTest(gpu=setting):
+        """A unit with only some of the GPU lines (an edit) is neither: it fails, with the setting on or off. So does
+        the default unit without its InaccessiblePaths= line (/usr/lib/wsl no longer hidden), and the GPU unit with
+        that default line added back."""
+        edits = (('gpu unit without BindPaths', True, lambda t: t.replace('BindPaths=-/dev/dxg\n', '')),
+                 ('default unit without the hidden line', False, lambda t: t.replace(k.HIDDEN + '\n', '')),
+                 ('default unit with that line changed', False,
+                  lambda t: t.replace(k.HIDDEN, k.HIDDEN.replace('-/mnt ', ''))),
+                 ('gpu unit with the hidden line added', True, lambda t: t.replace(k.GPU[0], k.HIDDEN + '\n' + k.GPU[0])))
+        for (name, written, edit), setting in [(e, s) for e in edits for s in (True, False)]:
+            with self.subTest(name, gpu=setting):
                 shutil.rmtree(self.root)
                 self.setUp()
-                self.machine({**CONFIG, 'gpu': True})
+                self.machine({**CONFIG, 'gpu': written})
                 self.walled()
-                self.write(self.UNIT, self.read(self.UNIT).replace('BindPaths=-/dev/dxg\n', ''))
+                text = self.read(self.UNIT)
+                self.assertTrue(edit(text) != text, name)   # the edit applies
+                self.write(self.UNIT, edit(text))
                 self.machine({**CONFIG, 'gpu': setting})
                 code, out = self.check()
                 self.assertEqual(code, 1, out)

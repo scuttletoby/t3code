@@ -308,9 +308,13 @@ of `/usr/lib/wsl` in `InaccessiblePaths=`, these lines, and nothing else of it c
 | `BindReadOnlyPaths=-/usr/lib/wsl/lib -/usr/lib/wsl/drivers` | read-only: `lib` holds what CUDA programs load (`libcuda.so.1`, `libdxcore.so`, `libd3d12*.so`, `nvidia-smi`; WSL's `/etc/ld.so.conf.d/ld.wsl.conf` names it), `drivers` the Windows GPU driver store, where NVIDIA's driver keeps the rest (`libcuda.so.1.1`, `nvcubins.bin`, ...) |
 | `BindPaths=-/dev/dxg` and `DeviceAllow=/dev/dxg rw`         | `PrivateDevices=yes` stays: it leaves `/dev/dxg` out of the unit's `/dev` (the bind puts this one node back) and closes the device policy (the allow opens this one device); every other device stays out                                                                           |
 
-A `-` path that is missing is skipped, so T3 still starts on a PC whose WSL has no GPU (`check` says so). The driver
-store is Windows' driver files (no user files); the agent reads them, it cannot change them. GPU jobs themselves (one
-at a time, when to turn it off) are the owner's rule, not the kit's. To turn it off, set `"gpu": false` (or remove it)
+A `-` path that is missing is skipped, so T3 still starts on a PC whose WSL has no GPU (`check` names each of
+`/dev/dxg`, `/usr/lib/wsl/lib` and `/usr/lib/wsl/drivers` that is missing; GPU jobs fail until it is back). The driver
+store is Windows' driver files (no user files); the agent reads them, it cannot change them. Those reads are not the
+whole of it: `/dev/dxg` is a direct line into the Windows host's GPU kernel driver (`dxgkrnl`), which handles the
+agent's requests in Windows' kernel. So with `gpu` on, a compromised agent can attack more of Windows than the
+read-only driver files: a bug in that driver is reachable from the sandbox. GPU jobs themselves (one at a time, when to
+turn it off) are the owner's rule, not the kit's. To turn it off, set `"gpu": false` (or remove it)
 and run step 3 again: the unit is the default one again, byte for byte, and T3 restarts under it.
 
 `pc-agents check` says `GPU access is on` or `off`, and fails (so the 2-minute check stops T3) when T3's unit says
