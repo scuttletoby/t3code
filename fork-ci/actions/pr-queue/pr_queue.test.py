@@ -1364,6 +1364,93 @@ class Recover(Base):   # a run killed after its disarm
         code, out = run_quiet(self.q.recover)   # room again: told once
         self.assertEqual([c[3] for c in calls()], ['bad-plan'])
 
+    # round 1: a name in STATE.told-bad is never given to a new lost plan, so a new one is always told
+    def test_a_new_bad_plan_after_a_person_deleted_the_told_one_is_told(self):   # state: runs again, no run between
+        calls = self.notify_queue()
+        self.recover(self.fake(), '{')   # STATE.bad, told
+        os.remove(self.q.state + '.bad')   # a person deleted it; no run saw "none left", the record stays
+        code, out = self.recover(self.fake(), '{')   # the next run: a new unreadable plan
+        self.assertEqual(code, 1, out)
+        self.assertEqual(len(calls()), 2, 'the new one is told')
+        (kept,) = self.bad_files()
+        self.assertIn(os.path.join(os.path.dirname(self.q.state), kept), calls()[1][4])
+
+    def test_a_new_bad_plan_after_a_person_deleted_only_the_first_is_told(self):   # state: two kept, one deleted
+        calls = self.notify_queue()
+        self.recover(self.fake(), '{')    # STATE.bad, told
+        self.recover(self.fake(), '[]')   # STATE.bad-<ns>, told
+        os.remove(self.q.state + '.bad')   # a person dealt with the first only
+        self.q.gh = self.q.gh_write = self.fake()
+        self.assertEqual(run_quiet(self.q.recover)[0], 0)   # a run between: one .bad left, the record stays
+        code, out = self.recover(self.fake(), '{"x": 1}')
+        self.assertEqual(code, 1, out)
+        self.assertEqual(len(calls()), 3, 'the new one is told')
+        self.assertEqual(len(self.bad_files()), 2)
+        self.q.gh = self.q.gh_write = self.fake()
+        run_quiet(self.q.recover)   # runs again: nobody woken twice
+        self.assertEqual(len(calls()), 3)
+
+    def test_a_record_of_the_previous_head_with_no_files_left_is_harmless(self):   # state: an old record
+        calls = self.notify_queue()
+        Q.write_text(self.q.state + '.told-bad', json.dumps([self.q.state + '.bad']))   # 2de9ef1's record format
+        code, out = self.recover(self.fake(), '{')
+        self.assertEqual(code, 1, out)
+        self.assertEqual(len(calls()), 1, 'told, though the record named that name')
+        self.q.gh = self.q.gh_write = self.fake()
+        run_quiet(self.q.recover)
+        self.assertEqual(len(calls()), 1)
+
+    def test_keep_bad_never_moves_over_a_file_made_after_its_check(self):   # never overwrites, by construction
+        Q.write_text(self.q.state, '{')
+        bad = self.q.state + '.bad'
+        real = os.path.lexists
+
+        def lexists(path):   # a person makes STATE.bad right after the check says it is free
+            free = not real(path)
+            if path == bad and free:
+                with open(bad, 'w') as f:
+                    f.write('theirs')
+            return not free
+        with unittest.mock.patch.object(Q.os.path, 'lexists', lexists):
+            kept = self.q.keep_bad()
+        with open(bad) as f:
+            self.assertEqual(f.read(), 'theirs', 'never overwritten')
+        self.assertNotEqual(kept, bad)
+        with open(kept) as f:
+            self.assertEqual(f.read(), '{')
+        self.assertFalse(self.plan_exists())
+
+    def test_keep_bad_stopped_half_way_leaves_the_plan_where_it_was(self):   # state: stopped half-way
+        Q.write_text(self.q.state, '{')
+        with unittest.mock.patch.object(Q.os, 'replace', side_effect=Killed), self.assertRaises(Killed):
+            self.q.keep_bad()
+        with open(self.q.state) as f:
+            self.assertEqual(f.read(), '{', 'the plan is still STATE')
+        self.q.gh = self.q.gh_write = self.fake()
+        code, out = run_quiet(self.q.recover)   # the next run keeps it
+        self.assertEqual(code, 1, out)
+        self.assertFalse(self.plan_exists())
+        self.assertIn('{', [open(os.path.join(os.path.dirname(self.q.state), n)).read() for n in self.bad_files()])
+
+    def test_earlier_bad_plans_are_named_when_finish_plan_raises(self):   # state: a run that fails half-way
+        Q.write_text(self.q.state + '.bad', '{')
+        Q.write_text(self.q.state, '[]')
+        self.q.gh = self.q.gh_write = self.fake()
+        out = io.StringIO()
+        with unittest.mock.patch.object(Q.os, 'replace', side_effect=PermissionError(13, 'Permission denied')), \
+                contextlib.redirect_stdout(out), self.assertRaises(PermissionError):
+            self.q.recover()
+        self.assertIn(f'::warning::pr-queue: {self.q.state}.bad is an unreadable plan', out.getvalue())
+
+    def test_a_bad_plan_notify_that_fails_says_so_in_its_own_words(self):   # no PR, no PR comment
+        calls = self.notify_queue()
+        self.q.cfg = config.parse(json.dumps({**CFG_RAW, 'notify_command': [*self.q.cfg.notify_command[:2], 'fail']}))
+        code, out = self.recover(self.fake(), '{')
+        self.assertEqual((code, len(calls())), (1, 1), out)
+        self.assertNotIn('#0', out)
+        self.assertNotIn('PR comment', out)
+        self.assertIn('.told-bad says it was told', out)
+
     def test_the_plan_survives_a_new_process_and_an_emptied_lock_folder(self):   # STATE is its own file
         f = self.fake(after=None)   # the run stops with the PR OFF: GitHub did not show the new head in time
         self.assertEqual(self.update(f)[0], Q.SILENT)
@@ -1777,6 +1864,15 @@ class OwnCache(Base):
         self.assertIn(lock, out)
         self.assertTrue(run_quiet(self.q.own_cache)[0], 'deletable again: the next run goes on')
         self.assertFalse(os.path.exists(lock))
+
+    def test_a_cache_whose_first_fetch_failed_fetches_on_the_next_run(self):   # round 1 blocker; state: no refs/queue
+        self.w.set('refs/pull/7/head', self.c)
+        got, out = run_quiet(self.q.fetch, 'no-such-base', 7, self.c)   # made, the first fetch failed
+        self.assertIsNone(got, out)
+        self.assertTrue(os.path.isdir(self.q.cache))
+        self.assertFalse(os.path.lexists(os.path.join(self.q.cache, 'refs', 'queue')), 'no refs/queue yet')
+        got, out = self.fetch(self.c)   # the next run
+        self.assertTrue(got, out)
 
     def test_refs_it_cannot_walk_are_said_not_raised(self):
         self.assertTrue(self.fetch(self.c)[0])

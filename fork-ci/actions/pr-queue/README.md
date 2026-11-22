@@ -891,14 +891,17 @@ queue's format) is this repository's. An unreadable plan, or one another user
 could have written (not this user's, or writable by its group or others), is
 kept as `STATE.bad` and the run fails. A later one never replaces it: it is
 kept as `STATE.bad-<time in ns>`, so each lost plan stays for a person to read.
-Every later run names each of these files in a `::warning::` (shown on the
+The new name is made empty first and the plan moved onto it, so no file is
+ever overwritten, and a name `STATE.told-bad` holds is never given to a new
+one, even after its file is deleted. Every later run names each of these files in a `::warning::` (shown on the
 run's page) while it exists, and with `notify_command` the queue runs that
 command once for each new one (kind `bad-plan`, section "Notify"). Which ones
 it told is kept in `STATE.told-bad`, written before the command runs: a run
 stopped between the two tells no one, and none is told twice. Once a person
 has deleted every one of them the record goes too, so a later one is told
 again. A `STATE.bad` an older release kept (it only logged a line) is told
-once by the first run of this one. A plan does not say who turned auto-merge off after the queue's own
+once by the first run of this one. A run that fails while finishing a plan
+still names the kept ones. A plan does not say who turned auto-merge off after the queue's own
 disarm: a pull request a person armed and disarmed again since then (while
 the run waited for the new head, after a stopped run, or after a run that saw
 it armed again right before the update) is re-armed too, if its head holds the

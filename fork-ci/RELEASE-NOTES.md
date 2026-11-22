@@ -19,7 +19,8 @@ An unreadable or untrusted plan no longer replaces an earlier `STATE.bad`: a lat
 `STATE.bad-<time in ns>`. Every run names each such file in a `::warning::` (shown on the run's page), not only a log
 line. With `notify_command` the queue runs that command once for each new one, with kind `bad-plan`, PR `0`, an empty
 head and the repository's pull request list as the link; which ones were told is kept in `STATE.told-bad`, removed once
-no such file is left. A `STATE.bad` an older release kept is told once. A cache folder the queue cannot make or list,
+no such file is left, and a name it holds is never given to a new one, so each new one is told. No kept plan
+overwrites a file. A `STATE.bad` an older release kept is told once. A cache folder the queue cannot make or list,
 or a stale ref lock it cannot delete, is said and the run fetches nothing (as before), without a Python traceback.
 
 **Upgrade:** a `notify_command` that reads `pr` as a pull request number must accept `0` for kind `bad-plan`, or
