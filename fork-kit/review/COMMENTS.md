@@ -62,13 +62,27 @@ minor: <a small thing>; <another>
   half-way, or meets existing, old or empty state?"). What counts as one is the gate's rule
   (`review_judge.has_state_line`); the gate parses the config's `state_line` setting but does not enforce it yet; the
   kit's `check` does, and so does every lens prompt the kit writes.
-- **Round markers:** a re-read after a fix may add `r2`, `r3` to the lens name (`lens: data-1 r2`). The gate counts
-  rounds from the different changes lenses read and from these markers, whichever is higher; the marker is not part of
-  the lens's name (`data-1 r2` is lens `data-1`).
+- **Round markers:** a re-read after a fix may add `r2`, `r3` to the lens name (`lens: data-1 r2`), or `re-check`,
+  which names no round number. The gate counts rounds from the different changes lenses read and from the numbered
+  markers, whichever is higher; a marker is not part of the lens's name (`data-1 r2` and `data-1 re-check` are lens
+  `data-1`).
 - **A recap of an earlier round** must not look like an open finding: `round 1, fixed: <what>`, never
   `Major 1: fixed` (that reads as an open major).
 - **One lens per comment**, never edited after posting (an edited or hidden comment reads nothing: post a new one).
 - Lines inside a fenced code block are not findings.
+
+## Who and where
+
+The gate's rules for which comments count, in short (gate README,
+[Lens comments](../../fork-ci/actions/pr-queue/README.md#lens-comments) and
+[Review rules](../../fork-ci/actions/pr-queue/README.md#review-rules)):
+
+- **The name is the whole name**, a bracket part too: `correctness (a.py)` and `correctness (b.py)` are two lenses.
+- **Where:** plain comments, reviews and inline review comments all count; a comment of a review not yet submitted
+  (pending) never does.
+- **Who:** only comments whose author association is in the queue config's `lens_author_associations`.
+- **Which config:** every rule that judges the head is the base tip's queue config. The gate reads the pull
+  request's merged config only to refuse one that does not parse (or is deleted, or gains a case twin).
 
 ## Verdicts
 
