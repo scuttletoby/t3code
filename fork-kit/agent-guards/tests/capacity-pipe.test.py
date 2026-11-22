@@ -54,7 +54,57 @@ REFUSED = [
     'stdbuf -oL t3-capacity 1 | tail',
     'stdbuf -o L t3-capacity 1 | tail',
     'time -p t3-capacity 2048 | tail -1 && x',
+    # #931: the keyword `time` before a group; a flag cluster whose value is glued on; env -S runs its value's words
+    'time { t3-capacity 2048; } | tail -1 && x',
+    'time -p { t3-capacity 2048; } | tail -1 && x',
+    '! time { t3-capacity 1; } | tail',
+    'sudo -uroot t3-capacity 1 | tail -1 && x',
+    'sudo -iuroot t3-capacity 1 | tail',
+    "env -S 't3-capacity 1' | tail",
+    "env -S't3-capacity 1' | tail",
+    "env -iS 't3-capacity 1' | tail",
+    "env --split-string='t3-capacity 1' | tail",
+    "env --split-string 'A=1 t3-capacity 1' | tail",
+    "env -S 'nice t3-capacity 1' | tail",
+    'env -S \'bash -c "t3-capacity 1 | tail"\'',
     'exec -a cap t3-capacity 1 | tail',
+    # PR 993 round 1: the other wrappers a command runs behind (chrt and taskset take a priority / mask first,
+    # flock a lock file; numactl, doas, runuser, systemd-run flags with their values)
+    'chrt -i 0 t3-capacity 1 | tail',
+    'chrt 10 t3-capacity 1 | tail',
+    'chrt --idle 0 t3-capacity 1 | tail',
+    'chrt -b 0 nice t3-capacity 1 | tail',
+    'chrt -d -T 1000 -P 2000 0 t3-capacity 1 | tail',
+    'taskset 0x3 t3-capacity 1 | tail',
+    'taskset -c 0-3 t3-capacity 1 | tail',
+    'taskset -c 0 t3-capacity 1 | tail',
+    'flock /tmp/cap.lock t3-capacity 1 | tail',
+    'flock -w 5 /tmp/cap.lock t3-capacity 1 | tail',             # timing: guard input, not a wait
+    'numactl -N 0 t3-capacity 1 | tail',
+    'numactl --cpunodebind=0 t3-capacity 1 | tail',
+    'doas -u root t3-capacity 1 | tail',
+    'runuser -u someone t3-capacity 1 | tail',
+    'systemd-run --user --scope -p MemoryMax=1G t3-capacity 1 | tail',
+    'unbuffer t3-capacity 1 | tail',
+    'chronic t3-capacity 1 | tail',
+    'ionice -c 3 chrt -i 0 t3-capacity 1 | tail',
+    'sudo chrt -i 0 t3-capacity 1 | tail',
+    # PR 993 round 2: systemd-run -d (--same-dir) takes no value; doas -a STYLE, runuser -s SHELL / -c TEXT; the
+    # kit's own heavy (--wait S, --kind K, --mb N, --measure K before the command)
+    'systemd-run -P -d t3-capacity 1 | tail',
+    'systemd-run --user -d -p MemoryMax=1G t3-capacity 1 | tail',
+    'doas -a style t3-capacity 1 | tail',
+    'doas -a style -u root t3-capacity 1 | tail',
+    'runuser -s /bin/sh -u someone t3-capacity 1 | tail',
+    "runuser -u someone -s /bin/bash t3-capacity 1 | tail",
+    "runuser someone -c 't3-capacity 1 | tail'",
+    "runuser -l someone -c 't3-capacity 1 | tail -1'",
+    "runuser -c 't3-capacity 1 | tail' someone",
+    'heavy t3-capacity 1 | tail',
+    'heavy --wait 60 t3-capacity 1 | tail',
+    'heavy --kind test --mb 512 -- t3-capacity 1 | tail',
+    'heavy --measure build t3-capacity 1 | tail',
+    'heavy nice t3-capacity 1 | tail',
     # after && ; newline, in if / while / until / for / case, behind !
     'cd /x && t3-capacity 2048 | tail -1 && heavy x',
     'true; t3-capacity 2048 | tail -1',
@@ -166,6 +216,23 @@ ALLOWED = [
     'nice -n t3-capacity x | tail',                          # the value of -n, not the command
     'function f { t3-capacity 2048 && x; }; f | tail',
     'time -p grep t3-capacity x | head',
+    # #931: these were refused: the value glued to -u was read as a flag cluster ending in -t (a value letter)
+    'sudo -uroot cat /usr/local/bin/t3-capacity | head',
+    'sudo -uroot diff /usr/local/bin/t3-capacity scripts/dev/t3-capacity | head',
+    'sudo -ugit install -m 755 scripts/dev/t3-capacity /usr/local/bin/ 2>&1 | tail -3',
+    'time { t3-capacity 2048 && x; } | tail -3',
+    "env -S 'cat t3-capacity' | tail",
+    'env -C t3-capacity ls | tail',                         # the value of -C (a folder), not the command
+    'chrt -i 0 cat t3-capacity | tail',
+    'taskset -c 0 grep t3-capacity x | head',
+    'flock t3-capacity ls | tail',                          # the lock file, not the command
+    'chrt -p 1234 | tail',
+    'doas -a t3-capacity ls | tail',                        # the values of -a, -s and --kind, not the command
+    'runuser -s t3-capacity -u someone ls | tail',
+    'heavy --kind t3-capacity ls | tail',
+    "runuser someone -c 'grep t3-capacity x | tail'",
+    'heavy sweep --dry-run | tail',
+    'taskset -p 1234 | tail',
     'python3 -I scripts/dev/run_tests.py scripts/dev/tests/test_t3_capacity.py 2>&1 | tail -5',
     '# t3-capacity 2048 | tail -1\nls',
     'ls # t3-capacity 2048 | tail -1',
@@ -242,6 +309,8 @@ class Reads(unittest.TestCase):
         cases = {'t3-capacity 2048 | tail -1 && echo RAN': True, '(t3-capacity 2048) | tail -1 && echo RAN': True,
                  '{ t3-capacity 2048; } | tail -1 && echo RAN': True, 'x=$(t3-capacity 2048 | tail -1) && echo RAN': True,
                  "sh -c 't3-capacity 2048 | tail -1 && echo RAN'": True,
+                 "env -S 't3-capacity 2048' | tail -1 && echo RAN": True,
+                 "env -S 't3-capacity 2048' && echo RAN": False,
                  't3-capacity 2048 && echo RAN': False, 'x=$(t3-capacity 2048) && echo RAN': False,
                  '{ t3-capacity 2048 && echo RAN; } | tail -5': False, 't3-capacity 2048 > /dev/null && echo RAN': False}
         for cmd, hidden in cases.items():
@@ -249,6 +318,15 @@ class Reads(unittest.TestCase):
                 out = subprocess.run(['/bin/sh', '-c', cmd], env=env, capture_output=True, text=True, timeout=60).stdout
                 self.assertEqual('RAN' in out, hidden, out)
                 self.assertEqual(bool(G.piped(cmd)), hidden)
+        bash = shutil.which('bash')
+        if bash:   # the keyword `time` before a group is bash's (sh has no such keyword)
+            for cmd, hidden in {'time { t3-capacity 2048; } | tail -1 && echo RAN': True,
+                                'time -p { t3-capacity 2048; } 2>/dev/null | tail -1 && echo RAN': True,
+                                'time { t3-capacity 2048 && echo RAN; } 2>/dev/null | tail -5': False}.items():
+                with self.subTest(cmd):
+                    out = subprocess.run([bash, '-c', cmd], env=env, capture_output=True, text=True, timeout=60).stdout
+                    self.assertEqual('RAN' in out, hidden, out)
+                    self.assertEqual(bool(G.piped(cmd)), hidden)
 
     def test_deep_or_long_text_is_read_in_time_and_never_crashes(self):
         deep = '$(' * 3000 + 't3-capacity 1 | tail' + ')' * 3000

@@ -27,6 +27,21 @@ DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 AT_FDCWD, RENAME_EXCHANGE = -100, 2
 
 
+def _no_constant(name):
+    """json: NaN and Infinity are no JSON (json.dumps would write them back as such)."""
+    raise ValueError(f'{name} is not a JSON number')
+
+
+def _no_twice(pairs):
+    """json: a key given twice is refused, not read as its last value (which one was meant is unknown)."""
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f'key {k!r} is given twice')
+        out[k] = v
+    return out
+
+
 class Refused(Exception):
     pass
 
@@ -112,6 +127,15 @@ class Installer:
         """The kit's config.json (HAS_CONFIG)."""
         return {'version': 1}
 
+    CONFIG_KEYS = None   # the config.json keys config() owns; others (added by hand) are kept. None: written whole
+
+    def config_to_write(self, a, plan):
+        """config() plus, when CONFIG_KEYS names the kit's own keys, every other key the old config.json had."""
+        new = self.config(a, plan)
+        if self.CONFIG_KEYS is None:
+            return new
+        return dict({k: v for k, v in self.read_config().items() if k not in self.CONFIG_KEYS}, **new)
+
     def kit_step(self, step, a, plan, dest):
         """One of KIT_STEPS, after the links: the release it writes for is the one in use."""
 
@@ -191,8 +215,9 @@ class Installer:
 
     def write_file(self, path, text, mode=0o644):
         """Atomic: a temporary file in the same folder, then renamed over the old one. Unchanged text is not
-        rewritten."""
+        rewritten. Temporary files a killed earlier run left for path are removed first (drop_temp_leftovers)."""
         real = self.p(path)
+        self.drop_temp_leftovers(path)
         with contextlib.suppress(OSError):
             with open(real, encoding='utf-8') as f:
                 if f.read() == text and stat.S_IMODE(os.lstat(real).st_mode) == mode and not os.path.islink(real):
@@ -211,6 +236,25 @@ class Installer:
                 os.unlink(tmp)
             raise
         return True
+
+    def drop_temp_leftovers(self, path):
+        """Remove the temporary files write_file left beside path when a run was killed between writing one and
+        renaming it (`.NAME.XXXXXXXX.tmp`; the unlink in write_file never ran). Every write_file runs under the
+        install lock, so none of them is a write in progress. Returns the names removed."""
+        folder, name = os.path.split(self.p(path))
+        mine = re.compile(r'\.' + re.escape(name) + r'\.[a-z0-9_]{8}\.tmp\Z')
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return []
+        gone = []
+        for n in sorted(names):
+            full = os.path.join(folder, n)
+            with contextlib.suppress(FileNotFoundError):
+                if mine.match(n) and stat.S_ISREG(os.lstat(full).st_mode):
+                    os.unlink(full)
+                    gone.append(n)
+        return gone
 
     def switch_link(self, path, target):
         """Point path at target in one step (a new link renamed over the old one, or over a plain old file)."""
@@ -363,7 +407,7 @@ class Installer:
     def read_config(self):
         try:
             with open(self.p(self.CONFIG), encoding='utf-8') as f:
-                data = json.load(f)
+                data = json.load(f, parse_constant=_no_constant, object_pairs_hook=_no_twice)
         except FileNotFoundError:
             return {}
         except (OSError, ValueError) as e:
@@ -517,7 +561,8 @@ class Installer:
         done('copy')
         done('self-test')
         if self.HAS_CONFIG:
-            self.write_file(self.CONFIG, json.dumps(self.config(a, plan), indent=2, sort_keys=True) + '\n')
+            text = json.dumps(self.config_to_write(a, plan), indent=2, sort_keys=True) + '\n'
+            self.write_file(self.CONFIG, text)
         done('config')
         self.switch_link(self.CURRENT, f'{self.VERSIONS}/{a.sha}')
         done('switch')
