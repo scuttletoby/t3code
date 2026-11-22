@@ -3,7 +3,8 @@
 
   heavy <command> [args...]       run <command> in its own scope in the slice, wait for it, stop the scope
   HEAVY_KEEP=1 heavy <command>    the same, but processes the command leaves running are kept (a daemon)
-  heavy --self-check              check the config, the slice and the installed files; exit 1 on a problem
+  heavy --self-check              check the config, the slice and the installed files (exit 1 on a problem), and
+                                  warn when the t3-capacity on PATH is not this kit's
   heavy sweep [--dry-run|--json]  stop or report what commands left behind outside heavy (lib/heavy_sweep.py)
   heavy leftovers [--older-than AGE] [--json]
                                   look only: what is left behind (processes, heavy scopes, containers) older
@@ -1059,6 +1060,20 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def capacity_on_path():
+    """None when the `t3-capacity` found on PATH is this kit's bin/t3-capacity (links resolved), else why not. Only a
+    warning: a host may wire the command in itself, but another copy's readings can differ from the kit's."""
+    import shutil
+    kit = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'bin', 't3-capacity')
+    found = shutil.which('t3-capacity')
+    if found is None:
+        return f't3-capacity is not on PATH (this kit\'s is {kit}; heavy-install links /usr/local/bin/t3-capacity)'
+    if os.path.realpath(found) != os.path.realpath(kit):
+        return (f't3-capacity on PATH is {found}, not this kit\'s {kit}: its readings can differ from the kit\'s '
+                f'(heavy-install links /usr/local/bin/t3-capacity; remove the other copy or put that folder first)')
+    return None
+
+
 def self_check():
     problems = []
     try:
@@ -1095,6 +1110,8 @@ def self_check():
             problems.append(f'{path}: differs from what was installed ({kind})')
     if rows is not None:
         print(f'installed files: {len(rows)} checked')
+    warning = capacity_on_path()
+    print(f'WARNING: {warning}' if warning else 't3-capacity on PATH: this kit\'s')
     for p in problems:
         print(f'PROBLEM: {p}')
     print('self-check: ' + ('OK' if not problems else f'{len(problems)} problems'))
