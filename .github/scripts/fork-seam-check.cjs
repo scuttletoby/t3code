@@ -1081,12 +1081,9 @@ function findAnnouncementWarnings(ownFiles, baseFiles, today) {
 }
 
 /**
- * In-date announcements in main's list (`mainFiles`) that this change's own list (`ownFiles`) drops:
- * a line neither still announced nor moved to "added". Only lines the merge-base's list
- * (`baseFiles`; undefined when unreadable: main's) had too: a branch from before the announcement
- * does not have it yet, and a merge keeps it. A merge that resolved the list from an older copy
- * dropped another change's step 1 unseen (#813); a list-only change says it withdraws one, and an
- * announcement expired or dated ahead on `today` (main's commit date) may go with any change.
+ * In-date announcements in main's list that this change's own list drops (neither announced nor in
+ * "added"), counting only copies the merge-base's list had (main's when unreadable). The caller
+ * skips list-only changes, which may withdraw one; expired ones may go with any change.
  */
 function findDroppedAnnouncements(mainFiles, baseFiles, ownFiles, today) {
   const reasons = [];
@@ -1243,7 +1240,7 @@ function parseConfig(text) {
     }
   }
   // Last: the structure above is JSON.parse's reading, which keeps only the last of two equal keys
-  // (two pull requests that each add an entry for one file, #813): the other is shown but never applies.
+  // (two pull requests that each add an entry for one file): the other is shown but never applies.
   const duplicate = findDuplicateKey(text);
   if (duplicate !== undefined) {
     throw new Error(
@@ -1433,6 +1430,7 @@ function readConfigAt(rev) {
       message.startsWith(`${CONFIG}: `)
         ? `${CONFIG} at ${rev.slice(0, 12)}: ${message.slice(CONFIG.length + 2)}`
         : `${CONFIG} at ${rev.slice(0, 12)}: ${message}`,
+      { cause: error },
     );
   }
 }
@@ -1584,7 +1582,7 @@ function main(argv) {
       : { files: listEditedFiles(baseFiles, ownFiles), ...listEditedCounts(baseList, ownConfig) };
   // The "pending" files whose text this change edits. Main's tree cannot tell which line it drops
   // is upstream's: a swapped upstream line (one out, one in) keeps every count it sees, and
-  // fork-follow then refuses main (#796). Counted from upstream as fork-follow counts them: fork
+  // fork-follow then refuses main. Counted from upstream as fork-follow counts them: fork
   // lines against the own ceiling, lost lines against the own "lost" entry.
   const changedFiles = new Set(changed);
   const pendingEdited =
@@ -1726,7 +1724,7 @@ function main(argv) {
       : []),
   ];
   const expired = upstream ? findExpiredAnnouncements(config.files, commitDay(head)) : [];
-  // A change that edits its list and something else keeps main's in-date announcements (#813).
+  // A change that edits its list and something else keeps main's in-date announcements.
   const listOnly = changed.every((file) => file === CONFIG);
   const dropped =
     editsList && ownFiles !== undefined && !listOnly

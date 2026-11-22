@@ -4158,7 +4158,7 @@ test("fork-checks counts from upstream and fork-tests' shallow run passes --no-u
   assert.match(tests[0], /fork-seam-check\.cjs --no-upstream HEAD\^1 HEAD$/);
 });
 
-// #796: a pull request's run judged a "pending" file from the merge-base, where swapping an upstream
+// A pull request's run judged a "pending" file from the merge-base, where swapping an upstream
 // line for a fork line keeps every count it sees (one line out, one in), so it passed while
 // fork-follow's count from upstream refused main. Both forms now count the same lines.
 test("a change that swaps an upstream line in a pending file whose counts are reached is refused by both forms", () => {
@@ -4216,7 +4216,7 @@ test("a change that swaps an upstream line in a pending file whose counts are re
   });
 });
 
-// #813: JSON.parse keeps the last of two equal keys, so the other entry is shown but never applies.
+// JSON.parse keeps the last of two equal keys, so the other entry is shown but never applies.
 // A pull request's own list was refused for one; main's list (merged around that check) and the
 // head's list fork-follow reads were not.
 test("a list with a duplicate key is refused wherever it is read: main's, the merge-base's or fork-follow's head", () => {
@@ -4241,7 +4241,7 @@ test("a list with a duplicate key is refused wherever it is read: main's, the me
   });
 });
 
-// #813: #777's squash merge dropped every line #774 had announced, and nothing noticed. A change
+// A squash merge from a branch made before an announcement dropped its lines, and nothing noticed. A change
 // that is not list-only keeps each in-date announcement main's list has (and its merge-base had):
 // still announced, or moved to "added".
 test("a change that drops another change's in-date announcement is refused, unless list-only or expired", () => {
