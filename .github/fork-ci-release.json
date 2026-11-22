@@ -1,5 +1,5 @@
 {
-  "_comment": "The fork-ci release (.github/scripts/fork-ci-release.py, fork-ci/README.md). paths: the only files a release commit holds (fork-kit: host kits, installed from a release commit), at the same paths as on sourceBranch. legacyTags: tags made before release commits existed (they name a sourceBranch commit, not a release commit, and stay where they are).",
+  "_comment": "The fork-ci release (.github/scripts/fork-ci-release.py, fork-ci/README.md). paths: the only files a release commit holds (fork-kit: host kits, installed from a release commit; the desk and heavy kits also read the fleet scripts and the capacity rule files listed here), at the same paths as on sourceBranch; fork-ci-release.test.py fails when a kit installer reads a file outside them. legacyTags: tags made before release commits existed (they name a sourceBranch commit, not a release commit, and stay where they are).",
   "sourceBranch": "main",
   "requiredCheck": "fork-ci-result",
   "branch": "ci-release",
@@ -16,6 +16,19 @@
     ".github/scripts/fork-fleet-walls",
     ".github/scripts/fork-fleet-launch.sh",
     ".github/scripts/fork-fleet-job-paths.txt",
+    ".github/scripts/fork-fleet-desk-agent.py",
+    ".github/scripts/fork-fleet-desk-agent.service",
+    ".github/scripts/fork-fleet-desk-seed.py",
+    ".github/scripts/fork-fleet-desk-wire.py",
+    ".github/scripts/fork-fleet-hook.sh",
+    ".github/scripts/fork-fleet-refresh.service",
+    ".github/scripts/fork-fleet-refresh.timer",
+    ".github/scripts/fork-fleet-seed.service",
+    ".github/scripts/fork-fleet-seed.timer",
+    ".github/fork-fleet.json",
+    "packages/shared/src/capacity/capacity-rule.json",
+    "packages/shared/src/capacity/capacity-format.json",
+    "packages/shared/src/capacity/capacity-vectors.json",
     "scripts/install.sh"
   ]
 }
