@@ -171,24 +171,32 @@ function readList(text) {
     .map((line) => line.replace(/#.*/, "").trim())
     .filter(Boolean)
     .map((line) => {
-      const match = line.match(/^(\S+)(?:\s+~([1-9]\d{0,4})s|\s+run by\s+(\S+))?(\s+ok lines)?$/);
+      const match = line.match(
+        /^(\S+)(?:\s+~([1-9]\d{0,4})s|\s+run by\s+(\S+))?(?:\s+(unittest|ok lines))?$/,
+      );
       if (!match)
         throw new Error(
           `${LIST}: cannot read "${line}" (expected "<test>", "<test> ~<seconds>s" or "<test> run by <file>", ` +
-            `each optionally ending in "ok lines")`,
+            `a Python test's then ending in its format: "unittest" or "ok lines")`,
         );
-      // Only a Python test has two formats (countTests()): unittest unless it says "ok lines".
-      if (match[4] && !match[1].endsWith(".py"))
+      // A Python test has two formats (countTests()), and says which: none is read as the other.
+      const python = match[1].endsWith(".py");
+      if (match[4] && !python)
         throw new Error(
-          `${LIST}: "${line}": only a Python test says "ok lines" (a shell test always prints them, a node test ` +
-            `never does)`,
+          `${LIST}: "${line}": only a Python test says "${match[4]}" (a shell test always prints ok lines, a ` +
+            `node test never does)`,
+        );
+      if (!match[4] && python)
+        throw new Error(
+          `${LIST}: "${line}": a Python test says its format at the end of its line: "unittest" (its tests ` +
+            `are unittest tests) or "ok lines" (it prints ok lines and its end line)`,
         );
       return {
         file: match[1],
         // `./a/b` and `a//b` name the same file as `a/b`, so every reader compares one spelling.
         runBy: match[3] ? path.posix.normalize(match[3]) : null,
         weight: match[2] ? Number(match[2]) : null,
-        format: match[1].endsWith(".py") ? (match[4] ? "ok lines" : "unittest") : null,
+        format: match[4] ?? null,
       };
     });
 }
@@ -446,9 +454,9 @@ const isEnd = (u) =>
   u.unloaded.every((n) => typeof n === "string" && TEST_NAME.test(n));
 
 // What a test ran, { format, tests, skipped, names, unloaded, failed, note }, or null (no count; tests null: none known
-// to have run, `note` says why). `how`: the list's Python format and the own run's `only`. Python unittest: the shim's
-// plan and counts per run, then its end line, whose `unloaded` tests count as skipped by name; node: its one line;
-// else stdout's ok, FAIL and `skip <name>` lines, ending in OK_LINES_FORM with the same counts.
+// to have run, `note` says why). `how`: the list's Python format (none: no count) and the own run's `only`. Python
+// unittest: the shim's plan and counts per run, then its end line, whose `unloaded` tests count as skipped by name;
+// node: its one line; else stdout's ok, FAIL and `skip <name>` lines, ending in OK_LINES_FORM with the same counts.
 function countTests(file, stdout, stderr, lines = [], how = {}) {
   const ext = file.match(TEST_FILE)?.[1];
   const whole = (n) => Number.isInteger(n) && n >= 0;
@@ -461,7 +469,12 @@ function countTests(file, stdout, stderr, lines = [], how = {}) {
     failed: null,
     note,
   });
-  const format = ext === "py" ? (how.format ?? "unittest") : null;
+  const format = ext === "py" ? (how.format ?? null) : null;
+  if (ext === "py" && format !== "unittest" && format !== "ok lines")
+    return none(
+      null,
+      `${LIST} declares no format for it ("unittest" or "ok lines"), so it cannot be read`,
+    );
   const shimEnd = ext === "py" && isEnd(lines.at(-1)) ? lines.at(-1) : null;
   if (format === "ok lines") {
     if (lines.length !== 1 || !shimEnd)
@@ -483,7 +496,7 @@ function countTests(file, stdout, stderr, lines = [], how = {}) {
       return none(
         "unittest",
         "fork-ci-unittest.py wrote no line: it stopped hard before its first unittest run (while it loads?) and " +
-          `never reached its end; a Python test that prints ok lines says "ok lines" in ${LIST}`,
+          `never reached its end; a Python test that prints ok lines says "ok lines" in ${LIST}, not "unittest"`,
       );
     const runs = [];
     const open = [];
@@ -515,7 +528,7 @@ function countTests(file, stdout, stderr, lines = [], how = {}) {
       return none(
         "unittest",
         "it started no unittest run (an exit before unittest.main?); a Python test that prints ok lines says " +
-          `"ok lines" in ${LIST}`,
+          `"ok lines" in ${LIST}, not "unittest"`,
       );
     // An own run's `only`: one class (its tests and its nested classes' count), or one test (that test only).
     const unloaded = how.only
@@ -636,7 +649,7 @@ function recordProblems(record) {
 }
 
 // `allowed`: the tests the run may and must skip, from the test's declarations (the plan), never from what ran.
-// `format`: a Python test's, as the list declares it (readList(); none: unittest).
+// `format`: a Python test's, as the list declares it (readList(); none: no count).
 function record(key, file, run, result, allowed, format = null) {
   const counts = countTests(file, result.stdout ?? "", result.stderr ?? "", result.unittest ?? [], {
     format,

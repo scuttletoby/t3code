@@ -21,11 +21,12 @@ const decodeRepoFile = Schema.decodeUnknownSync(T3ProjectFile);
 const ON = { mode: "handoff" } as const;
 
 describe("handoff settings", () => {
-  it("defaults to off, the agent as source, a 150K backstop and a 75K idle size", () => {
+  it("defaults to off, no source, a 150K backstop and a 75K idle size", () => {
     expect(DEFAULT_HANDOFF_SETTINGS).toEqual({
       mode: "off",
       threads: {},
-      source: "agent",
+      // Not `agent`: settings saved without a source start no write turns (they read as before).
+      source: "none",
       instructions: "",
       sizeTokens: 150_000,
       idleTokens: 75_000,
@@ -35,6 +36,15 @@ describe("handoff settings", () => {
   it("reads old settings without the key as off", () => {
     expect(readFile(undefined)).toEqual(DEFAULT_HANDOFF_SETTINGS);
     expect(decodeProject({}).handoff).toBeUndefined();
+  });
+
+  it("reads a handoff saved without a source as `none`; `agent` only when it is set", () => {
+    // Old settings: `mode: handoff` alone keeps its handoffs (parts 1, 3 and 4), no write turns.
+    expect(readFile(ON).source).toBe("none");
+    expect(readFile({ ...ON, source: "agent" }).source).toBe("agent");
+    // A save writes the value sparse, defaults left out: a chosen `agent` stays in the file.
+    const encode = Schema.encodeSync(HandoffSettings);
+    expect(encode(decodeHandoff({ ...ON, source: "agent" }))).toMatchObject({ source: "agent" });
   });
 
   it("reads a good value as written", () => {
