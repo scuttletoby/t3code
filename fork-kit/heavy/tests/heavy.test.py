@@ -177,12 +177,13 @@ class Heavy(unittest.TestCase):
         """Shell text that starts a sleeper which leaves its parent and its session (a daemon's double fork)."""
         return f'(setsid {self.sleeper} &)'
 
-    def settled(self, n):
-        """Shell text that waits (at most 10 s) until n processes of the command's own scope are sleepers: a forked
-        `sh` that has not exec'd yet would otherwise be named as a leftover `sh`."""
+    def settled(self, n, names='sleeper'):
+        """Shell text that waits (at most 10 s) until n processes of the command's own scope run one of NAMES (words):
+        a forked `sh` that has not exec'd yet would otherwise be named as a leftover `sh` (#981: once at load 14)."""
+        match = ' || '.join(f'[ "$x" = {w} ]' for w in names.split())
         return ('cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup); i=0; while [ $i -lt 200 ]; do c=0; '
-                'for p in $(cat "$cg/cgroup.procs"); do [ "$(cat /proc/$p/comm 2>/dev/null)" = sleeper ] && '
-                f'c=$((c + 1)); done; [ $c -ge {n} ] && break; i=$((i + 1)); sleep 0.05; done')
+                'for p in $(cat "$cg/cgroup.procs"); do x=$(cat /proc/$p/comm 2>/dev/null); '
+                f'{{ {match}; }} && c=$((c + 1)); done; [ $c -ge {n} ] && break; i=$((i + 1)); sleep 0.05; done')
 
     def guards(self):
         """Pids of this test's heavy guards: named scope-guard, with heavy's command line (it names the test folder)."""
@@ -293,7 +294,8 @@ class Heavy(unittest.TestCase):
     # --- leftovers -----------------------------------------------------------------------------------------------
 
     def test_leftover_child_is_stopped_and_named(self):
-        r = self.heavy('sh', '-c', f'{self.spin} & {self.sleeper} & exit 0')
+        # #981 leftover 7: without settled() the shell can exit before its children exec, and heavy names them "sh"
+        r = self.heavy('sh', '-c', f'{self.spin} & {self.sleeper} & {self.settled(2, "spin sleeper")}; exit 0')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ours(), [], 'leftovers still running after heavy returned')
         lines = self.heavy_lines(r.stderr)
@@ -301,7 +303,7 @@ class Heavy(unittest.TestCase):
         self.assertRegex(lines[0], r'^heavy: stopped 2 leftover processes \((spin, sleeper|sleeper, spin)\)$')
 
     def test_leftover_after_a_failing_command_keeps_the_exit_code(self):
-        r = self.heavy('sh', '-c', f'{self.sleeper} & exit 5')
+        r = self.heavy('sh', '-c', f'{self.sleeper} & {self.settled(1)}; exit 5')
         self.assertEqual(r.returncode, 5)
         self.assertEqual(self.ours(), [])
         self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 1 leftover process (sleeper)'])
@@ -320,14 +322,14 @@ class Heavy(unittest.TestCase):
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, 'out\n', 'err\n'))
 
     def test_nested_heavy_reports_once_and_leaves_nothing(self):
-        r = self.heavy(HEAVY, 'sh', '-c', f'{self.sleeper} & exit 0')
+        r = self.heavy(HEAVY, 'sh', '-c', f'{self.sleeper} & {self.settled(1)}; exit 0')
         self.assertEqual(r.returncode, 0)
         self.assertEqual(self.ours(), [])
         self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 1 leftover process (sleeper)'])
 
     def test_keep_leaves_the_daemon_and_says_so(self):
         env = dict(self.env, HEAVY_KEEP='1')
-        r = self.heavy('sh', '-c', f'{self.sleeper} & exit 0', env=env)
+        r = self.heavy('sh', '-c', f'{self.sleeper} & {self.settled(1)}; exit 0', env=env)
         self.assertEqual(r.returncode, 0)
         lines = self.heavy_lines(r.stderr)
         self.assertEqual(len(lines), 1, r.stderr)
@@ -538,7 +540,7 @@ class Heavy(unittest.TestCase):
         self.assertRegex(owner, r'scope=heavy-keep-sh-[0-9a-f]{8}\.scope$')
 
     def test_docker_missing_or_down_never_changes_the_run(self):
-        r = self.heavy('sh', '-c', f'{self.sleeper} & exit 3',
+        r = self.heavy('sh', '-c', f'{self.sleeper} & {self.settled(1)}; exit 3',
                        env=dict(self.env, HEAVY_DOCKER=os.path.join(self.dir, 'no-docker')))
         self.assertEqual(r.returncode, 3)
         self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 1 leftover process (sleeper)'])
@@ -1307,6 +1309,19 @@ class Parts(unittest.TestCase):
         self.assertEqual(state(mine, pw_home)[:2], (labelled(pw_home), os.path.join(pw_home, '.local', 'state')))
         self.assertFalse(os.path.exists(os.path.join(mine, '.local')))
         os.chmod(mine, 0o700)
+        # #951 item 4: this user's own home (700) in a folder others can write and that is not sticky: they could
+        # rename the home away and put their own in its place, so it is not used; the passwd home, or none at all
+        loose = os.path.join(self.dir, 'loose')
+        os.mkdir(loose)
+        os.chmod(loose, 0o777)
+        inside = os.path.join(loose, 'me')
+        os.mkdir(inside, 0o700)
+        self.assertEqual(state(inside, None), ('', '', ''))
+        self.assertEqual(state(inside, pw_home)[:2], (labelled(pw_home), os.path.join(pw_home, '.local', 'state')))
+        self.assertEqual(os.listdir(inside), [], 'a folder was made in a home someone else could swap')
+        os.chmod(loose, 0o1777)                     # sticky, as /tmp is: only its owner can rename the home
+        self.assertEqual(state(inside, None)[0], labelled(inside))
+        shutil.rmtree(os.path.join(inside, '.local'))
         # #771 item 1: a ~/.local others can write is not used (they could swap state for a link): no second folder,
         # nothing made in it; only this user's again: used
         os.mkdir(os.path.join(mine, '.local'), 0o700)

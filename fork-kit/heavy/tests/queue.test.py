@@ -470,6 +470,38 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(len([x for x in self.lines if x.startswith('waiting for capacity: level elevated')]), 1,
                          'said once while the reason stays the same')
 
+    def test_a_slow_first_answer_that_is_free_says_nothing(self):
+        """#981 leftover 1: the "free after waiting" line is said only after at least one answer that was not free.
+        A first ask that itself takes a second or more (a loaded machine) is no wait, and a heavy that says nothing
+        else must still say nothing (heavy.test.py counts its `heavy:` lines)."""
+        hq = self.hq()
+
+        def slow_free():
+            self.clock.t += 1.5                     # the ask itself takes 1.5 s
+            return True, 'free'
+        self.lines.clear()
+        waited = hq.capacity_wait(slow_free, 600, 2, out=self.lines.append, monotonic=self.clock.monotonic,
+                                  sleep=self.clock.sleep)
+        self.assertEqual((waited, self.lines), (1.5, []))
+        answers = iter([(False, 'busy'), (True, 'free')])
+        hq.capacity_wait(lambda: next(answers), 600, 2, out=self.lines.append, monotonic=self.clock.monotonic,
+                         sleep=self.clock.sleep)
+        self.assertEqual(self.lines[-1], 'the capacity check says free after waiting 2s', 'a real wait is said')
+
+    def test_a_queued_job_admitted_at_its_first_slow_look_says_nothing(self):
+        """The same rule for the queue's "admitted after waiting" line: only after a look that said not now."""
+        hq = self.hq()
+
+        def slow_capacity(kind, mb):
+            self.clock.t += 1.5
+            return True, 'free'
+        q = hq.Queue(self.host.box, self.cfg, now=self.clock.now, sleep=self.clock.sleep,
+                     monotonic=self.clock.monotonic, out=self.lines.append, capacity=slow_capacity)
+        self.lines.clear()
+        t = q.enter('gradle', 2048, 'heavy-gradle-1.scope', 'gradlew', 60)
+        self.assertEqual((t.state, self.lines), ('admitted', []))
+        hq.release(q, t)
+
     def test_a_job_without_kind_gives_up_and_a_broken_check_is_not_free(self):
         hq = self.hq()
 
@@ -1202,7 +1234,7 @@ class CommandLine(unittest.TestCase):
             return hq.machine_file.fields({'capacityCheck': check_on, 'pollSeconds': 0.2}, hq.SETTINGS, 'test')
         hq.settings = settings
         heavy.queue_module = lambda: hq
-        heavy.capacity_check = lambda: check
+        heavy.capacity_check = lambda *a: check
         heavy.tool = lambda name: '/bin/false'
         heavy.check_slice = lambda *a: '/user.slice/heavy.slice'
         heavy.in_heavy_scope = lambda *a: nested
@@ -1210,6 +1242,31 @@ class CommandLine(unittest.TestCase):
         heavy.run_scope = lambda *a, **k: ran.append(a[0]) or 0
         code = heavy.run(argv, {'slice': 'heavy.slice', 'grace_seconds': 30}, job)
         return code, asked, ran, said
+
+    def test_the_new_scope_is_found_under_the_queue_lock_without_asking_systemd(self):
+        """#981 leftover 3: scope_counted runs under the queue lock, which a hung user manager must never hold (its
+        `systemctl show` waits up to 30 s, the queue verbs only 30 s for the lock). A slice that was not active
+        before is read from the child's own cgroup: the scope's parent. Runs again: a known slice is kept."""
+        hq = load_module('heavy_queue_scope', QUEUE)
+        asked = []
+        p = subprocess.Popen(['sleep', '30'])
+        self.addCleanup(lambda: (p.kill(), p.wait(timeout=60)))
+        with open(f'/proc/{p.pid}/cgroup') as f:
+            parent, _, unit = next(x[3:].strip() for x in f if x.startswith('0::')).rpartition('/')
+        root = tempfile.mkdtemp(prefix='heavy-scope-root-')
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        os.makedirs(root + parent + '/' + unit)
+        with open(root + parent + '/' + unit + '/memory.stat', 'w') as f:
+            f.write('anon 0\n')
+        box = hq.Box('heavy.slice', '', None, cg_root=root, queue_root=root,
+                     resolve=lambda: asked.append(1) or time.sleep(2) or '')
+        start = time.monotonic()
+        self.assertTrue(self.heavy.scope_counted(box, unit, p, limit=5))
+        self.assertEqual((asked, box.slice_cg), ([], parent))
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertTrue(self.heavy.scope_counted(box, unit, p, limit=5), 'runs again: the slice is kept')
+        self.assertFalse(self.heavy.scope_counted(hq.Box('heavy.slice', '', None, cg_root=root, queue_root=root),
+                                                  'heavy-other-0.scope', p, limit=0.3), 'another scope: not it')
 
     def test_heavy_without_kind_asks_the_capacity_rule_before_it_starts(self):
         # #866: a test started right after a NOT OK (`check ; test`) still waits: heavy asks the rule itself
