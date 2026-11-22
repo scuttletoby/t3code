@@ -6,9 +6,9 @@ request per round. T3 runs the session; the project's **adapter** does everythin
 target. This page is what an adapter must do. The settings are
 [`server.playtest` and `projectOverride.playtest`](README.md#serverplaytest).
 
-Status: the settings, this contract, the session store and the worker (renew, the limits, ends
-for gone threads) exist. The `playtest` tool and the thread controls come in later pull requests and
-follow this page.
+Status: the settings, this contract, the session store, the worker (renew, the limits, ends for
+gone threads) and the agent's `playtest` tool exist. The thread controls come in a later pull
+request and follow this page.
 
 ## The steps
 
@@ -109,6 +109,27 @@ why it ended and its last round. A thread has at most one session that is not en
   claims expire on the target by themselves. A file with no version or an older one is handled the
   same way: copied aside, its sessions kept, written again as the current version. A file from a
   newer T3 is not read or written: every playtest call is refused until that T3 runs again.
+
+## The `playtest` tool
+
+An agent runs its session with one T3 tool, `playtest`, in a tool group of its own, `playtest` (a
+profile that keeps `waits` does not get it). It acts on the calling thread's own session only: the
+thread comes from the agent's T3 credential, and the tool takes no thread and no setting.
+
+| `action` | What it does                                                                                     |
+| -------- | ------------------------------------------------------------------------------------------------ |
+| `start`  | Claims `target` (and passes the optional `note`). Again for the target that is on: same session. |
+| `push`   | Runs one round on the thread's worktree and answers when the round ended.                        |
+| `status` | The thread's session, or its last one, with the last round and the step that runs now.           |
+| `end`    | Ends the session and releases the target. With no session: nothing to end (not an error).        |
+
+The answer names what happened and what to do next. Refusals are plain: playtest off ("only a
+person can switch it on in the settings"), busy (a round runs: wait for it, or end the session),
+no session (start one), a thread that is gone. `start` and `push` need a full-access thread not in
+plan mode, by the thread's modes as T3 records them at each call (they run the person's steps
+outside the thread's sandbox, without an approval); any other thread is refused with what to do.
+`status` and `end` work in every thread, so a restricted thread can still release its target. An
+outside MCP client (not in a T3 thread) is not offered the tool; a read-only client cannot use it.
 
 ## The worker
 

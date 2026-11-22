@@ -191,13 +191,20 @@ const world = Effect.fnUntraced(function* (usage: {
             if (state.serverRead !== null) yield* Deferred.succeed(state.serverRead, undefined);
             return {
               ...DEFAULT_SERVER_SETTINGS,
-              handoff: { ...DEFAULT_HANDOFF_SETTINGS, mode: "handoff" as const },
+              // The `command` source: the `agent` source's write turn is a run of its own.
+              handoff: {
+                ...DEFAULT_HANDOFF_SETTINGS,
+                mode: "handoff" as const,
+                source: "command" as const,
+                command: ["state"],
+              },
             };
           }),
         }),
         adapterRegistry(),
-        // The agent source: no command runs.
-        Layer.mock(HandoffCommand.HandoffCommand)({}),
+        Layer.mock(HandoffCommand.HandoffCommand)({
+          run: () => Effect.succeed({ ok: true as const, text: "STATE" }),
+        }),
       ),
     ),
   );
@@ -497,8 +504,8 @@ describe("handoff alerts through upstream's relay", () => {
       });
       yield* wait(MINUTE_MS);
       yield* endRun(runId1, "completed");
-      // The agent source opens the window 4 minutes before the cache expires: at 6 minutes.
-      yield* wait(6 * MINUTE_MS);
+      // The command source opens the window 2 minutes before the cache expires: at 8 minutes.
+      yield* wait(8 * MINUTE_MS);
       expect(runIds()).toEqual([runId1]);
       yield* wait(HANDOFF_SETTLE_MS);
       expect(runIds()).toEqual([runId1, handoffRunId]);
