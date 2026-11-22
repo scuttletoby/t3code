@@ -1,0 +1,50 @@
+{
+  ".github/workflows/windows-tests.yml": {
+    "(top-level)": {
+      "header": "e3b0c44298fc1c14",
+      "steps": [
+        {
+          "name": "on",
+          "digest": "f2709c1428c909d6"
+        },
+        {
+          "name": "permissions",
+          "digest": "893e619df25e8e99"
+        }
+      ]
+    },
+    "test": {
+      "header": "613d25928473f238",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "559b4f87dd8f2003"
+        },
+        {
+          "name": "Setup Vite+",
+          "digest": "6710cb57829890c8"
+        },
+        {
+          "name": "Resolve package cache path",
+          "digest": "32b9a89e60aad158"
+        },
+        {
+          "name": "Cache packages",
+          "digest": "85929653e9318c3a"
+        },
+        {
+          "name": "Install",
+          "digest": "9ea707acf27df30a"
+        },
+        {
+          "name": "Ensure Electron runtime is installed",
+          "digest": "2f013d2a590d1e58"
+        },
+        {
+          "name": "Test",
+          "digest": "658d0121315333b0"
+        }
+      ]
+    }
+  }
+}
