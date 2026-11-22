@@ -11,6 +11,8 @@ const WEIGHTS: ReadonlyArray<ReviewWeight> = ["critical", "normal", "light"];
 
 /** A `review` block of the repo's pr-queue config, as the gate's parser accepts it. */
 export interface ReviewBlock {
+  /** shadow: the gate requires only its required-lenses input; enforce: the path rules' lenses join it. */
+  readonly mode?: "shadow" | "enforce";
   readonly rules: ReadonlyArray<{
     readonly name: string;
     readonly weight: ReviewWeight;
