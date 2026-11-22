@@ -19,6 +19,7 @@ import { TestClock } from "effect/testing";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
+import { Playtest } from "../../../playtest/PlaytestLayer.ts";
 import { ServerSettingsService } from "../../../serverSettings.ts";
 import type { WaitDelivery } from "../../../waits/WaitDelivery.ts";
 import * as WaitService from "../../../waits/WaitService.ts";
@@ -100,9 +101,10 @@ const toolsLayer = (input: {
   const base = Layer.mergeAll(
     ServerSettingsService.layerTest(input.settings ?? {}),
     threadsLayer(input.shells ?? new Map([[CALLER, callerShell()]])),
-    // task_list's services; these tests never call it.
+    // task_list's and playtest's services; these tests never call them.
     Layer.mock(RemoteDelegation.RemoteDelegation)({}),
     Layer.mock(PeerForwarding.PeerForwarding)({}),
+    Layer.mock(Playtest)({ filePath: "unused" }),
   );
   const made = WaitService.make({
     filePath: input.filePath,
@@ -702,9 +704,9 @@ it.layer(NodeServices.layer)("wait tools", (it) => {
           }));
           assert.deepStrictEqual(
             all.map((tool) => tool.name),
-            ["wait_for", "wait_list", "wait_cancel", "task_list"],
+            ["wait_for", "wait_list", "wait_cancel", "task_list", "playtest"],
           );
-          // task_list shares the toolkit; its own budget is ForkAgentContextBudget's.
+          // task_list and playtest share the toolkit; their budget is ForkAgentContextBudget's.
           const listed = all.filter((tool) => tool.name.startsWith("wait_"));
           const total = listed.reduce((sum, tool) => sum + tool.description.length, 0);
           assert.isAtMost(total, 900);

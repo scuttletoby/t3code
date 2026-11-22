@@ -17,8 +17,11 @@ import { ModelSelection } from "./modelSelection.ts";
 export const HandoffMode = Schema.Literals(["off", "compact", "handoff"]);
 export type HandoffMode = typeof HandoffMode.Type;
 
-/** `command`: a program prints the handoff. `agent`: the old session writes it in one turn. */
-export const HandoffSource = Schema.Literals(["command", "agent"]);
+/**
+ * `none` (the default): parts 1, 3 and 4 only, as before the sources existed. `command`: a program
+ * prints the handoff. `agent`: the old session writes it in one turn, only when set.
+ */
+export const HandoffSource = Schema.Literals(["none", "command", "agent"]);
 export type HandoffSource = typeof HandoffSource.Type;
 
 /** At most this many per-thread modes. */
@@ -45,7 +48,8 @@ const HandoffSettingsStruct = Schema.Struct({
       ),
     )
     .pipe(Schema.withDecodingDefault(Effect.succeed({}))),
-  source: HandoffSource.pipe(Schema.withDecodingDefault(Effect.succeed("agent"))),
+  // Not `agent`: settings saved before the sources existed must not start write turns unasked.
+  source: HandoffSource.pipe(Schema.withDecodingDefault(Effect.succeed("none"))),
   /**
    * For `source: command`: program and fixed arguments, run without a shell. It must only read and
    * be safe to run twice. Only the person's settings set it, never an agent or a repository file.
@@ -84,7 +88,7 @@ export const HandoffSettings = HandoffSettingsStruct.check(
 );
 export type HandoffSettings = typeof HandoffSettings.Type;
 
-/** Off, no thread modes, the agent writes, 150K backstop, 75K idle. */
+/** Off, no thread modes, no source (T3's state only), 150K backstop, 75K idle. */
 export const DEFAULT_HANDOFF_SETTINGS: HandoffSettings = Schema.decodeSync(HandoffSettings)({});
 
 const decodeHandoffSettingsOption = Schema.decodeUnknownOption(HandoffSettings);

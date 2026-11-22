@@ -5,8 +5,9 @@ in [capacity-rule.json](capacity-rule.json). [capacity-vectors.json](capacity-ve
 every evaluator must answer the same way (each incident that led to today's fixed limits is one of them).
 [capacity-format.json](capacity-format.json) is the shape of both files. Evaluators today: TypeScript
 ([../capacityRule.ts](../capacityRule.ts), format check [../capacityFormat.ts](../capacityFormat.ts), vector
-runner [../capacityVectors.ts](../capacityVectors.ts)); the host kit's Python one comes later and runs the same vectors from
-this folder (its installer copies the three files).
+runner [../capacityVectors.ts](../capacityVectors.ts)) and the host kit's Python one
+(`fork-kit/heavy/lib/capacity_rule.py`), which runs the same vectors from this folder (its installer copies the
+three files).
 
 ## The rule
 
@@ -85,7 +86,8 @@ clock means no step down; a clock that went back restarts the wait.
 
 [../capacityReadings.ts](../capacityReadings.ts) reads the machine through a small host (files,
 commands, Node's numbers) that tests replace with the fixtures in
-[capacity-readings.json](capacity-readings.json); the kit's Python reader runs the same cases later. It
+[capacity-readings.json](capacity-readings.json); the kit's Python reader (`fork-kit/heavy/lib/capacity_readings.py`)
+runs the same cases and must give the same answers. It
 keeps nothing: no timer, no cache, no file written. `readMachine` gives `totalMb`, `availableMb`,
 `cpuCores`, `swap`, `psi`, `osLevel` (total and available from one read, total never kept);
 `readBoxPsi` a box's PSI; `readPieceDemand` one piece's demand (`gone` when its cgroup ended between

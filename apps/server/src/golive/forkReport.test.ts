@@ -1123,6 +1123,9 @@ describe("__fork-report settings", () => {
     mcpSubagentProfile: "MCP profiles: nothing applies a profile yet",
     mcpThreadProfiles: "MCP profiles: nothing applies a profile yet",
     mcpCarriedProfiles: "only narrows: refuses tasks another machine carried a profile with",
+    placement: "placement: settings only so far; nothing reads them yet (later placement rows)",
+    placementNeeds:
+      "placement: settings only so far; nothing reads them yet (later placement rows)",
   };
 
   it("counts every fork setting as a feature or names why it is not a switch", () => {
