@@ -43,6 +43,7 @@ import {
   resolveMcpProfile,
 } from "./mcpProfile.ts";
 import { makeClaudeAgentModelPolicyHook } from "./claudeAgentModelPolicy.ts";
+import { decodeSettingsFileSilently } from "./settingsFileRead.ts";
 import {
   MAX_T3_TOOL_SETS,
   type T3ToolSet,
@@ -455,7 +456,11 @@ const settingsFileReader = Effect.gen(function* () {
       return { kind: "missing", settings: managed.applyLocks(managed.defaults) };
     }
     const raw = yield* fs.readFileString(settingsPath);
-    const decoded = ServerSettingsService.decodeSettingsFileText(raw, managed.withDefaults);
+    const decoded = decodeSettingsFileSilently(
+      raw,
+      managed.withDefaults,
+      ServerSettingsService.decodePersistedSettings,
+    );
     if (Exit.isSuccess(decoded) && !ServerSettingsService.settingsFileLegacyKeysUnreadable(raw)) {
       return { kind: "decoded", settings: managed.applyLocks(decoded.value) };
     }
