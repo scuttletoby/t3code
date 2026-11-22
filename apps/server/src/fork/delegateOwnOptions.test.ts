@@ -621,12 +621,22 @@ describe("a child's own options, remote delegate_task", () => {
           `claimed ${driverKind}`,
         );
       }
-      // The rows themselves allow the model with no effort named: sent.
+      // The rows themselves allow the model with no effort named (and ultracode named off, which a
+      // pick sent there must name for a claudeAgent row): sent.
       assert.deepStrictEqual(
-        yield* sentTarget({ driverKind: "claudeAgent", model: OPENCODE.model }, "enforce", {
-          settings: claimRows,
-        }),
-        [{ environmentId: box, driverKind: "claudeAgent", model: OPENCODE.model, options: [] }],
+        yield* sentTarget(
+          { driverKind: "claudeAgent", model: OPENCODE.model, options: { ultracode: false } },
+          "enforce",
+          { settings: claimRows },
+        ),
+        [
+          {
+            environmentId: box,
+            driverKind: "claudeAgent",
+            model: OPENCODE.model,
+            options: [{ id: "ultracode", value: false }],
+          },
+        ],
       );
       assert.deepStrictEqual(yield* sentTarget({ model: OPENCODE.model }, "enforce"), [
         { environmentId: box, model: OPENCODE.model, options: [] },

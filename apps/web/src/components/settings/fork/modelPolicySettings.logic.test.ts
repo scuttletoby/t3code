@@ -283,6 +283,41 @@ describe("personModelPickMarks: the outside policy mark (#125)", () => {
     ).toContain("names no effort under effort");
   });
 
+  it("reads the instance of the machine whose settings hold the picks, not another machine's with the same id (#802)", () => {
+    const acpOn = (environmentId: string, control: string) => ({
+      environmentId,
+      instanceId: "acp",
+      driver: "acpRegistry",
+      models: [
+        {
+          slug: "acp-model",
+          capabilities: {
+            optionDescriptors: [{ id: control, type: "select", role: "reasoning" }],
+          },
+        },
+      ],
+    });
+    // The primary is listed first; the picks are the second machine's.
+    const both = [acpOn("primary", "effort_level"), acpOn("second", "thought_level")];
+    const rows = [{ driver: "acpRegistry", model: "acp-model", efforts: ["high"] }];
+    const mark = (environmentId: string) =>
+      personModelPickMarks(
+        policy("enforce", rows),
+        {
+          defaultModelSelection: {
+            instanceId: "acp",
+            model: "acp-model",
+            options: [{ id: "thought_level", value: "high" }],
+          },
+        } as never,
+        both,
+        environmentId,
+      )[0]?.outside;
+    expect(mark("second")).toBeNull();
+    // The primary's list reads only effort_level: thought_level there names no effort.
+    expect(mark("primary")).toBe("acp-model needs an effort from its row, and the pick names none");
+  });
+
   it("marks nothing while the policy is off or cannot be read; empty rows mark every pick", () => {
     expect(personModelPickMarks(policy("off"), picks, providers)).toEqual([]);
     expect(
