@@ -1,6 +1,7 @@
 import { OrchestratorMcpFailure, type ServerSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Environment from "../../../environment/ServerEnvironment.ts";
+import * as EnvironmentFacts from "../../../fork/environmentFacts.ts"; // Fork (P3): facts out
 import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandExecutor.ts";
 import * as Settings from "../../../serverSettings.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -51,6 +52,7 @@ export const layer = McpToolAccess.toLayer(EnvironmentToolkit, {
         serverVersion: descriptor.serverVersion,
         platform: descriptor.platform,
         preferences: preferences(current),
+        ...(yield* EnvironmentFacts.read), // Fork (P3): facts out
       };
     }),
   ),
