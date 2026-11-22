@@ -1250,7 +1250,7 @@ STATE_ROOT = ''         # '' = ~/.local/state (bin/heavy STATE_ROOT)
 def others_can_swap(path):
     """True when a folder above `path` (links resolved) is not root's or this user's, or a group or others can write it
     and it is not sticky: someone else could swap a part of the path after it was checked (#951; bin/heavy
-    others_can_swap and lib/heavy_facts.py swappable, the same rule)."""
+    others_can_swap and lib/heavy_facts.py swappable, the same rule: tests/facts.test.py OneRule checks they agree)."""
     uid, at = os.geteuid(), path
     while at != '/':
         at = os.path.dirname(at)

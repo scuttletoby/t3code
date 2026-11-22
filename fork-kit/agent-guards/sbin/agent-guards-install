@@ -13,7 +13,9 @@ fork-kit/common/{machine_file,kit_install}.py of one release into /usr/local/lib
 and only root can change; --no-settings removes it. The choice is kept in /etc/agent-guards/config.json, so a run
 without either option keeps it (the first install: no drop-in). The drop-in is written only after the links, so a
 hook it names is always there. Safe to run again, and to stop at any step; one installer at a time. The steps every
-kit shares are in fork-kit/common/kit_install.py.
+kit shares are in fork-kit/common/kit_install.py. A run killed while writing a file leaves its temporary copy
+(`.agent-guards.json.XXXXXXXX.tmp`, which names the hooks); the next run removes it, uninstall too. Keys of
+config.json other than the kit's own (version, settings, settingsOff), added by hand, are kept.
 
 Rolling back is `install --no-settings`: the hooks stay, new sessions no longer run them. A session that started
 while the hooks were wired keeps running the hooks it started with, so uninstall (which removes the hook files)
@@ -55,6 +57,7 @@ class AgentGuardsInstaller(kit_install.Installer):
     MODULES = ('__init__', 'approval', 'check', 'config', 'wiring')
     HELP = ('bin/agent-guards', 'agent-guards check')
     HAS_CONFIG = True
+    CONFIG_KEYS = ('version', 'settings', 'settingsOff')   # other keys of config.json (added by hand) are kept
     KIT_STEPS = ('settings',)
 
     def add_install_options(self, parser):
@@ -125,6 +128,7 @@ class AgentGuardsInstaller(kit_install.Installer):
         as older, never fewer). "settings" becomes false with it, so a later install without an option keeps the
         drop-in off (an uninstall that refuses has already removed it)."""
         cfg = self.read_config()
+        self.drop_temp_leftovers(wiring.DROP_IN)   # a killed write's copy of the drop-in names the hooks too
         if self.drop_in_ours():
             if cfg.get('settingsOff') != 'pending':
                 self.write_file(self.CONFIG, json.dumps(dict(cfg, settings=False, settingsOff='pending'), indent=2,
