@@ -4,7 +4,7 @@
  * orchestration code. Without that service a new pointer is refused: fail closed.
  */
 import type { ServerSettings, ThreadId, ThreadRoles } from "@t3tools/contracts";
-import { Context, Effect, Option } from "effect";
+import { Context, Effect, Exit, Option } from "effect";
 
 /** What the check needs to know about a thread. */
 export interface ThreadRoleTarget {
@@ -89,8 +89,10 @@ export function threadRolesSaveProblem(
       return `${describe(pointers[0]!)} cannot be checked here (this server path cannot read threads): set roles from the app's settings.`;
     }
     for (const pointer of pointers) {
-      const target = yield* targets.value.find(pointer.threadId).pipe(Effect.option);
-      if (Option.isNone(target)) {
+      // `Effect.exit`, not `Effect.option`: an unexpected crash in the lookup (a defect) also gives
+      // "try again" instead of failing the save as an internal error. Nothing is written either way.
+      const target = yield* Effect.exit(targets.value.find(pointer.threadId));
+      if (Exit.isFailure(target)) {
         return `${describe(pointer)}: thread ${pointer.threadId} could not be read, so the role was not saved: try again.`;
       }
       const problem = threadRolePointerProblem(pointer, target.value);

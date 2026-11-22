@@ -1140,13 +1140,16 @@ thread (not a sub-agent, a side chat or a task delegated from a linked machine) 
 orchestrator, belongs to the project its entry names. Where the server cannot read threads, such a
 save is refused too, never let through. A pointer the save leaves as it was is not checked again,
 so an old pointer to a thread deleted since blocks no other save; whoever reads the roles checks the
-thread and treats a failing one as no role.
+thread and treats a failing one as no role. An archived thread can take a role, but readers treat an
+archived or deleted thread with a role as no role. An entry for a project removed since stays in the
+file (no sweep clears it) until a save removes it; readers skip it.
 
 A save changes the roles field by field: a left-out field keeps its value, `assistant: null`
 removes the assistant, and each `orchestrators` entry is set or (`null`) removed on its own, so two
 saves for different projects keep both. A save with a bad id is refused. The file is read leniently:
 a missing or non-object value reads as no roles, a bad `assistant` as none, and a bad orchestrator
-entry drops alone, so a hand edit never resets the other settings.
+entry drops alone, so a hand edit never resets the other settings. A dropped entry is gone from the
+file after the next save of any setting, since the save writes the settings as read.
 
 ```json
 {

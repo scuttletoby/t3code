@@ -20,7 +20,9 @@ export const layer = Layer.effect(
           : {
               projectId: shell.projectId,
               listed: isListedThreadLineage(shell.lineage),
-              delegated: shell.delegatedFrom !== undefined,
+              // `!= null` as upstream's `isDelegatedAppThread`: an MCP-launched thread may carry
+              // `delegatedFrom: null`, and that thread is not delegated.
+              delegated: shell.delegatedFrom != null,
             };
       }),
     }),

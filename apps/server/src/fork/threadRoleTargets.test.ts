@@ -174,6 +174,19 @@ describe("threadRoles save check", () => {
       );
     }),
   );
+
+  it.effect("gives the same try-again refusal when the lookup crashes unexpectedly", () =>
+    Effect.gen(function* () {
+      const crashing = Layer.succeed(
+        ThreadRoleTargets,
+        ThreadRoleTargets.of({ find: () => Effect.die(new Error("lookup crashed")) }),
+      );
+      const problem = yield* threadRolesSaveProblem(NONE, roles("thread-top")).pipe(
+        Effect.provide(crashing),
+      );
+      assert.match(problem ?? "", /could not be read, so the role was not saved: try again/u);
+    }),
+  );
 });
 
 // Through the settings service, as a client's save reaches it: a refusal writes nothing.
