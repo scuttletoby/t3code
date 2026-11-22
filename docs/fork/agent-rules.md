@@ -55,7 +55,8 @@ Where a tool enforces a rule, the tool is the authority.
 - Never update pull request branches by hand when a merge queue does it. _Why: it restarts every CI at once._
 - Reports, handoffs and review notes go in the pull request or an issue. _Why: the repository holds current text._
 - Reviews follow the [review skill](../../fork-kit/review/SKILL.md) (weights, the state question, round limit);
-  never restate it. _Why: one source._
+  never restate it; its `plan` and `check` take `--settings .github/fork-review-kit.json` here. _Why: one source;
+  without it the kit reads no queue config and plans one lens._
 - No `git stash`; edit tracked files in place. _Why: worktrees share the stash; a move drops `+x`._
 - In a fork: build on upstream's mechanisms, check upstream first, never push, comment or open anything upstream.
   _Why: thin forks rebase cleanly; upstream is the owner's._
