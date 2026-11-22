@@ -9,6 +9,7 @@ import {
   placementFactsCommandProblem,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -39,25 +40,40 @@ const firstLine = (text: string) =>
     ?.slice(0, 200);
 
 /**
- * Exit 0: available, each printed line one more label (a line that is not one label is skipped).
- * Any other exit, a timeout or a failed start: not available, with the reason. Never fails. The path
- * is checked again on this OS (a hand edit skips the save's check) and run as one path, no shell,
- * no arguments; on Windows only an `.exe`, since a `.cmd` or `.bat` needs a shell.
+ * Exit 0: available, each printed line a label (others skipped); anything else: not available, with
+ * the reason. Never fails. The path is checked again on this OS and run as one path, no shell, no
+ * arguments; on Windows only an `.exe`, checked on the file the runner's own lookup would start.
  */
 export const runFactsCommand = Effect.fn("FactsCommand.run")(function* (factsCommand: string) {
   if (factsCommand === "") return { available: true, labels: [] } satisfies FactsCommandResult;
   const platform = yield* HostProcess.Platform;
   const problem = placementFactsCommandProblem(factsCommand, platform);
   if (problem !== undefined) return notAvailable(problem);
-  if (platform === "win32" && !/\.exe$/iu.test(factsCommand)) {
-    return notAvailable(
-      `factsCommand "${factsCommand}" is not an .exe: on Windows a .cmd, .bat or script needs a shell, which placement never uses`,
-    );
+  let command = factsCommand;
+  if (platform === "win32") {
+    if (!/\.exe$/iu.test(factsCommand)) {
+      return notAvailable(
+        `factsCommand "${factsCommand}" is not an .exe: on Windows a .cmd, .bat or script needs a shell, which placement never uses`,
+      );
+    }
+    // Without .EXE in PATHEXT the lookup starts a planted `facts.exe.CMD`, through a shell.
+    const resolved = yield* resolveSpawnCommand(factsCommand, []);
+    if (resolved.shell) {
+      return notAvailable(
+        `factsCommand "${factsCommand}" would run through a shell on this server (as ${resolved.command}; is .EXE missing from PATHEXT?), which placement never uses`,
+      );
+    }
+    if (!/\.exe$/iu.test(resolved.command)) {
+      return notAvailable(
+        `factsCommand "${factsCommand}" runs as "${resolved.command}" on this server, not an .exe`,
+      );
+    }
+    command = resolved.command;
   }
   const runner = yield* ProcessRunner.ProcessRunner;
   const result = yield* runner
     .run({
-      command: factsCommand,
+      command,
       args: [],
       timeout: FACTS_COMMAND_TIMEOUT,
       timeoutBehavior: "timedOutResult",
@@ -79,7 +95,8 @@ export const runFactsCommand = Effect.fn("FactsCommand.run")(function* (factsCom
     );
   }
   if (code !== 0) {
-    const said = firstLine(`${stdout}\n${stderr}`);
+    // The error output first: a label line printed before the failure would hide it.
+    const said = firstLine(`${stderr}\n${stdout}`);
     return notAvailable(
       `factsCommand exited with ${code === null ? "no code" : `code ${code}`}${said === undefined ? "" : `: ${said}`}`,
     );

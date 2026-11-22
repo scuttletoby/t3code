@@ -524,7 +524,10 @@ wiring). Fields, each with its default:
   for `labels`; a line that is not one label is skipped, at most 64); any other exit, a program that
   cannot start, or no answer within 5 seconds means not available, with the reason. The machine
   that runs it checks the path again on its own OS first and runs it with no arguments; on Windows
-  only an `.exe` runs, since a `.cmd`, `.bat` or script needs a shell. The runner is in the fork
+  only an `.exe` runs, since a `.cmd`, `.bat` or script needs a shell, and that holds for the file
+  the server's lookup would start, not only the text (with `.EXE` missing from PATHEXT, a
+  `facts.exe` path finds a planted `facts.exe.CMD`, which is refused). A failed run's reason is the
+  first line of its error output, else of its output. The runner is in the fork
   (`apps/server/src/fork/factsCommand.ts`); placement row P4 wires it into the facts read.
 - `never`: `[]`. Label groups that must not meet on one machine, such as
   `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
@@ -1450,7 +1453,8 @@ the account at launch (the gate does). The fields are part of the tool's result,
 list an agent loads, so the tool context budget is unchanged.
 
 When placement reads a linked machine's answer (`factsFromAnswer` in the same file), it decodes it
-with these schemas: neither field is "no facts", as above; an answer they refuse is "facts not
+with these schemas: no answer (the machine did not answer) or neither field is "no facts", as
+above; an answer they refuse is "facts not
 valid", and the machine is refused, even when it is named. This machine with no CPU and memory
 sample (no sampler, or one that cannot measure CPU) is still a place for work when every other
 rule passes, ranked last; a linked machine without them is not. Its weight still counts (`manual`
