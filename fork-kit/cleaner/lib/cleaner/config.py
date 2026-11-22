@@ -279,8 +279,9 @@ KEY_KINDS = {
     'compressCold': 'picks', 'compressCold.folders': 'picks', 'compressCold.keepFreeGB': 'floor',
     'folders.path': 'picks', 'folders.days': 'floor', 'folders.layered': 'loosens',
     # dedupe deletes no content either (every name keeps its bytes and metadata); its folders never are or hold a
-    # must-keep path, and every refusal holds in them (dedupe.py).
-    'dedupe': 'picks', 'dedupe.folders': 'picks', 'dedupe.writtenInPlace': 'keeps more',
+    # must-keep path, and every refusal holds in them (dedupe.py). writtenInPlace picks too: its patterns keep more,
+    # but missing it links nothing and `[]` turns linking on.
+    'dedupe': 'picks', 'dedupe.folders': 'picks', 'dedupe.writtenInPlace': 'picks',
     # agentScratch: on, its folder and its days pick what it looks at. keepFirst only adds a copy before a delete:
     # more patterns copy more; maxFileBytes has a floor; a session with more than maxSessionBytes to copy stays
     # whole, so the cap picks which sessions the rule may take at all (every refusal still holds for them). The

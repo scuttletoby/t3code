@@ -287,8 +287,8 @@ Only the person can change it; agents cannot. A save that is on without all four
 push step's name (or names one `claim`, `renew` or `release`), names a program by anything but its
 full path on the server's OS, or has a field this build does not know is refused. A hand-edited
 value that is not valid, or has a field this build does not know (a newer build's limit, a typo),
-reads as off (with a warning in the server log), and the next save of any setting writes the default
-in its place. So after moving back to an older build, copy the playtest value first: the older
+reads as off (with a warning in the server log that names what is wrong, such as the unknown
+field), and the next save of any setting writes the default in its place. So after moving back to an older build, copy the playtest value first: the older
 build's next save replaces a newer build's value. Other fields: how often a claim is renewed (`renewMinutes`), when an idle
 session ends (`idleMinutes`) and the longest session (`maxHours`).
 
