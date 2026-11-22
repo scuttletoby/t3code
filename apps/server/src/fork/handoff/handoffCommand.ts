@@ -4,6 +4,7 @@
  * handoff (docs/fork/handoff.md).
  */
 import type { ProjectId, ThreadId } from "@t3tools/contracts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -17,6 +18,33 @@ export const HANDOFF_COMMAND_MAX_BYTES = 32 * 1024;
 /** The thread's id, as provider tools get it. */
 export const HANDOFF_THREAD_ENV = "T3CODE_THREAD_ID";
 export const HANDOFF_PROJECT_ENV = "T3CODE_PROJECT_ID";
+/**
+ * All the command gets of the server's environment, besides the two ids: enough to find programs
+ * and the person's own config, not the server's tokens and keys. A program that needs more sets it
+ * itself (a script outside any repository).
+ */
+export const HANDOFF_COMMAND_ENV_KEYS = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "TMPDIR",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_RUNTIME_DIR",
+] as const;
+/**
+ * POSIX `env -i` starts the command with the list only: the runner the command shares with wait
+ * checks adds to the server's whole environment (upstream's `processRunner.ts`). Windows has no
+ * such program, so there the command gets the whole environment.
+ */
+const ENV_PROGRAM = "/usr/bin/env";
 
 /** The handoff the command printed, or why there is none. */
 export type HandoffCommandResult =
@@ -48,12 +76,30 @@ export const make = Effect.fn("HandoffCommand.make")(function* (
     if (project._tag === "None" || project.value._tag === "None") {
       return failed("its project cannot be read");
     }
+    const ids = { [HANDOFF_THREAD_ENV]: input.threadId, [HANDOFF_PROJECT_ENV]: input.projectId };
+    let argv = input.command;
+    if ((yield* HostProcess.Platform) !== "win32") {
+      // `env` reads a first word with "=" as a setting, not as the program.
+      if (input.command[0]?.includes("=") === true)
+        return failed('its program\'s path has an "=", which env reads as a setting');
+      const server = yield* HostProcess.Environment;
+      const kept = HANDOFF_COMMAND_ENV_KEYS.flatMap((key) =>
+        server[key] === undefined ? [] : [`${key}=${server[key]}`],
+      );
+      argv = [
+        ENV_PROGRAM,
+        "-i",
+        ...kept,
+        ...Object.entries(ids).map(([key, value]) => `${key}=${value}`),
+        ...input.command,
+      ];
+    }
     const ran = yield* runProgram({
-      argv: input.command,
+      argv,
       timeoutSeconds,
       cwd: project.value.value.workspaceRoot,
       maxOutputBytes: HANDOFF_COMMAND_MAX_BYTES,
-      env: { [HANDOFF_THREAD_ENV]: input.threadId, [HANDOFF_PROJECT_ENV]: input.projectId },
+      env: ids,
       // Its stdin is closed: a program that reads it when given no file ends instead of waiting.
       stdin: "",
     });

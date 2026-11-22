@@ -1,4 +1,4 @@
-import type { HostResourcesSnapshot } from "@t3tools/contracts";
+import { canonicalPlacementLabels, type HostResourcesSnapshot } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { chooseLoadBalancedEnvironment } from "../../client-runtime/src/load-balancing.ts";
@@ -73,6 +73,17 @@ const place = (machines: PlacementMachine[], over: Partial<PlacementInput> = {})
 
 const link = machine("x").link!;
 
+/** A machine's facts with placement facts but no host sample (no sampler, or its read failed). */
+const noHost = (over: Partial<NonNullable<MachineFacts["placement"]>> = {}): MachineFacts => ({
+  placement: { labels: [], available: true, factsAt: NOW, ...over },
+  receivedAt: NOW,
+});
+
+/** `placementNeeds` as the settings keep a bad value: it fits no machine. */
+const brokenNeeds = { unreadable: ["no spaces allowed"], problem: "bad label" };
+const BROKEN_NEEDS_REASON =
+  "this project's placementNeeds setting is not valid: bad label; fix it in Settings";
+
 interface Row {
   readonly name: string;
   readonly machine: PlacementMachine;
@@ -137,6 +148,23 @@ const table: Record<HardRule, Row[]> = {
       name: "no placement facts",
       machine: machine("a", { facts: { hostResources: host, receivedAt: NOW } }),
       reason: "The machine sent no placement facts.",
+    },
+    {
+      name: "an answer that did not decode: reported as not valid",
+      machine: machine("a", {
+        facts: { ...facts(), problem: "placement.available: expected a boolean" },
+      }),
+      reason: "The machine's facts are not valid: placement.available: expected a boolean",
+    },
+    {
+      name: "here without a host sample: its own gate checks at launch",
+      machine: here({ facts: noHost() }),
+      reason: null,
+    },
+    {
+      name: "here with a broken host sample: still refused",
+      machine: here({ facts: withHost({ totalMemoryBytes: 0 }) }),
+      reason: "The machine's CPU and memory facts are incomplete or not valid numbers.",
     },
     {
       name: "no host facts",
@@ -319,6 +347,12 @@ const table: Record<HardRule, Row[]> = {
       task: { needs: ["gpu", "  "] },
       reason: "The machine lacks what the project needs: (a blank need).",
     },
+    {
+      name: "a broken needs value fits no machine, never read as no needs",
+      machine: machine("a", { facts: withPlacement({ labels: ["gpu"] }) }),
+      task: { needs: brokenNeeds },
+      reason: BROKEN_NEEDS_REASON,
+    },
   ],
   H7: [
     { name: "one checkout, provider and model", machine: machine("a"), reason: null },
@@ -357,6 +391,31 @@ const table: Record<HardRule, Row[]> = {
     },
   ],
   H8: [
+    {
+      name: "here without a host sample: slots and the gate's free memory only",
+      machine: here({ facts: noHost({ slotsFree: 1, memoryFloorMb: 1024, freeMemoryMb: 2048 }) }),
+      reason: null,
+    },
+    {
+      name: "here without a host sample: CPU not measured yet is no refusal",
+      machine: here({ facts: withHost({ cpuUtilization: null }) }),
+      reason: null,
+    },
+    {
+      name: "here without a host sample: still no slot free",
+      machine: here({ facts: noHost({ slotsFree: 0 }) }),
+      reason: "No agent slot is free there.",
+    },
+    {
+      name: "here without a host sample or the gate's free memory: the floor cannot pass",
+      machine: here({ facts: noHost({ memoryFloorMb: 1024 }) }),
+      reason: "The machine's free memory is not known.",
+    },
+    {
+      name: "a linked machine with CPU not measured: refused as before",
+      machine: machine("a", { facts: withHost({ cpuUtilization: null }) }),
+      reason: "The machine's CPU use is not measured.",
+    },
     {
       name: "a slot free, memory above the floor",
       machine: machine("a", {
@@ -674,15 +733,82 @@ describe("the state question (design section 7, rows with no I/O)", () => {
       null,
       { receivedAt: NOW },
       { hostResources: host, receivedAt: NOW },
-      { placement: { labels: [], available: true, factsAt: NOW }, receivedAt: NOW },
+      noHost(),
       facts({ receivedAt: NOW - 60_000 }),
       withHost({ cpuUtilization: null }),
       withHost({ totalMemoryBytes: 0 }),
+      { ...facts(), problem: "not valid" },
     ];
     for (const f of partial) {
       expect(place([machine("a", { facts: f })]).kind).toBe("none");
+    }
+    // Here, only a missing host sample is let through (next test); the rest never fit.
+    for (const f of partial.filter((f) => f !== partial[3] && f !== partial[5])) {
       expect(place([here({ facts: f })]).kind).toBe("none");
     }
+  });
+
+  it("a sampler failure here does not stop all delegation: here is the fallback, last", () => {
+    // A lone here without host facts is picked (advise and enforce alike), says why.
+    for (const f of [noHost(), withHost({ cpuUtilization: null })]) {
+      for (const mode of ["advise", "enforce"] as const) {
+        const lone = place([here({ facts: f })], { mode });
+        expect(lone).toMatchObject({
+          kind: "picked",
+          mode,
+          environmentId: "here",
+          order: ["here"],
+        });
+        expect(lone.kind === "picked" && lone.why).toBe(
+          "here passes every hard rule; its CPU use was not measured, so it is picked only because no machine ranks.",
+        );
+        // Runs again: the same answer.
+        expect(place([here({ facts: f })], { mode })).toEqual(lone);
+      }
+      // A ranked linked machine comes first; here stays the next candidate on a refusal.
+      const both = place([here({ facts: f }), machine("a", { weight: "less" })]);
+      expect(both).toMatchObject({ environmentId: "a", order: ["a", "here"] });
+      expect(both.kind === "picked" && both.verdicts.find((v) => v.here)?.rank).toBe(2);
+      // Its hard rules still apply: a full gate, or needs it lacks, refuse it.
+      expect(place([here({ facts: noHost({ slotsFree: 0 }) })]).kind).toBe("none");
+      expect(place([here({ facts: f })], { task: task({ needs: ["gpu"] }) }).kind).toBe("none");
+      // Upstream's own limits still hold: manual (only when named) or an unknown weight word.
+      for (const weight of ["manual", "most" as never] as const) {
+        const result = place([here({ facts: f, weight })]);
+        expect(result.kind).toBe("none");
+        expect(result.kind === "none" ? result.verdicts[0]?.unranked : null).toBe(
+          weight === "manual"
+            ? "Set to manual: used only when named."
+            : 'Its weight word "most" is not one of prefer, normal, less or manual.',
+        );
+      }
+    }
+    // With memory sampled but CPU not: 5 % free or less is left out, as upstream's score does.
+    const nearlyFull = withHost({
+      cpuUtilization: null,
+      availableMemoryBytes: 0.02 * host.totalMemoryBytes,
+    });
+    expect(place([here({ facts: nearlyFull })])).toMatchObject({
+      kind: "none",
+      verdicts: [{ unranked: "Upstream's score leaves it out (free memory 5 % or less)." }],
+    });
+  });
+
+  it("a broken needs value fits no machine: named, here, or without facts", () => {
+    const needs = brokenNeeds;
+    const expected = {
+      kind: "none",
+      mode: "enforce",
+      reason: `No machine fits: ${BROKEN_NEEDS_REASON}.`,
+      verdicts: [],
+    };
+    expect(place([here(), machine("a")], { task: task({ needs }) })).toEqual(expected);
+    expect(
+      place([machine("old", { facts: null })], { task: task({ needs, named: "old" }) }),
+    ).toEqual(expected);
+    expect(place([here()], { task: task({ needs, named: "here" }) })).toEqual(expected);
+    // The same needs once fixed: labels again.
+    expect(place([here()], { task: task({ needs: [] }) })).toMatchObject({ kind: "picked" });
   });
 
   it("new install (empty settings): no labels, gate off; takes only work with no needs", () => {
@@ -766,12 +892,14 @@ describe("the state question (design section 7, rows with no I/O)", () => {
 });
 
 describe("labels: one canonical form (trimmed, lower-cased, blanks and repeats dropped)", () => {
-  it("canonicalLabels", () => {
-    expect(canonicalLabels([" GPU", "gpu", "Work ", "", "  ", "ci-runner"])).toEqual([
-      "gpu",
-      "work",
-      "ci-runner",
-    ]);
+  it("the engine's form is contracts' canonicalPlacementLabels, the one P2 stores with", () => {
+    const written = [" GPU", "gpu", "Work ", "", "  ", "ci-runner"];
+    expect(canonicalLabels(written)).toEqual(["gpu", "work", "ci-runner"]);
+    expect(canonicalLabels(written)).toEqual(canonicalPlacementLabels(written));
     expect(canonicalLabels([])).toEqual([]);
+    // A value from another machine's answer that is not a string never matches.
+    expect(canonicalLabels([1, null, "GPU"])).toEqual(["gpu"]);
+    const anyLabel = machine("a", { facts: withPlacement({ labels: [7 as never, "gpu"] }) });
+    expect(place([anyLabel], { task: task({ needs: ["7"] }) }).kind).toBe("none");
   });
 });

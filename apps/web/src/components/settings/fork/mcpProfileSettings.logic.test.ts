@@ -35,14 +35,15 @@ function serverSave(settings: ServerSettings, patch: unknown): ServerSettings {
 const LEAN = { servers: ["docs"], t3Tools: ["threads", "orchestration"] };
 
 describe("MCP profile list", () => {
-  it("shows all and t3-only read-only from an old settings file, and nothing else", () => {
+  it("shows the built-ins read-only from an old settings file, and nothing else", () => {
     const old = fromFile({});
     const rows = mcpProfileRows(old, null);
     expect(rows.map((row) => [row.name, row.kind, row.state])).toEqual([
       ["all", "built-in", "ok"],
       ["t3-only", "built-in", "ok"],
+      ["assistant", "built-in", "ok"],
     ]);
-    expect(mcpProfileChoices(old)).toEqual(["all", "t3-only"]);
+    expect(mcpProfileChoices(old)).toEqual(["all", "t3-only", "assistant"]);
     // The default and the rule show as their defaults; nothing to write.
     expect(shownProfileRef(old.mcpProfile, "all")).toBe("all");
     expect(shownProfileRef(old.mcpSubagentProfile, "inherit")).toBe("inherit");
@@ -144,7 +145,7 @@ describe("saving and deleting a profile", () => {
   it("refuses built-in names, inherit, bad names and a name taken", () => {
     const settings = fromFile({ mcpProfiles: { lean: LEAN } });
     const draft = { servers: [] as string[], t3Tools: "all" as const };
-    for (const name of ["all", "t3-only"]) {
+    for (const name of ["all", "t3-only", "assistant"]) {
       expect(saveMcpProfilePatch(settings, null, { ...draft, name })).toEqual({
         problem: `"${name}" is a built-in profile; pick another name.`,
       });

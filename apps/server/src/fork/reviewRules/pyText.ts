@@ -3,6 +3,9 @@
  * string indexing differ from Python's, and the gate is Python, so patterns here are spelled as Python reads them.
  */
 import { characterEntities } from "character-entities";
+import * as Schema from "effect/Schema";
+
+import { PY_ASSIGNED, PY_UNICODE } from "./pyUnicode.ts";
 
 /** Python's whitespace (str.isspace, re `\s`), as the body of a character class. */
 export const WS =
@@ -13,6 +16,80 @@ const W = "[\\p{L}\\p{N}_]";
 export const ALNUM = "[\\p{L}\\p{N}]";
 /** Python re `\b`. */
 export const B = `(?:(?<=${W})(?!${W})|(?<!${W})(?=${W}))`;
+
+const PY_CLASS = PY_ASSIGNED.split(" ")
+  .map((range) =>
+    range
+      .split("-")
+      .map((h) => `\\u{${h}}`)
+      .join("-"),
+  )
+  .join("");
+const PY_UNASSIGNED = new RegExp(`[^${PY_CLASS}]`, "gu");
+const IS_PY_UNASSIGNED = new RegExp(`^[^${PY_CLASS}]$`, "u");
+const UNASSIGNED = /\p{Cn}/gu;
+const IS_UNASSIGNED = /^\p{Cn}$/u;
+/** U+0000 to U+036F have been assigned since Unicode 1.1 (U+0370 to U+0377 since 5.1): no drift below them. */
+const PAST_SAFE = /[\u0370-\u{10ffff}]/u;
+/**
+ * What a rule reads of a code point: a letter or number (`\w`, digits), a mark (it can join the one before it in
+ * NFKC), a format character (`repr`, the findings' invisible-character rule) or a space.
+ */
+const READ_CLASS = /^[\p{L}\p{N}\p{M}\p{Cf}\p{Z}]$/u;
+
+/**
+ * A code point this runtime assigns and the gate's Python does not reads the same on both sides only when no rule reads
+ * it: Python reads every unassigned code point as no letter, number, mark, format character or space, with no case or
+ * NFKC mapping, and `repr` escapes it (pyText's `repr` does too). A new symbol, such as an emoji, reads alike.
+ */
+const readsOtherwise = (ch: string): boolean =>
+  READ_CLASS.test(ch) ||
+  ch.normalize("NFKC") !== ch ||
+  ch.toLowerCase() !== ch ||
+  ch.toUpperCase() !== ch;
+
+/** Text one of the rules cannot read as Python does: Python's Unicode and this runtime's assign a code point of it differently. */
+export class PyTextError extends Schema.TaggedError<PyTextError>()("PyTextError", {
+  codePoints: Schema.Array(Schema.String),
+  /** The post that holds them (LensPost.where), when the text is a post's. */
+  where: Schema.optional(Schema.String),
+}) {
+  override get message(): string {
+    return (
+      `${this.where === undefined ? "the text" : `the post ${this.where}`} holds ${this.codePoints.join(", ")}, ` +
+      `which the gate's Python (Unicode ${PY_UNICODE}) and this runtime assign differently, so the two would read ` +
+      "it differently"
+    );
+  }
+}
+
+/**
+ * Throws PyTextError when the text holds a code point only one of Python's Unicode (PY_UNICODE) and this runtime's
+ * assigns, and a rule reads it (readsOtherwise; always when only Python assigns it): `Ᲊ` (Unicode 16) before `major:`
+ * is a finding in the gate and none here. Code points both assign read alike, except upper case, which no rule reads.
+ */
+export function pyUnicodeCheck(text: string): void {
+  if (!PAST_SAFE.test(text)) return;
+  const drift = new Set<number>();
+  for (const [ch] of text.matchAll(PY_UNASSIGNED))
+    if (!IS_UNASSIGNED.test(ch) && readsOtherwise(ch)) drift.add(ch.codePointAt(0)!);
+  for (const [ch] of text.matchAll(UNASSIGNED))
+    if (!IS_PY_UNASSIGNED.test(ch)) drift.add(ch.codePointAt(0)!);
+  if (drift.size === 0) return;
+  throw new PyTextError({
+    codePoints: [...drift]
+      .toSorted((a, b) => a - b)
+      .map((u) => `U+${u.toString(16).toUpperCase().padStart(4, "0")}`),
+  });
+}
+
+/** Python's sorted() on strings: by code point, not by UTF-16 unit. */
+export function byCodePoint(a: string, b: string): number {
+  const x = Array.from(a, (c) => c.codePointAt(0)!);
+  const y = Array.from(b, (c) => c.codePointAt(0)!);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i]! - y[i]!;
+  return x.length - y.length;
+}
 
 /**
  * A Python pattern source for re.I: Python's case-insensitive `i` also matches `İ` and `ı`, JavaScript's does not
@@ -80,7 +157,7 @@ export function digitValue(ch: string): number {
   return n % 10;
 }
 
-/** repr(text) of a Python str. */
+/** repr(text) of a Python str: what the gate's Python leaves unassigned is not printable there, so it is escaped. */
 export function repr(text: string): string {
   const quote = text.includes("'") && !text.includes('"') ? '"' : "'";
   let out = "";
@@ -89,7 +166,10 @@ export function repr(text: string): string {
     if (ch === "\\" || ch === quote) out += "\\" + ch;
     else if (ch === "\t" || ch === "\n" || ch === "\r")
       out += { "\t": "\\t", "\n": "\\n", "\r": "\\r" }[ch];
-    else if (ch !== " " && /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Z}]/u.test(ch)) {
+    else if (
+      ch !== " " &&
+      (/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Z}]/u.test(ch) || IS_PY_UNASSIGNED.test(ch))
+    ) {
       const [p, w] = cp < 0x100 ? ["\\x", 2] : cp < 0x10000 ? ["\\u", 4] : ["\\U", 8];
       out += p + cp.toString(16).padStart(w as number, "0");
     } else out += ch;
