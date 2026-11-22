@@ -32,6 +32,7 @@ import {
 import { ForkRow, useForkRowLock } from "./ForkRow";
 import {
   MCP_ALWAYS_KEPT_NOTE,
+  MCP_NOT_A_SANDBOX_NOTE,
   MCP_BLANK_PICK_ISSUE,
   MCP_PICK_APPLIES_NOTE,
   type McpProfileDraft,
@@ -228,6 +229,7 @@ function ProfileEditor({
         onChange={(next) => setDraft({ ...draft, t3Tools: next })}
       />
       <p className="text-xs text-muted-foreground">{MCP_ALWAYS_KEPT_NOTE}</p>
+      <p className="text-xs text-muted-foreground">{MCP_NOT_A_SANDBOX_NOTE}</p>
       <label className="flex items-center gap-2 text-xs">
         <Checkbox
           checked={draft.noBuiltinTools === true}
@@ -274,6 +276,8 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
   const projectSettingsOverrides = useScopedSettings(
     (settings) => settings.projectSettingsOverrides,
   );
+  // The assistant thread never runs wider than `assistant`, so a pick's effect depends on it too.
+  const threadRoles = useScopedSettings((settings) => settings.threadRoles);
   const threadShells = useThreadShells();
   const projects = useProjects();
   const { environment } = useSettingsScope();
@@ -373,7 +377,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
   const pickRows = mcpThreadPickRows(mcpThreadProfiles, labels.threads);
   // The threads of the environment these settings are for: a pick's effect depends on its parent.
   const shells = threadShells.filter((shell) => shell.environmentId === environment?.environmentId);
-  const threadSettings = { ...settings, mcpCarriedProfiles, projectSettingsOverrides };
+  const threadSettings = { ...settings, mcpCarriedProfiles, projectSettingsOverrides, threadRoles };
   const pickEffect = (threadId: string, name: string) =>
     threadPickEffect(threadSettings, threadId, name, shells);
   const draftEffect =
@@ -400,7 +404,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
         {...searchableSetting("mcp-profiles")}
         settingKeys={["mcpProfiles"]}
         lockPaths={["mcpProfiles"]}
-        description="Which outside MCP servers and T3 tool groups a thread gets. Only Claude threads apply a profile narrower than all; others refuse such a turn."
+        description="Which outside MCP servers and T3 tool groups a thread gets. Claude and Codex threads apply a profile narrower than all; other providers refuse a turn whose profile leaves out an outside server."
       >
         <div className="grid gap-2 pb-2">
           {rows.map((row) => (

@@ -6,8 +6,11 @@
  */
 import {
   type AuthMcpClientAccess,
+  canonicalPlacementLabels,
   type HostResourcesSnapshot,
   isRuntimeModeAbove,
+  type PlacementNeeds,
+  readPlacementNeeds,
   type RuntimeMode,
 } from "@t3tools/contracts";
 
@@ -51,10 +54,19 @@ export interface PlacementFacts {
   readonly factsAt: number;
 }
 
-/** One `t3_environment_read` answer. Every field is optional: an older build sends none. */
+/**
+ * One `t3_environment_read` answer, as the server's `factsFromAnswer`
+ * (apps/server/src/fork/environmentFacts.ts) decodes it. An answer with neither `hostResources` nor
+ * `placement` (an older build) is `null` there, never this.
+ */
 export interface MachineFacts {
   readonly hostResources?: HostResourcesSnapshot;
   readonly placement?: PlacementFacts;
+  /**
+   * Set when the answer did not decode with P3's schema: the machine is refused (H2) with this as
+   * the reason, so a bad answer reads as bad, not as a busy or unfit machine. Named, too.
+   */
+  readonly problem?: string;
   /** When this machine received the answer (ms, the reader's clock), like upstream's `receivedAt`. */
   readonly receivedAt: number;
 }
@@ -84,8 +96,8 @@ export interface PlacementMachine {
   /** `null` for "here"; required for any other machine (a machine without one fails H1). */
   readonly link: PlacementLink | null;
   /**
-   * `null`: no answer, or an older build. Only `null` is "no facts"; an answer with neither
-   * `placement` nor `hostResources` gets every rule, so it is refused.
+   * `null`: no answer, or an older build (an answer with neither `placement` nor `hostResources`
+   * decodes to `null`). Named, a machine without facts meets only the rules that need none.
    */
   readonly facts: MachineFacts | null;
   /** `null`: not looked up. */
@@ -97,8 +109,11 @@ export interface PlacementMachine {
 export interface PlacementTask {
   /** The child's runtime mode, after `inherit` is resolved. */
   readonly runtimeMode: RuntimeMode;
-  /** The project's `placementNeeds`. */
-  readonly needs: ReadonlyArray<string>;
+  /**
+   * The project's `placementNeeds` as the settings hold it: labels, or a kept bad value, which
+   * fits no machine (read through contracts' `readPlacementNeeds`, never as `[]`).
+   */
+  readonly needs: PlacementNeeds;
   /** The `never` label groups of the machine that checks (sender, then receiver). */
   readonly never: ReadonlyArray<ReadonlyArray<string>>;
   /** The task asking is itself a placed child (H9). */
@@ -161,17 +176,17 @@ const isFiniteNumber = (value: unknown): value is number =>
 const isBadCount = (value: unknown) =>
   value !== null && value !== undefined && !(isFiniteNumber(value) && value >= 0);
 
-const canonicalLabel = (label: unknown) =>
-  typeof label === "string" ? label.trim().toLowerCase() : "";
-
 /**
- * The one form labels, needs and `never` groups are compared in: trimmed, lower-cased
- * (`toLowerCase`, no locale), blanks and repeats dropped, first spelling's place kept. P2 stores
- * labels in this form; comparing both sides here keeps H5 and H6 right for a value it did not.
+ * Labels, needs and `never` groups are compared in contracts' one form
+ * (`canonicalPlacementLabels`), the form P2 stores, so the two never differ; comparing both sides
+ * in it keeps H5 and H6 right for a value from another machine or an older file. A value that is
+ * not a string (another machine's answer) is dropped, so it never matches.
  */
-export const canonicalLabels = (labels: ReadonlyArray<string>): ReadonlyArray<string> => [
-  ...new Set(labels.map(canonicalLabel).filter((label) => label.length > 0)),
-];
+export const canonicalLabels = (labels: ReadonlyArray<unknown>): ReadonlyArray<string> =>
+  canonicalPlacementLabels(labels.filter((label): label is string => typeof label === "string"));
+
+/** One label in that form; blank (never met) for a blank or a value that is not a string. */
+const canonicalLabel = (label: unknown): string => canonicalLabels([label])[0] ?? "";
 
 /** Typed as a record so a mode upstream adds must be listed here before it can pass H3. */
 const KNOWN_RUNTIME_MODES: Readonly<Record<RuntimeMode, true>> = {
@@ -190,6 +205,17 @@ type Check = (machine: PlacementMachine, task: PlacementTask, now: number) => st
 
 const labelsOf = (machine: PlacementMachine) => machine.facts?.placement?.labels;
 
+/**
+ * This machine without a CPU sample (no sampler, a failed read, CPU not measured yet). A sampler
+ * failure here does not stop all delegation: it passes H2 and H8 without one and is tried after
+ * every ranked machine (`fitsAsFallback`). A linked machine without one is still refused.
+ */
+const isHereWithoutHostFacts = (machine: PlacementMachine) =>
+  machine.here &&
+  machine.facts !== null &&
+  (machine.facts.hostResources === undefined ||
+    machine.facts.hostResources.cpuUtilization === null);
+
 const H1: Check = (machine, _task, now) => {
   if (machine.here) return null;
   const link = machine.link;
@@ -204,13 +230,15 @@ const H1: Check = (machine, _task, now) => {
 const H2: Check = (machine, _task, now) => {
   const facts = machine.facts;
   if (facts === null) return "The machine sent no facts (no answer, or an older build).";
+  if (facts.problem !== undefined) return `The machine's facts are not valid: ${facts.problem}`;
   if (facts.placement === undefined) return "The machine sent no placement facts.";
   const host = facts.hostResources;
-  if (host === undefined) return "The machine sent no CPU and memory facts.";
+  if (host === undefined && !machine.here) return "The machine sent no CPU and memory facts.";
   if (
-    !(isFiniteNumber(host.cpuCount) && host.cpuCount > 0) ||
-    !(isFiniteNumber(host.totalMemoryBytes) && host.totalMemoryBytes > 0) ||
-    !(isFiniteNumber(host.availableMemoryBytes) && host.availableMemoryBytes >= 0)
+    host !== undefined &&
+    (!(isFiniteNumber(host.cpuCount) && host.cpuCount > 0) ||
+      !(isFiniteNumber(host.totalMemoryBytes) && host.totalMemoryBytes > 0) ||
+      !(isFiniteNumber(host.availableMemoryBytes) && host.availableMemoryBytes >= 0))
   ) {
     return "The machine's CPU and memory facts are incomplete or not valid numbers.";
   }
@@ -258,17 +286,27 @@ const H5: Check = (machine, task) => {
   return met === undefined ? null : `The machine has all of a never group: ${met.join(" + ")}.`;
 };
 
-/** A blank need is never met (fails closed). */
+/** A blank need is never met, and a broken needs value fits no machine (both fail closed). */
 const H6: Check = (machine, task) => {
+  const needs = needsOf(task);
+  if (needs.fits === "none") return needs.reason;
   const raw = labelsOf(machine);
   if (raw === undefined) return "No labels to check the project's needs against.";
   const labels = new Set(canonicalLabels(raw));
-  const missing = [...new Set(task.needs.map(canonicalLabel))].filter(
+  const missing = [...new Set(needs.labels.map(canonicalLabel))].filter(
     (need) => need.length === 0 || !labels.has(need),
   );
   return missing.length === 0
     ? null
     : `The machine lacks what the project needs: ${missing.map((need) => need || "(a blank need)").join(", ")}.`;
+};
+
+/** The task's needs through contracts' `readPlacementNeeds`; anything but labels fits nothing. */
+const needsOf = (task: PlacementTask) => {
+  const needs = readPlacementNeeds(task.needs);
+  return needs.fits === "labels" && !Array.isArray(needs.labels)
+    ? ({ fits: "none", reason: "this project's placementNeeds are not a list of labels" } as const)
+    : needs;
 };
 
 const H7: Check = (machine) => {
@@ -287,7 +325,10 @@ const MB = 1024 * 1024;
 const H8: Check = (machine) => {
   const placement = machine.facts?.placement;
   const host = machine.facts?.hostResources;
-  if (placement === undefined || host === undefined) return "No facts to check capacity.";
+  const hereWithoutHost = isHereWithoutHostFacts(machine);
+  if (placement === undefined || (host === undefined && !hereWithoutHost)) {
+    return "No facts to check capacity.";
+  }
   // As P3 sends it: `null` means the gate is on with no machine limit; absent means slots are off
   // (or the gate was unread, and then `available` is false, so H4 refuses). Either way only memory
   // and CPU apply here.
@@ -301,7 +342,9 @@ const H8: Check = (machine) => {
   if (isBadCount(placement.freeMemoryMb)) return "The machine's free memory is not a valid number.";
   const floor = placement.memoryFloorMb ?? null;
   if (floor !== null) {
-    const freeMb = placement.freeMemoryMb ?? host.availableMemoryBytes / MB;
+    const freeMb =
+      placement.freeMemoryMb ?? (host === undefined ? null : host.availableMemoryBytes / MB);
+    if (freeMb === null) return "The machine's free memory is not known.";
     if (!(isFiniteNumber(freeMb) && freeMb >= 0)) {
       return "The machine's free memory is not a valid number.";
     }
@@ -310,6 +353,10 @@ const H8: Check = (machine) => {
       return `Free memory ${Math.floor(freeMb)} MB is below the machine's floor of ${floor} MB.`;
     }
   }
+  // Here without a sample: with slots on, its gate checks again at launch; with them off, nothing
+  // does, as in upstream's own here-first launch (`isHereWithoutHostFacts`).
+  // `host` is always set past this line (checked above); the second test only narrows its type.
+  if (hereWithoutHost || host === undefined) return null;
   const cpu = host.cpuUtilization;
   if (cpu === null) return "The machine's CPU use is not measured.";
   if (!(isFiniteNumber(cpu) && cpu >= 0)) return "The machine's CPU use is not a valid number.";
@@ -390,15 +437,25 @@ const rankWithUpstream = (machines: ReadonlyArray<PlacementMachine>, now: number
 };
 
 /** Why upstream's score left out a machine that passed every hard rule. */
+/** Upstream's memory limit: 5 % free or less is left out. Unknown (no sample) is not low. */
+const isLowOnMemory = (machine: PlacementMachine) => {
+  const host = machine.facts?.hostResources;
+  return host !== undefined && host.availableMemoryBytes / host.totalMemoryBytes <= 0.05;
+};
+
+const isUsableWeight = (machine: PlacementMachine) =>
+  machine.weight === undefined || (isWeightWord(machine.weight) && machine.weight !== "manual");
+
+/** The fallback keeps every limit upstream's score could check: weight and, if sampled, memory. */
+const fitsAsFallback = (machine: PlacementMachine) =>
+  isHereWithoutHostFacts(machine) && isUsableWeight(machine) && !isLowOnMemory(machine);
+
 const unrankedReason = (machine: PlacementMachine) => {
   if (machine.weight === "manual") return "Set to manual: used only when named.";
   if (machine.weight !== undefined && !isWeightWord(machine.weight)) {
     return `Its weight word "${String(machine.weight)}" is not one of prefer, normal, less or manual.`;
   }
-  const host = machine.facts?.hostResources;
-  if (host !== undefined && host.availableMemoryBytes / host.totalMemoryBytes <= 0.05) {
-    return "Upstream's score leaves it out (free memory 5 % or less).";
-  }
+  if (isLowOnMemory(machine)) return "Upstream's score leaves it out (free memory 5 % or less).";
   return "Upstream's score leaves it out.";
 };
 
@@ -421,6 +478,11 @@ export const choosePlacement = (input: PlacementInput): PlacementResult => {
   if (duplicate !== undefined) {
     const reason = `Two machines share the id ${duplicate}, so none is picked.`;
     return { kind: "none", mode, reason, verdicts: [] };
+  }
+  // Before the name, too: a broken needs value fits no machine, also one named without facts.
+  const needs = needsOf(task);
+  if (needs.fits === "none") {
+    return { kind: "none", mode, reason: `No machine fits: ${needs.reason}.`, verdicts: [] };
   }
 
   if (task.named !== undefined) {
@@ -456,10 +518,13 @@ export const choosePlacement = (input: PlacementInput): PlacementResult => {
   }
 
   const failuresOf = machines.map((machine) => checkHardRules(machine, task, now));
-  const order = rankWithUpstream(
-    machines.filter((_, index) => failuresOf[index]?.length === 0),
-    now,
+  const fitting = machines.filter((_, index) => failuresOf[index]?.length === 0);
+  const ranked = rankWithUpstream(fitting, now);
+  // Here without a CPU sample (a sampler failure) is the fallback after every ranked machine.
+  const fallback = fitting.filter(
+    (machine) => fitsAsFallback(machine) && !ranked.includes(machine.environmentId),
   );
+  const order = [...ranked, ...fallback.map((machine) => machine.environmentId)];
   const verdicts: MachineVerdict[] = machines.map((machine, index) => {
     const failures = failuresOf[index] ?? [];
     const position = order.indexOf(machine.environmentId);
@@ -492,7 +557,10 @@ export const choosePlacement = (input: PlacementInput): PlacementResult => {
     mode,
     environmentId: best,
     order,
-    why: `${best} passes every hard rule and ranks first of ${order.length} by upstream's score.`,
+    why:
+      ranked.length > 0
+        ? `${best} passes every hard rule and ranks first of ${order.length} by upstream's score.`
+        : `${best} passes every hard rule; its CPU use was not measured, so it is picked only because no machine ranks.`,
     verdicts,
   };
 };

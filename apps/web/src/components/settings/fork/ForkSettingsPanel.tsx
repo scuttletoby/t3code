@@ -11,6 +11,7 @@ import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { WaitsAndSlotsSettings } from "../WaitsAndSlotsSettings";
+import { AssistantSettings } from "./AssistantSettings";
 import { forkFeatureStatuses } from "./forkStatus.logic";
 import { HandoffSettings } from "./HandoffSettings";
 import { McpProfileSettings } from "./McpProfileSettings";
@@ -49,6 +50,7 @@ export function ForkSettingsPanel() {
       <HandoffSettings isProjectScope={isProjectScope} />
       <PlaytestSettings isProjectScope={isProjectScope} />
       <McpProfileSettings isProjectScope={isProjectScope} />
+      {isProjectScope ? null : <AssistantSettings />}
     </SettingsPageContainer>
   );
 }
