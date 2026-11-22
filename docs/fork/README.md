@@ -317,17 +317,18 @@ the machine's half. Nothing reads it yet: the review runner comes in a later pul
 `preset` is `off` (nothing is listed, changed or checked) or `recommended`, which fills in the
 fork's defaults: Claude (`claudeAgent`) with `claude-opus-5-5` at `high` effort, the `approach`
 lens on `claude-fable-5-2` at `high`, the state question "What happens when this runs again, stops
-half-way, or meets existing, old or empty state?", small findings left after round 2 filed as
-issues (`minors: "issue"`), the config at `.github/pr-queue.json` and reports of at most 60000
-characters. A field written out wins over the preset's (`lensRunners` per lens); a field written
-out while `preset` is `off` does nothing. A fork update may change the preset's values; write the
-fields out to keep them fixed. Efforts an agent may not use are the model policy's, not this
-setting's.
+half-way, or meets existing, old or empty state?", small findings fixed in the pull request or
+dropped (`minors: "same-round"`, the review kit's default), the config at `.github/pr-queue.json`
+and reports of at most 60000 characters. A field written out wins over the preset's (`lensRunners`
+per lens); a field written out while `preset` is `off` does nothing. A fork update may change the
+preset's values; write the fields out to keep them fixed. Efforts an agent may not use are the model
+policy's, not this setting's.
 
 Fields: `runner` and each `lensRunners` entry are `{driver, model, effort}` (a driver kind, not a
 provider instance), and a lens name is not a built-in object key such as `constructor`;
-`stateQuestion` is 20 to 600 characters; `minors` is `same-round`, `issue` or
-`free`; `configPath` is relative to the repository, without `..`; `reportMaxChars` is a whole number
+`stateQuestion` is 20 to 600 characters; `minors` is `same-round` (the review kit's default and
+rule, written once in `MINORS` in `fork-kit/review/lib/review_kit.py`), `issue` or `free`;
+`configPath` is relative to the repository, without `..`; `reportMaxChars` is a whole number
 from 1000 to 65000.
 
 Only the person can change it; agents cannot. A save must name `preset` (it replaces the stored

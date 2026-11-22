@@ -23,8 +23,8 @@ The examples use the override prefix `tool ready --head`. A project's prefix is 
 
 ## The lens marker
 
-A comment carries the lens marker when one of its lines, read with Markdown stripped (emphasis, links, tags, quote,
-list and heading marks), in a code block or quote too:
+A comment carries the lens marker when one of its lines, read in NFKC (a full-width colon `：` is a colon) with
+Markdown stripped (emphasis, links, tags, quote, list and heading marks), in a code block or quote too:
 
 - starts with the lens field: `lens:` (also `lens=`, `lens —`, `lens –`), or
 - names a read: `read at` and a hex sha (`read at: 0123abc`, `read-at 0123abc`), or
@@ -346,7 +346,7 @@ The gate reads: `not a lens`
 
 ```text
 not a lens: fix round 1 checked
-head 0123456789abcdef0123456789abcdef01234567 fixes the round 1 major; minors filed as a follow-up issue
+head 0123456789abcdef0123456789abcdef01234567 fixes the round 1 major and its minors; one nit dropped, reason under Left
 ```
 
 A plain comment.
@@ -363,5 +363,5 @@ when its author is listed in the review block's `override_authors`.
 The gate reads: `override`
 
 ```text
-tool ready --head 0123456789abcdef0123456789abcdef01234567: fix diff checked, the round 1 minors are in a follow-up issue
+tool ready --head 0123456789abcdef0123456789abcdef01234567: fix diff checked, the round 1 minors are fixed in this head
 ```
