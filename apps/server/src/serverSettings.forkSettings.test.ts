@@ -9,6 +9,7 @@ import {
   type ModelPolicy,
   modelPolicyStance,
   ProjectId,
+  type ProviderInstanceId,
   ServerSettingsError,
   ServerSettingsPatch,
 } from "@t3tools/contracts";
@@ -22,6 +23,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Schema from "effect/Schema";
 
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
@@ -860,6 +862,104 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
           assert.strictEqual(after.sources.playtest, "environment");
         }).pipe(Effect.provide(layerServerSettings().pipe(Layer.provide(NodeCrypto.layer)))),
       ),
+    );
+  },
+);
+
+it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))(
+  "usagePacing: a hand-edited entry (#975)",
+  (it) => {
+    /**
+     * Loads `file` under the server's logger and saves another key twice. Returns what the load
+     * logged (`warnings`), what the first save wrote, and what the second save logged: a save reads
+     * the file again first, so it warns until a save has written the entry clean.
+     */
+    const loadThenSaveOther = (file: unknown) => {
+      const warnings: Array<string> = [];
+      const serverLogger = Logger.layer(
+        [
+          Logger.make(({ logLevel, message }) => {
+            if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+          }),
+        ],
+        { mergeWithExisting: false },
+      );
+      return Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(config.settingsPath, JSON.stringify(file));
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const loaded = yield* service.getSettings;
+        const atLoad = [...warnings];
+        yield* service.updateSettings(decodePatch({ enableAgentBrowserAccess: false }));
+        const written = (yield* readFile) as { usagePacing?: Record<string, unknown> };
+        const beforeSecondSave = warnings.length;
+        yield* service.updateSettings(decodePatch({ enableAgentBrowserAccess: true }));
+        return { loaded, written, warnings: atLoad, secondSave: warnings.slice(beforeSecondSave) };
+      }).pipe(Effect.provide(layerServerSettings().pipe(Layer.provideMerge(serverLogger))));
+    };
+
+    it.effect(
+      "warns on a misspelled key and on unknown window names, and the next save writes the cleaned entry",
+      () =>
+        Effect.gen(function* () {
+          const { loaded, written, warnings, secondSave } = yield* loadThenSaveOther({
+            usagePacing: {
+              "claude-a": {
+                burnFirst: true,
+                // Misspelled: dropped, so every window burns first, as before the list existed.
+                burnFirstWindow: ["weekly"],
+              },
+              "codex-b": { burnFirst: true, burnFirstWindows: ["weekly", "weekley"] },
+            },
+          });
+          assert.isUndefined(
+            loaded.usagePacing["claude-a" as ProviderInstanceId]?.burnFirstWindows,
+          );
+          const misspelled = warnings.filter((text) => text.includes('burnFirstWindow"'));
+          assert.lengthOf(misspelled, 1, warnings.join("\n"));
+          assert.include(misspelled[0], "claude-a");
+          assert.include(misspelled[0], "burnFirstWindows");
+          assert.include(misspelled[0], "next settings save");
+          const names = warnings.filter((text) => text.includes("weekley"));
+          assert.lengthOf(names, 1, warnings.join("\n"));
+          assert.include(names[0], "next settings save");
+          // The save writes what was read: the unknown key and name are gone from the file.
+          assert.deepStrictEqual(written.usagePacing, {
+            "claude-a": { reservePercent: 0, burnFirst: true, noLimits: false },
+            "codex-b": {
+              reservePercent: 0,
+              burnFirst: true,
+              burnFirstWindows: ["weekly"],
+              noLimits: false,
+            },
+          });
+          // Runs again: the file is clean now, so the next read warns nothing.
+          assert.deepStrictEqual(secondSave, []);
+        }),
+    );
+
+    it.effect("an unreadable list saves back as empty; a clean entry warns nothing", () =>
+      Effect.gen(function* () {
+        const unreadable = yield* loadThenSaveOther({
+          usagePacing: { "claude-a": { burnFirst: true, burnFirstWindows: "weekly" } },
+        });
+        assert.lengthOf(
+          unreadable.warnings.filter((text) => text.includes("burnFirstWindows")),
+          1,
+        );
+        assert.deepStrictEqual(unreadable.secondSave, []);
+        assert.deepStrictEqual(unreadable.written.usagePacing, {
+          "claude-a": { reservePercent: 0, burnFirst: true, burnFirstWindows: [], noLimits: false },
+        });
+        const clean = yield* loadThenSaveOther({
+          usagePacing: { "claude-a": { burnFirst: true, burnFirstWindows: ["weekly"] } },
+        });
+        assert.deepStrictEqual(
+          clean.warnings.filter((text) => text.includes("usagePacing")),
+          [],
+        );
+      }),
     );
   },
 );

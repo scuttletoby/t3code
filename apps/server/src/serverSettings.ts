@@ -33,6 +33,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
@@ -386,7 +387,7 @@ const PersistedServerSettings = Schema.Struct({
 });
 // Parse first and decode second, so a managed policy can fill its defaults in between.
 const decodeSettingsFileJsonExit = Schema.decodeUnknownExit(fromLenientJson(Schema.Unknown));
-const decodePersistedServerSettingsExit = Schema.decodeUnknownExit(PersistedServerSettings);
+const decodePersistedServerSettings = Schema.decodeUnknownEffect(PersistedServerSettings);
 const LegacyProviderSettingsJson = fromLenientJson(
   Schema.Struct({
     providers: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
@@ -398,16 +399,36 @@ const decodeLegacyProviderSettingsJsonExit = Schema.decodeUnknownExit(LegacyProv
 
 /**
  * The load's decode of a settings file's text: parse, rename retired keys, fill policy defaults,
- * decode. Pure, so the fork's read-only report (`__fork-report`) decodes exactly as a load does.
+ * decode. Fork: an Effect, so what a lenient field drops is logged to the caller's logger (the
+ * server's on a load), not to Effect's default console logger as a synchronous decode would.
+ */
+const decodeSettingsFileTextLogged = (
+  raw: string,
+  withDefaults: (persisted: unknown) => unknown = (persisted) => persisted,
+) => {
+  const parsed = decodeSettingsFileJsonExit(raw);
+  return Effect.exit(
+    Exit.isFailure(parsed)
+      ? Effect.failCause(parsed.cause)
+      : decodePersistedServerSettings(withDefaults(prepareSettingsFile(parsed.value))),
+  );
+};
+
+/** No loggers: the readers below log nothing, the load already warned about the same file. */
+const layerNoLoggers = Logger.layer([], { mergeWithExisting: false });
+
+/**
+ * {@link decodeSettingsFileTextLogged}, synchronous and silent. Pure, so the fork's read-only
+ * report (`__fork-report`, whose stdout is its JSON) and other second readers decode exactly as a
+ * load does without repeating its warnings.
  */
 export function decodeSettingsFileText(
   raw: string,
   withDefaults: (persisted: unknown) => unknown = (persisted) => persisted,
 ) {
-  const parsed = decodeSettingsFileJsonExit(raw);
-  return Exit.isFailure(parsed)
-    ? parsed
-    : decodePersistedServerSettingsExit(withDefaults(prepareSettingsFile(parsed.value)));
+  return Effect.runSync(
+    decodeSettingsFileTextLogged(raw, withDefaults).pipe(Effect.provide(layerNoLoggers)),
+  );
 }
 
 /** The load's lenient parse of a settings file's text (comments, trailing commas), before decoding. */
@@ -821,7 +842,7 @@ const make = Effect.gen(function* () {
 
     if (yield* readConfigExists) {
       const raw = yield* readRawConfig;
-      const decoded = decodeSettingsFileText(raw, managed.withDefaults);
+      const decoded = yield* decodeSettingsFileTextLogged(raw, managed.withDefaults);
       const legacySettings = decodeLegacyProviderSettingsJsonExit(raw);
       if (legacySettings._tag === "Success") {
         legacyProviders = legacySettings.value.providers;
