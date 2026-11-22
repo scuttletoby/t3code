@@ -5,7 +5,7 @@ The shared vectors (review.vectors.json: `cases`, `findings`, `scans`, `rounds`)
 rest here: reading git's name-status output, and that a rule set the parser
 would refuse, or a diff line nobody knows, never judges.
 """
-import dataclasses, json, os, sys, time, unittest
+import dataclasses, json, os, re, sys, time, types, unittest, unittest.mock
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 
@@ -15,6 +15,8 @@ import config  # noqa: E402
 import lens  # noqa: E402
 import review_config as rc  # noqa: E402
 import review_judge as rj  # noqa: E402
+sys.path.insert(0, os.path.join(HERE, '..', 'head-check'))
+import head_check  # noqa: E402  (the `reads` vectors: lens_reads, review_rounds and verdict, as the gate runs them)
 
 with open(os.path.join(HERE, 'review.vectors.json'), encoding='utf-8') as _f:
     VECTORS = json.load(_f)
@@ -213,9 +215,11 @@ class Findings(unittest.TestCase):
                 self.assertEqual(section, v['section'])
 
     def test_each_rule_keeps_its_vectors(self):   # a vector dropped from the file is a rule no longer shown
-        sizes = {g: len(group(g)) for g in ('finding', 'clean', 'section', 'one-kind', 'one-label', 'mention')}
+        sizes = {g: len(group(g)) for g in ('finding', 'clean', 'section', 'one-kind', 'one-label', 'mention', 'named',
+                                            'python-text')}
         self.assertEqual(sizes, {'finding': 58, 'clean': 37, 'section': 9, 'one-kind': 9, 'one-label': 4,
-                                 'mention': 8})
+                                 'mention': 8, 'named': 8, 'python-text': 10})
+        self.assertEqual(sum(sizes.values()), len(FINDINGS))
 
     def test_each_real_finding_format_counts(self):
         for v in group('finding'):
@@ -239,25 +243,6 @@ class Findings(unittest.TestCase):
                 r = rounds([('code', H1)], {'code': v['body']})
                 self.assertEqual(len(r.problems), 1)
                 self.assertIn('lens code: its newest report has no findings section', r.problems[0])
-
-    def test_a_long_run_of_spaces_takes_linear_time(self):   # #740 round 2: 81-91 s for one 65,000-character line
-        n = 200_000
-        for line in ('major' + ' ' * n + 'x', 'blocker: none' + ' ' * n + 'x', '| a | b |\n' + ' ' * n + 'x',
-                     '| a | b |\n|' + ' ' * n + 'x', '| a | b |\n|-' + ' ' * n + 'x',
-                     'not' + ' ' * n + 'safe', 'finding:' + ' ' * n + 'x', 'major: none' + ' \t' * (n // 2) + 'x'):
-            with self.subTest(line[:12]):
-                start = time.monotonic()
-                rj.read_findings(HEAD + line)
-                self.assertLess(time.monotonic() - start, 2)
-
-    def test_a_wide_table_row_takes_linear_time(self):   # the old per-cell read: 13 s at 4,000 cells, minutes at 65,536 chars
-        for text in ('| ' + 'major | ' * 8_000, '| ' + 'major | ' * 4_000 + 'x | ' * 4_000,
-                     '| ' + 'major | ' * 3_000 + '\n|' + '---|' * 3_000 + '\n| ' + 'x | ' * 3_000,
-                     '| major |' + ' |' * 30_000 + ' x |', '|' + '---|' * 16_000 + 'x'):
-            with self.subTest(text[:12]):   # each about one full-size comment (65,536 characters): 0.2-0.5 s here
-                start = time.monotonic()
-                rj.read_findings(HEAD + text)
-                self.assertLess(time.monotonic() - start, 2)
 
     def test_a_table_does_not_go_on_past_a_fence(self):   # a fence ends the table, as GitHub renders it
         table = '| blocker | major |\n|---|---|\n| none | none |\n'
@@ -372,22 +357,42 @@ class Rounds(unittest.TestCase):
 
 # Every section of review.vectors.json, replayed whole: the TypeScript side (apps/server/src/reviewRules) runs the same
 # sections, and each side fails on a section or a vector field it does not run, so neither can skip one quietly.
-SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds'}
-FIELDS = {'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
+SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds',
+            'reads', 'linear', 'py_unicode', 'unicode'}
+FIELDS = {'linear': {'name', 'fn', 'parts', 'expect', 'ms'},
+          'unicode': {'name', 'body', 'findings', 'section', 'unassigned', 'refused'},
+          'reads': {'name', 'posts', 'head', 'same', 'override_authors', 'required', 'expect'},
+          'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
           'findings': {'name', 'group', 'body', 'findings', 'section'},
-          'scans': {'name', 'posts', 'history', 'entries'},
+          'scans': {'name', 'posts', 'history', 'entries', 'not_lens'},
           'rounds': {'name', 'config', 'history', 'reports', 'decided', 'changes', 'override_authors', 'findings',
                      'expect'}}
-SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',))
+SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',), log=lambda *_: None)
+
+
+def vector_pr(posts):
+    """The vector's posts as a pull request: each by its `author` (else `someone`), one second apart unless it names its
+    `when`; a comment by default, else a `review` (its flags read unless `flags` is false) or an `inline` review
+    comment."""
+    pr = {'comments': [], 'reviews': [], lens.REVIEW_FLAGS: {}, lens.REVIEW_COMMENTS: []}
+    for i, p in enumerate(posts):
+        when = p.get('when', f'2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z')
+        post = {'body': p['body'], 'author': {'login': p.get('author', 'someone')}, 'authorAssociation': 'OWNER'}
+        flags = {'includesCreatedEdit': p.get('edited', False), 'isMinimized': p.get('hidden', False)}
+        kind = p.get('kind', 'comment')
+        if kind == 'review':
+            pr['reviews'].append({**post, 'id': f'R{i}', 'submittedAt': when,
+                                  'includesCreatedEdit': False, 'isMinimized': False})   # gh's defaults, never read
+            if p.get('flags', True):
+                pr[lens.REVIEW_FLAGS][f'R{i}'] = flags
+        else:
+            pr['comments' if kind == 'comment' else lens.REVIEW_COMMENTS].append({**post, 'createdAt': when, **flags})
+    return pr
 
 
 def scan(posts):
-    comments = [{'body': p['body'], 'author': {'login': 'someone'}, 'authorAssociation': 'OWNER',
-                 'createdAt': f'2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z',
-                 'includesCreatedEdit': p.get('edited', False), 'isMinimized': p.get('hidden', False)}
-                for i, p in enumerate(posts)]
-    found, history = SCAN.lens_scan({'comments': comments, 'reviews': []})
-    return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}
+    found, history, notes, _ = SCAN.scan_posts(vector_pr(posts))
+    return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}, [list(n) for n in notes]
 
 
 def replay_round(v):
@@ -400,6 +405,49 @@ def replay_round(v):
             'findings': [list(f) for f in r.findings], 'problems': list(r.problems), 'text': r.text(review)}
 
 
+class _MergeCommit:
+    """A checkout of GitHub's merge commit of `head` that knows no history (own_change: each read its own change)."""
+    holder = 'the checkout merges'
+
+    def __init__(self, head):
+        self.parents = ('0' * 40, head)
+
+    def merge_parents(self):
+        return self.parents
+
+    def git(self, *a):
+        return types.SimpleNamespace(returncode=1, stdout='', stderr='no history here')
+
+    def has(self, sha):
+        return True
+
+    fetch = has
+
+
+AGAIN_RE = re.compile(r'lens (.+?): its newest report (?:reads nothing|has no findings section)')
+
+
+def replay_reads(v):
+    """What the gate reads of the lens posts at `head`, under the `basic` rules in enforce with findings judged:
+    lens.Review.lens_reads (each key's sha), the keys review_rounds fails until that lens posts again (UNREAD, or a
+    report with no findings section), and whether head_check.verdict and the rounds pass. `same`: the reads that are
+    the head's change merged with the base (head_check.same_change)."""
+    head = v['head']
+    pr = {**vector_pr(v['posts']), 'isDraft': False, 'headRefOid': head}
+    rules = dataclasses.replace(CONFIGS['basic'], mode='enforce', findings=True,
+                                override_authors=tuple(v['override_authors']))
+    checkout = _MergeCommit(head)
+    same = lambda _checkout, h, read: (read == h or read in v['same'], 'the same change')   # noqa: E731
+    with unittest.mock.patch.object(head_check, 'same_change', same):
+        reads = {k: sha for k, (sha, _, _) in SCAN.lens_reads(pr).items()}
+        rounds, why = head_check.review_rounds(rules, SCAN, pr, checkout, VECTORS['override_prefix'])
+        ok, _, _ = head_check.verdict(pr, SCAN, checkout, {lens.lens_key(n): n for n in v['required']})
+    if rounds is None:
+        raise AssertionError(why)
+    again = sorted(m.group(1) for p in rounds.problems for m in [AGAIN_RE.match(p)] if m)
+    return {'reads': reads, 'again': again, 'passes': ok and not rounds.problems}
+
+
 class SharedVectors(unittest.TestCase):
     def test_this_side_runs_every_section_and_field(self):
         self.assertEqual(set(VECTORS), SECTIONS)
@@ -409,11 +457,57 @@ class SharedVectors(unittest.TestCase):
             for v in VECTORS[section]:
                 self.assertLessEqual(set(v), fields, f'{section}: {v["name"]}')
 
+    def test_every_linear_vector_in_its_time(self):   # #740 round 2: 81-91 s for one 65,000-character line before
+        for v in VECTORS['linear']:   # each its own bound: a slow but not hanging path would pass a test timeout
+            with self.subTest(v['name']):
+                body = ''.join(text * times for text, times in v['parts'])
+                start = time.monotonic()
+                if v['fn'] == 'read_findings':
+                    said, section = rj.read_findings(body)
+                    got = [[list(f) for f in said], section]
+                else:
+                    self.assertEqual(v['fn'], 'lens_problem')
+                    got = SCAN.lens_problem({'body': body})
+                self.assertLess(time.monotonic() - start, v['ms'] / 1000)
+                self.assertEqual(got, v['expect'])
+
+    def test_the_unicode_table_is_this_pythons(self):   # T3 refuses text whose code points its Unicode assigns otherwise
+        import unicodedata
+        u = VECTORS['py_unicode']
+        self.assertEqual(u['version'], unicodedata.unidata_version,
+                         'a new Python reads a new Unicode: regenerate py_unicode and T3\'s pyUnicode.ts together')
+        ranges, start = [], None
+        for cp in range(0x110000):
+            assigned = unicodedata.category(chr(cp)) != 'Cn'
+            if assigned and start is None:
+                start = cp
+            if not assigned and start is not None:
+                ranges.append((start, cp - 1))
+                start = None
+        if start is not None:
+            ranges.append((start, 0x10ffff))
+        self.assertEqual(u['assigned'], ' '.join(f'{a:x}' if a == b else f'{a:x}-{b:x}' for a, b in ranges))
+        for v in VECTORS['unicode']:
+            with self.subTest(v['name']):
+                said, section = rj.read_findings(v['body'])
+                self.assertEqual(([list(f) for f in said], section), (v['findings'], v['section']))
+                self.assertEqual(v['unassigned'],
+                                 sorted({f'U+{ord(c):04X}' for c in v['body'] if unicodedata.category(c) == 'Cn'}))
+                # What T3 refuses on a runtime that assigns them (a letter, number, mark, format or space there): a
+                # subset; the rest (a new symbol) reads alike here and there.
+                self.assertLessEqual(set(v['refused']), set(v['unassigned']))
+
     def test_every_scan(self):   # same comment twice, edited, hidden, old forms, no comment at all
         self.assertGreaterEqual(len(VECTORS['scans']), 31)
         for v in VECTORS['scans']:
             with self.subTest(v['name']):
-                self.assertEqual(scan(v['posts']), (v['history'], v['entries']))
+                self.assertEqual(scan(v['posts']), (v['history'], v['entries'], v.get('not_lens', [])))
+
+    def test_every_reads_vector(self):   # lens_start's copy of lens_reads, review_rounds' UNREAD and verdict
+        self.assertGreaterEqual(len(VECTORS['reads']), 10)
+        for v in VECTORS['reads']:
+            with self.subTest(v['name']):
+                self.assertEqual(replay_reads(v), v['expect'])
 
     def test_every_round(self):
         self.assertGreaterEqual(len(VECTORS['rounds']), 28)

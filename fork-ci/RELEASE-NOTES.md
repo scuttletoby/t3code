@@ -13,6 +13,42 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue: every unreadable plan is kept and told once; the cache never raises (#934)
+
+An unreadable or untrusted plan no longer replaces an earlier `STATE.bad`: a later one is kept as
+`STATE.bad-<time in ns>`. Every run names each such file in a `::warning::` (shown on the run's page), not only a log
+line. With `notify_command` the queue runs that command once for each new one, with kind `bad-plan`, PR `0`, an empty
+head and the repository's pull request list as the link; which ones were told is kept in `STATE.told-bad`, removed once
+no such file is left, and a name it holds is never given to a new one, so each new one is told. No kept plan
+overwrites a file. A `STATE.bad` an older release kept is told once. A cache folder the queue cannot make or list,
+or a stale ref lock it cannot delete, is said and the run fetches nothing (as before), without a Python traceback.
+
+**Upgrade:** a `notify_command` that reads `pr` as a pull request number must accept `0` for kind `bad-plan`, or
+ignore that kind.
+
+### pr-queue and head-check: only a comment with the lens marker is a lens report (#865)
+
+A comment counts as a lens report only when it carries the lens marker: a line that starts with the lens field
+(`lens:`, `lens=`, `lens —`, `lens –`), names a read (`read at` and a hex sha), or has a lens field with a hex sha after
+it (Markdown stripped, in code blocks and quotes too). A lens report that is not exactly one valid read still blocks, as
+before. A comment that only looks like one without the marker (a `## Lens A` heading, `safe to merge`, `covered:` and
+`checks:` lines) and holds no open finding no longer blocks: the run log and the head check's summary name it as
+`not a lens report` (a `WARN` row) with the reason. One without the marker that holds an open finding (a `blocker:` or
+`major:` line that is not `none`, NOT SAFE on its first two lines or a `verdict:` line, or `not safe to merge` on any
+line outside a fenced code block) still blocks, as before, whatever an older or newer read of that lens says: it is
+most likely a real report with a broken header. Its reason, first in the head check's, says to post a NEW comment
+whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker in does not count) and to
+delete the old one or edit it to start with `not a lens` and a colon; it also stops holding once edited so it holds
+no open finding (the same people could delete it). The queue posts that reason with the header described in words,
+so its comment never looks like a lens report. The head check's check run on the pull request shows the
+`not a lens report` row as `warn` too. Comments with the marker read exactly as before. T3's copy (`apps/server/src/fork/reviewRules`) and the review
+kit's `check` read the same rule from the shared vectors.
+
+**Upgrade:** a lens report written without the marker now counts for nothing, so a lens that posts one has not
+reported: list required lenses (`required-lenses`, or a `review` block in `enforce`) so a missing read still fails the
+head check, and have lenses run the kit's `check` before posting. An old comment without the marker that holds an
+open finding blocks as it did before this release; one that holds none stops blocking.
+
 ### pr-queue: what counts as a `state:` line is gate code (#797)
 
 `review_judge.has_state_line` holds the rule for a lens report's `state:` line (an answer after the colon, outside code

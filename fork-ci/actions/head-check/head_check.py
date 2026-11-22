@@ -57,6 +57,8 @@ import review_judge  # noqa: E402
 ATTEMPTS, RETRY_SECONDS = 3, 10
 FETCH_SECONDS = 120   # a fetch of a read commit that takes longer counts as failed (the job has 15 minutes in all)
 FIELDS = 'isDraft,headRefOid,comments,reviews'
+WARN = 'warn'   # a verdict row that passes but a reader should look at (a comment that is no lens report): not green
+LOG_MARK = {'ok': 'ok  ', 'warn': 'WARN', 'fail': 'FAIL'}
 SHA = pr_queue.SHA
 REFUSED = pr_queue.REFUSED
 # Every git call: the queue's safe flags (no hooks, fsmonitor, commit-graph, replace refs or attributes file). git runs
@@ -212,9 +214,14 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False, rules_name_l
     reads = review.lens_reads(pr)
     reviewed, read, why = review.reviewed_head(pr)
     missing = [name for key, name in required.items() if key not in reads]
-    found = ', '.join(sorted(reads)) or 'none'
+    # comments that look like a lens report but carry no lens marker and hold no open finding: no report, so they pass;
+    # named in a WARN row, never silent. Those that hold an open finding block: NO_HEADER entries of reads (held).
+    notes = [(f'{lens.NOT_LENS} ({where})', WARN, why) for where, why in review.not_lens_reports(pr)]
+    held = review.unmarked_held(pr)
+    why = short_held(why, held)   # the reason names a held comment by where it is: the fix is said once, first
+    found = short_held(', '.join(sorted(reads)), held) or 'none'
     if not reads and not required:
-        return True, 'no lens comments and no required lens: nothing to compare', []
+        return True, 'no lens comments and no required lens: nothing to compare', notes
     ok, how = same_change(checkout, head, read) if reviewed and read else (False, None)
     rows = [(name, False, f'required: no lens comment of a counted author has this name (lenses found: {found})')
             for name in missing]
@@ -226,13 +233,31 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False, rules_name_l
         else:
             text = f'{"override " if override else "read "}{sha[:12]}: {how}'
         rows.append(((f'{key} (required)' if key in required else key), bool(sha and read and ok), text))
+    rows += notes
     if missing:
+        if notes or held:   # the fix first: a look-alike is most likely the report, so no config hint
+            return False, (f'{marker_hint(len(notes) + len(held), held)}. Required lens without a read: '
+                           f'{", ".join(missing)}; lenses found: {found}'), rows
         where = ' or the review rules of the config' if rules_name_lenses else ''
         return False, (f'required lens without a read: {", ".join(missing)}. No counted lens comment has that name: '
                        f'check it in required-lenses (one name per line){where}; lenses found: {found}'), rows
     if not read:
-        return False, why, rows
+        return False, (f'{marker_hint(len(held), held)}. {why}' if held else why), rows
     return ok, how, rows
+
+
+def marker_hint(count, held=()):
+    """The fix for comments that look like a lens report but carry no lens marker, first in a failure reason; with
+    held ones (unmarked_held), the way out of those too (lens.HELD_WAY_OUT, the one wording)."""
+    out = f'{count} comment(s) look like a lens report but carry no lens marker: {lens.REPOST}'
+    return f'{out}, and {lens.HELD_WAY_OUT} (one that holds an open finding blocks until then)' if held else out
+
+
+def short_held(text, held):
+    """text with each held comment's long reason (its NO_HEADER key) cut to where it is: its row says the rest."""
+    for where, why in held:
+        text = text.replace(f'{where}, {why}', where)
+    return text
 
 
 def escape(text):
@@ -244,10 +269,15 @@ def cell(text):
     return re.sub(r'[|<>`\r\n]', ' ', str(text))
 
 
+def mark(good):
+    """A row's mark: ok, warn (WARN: it passes, but a reader should look) or fail."""
+    return 'warn' if good is WARN else 'ok' if good else 'fail'
+
+
 def report(ok, reason, rows, n, env, out=print):
     """The log, the step summary (one table, appended) and the `result` output."""
     for name, good, text in rows:
-        out(f'  {"ok  " if good else "FAIL"} {escape(name)}: {escape(text)}')
+        out(f'  {LOG_MARK[mark(good)]} {escape(name)}: {escape(text)}')
     out(f'#{n}: head check {"passed" if ok else "FAILED"}: {escape(reason)}' if ok else f'::error::#{n}: head check '
         f'failed: {escape(reason)}')
     summary = env.get('GITHUB_STEP_SUMMARY')
@@ -255,7 +285,7 @@ def report(ok, reason, rows, n, env, out=print):
         lines = [f'### Head check #{n}: {"pass" if ok else "fail"}', '', cell(reason), '']
         if rows:
             lines += ['| lens | | reason |', '| --- | --- | --- |']
-            lines += [f'| {cell(name)} | {"ok" if good else "fail"} | {cell(text)} |' for name, good, text in rows]
+            lines += [f'| {cell(name)} | {mark(good)} | {cell(text)} |' for name, good, text in rows]
         with open(summary, 'a', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
     output = env.get('GITHUB_OUTPUT')

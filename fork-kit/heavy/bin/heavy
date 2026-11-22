@@ -1,7 +1,10 @@
 #!/usr/bin/python3 -IB
 """heavy: run a command in a capped systemd user slice, and stop whatever it leaves behind.
 
-  heavy <command> [args...]       run <command> in its own scope in the slice, wait for it, stop the scope
+  heavy [--wait S] <command> [args...]
+                                  run <command> in its own scope in the slice, wait for it, stop the scope; first
+                                  wait (up to S seconds, default 7200, then exit 76) until the machine's capacity
+                                  rule (`heavy facts`) says free, unless heavy.queue.capacityCheck is false
   HEAVY_KEEP=1 heavy <command>    the same, but processes the command leaves running are kept (a daemon)
   heavy --self-check              check the config, the slice and the installed files (exit 1 on a problem), and
                                   warn when the t3-capacity on PATH is not this kit's
@@ -12,8 +15,9 @@
   heavy docker-label [--value]    the owner label for a container a test starts, so heavy (when its command ends)
                                   and the sweep can remove it (--owner-pid PID: the long-lived test process; README)
   heavy --kind <name> [--mb N] [--wait S] [--] <command> [args...]
-                                  the same, but first wait in the memory queue until the job's memory fits
-                                  (lib/heavy_queue.py; exit 76 after --wait seconds, default 7200, with the
+                                  the same, but first wait in the memory queue until the job's memory fits and
+                                  the capacity rule admits it (lib/heavy_queue.py; exit 76 after --wait seconds,
+                                  default 7200, with the
                                   line "heavy: gave up after waiting" on stderr: a command that exits 76 by itself
                                   has no such line)
   heavy --measure <kind> [--] <command> [args...]
@@ -68,6 +72,7 @@ INSTALLED = '/etc/heavy/installed.tsv'
 DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 30}
 SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
 CGROUP_ROOTS = ('/sys/fs/cgroup', '/sys/fs/cgroup/unified')
+SCOPE_START_SECONDS = 5  # a job without --kind keeps the queue lock at most this long, until its scope can be counted
 SETTLE = 1               # seconds stop_scope still looks after a step that sent nothing (processes ending anyway)
 WATCH = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)   # stop the scope after the grace time
 FORWARD = (signal.SIGUSR1, signal.SIGUSR2)                               # only passed on to the command
@@ -86,6 +91,7 @@ RUNTIME_ROOT = '/run/user'      # <root>/<uid>/heavy/labelled: the scopes `heavy
 STATE_ROOT = ''                 # <root>/heavy/labelled: the same, where /run/user is out of reach ('' = ~/.local/state)
 DOCKER_TIMEOUT = 20
 MAX_NAMES = 5
+DEFAULT_WAIT = 7200             # seconds a job waits for memory (--kind) or capacity (any job, #866) before exit 76
 # Python sets these to SIG_IGN at startup, and SIG_IGN survives exec: put them back before the command starts
 # (subprocess does the same for its children)
 PYTHON_IGNORED = [getattr(signal, n) for n in ('SIGPIPE', 'SIGXFSZ', 'SIGXFZ') if hasattr(signal, n)]
@@ -177,15 +183,20 @@ def check_slice(systemctl, name, limits=None):
     return p.get('ControlGroup', '') if p.get('ActiveState') == 'active' else ''
 
 
-def own_cgroup():
+def cgroup_of(pid):
+    """The cgroup v2 path of a process ('self' for heavy itself), '' when it cannot be read."""
     try:
-        with open('/proc/self/cgroup', encoding='utf-8') as f:
+        with open(f'/proc/{pid}/cgroup', encoding='utf-8') as f:
             for line in f:
                 if line.startswith('0::'):
                     return line[3:].strip()
     except OSError:
         pass
     return ''
+
+
+def own_cgroup():
+    return cgroup_of('self')
 
 
 def in_heavy_scope(slice_cg):
@@ -280,12 +291,8 @@ def scope_state(systemctl, unit):
 
 def in_cgroup(pid, cg):
     """True while the process is in the cgroup or below it."""
-    try:
-        with open(f'/proc/{pid}/cgroup', encoding='utf-8') as f:
-            path = next((line[3:].strip() for line in f if line.startswith('0::')), '')
-    except OSError:
-        return False
-    return path == cg or path.startswith(cg + '/')
+    path = cgroup_of(pid)
+    return bool(path) and (path == cg or path.startswith(cg + '/'))
 
 
 def signal_in(pids, cg, sig):
@@ -443,13 +450,31 @@ def marks_dir():
     return own_folder(os.path.join(RUNTIME_ROOT, str(os.getuid())))
 
 
+def others_can_swap(path):
+    """True when a folder above `path` (links resolved) is not root's or this user's, or a group or others can write it
+    and it is not sticky: someone else could swap a part of the path after it was checked (#951; lib/heavy_sweep.py
+    others_can_swap and lib/heavy_facts.py swappable, the same rule: tests/facts.test.py OneRule checks they agree;
+    plain heavy loads no kit module, so this copy stays)."""
+    uid, at = os.geteuid(), path
+    while at != '/':
+        at = os.path.dirname(at)
+        try:
+            st = os.lstat(at)
+        except OSError:
+            return True
+        if st.st_uid not in (0, uid) or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX):
+            return True
+    return False
+
+
 def state_base():
     """<home>/.local/state for the second notes folder (lib/heavy_sweep.py state_base, the same rule), or '' for none.
     The home is $HOME, else the password database's; only an absolute folder this user owns, that no group or other
-    user can write, and not /. heavy makes the folder when it is missing, so never in another user's home (root
-    with a user's HOME, `sudo -E heavy ...`, uses root's own home), never under a folder anyone can write (root
-    with HOME=/tmp: another user could plant /tmp/.local first) and never relative to the job's working folder (no
-    HOME and no passwd entry: no second folder)."""
+    user can write, not /, and in no folder someone else could swap it in (others_can_swap, #951). heavy makes the
+    folder when it is missing, so never in another user's home (root with a user's HOME, `sudo -E heavy ...`, uses
+    root's own home), never under a folder anyone can write (root with HOME=/tmp: another user could plant
+    /tmp/.local first) and never relative to the job's working folder (no HOME and no passwd entry: no second
+    folder)."""
     if STATE_ROOT:
         return STATE_ROOT
     homes = [os.environ.get('HOME') or '']
@@ -465,7 +490,8 @@ def state_base():
             st = os.lstat(home)
         except OSError:
             continue
-        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022 and home != '/':
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022 and home != '/' \
+                and not others_can_swap(home):
             return os.path.join(home, '.local', 'state')
     return ''
 
@@ -844,11 +870,68 @@ def queue_root():
     return root or None
 
 
-def queue_for(hq, cfg, systemctl, slice_cg, limits):
+def queue_for(hq, cfg, systemctl, slice_cg, limits, capacity=None, settings=None):
     """The memory queue of the slice (lib/heavy_queue.py), with its settings from the machine file."""
     box = hq.Box(cfg['slice'], slice_cg, limits.get('MemoryHigh') or limits.get('MemoryMax'), cg_root=cgroup_root(),
                  queue_root=queue_root(), resolve=lambda: slice_cgroup(systemctl, cfg['slice']))
-    return hq.Queue(box, hq.settings())
+    return hq.Queue(box, settings or hq.settings(), capacity=capacity)
+
+
+def capacity_check(slice_name=None):
+    """(kind, mb) -> (free?, why): this kit's `heavy facts --fresh` for the job (#866), judged by free/v1's reader,
+    with the same 20 s hold of a NOT OK as t3-capacity (lib/heavy_facts.py checked: one source); busy, no answer
+    within 5 s or a broken answer is not free. Raises CheckCannotRun when this kit's facts can never answer free (the
+    capacity rule not installed with it, a broken machine file, a basic tier machine: #981): waiting would only end
+    at --wait. slice_name: heavy's slice (its folder must be listable)."""
+    hf = kit_module('heavy_facts')
+    heavy = hf.test_env('HEAVY_CHECK_HEAVY') or os.path.realpath(__file__)     # tests: a fake `heavy facts`
+    if heavy == os.path.realpath(__file__):
+        why = hf.ready(queue_module(), slice_name)
+        if why:
+            raise CheckCannotRun(why)
+
+    def check(kind, mb):
+        verdict, why, _ = hf.checked(heavy, kind, mb, fresh=True)
+        return verdict == 'free', why
+    return check
+
+
+class CheckCannotRun(Exception):
+    pass
+
+
+def checker(argv, slice_name):
+    """capacity_check(slice_name), or None after saying why heavy does not run argv (exit 1)."""
+    try:
+        return capacity_check(slice_name)
+    except Exception as e:      # CheckCannotRun, or a kit that cannot load its facts: never a wait for nothing
+        say(f'the capacity check cannot run: {e}; not running {argv[0]} (install the kit again with heavy-install, '
+            f'fix the machine file, or set heavy.queue.capacityCheck to false)')
+        return None
+
+
+def scope_counted(box, unit, child, limit=SCOPE_START_SECONDS):
+    """Wait until heavy facts can count the new scope (its cgroup has a memory.stat), at most `limit` seconds, or
+    until the command has ended already (peeked at with WNOWAIT: wait_and_clean still reaps it). It runs under the
+    queue lock, so it never asks systemd (Box.refresh may: a hung user manager would hold the lock past the queue
+    verbs' 30 s, #981): a slice that was not active before (its first scope starts it) is read from the child's own
+    cgroup, as systemd-run moves itself into the new scope before it runs the command."""
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        if not box.slice_cg:
+            parent, _, leaf = cgroup_of(child.pid).rpartition('/')
+            if leaf == unit and parent:
+                box.slice_cg = parent
+        folder = box.folder(unit)
+        if folder and os.path.exists(os.path.join(folder, 'memory.stat')):
+            return True
+        try:
+            if os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return False
+        except ChildProcessError:
+            return False
+        time.sleep(0.02)
+    return False
 
 
 def run(argv, cfg, job=None):
@@ -871,12 +954,43 @@ def run(argv, cfg, job=None):
     grace = cfg['grace_seconds']
     unit = unit_name(argv[0], keep)
     env[b'HEAVY_SCOPE'] = unit.encode()
-    queue = ticket = sampler = child_mask = None
+    queue = ticket = sampler = child_mask = admission = None
+    if not nested and not (job is not None and job['kind']):
+        # #866: a job without --kind waits for the machine's capacity rule too (a queued one asks it in the queue)
+        hq = queue_module()
+        try:
+            settings = hq.settings()
+        except Refused as e:        # the queue's settings only steer this wait: warn and wait as by default
+            say(f'{e}; a job without --kind goes on with the default queue settings')
+            settings = hq.default_settings()
+        if settings['capacityCheck']:
+            check = checker(argv, cfg['slice'])
+            if check is None:
+                return 1
+            # under the queue lock, held until the scope can be counted: two waiters never take the same room
+            admission = queue_for(hq, cfg, systemctl, slice_cg, limits, settings=settings)
+            try:
+                hq.capacity_wait(lambda: check(None, None), (job or {}).get('wait', DEFAULT_WAIT),
+                                 settings['pollSeconds'], lock=admission)
+            except OSError as e:
+                say(f'memory queue: {e}; not running {argv[0]}')
+                return 1
+            except hq.GaveUp as e:
+                say(f'{e}; not running {argv[0]}')
+                return hq.EXIT_GAVE_UP
+            except hq.Stopped as e:
+                say(f'{signal.Signals(e.sig).name} while waiting for capacity; not running {argv[0]}')
+                return finish(e.sig, None)
     if job is not None and job['kind'] and not nested:
         hq = queue_module()
         child_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])     # the mask now: the command's, as without a queue
+        capacity = None
+        if hq.settings()['capacityCheck']:
+            capacity = checker(argv, cfg['slice'])
+            if capacity is None:
+                return 1
         try:
-            queue = queue_for(hq, cfg, systemctl, slice_cg, limits)
+            queue = queue_for(hq, cfg, systemctl, slice_cg, limits, capacity=capacity)
             hq.check_kind(job['kind'])
             mb, _how = queue.reservation(job['kind'], job['mb'])
             # admitted: INT/TERM/HUP stay blocked from here until run_scope takes them, so one that comes just after
@@ -912,14 +1026,23 @@ def run(argv, cfg, job=None):
             sampler = hm.Measurer(box, unit, measure_kind, hm.state_dir(), hq.cgroup_used, inner=sampler, out=say)
         except Exception as e:      # the measurement is never a reason not to run the job
             say(f'not recording the memory of {measure_kind}: {e}')
+    started = None
+    if admission is not None:
+        def started(child):
+            try:
+                scope_counted(admission.box, unit, child)
+            finally:
+                admission.drop()
     try:
-        return run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask)
+        return run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask, started)
     finally:
+        if admission is not None:
+            admission.drop()
         if ticket is not None:
             hq.release(queue, ticket)
 
 
-def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask=None):
+def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask=None, started=None):
 
     ignored = [s for s in WATCH + FORWARD if signal.getsignal(s) == signal.SIG_IGN]
     watch = [s for s in WATCH if s not in ignored]
@@ -946,6 +1069,8 @@ def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler
         say(f'cannot start systemd-run: {e}')
         return 1
     try:
+        if started is not None:     # the command runs: heavy's admission ends once its scope can be counted
+            started(child)
         return wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, sampler, docker, guard,
                               marks)
     finally:
@@ -1149,8 +1274,9 @@ def kit_module(name):
 
 
 def job_options(argv):
-    """(--kind/--mb/--wait/--measure as a dict, or None without them, or 'usage'; the rest of argv). --mb and
-    --wait need --kind; --measure works alone (no queue) or with --kind (another kind for the record)."""
+    """(--kind/--mb/--wait/--measure as a dict, or None without them, or 'usage'; the rest of argv). --mb needs
+    --kind; --measure works alone (no queue) or with --kind (another kind for the record); --wait alone is how long
+    a job without --kind waits for capacity."""
     opts, rest = {}, list(argv)
     while rest and rest[0].split('=', 1)[0] in ('--kind', '--mb', '--wait', '--measure'):
         key, eq, value = rest.pop(0).partition('=')
@@ -1163,11 +1289,12 @@ def job_options(argv):
         opts[key] = value
     if not opts:
         return None, argv
-    if not rest or ('--kind' not in opts and set(opts) != {'--measure'}):
+    # --mb needs --kind; --measure and --wait (how long a job without --kind waits for capacity, #866) work alone
+    if not rest or ('--kind' not in opts and not set(opts) <= {'--measure', '--wait'}):
         return 'usage', argv
     try:
         mb = int(opts.get('--mb', 3072))
-        wait = float(opts.get('--wait', 7200))
+        wait = float(opts.get('--wait', DEFAULT_WAIT))
     except ValueError:
         return 'usage', argv
     if not 64 <= mb <= 1 << 20 or not 0 <= wait <= 7 * 86400:

@@ -35,8 +35,8 @@ jobs:
           base: ${{ steps.green.outputs.sha }} # empty: a full run
       - if: steps.scope.outputs.docs_only != 'true'
         run: ./gradlew build
-      - if: fromJSON(steps.scope.outputs.jobs).engine != 'false'
-        run: ./gradlew :engine:test
+      - if: fromJSON(steps.scope.outputs.jobs).core != 'false'
+        run: ./gradlew :core:test
 ```
 
 Always test `!= 'true'` and `!= 'false'`, never `== 'false'` or `== 'true'`: a missing or empty output then means
@@ -44,7 +44,7 @@ Always test `!= 'true'` and `!= 'false'`, never `== 'false'` or `== 'true'`: a m
 
 Run it as a step of the jobs it gates, as above. If it runs in a job of its own that others `need`, a failure of that
 job skips them, and GitHub counts a skipped required job as passing: gate them with
-`if: ${{ !cancelled() && (needs.scope.result != 'success' || fromJSON(needs.scope.outputs.jobs).engine != 'false') }}`.
+`if: ${{ !cancelled() && (needs.scope.result != 'success' || fromJSON(needs.scope.outputs.jobs).core != 'false') }}`.
 
 ### Outputs
 
@@ -54,8 +54,8 @@ job skips them, and GitHub counts a skipped required job as passing: gate them w
 | `jobs`      | JSON `{"<job>": "true" \| "false"}`; `{}` when unknown                         |
 | `reason`    | one line: `docs-only:`, `full run:`, `scoped run:` or `not docs-only:` and why |
 
-The step log also prints one line per job: `job engine: run (engine/A.java matches its paths)` or
-`job engine: skip (...)`. Control characters, line separators and bytes that are not UTF-8 in a file name are
+The step log also prints one line per job: `job core: run (core/A.java matches its paths)` or
+`job core: skip (...)`. Control characters, line separators and bytes that are not UTF-8 in a file name are
 printed escaped (`\n`, `\udcff`), so a file name can neither start a `::workflow-command::` line nor add an output.
 
 ## What "the change" is
@@ -93,7 +93,7 @@ the diff to commits a passing push run already tested.
   "never_docs": [
     { "glob": "**/src/**", "why": "inside a source set (packed into jars)" },
     { "glob": "**/tests/**", "why": "inside a test folder" },
-    { "glob": "tools/CLAIMS.md", "why": "read by the release tool" }
+    { "glob": "tools/RELEASE-NOTES.md", "why": "read by the release tool" }
   ],
   "never_docs_from": [
     {
@@ -107,13 +107,13 @@ the diff to commits a passing push run already tested.
   "docs_only_events": ["pull_request"],
   "no_build": [".github/ISSUE_TEMPLATE/**", "tools/notes/**"],
   "jobs": {
-    "engine": {
-      "paths": ["engine/**", "shared/items/**"],
+    "core": {
+      "paths": ["core/**", "shared/common/**"],
       "paths_from": [
         {
           "file": "tools/modules.json",
           "list": "modules",
-          "where": { "kind": "engine-module" },
+          "where": { "kind": "core-module" },
           "field": ["paths", "inputs"],
           "label": "id"
         }

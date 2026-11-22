@@ -45,12 +45,18 @@ DEFAULTS = {
     'audit_runner': {'model': 'claude-fable-5-2', 'effort': 'high'},
     'forbidden_efforts': ['low', 'max'],
     'lens_rounds': 2,
-    'minors': 'issue',
+    'minors': 'same-round',
     'state_question': STATE_QUESTION,
 }
-MINORS = {'issue': 'minors not fixed when the pull request stops go into one follow-up issue, linked on it',
-          'same-round': 'minors are fixed in the same round; any left at the last round go into the pull request '
-                        'description with a reason each'}
+MINORS = {'issue': 'minors not fixed when the pull request stops go into one follow-up issue, linked on it, with the '
+                   'project\'s risk labels',
+          # The one place the kit states the same-round rule; SKILL.md, REVIEW.md and docs point here.
+          'same-round': 'a minor or nit is fixed in the same pull request when it is small and in scope (in the fix round '
+                        'that is running, adding no lens round), else dropped with a one-line reason under "Left" in the '
+                        'pull request description; it becomes an issue only when it is a real bug (wrong result, data, '
+                        'hang or security) outside the pull request\'s scope, as a comment on an open issue that covers '
+                        'that area if there is one. A follow-up pull request\'s own minors and nits never become an '
+                        'issue, and missing tests, wording, naming or style are never an issue by themselves'}
 FALLBACK_LENS = 'review'
 
 
@@ -121,7 +127,7 @@ def load_settings(root, path=None):
         problems.append('queue_config must be the repo-relative path of the queue config')
     if not (isinstance(s['lens_rounds'], int) and not isinstance(s['lens_rounds'], bool) and 1 <= s['lens_rounds'] <= 20):
         problems.append('lens_rounds must be a whole number 1-20')
-    if s['minors'] not in MINORS:
+    if not isinstance(s['minors'], str) or s['minors'] not in MINORS:
         problems.append(f'minors must be one of {", ".join(MINORS)}')
     if not isinstance(s['state_question'], str) or not 20 <= len(s['state_question'].strip()) <= 600:
         problems.append('state_question must be text of 20-600 characters (it cannot be emptied)')
@@ -305,8 +311,13 @@ def verdict(body, override_prefix, head=None):
     post = {'body': body, 'authorAssociation': 'OWNER', 'includesCreatedEdit': False, 'createdAt': '1'}
     if review.override_sha(post):
         return ['override']
-    if review.lens_problem(post):
+    kind = review.report_problem(post)[1]   # the gate's one rule for a comment that looks like a report (issue #865)
+    if kind == lens.BROKEN:
         return ['reads nothing']
+    if kind == lens.HELD:   # no lens marker, but an open finding: it blocks until deleted or `not a lens:`
+        return ['reads nothing', 'no lens marker']
+    if kind == lens.NOT_LENS:   # no lens marker and no open finding: no report, never a read or a block
+        return ['not a lens', 'no lens marker']
     header = lens.lens_header(body)
     if not header:
         return ['not a lens']

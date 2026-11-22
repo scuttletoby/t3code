@@ -1284,6 +1284,14 @@ class StartFinish(Files, unittest.TestCase):
         _, _, run = self.start()
         self.assertNotIn('details_url', self.checks.runs[-1], 'no run id: no link')
 
+    def test_a_warn_row_shows_warn_on_the_check_run(self):   # round 2: the not-a-lens row read ok on the PR's page
+        rows = [('correctness', True, 'read'), ('not a lens report (url)', H.WARN, 'no marker'),
+                ('security', False, 'reads nothing')]
+        _, text = G.verdict_text(True, 'r', [(7, 1, True, 'r', rows)], self.SHA, self.SHA)
+        self.assertIn('| correctness | ok | read |', text)
+        self.assertIn('| not a lens report (url) | warn | no marker |', text)
+        self.assertIn('| security | fail | reads nothing |', text)
+
     def test_a_verdict_text_is_cut_too(self):
         rows = [(f'lens{i}', False, 'x' * 100) for i in range(1000)]
         title, text = G.verdict_text(False, 'r' * 300, [(7, 1, False, 'r', rows)], self.SHA, self.SHA)

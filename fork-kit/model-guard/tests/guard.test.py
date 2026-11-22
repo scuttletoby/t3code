@@ -1859,6 +1859,25 @@ class Contract(unittest.TestCase):
         self.assertEqual(drivers, model_guard.DRIVER_EFFORT_IDS,
                          'MODEL_POLICY_DRIVER_EFFORT_IDS and the guard\'s DRIVER_EFFORT_IDS differ: keep them in step')
 
+    def test_agent_picking_options_are_the_servers_model_policy_ones(self):
+        """#802: while a policy is on, the server refuses the options that pick an agent or a mode, as the hook does: its
+        MODEL_POLICY_AGENT_OPTION_IDS (packages/contracts/src/modelPolicy.ts) is DRIVER_MODEL_OPTION_IDS entry for entry,
+        and its MODEL_POLICY_SESSION_MODE_OPTION_ID is ACP's session mode (a server test keeps that one ACP's own
+        constant). Kept here (not in an app test) so app code names no fork-owned path (#254)."""
+        path = os.path.join(REPO, 'packages', 'contracts', 'src', 'modelPolicy.ts')
+        with open(path, encoding='utf-8') as f:
+            source = f.read()
+        block = re.search(r'\bconst MODEL_POLICY_AGENT_OPTION_IDS[^=]*= \{(.*?)\};', source, re.S)
+        mode = re.search(r'export const MODEL_POLICY_SESSION_MODE_OPTION_ID = "([^"]+)";', source)
+        self.assertIsNotNone(block, f'MODEL_POLICY_AGENT_OPTION_IDS not found in {path}: keep the lists in step')
+        self.assertIsNotNone(mode, f'MODEL_POLICY_SESSION_MODE_OPTION_ID not found in {path}: keep the ids in step')
+        server = {driver: tuple(re.findall(r'"([^"]+)"', ids))
+                  for driver, ids in re.findall(r'(\w+): \[([^\]]*)\]', block.group(1))}
+        self.assertTrue(server, 'MODEL_POLICY_AGENT_OPTION_IDS reads as empty: keep the lists in step')
+        self.assertEqual(server, model_guard.DRIVER_MODEL_OPTION_IDS,
+                         'MODEL_POLICY_AGENT_OPTION_IDS and the guard\'s DRIVER_MODEL_OPTION_IDS differ: keep them in step')
+        self.assertEqual(mode.group(1), model_guard.ACP_SESSION_MODE_ID)
+
     def test_ultracode_maps_like_the_server(self):
         """The old effort value "ultracode" runs at xhigh with the option "ultracode" on, as T3's shared model code
         maps it (packages/shared/src/model.ts withLegacyUltracodeEffort)."""

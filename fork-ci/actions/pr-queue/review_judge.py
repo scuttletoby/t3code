@@ -224,6 +224,7 @@ NONE_RE = re.compile(
 FINDING_LINE_RE = re.compile(r'findings?\s*:\s*[\[(]?' + _KW + r'(?![^\W_])', re.I)   # `finding: major x`
 FINDINGS_NONE_RE = re.compile(r'(?:findings|issues|problems)\s*:\s*(?:none|nothing|no|0|n/?a)\s*\.?\s*$', re.I)
 NOT_SAFE_RE = re.compile(r'\bnot\s+safe\b', re.I)
+NOT_SAFE_TO_MERGE_RE = re.compile(r'\bnot\s+safe\s+to\s+merge\b', re.I)   # read_findings(unmarked=True), any line
 VERDICT_NOT_SAFE_RE = re.compile(r'verdict\s*[:—–-]?\s*not\s+safe\b', re.I)
 RULE_LINE_RE = re.compile(r'\s*(?:[-*_]\s*){3,}')   # a thematic break: no content
 HEADING_RE = re.compile(r' {0,3}#{1,6}(?:\s|$)')
@@ -343,13 +344,15 @@ def _under(lines, start, narrow):
     return None
 
 
-def read_findings(body):
+def read_findings(body, unmarked=False):
     """(findings, has_section). findings: [(kind, line)] of the report's blocker and major findings in line order, kind
     'blocker' or 'major', line as normalised (cut to SHOW_FINDING). Read both ways lens reads a line (clean_inline
     narrow or not): a line either way reads as a finding is one. has_section: the report has a blocker label and a major
     label (`blocker: none` and `major: none` too), or `findings: none`, or `finding: <kind>` lines. A first line (the
     lens header, or the title line under it) or a `verdict:` line that says NOT SAFE is a blocker whatever the labels
-    say."""
+    say. unmarked: a comment without the lens marker (lens.Review.report_problem): its first two lines are read as a
+    header and its title line are (a heading, then NOT SAFE under it), and `not safe to merge` on any line outside a
+    fenced code block is a blocker too."""
     found = {}
     seen = set()
     for narrow in (False, True):
@@ -359,14 +362,15 @@ def read_findings(body):
             found.setdefault(i, (kind, text[:SHOW_FINDING]))
     lines = (body or '').splitlines()
     top = [i for i, line in enumerate(lines) if line.strip()][:2]
-    first = set(top if lens.lens_header(body) else top[:1])   # the line after a lens header is a title too
+    first = set(top if unmarked or lens.lens_header(body) else top[:1])   # the line after a header is a title too
     fence = None
     for i, raw in enumerate(lines):
         fence, fenced = lens.fence_step(fence, raw)
         if fenced or i in found:
             continue
         line = _plain(raw, False)
-        if (i in first and NOT_SAFE_RE.search(line)) or VERDICT_NOT_SAFE_RE.match(line):
+        if (i in first and NOT_SAFE_RE.search(line)) or VERDICT_NOT_SAFE_RE.match(line) \
+                or (unmarked and NOT_SAFE_TO_MERGE_RE.search(line)):
             found[i] = ('blocker', f'the report says NOT SAFE: {line}'[:SHOW_FINDING])
     return [found[i] for i in sorted(found)], seen >= set(BLOCKING)
 
@@ -380,9 +384,9 @@ def has_state_line(body):
     return any(STATE_RE.match(lens.norm_line(fold(raw))) for raw in lens.plain_lines(body))
 
 
-def findings(body):
+def findings(body, unmarked=False):
     """[(kind, line)] of the report's blocker and major findings (read_findings)."""
-    return read_findings(body)[0]
+    return read_findings(body, unmarked)[0]
 
 
 def round_marker(name):

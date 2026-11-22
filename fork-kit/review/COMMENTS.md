@@ -1,8 +1,15 @@
 # Lens comments: the format the gate reads
 
 A lens posts its report as one pull request comment. The merge gate (`fork-ci/actions/pr-queue`) reads that comment
-with fixed rules and fails closed: a comment that looks like a report but is not one valid read blocks the head. This
-page shows the format with examples. The rules themselves are the gate's code and its README (sections
+with fixed rules. A comment that carries the lens marker (below) is a lens report, and the gate fails closed on it: one
+that is not exactly one valid read blocks the head. A comment without the marker that looks like a report is no lens
+report and never reads. It blocks only when it holds an open finding (a `blocker:` or `major:` line that is not
+`none`, NOT SAFE on its first two lines or a `verdict:` line, or `not safe to merge` on any line outside a fenced code
+block): then it is most likely a real report with a broken header, so it holds the head whatever an older or newer
+read of that lens says, until it is deleted, starts with `not a lens:`, or is edited so it holds no open finding (the
+same people could delete it). One with no open finding never blocks, and the gate's summary names it
+`not a lens report` with the reason.
+This page shows the format with examples. The rules themselves are the gate's code and its README (sections
 [Lens comments](../../fork-ci/actions/pr-queue/README.md#lens-comments) and
 [Review rules](../../fork-ci/actions/pr-queue/README.md#review-rules)); the gate's test vectors
 ([review.vectors.json](../../fork-ci/actions/pr-queue/review.vectors.json)) pin how it judges paths and lens counts.
@@ -13,6 +20,23 @@ of your own before posting it: `python3 -I fork-kit/review/lib/review_kit.py che
 comment.md` (`--settings` when the project's kit settings are not at `.github/review-kit.json`).
 
 The examples use the override prefix `tool ready --head`. A project's prefix is `override.prefix` in its queue config.
+
+## The lens marker
+
+A comment carries the lens marker when one of its lines, read in NFKC (a full-width colon `：` is a colon) with
+Markdown stripped (emphasis, links, tags, quote, list and heading marks), in a code block or quote too:
+
+- starts with the lens field: `lens:` (also `lens=`, `lens —`, `lens –`), or
+- names a read: `read at` and a hex sha (`read at: 0123abc`, `read-at 0123abc`), or
+- has a lens field followed by a hex sha anywhere in the line (`the security lens — fixed in 0123abc`).
+
+A real report has it on its first line, the header. The marker decides only whether a comment is a lens report; the
+rest of this page decides whether that report is one valid read. A heading such as `## Lens A`, `safe to merge`, or
+`covered:` and `checks:` lines are no marker: such a comment is `not a lens`, `no lens marker`, and a lens whose report
+reads that way has posted nothing the gate counts (a required lens then still has no read). If it holds an open finding
+it is `reads nothing`, `no lens marker` and blocks. Either way the fix is a NEW comment whose first line is
+`lens: <name> · reviewer: <who> · read at: <sha>`: editing the marker into the old comment does not count (an edited
+comment reads nothing).
 
 ## The shape
 
@@ -38,31 +62,46 @@ minor: <a small thing>; <another>
   half-way, or meets existing, old or empty state?"). What counts as one is the gate's rule
   (`review_judge.has_state_line`); the gate parses the config's `state_line` setting but does not enforce it yet; the
   kit's `check` does, and so does every lens prompt the kit writes.
-- **Round markers:** a re-read after a fix may add `r2`, `r3` to the lens name (`lens: data-1 r2`). The gate counts
-  rounds from the different changes lenses read and from these markers, whichever is higher; the marker is not part of
-  the lens's name (`data-1 r2` is lens `data-1`).
+- **Round markers:** a re-read after a fix may add `r2`, `r3` to the lens name (`lens: data-1 r2`), or `re-check`,
+  which names no round number. The gate counts rounds from the different changes lenses read and from the numbered
+  markers, whichever is higher; a marker is not part of the lens's name (`data-1 r2` and `data-1 re-check` are lens
+  `data-1`).
 - **A recap of an earlier round** must not look like an open finding: `round 1, fixed: <what>`, never
   `Major 1: fixed` (that reads as an open major).
 - **One lens per comment**, never edited after posting (an edited or hidden comment reads nothing: post a new one).
 - Lines inside a fenced code block are not findings.
 
+## Who and where
+
+The gate's rules for which comments count, in short (gate README,
+[Lens comments](../../fork-ci/actions/pr-queue/README.md#lens-comments) and
+[Review rules](../../fork-ci/actions/pr-queue/README.md#review-rules)):
+
+- **The name is the whole name**, a bracket part too: `correctness (a.py)` and `correctness (b.py)` are two lenses.
+- **Where:** plain comments, reviews and inline review comments all count; a comment of a review not yet submitted
+  (pending) never does.
+- **Who:** only comments whose author association is in the queue config's `lens_author_associations`.
+- **Which config:** every rule that judges the head is the base tip's queue config. The gate reads the pull
+  request's merged config only to refuse one that does not parse (or is deleted, or gains a case twin).
+
 ## Verdicts
 
 Each example says, on the line before it, what the gate reads, as words:
 
-| Words                 | Meaning                                                                                                            |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `lens <key>`          | a lens header naming this lens (`lens_key`: lowercased, a trailing round marker dropped)                           |
-| `round <n>`           | the header carries round marker `r<n>`                                                                             |
-| `read`                | the header names a full sha: this is a read of that head                                                           |
-| `short sha`, `no sha` | the header's sha is short or missing: no read                                                                      |
-| `clean`               | a findings section with no blocker and no major                                                                    |
-| `blocker`, `major`    | an open blocker or major: the gate holds the head until a new read on a fixed head, or a person                    |
-| `no findings section` | no blocker and major labels: with `findings` on, the gate does not take the read                                   |
-| `state`, `no state`   | a `state:` line with an answer, or none                                                                            |
-| `reads nothing`       | looks like a lens report but is not one valid read: the gate counts it as a blocking problem                       |
-| `not a lens`          | not a lens report at all (a plain comment, or one that opts out with `not a lens:`): ignored                       |
-| `override`            | an override comment for that sha (counts only from the configured author association, never edited and not hidden) |
+| Words                 | Meaning                                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `lens <key>`          | a lens header naming this lens (`lens_key`: lowercased, a trailing round marker dropped)                            |
+| `round <n>`           | the header carries round marker `r<n>`                                                                              |
+| `read`                | the header names a full sha: this is a read of that head                                                            |
+| `short sha`, `no sha` | the header's sha is short or missing: no read                                                                       |
+| `clean`               | a findings section with no blocker and no major                                                                     |
+| `blocker`, `major`    | an open blocker or major: the gate holds the head until a new read on a fixed head, or a person                     |
+| `no findings section` | no blocker and major labels: with `findings` on, the gate does not take the read                                    |
+| `state`, `no state`   | a `state:` line with an answer, or none                                                                             |
+| `reads nothing`       | not one valid read that the gate counts as a blocking problem: it carries the lens marker, or holds an open finding |
+| `no lens marker`      | looks like a lens report but carries no lens marker: never a read; a block only with `reads nothing` (open finding) |
+| `not a lens`          | not a lens report at all (a plain comment, or one that opts out with `not a lens:`): ignored                        |
+| `override`            | an override comment for that sha (counts only from the configured author association, never edited and not hidden)  |
 
 ## Good reports
 
@@ -208,6 +247,9 @@ major: none
 
 ## Comments that read nothing or are no report
 
+A comment with the lens marker that is not one valid read blocks the head (`reads nothing`). One without the marker
+is no report, however much it looks like one (`no lens marker`), and it blocks only when it holds an open finding.
+
 No findings section: only a major label, no blocker label. The gate sees no section and does not take the read.
 
 The gate reads: `lens code, read, no findings section, no state`
@@ -228,7 +270,7 @@ blocker: none
 major: none
 ```
 
-The header is not the first line. The comment looks like a report, so it is a blocking problem.
+The header is not the first line. The comment carries the lens marker, so it is a blocking problem.
 
 The gate reads: `reads nothing`
 
@@ -252,15 +294,63 @@ blocker: none
 major: none
 ```
 
-A report with no header, only report fields.
+A lens heading that names a read: `read at` and a sha are the marker, so this is a broken report, and it blocks.
 
 The gate reads: `reads nothing`
+
+```text
+## Lens code
+read at: 0123456789abcdef0123456789abcdef01234567
+blocker: none
+major: none
+```
+
+A report with no header, only report fields: no marker, so no lens report. It does not block, and it counts for
+nothing: the lens has not reported.
+
+The gate reads: `not a lens, no lens marker`
 
 ```text
 covered: src/queue.ts
 checks: ran the tests
 blocker: none
 major: none
+```
+
+A lens-like heading with no marker: no lens report.
+
+The gate reads: `not a lens, no lens marker`
+
+```text
+## Lens A
+blocker: none
+major: none
+```
+
+A lens-like heading with no marker that holds an open finding: most likely a real report with a broken header, so it
+blocks, whatever another read of that lens says. Delete it or start it with `not a lens:`, and post a new comment with
+the header.
+
+The gate reads: `reads nothing, no lens marker`
+
+```text
+## Lens A
+blocker: a second run loses the saved rows
+major: none
+```
+
+Without the marker the line under the heading is read as a title line, and `not safe to merge` anywhere outside a
+fenced code block is NOT SAFE, so this blocks too.
+
+The gate reads: `reads nothing, no lens marker`
+
+```text
+## Lens A, round 2
+
+**NOT SAFE to merge**
+
+covered: the retry path
+checks: ran the tests
 ```
 
 A note between rounds (for example from the orchestrator, after it checked a fix diff) opts out with `not a lens:`
@@ -270,7 +360,7 @@ The gate reads: `not a lens`
 
 ```text
 not a lens: fix round 1 checked
-head 0123456789abcdef0123456789abcdef01234567 fixes the round 1 major; minors filed as a follow-up issue
+head 0123456789abcdef0123456789abcdef01234567 fixes the round 1 major and its minors; one nit dropped, reason under Left
 ```
 
 A plain comment.
@@ -287,5 +377,5 @@ when its author is listed in the review block's `override_authors`.
 The gate reads: `override`
 
 ```text
-tool ready --head 0123456789abcdef0123456789abcdef01234567: fix diff checked, the round 1 minors are in a follow-up issue
+tool ready --head 0123456789abcdef0123456789abcdef01234567: fix diff checked, the round 1 minors are fixed in this head
 ```

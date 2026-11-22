@@ -10,7 +10,7 @@ temporary folder in the command line, scopes by those processes.
 """
 # How CI runs it (.github/scripts/fork-ci-tests.cjs, which records what it ran; fork-ci-result checks that):
 # fork-ci: run with HEAVY_REAL_TESTS=1
-import json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
+import inspect, json, os, pwd, re, secrets, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAKE_TOOLS = os.path.join(KIT, 'tests', 'fake_tools.py')
@@ -20,6 +20,65 @@ OLD = os.path.join(KIT, 'tests', 'old-heavy.sh')
 WRAPPERS = {os.path.realpath(HEAVY), os.path.realpath(OLD)}
 SLICE = os.environ.get('HEAVY_TEST_SLICE') or 'heavy.slice'
 REQUIRED = os.environ.get('HEAVY_REAL_TESTS') == '1'
+# #996: every setting that names a folder heavy writes in. A test hands heavy each one inside its own folder: HOME
+# alone is not enough, as the measured history is in the password database's home (lib/heavy_measure.py default_dir)
+STATE_SETTINGS = ('HOME', 'HEAVY_STATE_DIR', 'HEAVY_QUEUE_ROOT', 'HEAVY_FACTS_CACHE')
+LIVE = set()        # the folders of the Heavy tests running now: a run of heavy keeps its state in one of them
+
+
+def escapes(env, folders):
+    """#996: why heavy, run with env, could write outside folders (the tester's real home, history or queue), or
+    None. Every STATE_SETTINGS folder must be in one of them, and HOME one only this user can write (else heavy's
+    state notes fall back to the password database's home)."""
+    for key in STATE_SETTINGS:
+        value = env.get(key) or ''
+        if not (os.path.isabs(value) and any(os.path.commonpath([d, os.path.realpath(value)]) == d for d in folders)):
+            return f'{key}={value!r} is not in a test folder: heavy would write outside it'
+    if os.stat(env['HOME']).st_mode & 0o022:
+        return 'HOME can be written by others: heavy would use the real home instead'
+    return None
+
+
+# a command naming heavy: a wrapper's path anywhere in it (also inside `sh -c` text), or the bare word (the one on
+# the PATH; not the end of a path such as the kit's own folder)
+NAMES_HEAVY = re.compile('|'.join(re.escape(p) for p in {HEAVY, OLD, *WRAPPERS}) + r'|(?<![\w./-])heavy(?![\w./-])')
+
+
+def guard(words, env, how):
+    """#998 item 1: every process this test run starts passes here first (Popen, which run/call/check_output use,
+    and the os calls below), so a run of heavy kept in a variable, given as args=, through a bare `run` or through
+    os.system/os.spawn* is checked as well as one written inline. One that names heavy without its state in a running
+    test's folder (Heavy.isolated) fails before it starts. It follows what runs, not how the source spells it."""
+    words = [words] if isinstance(words, (str, bytes, os.PathLike)) else words
+    if any(NAMES_HEAVY.search(os.fsdecode(w)) for w in words if isinstance(w, (str, bytes, os.PathLike))):
+        problem = escapes(os.environ if env is None else env, LIVE)
+        if problem:
+            raise AssertionError(f'{how} runs heavy without Heavy.isolated: {problem}')
+
+
+class GuardedPopen(subprocess.Popen):
+    SIGNATURE = inspect.signature(subprocess.Popen)      # the real one (this class's own is *args, **kw)
+
+    def __init__(self, *args, **kw):
+        bound = self.SIGNATURE.bind(*args, **kw).arguments
+        guard(bound['args'], bound.get('env'), 'Popen')
+        super().__init__(*args, **kw)
+
+
+def guarded(real, env_at):
+    def call(*args, **kw):
+        guard([w for a in args for w in (a if isinstance(a, (list, tuple)) else [a])],
+              args[env_at] if env_at is not None and len(args) > env_at else kw.get('env'), f'os.{real.__name__}')
+        return real(*args, **kw)
+    return call
+
+
+subprocess.Popen = GuardedPopen
+# os.spawnl* call these spawnv* (os.exec* would replace this test run itself, so none is used)
+for _name, _env_at in (('system', None), ('spawnv', None), ('spawnvp', None), ('spawnve', 3), ('spawnvpe', 3),
+                       ('posix_spawn', 2), ('posix_spawnp', 2)):
+    if hasattr(os, _name):
+        setattr(os, _name, guarded(getattr(os, _name), _env_at))
 
 
 def manager_problem():
@@ -51,6 +110,8 @@ def nested_problem():
 
 
 PROBLEM = nested_problem() or manager_problem()
+# a failure that means heavy (or what it ran) did not end in time: the helpers' messages and subprocess's own
+HUNG = r'still running after|no line from pid|TimeoutExpired'
 
 
 def comm(pid):
@@ -102,8 +163,12 @@ class Heavy(unittest.TestCase):
     def setUp(self):
         if PROBLEM:
             self.fail(f'HEAVY_REAL_TESTS=1 but: {PROBLEM}')
+        if Heavy.hung:
+            self.fail(f'not run: heavy hung in {Heavy.hung} (its failure says where); the rest would only wait too')
         self.dir = os.path.realpath(tempfile.mkdtemp(prefix='heavy-test-'))
         self.addCleanup(self.cleanup)
+        LIVE.add(self.dir)
+        self.addCleanup(LIVE.discard, self.dir)      # after every later cleanup (they run last first)
         # Every test process has the test folder in its command line (that is how ours() finds it)
         self.sleeper = os.path.join(self.dir, 'sleeper')                 # a copy of sleep: a quiet leftover
         shutil.copy2(shutil.which('sleep'), self.sleeper)
@@ -122,9 +187,38 @@ class Heavy(unittest.TestCase):
         self.docker = self.script('docker', f'exec "{sys.executable}" -I -B "{FAKE_TOOLS}" "{self.docker_state}" '
                                             f'docker "$@"')
         # HOME: heavy makes ~/.local/state/heavy/labelled; a test never makes it in the tester's real home (#761)
+        # HEAVY_STATE_DIR: the measured history of every --kind/--measure job; its default is the password
+        # database's home, not HOME, so without it each test job wrote the tester's real history (#996)
+        # the capacity check of a job without --kind (#866): a fake that answers free at once, so no test waits on the
+        # tester's busy machine; test_the_real_capacity_check_answers runs the kit's own. Its 20 s hold goes into the
+        # test folder, never the user's live one
+        os.makedirs(os.path.join(self.dir, 'facts'))
         self.env = dict(os.environ, HEAVY_SLICE=SLICE, HEAVY_CONFIG=os.path.join(self.dir, 'no-config.json'),
-                        HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root, HEAVY_DOCKER=self.docker, HOME=self.dir)
+                        HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root, HEAVY_DOCKER=self.docker, HOME=self.dir,
+                        HEAVY_TESTING='1', HEAVY_CHECK_HEAVY=self.check_script('free-check', True),
+                        HEAVY_FACTS_CACHE=os.path.join(self.dir, 'facts', 'heavy-facts.json'),
+                        HEAVY_STATE_DIR=os.path.join(self.dir, 'measured'))
         self.env.pop('HEAVY_KEEP', None)
+
+    hung = None     # the first test whose heavy did not end in time: every later test fails at once, not at its timeout
+
+    def run(self, result=None):
+        result = result or self.defaultTestResult()
+        seen = len(result.errors), len(result.failures)
+        try:
+            return super().run(result)
+        finally:
+            for _, trace in result.errors[seen[0]:] + result.failures[seen[1]:]:
+                if Heavy.hung is None and re.search(HUNG, trace):
+                    Heavy.hung = self.id()
+
+    def check_script(self, name, free, before=''):
+        """A fake `heavy facts` (HEAVY_CHECK_HEAVY): runs the shell text BEFORE, then answers one valid free/v1 object,
+        free or busy, dated now."""
+        code = ('import datetime, json, sys; at = datetime.datetime.now(datetime.timezone.utc).isoformat(); '
+                f'print(json.dumps({{"v": 1, "free": {free}, "at": at, "notes": [], "reason": "test busy"}})); '
+                f'sys.exit({0 if free else 75})')
+        return self.script(name, f'{before}\nexec "{sys.executable}" -I -c {shlex.quote(code)}')
 
     def containers(self):
         with open(self.docker_state) as f:
@@ -147,12 +241,13 @@ class Heavy(unittest.TestCase):
         """Shell text that starts a sleeper which leaves its parent and its session (a daemon's double fork)."""
         return f'(setsid {self.sleeper} &)'
 
-    def settled(self, n):
-        """Shell text that waits (at most 10 s) until n processes of the command's own scope are sleepers: a forked
-        `sh` that has not exec'd yet would otherwise be named as a leftover `sh`."""
+    def settled(self, n, names='sleeper'):
+        """Shell text that waits (at most 10 s) until n processes of the command's own scope run one of NAMES (words):
+        a forked `sh` that has not exec'd yet would otherwise be named as a leftover `sh` (#981: once at load 14)."""
+        match = ' || '.join(f'[ "$x" = {w} ]' for w in names.split())
         return ('cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup); i=0; while [ $i -lt 200 ]; do c=0; '
-                'for p in $(cat "$cg/cgroup.procs"); do [ "$(cat /proc/$p/comm 2>/dev/null)" = sleeper ] && '
-                f'c=$((c + 1)); done; [ $c -ge {n} ] && break; i=$((i + 1)); sleep 0.05; done')
+                'for p in $(cat "$cg/cgroup.procs"); do x=$(cat /proc/$p/comm 2>/dev/null); '
+                f'{{ {match}; }} && c=$((c + 1)); done; [ $c -ge {n} ] && break; i=$((i + 1)); sleep 0.05; done')
 
     def guards(self):
         """Pids of this test's heavy guards: named scope-guard, with heavy's command line (it names the test folder)."""
@@ -249,9 +344,21 @@ class Heavy(unittest.TestCase):
         if not getattr(self, 'leaves_on_purpose', False):
             self.assertEqual(stray, [], 'a test left processes running (stopped by the cleanup)')
 
-    def heavy(self, *args, env=None, wrapper=None, **kw):
-        return subprocess.run([wrapper or HEAVY, *args], capture_output=True, text=True, timeout=60,
-                              env=env or self.env, cwd=self.dir, **kw)
+    def isolated(self, env):
+        """#996: env keeps every folder heavy writes in (STATE_SETTINGS) inside this test's folder (escapes()): a
+        test never writes the tester's real home, history or queue. Every run of heavy goes through here (heavy(),
+        start(); #998: guard() stops one that does not, at run time)."""
+        problem = escapes(env, (self.dir,))
+        self.assertIsNone(problem, problem)
+        return env
+
+    def heavy(self, *args, env=None, wrapper=None, timeout=60, **kw):
+        try:
+            return subprocess.run([wrapper or HEAVY, *args], capture_output=True, text=True, timeout=timeout,
+                                  env=self.isolated(env or self.env), cwd=self.dir, **kw)
+        except subprocess.TimeoutExpired as e:        # what it said till then shows where it hangs
+            said = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else e.stderr or ''
+            raise AssertionError(f'heavy {" ".join(args)} still running after {timeout:g} s; it said: {said!r}')
 
     def heavy_lines(self, stderr):
         return [line for line in stderr.splitlines() if line.startswith('heavy:')]
@@ -259,7 +366,8 @@ class Heavy(unittest.TestCase):
     # --- leftovers -----------------------------------------------------------------------------------------------
 
     def test_leftover_child_is_stopped_and_named(self):
-        r = self.heavy('sh', '-c', f'{self.spin} & {self.sleeper} & exit 0')
+        # #981 leftover 7: without settled() the shell can exit before its children exec, and heavy names them "sh"
+        r = self.heavy('sh', '-c', f'{self.spin} & {self.sleeper} & {self.settled(2, "spin sleeper")}; exit 0')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ours(), [], 'leftovers still running after heavy returned')
         lines = self.heavy_lines(r.stderr)
@@ -267,7 +375,7 @@ class Heavy(unittest.TestCase):
         self.assertRegex(lines[0], r'^heavy: stopped 2 leftover processes \((spin, sleeper|sleeper, spin)\)$')
 
     def test_leftover_after_a_failing_command_keeps_the_exit_code(self):
-        r = self.heavy('sh', '-c', f'{self.sleeper} & exit 5')
+        r = self.heavy('sh', '-c', f'{self.sleeper} & {self.settled(1)}; exit 5')
         self.assertEqual(r.returncode, 5)
         self.assertEqual(self.ours(), [])
         self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 1 leftover process (sleeper)'])
@@ -286,14 +394,14 @@ class Heavy(unittest.TestCase):
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, 'out\n', 'err\n'))
 
     def test_nested_heavy_reports_once_and_leaves_nothing(self):
-        r = self.heavy(HEAVY, 'sh', '-c', f'{self.sleeper} & exit 0')
+        r = self.heavy(HEAVY, 'sh', '-c', f'{self.sleeper} & {self.settled(1)}; exit 0')
         self.assertEqual(r.returncode, 0)
         self.assertEqual(self.ours(), [])
         self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 1 leftover process (sleeper)'])
 
     def test_keep_leaves_the_daemon_and_says_so(self):
         env = dict(self.env, HEAVY_KEEP='1')
-        r = self.heavy('sh', '-c', f'{self.sleeper} & exit 0', env=env)
+        r = self.heavy('sh', '-c', f'{self.sleeper} & {self.settled(1)}; exit 0', env=env)
         self.assertEqual(r.returncode, 0)
         lines = self.heavy_lines(r.stderr)
         self.assertEqual(len(lines), 1, r.stderr)
@@ -383,7 +491,7 @@ class Heavy(unittest.TestCase):
         self.addCleanup(err.close)
         go = os.path.join(self.dir, 'go')
         p = subprocess.Popen([HEAVY, 'sh', '-c', f'echo up; while [ ! -e {go} ]; do sleep 0.05; done'],
-                             stdout=subprocess.PIPE, stderr=err, text=True, env=self.env, cwd=self.dir,
+                             stdout=subprocess.PIPE, stderr=err, text=True, env=self.isolated(self.env), cwd=self.dir,
                              start_new_session=True)
         self.addCleanup(lambda: p.poll() is None and p.kill())
         self.assertEqual(read_line(p), 'up\n')
@@ -504,7 +612,7 @@ class Heavy(unittest.TestCase):
         self.assertRegex(owner, r'scope=heavy-keep-sh-[0-9a-f]{8}\.scope$')
 
     def test_docker_missing_or_down_never_changes_the_run(self):
-        r = self.heavy('sh', '-c', f'{self.sleeper} & exit 3',
+        r = self.heavy('sh', '-c', f'{self.sleeper} & {self.settled(1)}; exit 3',
                        env=dict(self.env, HEAVY_DOCKER=os.path.join(self.dir, 'no-docker')))
         self.assertEqual(r.returncode, 3)
         self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 1 leftover process (sleeper)'])
@@ -548,7 +656,8 @@ class Heavy(unittest.TestCase):
                              ('kill -INT $$', 130), ('kill -KILL $$', 137), ('kill -SEGV $$', 139)):
             with self.subTest(script=script):
                 r = subprocess.run(['sh', '-c', '"$0" sh -c "$1"; echo "status=$?"', HEAVY, script],
-                                   capture_output=True, text=True, timeout=60, env=self.env, cwd=self.dir)
+                                   capture_output=True, text=True, timeout=60, env=self.isolated(self.env),
+                                   cwd=self.dir)
                 self.assertIn(f'status={want}', r.stdout, r.stderr)
                 self.assertEqual(self.heavy_lines(r.stderr), [])
 
@@ -570,7 +679,8 @@ class Heavy(unittest.TestCase):
     def test_environment_is_the_callers_in_a_c_locale_too(self):
         # Python's C-locale coercion (PEP 538) adds LC_CTYPE=C.UTF-8 to heavy's own environment: not to the command's
         env = {k: v for k, v in self.env.items() if k in ('PATH', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
-                                                          'HEAVY_SLICE', 'HEAVY_CONFIG', 'HEAVY_GRACE', 'HEAVY_DOCKER')}
+                                                          'HEAVY_SLICE', 'HEAVY_CONFIG', 'HEAVY_GRACE', 'HEAVY_DOCKER',
+                                                          'HEAVY_TESTING', 'HEAVY_CHECK_HEAVY', *STATE_SETTINGS)}
         env['LANG'] = 'C'
         r = self.heavy('env', '-0', env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -614,7 +724,7 @@ class Heavy(unittest.TestCase):
 
     def start(self, *args, env=None):
         p = subprocess.Popen([HEAVY, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                             env=env or self.env, cwd=self.dir, start_new_session=True)
+                             env=self.isolated(env or self.env), cwd=self.dir, start_new_session=True)
         self.addCleanup(lambda: p.poll() is None and p.kill())
         return p
 
@@ -751,7 +861,7 @@ class Heavy(unittest.TestCase):
     def test_timeout_signal_to_heavy_and_its_group_counts_once(self):
         # timeout(1) sends the signal to heavy, then to its whole process group: one event, not a second signal
         r = subprocess.run(['timeout', '-s', 'INT', '1', HEAVY, self.counter(3)], capture_output=True, text=True,
-                           timeout=60, env=dict(self.env, HEAVY_GRACE='10'), cwd=self.dir)
+                           timeout=60, env=self.isolated(dict(self.env, HEAVY_GRACE='10')), cwd=self.dir)
         self.assertEqual((r.returncode, r.stdout), (124, 'ready\nint=1 usr1=0\n'), r.stderr)
         self.assertEqual(self.heavy_lines(r.stderr), [])
 
@@ -832,6 +942,29 @@ class Heavy(unittest.TestCase):
         self.assertEqual(self.queue_jobs(env), [])
         self.assertTrue(os.path.isdir(os.path.join(self.queue_root, SLICE)))       # the private queue was used
 
+    def test_a_measured_job_never_writes_the_testers_real_history(self):
+        # #996: the tests set a fake HOME, but heavy takes the measured history's folder from the password database,
+        # so each `heavy --kind heavy-test` run added a line to the tester's real ~/.local/state/heavy/measured.jsonl.
+        # A kind no other run uses, run both ways (--kind, --measure): its lines are in the test folder, not the
+        # real one
+        real = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, '.local', 'state', 'heavy')
+        kind = f'heavy-test-{secrets.token_hex(4)}'
+
+        def lines(folder):
+            found = []
+            for name in ('measured.jsonl', 'measured.jsonl.1'):
+                try:
+                    with open(os.path.join(folder, name), encoding='utf-8', errors='replace') as f:
+                        found += [line for line in f if f'"kind":"{kind}"' in line]
+                except FileNotFoundError:
+                    pass
+            return found
+        for args in (('--kind', kind, '--mb', '64', '--wait', '60'), ('--measure', kind)):
+            r = self.heavy(*args, '--', 'sleep', '3')
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(lines(real), [], f'a test wrote the real history in {real}')
+        self.assertEqual(len(lines(self.env['HEAVY_STATE_DIR'])), 2, 'recorded in the test folder instead')
+
     def test_a_failed_run_leaves_its_peak_too(self):
         env = dict(self.env, HOME=self.dir)
         r = self.heavy('--kind', 'heavy-test', '--mb', '64', '--wait', '60', '--', 'sh', '-c', 'sleep 4; exit 3',
@@ -876,6 +1009,113 @@ class Heavy(unittest.TestCase):
             hq.release(q, t)
         self.assertEqual(r.returncode, 76, r.stderr)
         self.assertIn('gave up after waiting', r.stderr)
+
+    # --- the capacity check of a job without --kind (#866) -------------------------------------------------------
+
+    def real_check(self, env=None):
+        """The environment with the kit's own capacity check (`heavy facts`) instead of the fake one."""
+        return {k: v for k, v in (env or self.env).items() if k != 'HEAVY_CHECK_HEAVY'}
+
+    def test_a_kit_without_the_capacity_rule_refuses_at_once_and_runs_nothing(self):
+        """The CI hang (#866): a checkout without packages/shared/src/capacity has a heavy whose facts can never
+        answer, and every job without --kind waited its whole --wait (2 hours) for an answer that never came."""
+        kit = os.path.join(self.dir, 'kit', 'fork-kit')
+        for part in ('heavy', 'common'):
+            shutil.copytree(os.path.join(os.path.dirname(KIT), part), os.path.join(kit, part),
+                            ignore=shutil.ignore_patterns('tests', '__pycache__'))
+        ran = os.path.join(self.dir, 'ran')
+        start = time.monotonic()
+        r = self.heavy('sh', '-c', f'touch {ran}', env=self.real_check(),
+                       wrapper=os.path.join(kit, 'heavy', 'bin', 'heavy'), timeout=30)
+        self.assertLess(time.monotonic() - start, 15, r.stderr)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn('the capacity check cannot run', r.stderr)
+        self.assertIn('capacity-rule.json', r.stderr)
+        self.assertFalse(os.path.exists(ran), 'the command ran without a capacity check')
+
+    def test_the_real_capacity_check_answers_within_its_wait(self):
+        start = time.monotonic()
+        r = self.heavy('--wait', '0', 'true', env=self.real_check(), timeout=30)
+        self.assertLess(time.monotonic() - start, 20, r.stderr)
+        if REQUIRED or r.returncode == 0:           # CI's runner has room for one job; a tester's machine may not
+            self.assertEqual((r.returncode, self.heavy_lines(r.stderr)), (0, []), r.stderr)
+        else:
+            self.assertEqual(r.returncode, 76, r.stderr)
+            self.assertIn('gave up', r.stderr)
+
+    def test_a_busy_capacity_check_gives_up_at_its_wait_and_runs_nothing(self):
+        ran = os.path.join(self.dir, 'ran')
+        r = self.heavy('--wait', '1', 'sh', '-c', f'touch {ran}',
+                       env=dict(self.env, HEAVY_CHECK_HEAVY=self.check_script('busy-check', False)))
+        self.assertEqual(r.returncode, 76, r.stderr)
+        self.assertIn('gave up', r.stderr)
+        self.assertIn('test busy', r.stderr)
+        self.assertFalse(os.path.exists(ran))
+
+    def stop(self, *procs):
+        for p in procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGTERM)
+            p.communicate(timeout=60)
+        wait_for(lambda: not self.ours(), what='the commands to stop')
+
+    def test_heavy_facts_counts_a_running_job_without_kind(self):
+        p = self.start('sh', '-c', f'exec {self.sleeper}')
+        wait_for(lambda: len(self.ours()) == 1, what='the command')
+        r = self.heavy('facts', '--fresh')          # facts is the kit's own (the fake only answers heavy's check)
+        self.assertIn(r.returncode, (0, 75), r.stderr)
+        running = json.loads(r.stdout)['queue']['running']
+        if REQUIRED:                                # CI: nothing else runs in the slice
+            self.assertEqual(running, 1, r.stdout)
+        else:
+            self.assertGreaterEqual(running, 1, r.stdout)
+        self.stop(p)
+
+    def test_two_waiters_without_kind_are_admitted_one_at_a_time(self):
+        """Both see room for one more job: without the admission lock both checks answer before either scope can be
+        counted, and both start (#866). The fake check writes how many of this test's scopes it can see."""
+        tag = 'w' + os.urandom(4).hex()
+        log = os.path.join(self.dir, 'checks.log')
+        count = (f'cg=$(systemctl --user show {SLICE} -p ControlGroup --value); '
+                 f'n=$(ls "/sys/fs/cgroup$cg" 2>/dev/null | grep -c "^heavy-{tag}-"); echo "$n" >> {log}; sleep 0.5')
+        env = dict(self.env, HEAVY_CHECK_HEAVY=self.check_script('counting-check', True, count))
+        cmd = self.script(tag, f'exec {self.sleeper}')
+        cg = '/sys/fs/cgroup' + subprocess.run(['systemctl', '--user', 'show', SLICE, '-p', 'ControlGroup', '--value'],
+                                               capture_output=True, text=True, timeout=30).stdout.strip()
+
+        def scopes():                               # not ours(): the fake check's own sh names this folder too
+            try:
+                return [n for n in os.listdir(cg) if n.startswith(f'heavy-{tag}-')]
+            except FileNotFoundError:
+                return []
+        a, b = self.start('--wait', '60', cmd, env=env), self.start('--wait', '60', cmd, env=env)
+        try:
+            wait_for(lambda: len(scopes()) == 2, timeout=30, what='both commands\' scopes')
+            with open(log) as f:
+                seen = sorted(int(n) for n in f.read().split())
+        finally:
+            self.stop(a, b)
+        self.assertEqual(seen, [0, 1], 'the second check ran before the first job could be counted')
+
+    def test_a_waiter_killed_while_it_holds_the_admission_lock_lets_the_next_one_in(self):
+        """Stops half-way: the lock is an flock that no child of heavy keeps, so a waiter killed in its check frees it
+        at once, though the check it started lives on."""
+        log = os.path.join(self.dir, 'checks.log')
+        hang = f'echo "$WAITER" >> {log}; if [ "$WAITER" = a ]; then {self.sleeper}; fi'
+        env = dict(self.env, HEAVY_CHECK_HEAVY=self.check_script('hanging-check', True, hang))
+        a = self.start('--wait', '60', 'true', env=dict(env, WAITER='a'))
+        wait_for(lambda: os.path.exists(log), what='the first check')
+        a.kill()
+        a.communicate(timeout=60)
+        start = time.monotonic()
+        r = self.heavy('--wait', '30', 'true', env=dict(env, WAITER='b'))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(time.monotonic() - start, 10, 'the killed waiter\'s lock was still held')
+        with open(log) as f:
+            self.assertEqual(f.read().split(), ['a', 'b'])
+        for pid in self.ours():                     # the first check's sleeper
+            os.kill(pid, signal.SIGKILL)
+        wait_for(lambda: not self.ours(), what='the hanging check to end')
 
     # --- measured need (lib/heavy_measure.py; the history and the capacity front are in measure.test.py) ----------
 
@@ -1165,6 +1405,19 @@ class Parts(unittest.TestCase):
         self.assertEqual(state(mine, pw_home)[:2], (labelled(pw_home), os.path.join(pw_home, '.local', 'state')))
         self.assertFalse(os.path.exists(os.path.join(mine, '.local')))
         os.chmod(mine, 0o700)
+        # #951 item 4: this user's own home (700) in a folder others can write and that is not sticky: they could
+        # rename the home away and put their own in its place, so it is not used; the passwd home, or none at all
+        loose = os.path.join(self.dir, 'loose')
+        os.mkdir(loose)
+        os.chmod(loose, 0o777)
+        inside = os.path.join(loose, 'me')
+        os.mkdir(inside, 0o700)
+        self.assertEqual(state(inside, None), ('', '', ''))
+        self.assertEqual(state(inside, pw_home)[:2], (labelled(pw_home), os.path.join(pw_home, '.local', 'state')))
+        self.assertEqual(os.listdir(inside), [], 'a folder was made in a home someone else could swap')
+        os.chmod(loose, 0o1777)                     # sticky, as /tmp is: only its owner can rename the home
+        self.assertEqual(state(inside, None)[0], labelled(inside))
+        shutil.rmtree(os.path.join(inside, '.local'))
         # #771 item 1: a ~/.local others can write is not used (they could swap state for a link): no second folder,
         # nothing made in it; only this user's again: used
         os.mkdir(os.path.join(mine, '.local'), 0o700)
@@ -1418,6 +1671,41 @@ class Hygiene(unittest.TestCase):
             with open(os.path.join(here, name), encoding='utf-8') as f:
                 found += untimed(f.read(), name)
         self.assertEqual(found, [])
+
+    def test_a_run_of_heavy_without_isolated_fails_before_it_starts(self):
+        # #998 item 1: guard() follows what runs, so each of these spellings is stopped. The scratch env is the
+        # tester's own shape (not a running test's folder); --help writes nothing even if one got through
+        scratch = os.path.realpath(tempfile.mkdtemp(prefix='heavy-guard-'))
+        self.addCleanup(shutil.rmtree, scratch, True)
+        env = dict(os.environ, **{key: scratch for key in STATE_SETTINGS})
+        cmd = [HEAVY, '--help']
+        bare = subprocess.run           # as after `from subprocess import run` (which untimed() does not let in)
+        runs = {
+            'inline': lambda: subprocess.run([HEAVY, '--help'], env=env, capture_output=True, timeout=60),
+            'kept in a variable': lambda: subprocess.run(cmd, env=env, capture_output=True, timeout=60),
+            'no env': lambda: subprocess.run(cmd, capture_output=True, timeout=60),
+            'args=': lambda: subprocess.run(args=cmd, env=env, capture_output=True, timeout=60),
+            'a bare name': lambda: bare(cmd, env=env, capture_output=True, timeout=60),
+            'sh -c text': lambda: subprocess.run(['sh', '-c', f'"{HEAVY}" --help'], env=env, capture_output=True,
+                                                 timeout=60),
+            'from the PATH': lambda: subprocess.run(['heavy', '--help'], env=env, capture_output=True, timeout=60),
+            'Popen': lambda: subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL),
+            'os.system': lambda: os.system(f'"{HEAVY}" --help >/dev/null'),
+            'os.spawnv': lambda: os.spawnv(os.P_WAIT, HEAVY, cmd),
+            'os.spawnlp': lambda: os.spawnlp(os.P_WAIT, 'heavy', 'heavy', '--help'),
+            'os.spawnve': lambda: os.spawnve(os.P_WAIT, HEAVY, cmd, env),
+            'os.posix_spawn': lambda: os.posix_spawn(HEAVY, cmd, env),
+        }
+        for what, run in runs.items():
+            with self.subTest(what):
+                with self.assertRaisesRegex(AssertionError, 'runs heavy without Heavy.isolated'):
+                    run()
+        self.assertEqual(os.listdir(scratch), [])
+        # the same command passes once its state is in a running test's folder, and other commands are not held
+        LIVE.add(scratch)
+        self.addCleanup(LIVE.discard, scratch)
+        self.assertEqual(subprocess.run(cmd, env=env, capture_output=True, timeout=60).returncode, 0)
+        self.assertEqual(subprocess.run(['true', 'heavy.slice', 'heavy-x.scope', KIT], timeout=60).returncode, 0)
 
     def test_the_check_finds_each_listed_form(self):
         # #761 item 3, #767 item 2: each of these hangs on a silent process; each timed form passes. The check
