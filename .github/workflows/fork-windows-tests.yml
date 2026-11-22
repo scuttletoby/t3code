@@ -1,0 +1,112 @@
+name: Fork Windows tests
+
+# Fork only. A nightly report of upstream's test suite on Windows, on GitHub-hosted
+# Windows runners (free for a public repository). It is never a required check and
+# never in the merge path: upstream's own Windows lane (windows-tests.yml) says
+# nothing in the suite passes on Windows yet, so expect red until that changes.
+#
+# The job follows upstream's windows-tests.yml step for step. Only these differ:
+# the runner (GitHub's windows-2025, not upstream's Blacksmith runner, which the
+# fork does not have), the trigger (a nightly schedule and a manual run, not
+# upstream's manual run with inputs), and the package, which comes from the matrix
+# (upstream's default run, every package but apps/server, and the apps/server run
+# that default leaves out). The fork does not run upstream's file itself:
+# fork-follow's sweep (fork-workflows.sh) disables every upstream workflow and
+# cancels its runs, and a changed runs-on line there would be a seam line.
+#
+# Following upstream: the `drift` job (fork-tests-drift.cjs --windows) fails when
+# upstream's windows-tests.yml changed since .github/fork-windows-tests-upstream.json
+# recorded it, when upstream removed it, or when the steps here (names, pinned
+# actions) differ from upstream's. It runs only here, so an upstream change turns
+# this report red, never Fork tests, a pull request or a release: nothing in
+# fork-tests.yml reads windows-tests.yml (contract: fork-contracts.test.py, windows).
+#
+# Reading a night's result: Actions, "Fork Windows tests", the newest run. Each
+# leg (all non-server, apps/server) passes or fails on its own; a failed leg's
+# Test step lists the failing files. A leg that hits its 45 minutes shows as
+# cancelled. To try one package or file on Windows, run upstream's commands in
+# the Test step on a branch that changes this file, never on main.
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer run replaces one still running (a manual run during the nightly one, or
+# a night whose run is still queued): only the newest result matters.
+concurrency:
+  group: fork-windows-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Upstream drift of windows-tests.yml (see the header); the test legs run either way.
+  drift:
+    name: Upstream drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: .github
+      - name: Compare upstream's windows-tests.yml with the recorded copy
+        run: node .github/scripts/fork-tests-drift.cjs --windows
+
+  test:
+    name: Test (${{ matrix.package || 'all non-server' }})
+    runs-on: windows-2025
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ["", "apps/server"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      # setup-vp's own cache restores a Linux-shaped store on Windows, which is
+      # slower than no cache (upstream's windows-tests.yml). Cache pnpm's Windows store directly.
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Resolve package cache path
+        id: package_cache_path
+        shell: pwsh
+        run: '"path=$(vp pm cache dir)" >> $env:GITHUB_OUTPUT'
+
+      - name: Cache packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.package_cache_path.outputs.path }}
+          key: windows-tests-packages-v1-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install
+        run: vp install
+
+      - name: Ensure Electron runtime is installed
+        if: matrix.package == '' || matrix.package == 'apps/desktop'
+        run: vp run --filter "@t3tools/desktop" ensure:electron
+
+      # Upstream's Test step without its files branch (a nightly run tests whole suites).
+      - name: Test
+        shell: pwsh
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          $package = $env:PACKAGE
+          if ($package -eq '') {
+            vp run --parallel --concurrency-limit 4 --filter '!t3' --filter '!@t3tools/monorepo' test
+          } else {
+            vp run --filter "./$package" test
+          }

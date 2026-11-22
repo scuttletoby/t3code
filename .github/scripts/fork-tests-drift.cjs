@@ -1,22 +1,36 @@
-// Fork only: fails when upstream's ci.yml or release.yml test jobs or TOP_LEVEL keys changed since
-// .github/fork-tests-upstream.json recorded them (comments ignored). It compares upstream with its
-// record, not with fork-tests.yml: `--record` prints the changes and saves them, and its commit and
-// PR must say per change what was ported or why it does not apply. Run: `node <this> [--record]`.
+// Fork only: fails when a GROUP's tracked upstream workflows (or their top-level keys) changed since
+// its record (comments ignored). `--record` saves the changes; its commit and PR say per change what was
+// ported or why not. `node <this> [--windows] [--record]`: tests (fork-tests.yml, the merge path) or
+// windows (fork-windows-tests.yml's own nightly job, so upstream's Windows lane never reaches the merge path).
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "../..");
-const recordPath = path.join(root, ".github/fork-tests-upstream.json");
 
-// Upstream file -> jobs the fork copies (null = every job in the file).
-const TRACKED = {
-  ".github/workflows/ci.yml": null,
-  ".github/workflows/release.yml": ["quality", "test", "test_web", "test_server"],
+// tracked: upstream file -> jobs the fork copies (null = every job). topLevel: the keys digested as TOP.
+// sameSteps: the copy's job keeps upstream's step names and pinned actions, in order.
+const GROUPS = {
+  tests: {
+    record: ".github/fork-tests-upstream.json",
+    copy: "fork-tests.yml",
+    tracked: {
+      ".github/workflows/ci.yml": null,
+      ".github/workflows/release.yml": ["quality", "test", "test_web", "test_server"],
+    },
+    topLevel: ["env", "defaults", "concurrency", "permissions"],
+  },
+  // The copy replaces `on:` on purpose, but upstream's inputs say what its Test step runs: tracked too.
+  windows: {
+    record: ".github/fork-windows-tests-upstream.json",
+    copy: "fork-windows-tests.yml",
+    tracked: { ".github/workflows/windows-tests.yml": null },
+    topLevel: ["on", "env", "defaults", "concurrency", "permissions"],
+    sameSteps: { file: ".github/workflows/windows-tests.yml", job: "test", copyJob: "test" },
+  },
 };
 
-// Top-level keys digested as the pseudo-job TOP (job ids cannot contain parentheses).
-const TOP_LEVEL = ["env", "defaults", "concurrency", "permissions"];
+// Top-level keys are digested as the pseudo-job TOP (job ids cannot contain parentheses).
 const TOP = "(top-level)";
 
 const digest = (lines) =>
@@ -24,7 +38,8 @@ const digest = (lines) =>
 
 const indentOf = (line) => line.length - line.trimStart().length;
 
-function parseJobs(text) {
+// Splits a workflow into its top-level keys (topLevel) and its jobs (header lines and raw step lines).
+function splitJobs(text, topLevel = GROUPS.tests.topLevel) {
   // Drop blank lines, full-line comments and trailing spaces.
   const lines = text
     .split("\n")
@@ -39,7 +54,7 @@ function parseJobs(text) {
   for (const line of lines) {
     if (indentOf(line) === 0) {
       const key = line.match(/^([A-Za-z0-9_-]+):/)?.[1];
-      topKey = TOP_LEVEL.includes(key) ? { name: key, lines: [] } : null;
+      topKey = topLevel.includes(key) ? { name: key, lines: [] } : null;
       if (topKey) top.push(topKey);
     }
     topKey?.lines.push(line);
@@ -80,6 +95,11 @@ function parseJobs(text) {
     step?.lines.push(line);
   }
 
+  return { top, jobs };
+}
+
+function parseJobs(text, topLevel) {
+  const { top, jobs } = splitJobs(text, topLevel);
   const result = {};
   if (top.length)
     result[TOP] = {
@@ -107,12 +127,18 @@ function parseJobs(text) {
   return result;
 }
 
-// Returns the digests and the tracked jobs upstream no longer has.
-function current() {
+// Returns the digests, the tracked jobs upstream no longer has and the tracked files it removed.
+function current(group = GROUPS.tests, base = root) {
   const out = {};
   const missing = [];
-  for (const [file, only] of Object.entries(TRACKED)) {
-    const jobs = parseJobs(fs.readFileSync(path.join(root, file), "utf8"));
+  const removed = [];
+  for (const [file, only] of Object.entries(group.tracked)) {
+    const full = path.join(base, file);
+    if (!fs.existsSync(full)) {
+      removed.push(file);
+      continue;
+    }
+    const jobs = parseJobs(fs.readFileSync(full, "utf8"), group.topLevel);
     if (only) {
       for (const name of only) if (!jobs[name]) missing.push(`${file}: job \`${name}\``);
       out[file] = Object.fromEntries(
@@ -122,7 +148,26 @@ function current() {
       out[file] = jobs;
     }
   }
-  return { now: out, missing };
+  return { now: out, missing, removed };
+}
+
+const removedLine = (file, copy) =>
+  `${file}: removed upstream: port what replaced it into ${copy} or drop the copy, ` +
+  "then update GROUPS in fork-tests-drift.cjs";
+
+// A job's steps as [name, uses] pairs, read from each step's own keys (not its with: block).
+function stepsOf(text, job) {
+  return (splitJobs(text).jobs[job]?.steps ?? []).map(({ lines }) => {
+    const own = indentOf(lines[0]) + 2;
+    const keys = {};
+    for (const [i, line] of lines.entries()) {
+      const flat = i === 0 ? line.replace(/^(\s*)- /, "$1  ") : line;
+      const m = indentOf(flat) === own && flat.trim().match(/^(name|uses):\s*(.+)$/);
+      if (m && !(m[1] in keys))
+        keys[m[1]] = m[2].replace(/\s+#.*$/, "").replace(/^(["'])(.*)\1$/, "$2");
+    }
+    return [keys.name ?? null, keys.uses ?? null];
+  });
 }
 
 function compare(recorded, now) {
@@ -188,13 +233,13 @@ function readRecord(file) {
   }
 }
 
-// Refuses while a tracked job is missing: the copy in fork-tests.yml then follows
-// a job upstream no longer has, and TRACKED must be updated first.
-function record(now, missing, file = recordPath) {
+// Refuses while a tracked job or file is missing: the fork's copy then follows
+// something upstream no longer has, and GROUPS must be updated first.
+function record(now, missing, file, copy = GROUPS.tests.copy) {
   if (missing.length) {
     console.error(
       `Not recorded: tracked jobs missing upstream: ${missing.join(", ")}.\n` +
-        "Find what replaced them, port that into fork-tests.yml and update TRACKED in " +
+        `Find what replaced them, port that into ${copy} and update GROUPS in ` +
         "fork-tests-drift.cjs, then record again.",
     );
     process.exitCode = 1;
@@ -211,34 +256,61 @@ function record(now, missing, file = recordPath) {
     `\nUpstream changes this record accepts (${changes.length}):\n` +
       changes.map((c) => `- ${c}`).join("\n") +
       "\n\nSay in the commit message and the PR body, for each line, what was ported " +
-      "into fork-tests.yml or why it does not apply. The check cannot tell; reviewers rely on it.",
+      `into ${copy} or why it does not apply. The check cannot tell; reviewers rely on it.`,
   );
 }
 
+// What the check reports for a group: removed files, changes since the record, and steps that differ.
+function drift(group = GROUPS.tests, base = root) {
+  const { now, removed } = current(group, base);
+  const recorded = readRecord(path.join(base, group.record));
+  for (const file of removed) delete recorded[file];
+  const lines = [
+    ...removed.map((file) => removedLine(file, group.copy)),
+    ...compare(recorded, now),
+  ];
+  const same = group.sameSteps;
+  const copyFile = path.join(base, ".github/workflows", group.copy);
+  if (same && !removed.includes(same.file) && fs.existsSync(copyFile)) {
+    const theirs = stepsOf(fs.readFileSync(path.join(base, same.file), "utf8"), same.job);
+    const mine = stepsOf(fs.readFileSync(copyFile, "utf8"), same.copyJob);
+    if (JSON.stringify(mine) !== JSON.stringify(theirs))
+      lines.push(
+        `${group.copy}: job \`${same.copyJob}\`: steps (names, pinned actions) differ from ` +
+          `${same.file} job \`${same.job}\`: ${JSON.stringify(mine)} != ${JSON.stringify(theirs)}`,
+      );
+  }
+  return lines;
+}
+
 function main() {
-  const { now, missing } = current();
-  if (process.argv.includes("--record")) return record(now, missing);
-  const recorded = JSON.parse(fs.readFileSync(recordPath, "utf8"));
-  const changes = compare(recorded, now);
+  const group = process.argv.includes("--windows") ? GROUPS.windows : GROUPS.tests;
+  if (process.argv.includes("--record")) {
+    const { now, missing, removed } = current(group);
+    const gone = removed.map((file) => `${file} (file removed upstream)`);
+    return record(now, [...gone, ...missing], path.join(root, group.record), group.copy);
+  }
+  const changes = drift(group);
   const summary = process.env.GITHUB_STEP_SUMMARY;
   if (changes.length === 0) {
-    const msg = "Upstream test jobs match the copy in fork-tests.yml (recorded digest).";
+    const msg = `Upstream test jobs match ${group.copy} (recorded digest).`;
     console.log(msg);
     if (summary) fs.appendFileSync(summary, `### Upstream drift\n\n${msg}\n`);
     return;
   }
   const report =
     "### Upstream drift\n\n" +
-    "Upstream's test jobs changed since `.github/workflows/fork-tests.yml` last followed them:\n\n" +
+    `Upstream's test jobs changed since ${group.copy} last followed them:\n\n` +
     changes.map((c) => `- ${c}`).join("\n") +
-    "\n\nPort the change into fork-tests.yml (or decide it does not apply and say why in the PR), then run " +
-    "`node .github/scripts/fork-tests-drift.cjs --record` and commit `.github/fork-tests-upstream.json`.\n";
+    `\n\nPort the change into ${group.copy} (or decide it does not apply and say why in the PR), then run ` +
+    `\`node .github/scripts/fork-tests-drift.cjs${group === GROUPS.windows ? " --windows" : ""} --record\` ` +
+    `and commit \`${group.record}\`.\n`;
   console.error(report);
   if (summary) fs.appendFileSync(summary, report);
   for (const c of changes) console.log(`::error title=Upstream drift::${c}`);
   process.exitCode = 1;
 }
 
-module.exports = { parseJobs, compare, record, TOP };
+module.exports = { parseJobs, compare, record, current, drift, stepsOf, GROUPS, TOP };
 
 if (require.main === module) main();

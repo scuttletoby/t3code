@@ -38,6 +38,7 @@
           ".github/fork-seams.json",
           ".github/fork-tests-upstream.json",
           ".github/fork-upstream.json",
+          ".github/fork-windows-tests-upstream.json",
           "docs/fork/gate-trust.md",
           "fork-ci/**",
           "fork-kit/gh-apps/**",
