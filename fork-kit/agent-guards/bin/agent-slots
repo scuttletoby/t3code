@@ -1,0 +1,119 @@
+#!/usr/bin/python3 -IB
+"""Claude Code hook for orchestrator sessions: "agent slots free + ready queue not empty = don't stop yet".
+Part of fork-kit/agent-guards (README.md there: install, settings entries, the machine file's "agent-guards" section).
+
+UserPromptSubmit: adds one line of context: live agent processes, free slots, the first items of the ready queue.
+Stop: if slots are free and the ready queue has items, blocks the stop once (not again while stop_hook_active).
+Acts only for the session ids in sessionsFile; every other session exits at once (one file read). Read only: it
+writes nothing, so two at once need no lock.
+
+General (any project, any Claude config dir). Project facts come from the machine file (agentSlots):
+  sessionsFile   one session id per line, # comments (default "": the hook does nothing)
+  queue          a markdown file; its ready list is the "- " lines under readyHeading (default "## Ready")
+  maxAlive       agent processes at most (default 10); processName the process counted (default "claude")
+  note           extra text for the context line, e.g. a build-agent limit (default "")
+Never fails a call because of its own error. A broken machine file section: the defaults (so it does nothing) and
+one line on stderr. Tests: fork-kit/agent-guards/tests/agent-slots.test.py
+"""
+import json, os, subprocess, sys
+
+NAME = 'agent-slots'
+
+
+def _settings():
+    """(agentSlots settings, problem or None); a copy without the kit's lib keeps the defaults and says so."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        c, problem = config.load('agentSlots')
+        for k in ('sessionsFile', 'queue'):
+            c[k] = config.expand(c[k])
+        return c, problem
+    except BaseException as e:   # noqa: BLE001
+        return ({'sessionsFile': '', 'queue': '', 'readyHeading': '## Ready', 'maxAlive': 10, 'processName': 'claude',
+                 'note': ''}, f'cannot load the kit\'s config code ({type(e).__name__}: {e})')
+
+
+def lines(path):
+    try:
+        with open(path) as f:
+            return f.read().split('\n')
+    except OSError:
+        return []
+
+
+def ready_items(c):
+    out, on = [], False
+    for line in lines(c['queue']):
+        if line.startswith('## '):
+            on = line.strip().lower() == c['readyHeading'].strip().lower()
+        elif on and line.startswith('- '):
+            out.append(line[2:].strip())
+    return out
+
+
+def alive(c):
+    r = subprocess.run(['pgrep', '-c', '-x', c['processName']], capture_output=True, text=True)
+    return int((r.stdout or '0').strip() or 0)
+
+
+def decide(data, c):
+    sessions = {l.strip() for l in lines(c['sessionsFile']) if l.strip() and not l.startswith('#')}
+    if not c['sessionsFile'] or data.get('session_id') not in sessions:
+        return None
+    event = data.get('hook_event_name', '')
+    n = alive(c)
+    mx = int(c['maxAlive'])
+    free = max(0, mx - n)
+    ready = ready_items(c)
+    head = '; '.join(ready[:3])
+    msg = (f'Agent slots: {n}/{mx} {c["processName"]} processes alive, {free} free'
+           + (f' ({c["note"]})' if c['note'] else '') + '. '
+           f'Ready queue ({c["queue"]}): {len(ready)} item(s){": " + head if head else ""}.')
+    if event == 'UserPromptSubmit':
+        return {'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext': msg}}
+    if event == 'Stop' and not data.get('stop_hook_active') and free and ready:
+        return {'decision': 'block', 'reason': msg + ' Fill the free slots from the ready queue before ending the '
+                'turn (read the issue first). If an item cannot start now, move it out of the ready list with the reason.'}
+    return None
+
+
+def _notice(problem, event, out):
+    """`out` with a config problem added where the agent and the owner see it (and one line on stderr)."""
+    if not problem:
+        return out
+    try:
+        from agent_guards import config
+        config.warn(NAME, problem)
+        return config.notice(NAME, problem, event, out)
+    except BaseException:   # noqa: BLE001 - no lib: say it plainly
+        text = f'{NAME}: {problem}; built-in defaults used. Tell the owner.'
+        try:
+            sys.stderr.write(text + '\n')
+        except Exception:  # noqa: BLE001
+            pass
+        return dict(out or {}, systemMessage=text)
+
+
+def main():
+    if sys.argv[1:]:
+        sys.stderr.write('usage: agent-slots (hook: UserPromptSubmit or Stop JSON on stdin)\n')
+        return 1
+    event, problem = None, None
+    try:
+        c, problem = _settings()
+        event = json.load(sys.stdin)
+        out = decide(event, c)
+    except Exception:  # never break a call because of this hook
+        out = None
+    try:
+        out = _notice(problem, event, out)
+    except Exception:  # noqa: BLE001
+        pass
+    if out:
+        print(json.dumps(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

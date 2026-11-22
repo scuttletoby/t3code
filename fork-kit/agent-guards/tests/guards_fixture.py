@@ -1,0 +1,70 @@
+"""Shared by the agent-guards tests: a machine file of their own, and a hook run the way Claude Code runs it.
+
+A hook reads the machine file at the fixed path (/etc/fork-kit/machine.json); a test never does. It points the
+kit's config at a file in a temporary folder (or at one that is not there: the built-in defaults), owned by the
+user who runs the test, through config.MACHINE_PATH and config.OWNER_UID, the two names that are there for tests.
+In a separate process the same is done by RUNNER, which then runs the hook file as __main__. No root, no network.
+"""
+import importlib.machinery, importlib.util, json, os, subprocess, sys
+
+sys.dont_write_bytecode = True   # the CI runner has no -B: no __pycache__ beside the hooks
+
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN, LIB = os.path.join(KIT, 'bin'), os.path.join(KIT, 'lib')
+sys.path.insert(0, LIB)
+from agent_guards import config, wiring  # noqa: E402
+
+NO_MACHINE = '/nonexistent-agent-guards-test/machine.json'   # not there: every hook uses its defaults
+RUNNER = '''import runpy, sys
+lib, machine, uid, hook = sys.argv[1:5]
+sys.path.insert(0, lib)
+from agent_guards import config
+config.MACHINE_PATH, config.OWNER_UID = machine, int(uid)
+sys.argv = [hook] + sys.argv[5:]
+runpy.run_path(hook, run_name='__main__')
+'''
+
+
+def machine_file(folder, section=None, text=None, mode=0o644):
+    """<folder>/machine.json with that "agent-guards" section (or that exact text); its path."""
+    path = os.path.join(folder, 'machine.json')
+    if text is None:
+        data = {'version': 1}
+        if section is not None:
+            data['agent-guards'] = section
+        text = json.dumps(data)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.chmod(path, mode)
+    return path
+
+
+def use_machine(path):
+    """This process's hooks (loaded as modules) read `path`, owned by the user who runs the test."""
+    config.MACHINE_PATH, config.OWNER_UID = path, os.geteuid()
+
+
+def load_hook(name, machine=NO_MACHINE):
+    """bin/<name> as a module, with its config read from `machine`."""
+    use_machine(machine)
+    mod_name = name.replace('-', '_')
+    loader = importlib.machinery.SourceFileLoader(mod_name, os.path.join(BIN, name))
+    spec = importlib.util.spec_from_loader(mod_name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def run_hook(name, event, machine=NO_MACHINE, env=None, cwd=None, timeout=60, args=(), hook=None):
+    """Run bin/<name> (or the file `hook`) in a new process with `event` (a dict, or text) on stdin."""
+    text = event if isinstance(event, str) else json.dumps(event)
+    argv = [sys.executable, '-I', '-B', '-c', RUNNER, LIB, machine, str(os.geteuid()), hook or os.path.join(BIN, name),
+            *args]
+    return subprocess.run(argv, input=text, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                          env=env if env is not None else dict(os.environ))
+
+
+def answer(r):
+    """What a finished hook said, as agent_guards.check reads it."""
+    from agent_guards import check
+    return check._answer(r)
