@@ -799,6 +799,28 @@ describe("withCodexMcpProfiles", () => {
       }),
   );
 
+  it.effect('builtinTools "none" refuses its turns, also one Codex starts itself for a goal', () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCodex({ servers: ["alpha"] });
+      const { profiles, profileFor } = makeProfiles();
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+      const seen = yield* completions(client);
+      const id = (yield* start(client, "t")).thread.id;
+      profiles.set("t", {
+        ...resolved("bare", "all"),
+        profile: { servers: "all", t3Tools: "all", builtinTools: "none" },
+      });
+      const message = yield* outcome(turn(client, id));
+      assert.include(message, 'MCP profile "bare" has builtinTools "none"');
+      assert.include(message, "codex cannot run a thread without its built-in tools");
+      assert.deepStrictEqual(fake.sent("turn/start"), []);
+      yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+      yield* fake.reached("turn/interrupt", 1);
+      yield* fake.emit("turn/completed", turnCompleted(id, "goal-2"));
+      assert.include((seen[0]!.error as { readonly message: string }).message, "builtinTools");
+    }),
+  );
+
   it.effect("an unchanged profile: a turn Codex starts for the goal runs untouched", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
