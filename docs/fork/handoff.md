@@ -143,7 +143,7 @@ The new session's first message has these parts:
      and on stderr each (warnings count too), its stdin closed, and a short list of the server's
      environment plus the thread and project ids (`T3CODE_THREAD_ID`, `T3CODE_PROJECT_ID`). Its
      output, trimmed, is
-     the handoff, between begin and end lines that mark it as the command's notes. It must only
+     the handoff, fenced as the command's notes (see the `agent` source's fence below). It must only
      read and be safe to run twice: a second trigger for the same run may run it again. It runs
      once the settle is over, right before the send; a handoff waiting for an agent slot keeps its
      result, a failure too, and does not run it again. A stale state file is caught by part 1,
@@ -163,8 +163,8 @@ The new session's first message has these parts:
      guards against mistakes, not against the person (the setting is theirs alone). It refuses:
      - a program that is not a full path on the server's OS, not a file, or inside a git checkout
        (a folder above it, or above the file a link points to, holds `.git`);
-     - for a known interpreter (shells, `python`, `node`, `deno`, `bun`, `ruby`, `perl`, `php`,
-       `lua`, `tclsh`, `pwsh`, `Rscript`): its script (the first argument that is not an option,
+     - for a known interpreter (shells, `python`, `node`, `ruby`, `perl`, `php`, `lua`, `tclsh`,
+       `pwsh`, `Rscript --vanilla`): its script (the first argument that is not an option,
        whatever its ending) by a relative path, missing, or inside a checkout, a folder Python
        would run (`__main__.py`) too; and a module found by name (`python -m x`, `node -r x`,
        `--import x`), as that is looked up from the project folder;
@@ -177,7 +177,11 @@ The new session's first message has these parts:
        settings is checked as above;
      - programs that run what a file in their working folder says: `make`, `just`, `rake`, `npm`,
        `npx`, `pnpm`, `yarn`, `cargo`, `go`, `gradle`, `mvn`, `ant`, `task`, `tox`, `nox`,
-       `poetry`, `pipenv`, `uv`, `composer`.
+       `poetry`, `pipenv`, `uv`, `composer`; and `bun`, `bunx` and `deno`, whatever script they
+       are given, as they read their config from it first (`bunfig.toml`'s `preload` runs project
+       code, `deno.json`'s import map changes what a script imports); `R`, whatever it is given,
+       and `Rscript` without `--vanilla` among its options (before its script or `-e`), as R
+       sources `.Rprofile` and reads `.Renviron` from its working folder before the script.
 
      It does not catch: code given inline (`sh -c '…'`, `python -c '…'`, which may itself run
      project files); wrappers other than `env` (`nice`, `timeout`, `xargs`, …), whose program is
@@ -195,17 +199,16 @@ The new session's first message has these parts:
      model change, no fresh context), so its cache is still warm, with the same check before it as
      the handoff (a thread that moved on drops it) and an agent slot when the server has a gate.
      Its ids are fixed per source run (`server:handoff-write:<thread>:<run>`), so a second trigger
-     does not send a second one. The reply, after the marker line, is the handoff, between begin
-     and end lines that mark it as the old session's notes (the last reply that starts with the
-     marker, when the session wrote more than one). A line in the notes that could pass for one of
-     the message's own (a begin or end line, `[T3 handoff`, `Recent conversation:`, the rules) is
-     quoted with `> `, so the notes cannot end their part early or fake another part. A line is
-     matched by its letters and digits only, after compatibility folding, with accents dropped and
-     look-alike Cyrillic, Greek and IPA letters read as Latin: so rules of any character, list,
-     table, quote and heading marks, `hand-off` and invisible characters do not hide one. Every
-     line break a reader may take as one (CR, CR LF, LF, vertical tab, form feed, NEL, U+2028,
-     U+2029) splits lines, and comes out as LF. A line that starts with "end" or "begin" and names a
-     handoff is quoted even in prose; that costs nothing.
+     does not send a second one. The reply, after the marker line, is the handoff, fenced as the
+     old session's notes (the last reply that starts with the marker, when the session wrote more
+     than one). **The fence:** part 2 goes, as written, between a begin and an end line that carry
+     a token of 128 random bits drawn for this message (`----- end handoff from the old session
+     <token> -----`), after a line saying the notes end only at the end line with that token. The
+     notes were written before the token was drawn, so no line of theirs (a copy of the end line,
+     one with a guessed token, look-alike letters of any script, markup, odd line breaks) ends
+     them early or fakes another part of the message; notes that happen to hold the token get a
+     new one. A handoff sent again (a second trigger, a slot wait) draws a new token; a failed
+     handoff's retry resends the same text.
      - **Part 3 leaves out** the write turn's prompt and its marked reply. A message the person
        steered into a write turn, and the answer to it, stay in later handoffs' part 3.
      - **No handoff at all** (the old session carries on with everything it had, and the next turn
@@ -236,8 +239,16 @@ The new session's first message has these parts:
        `effect:restart-continuation:<run>` row is pending (written with the cancel at a restart, or
        due after upstream's retry delay for a continuation that failed before its prompt), or
        upstream's `continuationStartRetryDelayMs` says a retry is coming and its row is not written
-       yet, the handoff waits for it, up to a minute past the time it is due. A continuation that
-       still does not come leaves the chain judged as it is (the log says so).
+       yet, the handoff waits for it: for a written row, until upstream's effect worker settles it,
+       however late a busy restart makes that (the worker runs a few rows at a time); for a retry
+       whose row is not written yet (upstream writes it right after the failure), up to a minute
+       past the time it is due. A continuation that still does not come leaves the chain judged as
+       it is (the log says so). A row that cannot be read counts as owed, never as "no row": the
+       handoff reads it again every 5 seconds, with no time limit, and logs a warning each time, so
+       it is never sent without its notes; an outbox that stays unreadable keeps that one handoff
+       waiting (other threads go on). The row's id is upstream's own, which upstream does not export:
+       `handoffContinuationRow.test.ts` runs upstream's restart writer and checks the handoff finds
+       its row.
      - **Quiet.** A write turn that completes is marked quiet as the handoff run is (same rule,
        same `:loud` suffix when the settle saw the relay not show the person's finish), so its end
        does not alert. A write turn started where the fallback follows its failure (the size

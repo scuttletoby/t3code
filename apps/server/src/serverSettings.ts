@@ -49,7 +49,7 @@ import * as ServerConfig from "./config.ts";
 import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { renameRetiredAutoUpdateKeys } from "./cloud/autoUpdateSettings.ts";
-import { prepareSettingsFile } from "./fork/settingsFileRead.ts"; // Fork: renames, bad intervals
+import { decodeSettingsFile, prepareSettingsFile } from "./fork/settingsFileRead.ts"; // Fork: load
 import * as ForkPolicy from "./fork/modelPolicyFile.ts"; // Fork: model policy
 import {
   deriveLegacyProjectOverrides,
@@ -387,6 +387,7 @@ const PersistedServerSettings = Schema.Struct({
 // Parse first and decode second, so a managed policy can fill its defaults in between.
 const decodeSettingsFileJsonExit = Schema.decodeUnknownExit(fromLenientJson(Schema.Unknown));
 const decodePersistedServerSettingsExit = Schema.decodeUnknownExit(PersistedServerSettings);
+export const decodePersistedSettings = Schema.decodeUnknownEffect(PersistedServerSettings);
 const LegacyProviderSettingsJson = fromLenientJson(
   Schema.Struct({
     providers: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
@@ -398,7 +399,7 @@ const decodeLegacyProviderSettingsJsonExit = Schema.decodeUnknownExit(LegacyProv
 
 /**
  * The load's decode of a settings file's text: parse, rename retired keys, fill policy defaults,
- * decode. Pure, so the fork's read-only report (`__fork-report`) decodes exactly as a load does.
+ * decode. Synchronous: the load and `__fork-report` use fork/settingsFileRead.ts's Effect form.
  */
 export function decodeSettingsFileText(
   raw: string,
@@ -821,7 +822,7 @@ const make = Effect.gen(function* () {
 
     if (yield* readConfigExists) {
       const raw = yield* readRawConfig;
-      const decoded = decodeSettingsFileText(raw, managed.withDefaults);
+      const decoded = yield* decodeSettingsFile(raw, managed.withDefaults, decodePersistedSettings);
       const legacySettings = decodeLegacyProviderSettingsJsonExit(raw);
       if (legacySettings._tag === "Success") {
         legacyProviders = legacySettings.value.providers;
