@@ -4,7 +4,11 @@
   "repo": "../model-eval/repo.git",
   "truth": "truth.json",
   "briefs": "briefs",
-  "transcripts": ["~/.claude/projects/*/*.jsonl", "~/.claude/projects/*/*/subagents/*.jsonl"],
+  "transcripts": [
+    "~/.claude/projects/*/*.jsonl",
+    "~/.claude/projects/*/*/subagents/*.jsonl",
+    "~/.claude/projects/*/*/subagents/workflows/*/*.jsonl"
+  ],
   "prices": {
     "claude-opus-5-5": {
       "input": 4,
