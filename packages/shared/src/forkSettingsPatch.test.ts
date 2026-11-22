@@ -21,6 +21,7 @@ import {
   clearProjectSettingsOverridesWithForkKeys,
   forkSettingsWriteProblem,
   keepLeftOutForkProjectKeys,
+  mcpProfileUses,
   playtestProgramProblem,
   splitForkSettingsPatch,
 } from "./forkSettingsPatch.ts";
@@ -363,6 +364,60 @@ describe("fork settings save check (MCP profile references)", () => {
     ],
   ] as const)("refuses %s, saying how to fix it", (_name, patch, message) => {
     expect(problemAfter(patch)).toMatch(message);
+  });
+});
+
+describe("fork settings save check (deleting an MCP profile in use)", () => {
+  const project = ProjectId.make("project-1");
+  const stored: ServerSettings = {
+    ...DEFAULT_SERVER_SETTINGS,
+    mcpProfiles: {
+      lean: { servers: [], t3Tools: ["threads"] },
+      spare: { servers: [], t3Tools: "all" },
+      // A hand entry under a built-in's name.
+      all: { servers: [], t3Tools: [] },
+    },
+    mcpThreadProfiles: { "thread-b": " lean ", "thread-a": "lean", "thread-c": "t3-only" },
+    projectSettingsOverrides: { [project]: { mcpSubagentProfile: "lean" } },
+  };
+  const problemAfter = (
+    base: ServerSettings,
+    patch: Parameters<typeof applyServerSettingsPatch>[1],
+  ) => forkSettingsWriteProblem(base, applyServerSettingsPatch(base, patch));
+
+  it("refuses it, naming each setting that uses it (the client's rule)", () => {
+    expect(mcpProfileUses(stored, "lean")).toEqual([
+      { kind: "project-subagent-rule", projectId: project },
+      { kind: "thread-pick", threadId: "thread-a" },
+      { kind: "thread-pick", threadId: "thread-b" },
+    ]);
+    expect(problemAfter(stored, { mcpProfiles: { lean: null } })).toBe(
+      `MCP profile "lean" cannot be deleted: it is in use by project ${project}'s mcpSubagentProfile, the pick for thread thread-a, the pick for thread thread-b. Change those first.`,
+    );
+    const asDefault = { ...stored, mcpProfile: "lean", mcpSubagentProfile: "lean" };
+    expect(problemAfter(asDefault, { mcpProfiles: { lean: null } })).toMatch(
+      /in use by mcpProfile, mcpSubagentProfile, project/,
+    );
+  });
+
+  it("takes it once nothing uses it, also in the same save, and again when it is gone", () => {
+    expect(problemAfter(stored, { mcpProfiles: { spare: null } })).toBeUndefined();
+    const sameSave = {
+      mcpProfiles: { lean: null },
+      mcpThreadProfiles: { [ThreadId.make("thread-a")]: null, [ThreadId.make("thread-b")]: "all" },
+      projectSettingsOverrides: { [project]: { mcpSubagentProfile: "" } },
+    };
+    expect(problemAfter(stored, sameSave)).toBeUndefined();
+    // Runs again: the profile is already gone, so the same delete is no longer a delete.
+    const after = applyServerSettingsPatch(stored, sameSave);
+    expect(problemAfter(after, { mcpProfiles: { lean: null } })).toBeUndefined();
+  });
+
+  it("lets a hand entry under a built-in's name go, and old dangling picks block nothing", () => {
+    expect(problemAfter(stored, { mcpProfiles: { all: null } })).toBeUndefined();
+    // A pick that names a profile already missing (an old state) blocks no other delete.
+    const dangling = { ...stored, mcpThreadProfiles: { ...stored.mcpThreadProfiles, x: "gone" } };
+    expect(problemAfter(dangling, { mcpProfiles: { spare: null } })).toBeUndefined();
   });
 });
 
