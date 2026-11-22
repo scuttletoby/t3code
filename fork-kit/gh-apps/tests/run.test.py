@@ -70,6 +70,18 @@ class Run(unittest.TestCase):
         self.assertIn(b'runs only as ghrun', proc.stderr)
         self.assertFalse(self.gh_ran())
 
+    def test_repeated_selector_flag_is_a_usage_error(self):
+        """Lens A: --app and --repo each at most once on this side too (as in the wrapper), never last-wins."""
+        self.host.add_app('other', 'octo/other')
+        for args in (['--app', 'other', '--app', 'demo', '--repo', 'octo/demo', '--', 'gh', 'pr', 'list'],
+                     ['--app', 'demo', '--repo', 'octo/other', '--repo', 'octo/demo', '--', 'gh', 'pr', 'list'],
+                     ['--app', 'demo', '--repo', 'octo/demo', '--app', 'demo', '--', 'gh', 'pr', 'list'],
+                     ['--app', '', '--repo', 'octo/demo', '--', 'gh', 'pr', 'list']):
+            proc = kf.drive(self.host, 'run', args)
+            self.assertEqual(proc.returncode, 2, (args, proc.stderr))
+            self.assertIn(b'usage: gh-as', proc.stderr)
+        self.assertFalse(self.gh_ran())
+
     def test_app_by_name_refused_while_another_app_file_is_or_could_be_for_the_repo(self):
         """Lens round 2: two App files for one repository (one was broken when the second was added, then fixed)
         let the agent pick the stronger one with --app. gh-as refuses while any other file is, or could be, for

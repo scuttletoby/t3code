@@ -119,6 +119,7 @@ fork-kit/golive/tests/rehearse.test.py ~56s
 fork-kit/golive/tests/switch.test.py ~109s
 fork-kit/gh-apps/tests/install.test.py
 fork-kit/gh-apps/tests/mint.test.py
+fork-kit/gh-apps/tests/parity.test.py
 fork-kit/gh-apps/tests/policy.test.py
 fork-kit/gh-apps/tests/run.test.py
 fork-kit/gh-apps/tests/wrapper.test.py
