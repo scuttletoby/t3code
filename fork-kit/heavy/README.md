@@ -19,7 +19,7 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 | ---------------------------- | -------------------------------------------------------------------------------------------- |
 | `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends |
 | `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)        |
-| `heavy --self-check`         | checks the config, that the slice has a unit with a memory limit, and the installed files    |
+| `heavy --self-check`         | checks the config, the slice's limit and the installed files; warns on another `t3-capacity` |
 | `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                              |
 | `heavy sweep [--dry-run]`    | one leftover sweep (below); the user timer runs it every 5 minutes                           |
 | `heavy sweep --json`         | looks only: what a sweep would stop or report, as JSON                                       |
@@ -569,13 +569,17 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   cache folder nothing carries, so every call starts "elevated" (only the rule's floors admit; never straight to
   "ok").
 
-Two thin callers come with it (not linked onto PATH: a host wires them in itself):
+Two thin callers come with it:
 
 - `bin/t3-capacity [--kind KIND] [MB]`: the older host check's output (first line `available=..MB swapfree=..MB
   load=..`, available less the rule's whole reservation hold, last line `OK` or `NOT OK: why`, exit 0 or 1), now
-  from `heavy facts`. MB defaults to 3072.
-- `bin/agent-slots`: a Claude Code hook (UserPromptSubmit, Stop) for orchestrator sessions: free agent slots are
-  the smaller of the process limit and the machine's `fits` for its kind.
+  from `heavy facts`. MB defaults to 3072. The installer links `/usr/local/bin/t3-capacity` to it, so the command
+  has one source, the release in use; `heavy --self-check` warns when the `t3-capacity` found on PATH is another
+  copy (its readings can differ: an older copy, for one, counts no reservations). A host's installer that wrote
+  its own copy there stops doing so and runs `heavy-install` instead (Install, below).
+- `bin/agent-slots` (not linked onto PATH: a host wires it in itself): a Claude Code hook (UserPromptSubmit, Stop)
+  for orchestrator sessions: free agent slots are the smaller of the process limit and the machine's `fits` for
+  its kind.
 
 A `heavy facts` that does not answer within 5 s (it is killed), fails or prints something else is never free for
 either caller.
@@ -645,9 +649,11 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | ----------------------------------------------- | ------------------------------------------------------------------------- |
 | `/usr/local/bin/heavy`                          | link to `current/bin/heavy`                                               |
 | `/usr/local/sbin/heavy-install`                 | link to `current/sbin/heavy-install`                                      |
+| `/usr/local/bin/t3-capacity`                    | link to `current/bin/t3-capacity`                                         |
 | `/usr/local/libexec/heavy/versions/<sha>/`      | the code of one release, with `MANIFEST.sha256` (root 755)                |
 | `/usr/local/libexec/heavy/current`              | link to the release in use (switched in one step)                         |
 | `/usr/local/libexec/heavy/replaced/`            | a plain `/usr/local/bin/heavy` from before the kit, put back on uninstall |
+| `/usr/local/libexec/heavy/replaced-capacity/`   | a plain `/usr/local/bin/t3-capacity` (a host's copy), put back likewise   |
 | `/etc/heavy/config.json`                        | slice name and grace time                                                 |
 | `/etc/heavy/installed.tsv`                      | every installed path with its link target or hash (`--self-check`)        |
 | `/etc/systemd/user/<slice>`                     | only with limit options: the slice unit                                   |
@@ -674,16 +680,23 @@ It prints the sha, the hash of the download and every installed path. Add `--sli
 runs `systemctl --user daemon-reload`). Add `--sweep-timer` to install the leftover sweep's user units (each user
 then runs `systemctl --user daemon-reload && systemctl --user enable --now heavy-sweep.timer`; `--no-sweep-timer`
 removes them again). Upgrade: the same line again. Remove:
-`/usr/local/sbin/heavy-install uninstall` (puts an old plain `/usr/local/bin/heavy` back). Check:
-`heavy --self-check` (as the user: config, slice and files) or `heavy-install self-check` (files only).
+`/usr/local/sbin/heavy-install uninstall` (puts an old plain `/usr/local/bin/heavy` and `/usr/local/bin/t3-capacity`
+back). Check: `heavy --self-check` (as the user: config, slice and files, and a warning when `t3-capacity` on the
+user's PATH is not the kit's) or `heavy-install self-check` (files only).
+
+A host whose own installer copies a `t3-capacity` to `/usr/local/bin` changes it to run `heavy-install` (or to check
+that `/usr/local/bin/t3-capacity` is the link to `/usr/local/libexec/heavy/current/bin/t3-capacity`) and never to
+write that path itself: a copy over the link would land in the release's own folder (`heavy-install self-check`
+then says `changed since install`), and one written beside it and renamed over it replaces the link with a copy
+again (`--self-check` says the link differs; the next install keeps that copy and links again).
 
 ## Runs again, stops half-way, old or empty state
 
 - **Runs again:** every step checks what is there and only fixes what differs; a second run changes nothing.
 - **Stops half-way:** the steps run in this order: check, folders, copy, self-test, config, slice unit, switch,
   links, sweep units, record. A version folder is copied to a temporary name and renamed; a half-copied or changed
-  one is made again. The old `/usr/local/bin/heavy` keeps working until the links step, which copies it to
-  `replaced/` before the link replaces it. The sweep's units are written only after that, so a timer never runs
+  one is made again. The old `/usr/local/bin/heavy` and `/usr/local/bin/t3-capacity` keep working until the links
+  step, which copies each to its `replaced` folder before its link replaces it in one rename. The sweep's units are written only after that, so a timer never runs
   before the release it needs is in use. Running the same line again finishes the job.
 - **Rollback:** the timer's service runs `/usr/local/libexec/heavy/current/lib/heavy_sweep.py` (the sweep of the
   release in use, never an older `heavy` without the `sweep` verb), and only when that file exists. Before going
@@ -697,8 +710,12 @@ removes them again). Upgrade: the same line again. Remove:
 - **Rollback past the memory queue:** remove the `queue` key from the machine file's `heavy` section first. A
   release from before the queue does not know it: its sweep refuses the whole machine file and says which key. That
   release cannot be changed from here, so the order is the guard: key out, then the older release.
-- **Old state:** a plain-file `/usr/local/bin/heavy` (the one-line wrapper from before) is kept and put back by
-  uninstall. A link there that points elsewhere, a folder where the kit expects its own, or a slice unit in
+- **Rollback past the `t3-capacity` link:** an older installer leaves `/usr/local/bin/t3-capacity` as it is, a link
+  to `current/bin/t3-capacity`; every release since `heavy facts` has that file. Before going back further, run
+  `heavy-install uninstall` (it puts the old copy back). The old copy is kept in `replaced-capacity/`, not in
+  `replaced/`, because an older installer's uninstall puts the newest file of `replaced/` back as `heavy`.
+- **Old state:** a plain-file `/usr/local/bin/heavy` (the one-line wrapper from before) or `/usr/local/bin/t3-capacity`
+  (a host's own copy) is kept and put back by uninstall. A link there that points elsewhere, a folder where the kit expects its own, or a slice unit in
   `/etc/systemd/user/` the kit did not write is refused with a message, never overwritten. Config values stay
   unless an option names a new one.
 - **Empty state:** a fresh machine installs with the defaults. heavy then refuses to run commands until the slice

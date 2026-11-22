@@ -9,13 +9,14 @@
 
 install copies bin/heavy, sbin/heavy-install, lib/, systemd/, README.md and fork-kit/common/machine_file.py of one
 release into /usr/local/libexec/heavy/versions/<sha>/ (with MANIFEST.sha256), checks the copy, switches the link `current` to it,
-writes /etc/heavy/config.json and links /usr/local/bin/heavy and /usr/local/sbin/heavy-install to it. An old
-/usr/local/bin/heavy that is a plain file (a copy from before this kit) is kept in /usr/local/libexec/heavy/replaced/
-and put back by uninstall. With a --memory-*, --swap-max or --cpu-weight option it also writes the slice unit
-/etc/systemd/user/<slice> (every user's manager reads it after `systemctl --user daemon-reload`; a user's own
-~/.config/systemd/user/<slice> wins over it). With --sweep-timer it also writes the user units heavy-sweep.service
-and heavy-sweep.timer to /etc/systemd/user/ (each user enables the timer); --no-sweep-timer removes them. Safe to
-run again, and to stop at any step.
+writes /etc/heavy/config.json and links /usr/local/bin/heavy, /usr/local/bin/t3-capacity and
+/usr/local/sbin/heavy-install to it. An old /usr/local/bin/heavy that is a plain file (a copy from before this kit) is
+kept in /usr/local/libexec/heavy/replaced/, an old plain /usr/local/bin/t3-capacity (a host's own copy) in
+/usr/local/libexec/heavy/replaced-capacity/; uninstall puts them back. With a --memory-*, --swap-max or
+--cpu-weight option it also writes the slice unit /etc/systemd/user/<slice> (every user's manager reads it after
+`systemctl --user daemon-reload`; a user's own ~/.config/systemd/user/<slice> wins over it). With --sweep-timer it
+also writes the user units heavy-sweep.service and heavy-sweep.timer to /etc/systemd/user/ (each user enables the
+timer); --no-sweep-timer removes them. Safe to run again, and to stop at any step.
 """
 import argparse, contextlib, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
 
@@ -31,8 +32,14 @@ CURRENT = LIBEXEC + '/current'
 REPLACED = LIBEXEC + '/replaced'
 WRAPPER = '/usr/local/bin/heavy'
 INSTALLER = '/usr/local/sbin/heavy-install'
+CAPACITY = '/usr/local/bin/t3-capacity'
+# a plain old copy of t3-capacity has its own folder: an installer from before it restores the newest file of
+# REPLACED as /usr/local/bin/heavy on uninstall, so a t3-capacity there could come back as heavy
+REPLACED_CAPACITY = LIBEXEC + '/replaced-capacity'
 UNIT_DIR = '/etc/systemd/user'
-LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-install'}
+LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-install',
+         CAPACITY: CURRENT + '/bin/t3-capacity'}
+KEPT = {WRAPPER: (REPLACED, 'heavy'), CAPACITY: (REPLACED_CAPACITY, 't3-capacity')}   # where a plain old file goes
 
 SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'lib/heavy_queue.py',
                 'lib/heavy_measure.py', 'common/machine_file.py', 'systemd/heavy-sweep.service',
@@ -255,11 +262,11 @@ def check_old_state():
         real = p(path)
         if not os.path.lexists(real) or ours(path, target):
             continue
-        if path == WRAPPER and os.path.isfile(real) and not os.path.islink(real):
-            continue   # a plain old copy: kept in REPLACED, put back by uninstall
+        if path in KEPT and os.path.isfile(real) and not os.path.islink(real):
+            continue   # a plain old copy: kept in its KEPT folder, put back by uninstall
         raise Refused(f'{path} exists and is not the kit\'s link (a link elsewhere, or a folder): '
                       f'remove it by hand and run again')
-    for path in (ETC, LIBEXEC, VERSIONS, REPLACED):
+    for path in (ETC, LIBEXEC, VERSIONS, REPLACED, REPLACED_CAPACITY):
         real = p(path)
         if os.path.lexists(real) and (os.path.islink(real) or not os.path.isdir(real)):
             raise Refused(f'{path} exists and is not a folder: remove it by hand and run again')
@@ -267,19 +274,21 @@ def check_old_state():
         raise Refused(f'{CURRENT} exists and is not a link: remove it by hand and run again')
 
 
-def keep_old_wrapper():
-    """A plain old /usr/local/bin/heavy goes to REPLACED (by its hash, so a second run copies nothing)."""
-    real = p(WRAPPER)
-    if not os.path.isfile(real) or os.path.islink(real):
+def keep_old(path):
+    """A plain old file at a linked path (/usr/local/bin/heavy, /usr/local/bin/t3-capacity) goes to its KEPT folder
+    (by its hash, so a second run copies nothing). The file itself stays until its link replaces it in one step."""
+    real = p(path)
+    if path not in KEPT or not os.path.isfile(real) or os.path.islink(real):
         return None
-    ensure_dir(REPLACED)
+    folder, name = KEPT[path]
+    ensure_dir(folder)
     digest = sha256_file(real)
-    dest = p(f'{REPLACED}/heavy.{digest[:16]}')
+    dest = p(f'{folder}/{name}.{digest[:16]}')
     if not os.path.exists(dest):
         tmp = dest + '.tmp'
         shutil.copy2(real, tmp)
         os.replace(tmp, dest)
-        say(f'the old {WRAPPER} (sha256 {digest[:16]}) is kept as {REPLACED}/heavy.{digest[:16]}')
+        say(f'the old {path} (sha256 {digest[:16]}) is kept as {folder}/{name}.{digest[:16]}')
     return dest
 
 
@@ -376,8 +385,8 @@ def install(a, stop_after=None):
     done('slice-unit')
     switch_link(CURRENT, f'{VERSIONS}/{a.sha}')
     done('switch')
-    keep_old_wrapper()
     for path, target in LINKS.items():
+        keep_old(path)
         switch_link(path, target)
     done('links')
     # after the links: the timer is only written once the release it runs is the one in use
@@ -415,15 +424,16 @@ def uninstall():
     for path, target in LINKS.items():
         if ours(path, target):
             os.unlink(p(path))
-    backups = []
-    if os.path.isdir(p(REPLACED)):
-        backups = sorted((os.path.join(p(REPLACED), n) for n in os.listdir(p(REPLACED)) if not n.endswith('.tmp')),
-                         key=os.path.getmtime)
-    if backups and not os.path.lexists(p(WRAPPER)):
-        tmp = p(WRAPPER) + '.restore'
-        shutil.copy2(backups[-1], tmp)
-        os.replace(tmp, p(WRAPPER))
-        say(f'put the old {WRAPPER} back')
+    for path, (folder, name) in KEPT.items():
+        backups = []
+        if os.path.isdir(p(folder)):
+            backups = sorted((os.path.join(p(folder), n) for n in os.listdir(p(folder))
+                              if n.startswith(name + '.') and not n.endswith('.tmp')), key=os.path.getmtime)
+        if backups and not os.path.lexists(p(path)):
+            tmp = p(path) + '.restore'
+            shutil.copy2(backups[-1], tmp)
+            os.replace(tmp, p(path))
+            say(f'put the old {path} back')
     for path in sweep_unit_paths():
         if ours_unit(path):
             os.unlink(p(path))
