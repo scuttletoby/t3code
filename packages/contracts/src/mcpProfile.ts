@@ -15,6 +15,13 @@ export const MCP_PROFILE_ALL = "all";
 export const MCP_PROFILE_T3_ONLY = "t3-only";
 /** The two profiles every build knows; `mcpProfiles` cannot redefine them. */
 const MCP_BUILT_IN_PROFILE_NAMES: ReadonlyArray<string> = [MCP_PROFILE_ALL, MCP_PROFILE_T3_ONLY];
+/**
+ * A profile's `builtinTools`: `none` starts the thread with no built-in tools of the provider (no
+ * shell, files or web; only MCP tools). Only Claude applies it; a turn on any other driver is
+ * refused. Absent or `all` is today's behaviour.
+ */
+export const MCP_BUILTIN_TOOLS_NONE = "none";
+const MCP_BUILTIN_TOOLS_VALUES: ReadonlyArray<string> = ["all", MCP_BUILTIN_TOOLS_NONE];
 /** `mcpSubagentProfile` value: a delegated child follows `mcpProfile` like any other thread. */
 export const MCP_SUBAGENT_INHERIT = "inherit";
 
@@ -97,20 +104,27 @@ export const McpProfilesFromSettingsFile = Schema.Unknown.pipe(
 );
 
 const MCP_PROFILE_FIELDS: ReadonlyArray<string> = ["servers", "t3Tools"];
+const MCP_PROFILE_OPTIONAL_FIELDS: ReadonlyArray<string> = ["builtinTools"];
 const KNOWN_GROUPS: ReadonlyArray<string> = MCP_T3_TOOL_GROUPS;
 
 const isAllOrListOf = (value: unknown, isEntry: (entry: unknown) => boolean): boolean =>
   value === "all" || (Array.isArray(value) && value.every(isEntry));
 
 /**
- * A profile a save may store: exactly `servers` (non-blank names) and `t3Tools` (known groups), each
- * `"all"` or a keep-list; a keep-list leaves out anything not named. An unknown field is refused, not
- * dropped, so a save never stores a profile cut down from what the person wrote.
+ * A profile a save may store: `servers` (non-blank names) and `t3Tools` (known groups), each
+ * `"all"` or a keep-list; a keep-list leaves out anything not named; and optionally `builtinTools`
+ * (`"all"` or `"none"`). An unknown field is refused, not dropped, so a save never stores a profile
+ * cut down from what the person wrote.
  */
 const isSavableMcpProfile = (entry: unknown): boolean =>
   isRecord(entry) &&
-  Object.keys(entry).length === MCP_PROFILE_FIELDS.length &&
-  Object.keys(entry).every((field) => MCP_PROFILE_FIELDS.includes(field)) &&
+  MCP_PROFILE_FIELDS.every((field) => Object.hasOwn(entry, field)) &&
+  Object.keys(entry).every(
+    (field) => MCP_PROFILE_FIELDS.includes(field) || MCP_PROFILE_OPTIONAL_FIELDS.includes(field),
+  ) &&
+  (!Object.hasOwn(entry, "builtinTools") ||
+    (typeof entry.builtinTools === "string" &&
+      MCP_BUILTIN_TOOLS_VALUES.includes(entry.builtinTools))) &&
   isAllOrListOf(entry.servers, (name) => typeof name === "string" && name.trim() !== "") &&
   isAllOrListOf(
     entry.t3Tools,
@@ -141,7 +155,7 @@ export const McpProfilesPatch = Schema.Record(Schema.String, Schema.Unknown)
       (profiles: { readonly [name: string]: unknown }) =>
         Object.values(profiles).every((entry) => entry === null || isSavableMcpProfile(entry)),
       {
-        expected: `profiles with only ${MCP_PROFILE_FIELDS.join(" and ")}, each "all" or a list (servers: non-blank names; t3Tools: ${MCP_T3_TOOL_GROUPS.join(", ")}), or null to remove one`,
+        expected: `profiles with only ${MCP_PROFILE_FIELDS.join(" and ")}, each "all" or a list (servers: non-blank names; t3Tools: ${MCP_T3_TOOL_GROUPS.join(", ")}), and optionally builtinTools ("all" or "none"), or null to remove one`,
       },
     ),
   );

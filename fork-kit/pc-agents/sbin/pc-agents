@@ -442,6 +442,12 @@ def install_packages():
     return None
 
 
+def missing_sources(source):
+    """The code files of a release that setup copies and SOURCE (the release's top folder) lacks; [] when it has them
+    all. .github/scripts/fork-ci-release.test.py runs it on the files a release commit holds."""
+    return [src for src in k.CODE if not os.path.isfile(os.path.join(source, src))]
+
+
 def setup(source, sha):
     """Make or repair everything from the release sha. source: its files (a checkout), or None for the release folder
     setup installed before (the automatic update reruns setup from the installed kit, never from new code)."""
@@ -451,6 +457,10 @@ def setup(source, sha):
     if not k.ROOT and os.geteuid() != 0:
         return say('run this as root') or 2
     os.umask(0o022)
+    missing = [] if source is None else missing_sources(source)
+    if missing:
+        return say(f'refused, nothing changed: --source {source}: {missing[0]} is missing (point it at the release\'s '
+                   'top folder)') or 1
     try:
         c = k.config()
     except machine_file.MachineFileError as e:

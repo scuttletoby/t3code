@@ -17,6 +17,7 @@ const WHOLE_ONLY = [
   "placementNeeds",
   "playtest",
   "reviewRules",
+  "threadRoles",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;
 
 export const FORK_WHOLE_MANAGED_SETTINGS: ReadonlySet<string> = new Set(WHOLE_ONLY);

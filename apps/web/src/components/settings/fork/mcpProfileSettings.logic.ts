@@ -5,6 +5,7 @@
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
 import {
+  MCP_BUILTIN_TOOLS_NONE,
   MCP_PROFILE_ALL,
   MCP_PROFILE_T3_ONLY,
   MCP_SUBAGENT_INHERIT,
@@ -177,27 +178,33 @@ export function mcpServerSuggestions(
 const describeList = (list: "all" | ReadonlyArray<string>, all: string) =>
   list === "all" ? all : list.length === 0 ? "none" : list.join(", ");
 
-/** "Servers: all · T3 tools: threads, preview". */
+/** "Servers: all · T3 tools: threads, preview", and " · Built-in tools: none" when it drops them. */
 export const describeMcpProfileSet = (profile: McpProfileSet): string =>
-  `Servers: ${describeList(profile.servers, "all")} · T3 tools: ${describeList(profile.t3Tools, "all")}`;
+  `Servers: ${describeList(profile.servers, "all")} · T3 tools: ${describeList(profile.t3Tools, "all")}${
+    profile.builtinTools === MCP_BUILTIN_TOOLS_NONE ? " · Built-in tools: none" : ""
+  }`;
 
 /** What the profile editor holds. */
 export interface McpProfileDraft {
   readonly name: string;
   readonly servers: "all" | ReadonlyArray<string>;
   readonly t3Tools: "all" | ReadonlyArray<McpT3ToolGroup>;
+  /** True for `builtinTools: "none"`; an edit keeps it unless the person clears it. */
+  readonly noBuiltinTools?: boolean;
 }
 
 export const emptyMcpProfileDraft = (): McpProfileDraft => ({
   name: "",
   servers: [],
   t3Tools: "all",
+  noBuiltinTools: false,
 });
 
 export const draftOf = (name: string, profile: McpProfileSet): McpProfileDraft => ({
   name,
   servers: profile.servers,
   t3Tools: profile.t3Tools,
+  noBuiltinTools: profile.builtinTools === MCP_BUILTIN_TOOLS_NONE,
 });
 
 /**
@@ -241,7 +248,9 @@ export function saveMcpProfilePatch(
       : MCP_T3_TOOL_GROUPS.filter((group) =>
           (draft.t3Tools as ReadonlyArray<string>).includes(group),
         );
-  return { patch: { mcpProfiles: { [name]: { servers, t3Tools } } } };
+  const builtinTools =
+    draft.noBuiltinTools === true ? { builtinTools: MCP_BUILTIN_TOOLS_NONE } : {};
+  return { patch: { mcpProfiles: { [name]: { servers, t3Tools, ...builtinTools } } } };
 }
 
 /** Labels for the panel's messages: project and thread titles this client knows. */

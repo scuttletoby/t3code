@@ -5,6 +5,7 @@
  * thread's result in its menu and reads profile entries by the same rules in Settings.
  */
 import {
+  MCP_BUILTIN_TOOLS_NONE,
   MCP_CARRIED_PROFILES_REFUSE,
   MCP_PROFILE_ALL,
   MCP_PROFILE_T3_ONLY,
@@ -37,10 +38,14 @@ export interface McpProfileThread {
   readonly delegated: boolean;
 }
 
-/** A profile this build can apply: `"all"` or a keep-list, for servers and for T3 tool groups. */
+/**
+ * A profile this build can apply: `"all"` or a keep-list, for servers and for T3 tool groups; and
+ * `builtinTools: "none"` for a thread with no built-in provider tools (absent means all of them).
+ */
 export interface McpProfileSet {
   readonly servers: "all" | ReadonlyArray<string>;
   readonly t3Tools: "all" | ReadonlyArray<McpT3ToolGroup>;
+  readonly builtinTools?: typeof MCP_BUILTIN_TOOLS_NONE;
 }
 
 /** Where a thread's profile came from. */
@@ -109,12 +114,12 @@ const BUILT_IN_PROFILES: Readonly<Record<string, McpProfileSet>> = {
 };
 
 const KNOWN_GROUPS: ReadonlySet<string> = new Set(MCP_T3_TOOL_GROUPS);
-const PROFILE_FIELDS: ReadonlySet<string> = new Set(["servers", "t3Tools"]);
+const PROFILE_FIELDS: ReadonlySet<string> = new Set(["servers", "t3Tools", "builtinTools"]);
 const CARRIED_FIELDS: ReadonlySet<string> = new Set(["name", ...PROFILE_FIELDS]);
 
-/** True when the profile is today's behaviour: every outside server and every T3 tool. */
+/** True when the profile is today's behaviour: every outside server, T3 tool and built-in tool. */
 export const isEveryMcpTool = (profile: McpProfileSet): boolean =>
-  profile.servers === "all" && profile.t3Tools === "all";
+  profile.servers === "all" && profile.t3Tools === "all" && profile.builtinTools === undefined;
 
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -152,6 +157,22 @@ function parseT3Tools(
   }
   return { ok: true, value: { groups: unique(groups), unknown: unique(unknown) } };
 }
+
+/**
+ * `builtinTools`: absent or `"all"` keeps them; `"none"` drops them. Any other value (a typo, or a
+ * newer build's) refuses the profile, so it never reads as more than was meant.
+ */
+function parseBuiltinTools(value: unknown): Parsed<McpProfileSet["builtinTools"]> {
+  if (value === undefined || value === "all") return { ok: true, value: undefined };
+  if (value === MCP_BUILTIN_TOOLS_NONE) return { ok: true, value };
+  return { ok: false, issue: '`builtinTools` must be "all" or "none"' };
+}
+
+/** `servers` and `t3Tools` with `builtinTools` added only when it drops them. */
+const withBuiltinTools = (
+  set: Omit<McpProfileSet, "builtinTools">,
+  builtinTools: McpProfileSet["builtinTools"],
+): McpProfileSet => (builtinTools === undefined ? set : { ...set, builtinTools });
 
 type Lookup =
   | { readonly ok: true; readonly profile: McpProfileSet; readonly unknown: ReadonlyArray<string> }
@@ -200,28 +221,35 @@ export function readMcpProfileEntry(entry: unknown): McpProfileEntryRead {
   if (!servers.ok) return { ok: false, issue: servers.issue };
   const t3Tools = parseT3Tools(entry.t3Tools);
   if (!t3Tools.ok) return { ok: false, issue: t3Tools.issue };
+  const builtinTools = parseBuiltinTools(entry.builtinTools);
+  if (!builtinTools.ok) return { ok: false, issue: builtinTools.issue };
   return {
     ok: true,
-    profile: { servers: servers.value, t3Tools: t3Tools.value.groups },
+    profile: withBuiltinTools(
+      { servers: servers.value, t3Tools: t3Tools.value.groups },
+      builtinTools.value,
+    ),
     unknown: t3Tools.value.unknown,
   };
 }
 
 /**
- * A delegating thread's resolved profile as another machine sends it with a task: its name and
- * its `servers` and `t3Tools`. {@link resolveMcpProfile} cuts the task's own profile down to it.
+ * A delegating thread's resolved profile as another machine sends it with a task: its name, its
+ * `servers` and `t3Tools`, and `builtinTools` only when `"none"` (a machine from before that field
+ * refuses such a task, never widens it). {@link resolveMcpProfile} cuts the task's own profile down
+ * to it.
  */
 export type McpProfileCarried = {
   readonly name: string;
   readonly servers: McpProfileSet["servers"];
   readonly t3Tools: McpProfileSet["t3Tools"];
+  readonly builtinTools?: typeof MCP_BUILTIN_TOOLS_NONE;
 };
 
 /** A resolved profile as it is carried to another machine with a delegated task. */
 export const carryMcpProfile = (resolved: McpProfileResolved): McpProfileCarried => ({
   name: resolved.name,
-  servers: resolved.profile.servers,
-  t3Tools: resolved.profile.t3Tools,
+  ...resolved.profile,
 });
 
 export type CarriedLookup =
@@ -250,7 +278,16 @@ export function readCarried(value: unknown): CarriedLookup {
   if (!servers.ok) return { ok: false, name, issue: servers.issue };
   const t3Tools = parseT3Tools(value.t3Tools);
   if (!t3Tools.ok) return { ok: false, name, issue: t3Tools.issue };
-  return { ok: true, name, profile: { servers: servers.value, t3Tools: t3Tools.value.groups } };
+  const builtinTools = parseBuiltinTools(value.builtinTools);
+  if (!builtinTools.ok) return { ok: false, name, issue: builtinTools.issue };
+  return {
+    ok: true,
+    name,
+    profile: withBuiltinTools(
+      { servers: servers.value, t3Tools: t3Tools.value.groups },
+      builtinTools.value,
+    ),
+  };
 }
 
 /** A set value; empty or absent means "not set". */
@@ -296,7 +333,8 @@ function cutTo(child: McpProfileSet, parent: McpProfileSet): McpProfileSet {
       : child.t3Tools === "all"
         ? parent.t3Tools
         : child.t3Tools.filter((group) => parent.t3Tools.includes(group));
-  return { servers, t3Tools };
+  // Either one without built-in tools leaves the thread without them.
+  return withBuiltinTools({ servers, t3Tools }, child.builtinTools ?? parent.builtinTools);
 }
 
 const sameList = (a: "all" | ReadonlyArray<string>, b: "all" | ReadonlyArray<string>) =>
@@ -307,7 +345,27 @@ const sameList = (a: "all" | ReadonlyArray<string>, b: "all" | ReadonlyArray<str
 /** True when `child` keeps nothing `parent` does not: cutting it to `parent` takes nothing away. */
 export function isWithinMcpProfile(child: McpProfileSet, parent: McpProfileSet): boolean {
   const cut = cutTo(child, parent);
-  return sameList(cut.servers, child.servers) && sameList(cut.t3Tools, child.t3Tools);
+  return (
+    sameList(cut.servers, child.servers) &&
+    sameList(cut.t3Tools, child.t3Tools) &&
+    cut.builtinTools === child.builtinTools
+  );
+}
+
+/**
+ * What `child` keeps that `parent` does not, named for a refusal ("MCP servers", "T3 tools",
+ * "built-in tools", joined with "or"); an empty string when `child` is within `parent`.
+ */
+export function mcpProfileWiderParts(child: McpProfileSet, parent: McpProfileSet): string {
+  const cut = cutTo(child, parent);
+  const parts = [
+    ...(sameList(cut.servers, child.servers) ? [] : ["MCP servers"]),
+    ...(sameList(cut.t3Tools, child.t3Tools) ? [] : ["T3 tools"]),
+    ...(cut.builtinTools === child.builtinTools ? [] : ["built-in tools"]),
+  ];
+  return parts.length <= 1
+    ? (parts[0] ?? "")
+    : `${parts.slice(0, -1).join(", ")} or ${parts[parts.length - 1]}`;
 }
 
 const FIX = `pick "${MCP_PROFILE_ALL}" for this thread, or fix the profile in Settings`;
@@ -407,7 +465,8 @@ function resolveAt(
     profile,
     narrowedByParent:
       !sameList(profile.servers, own.profile.servers) ||
-      !sameList(profile.t3Tools, own.profile.t3Tools),
+      !sameList(profile.t3Tools, own.profile.t3Tools) ||
+      profile.builtinTools !== own.profile.builtinTools,
   };
 }
 

@@ -166,6 +166,7 @@ function plan(entries, present, ever, read = () => null, allowed = RUN_ELSEWHERE
 }
 
 function readList(text) {
+  const seen = new Set();
   return text
     .split("\n")
     .map((line) => line.replace(/#.*/, "").trim())
@@ -176,9 +177,13 @@ function readList(text) {
       );
       if (!match)
         throw new Error(
-          `${LIST}: cannot read "${line}" (expected "<test>", "<test> ~<seconds>s" or "<test> run by <file>", ` +
-            `a Python test's then ending in its format: "unittest" or "ok lines")`,
+          `${LIST}: cannot read "${line}" (expected "<test>", "<test> ~<seconds>s" or "<test> run by <file>"; ` +
+            `a Python test's line then ends in its format: "unittest" or "ok lines")`,
         );
+      // One line per test: two would let a part and `--run` each read a different one.
+      if (seen.has(match[1]))
+        throw new Error(`${LIST}: "${match[1]}" is listed twice (one line per test)`);
+      seen.add(match[1]);
       // A Python test has two formats (countTests()), and says which: none is read as the other.
       const python = match[1].endsWith(".py");
       if (match[4] && !python)

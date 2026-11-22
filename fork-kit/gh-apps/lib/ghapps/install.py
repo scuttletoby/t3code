@@ -248,10 +248,16 @@ def tree_problems(folder):
     return problems
 
 
+def missing_sources(source):
+    """The SOURCE_FILES that SOURCE lacks; [] when it has them all.
+    .github/scripts/fork-ci-release.test.py runs it on the files a release commit holds."""
+    return [rel for rel in SOURCE_FILES if not os.path.isfile(os.path.join(source, rel))]
+
+
 def copy_tool(ops, source, sha):
-    for rel in SOURCE_FILES:
-        if not os.path.isfile(os.path.join(source, rel)):
-            raise Refused(f'--source {source}: {rel} is missing (point it at the fork-kit/gh-apps folder)')
+    missing = missing_sources(source)
+    if missing:
+        raise Refused(f'--source {source}: {missing[0]} is missing (point it at the fork-kit/gh-apps folder)')
     versions = c.p(c.VERSIONS)
     dest = os.path.join(versions, sha)
     if os.path.lexists(dest):

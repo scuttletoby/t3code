@@ -43,36 +43,38 @@ The defaults, "off" and "decided in" below come from one table in the code,
 (`packages/shared/src/forkDocs.test.ts`) fails when this table and that one differ, or a setting has
 no section below. "Off" means the default leaves the machine as upstream's would be.
 
-| Setting                                                                      | Default                     | Off | Decided in                                               |
-| ---------------------------------------------------------------------------- | --------------------------- | --- | -------------------------------------------------------- |
-| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`                     | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
-| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                        | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
-| [`server.activityProbe`](#serveractivityprobe)                               | `false`                     | yes | [#509](https://github.com/scuttletoby/t3code/issues/509) |
-| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                        | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
-| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                     | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                        | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`         | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                        | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`         | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
-| [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}` | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
-| [`server.placement`](#serverplacement)                                       | `{"mode":"off"}`            | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
-| [`server.placementNeeds`](#serverplacementneeds)                             | `[]`                        | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
-| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`         | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                    | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
-| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpCarriedProfiles`](#servermcpcarriedprofiles)                     | `"apply"`                   | yes | [#640](https://github.com/scuttletoby/t3code/issues/640) |
-| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`            | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
-| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                     | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
-| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                     | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
-| [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                     | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
+| Setting                                                                      | Default                                 | Off | Decided in                                               |
+| ---------------------------------------------------------------------------- | --------------------------------------- | --- | -------------------------------------------------------- |
+| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`                                 | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
+| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                                    | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
+| [`server.activityProbe`](#serveractivityprobe)                               | `false`                                 | yes | [#509](https://github.com/scuttletoby/t3code/issues/509) |
+| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                                    | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
+| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                                 | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                                    | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                                    | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`                      | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
+| [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}`             | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
+| [`server.placement`](#serverplacement)                                       | `{"mode":"off"}`                        | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
+| [`server.placementNeeds`](#serverplacementneeds)                             | `[]`                                    | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
+| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`                     | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                                | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
+| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                                    | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`                                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`                             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                                    | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpCarriedProfiles`](#servermcpcarriedprofiles)                     | `"apply"`                               | yes | [#640](https://github.com/scuttletoby/t3code/issues/640) |
+| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`                        | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| [`server.threadRoles`](#serverthreadroles)                                   | `{"assistant":null,"orchestrators":{}}` | yes | [#138](https://github.com/scuttletoby/t3code/issues/138) |
+| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                                 | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                                 | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                                 | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
+| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                                 | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                                 | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
+| [`client.calmSidebarEnabled`](#clientcalmsidebarenabled)                     | `false`                                 | yes | [#139](https://github.com/scuttletoby/t3code/issues/139) |
 
 For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
 and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
@@ -997,6 +999,32 @@ A thread with `all` delegates to any machine and any instance there, without ask
 arrives from a machine on an older T3 carries nothing, so it gets this machine's profile for its
 role as before, and the server log says so.
 
+A profile may also say `"builtinTools": "none"` (optional; absent, or `"all"`, keeps the provider's
+built-in tools as before). Such a thread gets no shell, file, web or other built-in tool, only MCP
+tools (T3's own, and the outside servers its `servers` keeps): a base for an assistant that reads
+the owner's data without changing files. Only Claude applies it: its query opens with no built-in
+tool (`tools: []`, and every built-in Claude names in `disallowedTools`), and a call to any tool
+that is not an MCP tool is refused at the call, with the reason. A thread whose profile changes to
+it starts a fresh Claude process for its next turn, so a process that still has its tools is not
+reused. Every other provider (Codex too) cannot run without its built-in tools, so a turn there is
+not started and says why (switch the thread to a Claude instance, or pick another profile); Codex
+also stops a turn it starts on its own for a goal, but only soon after that turn starts, so its first
+tool calls may already run. A child keeps `none` from its parent (never more
+than its parent), a delegated task carries it to the other machine, and a delegation refuses, before
+sending, a non-Claude instance there, as for any profile narrower than `all`. A T3 from before this
+field reads a profile or carried task with it as one it cannot read and refuses it, never giving it
+the tools; a machine on such a T3 that takes delegated tasks accepts the task, then refuses its
+turn, so a thread that does nothing is left there (never one with more tools). Any other value makes
+the profile broken.
+
+`builtinTools` removes only the provider's own tools. For a really tool-less (read-only) thread,
+also give `t3Tools` a list of only the groups it needs (leave out `orchestration`, `playtest`,
+`worktree`, `preview` and other groups that act: they can ask another thread to act, run build
+steps, change worktrees or run page script), and `servers` a
+list of read-only servers: an outside MCP server may wrap a shell or write files. Not a sandbox: a
+Claude setting that turns hooks off, or launch arguments that add tools, can weaken it on a machine
+the owner set up so.
+
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
 ```
@@ -1004,7 +1032,7 @@ role as before, and the server log says so.
 In the app: **Settings → Fork**, section MCP profiles. It lists `all` and `t3-only` (read-only)
 and each named profile, and adds, edits and deletes named ones: `servers` is all or a list of
 names (the editor offers the names other profiles use and takes any other; no list of the
-machine's servers reaches the app yet), `t3Tools` all or a list of groups. `request_secret`,
+machine's servers reaches the app yet), `t3Tools` all or a list of groups, and a "No built-in tools" box sets `builtinTools: "none"`. `request_secret`,
 `send_to_user` and `tool_search` always stay. A built-in name cannot be taken, and a profile that
 the default, the sub-agent rule, a project or a thread pick names cannot be deleted: the panel
 says which, and offers to clear the thread picks that name it; the server refuses such a delete
@@ -1123,6 +1151,38 @@ there keeps it as stored.
 { "handoff": { "mode": "handoff", "threads": { "<thread id>": "compact" } } }
 ```
 
+### `server.threadRoles`
+
+Which threads hold a role, for the calm sidebar: the `assistant` thread (or `null`), and in
+`orchestrators` one thread per project (project id to thread id). A role is a pointer in the
+settings, not a tag on the thread, so a project has at most one orchestrator and the roles are a
+setting the person changes ([#138](https://github.com/scuttletoby/t3code/issues/138)). The default,
+no roles, changes nothing. This setting alone shows nothing: the calm sidebar
+(`client.calmSidebarEnabled`) reads it.
+
+Only the person can change it; agents cannot (the settings tool refuses it as person-only). A save
+that sets a pointer anew is refused unless the thread exists and is not deleted, is a top-level
+thread (not a sub-agent, a side chat or a task delegated from a linked machine) and, for an
+orchestrator, belongs to the project its entry names. Where the server cannot read threads, such a
+save is refused too, never let through. A pointer the save leaves as it was is not checked again,
+so an old pointer to a thread deleted since blocks no other save; whoever reads the roles checks the
+thread and treats a failing one as no role. An archived thread can take a role, but readers treat an
+archived or deleted thread with a role as no role. An entry for a project removed since stays in the
+file (no sweep clears it) until a save removes it; readers skip it.
+
+A save changes the roles field by field: a left-out field keeps its value, `assistant: null`
+removes the assistant, and each `orchestrators` entry is set or (`null`) removed on its own, so two
+saves for different projects keep both. A save with a bad id is refused. The file is read leniently:
+a missing or non-object value reads as no roles, a bad `assistant` as none, and a bad orchestrator
+entry drops alone, so a hand edit never resets the other settings. A dropped entry is gone from the
+file after the next save of any setting, since the save writes the settings as read.
+
+```json
+{
+  "threadRoles": { "assistant": "<thread id>", "orchestrators": { "<project id>": "<thread id>" } }
+}
+```
+
 ### `projectOverride.waitChecks`
 
 A project's own list of wait checks. It replaces the server's list for that project as a whole (a
@@ -1190,6 +1250,14 @@ is not valid fails closed as the server's does: that project's work goes to no m
 server's needs, never none), and its text is kept. A project save that leaves this key out (an older
 client) keeps the stored value, and one that sends back the kept text unchanged keeps it too (other
 text is refused); only `null` clears it, as for `playtest`.
+
+### `client.calmSidebarEnabled`
+
+Turns on the calm sidebar on this device: the threads in `server.threadRoles` go to the top, and the
+other top-level threads fold into one closed group with a count of those waiting for you
+([#139](https://github.com/scuttletoby/t3code/issues/139)). Off (the default): upstream's sidebar.
+It is a client setting, so each device chooses: calm on a phone, the full list on a desktop. A
+client settings file without it reads as off.
 
 ### A setting the fork removed
 

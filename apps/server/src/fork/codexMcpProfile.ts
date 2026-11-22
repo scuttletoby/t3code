@@ -4,7 +4,7 @@
  * checks the thread's live servers, refuses on a mismatch, and fixes its T3 tool groups (cut on
  * T3's MCP server, mcpT3ToolFilter.ts), also on a turn Codex starts itself.
  */
-import { MCP_PROFILE_ALL, ThreadId } from "@t3tools/contracts";
+import { MCP_BUILTIN_TOOLS_NONE, MCP_PROFILE_ALL, ThreadId } from "@t3tools/contracts";
 import type * as CodexClient from "effect-codex-app-server/client";
 import * as CodexError from "effect-codex-app-server/errors";
 import type * as CodexSchema from "effect-codex-app-server/schema";
@@ -14,7 +14,11 @@ import * as Schema from "effect/Schema";
 import type { CodexAppServerClientFactoryShape } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { AGENT_THREAD_ENV } from "../preview/PortScanner.ts";
 import { ClaudeMcpProfileError, makeThreadMcpProfilesById } from "./claudeMcpProfile.ts";
-import type { McpProfileResolved, McpProfileSet } from "./mcpProfile.ts";
+import {
+  type McpProfileResolved,
+  type McpProfileSet,
+  builtinToolsNoneRefusal,
+} from "./mcpProfile.ts";
 import { fixT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
 
 type Client = CodexClient.CodexAppServerClient["Service"];
@@ -287,6 +291,11 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
       Effect.mapError((cause) => refusal(method, cause)),
     );
     fixT3ToolSet(threadId, t3ToolSetOf(resolved));
+    // Codex cannot run a thread without its shell and file tools; also a turn it starts itself.
+    if (resolved.profile.builtinTools === MCP_BUILTIN_TOOLS_NONE) {
+      const reason = builtinToolsNoneRefusal(resolved.name, "codex");
+      return yield* refusal(method, new ClaudeMcpProfileError({ reason }));
+    }
     // A thread loaded narrower than its profile is now stays narrower until Codex reloads it.
     if (resolved.profile.servers === "all") return;
     const statuses: Array<{ readonly name: string; readonly runtimeStatus?: string | null }> = [];

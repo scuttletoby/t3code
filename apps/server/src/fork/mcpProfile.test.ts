@@ -7,6 +7,7 @@ import {
   type McpProfileResolution,
   type McpProfileSettings,
   type McpProfileThread,
+  carryMcpProfile,
   isEveryMcpTool,
   resolveMcpProfile,
   isWithinMcpProfile,
@@ -267,10 +268,7 @@ describe("MCP profile resolver: never falls back to all", () => {
   });
 
   it.each([
-    [
-      "an unknown field (written by a newer build)",
-      { servers: [], t3Tools: [], builtinTools: "none" },
-    ],
+    ["an unknown field (written by a newer build)", { servers: [], t3Tools: [], hosts: ["a"] }],
     ["a missing field", { servers: [] }],
     ["a wrong servers value", { servers: "docs", t3Tools: "all" }],
     ["a blank server name", { servers: [" "], t3Tools: "all" }],
@@ -623,5 +621,56 @@ describe("isWithinMcpProfile (#681)", () => {
     expect(isWithinMcpProfile(set(["docs", "search"]), set(["docs"]))).toBe(false);
     expect(isWithinMcpProfile(set(["docs"], ["threads"]), set(["docs"], ["threads"]))).toBe(true);
     expect(isWithinMcpProfile(set(["docs"], ["threads"]), set(["docs"], []))).toBe(false);
+  });
+});
+
+describe('builtinTools "none" (assistant)', () => {
+  const settings = fromFile({
+    mcpProfiles: { bare: { servers: "all", t3Tools: "all", builtinTools: "none" }, ...PROFILES },
+    mcpThreadProfiles: { assistant: "bare", "lean-parent": "lean" },
+  });
+
+  it("reads an old profile without the field as before: built-in tools kept", () => {
+    const result = resolved(resolveMcpProfile(settings, [top("lean-parent")]));
+    expect(result.profile).toEqual(PROFILES.lean);
+    expect(result.profile).not.toHaveProperty("builtinTools");
+    expect(isEveryMcpTool(resolved(resolveMcpProfile(settings, [top("other")])).profile)).toBe(
+      true,
+    );
+  });
+
+  it("is narrower than all, and a child keeps it: never wider than its parent", () => {
+    const own = resolved(resolveMcpProfile(settings, [top("assistant")]));
+    expect(own.profile).toEqual({ servers: "all", t3Tools: "all", builtinTools: "none" });
+    expect(isEveryMcpTool(own.profile)).toBe(false);
+    expect(isWithinMcpProfile(own.profile, { servers: "all", t3Tools: "all" })).toBe(true);
+    expect(isWithinMcpProfile({ servers: "all", t3Tools: "all" }, own.profile)).toBe(false);
+    const sub = resolved(resolveMcpProfile(settings, [child("c1"), top("assistant")]));
+    expect(sub.profile.builtinTools).toBe("none");
+    expect(sub.narrowedByParent).toBe(true);
+  });
+
+  it("travels with a delegated task and comes back the same on the other machine", () => {
+    const own = resolved(resolveMcpProfile(settings, [top("assistant")]));
+    const carried = carryMcpProfile(own);
+    expect(carried).toEqual({ name: "bare", servers: "all", t3Tools: "all", builtinTools: "none" });
+    const there = resolved(resolveMcpProfile(fromFile({}), [child("task")], carried));
+    expect(there.profile.builtinTools).toBe("none");
+    // A task without it carries no field, so an older receiver reads it as before.
+    expect(carryMcpProfile(resolved(resolveMcpProfile(settings, [top("x")])))).not.toHaveProperty(
+      "builtinTools",
+    );
+  });
+
+  it.each([["some"], [false], [["Bash"]]])("refuses, never widens, builtinTools %j", (value) => {
+    const broken = fromFile({
+      mcpProfiles: { odd: { servers: "all", t3Tools: "all", builtinTools: value } },
+      mcpProfile: "odd",
+    });
+    expect(refused(resolveMcpProfile(broken, [top("t1")])).message).toContain("builtinTools");
+    const carried = { name: "odd", servers: "all", t3Tools: "all", builtinTools: value };
+    expect(refused(resolveMcpProfile(fromFile({}), [child("task")], carried)).message).toContain(
+      "builtinTools",
+    );
   });
 });

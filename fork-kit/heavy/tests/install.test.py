@@ -458,6 +458,19 @@ class Install(unittest.TestCase):
             self.assertEqual(f.read(), '[Slice]\nMemoryMax=1G\n')
         self.assertEqual(self.install()[0], 0)                      # without limits: used as it is
 
+    def test_a_source_without_a_file_is_refused_before_anything_is_written(self):
+        self.assertEqual(self.m.missing_sources(KIT), [])
+        top = tempfile.mkdtemp(prefix='heavy-source-')   # the kit alone: no fork-kit/common, no capacity rule
+        self.addCleanup(shutil.rmtree, top, ignore_errors=True)
+        src = os.path.join(top, 'fork-kit', 'heavy')
+        shutil.copytree(KIT, src)
+        missing = self.m.missing_sources(src)
+        self.assertEqual(missing, [r for r in self.m.SOURCE_FILES if r.startswith(('common/', 'capacity/'))])
+        code, _, err = self.install(source=src)
+        self.assertEqual(code, 1, err)
+        self.assertIn(f'{missing[0]} is missing', err)
+        self.assertEqual(os.listdir(self.root), ['usr'])
+
     def test_bad_options_are_refused(self):
         for extra in (['--slice', 'heavy'], ['--slice', '../x.slice'], ['--grace', '0'], ['--grace', 'soon'],
                       ['--memory-max', '6 GB'], ['--cpu-weight', '0'], ['--swap-max', '1G']):

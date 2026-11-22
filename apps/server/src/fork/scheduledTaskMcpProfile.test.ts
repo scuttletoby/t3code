@@ -461,7 +461,7 @@ it.effect("a narrowed thread cannot change what a task bound to a wider thread r
               Effect.flip,
             );
             expect(messageOf(refused)).toContain(
-              `this task runs in thread ${WIDE}, whose MCP profile "all" keeps MCP servers or T3 tools "docs" does not`,
+              `this task runs in thread ${WIDE}, whose MCP profile "all" keeps MCP servers "docs" does not`,
             );
           }
           // Reading it, renaming it, pausing it or changing its schedule stays allowed.
@@ -1828,7 +1828,7 @@ it.effect(
                 const last = yield* scheduleTask({ scheduledTaskId: "task:bound-wide", ...change });
                 expect(last.isFailure).toBe(true);
                 expect(last.result.message).toContain(
-                  `this task runs in thread ${WIDE}, whose MCP profile "all" keeps MCP servers or T3 tools "docs" does not`,
+                  `this task runs in thread ${WIDE}, whose MCP profile "all" keeps MCP servers "docs" does not`,
                 );
               }
               expect(reached).toHaveLength(0);
