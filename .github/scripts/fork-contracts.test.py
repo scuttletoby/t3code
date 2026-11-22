@@ -1012,8 +1012,9 @@ SCAN_RUN_LINE = 'bash "${RUNNER_TEMP:?}/scan-from-default-branch.sh"'
 # one artifact of that name, never unpacks the archive (one plain file read in memory, every line
 # checked), and falls back to a first run on any doubt; it reads nothing while a tag is named like the
 # branch (#703); reset_record leaves an empty record instead (a reset run's re-run: its own newest
-# earlier attempt's record, else, or on any failed or doubtful read, the empty one, #791; GitHub has listed
-# no earlier attempt's record to a re-run so far, so a re-run reads as a new run does, #950). Its output `read` (found, none, reset, failed) tells the scan
+# earlier attempt's record, else, or on any failed or doubtful read, the empty one, #791; "Re-run failed
+# jobs" leaves that record in the run, "Re-run all jobs" deletes it, and such a re-run warns and reads as a
+# new run does, #950). Its output `read` (found, none, reset, failed) tells the scan
 # step whether a partial record may replace the last one (#703). Its behaviour: the reader e2e below.
 # The keep step uploads only on a branch, once the scan step has written the record whole (its output
 # `record`) or reset_record left the empty one, for 90 days (the repository's most). What the scan step
@@ -1043,8 +1044,8 @@ none() {
 [[ "$GITHUB_REF" == refs/heads/* ]] || none failed "a run on a tag reads no record of the sweep"
 # A re-run (attempt 2 on) first looks for its own earlier attempt's record (#703), and only in a
 # run of the sweep's own workflow: in another workflow's run, any of its jobs could have kept an
-# artifact of that name. GitHub has listed none so far: once a re-run starts, the run lists no
-# earlier attempt's artifact (#950), so a re-run reads as a new run does. Both checks are logged.
+# artifact of that name. "Re-run failed jobs" leaves that record in the run; "Re-run all jobs"
+# deletes it (#950), and the re-run then warns and reads as a new run does. Both checks are logged.
 self=""
 if [[ "${GITHUB_RUN_ATTEMPT:-1}" != 1 \
     && "${GITHUB_WORKFLOW_REF:-}" == "$GITHUB_REPOSITORY/.github/workflows/fork-secret-sweep.yml@"* ]]; then
@@ -1054,8 +1055,8 @@ fi
 # reset_record: an empty record (the header only), which the last step keeps even when this
 # run fails before the scan step writes its own, so no later sweep reads the older one (#703).
 # A re-run of a reset run (it keeps the input) first looks for its own earlier attempt's record,
-# which was written after the reset, and no older run's; without one (so far always, #950), or
-# when it cannot be read, the empty record.
+# which was written after the reset, and no older run's; without one (none kept, or deleted by
+# "Re-run all jobs", #950), or when it cannot be read, the empty record.
 empty_record() {
   echo "fork secret sweep record 2" > "$dir/deleted-tips"
   echo "read=reset" >> "${GITHUB_OUTPUT:?}"
@@ -1083,14 +1084,22 @@ from=""
 while read -r id sha; do
   [[ "$id" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
   [[ "$id" != "$GITHUB_RUN_ID" || "$id $sha" == "$self" ]] || continue
+  # "LISTED KEPT [ID SIZE]": how many artifacts the API listed for the name, and how many of
+  # them are this run's unexpired record (at most one, else no record is trusted).
   if ! found="$(RUN="$id" gh api -X GET "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" -f name=fork-secret-sweep-record \
-      --jq '[.artifacts[] | select(.name == "fork-secret-sweep-record" and .expired == false and (.workflow_run.id | tostring) == env.RUN)] |
-        if length == 0 then empty elif length == 1 then "\(.[0].id) \(.[0].size_in_bytes)" else error("more than one") end')"; then
+      --jq '"\(.artifacts | length) " +
+        ([.artifacts[] | select(.name == "fork-secret-sweep-record" and .expired == false and (.workflow_run.id | tostring) == env.RUN)] |
+        if length > 1 then error("more than one") else "\(length) \(.[0].id // "") \(.[0].size_in_bytes // "")" end)')"; then
     none failed "the record of sweep run $id cannot be listed"
   fi
-  [[ "$id" != "$GITHUB_RUN_ID" ]] || echo "::notice title=Secret scan::this run's own records listed: $([[ -n "$found" ]] && echo 1 || echo 0)"
-  [[ -n "$found" ]] || continue
-  read -r artifact size <<< "$found"
+  listed="" kept="" artifact="" size=""
+  read -r listed kept artifact size <<< "$found"
+  [[ "$listed" =~ ^[0-9]+$ && "$kept" =~ ^[01]$ ]] || none failed "the record of sweep run $id cannot be listed"
+  if [[ "$id" == "$GITHUB_RUN_ID" ]]; then
+    echo "::notice title=Secret scan::this run's own records: the API listed $listed artifact(s) of that name, $kept of them this run's unexpired record"
+    [[ "$kept" == 1 ]] || echo "::warning title=Secret scan::this re-run finds no record of its earlier attempt: that attempt kept none, or this is a \"Re-run all jobs\", which deletes an earlier attempt's artifacts (#950; \"Re-run failed jobs\" keeps them), so it reads as a new run does" >&2
+  fi
+  [[ "$kept" == 1 ]] || continue
   [[ "$artifact" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && "$size" -le 4000000 ]] || none failed "the record of sweep run $id is not the sweep's own"
   if ! has="$(gh api -X GET "repos/$GITHUB_REPOSITORY/compare/$sha...$GITHUB_SHA" -f per_page=1 --jq .status)"; then
     none failed "whether this branch has the commit of sweep run $id cannot be checked"
@@ -1390,8 +1399,8 @@ fi
 # shows again, or the activity record no longer lists, is dropped). Written whole, then renamed, and only
 # then marked written: a run stopped before that keeps nothing. Also when a lookup fails
 # half-way, or the time limit is reached, before the job fails, if `partial` allows it:
-# the next sweep run goes on from there (#701, #703); a re-run of this one does not, since it
-# no longer sees this attempt's record (#950).
+# the next sweep run, or a "Re-run failed jobs" of this one, goes on from there (#701, #703,
+# #950); "Re-run all jobs" deletes this attempt's record, so that re-run does not.
 declare -A read_by_scan=()
 keep() {
 local tip
@@ -1421,9 +1430,10 @@ for tip in "${deleted[@]}"; do
 [[ -z "${read_by_scan[$tip]:-}" && -z "${reviewed[$tip]:-}" ]] || continue
 # A time limit well inside the job's 30 minutes (#703): 20 minutes of this step (the
 # steps before it take a few). Past it, the lookups stop as when one fails, and the
-# record keeps what they proved, so the next sweep run goes on from there (not a re-run, #950).
+# record keeps what they proved, so the next sweep run, or a "Re-run failed jobs" of this
+# one, goes on from there (not "Re-run all jobs", which deletes it, #950).
 if ((SECONDS > 1200)); then
-echo "::error::Secret scan: this step passed 20 minutes before the lookups of deleted tips ended, so they stop here, before the job's time limit. Start a new run of the sweep (or wait for the next daily one), not a re-run: a new run goes on from the tips this one proved, a re-run cannot see them." >&2
+echo "::error::Secret scan: this step passed 20 minutes before the lookups of deleted tips ended, so they stop here, before the job's time limit. Start a new run of the sweep (or wait for the next daily one), or use \"Re-run failed jobs\": both go on from what this one kept. Not \"Re-run all jobs\": it deletes this attempt's record (#950)." >&2
 [[ -z "$partial" ]] || keep
 exit 2
 fi
@@ -1431,7 +1441,7 @@ if ! runs="$(GH_TOKEN="$LOOKUP_TOKEN" TIP="$tip" gh api --paginate -X GET "repos
 -f head_sha="$tip" -f per_page=100 --jq '.workflow_runs[] |
 if .head_sha != env.TIP then error("not the asked commit") else . end |
 select(.path == ".github/workflows/fork-secret-scan.yml" or .path == ".github/workflows/fork-tests.yml") | .id')"; then
-echo "::error::Secret scan: cannot list the runs of deleted tip $tip, so whether a scan read it is unknown. Re-run the job." >&2
+echo "::error::Secret scan: cannot list the runs of deleted tip $tip, so whether a scan read it is unknown. Use \"Re-run failed jobs\" or start a new run of the sweep: both go on from what this one kept (\"Re-run all jobs\" deletes it, #950)." >&2
 [[ -z "$partial" ]] || keep
 exit 2
 fi
@@ -1441,7 +1451,7 @@ for id in "${ids[@]}"; do
 if ! scanned="$(GH_TOKEN="$LOOKUP_TOKEN" TIP="$tip" gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
 -f filter=all -f per_page=100 --jq '.jobs[] | select(.head_sha == env.TIP and .conclusion == "success" and
 (.name == "Secret scan" or .name == "Secret scan / Secret scan")) | .id')"; then
-echo "::error::Secret scan: cannot list the jobs of run $id of deleted tip $tip, so whether a scan read it is unknown. Re-run the job." >&2
+echo "::error::Secret scan: cannot list the jobs of run $id of deleted tip $tip, so whether a scan read it is unknown. Use \"Re-run failed jobs\" or start a new run of the sweep: both go on from what this one kept (\"Re-run all jobs\" deletes it, #950)." >&2
 [[ -z "$partial" ]] || keep
 exit 2
 fi
@@ -2418,7 +2428,7 @@ def time_limit_case(code):
     s = sweep_lookup(sweep_clone(f"late{n}"), budget_heads, f"late{n}", "SECONDS=100000\n" + code,
                      sweep_temp(f"late{n}", RECORD_HEAD + f"{budget_tips[2]} scanned\n"), **budget_env)
     return (s.r.returncode == 2 and "passed 20 minutes" in s.r.stderr and "actions/runs" not in s.calls
-            and "Start a new run of the sweep (or wait for the next daily one), not a re-run" in s.r.stderr
+            and 'Start a new run of the sweep (or wait for the next daily one), or use "Re-run failed jobs": both go on from what this one kept' in s.r.stderr
             and s.record == RECORD_HEAD + f"{budget_tips[2]} scanned\n" and s.output == "record=written\n"), [s]
 
 
@@ -2466,21 +2476,27 @@ for name, (what, case) in E2E_CASES.items():
 # Each guard of the record's write and read, removed: the case about it goes red.
 for what, old, new, cases in (
     ("the record's partial write before a failed runs lookup",
-     'whether a scan read it is unknown. Re-run the job." >&2\n[[ -z "$partial" ]] || keep\nexit 2\n',
-     'whether a scan read it is unknown. Re-run the job." >&2\nexit 2\n', ("budget", "unreached")),
+     'whether a scan read it is unknown. Use \\"Re-run failed jobs\\" or start a new run of the sweep: '
+     'both go on from what this one kept (\\"Re-run all jobs\\" deletes it, #950)." >&2\n[[ -z "$partial" ]] || keep\nexit 2\n',
+     'whether a scan read it is unknown. Use \\"Re-run failed jobs\\" or start a new run of the sweep: '
+     'both go on from what this one kept (\\"Re-run all jobs\\" deletes it, #950)." >&2\nexit 2\n', ("budget", "unreached")),
     ("the partial record's gate (#703)", '[[ -z "$partial" ]] || keep\nexit 2\n', "keep\nexit 2\n",
      ("failedread", "rejected")),
     ("the partial record's gate at the jobs lookup alone (#703)",
-     'whether a scan read it is unknown. Re-run the job." >&2\n[[ -z "$partial" ]] || keep\nexit 2\nfi\nif [[ -n "$scanned" ]]',
-     'whether a scan read it is unknown. Re-run the job." >&2\nkeep\nexit 2\nfi\nif [[ -n "$scanned" ]]', ("failedread",)),
+     'whether a scan read it is unknown. Use \\"Re-run failed jobs\\" or start a new run of the sweep: '
+     'both go on from what this one kept (\\"Re-run all jobs\\" deletes it, #950)." >&2\n[[ -z "$partial" ]] || keep\nexit 2\nfi\nif [[ -n "$scanned" ]]',
+     'whether a scan read it is unknown. Use \\"Re-run failed jobs\\" or start a new run of the sweep: '
+     'both go on from what this one kept (\\"Re-run all jobs\\" deletes it, #950)." >&2\nkeep\nexit 2\nfi\nif [[ -n "$scanned" ]]', ("failedread",)),
     ("the partial record's gate at the runs lookup alone (#703)",
-     'cannot list the runs of deleted tip $tip, so whether a scan read it is unknown. Re-run the job." >&2\n'
+     'cannot list the runs of deleted tip $tip, so whether a scan read it is unknown. Use \\"Re-run failed jobs\\" or start a new run of the sweep: '
+     'both go on from what this one kept (\\"Re-run all jobs\\" deletes it, #950)." >&2\n'
      '[[ -z "$partial" ]] || keep\n',
-     'cannot list the runs of deleted tip $tip, so whether a scan read it is unknown. Re-run the job." >&2\nkeep\n',
+     'cannot list the runs of deleted tip $tip, so whether a scan read it is unknown. Use \\"Re-run failed jobs\\" or start a new run of the sweep: '
+     'both go on from what this one kept (\\"Re-run all jobs\\" deletes it, #950)." >&2\nkeep\n',
      ("failedruns",)),
     ("the partial record's gate at the time limit alone (#703)",
-     'a new run goes on from the tips this one proved, a re-run cannot see them." >&2\n[[ -z "$partial" ]] || keep\n',
-     'a new run goes on from the tips this one proved, a re-run cannot see them." >&2\nkeep\n', ("failedtime",)),
+     'Not \\"Re-run all jobs\\": it deletes this attempt\'s record (#950)." >&2\n[[ -z "$partial" ]] || keep\n',
+     'Not \\"Re-run all jobs\\": it deletes this attempt\'s record (#950)." >&2\nkeep\n', ("failedtime",)),
     ("a partial record when no earlier sweep kept one (#703)", "none) partial=1 ;;", "none) ;;", ("budget",)),
     ("a partial record after a read or reset record (#703)", 'found | reset) [[ ! -f "$record" ]] || partial=1 ;;',
      "found | reset) ;;", ("reset", "unreached", "timelimit")),
@@ -2490,8 +2506,8 @@ for what, old, new, cases in (
      'SCANNED_GONE+="$tip "\ncontinue\nfi\n[[ -z "${reviewed[$tip]:-}" ]] || continue\n', ("unserved",)),
     ("the time limit (#703)", "if ((SECONDS > 1200)); then", "if false; then", ("timelimit", "midway")),
     ("the partial record at the time limit (#703)",
-     'a new run goes on from the tips this one proved, a re-run cannot see them." >&2\n[[ -z "$partial" ]] || keep\n',
-     'a new run goes on from the tips this one proved, a re-run cannot see them." >&2\n', ("timelimit", "midway")),
+     'Not \\"Re-run all jobs\\": it deletes this attempt\'s record (#950)." >&2\n[[ -z "$partial" ]] || keep\n',
+     'Not \\"Re-run all jobs\\": it deletes this attempt\'s record (#950)." >&2\n', ("timelimit", "midway")),
     ("the removal of a left .new", 'rm -rf -- "$record.new"\n', "", ("link", "newdir")),
     ("write-then-rename (the record written in place)", '} > "$record.new"\nmv -f -- "$record.new" "$record"\n',
      '} > "$record"\n', ("kill",)),
@@ -2750,14 +2766,15 @@ def read_detail(s):
 def read_as(want, frm=801, state="failed"):
     """The case's check: the record from run frm (want: its text; output read=found), or none, a
     warning, and the output read=state ("failed": one may exist but cannot be read or trusted, so no
-    partial record may replace it; "none": no earlier sweep kept one, #703)."""
+    partial record may replace it; "none": no earlier sweep kept one, #703). A found read warns of nothing
+    but a re-run's missing own record (#950)."""
     def ok(s):
         if want is None:
             return (s.r.returncode == 0 and s.record is None and "::warning title=Secret scan::" in s.out
                     and "checked as on a first run" in s.out and "sweep-record.zip" not in s.left
                     and s.output == f"read={state}\n")
         return (s.r.returncode == 0 and s.record == want and f"the sweep's record from run {frm}:" in s.out
-                and "::warning" not in s.out and s.left == [] and s.output == "read=found\n")
+                and "::warning" not in s.out.replace(NO_OWN_RECORD, "") and s.left == [] and s.output == "read=found\n")
     return ok
 
 
@@ -2767,20 +2784,31 @@ def reset_empty(s):
             and "actions/workflows" not in s.calls and "an empty record is kept even if this run fails" in s.out)
 
 
-def rerun_log(matched=True, listed=None):
-    """A re-run's log (#950): whether its workflow ref was the sweep's, and how many of its own run's
-    records were listed (listed None: its own run never asked about). A first attempt logs neither."""
+# What a re-run whose own run keeps no record warns (#950): the cause ("Re-run all jobs" deletes an
+# earlier attempt's artifacts, seen live) and the re-run that keeps them.
+NO_OWN_RECORD = ("::warning title=Secret scan::this re-run finds no record of its earlier attempt: that attempt kept none, "
+                 "or this is a \"Re-run all jobs\", which deletes an earlier attempt's artifacts (#950; "
+                 "\"Re-run failed jobs\" keeps them), so it reads as a new run does")
+
+
+def rerun_log(matched=True, kept=None, listed=None):
+    """A re-run's log (#950): whether its workflow ref was the sweep's, and, of its own run, how many
+    artifacts of the record's name the API listed (listed; by default kept) and how many of them are
+    its unexpired record (kept; None: its own run never asked about). Kept 0 also warns why (#950).
+    A first attempt logs none of it."""
     def ok(s):
         ref = ("the sweep's, so its own earlier record is looked for first" if matched
                else "not the sweep's, so its own earlier record is not looked for")
+        own = (f"::notice title=Secret scan::this run's own records: the API listed {kept if listed is None else listed} "
+               f"artifact(s) of that name, {kept} of them this run's unexpired record\n")
         return (f"::notice title=Secret scan::attempt 2 of run 900, workflow ref " in s.out and ref in s.out
-                and (f"::notice title=Secret scan::this run's own records listed: {listed}\n" in s.out if listed is not None
-                     else "own records listed" not in s.out))
+                and (own in s.out if kept is not None else "this run's own records" not in s.out)
+                and ((NO_OWN_RECORD in s.out) == (kept == 0)))
     return ok
 
 
 def first_attempt_log(s):
-    return "workflow ref" not in s.out and "own records listed" not in s.out
+    return "workflow ref" not in s.out and "this run's own records" not in s.out and NO_OWN_RECORD not in s.out
 
 
 def two_runs(bad):
@@ -2837,23 +2865,28 @@ READ_CASES = {
          "zips": {903: a_zip([("deleted-tips", RECORD_HEAD + f"{sweep_gone2} scanned\n{sweep_gone} scanned\n")]),
                   902: other_zip, 901: good_zip}},
         lambda s: read_as(RECORD_HEAD + f"{sweep_gone2} scanned\n{sweep_gone} scanned\n", 900)(s)
-        and rerun_log(listed=1)(s)),
-    # #950: once a re-run starts, GitHub lists no earlier attempt's artifact of the run, so these cases
-    # (its own run lists none) are what a re-run meets live: it reads as a new run does, and says why.
+        and rerun_log(kept=1)(s)),
+    # #950: "Re-run all jobs" deletes an earlier attempt's artifacts, so these cases (its own run lists
+    # none) are what such a re-run meets live: it reads as a new run does, and warns why.
     "a re-run whose first attempt's record is not listed (#950): the newest earlier run's, logged": (
         {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802), a_run(801)]},
-        lambda s: read_as(good_record)(s) and "runs/900/artifacts" in s.calls and rerun_log(listed=0)(s)),
+        lambda s: read_as(good_record)(s) and "runs/900/artifacts" in s.calls and rerun_log(kept=0)(s)),
     "a re-run whose own record is not listed and whose newest earlier run kept an empty one (#950)": (
         {"GITHUB_RUN_ATTEMPT": "2", "zips": {901: a_zip([("deleted-tips", RECORD_HEAD)])}},
-        lambda s: read_as(RECORD_HEAD)(s) and rerun_log(listed=0)(s)),
+        lambda s: read_as(RECORD_HEAD)(s) and rerun_log(kept=0)(s)),
     "a re-run whose own record is not listed and whose newest earlier run's expired: the one before (#950)": (
         {**two_runs({}), "GITHUB_RUN_ATTEMPT": "2",
          "artifacts": {802: [an_artifact(902, 802, expired=True)], 801: [an_artifact(901, 801)]}},
-        lambda s: read_as(good_record)(s) and rerun_log(listed=0)(s)),
+        lambda s: read_as(good_record)(s) and rerun_log(kept=0)(s)),
+    "a re-run whose own run lists an artifact of that name that is not its unexpired record: both counts "
+    "logged (listed 1, kept 0), and the newest earlier run's read (#967)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "artifacts": {900: [an_artifact(903, 900, expired=True)], 801: [an_artifact(901, 801)]},
+         "zips": {903: other_zip, 901: good_zip}},
+        lambda s: read_as(good_record)(s) and "artifacts/903/zip" not in s.calls and rerun_log(kept=0, listed=1)(s)),
     "a re-run whose own record is not listed and no earlier sweep kept one (or it expired): a first run "
     "(#950)": (
         {"GITHUB_RUN_ATTEMPT": "2", "runs": []},
-        lambda s: read_as(None, state="none")(s) and rerun_log(listed=0)(s)),
+        lambda s: read_as(None, state="none")(s) and rerun_log(kept=0)(s)),
     "a re-run of another workflow's run (fork-tests.yml, which may also call the scan): its own run never "
     "asked about, though it has an artifact of that name (#703)": (
         {"GITHUB_RUN_ATTEMPT": "2", "GITHUB_WORKFLOW_REF": "me/t3code/.github/workflows/fork-tests.yml@refs/heads/main",
@@ -2864,13 +2897,13 @@ READ_CASES = {
     "listed (#703)": (
         {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "artifacts": {900: [an_artifact(903, 900)], 801: [an_artifact(901, 801)]},
          "zips": {903: a_zip([("deleted-tips", other_record)]), 901: good_zip}},
-        lambda s: read_as(other_record, 900)(s) and "actions/workflows" not in s.calls and rerun_log(listed=1)(s)),
+        lambda s: read_as(other_record, 900)(s) and "actions/workflows" not in s.calls and rerun_log(kept=1)(s)),
     "a re-run of a reset_record run whose first attempt's record is not listed (#950): the empty record, no "
     "older run listed (#703)": (
         {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2"},
         lambda s: s.r.returncode == 0 and s.record == RECORD_HEAD and s.output == "read=reset\n"
         and "runs/900/artifacts" in s.calls and "actions/workflows" not in s.calls and s.left == []
-        and rerun_log(listed=0)(s)),
+        and rerun_log(kept=0)(s)),
     # #791: any failed or doubtful read in a reset run's re-run gives the empty record, never read=failed:
     # if its first attempt kept nothing, read=failed would leave the record from before the reset in use.
     "a re-run of a reset_record run whose own record cannot be listed: the empty record, no older run "
@@ -3027,7 +3060,7 @@ for n, attempt in enumerate(("1", "2")):
 check("secret-scan e2e (#950): a re-run whose own record is not listed, then the scan's lookups fail half-way: "
       "the newest earlier sweep's record read, and the same proven tips kept as a first attempt keeps",
       read1 is not None and read2 is not None and read2.group(1) == read1.group(1) == "found"
-      and "own records listed: 0" in r2.out and s2.r.returncode == 2 and s2.output == "record=written\n"
+      and "this run's own records: the API listed 0 artifact(s) of that name, 0 of them" in r2.out and s2.r.returncode == 2 and s2.output == "record=written\n"
       and s2.record is not None and s2.record == s1.record,
       f"first: {read_detail(r1)} | {sweep_detail(s1)} || re-run: {read_detail(r2)} | {sweep_detail(s2)}")
 # Each of the read step's guards, removed: a case above goes red. (Two are only belts and braces, so no
@@ -3058,7 +3091,8 @@ for what, old, new in (
     ("the artifact's name check", 'select(.name == "fork-secret-sweep-record" and ', "select("),
     ("the expired check", ".expired == false and ", ""),
     ("the artifact's run check", " and (.workflow_run.id | tostring) == env.RUN", ""),
-    ("the one-artifact check", 'else error("more than one") end', 'else "\\(.[0].id) \\(.[0].size_in_bytes)" end'),
+    ("the one-artifact check", 'if length > 1 then error("more than one") else "\\(length)',
+     'if false then empty else "\\([length, 1] | min)'),
     ("the ancestor check", '[[ "$has" == ahead || "$has" == identical ]] || continue', ":"),
     ("the listed size check", ' && "$size" -le 4000000', ""),
     ("the archive's size check", '[[ "$(stat -c %s -- "$zip")" -le 4000000 ]] ||', ": ||"),
