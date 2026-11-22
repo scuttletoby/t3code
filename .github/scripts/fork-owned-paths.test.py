@@ -135,6 +135,9 @@ for label, change, base in [
     ("a file an app job reads (fork-test-shards.cjs)", {".github/scripts/fork-test-shards.cjs": "x\n"}, None),
     ("the runner routing (fork-fleet.py)", {".github/scripts/fork-fleet.py": "x\n"}, None),
     ("the fleet facts (fork-fleet.json)", {".github/fork-fleet.json": "{}\n"}, None),
+    ("a gate change with the review vectors the server test reads",
+     {"fork-ci/actions/pr-queue/review_judge.py": "x\n", "fork-ci/actions/pr-queue/review.vectors.json": "{}\n"}, None),
+    ("a change to the gate's lens corpus", {"fork-ci/actions/pr-queue/testdata/lens-corpus.jsonl": "{}\n"}, None),
     ("a package.json inside fork-kit", {"fork-kit/x/package.json": "{}\n"}, None),
     ("a lock file", {"pnpm-lock.yaml": "x\n"}, None),
     ("a file moved out of fork-ci/", {"fork-ci/a.ts": None, "packages/shared/src/a.ts": "a\n"}, {"fork-ci/a.ts": "a\n"}),
@@ -170,8 +173,10 @@ REAL = owned([
     ".github/scripts/fork-fleet.py", ".github/scripts/fork-test-shards.cjs", ".github/scripts/fork-vitest-gc-check.cjs",
     ".github/fork-fleet.json", "fork-ci/package.json", "fork-kit/x/tsconfig.json", "package.json", "apps/web/src/a.ts",
     "docs/fork/README.md", "scripts/release-smoke.ts", "fork-ci", "fork-cix/a",
+    "fork-ci/actions/pr-queue/review.vectors.json", "fork-ci/actions/pr-queue/testdata/lens-corpus.jsonl",
 ])
-want_owned = {p for p in REAL if p.startswith(("fork-ci/actions", "fork-kit/heavy")) or p in {
+want_owned = {p for p in REAL if p.startswith(("fork-ci/actions", "fork-kit/heavy")) and "/review.vectors" not in p
+              and "/testdata/lens-corpus" not in p or p in {
     ".github/scripts/fork-fleet-walls.py", ".github/scripts/fork-fleet-walls/linux", ".github/scripts/fork_workflow_expr.py",
     ".github/fork-ci-tests.txt", ".gitleaks.toml", "FORK_CHANGES.md"}}
 check("list: the fork's own folders and scripts are fork-owned; the rest, and every NEVER path, are not",

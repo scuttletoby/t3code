@@ -80,6 +80,7 @@ fork-ci/actions/gradle-cache/gradle_cache.test.py
 fork-ci/actions/handoff-put/handoff.test.py ~16s
 fork-ci/actions/head-check/head_check.test.py ~69s
 fork-ci/actions/head-check/head_gate.test.py
+fork-ci/actions/head-check/review_guide.test.py
 fork-ci/actions/job-changed/job-changed.test.py ~21s
 fork-ci/actions/pinned/pinned.test.py
 fork-ci/actions/pr-queue/lens.test.py
@@ -123,6 +124,8 @@ fork-kit/gh-apps/tests/run.test.py
 fork-kit/gh-apps/tests/wrapper.test.py
 # Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
+fork-kit/heavy/tests/capacity_rule.test.py ~5s
+fork-kit/heavy/tests/facts.test.py ~30s
 fork-kit/heavy/tests/install.test.py ~8s
 fork-kit/heavy/tests/measure.test.py ~10s
 fork-kit/heavy/tests/queue.test.py ~18s
@@ -134,6 +137,9 @@ fork-kit/model-guard/tests/install.test.py ~21s
 fork-kit/pc-agents/tests/check.test.py ~32s
 fork-kit/pc-agents/tests/setup.test.py ~153s
 fork-kit/pc-agents/tests/update.test.py ~66s
+fork-kit/review/tests/comments.test.py
+fork-kit/review/tests/eval.test.py
+fork-kit/review/tests/plan.test.py
 fork-kit/schedule-kick/tests/cron.test.py
 fork-kit/schedule-kick/tests/install.test.py
 fork-kit/schedule-kick/tests/kick.test.py

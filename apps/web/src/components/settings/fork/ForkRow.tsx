@@ -16,17 +16,35 @@ import { SettingResetButton, SettingsRow } from "../settingsLayout";
 import { useScopedSettingsWriteAllowed } from "../useScopedSettings";
 import { subRowResetValue } from "./forkRowReset.logic";
 
-/** Every selected environment's accounts, the primary's first, as the agent slots rows list them. */
-export function useSelectedProviders() {
+/** The selected environments, the primary's first. */
+function useSelectedEnvironments() {
   const { environment, connectedEnvironments } = useSettingsScope();
-  const providersByEnvironment = useEnvironmentProviders();
   return [
     ...(environment ? [environment] : []),
     ...connectedEnvironments.filter(
       (candidate) => candidate.environmentId !== environment?.environmentId,
     ),
-  ].flatMap(
+  ];
+}
+
+/** Every selected environment's accounts, the primary's first, as the agent slots rows list them. */
+export function useSelectedProviders() {
+  const providersByEnvironment = useEnvironmentProviders();
+  return useSelectedEnvironments().flatMap(
     (candidate) => providersByEnvironment.get(candidate.environmentId) ?? EMPTY_SERVER_PROVIDERS,
+  );
+}
+
+/**
+ * {@link useSelectedProviders}, each with the environment it is on: a check that a machine's server
+ * makes on its own catalog alone (the model policy's alias flag) reads each machine apart.
+ */
+export function useSelectedProvidersByEnvironment() {
+  const providersByEnvironment = useEnvironmentProviders();
+  return useSelectedEnvironments().flatMap((candidate) =>
+    (providersByEnvironment.get(candidate.environmentId) ?? EMPTY_SERVER_PROVIDERS).map(
+      (provider) => ({ ...provider, environmentId: candidate.environmentId }),
+    ),
   );
 }
 

@@ -17,8 +17,10 @@ import {
   type ServerSettingsPatch,
   isBuiltInMcpProfileName,
   isDefinableMcpProfileName,
+  isKeptPlacementNeedsUnchanged,
   isKeptReviewRulesUnchanged,
   isPlaytestProgramFullyQualified,
+  placementFactsCommandProblem,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -77,10 +79,26 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** A merge-fields value's problem after a save that named only some fields over kept text. */
+const PARTIAL_SAVE_OVER_UNREADABLE = "a save named only some of its fields";
+
 function applyRule(rule: ForkPatchRule, stored: unknown, patch: unknown): unknown {
   if (rule === "replace") return patch;
   if (rule === "merge-fields") {
     const next: Record<string, unknown> = isRecord(stored) ? { ...stored } : {};
+    // A value the file holds unreadable (kept as written, read as its fail-closed fields): only a
+    // save that names every field replaces the kept text. A partial one is not merged (it would go
+    // over the fail-closed fields and drop the person's others, a `never` group say); the kept text
+    // stays what is written, and the save check refuses it by this problem.
+    if (Object.hasOwn(next, "unreadable")) {
+      const named = isRecord(patch) ? patch : {};
+      const whole = Object.keys(next).every(
+        (field) => field === "unreadable" || field === "problem" || named[field] !== undefined,
+      );
+      if (!whole) return { ...next, problem: PARTIAL_SAVE_OVER_UNREADABLE };
+      delete next.unreadable;
+      delete next.problem;
+    }
     for (const [field, value] of Object.entries(patch as Record<string, unknown>)) {
       if (value !== undefined) next[field] = value;
     }
@@ -242,6 +260,24 @@ export function playtestProgramProblem(
 }
 
 /**
+ * A `placement.factsCommand` a save sets that is not a full path on the server's OS (`platform`).
+ * One already stored is never refused, so a hand edit blocks no other save (placing work reads it
+ * as off, through contracts' `placementOnPlatform`).
+ */
+export function placementFactsCommandSaveProblem(
+  current: ServerSettings,
+  next: ServerSettings,
+  platform: string,
+): string | undefined {
+  const command = next.placement.factsCommand;
+  if (Object.hasOwn(next.placement, "unreadable") || command === current.placement.factsCommand) {
+    return undefined;
+  }
+  const problem = placementFactsCommandProblem(command, platform);
+  return problem === undefined ? undefined : `placement: ${problem}.`;
+}
+
+/**
  * Fork: why the server refused a save of fork settings, with the fix. The server fails the save
  * with upstream's `ServerSettingsError` (operation `normalize`, as for a patch that does not decode)
  * and this as its `cause`, so upstream's error type stays as it is; the cause's name
@@ -388,6 +424,15 @@ export function forkSettingsWriteProblem(
   next: ServerSettings,
 ): string | undefined {
   const problems: Array<string | undefined> = [
+    ...FORK_PATCH_KEYS.map((key) => {
+      const value: unknown = next[key];
+      return FORK_PATCH_RULES[key] === "merge-fields" &&
+        isRecord(value) &&
+        Object.hasOwn(value, "unreadable") &&
+        value.problem === PARTIAL_SAVE_OVER_UNREADABLE
+        ? `${key} is not valid; save the whole setting (every field), or fix it in the settings file.`
+        : undefined;
+    }),
     settingsIntervalProblem(current, next),
     maxEntriesProblem(current, next),
     mcpProfileInUseProblem(current, next),
@@ -418,6 +463,9 @@ export function forkSettingsWriteProblem(
       isKeptReviewRulesUnchanged(stored?.reviewRules, overrides.reviewRules)
         ? undefined
         : `Project ${projectId}'s reviewRules sends back unreadable text that is not the one stored for it (it was changed elsewhere): reload the settings and save again, or set the project's review rules anew.`,
+      isKeptPlacementNeedsUnchanged(stored?.placementNeeds, overrides.placementNeeds)
+        ? undefined
+        : `Project ${projectId}'s placementNeeds sends back unreadable text that is not the one stored for it (it was changed elsewhere): reload the settings and save again, or set the project's needs anew.`,
       mcpProfileRefProblem(
         next,
         `Project ${projectId}'s mcpProfile`,

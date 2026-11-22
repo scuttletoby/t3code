@@ -28,6 +28,13 @@ import {
   McpThreadProfilesPatch,
 } from "./mcpProfile.ts";
 import { ModelPolicyFromSettingsFile, ModelPolicyPatch } from "./modelPolicy.ts";
+import {
+  PlacementNeedsFromSettingsFile,
+  PlacementNeedsPatch,
+  PlacementNeedsProjectPatch,
+  PlacementSettingsFromSettingsFile,
+  PlacementSettingsPatch,
+} from "./placement.ts";
 import { PlaytestSettings, PlaytestSettingsFromSettingsFile } from "./playtest.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
@@ -56,6 +63,7 @@ export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
 export * from "./mcpProfileResolve.ts";
 export * from "./modelPolicy.ts";
+export * from "./placement.ts";
 export * from "./playtest.ts";
 export * from "./reviewRules.ts";
 export * from "./usagePacing.ts";
@@ -117,6 +125,15 @@ export const ForkServerSettingsFields = {
   reviewRules: ReviewRulesFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   /** Which models agents may pick; off by default. A bad value reads as enforce, nothing allowed. */
   modelPolicy: ModelPolicyFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  /** What this machine has and how it places work on linked machines; off. A bad value reads as off, kept as written. */
+  placement: PlacementSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  /**
+   * Labels a machine must have to take a project's work, for projects without their own; none. A bad
+   * value fits no machine, kept as written.
+   */
+  placementNeeds: PlacementNeedsFromSettingsFile.pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -156,6 +173,10 @@ export const ForkServerSettingsPatchFields = {
    * or a value without both `mode` and `allow` (it replaces the stored value whole).
    */
   modelPolicy: Schema.optionalKey(ModelPolicyPatch),
+  /** Strict: a save refuses a bad field or an unknown key; a field left out keeps its value. */
+  placement: Schema.optionalKey(PlacementSettingsPatch),
+  /** Strict: a save refuses a bad label; it replaces a kept bad value. */
+  placementNeeds: Schema.optionalKey(PlacementNeedsPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -200,6 +221,10 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   // Whole, as playtest, so the strict check sees the value that is saved; two saves at once, the last
   // one wins. The patch has no defaults, so a save that leaves out `mode` or `allow` is refused.
   modelPolicy: "replace",
+  // A field left out keeps its value. Over a kept unreadable value only a save of every field is
+  // taken (it replaces the text); the save check refuses a partial one (forkSettingsPatch.ts).
+  placement: "merge-fields",
+  placementNeeds: "replace",
 };
 
 /** The client settings' fork fields (stored in the browser); none yet. */
@@ -217,6 +242,8 @@ export const FORK_PROJECT_SCOPED_KEYS = [
   "handoff",
   // A project's value replaces the server's whole, `preset` included.
   "reviewRules",
+  // A project's needs replace the server's whole.
+  "placementNeeds",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;
 
 /** Drops a `null`: it is a save's "clear", never a project's own value. */
@@ -254,6 +281,11 @@ export const ForkProjectOverrideFields = {
   handoff: nullReadsAsUnset(HandoffSettingsFromSettingsFile),
   /** As `playtest`; a bad value is also kept as written (reviewRules.ts). */
   reviewRules: nullReadsAsUnset(ReviewRulesFromSettingsFile),
+  /**
+   * As `playtest`, but a bad value fits no machine for that project (never no needs, never the
+   * server's), kept as written.
+   */
+  placementNeeds: nullReadsAsUnset(PlacementNeedsFromSettingsFile),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
 /**
@@ -268,6 +300,7 @@ export const FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT = {
   playtest: null,
   handoff: null,
   reviewRules: null,
+  placementNeeds: null,
 } as const satisfies Partial<Record<keyof typeof ForkProjectOverrideFields, "" | null>>;
 
 /** A project's overrides of fork settings in a patch (each project's set is replaced whole). */
@@ -292,6 +325,11 @@ export const ForkProjectOverridePatchFields = {
    * value; `null` clears it (the project then uses the server's).
    */
   reviewRules: Schema.optionalKey(Schema.NullOr(ReviewRulesProjectPatch)),
+  /**
+   * A save refuses a bad label, but takes the kept bad value back unchanged (the server checks it is
+   * the stored one). Left out keeps the stored value; `null` clears it.
+   */
+  placementNeeds: Schema.optionalKey(Schema.NullOr(PlacementNeedsProjectPatch)),
 } satisfies Record<keyof typeof ForkProjectOverrideFields, unknown>;
 
 /**

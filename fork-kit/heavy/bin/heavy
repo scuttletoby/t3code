@@ -23,6 +23,8 @@
   heavy capacity --kinds FILE --show [--json] [<kind>...]
                                   each kind's amount and how it was found
   heavy queue [--json]            what the memory queue runs and holds, and the figures behind it
+  heavy facts [--kind K] [--mb N] may one more piece of work start? The capacity rule's answer as a free/v1
+                                  object with per-kind "fits" (lib/heavy_facts.py; exit 0 free, 75 busy)
   heavy waits [--days N] [--json] minutes waited for memory per day
   heavy -- <command> [args...]    run a command named like one of the words above
 
@@ -1184,6 +1186,14 @@ def main(argv):
                 'docker-label': mod.label_main}[argv[0]](argv[1:])
     if argv[:1] in (['queue'], ['waits']):
         return queue_verb(argv[0], argv[1:])
+    if argv[:1] == ['facts']:
+        try:
+            hf = kit_module('heavy_facts')
+            cfg = load_config()
+            return hf.facts_main(argv[1:], cfg['slice'], queue_root(), queue_module())
+        except (Refused, OSError, ImportError, SyntaxError, ValueError) as e:
+            say(f'facts: {e}')
+            return 1
     if argv[:1] == ['capacity']:
         try:
             hm = measure_module()
