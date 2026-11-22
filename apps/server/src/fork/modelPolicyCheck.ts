@@ -8,6 +8,7 @@ import {
   checkModelPolicyPick,
   type ModelPolicy,
   modelPolicyAliasTargets,
+  type ModelPolicyFix,
   modelPolicyCatalogEffortIds,
   type ModelPolicyPick,
   modelPolicyPickEfforts,
@@ -33,7 +34,9 @@ export type PolicyRoute =
   | "delegate_task"
   | "create_threads"
   | "t3_thread_launch"
-  | "t3_thread_configure";
+  | "t3_thread_configure"
+  /** Claude's own Agent tool (claudeAgentModelPolicy.ts). */
+  | "Agent";
 
 /** Where the call names its model, for the refusal's hint. */
 const FIELDS: Record<PolicyRoute, string> = {
@@ -41,6 +44,8 @@ const FIELDS: Record<PolicyRoute, string> = {
   create_threads: "target.model, with one of its efforts in target.options",
   t3_thread_launch: "modelSelection.model, with one of its efforts in modelSelection.options",
   t3_thread_configure: "modelSelection.model, with one of its efforts in modelSelection.options",
+  Agent:
+    "the Agent call's model (an alias such as opus names the model this machine's Claude model list maps it to), with one of its efforts in effort",
 };
 
 /** Where the call names its model alone, and its options. */
@@ -49,19 +54,18 @@ const MODEL_FIELD: Record<PolicyRoute, string> = {
   create_threads: "target.model",
   t3_thread_launch: "modelSelection.model",
   t3_thread_configure: "modelSelection.model",
+  Agent: "model",
 };
 const OPTIONS_FIELD: Record<PolicyRoute, string> = {
   delegate_task: "target.options",
   create_threads: "target.options",
   t3_thread_launch: "modelSelection.options",
   t3_thread_configure: "modelSelection.options",
+  Agent: "the call",
 };
 
 /** What the agent does to fix a refused pick, per the verdict's `fix`. */
-const fixText = (
-  fix: "option" | "model-option" | "effort-id" | undefined,
-  route: PolicyRoute,
-): string => {
+const fixText = (fix: ModelPolicyFix | undefined, route: PolicyRoute): string => {
   switch (fix) {
     case "model-option":
       return `Pick the model in the model field (${MODEL_FIELD[route]}) and leave the model option out of ${OPTIONS_FIELD[route]}: this option is not allowed while the model policy is on.`;
@@ -69,6 +73,10 @@ const fixText = (
       return `Leave that option out of ${OPTIONS_FIELD[route]}: this option is not allowed while the model policy is on. Pick the model in ${MODEL_FIELD[route]} and its effort under the id its driver reads.`;
     case "effort-id":
       return "Start that agent on this machine once so its model list shows the effort control, or pick a model whose driver has a fixed effort id.";
+    case "agent-option":
+      return `Leave that option out of ${OPTIONS_FIELD[route]}: an option that picks an agent or a mode is not allowed while the model policy is on. Pick the model in ${MODEL_FIELD[route]} and its effort under the id its driver reads.`;
+    case "ultracode":
+      return `Name the option ultracode in ${OPTIONS_FIELD[route]}: { "id": "ultracode", "value": false } runs the effort named, true runs ultracode (when its row allows it).`;
     case undefined:
       return `Name one of these models in ${FIELDS[route]}.`;
   }
@@ -280,6 +288,8 @@ const pickOfRemote = (
     // What any list here describes for the model: the driver there is not known.
     describedOptionIds: describedIds(lists, listed),
     ...(ultracodeByDefault(lists, listed, options) ? { ultracodeMaybeDefault: true } : {}),
+    // The machine there reads its own list for the ultracode default: a Claude row reads both ways.
+    ultracodeDefaultUnknown: true,
     ...(aliasOf === undefined ? {} : { aliasOf }),
   };
 };

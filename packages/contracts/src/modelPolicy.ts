@@ -170,6 +170,18 @@ const MODEL_POLICY_DRIVER_EFFORT_IDS: Readonly<Record<string, string>> = {
 const MODEL_POLICY_OPENCODE_NO_VARIANT = "t3:default";
 /** The ultracode option, and the effort name the policy gives it: it runs at xhigh in ultracode. */
 const MODEL_POLICY_ULTRACODE = "ultracode";
+/** The only driver with the ultracode option (the Claude driver reads the catalog's default for it). */
+const MODEL_POLICY_ULTRACODE_DRIVER = "claudeAgent";
+/**
+ * Options that pick an agent or a mode (own prompt, tools, settings, maybe model): refused while a
+ * policy is on, even when described. The model guard's `DRIVER_MODEL_OPTION_IDS` and ACP's
+ * `ACP_SESSION_MODE_OPTION_ID`; a server test keeps them in step.
+ */
+export const MODEL_POLICY_AGENT_OPTION_IDS: Readonly<Record<string, ReadonlyArray<string>>> = {
+  kiro: ["mode"],
+  opencode: ["agent"],
+};
+export const MODEL_POLICY_SESSION_MODE_OPTION_ID = "_t3/session-mode";
 
 /** One pick of a model, as a call or a setting names it. */
 export interface ModelPolicyPick {
@@ -192,6 +204,12 @@ export interface ModelPolicyPick {
    * way, so both readings count, the one with ultracode and the one without.
    */
   readonly ultracodeMaybeDefault?: boolean | undefined;
+  /**
+   * The pick leaves the ultracode option out and runs on a machine whose model list is not read here
+   * (a pick for a linked machine): that list may turn ultracode on by default for the model, so a
+   * Claude row reads it both ways, with ultracode and without. Naming the option settles it.
+   */
+  readonly ultracodeDefaultUnknown?: boolean | undefined;
   /**
    * The option ids the checking machine's model lists describe for the model. When set, any other
    * option the policy does not read as an effort is refused: the driver may still apply it (Kiro's
@@ -361,6 +379,9 @@ const rowAllows = (row: ModelPolicyRow, efforts: ReadonlyArray<string>) =>
     ? efforts.length === 0
     : efforts.length > 0 && efforts.every((effort) => row.efforts!.includes(effort));
 
+/** What fixes a refused pick, when it is not "name a model in the rows" ({@link ModelPolicyVerdict}). */
+export type ModelPolicyFix = "option" | "model-option" | "effort-id" | "agent-option" | "ultracode";
+
 export type ModelPolicyVerdict =
   | { readonly inside: true; readonly row: ModelPolicyRow }
   | {
@@ -369,9 +390,10 @@ export type ModelPolicyVerdict =
       /**
        * What fixes it, when it is not "name a model in the rows": `option`, leave out an option the
        * policy cannot read; `model-option`, pick the model in the model field, not in the options;
-       * `effort-id`, the driver's effort id is not known on this machine.
+       * `effort-id`, the driver's effort id is not known on this machine; `agent-option`, leave out
+       * an option that picks an agent or a mode; `ultracode`, name the ultracode option.
        */
-      readonly fix?: "option" | "model-option" | "effort-id";
+      readonly fix?: ModelPolicyFix;
     };
 
 /**
@@ -381,12 +403,30 @@ export type ModelPolicyVerdict =
  */
 function unreadableOption(pick: ModelPolicyPick): string | undefined {
   if (pick.describedOptionIds === undefined) return undefined;
+  const agentOption = agentPickingOption(pick);
+  if (agentOption !== undefined) return agentOption;
   const readable = new Set([
     ...pick.describedOptionIds,
     ...pickEffortIds(pick, true),
     MODEL_POLICY_ULTRACODE,
   ]);
   return pick.options?.find((option) => !readable.has(option.id))?.id;
+}
+
+/**
+ * The first option of a pick that picks an agent or a mode ({@link MODEL_POLICY_AGENT_OPTION_IDS}):
+ * its driver's own, or every driver's when the driver is not known (a pick for a linked machine).
+ */
+function agentPickingOption(pick: ModelPolicyPick): string | undefined {
+  const ids = new Set([
+    MODEL_POLICY_SESSION_MODE_OPTION_ID,
+    ...(pick.driver === undefined
+      ? Object.values(MODEL_POLICY_AGENT_OPTION_IDS).flat()
+      : Object.hasOwn(MODEL_POLICY_AGENT_OPTION_IDS, pick.driver)
+        ? MODEL_POLICY_AGENT_OPTION_IDS[pick.driver]!
+        : []),
+  ]);
+  return pick.options?.find((option) => ids.has(option.id))?.id;
 }
 
 /**
@@ -421,16 +461,30 @@ export function checkModelPolicyPick(
   }
   const efforts = modelPolicyPickEfforts(pick);
   const options = pick.options ?? [];
+  // The machine that runs it may turn ultracode on by default: a Claude row reads it both ways.
+  const ultracodeUnknown =
+    pick.driver === undefined &&
+    pick.ultracodeDefaultUnknown === true &&
+    !options.some((option) => option.id === MODEL_POLICY_ULTRACODE);
+  const bothWays = ultracodeUnknown
+    ? modelPolicyPickEfforts({ ...pick, ultracodeMaybeDefault: true })
+    : efforts;
   /** Why one row refuses the pick, or `undefined` when it allows it. */
   const refuses = (
     row: ModelPolicyRow,
-  ): { readonly why: string; readonly fix?: "effort-id" } | undefined => {
+  ): { readonly why: string; readonly fix?: "effort-id" | "ultracode" } | undefined => {
     if (!rowAllows(row, efforts)) {
       return {
         why:
           efforts.length === 0
             ? `${model} needs an effort from its row, and the pick names none`
             : `${model} does not allow effort ${efforts.join(" + ")}`,
+      };
+    }
+    if (row.driver === MODEL_POLICY_ULTRACODE_DRIVER && !rowAllows(row, bothWays)) {
+      return {
+        why: `the pick leaves the option ultracode out, and the machine that runs it may turn ultracode on by default for ${model} (its model list is not read here), which its ${row.driver} row does not allow`,
+        fix: "ultracode",
       };
     }
     if (row.efforts === undefined) return undefined;
@@ -445,11 +499,16 @@ export function checkModelPolicyPick(
     const missing = own.find(
       (id) => !options.some((option) => option.id === id && typeof option.value === "string"),
     );
-    return missing === undefined
-      ? undefined
-      : {
-          why: `${model} names no effort under ${missing}, the option ${row.driver} reads it from (left out, the driver runs its default level)`,
-        };
+    if (missing === undefined) return undefined;
+    // Several ids: the model lists of several instances of the driver here name the control
+    // differently, and which one runs the pick is not known, so each must be named.
+    const several =
+      own.length > 1
+        ? `; ${row.driver} reads ${model}'s effort from each of ${own.join(", ")} here (its instances' model lists name the control differently), and which instance runs the pick is not known, so the pick must name every one (an instance whose list does not describe an id refuses it in turn: pick a model whose driver has a fixed effort id, or start the task where one instance runs it)`
+        : "";
+    return {
+      why: `${model} names no effort under ${missing}, the option ${row.driver} reads it from (left out, the driver runs its default level)${several}`,
+    };
   };
   const verdicts = rows.map((row) => ({ row, refusal: refuses(row) }));
   const allowed = verdicts.filter((verdict) => verdict.refusal === undefined);
@@ -459,6 +518,13 @@ export function checkModelPolicyPick(
     // after the checked ones (a second effort id, a hidden session mode, a `model` option).
     const unreadable = unreadableOption(pick);
     if (unreadable === undefined) return { inside: true, row };
+    if (unreadable === agentPickingOption(pick)) {
+      return {
+        inside: false,
+        why: `the option ${unreadable} picks an agent or a mode, which brings its own prompt, tools and settings (an agent can carry its own model) that the policy cannot see`,
+        fix: "agent-option",
+      };
+    }
     return unreadable === "model"
       ? {
           inside: false,
@@ -467,7 +533,11 @@ export function checkModelPolicyPick(
         }
       : {
           inside: false,
-          why: `the option ${unreadable} is not described for ${model} in this machine's model list and is not an effort id the policy reads, so the driver could apply it unchecked`,
+          why: `the option ${unreadable} is not described for ${model} in this machine's model list and is not an effort id the policy reads, so the driver could apply it unchecked${
+            pick.driver === undefined
+              ? " (the pick runs on a linked machine: a control only the agent there has is refused here too, as this machine cannot tell whether it sets the effort; start that agent on this machine once so its model list describes it)"
+              : ""
+          }`,
           fix: "option",
         };
   }

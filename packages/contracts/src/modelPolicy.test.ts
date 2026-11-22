@@ -539,6 +539,10 @@ describe("an effort under the id the row's driver reads (#780)", () => {
   });
 });
 
+/** The refusal's note on a control only a linked machine's agent has. */
+const LINKED_CONTROL =
+  " (the pick runs on a linked machine: a control only the agent there has is refused here too, as this machine cannot tell whether it sets the effort; start that agent on this machine once so its model list describes it)";
+
 describe("an option the policy cannot read, while a policy is on (#793 review)", () => {
   const kiroRows = [{ driver: "kiro", model: "k", efforts: ["high"] }] as never;
   const acpRows = [{ driver: "acpRegistry", model: "acp-model", efforts: ["high"] }] as never;
@@ -586,11 +590,19 @@ describe("an option the policy cannot read, while a policy is on (#793 review)",
       for (const known of [driver, undefined]) {
         // Runs again: the same verdict.
         for (const _ of [1, 2]) {
-          expect(checkModelPolicyPick(rows, { ...pick, driver: known }), name).toEqual({
-            inside: false,
-            why: `the option ${unreadable} is not described for ${pick.model} in this machine's model list and is not an effort id the policy reads, so the driver could apply it unchecked`,
-            fix: "option",
-          });
+          expect(checkModelPolicyPick(rows, { ...pick, driver: known }), name).toEqual(
+            unreadable === "_t3/session-mode"
+              ? {
+                  inside: false,
+                  why: "the option _t3/session-mode picks an agent or a mode, which brings its own prompt, tools and settings (an agent can carry its own model) that the policy cannot see",
+                  fix: "agent-option",
+                }
+              : {
+                  inside: false,
+                  why: `the option ${unreadable} is not described for ${pick.model} in this machine's model list and is not an effort id the policy reads, so the driver could apply it unchecked${known === undefined ? LINKED_CONTROL : ""}`,
+                  fix: "option",
+                },
+          );
         }
         const without = pick.options.filter((option) => option.id !== unreadable);
         expect(
@@ -682,5 +694,133 @@ describe("modelPolicyAliasTargets", () => {
     expect(modelPolicyAliasTargets(lists, "opus")).toEqual([]);
     expect(modelPolicyAliasTargets([lists[1]!, lists[0]!], "opus")).toEqual([]);
     expect(modelPolicyAliasTargets(lists, OPUS)).toEqual([]);
+  });
+});
+
+describe("#802: what the sending machine cannot know, and options that pick an agent", () => {
+  const OPUS = "claude-opus-5-5";
+  const rows = MODEL_POLICY_START_ROWS;
+  const options = (...pairs: ReadonlyArray<readonly [string, unknown]>) =>
+    pairs.map(([id, value]) => ({ id, value }));
+
+  it("a pick for a linked machine that leaves ultracode out reads both ways on a Claude row", () => {
+    const remote = (...pairs: ReadonlyArray<readonly [string, unknown]>) => ({
+      driver: undefined,
+      model: OPUS,
+      options: options(...pairs),
+      ultracodeDefaultUnknown: true,
+    });
+    // The machine there may turn ultracode on by default; its row does not allow ultracode.
+    for (const _ of [1, 2]) {
+      expect(checkModelPolicyPick(rows, remote(["effort", "high"]))).toEqual({
+        inside: false,
+        why: `the pick leaves the option ultracode out, and the machine that runs it may turn ultracode on by default for ${OPUS} (its model list is not read here), which its claudeAgent row does not allow`,
+        fix: "ultracode",
+      });
+    }
+    // Naming the option settles it, either way the row allows.
+    expect(
+      checkModelPolicyPick(rows, remote(["effort", "high"], ["ultracode", false])),
+    ).toMatchObject({ inside: true });
+    expect(checkModelPolicyPick(rows, remote(["effort", "high"], ["ultracode", true])).inside).toBe(
+      false,
+    );
+    const ultracodeToo = [
+      { driver: "claudeAgent", model: OPUS, efforts: ["high", "ultracode"] },
+    ] as never;
+    expect(checkModelPolicyPick(ultracodeToo, remote(["effort", "high"]))).toMatchObject({
+      inside: true,
+    });
+    // A known driver reads its own catalog's default (pickOfSelection), and another driver's row
+    // has no ultracode: the field changes neither.
+    expect(
+      checkModelPolicyPick(rows, { ...remote(["effort", "high"]), driver: "claudeAgent" }),
+    ).toMatchObject({ inside: true });
+    const codexRows = [{ driver: "codex", model: "gpt", efforts: ["high"] }] as never;
+    expect(
+      checkModelPolicyPick(codexRows, {
+        ...remote(["reasoningEffort", "high"]),
+        model: "gpt",
+      }),
+    ).toMatchObject({ inside: true });
+  });
+
+  it("several effort ids for one driver: the refusal names each and why (fail closed)", () => {
+    const acpRows = [{ driver: "acpRegistry", model: "acp-model", efforts: ["high"] }] as never;
+    const pick = (...pairs: ReadonlyArray<readonly [string, unknown]>) => ({
+      driver: undefined,
+      model: "acp-model",
+      options: options(...pairs),
+      driverEffortIds: { acpRegistry: ["thought_level", "effort_level"] },
+    });
+    expect(checkModelPolicyPick(acpRows, pick(["thought_level", "high"]))).toEqual({
+      inside: false,
+      why: "acp-model names no effort under effort_level, the option acpRegistry reads it from (left out, the driver runs its default level); acpRegistry reads acp-model's effort from each of thought_level, effort_level here (its instances' model lists name the control differently), and which instance runs the pick is not known, so the pick must name every one (an instance whose list does not describe an id refuses it in turn: pick a model whose driver has a fixed effort id, or start the task where one instance runs it)",
+    });
+    expect(
+      checkModelPolicyPick(acpRows, pick(["thought_level", "high"], ["effort_level", "high"])),
+    ).toMatchObject({ inside: true });
+  });
+
+  it("refuses an option that picks an agent or a mode while the policy is on, even when described", () => {
+    const agentText = (id: string) => ({
+      inside: false,
+      why: `the option ${id} picks an agent or a mode, which brings its own prompt, tools and settings (an agent can carry its own model) that the policy cannot see`,
+      fix: "agent-option",
+    });
+    const opencodeRows = [{ driver: "opencode", model: "oc", efforts: ["high"] }] as never;
+    const opencode = (driver: string | undefined, ...extra: ReadonlyArray<[string, unknown]>) =>
+      checkModelPolicyPick(opencodeRows, {
+        driver,
+        model: "oc",
+        options: options(["variant", "high"], ...extra),
+        describedOptionIds: ["variant", "agent"],
+      });
+    for (const driver of ["opencode", undefined]) {
+      expect(opencode(driver, ["agent", "build"])).toEqual(agentText("agent"));
+      expect(opencode(driver)).toMatchObject({ inside: true });
+    }
+    // A described ACP session mode (its modes are not a copy of the thought levels), any driver.
+    const acpRows = [{ driver: "acpRegistry", model: "acp-model", efforts: ["high"] }] as never;
+    for (const driver of ["acpRegistry", undefined]) {
+      expect(
+        checkModelPolicyPick(acpRows, {
+          driver,
+          model: "acp-model",
+          options: options(["thought_level", "high"], ["_t3/session-mode", "plan"]),
+          driverEffortIds: { acpRegistry: ["thought_level"] },
+          describedOptionIds: ["thought_level", "_t3/session-mode"],
+        }),
+      ).toEqual(agentText("_t3/session-mode"));
+    }
+    // Kiro mode: on Kiro, and on a pick whose driver is not known; another driver's own `mode`
+    // stays an ordinary option.
+    const kiroRows = [{ driver: "kiro", model: "k", efforts: ["high"] }] as never;
+    for (const driver of ["kiro", undefined]) {
+      expect(
+        checkModelPolicyPick(kiroRows, {
+          driver,
+          model: "k",
+          options: options(["reasoningEffort", "high"], ["mode", "x"]),
+          describedOptionIds: ["reasoningEffort", "mode"],
+        }),
+      ).toEqual(agentText("mode"));
+    }
+    expect(
+      checkModelPolicyPick([{ driver: "codex", model: "gpt", efforts: ["high"] }] as never, {
+        driver: "codex",
+        model: "gpt",
+        options: options(["reasoningEffort", "high"], ["mode", "x"]),
+        describedOptionIds: ["reasoningEffort", "mode"],
+      }),
+    ).toMatchObject({ inside: true });
+    // Settings' marks (no described ids): not checked, as before.
+    expect(
+      checkModelPolicyPick(opencodeRows, {
+        driver: "opencode",
+        model: "oc",
+        options: options(["variant", "high"], ["agent", "build"]),
+      }),
+    ).toMatchObject({ inside: true });
   });
 });

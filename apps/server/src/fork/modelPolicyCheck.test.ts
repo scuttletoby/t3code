@@ -13,8 +13,10 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
+  MODEL_POLICY_AGENT_OPTION_IDS,
   MODEL_POLICY_DRIVER_ALIASES,
   MODEL_POLICY_EFFORT_OPTION_IDS,
+  MODEL_POLICY_SESSION_MODE_OPTION_ID,
   MODEL_POLICY_START_ROWS,
   modelPolicyPickEfforts,
   type ModelPolicy,
@@ -29,6 +31,7 @@ import {
   OrchestratorMcpFailure,
   ThreadId,
 } from "@t3tools/contracts";
+import { ACP_SESSION_MODE_OPTION_ID } from "@t3tools/provider-acp/server/sessionConfig";
 import { DEFAULT_VARIANT_CHOICE_ID } from "@t3tools/shared/model";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -473,13 +476,15 @@ describe("a selection as the policy reads it", () => {
       ],
     } as never);
     assert.include(refusal(policy("enforce", rows), decoy), "does not allow effort high + max");
-    // Each row's driver reads its own id, so the pick names the effort under both.
+    // Each row's driver reads its own id, so the pick names the effort under both (and ultracode,
+    // which the machine there may turn on by default for a Claude model).
     const inside = ModelPolicyCheck.pickOfRemoteTarget([], {
       driverKind: "codex",
       model: "shared",
       options: [
         { id: "reasoningEffort", value: "high" },
         { id: "effort", value: "high" },
+        { id: "ultracode", value: false },
       ],
     } as never);
     assert.isUndefined(refusal(policy("enforce", rows), inside));
@@ -570,9 +575,11 @@ describe("an effort named only under a driver's own option id (#780)", () => {
 
   it("sent to a linked machine: an id the row's driver does not read names no effort there", () => {
     // Lens A's probes: both were inside before. Claude (the Opus row's driver) reads only `effort`.
+    // Each names ultracode, which a Claude pick sent there must.
+    const NO_ULTRA = { id: "ultracode", value: false };
     const probes = [
-      remote([acpOpus], OPUS, [{ id: ACP_REASONING_ID, value: "high" }]),
-      remote([], OPUS, [{ id: "reasoning", value: "high" }]),
+      remote([acpOpus], OPUS, [{ id: ACP_REASONING_ID, value: "high" }, NO_ULTRA]),
+      remote([], OPUS, [{ id: "reasoning", value: "high" }, NO_ULTRA]),
     ];
     for (const pick of probes) {
       assert.include(
@@ -581,7 +588,10 @@ describe("an effort named only under a driver's own option id (#780)", () => {
       );
     }
     assert.isUndefined(
-      refusal(policy("enforce"), remote([acpOpus], OPUS, [{ id: "effort", value: "high" }])),
+      refusal(
+        policy("enforce"),
+        remote([acpOpus], OPUS, [{ id: "effort", value: "high" }, NO_ULTRA]),
+      ),
     );
   });
 
@@ -682,16 +692,73 @@ describe("an effort named only under a driver's own option id (#780)", () => {
       ),
       "does not allow effort ultracode + xhigh",
     );
-    // The pick names the option: its own value stands. No catalog here: no default read.
+    // The pick names the option: its own value stands.
     const off = remote([ultracodeByDefault], OPUS, [
       { id: "effort", value: "high" },
       { id: "ultracode", value: false },
     ]);
     assert.isUndefined(off.ultracodeMaybeDefault);
     assert.isUndefined(refusal(policy("enforce"), off));
-    assert.isUndefined(
-      refusal(policy("enforce"), remote([], OPUS, [{ id: "effort", value: "high" }])),
+    // No catalog here that turns it on: the machine there reads its own, which may, so a
+    // Claude row reads it both ways too; the refusal says to name the option.
+    const unknown = refusal(policy("enforce"), remote([], OPUS, [{ id: "effort", value: "high" }]));
+    assert.include(
+      unknown,
+      `the machine that runs it may turn ultracode on by default for ${OPUS} (its model list is not read here)`,
     );
+    assert.include(
+      unknown,
+      'Name the option ultracode in target.options: { "id": "ultracode", "value": false }',
+    );
+    assert.isUndefined(
+      refusal(
+        policy("enforce"),
+        remote([], OPUS, [
+          { id: "effort", value: "high" },
+          { id: "ultracode", value: false },
+        ]),
+      ),
+    );
+  });
+
+  it("an option that picks an agent or a mode is refused with what to leave out (#802)", () => {
+    const opencode = {
+      driver: "opencode",
+      model: "oc",
+      options: [
+        { id: "variant", value: "high" },
+        { id: "agent", value: "build" },
+      ],
+      describedOptionIds: ["variant", "agent"],
+    };
+    const rows: ReadonlyArray<ModelPolicyRow> = [
+      { driver: ProviderDriverKind.make("opencode"), model: "oc", efforts: ["high"] },
+    ];
+    const text = refusal(policy("enforce", rows), opencode);
+    assert.include(text, "the option agent picks an agent or a mode");
+    assert.include(
+      text,
+      "Leave that option out of target.options: an option that picks an agent or a mode is not allowed while the model policy is on.",
+    );
+    const advised = answer(policy("advise", rows), opencode);
+    assert.include("note" in advised ? (advised.note ?? "") : "", "the option agent picks");
+  });
+
+  it("the agent-picking options are the model guard's and ACP's session mode", () => {
+    const guard = NodeFS.readFileSync(
+      new URL("../../../../fork-kit/model-guard/lib/model_guard.py", import.meta.url),
+      "utf8",
+    );
+    const line = /^DRIVER_MODEL_OPTION_IDS = (\{.*\})$/m.exec(guard)?.[1];
+    assert.isDefined(line);
+    const guardIds = Object.fromEntries(
+      [...(line ?? "").matchAll(/'([^']+)': \(([^)]*)\)/g)].map((match) => [
+        match[1],
+        [...match[2]!.matchAll(/'([^']+)'/g)].map((id) => id[1]),
+      ]),
+    );
+    assert.deepStrictEqual(guardIds, MODEL_POLICY_AGENT_OPTION_IDS);
+    assert.strictEqual(MODEL_POLICY_SESSION_MODE_OPTION_ID, ACP_SESSION_MODE_OPTION_ID);
   });
 
   it("the aliases a driver resolves by itself are Claude Code's own", () => {
@@ -1066,9 +1133,13 @@ describe("t3_thread_configure through upstream's handler", () => {
       // Runs again: refused again; nothing sent, nothing changed here.
       assert.include(yield* configure({ model: "claude-haiku-5-5" }, THERE), "is in no row");
       assert.lengthOf(forwarded, 0);
-      // Inside the rows, or a change with no model (it only renames): sent.
+      // Inside the rows (naming ultracode, which a Claude pick sent there must), or a change
+      // with no model (it only renames): sent.
       assert.include(
-        yield* configure({ model: OPUS, options: effort("high") }, THERE),
+        yield* configure(
+          { model: OPUS, options: [...effort("high"), { id: "ultracode", value: false }] },
+          THERE,
+        ),
         "sent there",
       );
       assert.include(yield* configure(undefined, THERE), "sent there");

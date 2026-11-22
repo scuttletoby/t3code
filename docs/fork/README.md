@@ -343,7 +343,20 @@ policy too (the link names the agent's thread; a call the owner's client sends t
 so each machine refuses an agent's pick outside its own rows, whatever the sending machine's policy
 says. An agent is
 a caller whose session is bound to a thread; the owner's client has none, and anything that reaches
-the server without such a session counts as a person, so the model guard hook is the backstop. A pick is inside when it
+the server without such a session counts as a person, so the model guard hook is the backstop.
+Claude's own Agent tool (Task in older Claude Code) is checked too, as each call is made (#128): T3
+gives every Claude session it opens a PreToolUse hook that reads the policy on each call. The call
+must name a model and, for a row with `efforts`, its `effort`; the model alias the call names
+(`opus`) is read as the full id this machine's Claude model list maps it to, the same id T3 shows for
+the sub-agent, and a name the list does not map is read as given (so it matches no row). A built-in
+sub-agent type that names no model (one that would run on its own, often smaller, model) is refused
+in `enforce`. A `fork` call is read the same way, as the owner decided for every call and as the
+model guard reads it, although Claude runs a fork on the session's own model and ignores the one it
+names. `enforce` refuses with the rows, `advise` runs it with a note to the agent, an
+inside pick gets its row's `useFor`, and each call is logged as "model policy pick" with route
+`Agent`. A check that fails refuses the call. The hook is fixed when the Claude process opens: a
+process started before this version runs without it until T3 opens a new one (a new profile, a
+restart). Workflow `agent()` calls are not read here (the script is code); the model guard reads them. A pick is inside when it
 names a model by its full id (#128; an alias such as `opus` is not read as its model, and the
 refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
 `efforts`, names one of them (`ultracode` counts as its own effort; a row without `efforts` allows
@@ -362,7 +375,11 @@ or `ultracode` (#793): a driver can still apply an option the policy does not re
 checked ones (Kiro's `effortLevel`, Grok's native `thought_level`, an ACP agent's `_t3/session-mode`
 that the list hides because it repeats the thought levels, or a `model` option written after the
 model). Such a pick is refused in `enforce` (pick the model in the model field; the option is not
-allowed while the policy is on) and reported in `advise`, as the model guard does. So a second
+allowed while the policy is on) and reported in `advise`, as the model guard does. An option that
+picks an agent or a mode is refused even when the list describes it (#802), as the model guard's
+`DRIVER_MODEL_OPTION_IDS` does: OpenCode's `agent` (an OpenCode agent can carry its own model),
+Kiro's `mode`, and an ACP `_t3/session-mode` on any driver (each brings its own prompt, tools and
+settings the policy cannot see); without a known driver each of them is refused. So a second
 effort option cannot hide a higher effort, and an option cannot change the model. A pick that leaves the ultracode option out runs at the model's default for it, so a model
 whose catalog default is ultracode reads as ultracode. Without a known driver (a call for a linked machine; a `driverKind` the agent names is its
 own claim and is not read), every row naming the model must allow it (the refusal names the drivers
@@ -370,7 +387,16 @@ whose rows refuse it), and each row's driver needs the effort under its own id a
 for an ACP model this machine's catalog does not describe is refused here), every built-in driver's
 effort option and every control this machine's catalog marks for the model is read too (a decoy
 cannot hide a higher effort), a model this machine's catalog turns ultracode on for by default is
-read both with and without it, and an alias gets the same "name the full id" hint as here. The
+read both with and without it, and an alias gets the same "name the full id" hint as here. This
+machine knows only its own catalog (#802): the machine there may turn ultracode on by default for a
+Claude model where this one does not, so on a Claude row a pick that leaves the ultracode option out
+is read both ways too (name `ultracode: false` or `true`); a control only the agent there has is
+refused here (this machine cannot tell whether it sets the effort; start that agent here once so its
+list describes it). When several instances of one driver here name a model's effort control
+differently (two ACP agents listing the same model), the pick must name the effort under each id,
+as which instance runs it is not known; the refusal names every id and why. This fails closed: an
+instance whose list does not describe one of them refuses it there in turn, so pick a model whose
+driver has a fixed effort id, or start the task where one instance runs it. The
 machine there checks the pick again with its own catalog (#780). In `enforce` a pick outside is refused with the rows; in
 `advise` it runs, and `delegate_task`'s reply says what `enforce` would refuse (the other routes
 only log it). A pick inside gets its row's `useFor` in `delegate_task`'s reply. Each checked pick is
@@ -385,7 +411,9 @@ a policy change a retry is refused even when the first call already started its 
 task runs on, with no record here). Not checked by the server: a project's default model (`t3_project_create`,
 `t3_project_update`) and `schedule_task`'s model, which a later run uses; the model guard hook
 (`fork-kit/model-guard`) refuses an agent's such call in `enforce`. The owner's own picks (in the app, or `t3_thread_launch` from the owner's client)
-are never refused; Settings marks the server's model picks outside the rows ("outside policy").
+are never refused; Settings marks the server's model picks outside the rows ("outside policy"),
+each read on the instance of the machine whose settings hold it (#802; the default `claudeAgent` is
+on every machine, with its own catalog).
 
 Left (#731): a `t3_thread_launch` retry with the same key that names no model is not checked again.
 After a policy change, the retry of an idle launch (one without a message) that adds a message starts
