@@ -7,7 +7,7 @@ so the agent cannot undo it:
 
 | Wall                    | What the kit does                                                                                                                                                                                                                                                                                                                                  |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No Windows files        | `/etc/wsl.conf`: `[automount] enabled=false`, `mountFsTab=false`; the unit also hides `/mnt`, `/run/WSL`, `/tmp/.X11-unix`, `/usr/lib/wsl` (but for its GPU folders, read-only, with `gpu`) and `/run/tailscale` (the Tailscale daemon's socket)                                                                                                                                                    |
+| No Windows files        | `/etc/wsl.conf`: `[automount] enabled=false`, `mountFsTab=false`; the unit also hides `/mnt`, `/run/WSL`, `/tmp/.X11-unix`, `/usr/lib/wsl` (but for its GPU folders, read-only, with `gpu`) and `/run/tailscale` (the Tailscale daemon's socket)                                                                                                   |
 | No Windows programs     | `[interop] enabled=false`, `appendWindowsPath=false`; WSL's binfmt handler masked                                                                                                                                                                                                                                                                  |
 | No way out of the user  | one login user (`agent`), in no group but its own, no sudo rule, login shell `/usr/sbin/nologin`; the distro's default user is `root`, not `agent`; cron, at, ssh and the agent's systemd user manager (`user@<uid>.service`) masked, so no login, linger or user unit of the agent runs anything outside T3's unit                                |
 | A sandboxed unit        | `t3code-agents.service` (system unit, `User=agent`): `ProtectSystem=strict`, only `/home/agent` writable, no `AF_VSOCK` (Hyper-V sockets to Windows), io_uring off, no namespaces, `PrivateDevices`, `MemoryMax`, `CPUQuota`                                                                                                                       |
@@ -72,22 +72,22 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 }
 ```
 
-| Key                     | What                                                                                                                                        |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `organization`          | the name the managed policy shows in T3's settings                                                                                          |
-| `t3Version`             | the exact T3 version (the linking T3's), 0.1.7 or newer (see below); its release files, as `scripts/install.sh`'s                           |
-| `t3ReleaseBaseUrl`      | where that version's release files are (`T3CODE_RELEASE_BASE_URL` of `scripts/install.sh`)                                                  |
-| `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                                                |
-| `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                                           |
-| `maxRuntimeMode`        | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                                          |
-| `lockedSettings`        | more T3 settings to lock, `{path: value}`, only ones `t3Version` knows (`agentSlots.…`: a fork build), see below                            |
-| `memoryMax`, `cpuQuota` | the unit's `MemoryMax` and `CPUQuota`                                                                                                       |
-| `nameservers`           | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                                             |
-| `allow`                 | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host                                  |
-| `devPorts`              | optional: the TCP ports the agent's dev servers may listen on and be reached on, `LOW-HIGH` (default `4100-4199`)                           |
-| `peers`                 | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to                                   |
-| `tailscaleTag`          | the tag this PC's Tailscale node gets (`tag:name`)                                                                                          |
-| `autoUpdate`            | optional: `{"enabled": true, "follow": "OWNER/NAME"}` installs that fork's new releases by itself (see "Automatic updates"); off by default |
+| Key                     | What                                                                                                                                                                  |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `organization`          | the name the managed policy shows in T3's settings                                                                                                                    |
+| `t3Version`             | the exact T3 version (the linking T3's), 0.1.7 or newer (see below); its release files, as `scripts/install.sh`'s                                                     |
+| `t3ReleaseBaseUrl`      | where that version's release files are (`T3CODE_RELEASE_BASE_URL` of `scripts/install.sh`)                                                                            |
+| `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                                                                          |
+| `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                                                                     |
+| `maxRuntimeMode`        | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                                                                    |
+| `lockedSettings`        | more T3 settings to lock, `{path: value}`, only ones `t3Version` knows (`agentSlots.…`: a fork build), see below                                                      |
+| `memoryMax`, `cpuQuota` | the unit's `MemoryMax` and `CPUQuota`                                                                                                                                 |
+| `nameservers`           | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                                                                       |
+| `allow`                 | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host                                                            |
+| `devPorts`              | optional: the TCP ports the agent's dev servers may listen on and be reached on, `LOW-HIGH` (default `4100-4199`)                                                     |
+| `peers`                 | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to                                                             |
+| `tailscaleTag`          | the tag this PC's Tailscale node gets (`tag:name`)                                                                                                                    |
+| `autoUpdate`            | optional: `{"enabled": true, "follow": "OWNER/NAME"}` installs that fork's new releases by itself (see "Automatic updates"); off by default                           |
 | `gpu`                   | optional: `true` lets the agents use the PC's GPU (CUDA): `/dev/dxg` and, read-only, `/usr/lib/wsl/lib` and `/usr/lib/wsl/drivers` (see "GPU access"); off by default |
 
 `t3Version` must be 0.1.7 or newer: older releases have no managed policy, so they would run with none of the kit's
@@ -299,14 +299,14 @@ translation, fine-tuning), add to the `pc-agents` section of the machine file (a
 "gpu": true
 ```
 
-and run step 3 again (setup writes the unit and restarts T3). Then the unit (and `pc-agents as-agent`) has, in place
+and run step 3 again (setup writes the unit and restarts T3). Then the unit (and so `as-agent`) has, in place
 of `/usr/lib/wsl` in `InaccessiblePaths=`, these lines, and nothing else of it changes:
 
-| Line                                                         | Why                                                                                                                                                                                                             |
-| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TemporaryFileSystem=/usr/lib/wsl:ro`                        | an empty read-only folder over `/usr/lib/wsl`: anything else WSL puts there stays hidden                                                                                                                       |
-| `BindReadOnlyPaths=-/usr/lib/wsl/lib -/usr/lib/wsl/drivers`  | read-only: `lib` holds what CUDA programs load (`libcuda.so.1`, `libdxcore.so`, `libd3d12*.so`, `nvidia-smi`; WSL's `/etc/ld.so.conf.d/ld.wsl.conf` names it), `drivers` the Windows GPU driver store, where NVIDIA's driver keeps the rest (`libcuda.so.1.1`, `nvcubins.bin`, ...) |
-| `BindPaths=-/dev/dxg` and `DeviceAllow=/dev/dxg rw`          | `PrivateDevices=yes` stays: it leaves `/dev/dxg` out of the unit's `/dev` (the bind puts this one node back) and closes the device policy (the allow opens this one device); every other device stays out      |
+| Line                                                        | Why                                                                                                                                                                                                                                                                                 |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TemporaryFileSystem=/usr/lib/wsl:ro`                       | an empty read-only folder over `/usr/lib/wsl`: anything else WSL puts there stays hidden                                                                                                                                                                                            |
+| `BindReadOnlyPaths=-/usr/lib/wsl/lib -/usr/lib/wsl/drivers` | read-only: `lib` holds what CUDA programs load (`libcuda.so.1`, `libdxcore.so`, `libd3d12*.so`, `nvidia-smi`; WSL's `/etc/ld.so.conf.d/ld.wsl.conf` names it), `drivers` the Windows GPU driver store, where NVIDIA's driver keeps the rest (`libcuda.so.1.1`, `nvcubins.bin`, ...) |
+| `BindPaths=-/dev/dxg` and `DeviceAllow=/dev/dxg rw`         | `PrivateDevices=yes` stays: it leaves `/dev/dxg` out of the unit's `/dev` (the bind puts this one node back) and closes the device policy (the allow opens this one device); every other device stays out                                                                           |
 
 A `-` path that is missing is skipped, so T3 still starts on a PC whose WSL has no GPU (`check` says so). The driver
 store is Windows' driver files (no user files); the agent reads them, it cannot change them. GPU jobs themselves (one
