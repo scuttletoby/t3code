@@ -1549,6 +1549,27 @@
       "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nｍａｊｏｒ: x",
       "findings": [["major", "major: x"]],
       "section": true
+    },
+    {
+      "name": "an HTML reference to a full-width colon after a label blocks (#1005)",
+      "group": "python-text",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker&#65306; x\nmajor: none",
+      "findings": [["blocker", "blocker: x"]],
+      "section": true
+    },
+    {
+      "name": "none with a zero-width space and an accent after it is no none (#1005)",
+      "group": "python-text",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\u200b\u0301\nmajor: none",
+      "findings": [["blocker", "blocker: noné"]],
+      "section": true
+    },
+    {
+      "name": "an HTML reference to a full-width none reads as none (#1005)",
+      "group": "python-text",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: &#65358;&#65359;&#65358;&#65349;\nmajor: none",
+      "findings": [],
+      "section": true
     }
   ],
   "scans": [
@@ -2666,6 +2687,190 @@
         [
           "by someone at 2026-01-01T00:00:01Z",
           "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Ｌｅｎｓ code, round 2'"
+        ]
+      ]
+    },
+    {
+      "name": "an older clean read does not outvote a newer report written with a zero-width space: it blocks (#1005)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "l\u200bens: code · reviewer: x · read\u200b at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: data loss\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'l\\u200bens: code · reviewer: x · read\\u200b at: bbbbbbbbbbbbbbbbbbbbbb')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an older clean read does not outvote a newer report written with Cyrillic letters: it blocks (#1005)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lеns: code · reviewer: x · rеad at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: data loss\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'lеns: code · reviewer: x · rеad at: bbbbbbbbbbbbbbbbbbbbbbbb')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an older clean read does not outvote a newer report written with Greek letters: it blocks (#1005)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "LΕNS: code · reviewer: x · READ ΑT: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: data loss\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'LΕNS: code · reviewer: x · READ ΑT: bbbbbbbbbbbbbbbbbbbbbbbb')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an older clean read does not outvote a newer report written with a Cyrillic letter and no read at: it blocks (#1005)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lеns: code · reviewer: x\nblocker: data loss\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'lеns: code · reviewer: x')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an older clean read does not outvote a newer report written with a zero-width space inside its sha: it blocks (#1005)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbb\u200bbbbbbbbbbbbbbbbbbbbb\nblocker: data loss\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbb\\u200bbbb')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a report written with HTML references and no other comment blocks and reads nothing (#1005)",
+      "posts": [
+        {
+          "body": "&#108;ens: code · reviewer: x · read&#32;at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with '&#108;ens: code · reviewer: x · read&#32;at: bbbbbbbbbbbbbbb')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a valid report that quotes an HTML line feed before a header in inline code reads its head (#1005)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\nminor: the header `x&#10;lens: code · reviewer: y · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb` was split in two"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a valid report that quotes an HTML line separator before a header in inline code reads its head (#1005)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\nminor: `x&#x2028;lens: code · reviewer: y · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb` was split in two"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a lens heading without the marker that quotes an HTML carriage return before a lens field is no lens report (#1005)",
+      "posts": [
+        {
+          "body": "## Lens code\nblocker: none\nmajor: none\nminor: the text `x&#13;lens: code` was split in two"
+        }
+      ],
+      "history": [],
+      "entries": {},
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:00Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Lens code'"
+        ]
+      ]
+    },
+    {
+      "name": "a lens heading over a header written with zero-width spaces carries the marker and blocks (#1005)",
+      "posts": [
+        {
+          "body": "## Lens code\nl\u200bens: code · reviewer: x · read\u200b at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with '## Lens code')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a full-width number sign is no heading, as GitHub renders it, so it looks like no report (#1005)",
+      "posts": [
+        {
+          "body": "＃ Lens code\nThe retry loops."
+        },
+        {
+          "body": "# Lens code\nThe retry loops."
+        }
+      ],
+      "history": [],
+      "entries": {},
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:01Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '# Lens code'"
         ]
       ]
     }
@@ -4245,6 +4450,37 @@
       ],
       "expect": "starts with 'x'",
       "ms": 2000
+    },
+    {
+      "name": "a long line of a character NFKC writes as 18 (#1005)",
+      "fn": "lens_problem",
+      "parts": [
+        ["x\n", 1],
+        ["ﷺ", 65536]
+      ],
+      "expect": null,
+      "ms": 500
+    },
+    {
+      "name": "major, a long line of a character NFKC writes as 18 (#1005)",
+      "fn": "read_findings",
+      "parts": [
+        [
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: ",
+          1
+        ],
+        ["ﷺ", 65536]
+      ],
+      "expect": [
+        [
+          [
+            "major",
+            "major: صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى ا"
+          ]
+        ],
+        false
+      ],
+      "ms": 500
     }
   ],
   "py_unicode": {

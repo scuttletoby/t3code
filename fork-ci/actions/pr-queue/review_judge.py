@@ -198,7 +198,10 @@ def judge(review, changes, config_path):
 # Before any of this the text is folded (fold): NFKC (`Ｍajor` -> Major), format characters removed (zero-width space and
 # joiner, soft hyphen, bidi marks: category Cf), and Cyrillic and Greek letters that look like Latin ones read as Latin
 # (`majоr` with a Cyrillic о); a 0 for an o in a label is read too (`maj0r`); HTML entities decoded (`ma&#106;or`) and
-# Markdown backslash escapes dropped (`major\: x`), as GitHub renders them.
+# Markdown backslash escapes dropped (`major\: x`), as GitHub renders them. Each line is then read in NFKC again
+# (lens.norm_line), after the entities are decoded, so what an entity writes reads as GitHub shows it (issue #1005, the
+# shared vectors marked #1005): `blocker&#65306; x` (a full-width colon) blocks, `&#65358;&#65359;&#65358;&#65349;` (a
+# full-width none) reads as none, and `none` with a zero-width space and then an accent is `noné`, no none, so it blocks.
 CONFUSABLES = str.maketrans({
     'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H', 'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'Х': 'X',
     'І': 'I', 'Ј': 'J', 'Ѕ': 'S', 'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'х': 'x', 'у': 'y', 'і': 'i',
@@ -235,13 +238,22 @@ SHOW_FINDING = 120   # characters of a finding line named in the reason
 BLOCKING = ('blocker', 'major')
 
 
-def fold(text):
-    """The text as the findings rules read it: NFKC, format characters (category Cf) gone, look-alike letters Latin."""
-    text = unicodedata.normalize('NFKC', text or '')
+@lens.memo
+def _fold(text, _=False):
+    """fold, remembered (lens.memo)."""
+    text = lens.nfkc(text)
     # html.unescape raises on a number reference past int's 4,300-digit limit: its value, or one past Unicode (U+FFFD)
     text = re.sub(r'&#0*([0-9]+)', lambda m: '&#' + (m[1] if len(m[1]) <= 7 else '1114112'), text)
     text = re.sub(r'\\([!-/:-@\[-`{-~])', r'\1', html.unescape(text))
-    return ''.join(ch for ch in text if unicodedata.category(ch) != 'Cf').translate(CONFUSABLES)
+    cf = ''.join(re.escape(ch) for ch in set(text) if unicodedata.category(ch) == 'Cf')
+    return (re.sub(f'[{cf}]', '', text) if cf else text).translate(CONFUSABLES)
+
+
+def fold(text):
+    """The text as the findings rules read it: NFKC, format characters (category Cf) gone, look-alike letters Latin.
+    Refused on a Python whose Unicode is not the rules' (lens.unicode_check)."""
+    lens.unicode_check(text or '')
+    return _fold(text or '')
 
 
 def _kind(kw):
