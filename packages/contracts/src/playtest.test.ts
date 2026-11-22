@@ -211,7 +211,16 @@ describe("playtest settings in the settings file", () => {
       yield* drop(without("claim"));
       expect(JSON.stringify(logged)).toContain("invalid playtest settings read as off");
       yield* drop({ ...ADAPTER, claim: { ...ADAPTER.claim, maxRuns: 1 } });
-      expect(String(logged.at(-1))).toContain('["claim"]["maxRuns"]');
+      expect(String(logged.at(-1))).toContain(
+        'Expected no excess property at ["claim"]["maxRuns"]',
+      );
+      expect(String(logged.at(-1))).not.toMatch(/\s{2}/);
+      yield* drop({
+        ...ADAPTER,
+        claim: step(["game", "--token=SECRETVALUE"]),
+      });
+      expect(String(logged.at(-1))).toContain("invalid playtest settings read as off");
+      expect(String(logged.at(-1))).not.toContain("SECRETVALUE");
     }),
   );
 

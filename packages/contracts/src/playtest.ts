@@ -182,7 +182,7 @@ export const PlaytestSettingsFromSettingsFile = Schema.Unknown.pipe(
           return raw as typeof PlaytestSettings.Encoded;
         }
         yield* Effect.logWarning(
-          `settings: invalid playtest settings read as off (${problem.replaceAll("\n", " ")}); the next settings save replaces them`,
+          `settings: invalid playtest settings read as off (${problem.replace(/\s+/g, " ").trim()}); the next settings save replaces them`,
         );
         return {};
       }),
