@@ -695,15 +695,18 @@ class PathRules(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn('required lens without a read: design', out)
 
-    def test_enforce_needs_the_lenses_of_the_heaviest_rule_hit(self):
+    def test_enforce_needs_the_lenses_of_every_rule_hit(self):   # #82: the critical lenses never replace code's
         base = self.base()
         head = self.head(base, **{'src/storage/s.py': lines(40, ['x'], 3), 'src/app.py': 'a\n', 'docs/d.md': 'd\n'})
         code, out = self.check(base, head, ['code'])
         self.assertEqual(code, 1, out)
         self.assertIn('required lens without a read: data-1, data-2', out)
-        self.assertIn('path rules (enforce): the path rules decide: critical, lenses data-1, data-2 (3 changed paths',
-                      out)
-        self.assertEqual(self.check(base, head, ['data-1', 'data-2'])[0], 0)
+        self.assertIn('path rules (enforce): the path rules decide: critical, lenses data-1, data-2, code (3 changed '
+                      'paths', out)
+        code, out = self.check(base, head, ['data-1', 'data-2'])
+        self.assertEqual(code, 1, out)
+        self.assertIn('required lens without a read: code', out)
+        self.assertEqual(self.check(base, head, ['data-1', 'data-2', 'code'])[0], 0)
 
     def test_enforce_still_requires_the_input_lenses(self):
         base = self.base()
@@ -748,24 +751,28 @@ class PathRules(unittest.TestCase):
                 self.assertEqual(code, 1, out)
                 self.assertIn('data-1, data-2', out)
         head = self.head(base, drop=['src/storage/s.py'], **{'src/s.py': lines(40)})
-        code, out = self.check(base, head, ['data-1', 'data-2'])
+        code, out = self.check(base, head, ['data-1', 'data-2', 'code'])   # the new path is code's to read (#82)
         self.assertEqual(code, 0, out)
         self.assertIn('data (critical): src/storage/s.py; code (normal): src/s.py', out)
 
     def test_the_config_and_the_lens_prompts_are_always_critical(self):
         base = self.base()
         prompt = REVIEW_BLOCK['lenses']['code']['prompt']
-        for name, kw in (('config edited', {'cfg': review_cfg('enforce', findings=False)}),   # deleted: refused (#388)
-                         ('prompt renamed', {'drop': [prompt], 'docs/code-lens.md': PROMPTS[prompt]}),
-                         ('prompt edited', {prompt: 'changed\n'}),
-                         ('workflow', {'.github/workflows/ci.yml': 'on: push\n'})):
-            with self.subTest(name):
+        # A protected path also counts for its own rule: under the catch-all (the config, a workflow) it needs the
+        # code lens too, every rule hit gives its lenses (#82); a prompt under the light docs rule adds none.
+        for name, kw, own in (('config edited', {'cfg': review_cfg('enforce', findings=False)}, ['code']),
+                              ('prompt renamed', {'drop': [prompt], 'docs/code-lens.md': PROMPTS[prompt]}, []),
+                              ('prompt edited', {prompt: 'changed\n'}, []),
+                              ('workflow', {'.github/workflows/ci.yml': 'on: push\n'}, ['code'])):
+            with self.subTest(name):   # the config deleted: refused (#388)
                 head = self.head(base, **kw)
                 code, out = self.check(base, head, ['code'])
                 self.assertEqual(code, 1, out)
-                self.assertIn('critical, lenses data-1, data-2', out)
+                self.assertIn('critical, lenses ' + ', '.join(['data-1', 'data-2', *own]) + ' (', out)
                 self.assertIn('protected: ', out)
-                self.assertEqual(self.check(base, head, ['data-1', 'data-2'])[0], 0)
+                self.assertEqual(self.check(base, head, ['data-1', 'data-2', *own])[0], 0)
+                if own:
+                    self.assertEqual(self.check(base, head, ['data-1', 'data-2'])[0], 1)
 
     def test_an_empty_diff_is_judged_by_the_catch_all_rule(self):   # empty state: never "no lens needed"
         base = self.base()
@@ -1588,7 +1595,9 @@ class ForkConfigRules(unittest.TestCase):
 
     def test_it_is_in_enforce(self):
         self.assertEqual(FORK_RAW['review']['mode'], 'enforce')
-        self.assertNotIn('override_authors', FORK_RAW['review'])   # #78: no person posts from a login of their own yet
+        # #78: no person posts from a login of their own yet. Written out, empty: releases ci/v20 and older do not know
+        # the key and refuse the config (fail closed), where they would judge no finding and no round (fail open).
+        self.assertEqual(FORK_RAW['review']['override_authors'], [])
 
     def test_a_workflow_or_gate_change_needs_the_extra_review(self):   # #82
         for changed in ('.github/workflows/ci.yml', 'fork-ci/actions/x.py'):
@@ -1601,6 +1610,30 @@ class ForkConfigRules(unittest.TestCase):
                 self.assertEqual(code, 0, out)
                 code, out = self.check(base, head, [self.said('merge-path', head)])   # one review is not enough
                 self.assertEqual(code, 1, out)
+
+    def test_an_app_change_plus_a_gate_file_needs_the_code_lens_too(self):   # #82: one EXTRA review, not instead
+        for gate in ('.github/workflows/ci.yml', 'fork-ci/actions/x.py'):
+            with self.subTest(gate):
+                base, head = self.pair('apps/server/src/x.ts', gate)
+                code, out = self.check(base, head, [self.said('merge-path', head), self.said('state', head)])
+                self.assertEqual(code, 1, out)   # nobody read the app code
+                self.assertIn('required lens without a read: code', out)
+                self.assertIn('the path rules decide: critical, lenses merge-path, state, code (', out)
+                code, out = self.check(base, head, [self.said('merge-path', head), self.said('state', head),
+                                                    self.said('code', head)])
+                self.assertEqual(code, 0, out)
+
+    def test_the_rollback_to_shadow_needs_the_gate_lenses(self):   # it changes the config: judged by the base's rules
+        raw = json.loads(json.dumps(FORK_RAW))
+        raw['review']['mode'] = 'shadow'
+        base, _ = self.pair()
+        tree = {FORK_CONFIG_PATH: json.dumps(FORK_RAW, indent=2) + '\n', **fork_prompts(), **self.FILES}
+        head = self.w.commit({**tree, FORK_CONFIG_PATH: json.dumps(raw, indent=2) + '\n'}, [base])
+        code, out = self.check(base, head, [self.said('code', head)])
+        self.assertEqual(code, 1, out)
+        self.assertIn('required lens without a read: merge-path, state', out)
+        code, out = self.check(base, head, [self.said('merge-path', head), self.said('state', head)])
+        self.assertEqual(code, 0, out)
 
     def test_an_app_change_that_adds_a_seam_or_a_test_line_needs_the_code_lens(self):   # the dry run's wrong refusals
         for extra in ('.github/fork-seams.json', '.github/fork-ci-tests.txt'):

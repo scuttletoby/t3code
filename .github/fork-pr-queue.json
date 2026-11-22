@@ -36,7 +36,9 @@
           ".github/fork-secret-sweep-gone-tips.txt",
           ".github/fork-tests-upstream.json",
           ".github/fork-upstream.json",
-          "fork-ci/**"
+          "fork-ci/**",
+          "fork-kit/gh-apps/**",
+          "fork-kit/review/**"
         ],
         "lenses": ["merge-path", "state"]
       },
@@ -51,6 +53,7 @@
     "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
     "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
     "findings": true,
+    "override_authors": [],
     "state_line": false
   }
 }

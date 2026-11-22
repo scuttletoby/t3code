@@ -141,8 +141,15 @@ whole). Then (`review_judge.py`, `review_glob.py`):
   folder is a critical change); a delete, a mode change and a type change count
   under their path;
 - a built-in protected path also counts for the first critical rule;
-- the heaviest weight hit decides; the required lenses are the lenses of every
-  rule of that weight that was hit, in rule order, each once;
+- the heaviest weight hit is the change's weight; the required lenses are the
+  lenses of every rule that was hit, whatever its weight, in rule order, each
+  once. Each path gets its own rule's read: an app change plus one workflow
+  file needs the app rule's lens and the critical lenses, never the critical
+  lenses alone (owner decision,
+  [issue 82](https://github.com/scuttletoby/t3code/issues/82): one *extra*
+  review). A protected path counts for its own rule too, so one under a
+  normal catch-all also needs that rule's lens; put the protected paths in a
+  critical rule of their own to keep them at the critical lenses;
 - an empty diff (the head adds nothing to its merge base) counts as the catch-all
   rule, never as "no lens needed";
 - with more than one merge base (criss-cross merges), the paths changed against
@@ -311,8 +318,10 @@ pull request of its own on the default branch.
    ([fork-ci README, "How a release is made"](../../README.md#how-a-release-is-made));
    a project never makes one. The path rules (`review`, `shadow` and `enforce`)
    are in `ci/v15` and later. Findings, rounds and `override_authors` are in
-   the first release after `ci/v20`
-   ([RELEASE-NOTES.md](../../RELEASE-NOTES.md), #740). Take the newest
+   `ci/v21` and later
+   ([RELEASE-NOTES.md](../../RELEASE-NOTES.md), #740). Up to `ci/v22` the
+   lenses of the heaviest weight hit only were required; every rule hit gives
+   its lenses from the first release after `ci/v22`. Take the newest
    `ci/vN` and its release sha as in
    [Pinning](../../README.md#pinning).
 2. **Pin.** In one pull request, move every `uses:` of fork-ci in the
@@ -404,17 +413,34 @@ pull request of its own on the default branch.
    this step (owner decisions in issues
    [82](https://github.com/scuttletoby/t3code/issues/82),
    [99](https://github.com/scuttletoby/t3code/issues/99) and
-   [100](https://github.com/scuttletoby/t3code/issues/100)), with no
-   `override_authors` while agents post from the owner's login
-   ([issue 78](https://github.com/scuttletoby/t3code/issues/78)). Its critical
+   [100](https://github.com/scuttletoby/t3code/issues/100)). Its
+   `override_authors` is written out empty: no person while agents post from
+   the owner's login
+   ([issue 78](https://github.com/scuttletoby/t3code/issues/78)), and
+   `ci/v20` and older refuse the key, so a caller pinned to one of them fails
+   closed instead of enforcing the path rules without findings and rounds. A
+   caller of this config pins `ci/v21` or later; the first release after
+   `ci/v22` adds the code lens to mixed changes (above). Its critical
    rule names the workflow and gate-setting files under `.github` one by one
    instead of `.github/**`: the seam list and the test list, which most pull
    requests add a line to, stay normal, or plain app changes would need the
-   gate lenses and no `code` lens. A test in `review_judge.test.py` fails when
-   a new file under `.github` is in neither list. The fork runs no gate on
-   its own pull requests yet (no caller, App or ruleset,
+   gate lenses and no `code` lens. It also holds `fork-ci/**`,
+   `fork-kit/review/**` (the lens format checker and lens skill: what a lens
+   report must say) and `fork-kit/gh-apps/**` (the gate App's key and
+   tokens). Tests in `review_judge.test.py` fail when a new file under
+   `.github` or a new folder under `fork-kit` is not sorted. The fork runs no
+   gate on its own pull requests yet (no caller, App or ruleset,
    [issue 81](https://github.com/scuttletoby/t3code/issues/81)), so the block
    decides nothing there until one exists.
+
+   Until issue 78 is done, two of these rules are not yet a person's
+   decision on the fork. The round cap: rounds count from the lens comments
+   that still exist, and every lens author is the owner's login that agents
+   post from, so an agent can delete old round comments (or open a new pull
+   request) and start again at round 1. A push after the review: an override
+   for the new head lets it pass on the old reads without a listed person
+   (open findings still block). Only clearing a finding and passing the cap
+   need a listed person, and none is listed.
 
 6. **Roll back** in the reverse order: lens names back into an emptied
    input, then `mode` back to `shadow` (or the block out), and only then a
@@ -424,6 +450,17 @@ pull request of its own on the default branch.
    The pin-back pull request is judged by the current gate, which knows the
    key, so it can merge; after it, the old release refuses the config, every
    head fails, and only the owner step below gets out.
+
+   The fork's own rollback to `shadow` is one pull request with three
+   changes: the `"mode"` line of `.github/fork-pr-queue.json`, and the two
+   tests that pin `enforce`, `ForkConfigRules.test_it_is_in_enforce` in
+   `head_check.test.py` and
+   `ForkConfig.test_it_parses_in_enforce_with_the_owners_numbers_and_no_person_yet`
+   in `review_judge.test.py`. While the base is in `enforce`, that pull
+   request is judged by the enforce rules: it changes the config and
+   `fork-ci/**`, so it needs clean `merge-path` and `state` reports within
+   the round cap. If the gate itself is broken so that every head fails, only
+   the owner step below gets out.
 
 **Stopped half-way, or run again.** Every step leaves a state that works or
 fails closed:
