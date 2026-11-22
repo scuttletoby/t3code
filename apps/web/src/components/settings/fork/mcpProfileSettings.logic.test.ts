@@ -7,6 +7,8 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   clearThreadPicksPatch,
   deleteMcpProfilePatch,
+  describeMcpProfileSet,
+  draftOf,
   mcpProfileChoices,
   mcpProfileRows,
   mcpProfileUsers,
@@ -120,6 +122,23 @@ describe("saving and deleting a profile", () => {
     expect(remove).toEqual({ patch: { mcpProfiles: { lean: null } } });
     settings = serverSave(settings, "patch" in remove ? remove.patch : null);
     expect(Object.keys(settings.mcpProfiles)).toEqual(["other"]);
+  });
+
+  it('keeps builtinTools "none" through an edit and shows it; others save without it', () => {
+    const bare = { servers: "all", t3Tools: "all", builtinTools: "none" } as const;
+    const settings = fromFile({ mcpProfiles: { bare, lean: LEAN } });
+    const row = mcpProfileRows(settings, null).find((entry) => entry.name === "bare")!;
+    expect(row.state).toBe("ok");
+    expect(describeMcpProfileSet(bare)).toContain("Built-in tools: none");
+    const edit = saveMcpProfilePatch(settings, "bare", draftOf("bare", bare));
+    expect(edit).toEqual({ patch: { mcpProfiles: { bare } } });
+    serverSave(settings, "patch" in edit ? edit.patch : null);
+    const lean = saveMcpProfilePatch(
+      settings,
+      "lean",
+      draftOf("lean", settings.mcpProfiles.lean as never),
+    );
+    expect(JSON.stringify(lean)).not.toContain("builtinTools");
   });
 
   it("refuses built-in names, inherit, bad names and a name taken", () => {

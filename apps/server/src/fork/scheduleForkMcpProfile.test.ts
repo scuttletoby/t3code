@@ -414,12 +414,32 @@ it.effect("a project with no profile of its own gives the server's to the task's
     yield* withToolkits({ ...server, ...pickFor("t3-only") }, ({ recorded, schedule }) =>
       Effect.gen(function* () {
         expect(yield* schedule({ projectId: BARE_PROJECT })).toContain(
-          'would get "docs", which keeps MCP servers or T3 tools "t3-only" does not',
+          'would get "docs", which keeps MCP servers "t3-only" does not',
         );
         expect(recorded.scheduled).toHaveLength(0);
       }),
     );
   }),
+);
+
+it.effect("a schedule or fork refusal names built-in tools when only they are wider", () =>
+  // The caller keeps every MCP server and T3 tool but no built-in tool; PROJECT is on all.
+  withToolkits(
+    {
+      mcpProfiles: { bare: { servers: "all", t3Tools: "all", builtinTools: "none" } },
+      ...pickFor("bare"),
+    },
+    ({ recorded, schedule, fork }) =>
+      Effect.gen(function* () {
+        const scheduled = yield* schedule({ projectId: PROJECT, bindToCurrentThread: false });
+        expect(scheduled).toContain('would get "all", which keeps built-in tools "bare" does not');
+        expect(scheduled).not.toContain("MCP servers");
+        const forked = yield* fork(WIDE);
+        expect(forked).toContain('would get "all", which keeps built-in tools "bare" does not');
+        expect(recorded.scheduled).toHaveLength(0);
+        expect(recorded.dispatched).toHaveLength(0);
+      }),
+  ),
 );
 
 it.effect("a caller whose profile cannot be worked out is refused, never taken as all", () =>

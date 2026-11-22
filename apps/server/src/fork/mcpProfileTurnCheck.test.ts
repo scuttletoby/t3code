@@ -391,6 +391,28 @@ describe("mcpProfileTurnCheck", () => {
       ),
   );
 
+  it.effect('builtinTools "none" runs only on Claude; Codex and OpenCode refuse the turn', () =>
+    withCheck(
+      {
+        mcpProfiles: { bare: { servers: "all", t3Tools: "all", builtinTools: "none" } },
+        mcpProfile: "bare",
+      } as Mcp,
+      [],
+      ({ calls, start }) =>
+        Effect.gen(function* () {
+          const own = appThread("own");
+          assert.strictEqual(yield* start(own, CLAUDE), "ok");
+          for (const id of [CODEX, OPENCODE]) {
+            const message = yield* start(own, id);
+            assert.include(message, 'MCP profile "bare" has builtinTools "none"');
+            assert.include(message, "Switch the thread to a Claude instance");
+            assert.include(yield* start(own, id, "resume"), "builtinTools");
+          }
+          assert.deepStrictEqual(calls, ["start:claudeAgent:own"]);
+        }),
+    ),
+  );
+
   it.effect("a profile change applies from the next turn: the running one keeps its set", () =>
     withCheck(
       {
