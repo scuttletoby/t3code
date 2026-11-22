@@ -68,7 +68,7 @@ class Corpus(unittest.TestCase):
                'override_sha': SOURCE.override_sha, 'lens_header': lens.lens_header, 'no_lens_text': lens.no_lens_text,
                'latest_checks': lens.latest_checks, 'check_state': lens.check_state, 'lens_key': lens.lens_key}
         self.assertEqual({c['fn'] for c in cases}, set(fns) | {'full_sha'})
-        wrong, changed, opt_out, no_marker, held = [], 0, 0, [], []
+        wrong, changed, opt_out, no_marker, held, folded = [], 0, 0, [], [], []
         for c in (c for c in cases if c['fn'] in fns):
             got = json.loads(json.dumps(fns[c['fn']](*c['args'])))
             if got == c['out']:
@@ -86,6 +86,15 @@ class Corpus(unittest.TestCase):
             if c['fn'] == 'lens_problem' and c['out'] is None and (got or '').startswith(lens.OPT_OUT_READ):
                 opt_out += 1   # issue #77: a hex `read at` below `not a lens:` blocks now
                 continue
+            if c['fn'] == 'lens_header' and lens.nfkc(c['args'][0]) != c['args'][0] and c['out'] \
+                    and c['out'][1] is None \
+                    and got == [c['out'][0], lens.READ_AT_RE.search(lens.nfkc(c['args'][0]))[1]]:
+                folded.append(c['args'][0])   # issue #989: `read at：<sha>` reads its sha; the source read none
+                continue
+            if c['fn'] == 'reviewed_head' and any(lens.nfkc(p.get('body') or '') != p.get('body') for p in posts) \
+                    and got[:2] == c['out'][:2] == [True, None] and lens.SHORT in got[2]:
+                folded.append(posts)   # issue #989: the same answer (reads nothing), now because that read is short
+                continue
             body = c['args'][0].get('body') or '' if c['fn'] == 'lens_problem' else ''
             if c['fn'] == 'lens_problem' and got is None and not lens.has_marker(body) \
                     and SOURCE.looks_problem(*c['args']) == c['out']:
@@ -101,6 +110,8 @@ class Corpus(unittest.TestCase):
         self.assertEqual(opt_out, 2, 'answers changed on purpose (a hex read at below not a lens:, issue #77)')
         self.assertEqual(len(no_marker), 6 + 3, 'answers changed on purpose (no lens marker, issue #865)')
         self.assertEqual(len(held), 1, 'old state: a report with an open finding and no marker blocks as before')
+        self.assertEqual(len(folded), 2, 'answers changed on purpose (a line is read in NFKC, issue #989)')
+        self.assertIn('read at\uff1aabc0abc', folded[0])   # a short sha: as a read it still reads nothing
         self.assertIn('finding: major', held[0])
         # a lens heading, `safe to merge`, report fields: never a `lens:` line or a read
         for body in (b for b in no_marker if isinstance(b, str)):
@@ -472,6 +483,67 @@ class Marker(unittest.TestCase):
         self.assertEqual(self.r.not_lens_reports(p), [])
         self.assertEqual(len(self.lines), 1)
         self.assertIn('ignored a lens-looking post https://github.test/s1', self.lines[0])
+
+
+class FullWidth(unittest.TestCase):
+    """Issue #989: a header written with the full-width colon `：` (U+FF1A), or another compatibility form NFKC folds
+    (`﹕` U+FE55, full-width letters and digits), was neither a header, nor the marker, nor a look-alike: the comment
+    counted for nothing. norm_line folds each line with NFKC first, as the findings rules (review_judge.fold) already
+    do, so it reads as the plain form it renders like."""
+    FW = f'lens： code · reviewer： x · read at： {SHA_B}\nblocker： none\nmajor： none'
+    MIXED = f'lens： code · reviewer: x · read at: {SHA_B}\nblocker: none\nmajor: none'   # blocked as broken before
+    WIDE = f'ｌｅｎｓ﹕ code · reviewer﹕ x · ｒｅａｄ ａｔ﹕ {"ｂ" * 40}\nblocker: none\nmajor: none'
+
+    def setUp(self):
+        self.r = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',), log=lambda _: None)
+
+    def test_a_full_width_header_is_a_header_and_a_read(self):
+        for body in (self.FW, self.MIXED, self.WIDE):
+            for narrow in (False, True):
+                with self.subTest(body=body, narrow=narrow):
+                    self.assertEqual(lens.lens_header(body, narrow), ('code', SHA_B))
+            with self.subTest(body=body):
+                self.assertTrue(lens.has_marker(body))
+                self.assertEqual(self.r.report_problem(post(body)), (None, None))
+                self.assertEqual(self.r.reviewed_head(pr(post(body))), (True, SHA_B, 'every lens read it'))
+
+    def test_a_broken_full_width_report_blocks_and_is_never_silent(self):   # the marker is seen: fail closed
+        for body in (f'Here is my review.\n{self.FW}', f'{self.FW}\nlens： state · reviewer： x · read at： {SHA_B}',
+                     'lens： <name> · reviewer： x · read at： <sha>\nmajor： none', f'```\n{self.FW}\n```'):
+            with self.subTest(body=body):
+                self.assertTrue(lens.has_marker(body))
+                self.assertEqual(self.r.report_problem(post(body))[1], lens.BROKEN)
+                p = pr(post(Marker.READ), post(body, when='2026-01-02T00:00:00Z'))
+                self.assertEqual(self.r.reviewed_head(p)[:2], (True, None))
+
+    def test_a_full_width_look_alike_without_the_marker_is_named(self):   # neither silent nor a read
+        for body in ('## Ｌｅｎｓ correctness\nｓａｆｅ ｔｏ ｍｅｒｇｅ： yes', '## Ｌｅｎｓ correctness\nblocker: none\nmajor: none'):
+            with self.subTest(body=body):
+                self.assertFalse(lens.has_marker(body))
+                self.assertIn(lens.NO_MARKER, self.r.not_lens_report(post(body)))
+
+    def test_old_state_an_older_full_width_read_does_not_outvote_a_newer_one(self):   # comments posted before the fix
+        newer = post(Marker.READ.replace(SHA_B, SHA_A).replace('correctness', 'code'), when='2026-01-02T00:00:00Z')
+        self.assertEqual(self.r.reviewed_head(pr(post(self.FW), newer)), (True, SHA_A, 'every lens read it'))
+        older = post(Marker.READ.replace(SHA_B, SHA_A).replace('correctness', 'code'), when='2025-12-31T00:00:00Z')
+        self.assertEqual(self.r.reviewed_head(pr(older, post(self.FW))), (True, SHA_B, 'every lens read it'))
+        edited = post(self.FW, includesCreatedEdit=True)   # edited after posting: a lens that read nothing
+        reviewed, sha, why = self.r.reviewed_head(pr(edited))
+        self.assertEqual((reviewed, sha), (True, None))
+        self.assertIn(lens.EDITED, why)
+
+    def test_runs_again_with_the_same_answer(self):   # the gate keeps no state: a re-run reads the comments afresh
+        p = pr(post(self.FW))
+        self.assertEqual(self.r.reviewed_head(p), self.r.reviewed_head(copy.deepcopy(p)))
+
+    def test_text_the_queue_posts_never_reads_as_a_lens_form(self):   # no_lens_text folds what the reader folds
+        for text in ('lens： x', f'read at： {SHA_B[:12]}', f'ｒｅａｄ ａｔ {SHA_B[:12]}', 'ｓａｆｅ ｔｏ ｍｅｒｇｅ',
+                     'lens﹦ x', f'`lens： x · read at： {SHA_B}`'):
+            for keep in (False, True):
+                with self.subTest(text=text, keep=keep):
+                    out = lens.no_lens_text(text, keep_markdown=keep)
+                    self.assertFalse(lens.has_marker(out), out)
+                    self.assertIsNone(self.r.looks_problem(post(f'pr_queue turned auto-merge OFF: {out}')), out)
 
 
 class Markdown(unittest.TestCase):

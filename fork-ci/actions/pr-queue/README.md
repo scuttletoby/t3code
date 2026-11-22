@@ -520,7 +520,11 @@ lens: correctness · reviewer: <who> · read at: <sha>
 ```
 
 `Lens:`, `**Lens:**`, `## lens:` and `- lens:` work too; the separator may be
-`·`, `,`, `—` or nothing, and `<sha>` is the full 40-hex commit sha. A shorter
+`·`, `,`, `—` or nothing, and `<sha>` is the full 40-hex commit sha. Each line
+is read in NFKC first, as the findings rules read it: the full-width colon `：`
+reads as `:` and full-width letters and digits as plain ones, so
+`lens： code · reviewer： x · read at： <sha>` is a header (issue 989: it was no
+header, no marker and no look-alike, so it silently counted for nothing). A shorter
 sha reads nothing: a force-push can bring a new commit with the same prefix. The
 sha need not still be a commit of the pull request (a rebase drops it); the
 queue re-arms only a head whose change is exactly the change read there. Each
@@ -1150,7 +1154,7 @@ replaced, and the replaced corpus was checked against the source copy before it
 was committed. A rule change here must keep the corpus green or say in its pull
 request why a recorded answer changes.
 
-The port differs on purpose in five ways, and the replay checks each recorded
+The port differs on purpose in six ways, and the replay checks each recorded
 answer that changes for its reason. The source's repository is private, so its
 comments carry no author association: the replay gives them `OWNER` and
 unedited. A read shorter than 40 hex, and a lens comment edited after posting,
@@ -1159,7 +1163,10 @@ a short read to the pull request's commits, is gone. A hidden (minimized) lens
 comment reads nothing: the source never read `isMinimized`, and no recorded
 call has it, so no recorded answer changes for it. A comment whose first line
 is `not a lens:` and that holds a hex `read at` outside a `>` quote is a lens
-that read nothing (2 recorded answers; the source cleared it).
+that read nothing (2 recorded answers; the source cleared it). A line is read in
+NFKC (issue 989), so `read at：<sha>` with the full-width colon names its sha (2
+recorded answers: the source read no sha; the one recorded sha is short, so it
+still reads nothing).
 
 `pr_queue.py` is a port of the same project's queue, and `pr_queue.test.py`
 holds that project's queue tests with the port's names. What the port changed:

@@ -18,12 +18,14 @@ report but is not exactly one valid read, or a lens comment edited after posting
 lens that read nothing, so the queue never takes a reviewed PR for an unreviewed one. A hidden override counts nothing. A read is a full 40-hex sha: a shorter one could be matched by a commit pushed later.
 """
 import re
+import unicodedata
 
-# One normaliser (norm_line) reads every line alike, plain or in a fence, a quote or an indented block: quote, list and
-# heading markers, emphasis, backticks, pipes, links and HTML tags go first, so no Markdown shape hides a header or a
-# `read at`. A header line (header_line) is a normalised line starting `lens:` with a hex `read at` in it. A first line
-# that is indented 4+ spaces, quoted or a fence is never the header (lens_header), but its header line still counts as
-# one (lens_problem: fail closed).
+# One normaliser (norm_line) reads every line alike, plain or in a fence, a quote or an indented block: NFKC first (the
+# full-width colon `：` reads as `:`, as the findings rules fold it; issue #989), then quote, list and heading markers,
+# emphasis, backticks, pipes, links and HTML tags go, so no Markdown shape hides a header or a `read at`. A header line
+# (header_line) is a normalised line starting `lens:` with a hex `read at` in it. A first line that is indented 4+
+# spaces, quoted or a fence is never the header (lens_header), but its header line still counts as one (lens_problem:
+# fail closed).
 LENS_RE = re.compile(r'lens\s*:\s*(.*)', re.I)
 # A line that starts with a lens field in a form loose_header reads (`lens:`, `lens —`, `lens –`, and `lens=` with no
 # blank before the `=`): below the first line, one with a sha is a second lens's header (lens_problem; issue #303).
@@ -62,7 +64,7 @@ EMBEDDED = 'holds a lens header line'   # lens_problem: `not a lens:` cannot cle
 OPT_OUT_READ = 'says on its first line that it is no lens report, but holds a hex read-at sha outside a `>` quote'
 # What a lens report looks like (ONE rule on normalised lines): on a plain line (outside code blocks and quotes) a
 # `lens:`, a `read at:` or `read at <hex>`, `safe to merge`, or in its first TOP_LINES plain lines a Markdown heading
-# naming a lens (LOOKS_HEADING_RE reads the raw line: normalising drops `#`), or two `covered:`/`checks:` field lines;
+# naming a lens (LOOKS_HEADING_RE: the raw line, NFKC; normalising drops `#`), or two `covered:`/`checks:` field lines;
 # on ANY line, fenced, indented or quoted too, a `read at` with a hex sha, a header line or a `lens:` field with any hex
 # sha (loose_header). Such a comment without a valid first-line header is a lens that read nothing when it carries the
 # lens marker (has_marker) or, without it, holds an open finding (Review.report_problem); else it is no lens report at
@@ -160,10 +162,18 @@ def clean_inline(text, narrow=False):
     return re.sub(r'(?<![^\W_])_+|_+(?![^\W_])', '', text)
 
 
+def nfkc(text):
+    """The text in NFKC: a compatibility form reads as the plain one it renders like (`：` U+FF1A and `﹕` U+FE55 as
+    `:`, full-width letters and digits as ASCII). Without it a header written with one was neither a header, nor the
+    marker, nor a look-alike, so the comment silently counted for nothing (issue #989)."""
+    return unicodedata.normalize('NFKC', text)
+
+
 def norm_line(line, narrow=False):
-    """One line as lens_problem and lens_header read it: clean_inline, then any leading quote markers, list markers (`-`
-    `+` `•` `1.` `1)`, a task box `[x]`; `*` is gone already), heading marks and `~~~` fences stripped."""
-    return LEADING_MARKERS_RE.sub('', clean_inline(line, narrow), count=1).strip()
+    """One line as lens_problem and lens_header read it: nfkc, clean_inline, then any leading quote markers, list
+    markers (`-` `+` `•` `1.` `1)`, a task box `[x]`; `*` is gone already), heading marks and `~~~` fences stripped.
+    Markdown structure (opens_plain, fences, quotes) is still read on the raw line, as GitHub renders it."""
+    return LEADING_MARKERS_RE.sub('', clean_inline(nfkc(line), narrow), count=1).strip()
 
 
 # Every leading marker in one match (issue #72: one re.sub per marker took 0.3-0.7 s for a 64 KB line of them). The same
@@ -309,7 +319,9 @@ def no_lens_text(text, keep_markdown=False):
     no `safe to merge`. keep_markdown: the
     queue's own advice (a command in backticks, a `<sha>` placeholder) stays as written when, read without its markdown
     either way (clean_inline narrow or not), it holds none of these; otherwise it is cleaned like any other text. A
-    REPOST in the text (a held reason) is posted as REPOST_PLAIN, as written, when the whole stays free of them."""
+    REPOST in the text (a held reason) is posted as REPOST_PLAIN, as written, when the whole stays free of them. The
+    text is NFKC first, as the reader folds it (norm_line): `lens：` is a lens field there too (issue #989)."""
+    text = nfkc(text)
     if REPOST in text:
         out = REPOST_PLAIN.join(no_lens_text(part, keep_markdown) for part in text.split(REPOST))
         if _lens_free(out):
@@ -484,7 +496,7 @@ class Review:
         if sum(bool(FIELD_LINE_RE.match(norm(line))) for line in plain) >= 2:   # fields of a headerless report
             return start
         if any(READ_AT_RE.search(line) for line in normed) or any(LOOKS_RE.search(norm(line)) for line in plain) \
-                or any(LOOKS_HEADING_RE.match(line) for line in plain[:TOP_LINES]):
+                or any(LOOKS_HEADING_RE.match(nfkc(line)) for line in plain[:TOP_LINES]):
             return start
         return None
 

@@ -23,8 +23,8 @@ The examples use the override prefix `tool ready --head`. A project's prefix is 
 
 ## The lens marker
 
-A comment carries the lens marker when one of its lines, read with Markdown stripped (emphasis, links, tags, quote,
-list and heading marks), in a code block or quote too:
+A comment carries the lens marker when one of its lines, read in NFKC (a full-width colon `：` is a colon) with
+Markdown stripped (emphasis, links, tags, quote, list and heading marks), in a code block or quote too:
 
 - starts with the lens field: `lens:` (also `lens=`, `lens —`, `lens –`), or
 - names a read: `read at` and a hex sha (`read at: 0123abc`, `read-at 0123abc`), or

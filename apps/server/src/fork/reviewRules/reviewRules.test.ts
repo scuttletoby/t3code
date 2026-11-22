@@ -220,8 +220,20 @@ describe("the shared vectors", () => {
     };
     const cases = CORPUS.filter((c) => c.fn in fns);
     assert.strictEqual(cases.length, 528 + 46);
-    for (const c of cases)
-      assert.deepStrictEqual(fns[c.fn]!(...c.args), c.out, JSON.stringify(c.args));
+    // A line is read in NFKC, so `read at：<sha>` reads its sha where the source read none: the one recorded answer
+    // that changes on purpose (lens.test.py's Corpus counts it too). Its sha is short, so it still reads nothing.
+    const folded = cases.filter(
+      (c) =>
+        c.fn === "lens_header" && c.args[0].normalize("NFKC") !== c.args[0] && c.out?.[1] === null,
+    );
+    assert.deepStrictEqual(
+      folded.map((c) => c.args[0]),
+      ["lens: correctness · reviewer: lens-x (Opus xhigh) · read at\uff1aabc0abc"],
+    );
+    for (const c of cases) {
+      const want = folded.includes(c) ? [c.out[0], "abc0abc"] : c.out;
+      assert.deepStrictEqual(fns[c.fn]!(...c.args), want, JSON.stringify(c.args));
+    }
   });
 });
 
