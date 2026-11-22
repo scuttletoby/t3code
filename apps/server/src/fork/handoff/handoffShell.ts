@@ -1,7 +1,8 @@
 /**
- * Fork: a completed quiet handoff run shows in the thread shell as upstream's stopped run
- * (`latestRunStopRequested`), so the browser's notice and the relay stay quiet through upstream's
- * own gates. One rule, read in the shell's JavaScript path and mirrored in its SQL path.
+ * Fork: a completed quiet handoff run, or the `agent` source's write turn before it, shows in the
+ * thread shell as upstream's stopped run (`latestRunStopRequested`), so the browser's notice and
+ * the relay stay quiet through upstream's own gates. One rule, read in the shell's JavaScript path
+ * and mirrored in its SQL path.
  */
 import type {
   OrchestrationV2ConversationMessage,
@@ -16,7 +17,9 @@ import {
   HANDOFF_LOUD_SUFFIX,
   HANDOFF_MESSAGE_PREFIX,
   HANDOFF_RETRY_SUFFIX,
+  HANDOFF_WRITE_PREFIX,
   parseHandoffMessageId,
+  parseHandoffWrite,
 } from "./handoffFacts.ts";
 
 /**
@@ -30,11 +33,18 @@ type QuietMessage = Pick<
   "id" | "runId" | "createdBy" | "creationSource"
 >;
 
+/** The source run a handoff run or a write turn names, when it may be quiet (not loud, no retry). */
+function quietCandidate(threadId: ThreadId, messageId: string): string | null {
+  const handoff = parseHandoffMessageId(threadId, messageId);
+  if (handoff !== null) return handoff.retry || handoff.loud ? null : handoff.runId;
+  const write = parseHandoffWrite(threadId, messageId);
+  return write === null || write.loud ? null : write.runId;
+}
+
 /**
- * A completed first-send handoff run, not marked loud (its settle saw the relay show the person's
- * finish at every check), sent by the server, no message of the person's in it, and requested at
- * least the relay's hold after the person's run finished (so their alert went out). Anything else,
- * a retry included, alerts as the turn's finish.
+ * A completed first-send handoff run or write turn, not loud, sent by the server, with no message
+ * of the person's, requested at least the relay's hold after the person's run finished. Anything
+ * else (a retry, a steered write turn) alerts; a failed write turn is upstream's failed run.
  */
 export function isQuietHandoffRun(
   threadId: ThreadId,
@@ -43,14 +53,14 @@ export function isQuietHandoffRun(
   sourceRun: Pick<OrchestrationV2Run, "id" | "completedAt"> | undefined,
 ): boolean {
   if (run.status !== "completed") return false;
-  const handoff = parseHandoffMessageId(threadId, run.userMessageId);
-  if (handoff === null || handoff.retry || handoff.loud) return false;
+  const sourceRunId = quietCandidate(threadId, run.userMessageId);
+  if (sourceRunId === null) return false;
   const prompt = messages.find((message) => message.id === run.userMessageId);
   if (prompt?.createdBy !== "agent" || prompt.creationSource !== "server") return false;
   if (messages.some((message) => message.runId === run.id && message.createdBy === "user")) {
     return false;
   }
-  if (sourceRun?.id !== handoff.runId || sourceRun.completedAt == null) return false;
+  if (sourceRun?.id !== sourceRunId || sourceRun.completedAt == null) return false;
   return (
     DateTime.toEpochMillis(run.requestedAt) - DateTime.toEpochMillis(sourceRun.completedAt) >=
     RELAY_COMPLETION_HOLD_MS
@@ -66,9 +76,9 @@ export function quietHandoffShellMark(
   latestRun: OrchestrationV2Run | null | undefined,
 ): { readonly latestRunStopRequested?: true } {
   if (latestRun == null) return {};
-  const handoff = parseHandoffMessageId(projection.thread.id, latestRun.userMessageId);
-  if (handoff === null) return {};
-  const sourceRun = projection.runs.find((run) => run.id === handoff.runId);
+  const sourceRunId = quietCandidate(projection.thread.id, latestRun.userMessageId);
+  if (sourceRunId === null) return {};
+  const sourceRun = projection.runs.find((run) => run.id === sourceRunId);
   return isQuietHandoffRun(projection.thread.id, latestRun, projection.messages, sourceRun)
     ? { latestRunStopRequested: true }
     : {};
@@ -76,19 +86,25 @@ export function quietHandoffShellMark(
 
 /**
  * `isQuietHandoffRun` in SQL, for the run row `alias` of the shell read, followed by `OR`: it goes
- * right before upstream's stop-request `EXISTS`, so the column is true for a quiet handoff run too.
- * The id checks come first (a CASE), so any other run skips the lookups.
+ * right before upstream's stop-request `EXISTS`, so the column is true for a quiet handoff run or
+ * write turn too. The id checks come first (a CASE), so any other run skips the lookups.
  */
 export const quietHandoffRunOrSql = (sql: SqlClient.SqlClient, alias: string) => {
   const run = sql.literal(alias);
   const messageId = sql`json_extract(${run}.payload_json, '$.userMessageId')`;
-  const prefix = sql`(${HANDOFF_MESSAGE_PREFIX} || ${run}.thread_id || ':')`;
-  // What follows the prefix: the source run's id when neither suffix ends it.
-  const rest = sql`substr(${messageId}, length(${prefix}) + 1)`;
+  const prefixOf = (kind: string) => sql`(${kind} || ${run}.thread_id || ':')`;
+  const startsWith = (kind: string) =>
+    sql`substr(${messageId}, 1, length(${prefixOf(kind)})) = ${prefixOf(kind)}`;
+  // What follows the handoff or write-turn prefix: the source run's id when no suffix ends it.
+  const rest = sql`(CASE
+    WHEN ${startsWith(HANDOFF_MESSAGE_PREFIX)}
+      THEN substr(${messageId}, length(${prefixOf(HANDOFF_MESSAGE_PREFIX)}) + 1)
+    WHEN ${startsWith(HANDOFF_WRITE_PREFIX)}
+      THEN substr(${messageId}, length(${prefixOf(HANDOFF_WRITE_PREFIX)}) + 1)
+    ELSE '' END)`;
   const endsWith = (suffix: string) => sql`substr(${rest}, ${-suffix.length}) = ${suffix}`;
   return sql`COALESCE((CASE
     WHEN ${run}.status = 'completed'
-      AND substr(${messageId}, 1, length(${prefix})) = ${prefix}
       AND ${rest} <> ''
       AND NOT ${endsWith(HANDOFF_RETRY_SUFFIX)}
       AND NOT ${endsWith(HANDOFF_LOUD_SUFFIX)}

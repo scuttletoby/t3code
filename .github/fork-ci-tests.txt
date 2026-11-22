@@ -72,6 +72,7 @@
 .github/scripts/fork-vitest-gc-check.test.cjs
 .github/scripts/fork-workflow-triggers.test.cjs
 fork-ci/actions/ci-demand/ci_demand.test.py ~17s
+fork-ci/actions/doc-check/doc_check.test.py
 fork-ci/actions/docs-scope/docs-scope.test.py ~12s
 fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/fleet-watch/fleet_watch.test.py
@@ -127,11 +128,14 @@ fork-kit/golive/tests/rehearse.test.py ~56s
 fork-kit/golive/tests/switch.test.py ~109s
 fork-kit/gh-apps/tests/install.test.py
 fork-kit/gh-apps/tests/mint.test.py
+fork-kit/gh-apps/tests/parity.test.py
 fork-kit/gh-apps/tests/policy.test.py
 fork-kit/gh-apps/tests/run.test.py
 fork-kit/gh-apps/tests/wrapper.test.py
 # Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
+fork-kit/heavy/tests/capacity_rule.test.py ~5s
+fork-kit/heavy/tests/facts.test.py ~30s
 fork-kit/heavy/tests/install.test.py ~8s
 fork-kit/heavy/tests/measure.test.py ~10s
 fork-kit/heavy/tests/queue.test.py ~18s

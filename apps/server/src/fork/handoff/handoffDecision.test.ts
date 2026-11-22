@@ -74,7 +74,11 @@ describe("handoffDecision: when", () => {
       kind: "sleep",
       untilMs: expiry - 2 * MINUTE,
     });
-    expect(HANDOFF_IDLE_LEAD_MS).toEqual({ agent: 4 * MINUTE, command: 2 * MINUTE });
+    expect(HANDOFF_IDLE_LEAD_MS).toEqual({
+      none: 4 * MINUTE,
+      agent: 4 * MINUTE,
+      command: 2 * MINUTE,
+    });
   });
 
   it("counts exactly the idle size as idle (at 75,000 or more), one token less as too small", () => {

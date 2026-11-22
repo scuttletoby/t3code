@@ -227,7 +227,9 @@ def main(argv):
     app_name = repo = None
     args = list(argv)
     try:
-        while args and args[0] in ('--app', '--repo') and len(args) > 1:
+        seen = set()
+        while args and args[0] in ('--app', '--repo') and len(args) > 1 and args[0] not in seen:
+            seen.add(args[0])   # each at most once, as in the wrapper: a repeated one is a usage error, not last-wins
             if args[0] == '--app':
                 app_name = args[1]
             else:
