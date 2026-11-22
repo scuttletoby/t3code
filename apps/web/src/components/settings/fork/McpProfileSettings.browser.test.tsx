@@ -127,6 +127,16 @@ describe("McpProfileSettings", () => {
     expect(state.update).not.toHaveBeenCalled();
   });
 
+  it("says under the T3 tool groups that a profile is not a sandbox", async () => {
+    setup({});
+    await using screen = await render(<McpProfileSettings isProjectScope={false} />);
+    await userEvent.click(screen.getByRole("button", { name: "Add profile" }));
+    await expect
+      .element(screen.getByText(/^Profiles are not a sandbox: only requests/))
+      .toBeVisible();
+    await expect.element(screen.getByText(/the `t3 thread` CLI/)).toBeVisible();
+  });
+
   it("shows an entry from a newer build as broken, with no Edit", async () => {
     setup({ mcpProfiles: { newer: { servers: "all", t3Tools: "all", hosts: ["a"] } } });
     await using screen = await render(<McpProfileSettings isProjectScope={false} />);
