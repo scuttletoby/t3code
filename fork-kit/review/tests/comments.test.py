@@ -541,11 +541,13 @@ class SkillFormat(unittest.TestCase):
                               '"Which fork version")', ' '.join(kit_text(name).split()))
 
     def test_review_md_says_which_decides_the_runner(self):
-        """REVIEW.md says whether its file or T3's review rules setting decides the runner (#797). It says nothing in
-        T3 reads the setting yet; when T3's docs stop saying so, this fails and REVIEW.md must be read again."""
+        """REVIEW.md says whether its file or T3's review rules setting decides the runner (#797): T3's `lens_start`
+        reads the setting for the lenses it starts (only in enforce mode), this file for the lenses started by hand.
+        When T3's docs stop saying so, this fails and REVIEW.md must be read again."""
         review = ' '.join(kit_text('REVIEW.md').split())
-        for words in ("**This file or T3's review rules setting:**", 'Nothing in T3 reads it yet, so today this file '
-                      'decides', "T3's setting the lenses T3 starts on that machine",
+        for words in ("**This file or T3's review rules setting:**", "While it is on, T3's `lens_start` tool reads it",
+                      "T3's setting the runner of every lens `lens_start` starts on that machine",
+                      'it starts lenses only for a `review` block in `enforce` mode',
                       'this file every lens an agent starts by hand from the skill and what `plan` prints',
                       'the gate does not read either'):
             with self.subTest(says=words):
@@ -553,7 +555,9 @@ class SkillFormat(unittest.TestCase):
         with open(os.path.join(REPO, 'docs', 'fork', 'README.md'), encoding='utf-8') as f:
             t3 = ' '.join(f.read().split())
         self.assertIn('`reviewRules`', t3)
-        self.assertIn('Nothing reads it yet', t3)
+        self.assertIn('While it is on, the T3 tool `lens_start` (below) reads it', t3)
+        self.assertIn('so outside `enforce` it refuses', t3)
+        self.assertNotIn('Nothing reads it yet', t3)
 
     def test_the_skill_says_whichever_is_higher(self):
         """review_round takes the higher of the change count and the round marker, never the sum."""
