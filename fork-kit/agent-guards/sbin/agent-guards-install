@@ -16,11 +16,14 @@ hook it names is always there. Safe to run again, and to stop at any step; one i
 kit shares are in fork-kit/common/kit_install.py.
 
 Rolling back is `install --no-settings`: the hooks stay, new sessions no longer run them. A session that started
-while the drop-in was there keeps running the hooks it started with, so uninstall (which removes the hook files)
-refuses while such a session runs (a `claude` process older than the drop-in's removal, kept as "settingsOff" in
-config.json), and while a settings file the kit did not write names a kit hook (managed-settings.json, another
-managed-settings.d file, a user's ~/.claude*/settings*.json): a hook that is gone refuses every Bash command
-there. Uninstall with the drop-in still there removes it first, then checks.
+while the hooks were wired keeps running the hooks it started with, so uninstall (which removes the hook files)
+refuses while a settings file the kit did not write names a kit hook (managed-settings.json, another
+managed-settings.d file, a user's ~/.claude*/settings*.json, a running session's project .claude/settings*.json),
+and while such a session runs: a Claude Code process (found by the real path of its program, not its name) older
+than the drop-in's removal ("settingsOff" in config.json), or older than this uninstall when a hand-wired entry was
+seen before (hand-wired-seen.json) or the drop-in was never on. It refuses with its own message when it runs inside
+such a session: run it from a terminal. A hook that is gone refuses every Bash command there. Uninstall with the
+drop-in still there removes it first, then checks.
 """
 import contextlib, glob, json, os, pwd, sys, time
 _kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -140,16 +143,108 @@ class AgentGuardsInstaller(kit_install.Installer):
         self.settings_off()
 
     HOMES = None          # tests only: the home folders searched for user settings (default: every passwd entry)
-    CLAUDE = 'claude'     # Claude Code's process name
+    HAND_WIRED = ETC + '/hand-wired-seen.json'   # when a settings file the kit did not write last named a hook
+    CLAUDE_PATHS = ('/claude/versions/', '/@anthropic-ai/claude-code')   # in a Claude Code program's real path
 
-    def foreign_settings(self):
-        """Settings files the kit did not write that name a kit hook (or cannot be read), as (path, why)."""
-        homes = self.HOMES if self.HOMES is not None else sorted({e.pw_dir for e in pwd.getpwall() if e.pw_dir})
+    def homes(self):
+        return self.HOMES if self.HOMES is not None else sorted({e.pw_dir for e in pwd.getpwall() if e.pw_dir})
+
+    def home_path(self, home, *rel):
+        return os.path.join(self.p(home) if self.HOMES is None else home, *rel)
+
+    def installed_claude(self):
+        """The real paths of the Claude Code programs installed where a session finds them: each user's
+        ~/.local/bin/claude, /usr/local/bin/claude, /usr/bin/claude."""
+        out = set()
+        for path in [self.home_path(h, '.local', 'bin', 'claude') for h in self.homes()] + \
+                [self.p('/usr/local/bin/claude'), self.p('/usr/bin/claude')]:
+            if os.path.exists(path):
+                out.add(os.path.realpath(path))
+        return out
+
+    def proc_link(self, pid, name):
+        """The target of /proc/<pid>/<name> (exe, cwd) as the kernel gives it, or None."""
+        try:
+            return os.readlink(f'{self.PROC}/{pid}/{name}').removesuffix(' (deleted)')
+        except OSError:
+            return None
+
+    def is_claude(self, pid, args, installed):
+        """Whether the process runs Claude Code, by the real path of its program (/proc/<pid>/exe: the native build
+        in .../claude/versions/<v>, under any name or link), of the script node runs (argv[1] in the
+        @anthropic-ai/claude-code package, through any link), or of an installed `claude`. The name alone (argv[0]
+        `claude`) counts too."""
+        cwd = self.proc_link(pid, 'cwd') or '/'
+        paths = [self.proc_link(pid, 'exe') or '']
+        for a in args[:2]:
+            paths.append(a)
+            if '/' in a:
+                paths.append(os.path.realpath(os.path.join(cwd, a)))
+        return any(p and (os.path.basename(p) == 'claude' or any(c in p for c in self.CLAUDE_PATHS)
+                          or p in installed) for p in paths)
+
+    def sessions(self):
+        """The running Claude Code sessions: dicts with pid, args, start (epoch seconds, None when unreadable), cwd
+        (None when unreadable) and own (an ancestor of this uninstall: it runs inside that session)."""
+        try:
+            boot, tick = self.boot_time(), os.sysconf('SC_CLK_TCK')
+        except (OSError, ValueError) as e:
+            raise self.Refused(f'{self.PROC}/stat cannot be read ({e}): uninstall cannot see which Claude Code '
+                               'sessions run') from None
+        ancestors, pid = set(), os.getpid()
+        while pid > 1 and pid not in ancestors:   # this uninstall and what started it (sudo, a shell, a session)
+            ancestors.add(pid)
+            try:
+                with open(f'{self.PROC}/{pid}/stat', 'rb') as f:
+                    pid = int(f.read().rpartition(b')')[2].split()[1])
+            except (OSError, ValueError, IndexError):
+                break
+        installed, out = self.installed_claude(), []
+        for name in sorted((n for n in os.listdir(self.PROC) if n.isdigit()), key=int):
+            if int(name) == os.getpid():
+                continue
+            try:
+                with open(f'{self.PROC}/{name}/cmdline', 'rb') as f:
+                    args = [a.decode('utf-8', 'replace') for a in f.read().split(b'\0') if a]
+            except OSError:
+                continue
+            if not self.is_claude(name, args, installed):
+                continue
+            try:
+                with open(f'{self.PROC}/{name}/stat', 'rb') as f:
+                    start = boot + int(f.read().rpartition(b')')[2].split()[19]) / tick
+            except (OSError, ValueError, IndexError):
+                start = None
+            out.append({'pid': int(name), 'args': args, 'start': start, 'cwd': self.proc_link(name, 'cwd'),
+                        'own': int(name) in ancestors})
+        return out
+
+    def older_sessions(self, since, sessions=None):
+        """The sessions that started before `since` (epoch seconds), or whose start cannot be read."""
+        return [s for s in (self.sessions() if sessions is None else sessions)
+                if s['start'] is None or s['start'] < since]
+
+    def project_settings(self, sessions):
+        """The project settings files a running session may have read: .claude/settings*.json in its working folder
+        and each folder above it (where /proc shows the folder)."""
+        files = []
+        for s in sessions:
+            d = s['cwd']
+            while d and os.path.isabs(d):
+                files += sorted(glob.glob(os.path.join(d, '.claude', 'settings*.json')))
+                if d == os.path.dirname(d):
+                    break
+                d = os.path.dirname(d)
+        return files
+
+    def foreign_settings(self, sessions=()):
+        """Settings files the kit did not write that name a kit hook (or cannot be read), as (path, why): managed
+        settings, each user's ~/.claude*/settings*.json, and the project settings of running sessions."""
         files = [self.p(f'{wiring.MANAGED_DIR}/managed-settings.json')]
         files += sorted(glob.glob(self.p(f'{os.path.dirname(wiring.DROP_IN)}/*')))
-        for home in homes:
-            files += sorted(glob.glob(os.path.join(self.p(home) if self.HOMES is None else home, '.claude*',
-                                                   'settings*.json')))
+        for home in self.homes():
+            files += sorted(glob.glob(self.home_path(home, '.claude*', 'settings*.json')))
+        files += self.project_settings(sessions)
         names = [f'{wiring.BIN}/{h}' for h in HOOKS]
         found = []
         for f in dict.fromkeys(files):
@@ -175,62 +270,59 @@ class AgentGuardsInstaller(kit_install.Installer):
                     return int(line.split()[1])
         raise ValueError('no btime')
 
-    def older_sessions(self, since):
-        """`claude` processes that started before `since` (epoch seconds), one line each; a process whose start
-        cannot be read counts as older."""
+    def hand_wired_seen(self):
+        """The time a settings file the kit did not write was last seen naming a hook (an earlier uninstall refused
+        for it), or None. Kept in <etc>, which uninstall removes last."""
         try:
-            boot, tick = self.boot_time(), os.sysconf('SC_CLK_TCK')
-        except (OSError, ValueError) as e:
-            raise self.Refused(f'{self.PROC}/stat cannot be read ({e}): uninstall cannot see which Claude Code '
-                               'sessions are older than the removal of the drop-in') from None
-        mine, pid = set(), os.getpid()
-        while pid > 1 and pid not in mine:   # this uninstall and what started it (a session running sudo)
-            mine.add(pid)
-            try:
-                with open(f'{self.PROC}/{pid}/stat', 'rb') as f:
-                    pid = int(f.read().rpartition(b')')[2].split()[1])
-            except (OSError, ValueError, IndexError):
-                break
-        out = []
-        for name in sorted((n for n in os.listdir(self.PROC) if n.isdigit()), key=int):
-            if int(name) in mine:
-                continue
-            try:
-                with open(f'{self.PROC}/{name}/cmdline', 'rb') as f:
-                    args = [a.decode('utf-8', 'replace') for a in f.read().split(b'\0') if a]
-            except OSError:
-                continue
-            if not any(os.path.basename(a) == self.CLAUDE for a in args[:2]) \
-                    and not any('@anthropic-ai/claude-code' in a for a in args[:2]):
-                continue
-            try:
-                with open(f'{self.PROC}/{name}/stat', 'rb') as f:
-                    start = boot + int(f.read().rpartition(b')')[2].split()[19]) / tick
-            except (OSError, ValueError, IndexError):
-                start = None
-            if start is None or start < since:
-                out.append(f'process {name}: {" ".join(args)[:200]}')
-        return out
+            with open(self.p(self.HAND_WIRED), encoding='utf-8') as f:
+                t = json.load(f).get('seen')
+            return t if isinstance(t, (int, float)) and not isinstance(t, bool) else time.time()
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, AttributeError):
+            return time.time()   # a broken record: count it as seen now (more sessions older, never fewer)
+
+    def show(self, f):
+        return f[len(self.PREFIX):] if self.PREFIX and f.startswith(self.PREFIX) else f
 
     @contextlib.contextmanager
     def uninstall_guard(self):
-        foreign = self.foreign_settings()
+        sessions = self.sessions()
+        foreign = self.foreign_settings(sessions)
         if foreign:
+            if os.path.isdir(self.p(self.ETC)):   # the second run still checks the sessions that read those entries
+                self.write_file(self.HAND_WIRED, json.dumps({'seen': int(time.time()) + 1}) + '\n')
             raise self.Refused('uninstall refused: a settings file this kit did not write names a kit hook, and '
                                'with the hook gone it would refuse every Bash command there:\n  '
-                               + '\n  '.join(f'{f[len(self.PREFIX):] if f.startswith(self.PREFIX) else f}: {why}'
-                                             for f, why in foreign)
-                               + '\nRemove those entries by hand and run uninstall again')
+                               + '\n  '.join(f'{self.show(f)}: {why}' for f, why in foreign)
+                               + '\nRemove those entries by hand and run uninstall again (it then also waits for the '
+                               'sessions that started with them)')
         self.settings_off()
         off = self.read_config().get('settingsOff')
-        if isinstance(off, (int, float)) and not isinstance(off, bool):
-            older = self.older_sessions(off)
-            if older:
-                raise self.Refused('uninstall refused: these Claude Code sessions started while the hooks were in '
-                                   'managed settings and still run them; with the hooks gone they would refuse every '
-                                   'Bash command:\n  ' + '\n  '.join(older) + '\nThe drop-in is removed, so new '
-                                   'sessions do not run the hooks. Let these end (or stop them) and run uninstall '
-                                   'again')
+        seen = self.hand_wired_seen()
+        if seen is not None:
+            since = int(time.time()) + 1
+            why = ('a settings file the kit did not write named the hooks (seen by an earlier uninstall), so every '
+                   'session older than this uninstall may run them')
+        elif isinstance(off, (int, float)) and not isinstance(off, bool):
+            since = off
+            why = 'these sessions started while the hooks were in managed settings and still run them'
+        else:
+            since = int(time.time()) + 1
+            why = ('the kit\'s drop-in was never on, so the hooks can only be wired by hand, in a file uninstall may '
+                   'not see; every session older than this uninstall may run them')
+        older = self.older_sessions(since, sessions)
+        own = [s for s in older if s['own']]
+        if own:
+            raise self.Refused(f'uninstall refused: it runs inside Claude Code session process {own[0]["pid"]}, which '
+                               'has the hooks; with them gone that session would refuse every Bash command. Run '
+                               'uninstall from a terminal, not from a Claude Code session that has the hooks')
+        if older:
+            raise self.Refused(f'uninstall refused: {why}; with the hooks gone they would refuse every Bash '
+                               'command:\n  ' + '\n  '.join(f'process {s["pid"]}: {" ".join(s["args"])[:200]}'
+                                                            for s in older)
+                               + '\nNew sessions do not run the kit\'s drop-in. Let these end (or stop them) and run '
+                               'uninstall again')
         yield
 
     def _remove(self):

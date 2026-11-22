@@ -34,9 +34,9 @@ class Install(fx.FakeHost):
         os.makedirs(self.homes)
         self.m.HOMES = [os.path.join(self.homes, 'agent')]
 
-    def session(self, pid, argv=('claude', '-p'), started=None):
+    def session(self, pid, argv=('claude', '-p'), started=None, exe=None, cwd=None, ppid=1):
         """A fake process in PROC: argv, started at `started` (epoch seconds; default: at boot). started='bad': a
-        stat that cannot be read."""
+        stat that cannot be read. exe, cwd: the targets of its /proc links; ppid: its parent."""
         d = os.path.join(self.m.PROC, str(pid))
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, 'cmdline'), 'wb') as f:
@@ -46,7 +46,10 @@ class Install(fx.FakeHost):
                 f.write('garbled')
             else:
                 ticks = int(((started or self.boot) - self.boot) * os.sysconf('SC_CLK_TCK'))
-                f.write(f'{pid} (node) S 1 ' + ' '.join(['0'] * 17) + f' {ticks} 0 0\n')
+                f.write(f'{pid} (node) S {ppid} ' + ' '.join(['0'] * 17) + f' {ticks} 0 0\n')
+        for name, target in (('exe', exe), ('cwd', cwd)):
+            if target:
+                os.symlink(target, os.path.join(d, name))
         return d
 
     def config(self):
@@ -286,6 +289,121 @@ class Install(fx.FakeHost):
         self.assertEqual(code, 1)
         self.assertIn('only root can write', err)
         self.assertEqual(os.listdir(self.path(wiring.MANAGED_DIR)), [])
+
+    # PR 847 round 2: uninstall's running-session check (lens B minor 2, lens A minors 1 and 2)
+    HAND = '/etc/agent-guards/hand-wired-seen.json'
+    ENTRY = {'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [
+        {'type': 'command', 'command': '/usr/local/bin/actions-disable-guard'}]}]}}
+
+    def make(self, rel, text='', mode=0o644):
+        path = os.path.join(self.host, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(text)
+        os.chmod(path, mode)
+        return path
+
+    def assert_uninstall_refused(self, *parts):
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1, err)
+        for part in parts:
+            self.assertIn(part, err)
+        self.assertTrue(self.is_file('/usr/local/bin/actions-disable-guard'))
+        return err
+
+    def test_r2_minorB2_a_session_is_found_by_its_program_path_not_its_name(self):
+        native = self.make('home/agent/.local/share/claude/versions/2.1.9', '#!/bin/sh\n', 0o755)
+        os.makedirs(os.path.join(self.m.HOMES[0], '.local', 'bin'))
+        os.symlink(native, os.path.join(self.m.HOMES[0], '.local', 'bin', 'claude'))
+        cli = self.make('opt/node_modules/@anthropic-ai/claude-code/cli.js')
+        work = os.path.join(self.host, 'work')
+        os.makedirs(work)
+        os.symlink(cli, os.path.join(work, 'cc.js'))
+        other = self.make('opt/elsewhere/agent-bin', '#!/bin/sh\n', 0o755)
+        os.unlink(os.path.join(self.m.HOMES[0], '.local', 'bin', 'claude'))
+        os.symlink(other, os.path.join(self.m.HOMES[0], '.local', 'bin', 'claude'))   # an install in its own folder
+        for argv, exe, cwd in ((('cc', '-p', 'x'), native, None),                    # a renamed link to the build
+                               (('foo', '-p'), native + ' (deleted)', None),         # exec -a, updated since
+                               (('/usr/bin/node', './cc.js', '-p'), '/usr/bin/node', work),   # node, a link to cli.js
+                               (('agent-bin', '-p'), other, None)):                  # the installed `claude`
+            with self.subTest(argv=argv):
+                self.fresh()
+                self.assertEqual(self.install('--settings')[0], 0)
+                d = self.session(4242, argv, exe=exe, cwd=cwd)
+                self.assert_uninstall_refused('process 4242', 'started while the hooks were in managed settings')
+                shutil.rmtree(d)
+        self.session(4243, ('bash', '-c', 'claude'), exe='/usr/bin/bash')            # not Claude Code itself
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+
+    def test_r2_minorA1_uninstall_run_inside_a_session_that_has_the_hooks_is_refused(self):
+        self.assertEqual(self.install('--settings')[0], 0)
+        self.session(os.getpid(), ('python3', 'agent-guards-install'), started=time.time(), ppid=5001)
+        self.session(5001, ('sudo', 'agent-guards-install'), started=time.time(), ppid=5000)
+        self.session(5000, ('claude',), ppid=1)                       # the session whose Bash tool ran sudo
+        self.assert_uninstall_refused('inside Claude Code session process 5000',
+                                      'Run uninstall from a terminal')
+        shutil.rmtree(os.path.join(self.m.PROC, '5000'))              # a session that started after the drop-in went
+        self.session(5000, ('claude',), started=time.time() + 5, ppid=1)
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+
+    def test_r2_minorA2_after_hand_wired_entries_go_the_next_uninstall_still_waits_for_older_sessions(self):
+        user = os.path.join(self.m.HOMES[0], '.claude', 'settings.json')
+        for name in ('no drop-in ever', 'drop-in removed earlier'):
+            with self.subTest(name):
+                self.fresh()
+                self.assertEqual(self.install('--settings' if name != 'no drop-in ever' else '--no-settings')[0], 0)
+                if name == 'drop-in removed earlier':
+                    self.assertEqual(self.install('--no-settings')[0], 0)
+                    cfg = dict(self.config(), settingsOff=self.boot + 10)     # removed long ago
+                    with open(self.path(CONFIG), 'w') as f:
+                        json.dump(cfg, f)
+                os.makedirs(os.path.dirname(user), exist_ok=True)
+                with open(user, 'w') as f:
+                    json.dump(self.ENTRY, f)
+                d = self.session(4242, started=self.boot + 100)              # started with the hand-wired entry
+                self.assert_uninstall_refused('names /usr/local/bin/actions-disable-guard')
+                os.unlink(user)                                               # the owner removes it, runs again
+                self.assert_uninstall_refused('process 4242', 'named the hooks')
+                self.assert_uninstall_refused('process 4242')                 # and again: still
+                shutil.rmtree(d)
+                self.assertEqual(self.run_main('uninstall')[0], 0)
+                self.assertFalse(os.path.lexists(self.path('/etc/agent-guards')))
+
+    def test_r2_minorA2_without_the_drop_in_ever_on_every_older_session_counts(self):
+        self.assertEqual(self.install()[0], 0)
+        d = self.session(4242)
+        self.assert_uninstall_refused('process 4242', 'drop-in was never on')
+        shutil.rmtree(d)
+        self.session(4243, started=time.time() + 5)
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+
+    def test_r2_minorA2_project_settings_of_a_running_session_are_searched(self):
+        proj = os.path.join(self.host, 'proj')
+        self.make('proj/.claude/settings.local.json', json.dumps(self.ENTRY))
+        os.makedirs(os.path.join(proj, 'sub'))
+        self.assertEqual(self.install('--settings')[0], 0)
+        d = self.session(4242, started=time.time() + 5, cwd=os.path.join(proj, 'sub'))   # newer: has no drop-in
+        err = self.assert_uninstall_refused('names /usr/local/bin/actions-disable-guard')
+        self.assertIn(os.path.join(proj, '.claude', 'settings.local.json'), err)
+        shutil.rmtree(d)
+        self.assertEqual(self.run_main('uninstall')[0], 0)            # a project no session runs in is not read
+
+    def test_r2_state_an_uninstall_stopped_after_the_hand_wired_record_or_a_broken_record_still_counts(self):
+        for text in (json.dumps({'seen': self.boot + 200}), 'garbled', '[]', json.dumps({'seen': 'x'})):
+            with self.subTest(text):
+                self.fresh()
+                self.assertEqual(self.install('--settings')[0], 0)
+                self.assertEqual(self.install('--no-settings')[0], 0)
+                with open(self.path(CONFIG)) as f:
+                    cfg = json.load(f)
+                with open(self.path(CONFIG), 'w') as f:
+                    json.dump(dict(cfg, settingsOff=self.boot + 10), f)
+                with open(self.path(self.HAND), 'w') as f:                # what a run stopped after it leaves
+                    f.write(text)
+                d = self.session(4242, started=self.boot + 100)
+                self.assert_uninstall_refused('process 4242')
+                shutil.rmtree(d)
+                self.assertEqual(self.run_main('uninstall')[0], 0)
 
     def fresh(self):
         shutil.rmtree(self.root)

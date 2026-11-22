@@ -152,9 +152,14 @@ already running keep the hooks they started with. `--no-settings` removes it; th
 neither keeps the last one (a first install: no drop-in). The installer refuses to overwrite a drop-in of that name
 it did not write.
 
-Uninstall refuses while a settings file the kit did not write (a user's `~/.claude/settings.json`, say) still names
-a hook: removing the file would make that entry fail. Otherwise it removes the drop-in first, then refuses while a
-Claude Code session started before that still runs (it has the hooks loaded); run it again when those have ended.
+Uninstall refuses while a settings file the kit did not write (a user's `~/.claude/settings.json`, or the project
+`.claude/settings*.json` of a folder a running session works in) still names a hook: removing the file would make
+that entry fail. Otherwise it removes the drop-in first, then refuses while a Claude Code session started before
+that still runs (it has the hooks loaded); run it again when those have ended. It finds sessions by the real path of
+their program (`/proc/<pid>/exe`, the script node runs), so a renamed link to Claude Code counts too. When it once
+saw a hand-wired entry, or the drop-in was never on, every session older than the uninstall counts, since such a
+session may have read an entry that is gone now. Run uninstall from a terminal: from inside a session that has the
+hooks it refuses, because that session would lose them.
 To take the hooks out of new sessions at once and keep the files, run the installer with `--no-settings` (the
 rollback).
 
