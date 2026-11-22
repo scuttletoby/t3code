@@ -45,9 +45,10 @@ All of them are the queue's, imported from `../pr-queue`, never copied:
 - **Lenses by changed path** (`review_judge.py`, the pr-queue README, "Review
   rules"): when the base's config has a `review` block, the paths the head
   changes against its merge base (`git diff --name-status -M`, renames under
-  both paths, no cap) are judged by its rules. In `enforce` the lenses of the
-  heaviest weight hit are required on top of `required-lenses`; in `shadow` the
-  summary only adds a row "the path rules would have said: ...". A change the
+  both paths, no cap) are judged by its rules. In `enforce` the lenses of every
+  rule hit (whatever its weight) are required on top of `required-lenses`; in
+  `shadow` the summary only adds a row "the path rules would have said: ...".
+  A change the
   rules cannot judge (no merge base, a failed diff) refuses, in either mode.
   Without the block, nothing of this runs.
 - **Findings and rounds** (`review_judge.judge_rounds`, the pr-queue README,
