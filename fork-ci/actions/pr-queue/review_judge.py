@@ -34,6 +34,10 @@ judge_rounds judges the review itself, from the lens comments (README.md, "Revie
     until a person's override for the head, newer than every lens comment, lets it through (it alone is enough: it
     also waives the approach lens). Owner decision: issue #100.
 Pure as judge is: the lens comments come in (lens.Review.lens_scan), the verdict goes out.
+
+has_state_line says what counts as a report's `state:` line (the answer to the state question). The `state_line`
+setting is parsed but not enforced yet; the review kit (fork-kit/review, `check`) imports this rule, so the gate and
+the kit read one rule when the gate starts enforcing it.
 """
 import html
 import re
@@ -365,6 +369,15 @@ def read_findings(body):
         if (i in first and NOT_SAFE_RE.search(line)) or VERDICT_NOT_SAFE_RE.match(line):
             found[i] = ('blocker', f'the report says NOT SAFE: {line}'[:SHOW_FINDING])
     return [found[i] for i in sorted(found)], seen >= set(BLOCKING)
+
+
+STATE_RE = re.compile(r'state\s*:\s*\S', re.I)
+
+
+def has_state_line(body):
+    """A `state:` line with an answer (anything but blanks after the colon), outside fenced and indented code blocks and
+    quotes, read as a lens header is (folded, markdown and list markers stripped: `**State:** ok`, `- state: ok`)."""
+    return any(STATE_RE.match(lens.norm_line(fold(raw))) for raw in lens.plain_lines(body))
 
 
 def findings(body):

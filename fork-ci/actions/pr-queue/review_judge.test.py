@@ -193,6 +193,19 @@ def group(name):
     return [v for v in FINDINGS if v['group'] == name]
 
 
+class StateLine(unittest.TestCase):
+    """has_state_line: what counts as a report's `state:` line (the review kit imports it; the gate parses
+    `state_line` but does not enforce it yet)."""
+
+    def test_an_answered_state_line_outside_code_and_quotes(self):
+        for body, said in (('state: a second run does nothing', True), ('**State:** fine', True),
+                           ('- state: fine', True), ('STATE : fine', True), ('state:', False), ('state:   ', False),
+                           ('the state is fine', False), ('```\nstate: fine\n```', False), ('> state: fine', False),
+                           ('    state: fine', False)):
+            with self.subTest(body=body):
+                self.assertIs(rj.has_state_line(f'lens: code\n{body}\nblocker: none\n'), said)
+
+
 class Findings(unittest.TestCase):
     def test_every_shared_findings_vector(self):
         for v in FINDINGS:

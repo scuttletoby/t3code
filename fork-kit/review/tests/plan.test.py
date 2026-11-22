@@ -178,6 +178,115 @@ class Plan(Project):
         self.git('init', '-q')
         self.assertIn('nosuch is not a commit', self.plain(self.cli('plan', '--base', 'nosuch')))
 
+    def commit(self, message, *paths):
+        for rel in paths:
+            self.put(rel, f'{message}\n')
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', message)
+
+    def test_a_base_config_that_is_not_utf8_is_refused_as_the_gate_refuses_it(self):   # #797 item 1
+        path = self.config()
+        with open(path, 'rb') as f:
+            data = f.read().replace(b'docs/review.md', b'docs/r\xe9view.md')   # Latin-1, valid JSON otherwise
+        with open(path, 'wb') as f:
+            f.write(data)
+        self.git('init', '-q')
+        self.commit('base', 'src/app.ts')
+        self.git('checkout', '-q', '-b', 'topic')
+        self.commit('change', 'src/x.ts')
+        with self.assertRaises(review_kit.gate_config.ConfigError):   # the gate's reader, on the same bytes
+            review_kit.gate_config.parse(data, 'config')
+        self.assertIn('not UTF-8', self.plain(self.run_plan('--base', 'main')))
+        self.assertIn('not UTF-8', self.plain(self.cli('plan', '--base', 'main')))
+
+    def test_base_reads_every_merge_base_as_the_gate_does(self):   # #797 item 2: criss-cross merges
+        self.config()
+        self.git('init', '-q')
+        self.commit('root', 'src/app.ts')
+        self.git('checkout', '-q', '-b', 'x')
+        self.commit('x', 'src/storage/x.ts')
+        self.git('checkout', '-q', '-b', 'y', 'main')
+        self.commit('y', 'src/y.ts')
+        self.git('checkout', '-q', '-B', 'main', 'x')
+        self.git('merge', '-q', '--no-ff', '-m', 'main takes y', 'y')
+        self.git('checkout', '-q', '-b', 'topic', 'y')
+        self.git('merge', '-q', '--no-ff', '-m', 'topic takes x', 'x')
+        self.commit('topic', 'src/t.ts')
+        bases = subprocess.run([*GIT, '-C', self.dir, 'merge-base', '--all', 'main', 'topic'], capture_output=True,
+                               text=True, env=self.env).stdout.split()
+        self.assertEqual(len(bases), 2, 'the fixture needs two merge bases')
+        code, out, err = self.cli('plan', '--base', 'main')
+        self.assertEqual((code, err), (0, ''), out)
+        # from one merge base git sees two paths (src/t.ts and one of the others); the gate sees all three
+        self.assertIn('3 changed paths', out)
+        self.assertIn('weight: critical', out)
+
+    def test_base_reads_paths_whatever_the_repository_git_settings(self):   # #797 item 2: unusual git settings
+        self.config()
+        self.git('init', '-q')
+        self.commit('base', 'src/app.ts', 'src/sub/a.ts')
+        self.git('checkout', '-q', '-b', 'topic')
+        self.commit('change', 'src/storage/wallet.ts', 'src/sub/a.ts')
+        self.git('config', 'diff.relative', 'true')   # from src/sub, a plain git diff shows only src/sub's paths
+        out, err = io.StringIO(), io.StringIO()
+        code = self.m.run(['plan', '--root', os.path.join(self.dir, 'src', 'sub'), '--base', 'main'], out, err)
+        self.assertEqual((code, err.getvalue()), (0, ''), out.getvalue())
+        self.assertIn('2 changed paths', out.getvalue())
+        self.assertIn('weight: critical', out.getvalue())
+
+    def base_repo(self):
+        """A repository with the config on main and one more commit on topic (checked out)."""
+        self.config()
+        self.git('init', '-q')
+        self.commit('base', 'src/app.ts')
+        self.git('checkout', '-q', '-b', 'topic')
+        self.commit('change', 'src/storage/wallet.ts')
+
+    def test_a_base_without_the_config_falls_back(self):
+        self.git('init', '-q')
+        self.commit('base', 'src/app.ts')
+        self.git('checkout', '-q', '-b', 'topic')
+        self.commit('change', 'src/storage/wallet.ts')
+        code, out, err = self.run_plan('--base', 'main')
+        self.assertEqual((code, err), (0, ''), out)
+        self.assertIn('no queue config .github/pr-queue.json at ', out)
+        self.assertIn('weight: normal\nlenses: review (one read-only agent)', out)
+
+    def test_a_base_config_git_cannot_read_is_a_problem(self):   # #957 item 1
+        self.base_repo()
+        blob = subprocess.run([*GIT, '-C', self.dir, 'rev-parse', 'main:.github/pr-queue.json'], capture_output=True,
+                              text=True, env=self.env, check=True).stdout.strip()
+        os.remove(os.path.join(self.dir, '.git', 'objects', blob[:2], blob[2:]))   # as a partial clone offline
+        err = self.plain(self.run_plan('--base', 'main'))
+        self.assertIn('.github/pr-queue.json is in ', err)
+        self.assertIn('git cannot read it', err)
+
+    def test_a_repository_the_gate_would_refuse_is_refused(self):   # #957 item 2: grafts change merge bases
+        self.base_repo()
+        for name in ('info/grafts', 'objects/info/alternates', 'shallow'):
+            with self.subTest(name=name):
+                path = os.path.join(self.dir, '.git', name)
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write('')
+                err = self.plain(self.run_plan('--base', 'main'))
+                self.assertIn(f'cannot be read as the gate reads it', err)
+                self.assertIn(name, err)
+                os.remove(path)
+        self.assertEqual(self.run_plan('--base', 'main')[0], 0)
+
+    def test_a_linked_worktree_is_checked_in_the_common_git_folder(self):   # #957 item 2
+        self.base_repo()
+        wt = os.path.join(self.dir, 'wt')
+        self.git('worktree', 'add', '-q', '--detach', wt, 'topic')
+        out, err = io.StringIO(), io.StringIO()
+        self.assertEqual(self.m.run(['plan', '--root', wt, '--base', 'main'], out, err), 0, err.getvalue())
+        self.assertIn('weight: critical', out.getvalue())
+        with open(os.path.join(self.dir, '.git', 'info', 'grafts'), 'w', encoding='utf-8') as f:
+            f.write('')
+        out, err = io.StringIO(), io.StringIO()
+        self.assertEqual(self.m.run(['plan', '--root', wt, '--base', 'main'], out, err), 2, out.getvalue())
+        self.assertIn('info/grafts', err.getvalue())
+
 
 class States(Project):
     """The files the plan reads, in every state they can be in."""
@@ -188,6 +297,26 @@ class States(Project):
         self.assertIn('no queue config .github/pr-queue.json: no review rules', out)
         self.assertIn('weight: normal\nlenses: review (one read-only agent)\n', out)
         self.assertIn('SKILL.md, "Lens prompt"', out)
+
+    def test_no_queue_config_names_settings_under_another_name(self):   # #957 item 4
+        self.put('.github/fork-review-kit.json', {'version': 1, 'queue_config': '.github/fork-pr-queue.json'})
+        self.config(rel='.github/fork-pr-queue.json')
+        code, out, err = self.plan(changes(('M', 'src/storage/wallet.ts')))
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('no queue config .github/pr-queue.json', out)
+        self.assertIn('.github/fork-review-kit.json looks like kit settings under another name: if it is this '
+                      'project\'s, pass --settings .github/fork-review-kit.json', out)
+        code, out, err = self.plan(changes(('M', 'src/storage/wallet.ts')), '--settings', '.github/fork-review-kit.json')
+        self.assertEqual((code, err), (0, ''))
+        self.assertNotIn('looks like kit settings', out)
+        self.assertIn('weight: critical', out)
+
+    def test_the_hint_only_when_no_settings_were_read(self):   # #957 item 4
+        self.put('.github/fork-review-kit.json', {'version': 1})
+        self.put('.github/review-kit.json', {'version': 1})   # the project's own settings: nothing missing
+        out = self.plan(changes(('M', 'a')))[1]
+        self.assertIn('no queue config', out)
+        self.assertNotIn('looks like kit settings', out)
 
     def test_an_old_config_without_a_review_block(self):
         self.config(review=None)
@@ -301,7 +430,30 @@ MUTATIONS = {
                                           (Plan, 'test_the_state_question_is_in_every_plan')),
     'two lenses are independent': ("if len(lenses) > 1 else 'one read-only agent')", "if False else 'one read-only agent')",
                                    (Plan, 'test_a_critical_path_needs_two_independent_lenses')),
-    'the config is read from the base': ("['git', '-C', root, 'show', f'{base}:{rel}']", "['false']",
+    'a base config is read as bytes': ('    return r.stdout\n', "    return r.stdout.decode('utf-8', 'replace')\n",
+                                       (Plan, 'test_a_base_config_that_is_not_utf8_is_refused_as_the_gate_refuses_it')),
+    'a base config git cannot read is a problem': ("        raise Problem(f'{rel} is in {base[:12]} but git cannot read it",
+                                                   "        return None\n        raise Problem(f'{rel} is in {base[:12]} "
+                                                   "but git cannot read it", (Plan, 'test_a_base_config_git_cannot_read_is_a_problem')),
+    'a base without the config falls back': ('    if not r.stdout:\n        return None\n',
+                                             "    if not r.stdout:\n        raise Problem('no config')\n",
+                                             (Plan, 'test_a_base_without_the_config_falls_back')),
+    "the gate's repository check": ('        if why:\n            raise Problem(f\'the repository at {root} cannot be read',
+                                    '        if False:\n            raise Problem(f\'the repository at {root} cannot be read',
+                                    (Plan, 'test_a_repository_the_gate_would_refuse_is_refused')),
+    'the common git folder': ("'--git-common-dir'", "'--absolute-git-dir'",
+                              (Plan, 'test_a_linked_worktree_is_checked_in_the_common_git_folder')),
+    'the settings hint': ('    if others:\n        cfg_note +=', '    if False:\n        cfg_note +=',
+                          (States, 'test_no_queue_config_names_settings_under_another_name')),
+    'the hint only without settings': ("others = other_settings(root) if cfg is None and note else []",
+                                       "others = other_settings(root) if cfg is None else []",
+                                       (States, 'test_the_hint_only_when_no_settings_were_read')),
+    'the gate\'s changed paths': ('found, why = head_check.changed_paths(checkout, base, head)',
+                                  "found, why = review_judge.parse_name_status(subprocess.run(['git', '-C', root, "
+                                  "'diff', '--name-status', '-z', '-M', f'{base}...HEAD'], capture_output=True)"
+                                  ".stdout.decode()), None",
+                                  (Plan, 'test_base_reads_paths_whatever_the_repository_git_settings')),
+    'the config is read from the base': ("['git', '-C', root, 'show', f'{base}:{path}']", "['false']",
                                          (Plan, 'test_base_reads_the_config_and_changes_from_git')),
 }
 

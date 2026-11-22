@@ -80,6 +80,10 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                case: the checkout's timeout, the wait cap (or the script's git calls, if longer) and one
                last poll, from the script's own limits, with a minute to spare for the job's set-up.
 
+  review-kit   the review kit (fork-kit/review) reads the fork's kit settings
+               (.github/fork-review-kit.json, given with --settings) and through them the fork's queue
+               config in enforce; without --settings its plan names that file.
+
     python3 .github/scripts/fork-contracts.test.py
 
 Needs PyYAML, git and bash. Each check prints ok/FAIL; any FAIL exits 1.
@@ -1004,11 +1008,11 @@ SCAN_RUN_LINE = 'bash "${RUNNER_TEMP:?}/scan-from-default-branch.sh"'
 # within hours (review B). The read step runs only for the sweep, holds only the job's read-only token
 # (no secret), takes the record only from a run of fork-secret-sweep.yml (that path, schedule or
 # workflow_dispatch, this branch, this repository and not a fork, ended success or failure, an ancestor
-# commit, not this run but for a re-run's own first attempt, in a run of the sweep's workflow) and its
+# commit, not this run but for a re-run's own newest earlier attempt, in a run of the sweep's workflow) and its
 # one artifact of that name, never unpacks the archive (one plain file read in memory, every line
 # checked), and falls back to a first run on any doubt; it reads nothing while a tag is named like the
-# branch (#703); reset_record leaves an empty record instead (a reset run's re-run: its own first
-# attempt's record, else the empty one). Its output `read` (found, none, reset, failed) tells the scan
+# branch (#703); reset_record leaves an empty record instead (a reset run's re-run: its own newest
+# earlier attempt's record, else, or on any failed or doubtful read, the empty one, #791). Its output `read` (found, none, reset, failed) tells the scan
 # step whether a partial record may replace the last one (#703). Its behaviour: the reader e2e below.
 # The keep step uploads only on a branch, once the scan step has written the record whole (its output
 # `record`) or reset_record left the empty one, for 90 days (the repository's most). What the scan step
@@ -1022,9 +1026,15 @@ rm -rf -- "$dir" "$zip"
 mkdir -m 700 -- "$dir"
 # none STATE WHY: no record. STATE, the output `read`: "none" when no earlier sweep kept one,
 # "failed" when one may exist but cannot be read or trusted; then a partial record of this
-# run must not replace it (#703).
+# run must not replace it (#703). A reset run on a branch (its re-run reads its own record)
+# takes the empty record instead of "failed": it trusts nothing, so it is always safe, and a
+# failed call cannot leave the record from before the reset in use (#791).
 none() {
   rm -rf -- "$zip" "$dir/deleted-tips"
+  if [[ "$1" == failed && "$RESET" == true && "$GITHUB_REF" == refs/heads/* ]]; then
+    echo "::warning title=Secret scan::$2" >&2
+    empty_record
+  fi
   echo "read=$1" >> "${GITHUB_OUTPUT:?}"
   echo "::warning title=Secret scan::$2, so every listed tip is checked as on a first run" >&2
   exit 0
@@ -1040,8 +1050,9 @@ if [[ "${GITHUB_RUN_ATTEMPT:-1}" != 1 \
 fi
 # reset_record: an empty record (the header only), which the last step keeps even when this
 # run fails before the scan step writes its own, so no later sweep reads the older one (#703).
-# A re-run of a reset run (it keeps the input) first takes its own earlier attempt's record,
-# which was written after the reset, and no older run's; without one, the empty record.
+# A re-run of a reset run (it keeps the input) first takes its own newest earlier attempt's
+# record, which was written after the reset, and no older run's; without one, or when it cannot
+# be read, the empty record.
 empty_record() {
   echo "fork secret sweep record 2" > "$dir/deleted-tips"
   echo "read=reset" >> "${GITHUB_OUTPUT:?}"
@@ -1508,8 +1519,12 @@ def lookup_problems(scan):
                 problems.append(f"{SCAN_FILE}/{j}: LOOKUP_TOKEN is not the job's token")
             # The lookups' time limit (#703) must leave the steps before this one, and the lookup under
             # way when it is passed, inside the job's time-out (else the job is killed and keeps nothing).
+            # The limit line missing or reworded fails too, never skips the check (#791).
             limit, timeout = re.search(r"\(\(SECONDS > (\d+)\)\)", run), job.get("timeout-minutes")
-            if limit and not (type(timeout) is int and int(limit.group(1)) + LOOKUP_LIMIT_MARGIN <= timeout * 60):
+            if not limit:
+                problems.append(f"{SCAN_FILE}/{j}: no lookups' time limit in the form ((SECONDS > N)), so it cannot be "
+                                "checked against the job's timeout-minutes (#703, #791)")
+            elif not (type(timeout) is int and int(limit.group(1)) + LOOKUP_LIMIT_MARGIN <= timeout * 60):
                 problems.append(f"{SCAN_FILE}/{j}: the lookups' time limit ({limit.group(1)} s) is not at least "
                                 f"{LOOKUP_LIMIT_MARGIN} s inside the job's timeout-minutes ({timeout!r}), #703")
             if env.get("RECORD_READ") != "${{ steps.read.outputs.read }}":
@@ -1597,6 +1612,15 @@ ALERT_RUN = re.compile(r'bash \.github/scripts/fork-run-alert\.sh --title "[^"]+
 
 # The sweep's one input to the scan: reset_record, only when a hand run asks for it (#701).
 SWEEP_WITH = {"reset_record": "${{ inputs.reset_record == true }}"}
+# Sweeps of one ref one at a time, the running one never cancelled (#791): a sweep that starts while
+# a reset run runs waits for it and reads its record, so it cannot undo the reset unseen.
+SWEEP_CONCURRENCY = {"group": "fork-secret-sweep-${{ github.ref }}", "cancel-in-progress": False}
+
+
+def same_group(group, *others):
+    """True when GROUP is one of OTHERS, spaces aside (`${{ github.ref }}` and `${{github.ref}}` are one group)."""
+    key = lambda g: re.sub(r"\s+", "", str(g))
+    return any(o is not None and key(group) == key(o) for o in others)
 
 
 def sweep_problems(wfs):
@@ -1616,6 +1640,9 @@ def sweep_problems(wfs):
                         f"({', '.join(sorted(events - {'schedule', 'workflow_dispatch'}))})")
     if sweep.get("permissions") != {"contents": "read"}:
         problems.append(f"{SWEEP_FILE}: workflow permissions are not exactly contents: read")
+    if sweep.get("concurrency") != SWEEP_CONCURRENCY:
+        problems.append(f"{SWEEP_FILE}: the workflow's concurrency is not one group per ref that never cancels the "
+                        "running sweep (a sweep started during a reset run would undo the reset, #791)")
     jobs = sweep.get("jobs") or {}
     callers = [j for j, job in jobs.items() if job.get("uses") == SCAN_CALL]
     if len(callers) != 1:
@@ -1652,6 +1679,11 @@ def sweep_problems(wfs):
         conc = job.get("concurrency")
         if not (isinstance(conc, dict) and conc.get("group") and conc.get("cancel-in-progress") is False):
             problems.append(f"{SWEEP_FILE}/{j}: no concurrency group that queues (two sweeps at once would each open an issue)")
+        elif same_group(conc["group"], SWEEP_CONCURRENCY["group"], (sweep.get("concurrency") or {}).get("group")):
+            # A job group equal to its own run's workflow group: GitHub sees a deadlock and cancels the
+            # job, so a failed sweep would alert no one (#791).
+            problems.append(f"{SWEEP_FILE}/{j}: its concurrency group is the workflow's (GitHub cancels the alert "
+                            "as a deadlock)")
         for step in job.get("steps") or []:
             run = " ".join(str(step.get("run", "")).split())
             if "fork-run-alert.sh" not in run:
@@ -1955,6 +1987,18 @@ for label, mutate in {
         "if", "${{ github.event_name == 'schedule' }}"),
     "an alert not after the sweep": lambda w: w[SWEEP_FILE]["jobs"]["alert"].pop("needs"),
     "an alert without its concurrency group": lambda w: w[SWEEP_FILE]["jobs"]["alert"].pop("concurrency"),
+    # #791: the sweeps of one ref one at a time, the running one never cancelled.
+    "a sweep without its concurrency group": lambda w: w[SWEEP_FILE].pop("concurrency"),
+    "a sweep whose concurrency cancels the running sweep": lambda w: w[SWEEP_FILE]["concurrency"].__setitem__(
+        "cancel-in-progress", True),
+    "a sweep whose concurrency group is one run's own (nothing waits)": lambda w: w[SWEEP_FILE]["concurrency"].__setitem__(
+        "group", "fork-secret-sweep-${{ github.run_id }}"),
+    "a sweep whose concurrency group is the alert's": lambda w: w[SWEEP_FILE]["concurrency"].__setitem__(
+        "group", "fork-secret-sweep-alert"),
+    "an alert whose concurrency group is the sweep's (a deadlock: GitHub cancels the alert)": lambda w: w[SWEEP_FILE][
+        "jobs"]["alert"]["concurrency"].__setitem__("group", "fork-secret-sweep-${{ github.ref }}"),
+    "an alert whose concurrency group is the sweep's, spaced otherwise": lambda w: w[SWEEP_FILE][
+        "jobs"]["alert"]["concurrency"].__setitem__("group", "fork-secret-sweep-${{github.ref}}"),
     "an alert whose concurrency cancels a running one": lambda w: w[SWEEP_FILE]["jobs"]["alert"]["concurrency"].__setitem__(
         "cancel-in-progress", True),
     "an alert that may fail quietly": lambda w: w[SWEEP_FILE]["jobs"]["alert"].__setitem__("continue-on-error", True),
@@ -1969,6 +2013,18 @@ for label, mutate in {
 }.items():
     check(f"secret-scan: {SCAN_FILE} with {label} fails" if "fork-tests" not in label and "sweep" not in label
           and "alert" not in label else f"secret-scan: {label} fails", scan_mutant(mutate))
+
+# #791: the lookups' time-limit line reworded or gone: its own check against the job's time-out fails
+# (not only the exact-text contract), so it can never pass quietly by not finding the line.
+for what, new in (("reworded (>=)", "if ((SECONDS >= 1200)); then"), ("gone", "if false; then")):
+    tl_wfs = copy.deepcopy(real)
+    tl_step = scan_step(tl_wfs)
+    tl_run = tl_step["run"].replace("if ((SECONDS > 1200)); then", new)
+    tl_step["run"] = tl_run
+    tl_found = [p for p in lookup_problems(tl_wfs[SCAN_FILE]) if "no lookups' time limit" in p]
+    check(f"secret-scan: the lookups' time-limit line {what}: its check against the job's timeout-minutes fails, "
+          "not skips (#791)", tl_run != scan_step(real)["run"] and bool(tl_found),
+          "the line not found in the real file" if tl_run == scan_step(real)["run"] else "no time-limit problem")
 
 check("secret-scan: the sweep's activity lookup (#239) in its exact form passes",
       not scan_mutant(lambda w: scan_step(w).__setitem__("run", with_sweep_lookup(scan_step(w)["run"])))
@@ -2699,6 +2755,12 @@ def read_as(want, frm=801, state="failed"):
     return ok
 
 
+def reset_empty(s):
+    """A reset run's empty record (the header only), read=reset, no older run listed, nothing left."""
+    return (s.r.returncode == 0 and s.record == RECORD_HEAD and s.output == "read=reset\n" and s.left == []
+            and "actions/workflows" not in s.calls and "an empty record is kept even if this run fails" in s.out)
+
+
 def two_runs(bad):
     """The newest run (802) is one the step must not read, with a record of its own; 801 is good."""
     return {"runs": [a_run(802, **bad), a_run(801)],
@@ -2771,10 +2833,32 @@ READ_CASES = {
         {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2"},
         lambda s: s.r.returncode == 0 and s.record == RECORD_HEAD and s.output == "read=reset\n"
         and "runs/900/artifacts" in s.calls and "actions/workflows" not in s.calls and s.left == []),
-    "a re-run of a reset_record run whose own record cannot be listed: no record, read=failed, so its first "
-    "attempt's stays the one in use (#703)": (
+    # #791: any failed or doubtful read in a reset run's re-run gives the empty record, never read=failed:
+    # if its first attempt kept nothing, read=failed would leave the record from before the reset in use.
+    "a re-run of a reset_record run whose own record cannot be listed: the empty record, no older run "
+    "listed (#791)": (
         {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "FAKE_FAIL": "/artifacts -f",
-         "artifacts": {900: [an_artifact(903, 900)]}, "zips": {903: good_zip}}, read_as(None)),
+         "artifacts": {900: [an_artifact(903, 900)]}, "zips": {903: good_zip}},
+        lambda s: reset_empty(s) and "runs/900/artifacts" in s.calls and "cannot be listed" in s.out),
+    "a re-run of a reset_record run whose tag check fails: the empty record (#791)": (
+        {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "FAKE_FAIL": "matching-refs",
+         "artifacts": {900: [an_artifact(903, 900)]}, "zips": {903: good_zip}},
+        lambda s: reset_empty(s) and "runs/900/" not in s.calls and "cannot be checked" in s.out),
+    "a re-run of a reset_record run while a tag is named like the branch: the empty record (#791)": (
+        {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "tags": ["refs/tags/main"],
+         "artifacts": {900: [an_artifact(903, 900)]}, "zips": {903: good_zip}},
+        lambda s: reset_empty(s) and "runs/900/" not in s.calls),
+    "a re-run of a reset_record run whose own record cannot be downloaded: the empty record (#791)": (
+        {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "artifacts": {900: [an_artifact(903, 900)]}, "zips": {}},
+        lambda s: reset_empty(s) and "artifacts/903/zip" in s.calls),
+    "a re-run of a reset_record run whose own record cannot be read: the empty record, not a partial bad one "
+    "(#791)": (
+        {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "artifacts": {900: [an_artifact(903, 900)]},
+         "zips": {903: a_zip([("deleted-tips", good_record + "junk\n")])}},
+        lambda s: reset_empty(s) and "artifacts/903/zip" in s.calls),
+    "a re-run of a reset_record run whose commit check fails: the empty record (#791)": (
+        {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "FAKE_FAIL": "compare/",
+         "artifacts": {900: [an_artifact(903, 900)]}, "zips": {903: good_zip}}, reset_empty),
     "a first attempt: its own run never asked about": (
         {}, lambda s: read_as(good_record)(s) and "runs/900/" not in s.calls),
     "no sweep run kept one yet (or it expired): a first run": ({"runs": []}, read_as(None, state="none")),
@@ -2881,6 +2965,9 @@ check("secret-scan e2e (#701): the record the read step left is the one the scan
 for n, (what, setup, want_record, want_output) in enumerate((
     ("reset_record", {"RESET": "true"}, RECORD_HEAD + f"{budget_tips[0]} scanned\n", "record=written\n"),
     ("a failed read (the runs cannot be listed)", {"FAKE_FAIL": "actions/workflows"}, None, ""),
+    ("a reset run's re-run whose own record cannot be listed (#791)",
+     {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "FAKE_FAIL": "/artifacts -f", "artifacts": {900: [an_artifact(903, 900)]}},
+     RECORD_HEAD + f"{budget_tips[0]} scanned\n", "record=written\n"),
 )):
     r = read_record(read_code, **setup)
     read = re.fullmatch(r"read=(\w+)\n", r.output)
@@ -2931,6 +3018,11 @@ for what, old, new in (
     ("the whole-text match", "re.fullmatch(", "re.match("),
     ("the duplicate check", "if len(set(tips)) != len(tips):", "if False:"),
     ("the fresh folder", 'rm -rf -- "$dir" "$zip"\n', ""),
+    ("the empty record on a failed read in a reset run (#791)",
+     '  if [[ "$1" == failed && "$RESET" == true && "$GITHUB_REF" == refs/heads/* ]]; then\n'
+     '    echo "::warning title=Secret scan::$2" >&2\n    empty_record\n  fi\n', ""),
+    ("the branch check of the empty record on a failed read (#791)",
+     ' && "$GITHUB_REF" == refs/heads/* ]]; then', " ]]; then"),
 ):
     mutated = read_code.replace(old, new)
     results = read_results(mutated, first_red=True) if mutated != read_code else {}
@@ -4795,6 +4887,25 @@ for label, change in {
     "a slower last poll than the budget holds": {"API_TIMEOUT": 200},
 }.items():
     check(f"policies: {label} fails", *policy_mutant(lambda p, w, t: None, {**POLICY_LIMITS, **change}))
+
+# --- review-kit (#957) ---------------------------------------------------------------------------
+# The fork keeps its kit settings under its own name, so the general kit's tests do not name them (#957 item 5).
+
+
+def review_plan(*args):
+    changes = work / "review-kit-changes.bin"
+    changes.write_bytes(b"M\0fork-kit/review/SKILL.md\0")
+    r = subprocess.run([sys.executable, "-I", "-B", str(root / "fork-kit/review/lib/review_kit.py"), "plan", "--root",
+                        str(root), *args, "--changes", str(changes)], capture_output=True, text=True, timeout=120)
+    return r.returncode, r.stdout, r.stderr
+
+
+code, out, err = review_plan("--settings", ".github/fork-review-kit.json")
+check("review-kit: the fork's settings point the kit at the fork's queue config, in enforce, with no note",
+      (code, err) == (0, "") and "note:" not in out and "weight: critical" in out, out + err)
+code, out, err = review_plan()
+check("review-kit: without --settings the plan names the fork's settings file",
+      code == 0 and "pass --settings .github/fork-review-kit.json" in out, out + err)
 
 shutil.rmtree(work, ignore_errors=True)
 if failures:
