@@ -41,9 +41,9 @@ How it reads a command (by parsing, not by pattern):
      wrapper only under its own name or in a system folder: `./sudo` and the `nice` of `bash nice` are files.
      Files that carry arguments are read: `curl -K`, `wget -i`, `xargs -a`.
   5. Flow. Token text that goes on (a pipe into anything but a DATA word, a file, $(..), an exported variable, a
-     file that names a token and gets another name with cp/mv/ln) in a command that also runs a word the guard
-     cannot read is refused: `echo '<the command>' | at now`, `cp x.txt run.sh && bash run.sh`,
-     `curl -q -X PUT "$(cat url.txt)"`.
+     file that names a token and gets another name with cp/mv/ln/install, dd of=, sed w or awk print >) in a
+     command that also runs a word the guard cannot read is refused: `echo '<the command>' | at now`,
+     `cp x.txt run.sh && bash run.sh`, `curl -q -X PUT "$(cat url.txt)"`.
   6. It answers in time: the hook has a 10 s limit and a hook that is not done by then does not stop the
      command, so 5 s after the hook process started the guard refuses the command itself. Before that:
        - fast exit: a command of plain words that cannot name or run anything guarded (ls, git status, cat a > b,
@@ -51,8 +51,10 @@ How it reads a command (by parsing, not by pattern):
        - cache: what it learns from files (a code file names a token or not, a `#!` line, the gh aliases) is kept
          60 s in <stateDir>/cache-v1.json (default ~/.local/state/actions-disable-guard), per file name + inode + size + change times.
          A file changed within the last 2 s is not cached; a missing, broken, old, foreign or odd cache is ignored
-         and written new (temp file, then rename). Shell scripts are still read every time (their reading depends
-         on the command around them).
+         and written new (temp file, then rename). A run whose guard file, or a link on the way to it (the kit's
+         bin link and `current`), changed after the run started neither reads nor writes it: the code in memory may
+         be another release's. Shell scripts are still read every time (their reading depends on the command
+         around them).
 
 Refused:
   - gh workflow disable ...                    (also through gh aliases: existing ones are expanded, new ones refused;
@@ -74,15 +76,19 @@ Refused:
     read, and (owner decision, #930) a write that leaves no required check: a protection PUT with
     required_status_checks null, left out or with empty contexts/checks, an empty PATCH of required_status_checks or
     PUT of its contexts, a ruleset write whose `rules` hold no required_status_checks rule with a check, the GraphQL
-    updateBranchProtectionRule / updateRepositoryRuleset that does the same (requiresStatusChecks false, [] lists,
-    also through a variable), by gh api (-f/-F nested fields, --input) or curl/wget (-d, --json, --post-data ..),
-    and such a write whose body the guard cannot read. A write that keeps or adds checks passes
+    updateBranchProtectionRule / updateRepositoryRuleset that does the same (requiresStatusChecks false, [] lists, a
+    REQUIRED_STATUS_CHECKS rule with an empty list, also through a variable or the whole input as one variable from
+    -F 'input[..]' fields or an --input file, and a variable the guard cannot read), by gh api (-f/-F nested
+    fields, --input) or curl/wget (-d, --json, --post-data ..), and such a write whose body the guard cannot read.
+    A write that keeps or adds checks passes
   - everything rule 3 cannot prove and rule 5 catches (see there)
   - `gh` with a word that is no gh command when the gh config holds YAML outside the small subset this reader
     follows (`!!str` tags, `? ` keys, anchors, flow maps ..), or sits in a folder the guard cannot read
     (GH_CONFIG_DIR, XDG_CONFIG_HOME or HOME from a variable): the word may be an alias
   - each script of the machine file's actionsDisable.refuseScripts run with its flag (a project tool that
-    disables workflows itself: {"name": "garden.py", "flag": "--fix", "why": "disables ..."}), where the file is real
+    disables workflows itself: {"name": "garden.py", "flag": "--fix", "why": "disables ..."}), where the file is real;
+    and a line that calls one in a file whose text a shell runs (sed e, `cat f | bash`, eval "$(cat f)")
+  - a GraphQL call whose query (or a field name that can be `query`) the guard cannot read
   - a command the guard cannot finish reading in time
 Passes: reads (GET), gh workflow enable/list/view/run, PUT .../enable, searching and writing text about all this
 (rg/grep, notes, commit messages, issue and PR bodies through gh), and every command that names no guarded token.
@@ -102,29 +108,32 @@ Known over-refusals (harmless, but not provable from the text; the message says 
     it in (`cat big.js | gzip`)
   - an exported variable or a `VAR=.. command` prefix that carries a token
   - a GraphQL body piped into gh (`echo '{..}' | gh api graphql --input -`): use `--input - <<< '{..}'` or -f query=
+  - a GraphQL query from a variable or command output, also a read (`-f query="$(cat q.graphql)"`): use
+    `-F query=@q.graphql`; a $variable inside "quotes" in the query (an id) is fine
   - a gh word that is no gh command (an alias) while the gh config is half-written or uses YAML outside the subset
   - a rules write to a ruleset that never had required checks (a tag ruleset), or a protection body written by the
     same command: the owner marker, or write the body file in a command before
 
 Not covered (a text guard cannot): a value hidden in a variable, file or command output that the command gets at
-run time (a download, base64, a file renamed by a tool other than cp/mv/ln), code that builds the words at run
-time or loads them from another file (import, require), a file of commands that is no shell script and does not
-look like code, written by an earlier command and handed to a tool the guard does not know (`at -f job.txt`,
-`make -f x.mk`, a Makefile, package.json scripts), a gh copy made by an earlier command when there is no gh on
-PATH to compare it with, a compiled program that shadows a DATA or wrapper word on PATH (a text script there is
-read), a PATH set by the command itself, a remote shell's own config, raw clients (openssl s_client), GraphQL sent
-through curl/wget. Also not covered (a review round; each needs a command built to hide the action; closed by the
-token layer):
+run time (a download, base64, a file renamed by a tool other than cp/mv/ln/install/dd, awk -f programs), code
+that builds the words at run time or loads them from another file (import, require), a file of commands that is no
+shell script and does not look like code, written by an earlier command and handed to a tool the guard does not
+know (`at -f job.txt`, `make -f x.mk`, a Makefile, package.json scripts), a gh copy made by an earlier command when
+there is no gh on PATH to compare it with, a compiled program that shadows a DATA or wrapper word on PATH (a text
+script there is read), a PATH set by the command itself, a remote shell's own config, raw clients (openssl
+s_client), GraphQL sent through curl/wget. Also not covered (a review round; each needs a command built to hide the
+action; closed by the token layer):
   - known words that run code: find -exec, BASH_ENV, git diff.external / core.fsmonitor
   - protection writes that keep a check but weaken the rest: a PUT that replaces the checks with other ones, drops
     the review rules or enforce_admins, a ruleset whose conditions leave `main` out or that adds bypass actors (the
     guard cannot ask GitHub what is there now)
   - on a system without /proc the start-time check of the cache (an edited guard during a run) is skipped
+  - a wall clock stepped forward across a reinstall during a run: the start-time check compares file and link
+    times with the process start
   - the guard is read from source on each call (python3 -IB, no bytecode): an entry file compiled at install time
     would save some ms, a larger design (#930 item 12)
   - a command kept in a variable and run as the command word (`read -r c <<< '..'; $c`)
   - a script changed by the same command before it runs it (mv, ln, >, >>, sed -i, then bash)
-  - a GraphQL query from a variable or command output (`-f query="$Q"`)
 A guarded call only in a script 5 or more levels deep (a.sh -> b.sh -> c.sh -> d.sh -> e.sh) passes as an unknown program
 unless other text in the command flows on.
 gh has no request hook, so this hook is the command-text layer; the wall is a token that cannot do it.
@@ -160,7 +169,7 @@ machine file or section gives those defaults; a broken one too, with one line on
 Tests: fork-kit/agent-guards/tests/actions-disable.test.py
 """
 import fnmatch, itertools, json, os, re, shlex, signal, sys, time
-from stat import S_ISDIR, S_ISREG
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from urllib.parse import unquote
 
 
@@ -1457,8 +1466,19 @@ def api_reason(args, ctx, top=False):
             return reason('a GraphQL updateRepositoryRuleset that switches the ruleset off (enforcement: DISABLED '
                           'or EVALUATE), '
                           'or one with a body the guard cannot read')
-        if gql:
-            why = gql_empties([canon(x, cue=False) for x in list(args) + bodies])
+        if gql:   # gh sends every -f/-F field but `query` as a GraphQL variable (input[rules][][type]=.. nests)
+            hid_q = next((f for _, f in typed if spells(f.partition('=')[0], 'query') and (
+                hidden(f.partition('=')[0]) or gql_hidden(f.partition('=')[2]))), None)
+            if hid_q is not None:
+                return reason('a GraphQL call whose query (or a field name) the guard cannot read (command output, '
+                              'a variable): it may delete or empty branch protection or a ruleset',
+                              'Write the query to a file in a command before this one and pass it with '
+                              '`-F query=@<file>`; variables only for ids, as -f/-F fields.')
+            vb = gh_fields_body([(m, f) for m, f in typed if f.partition('=')[0] not in ('query', 'operationName')],
+                                ctx, keep_hidden=True)
+            gvars = [vb] + [j['variables'] for _, b in known[:len(inputs)] for j in [json_body(b)]
+                            if isinstance(j, dict) and j.get('variables') is not None]
+            why = gql_empties([canon(x, cue=False) for x in list(args) + bodies], gvars)
             if why:
                 return reason(f'a GraphQL update of branch protection or a ruleset that {why}: that takes `main` '
                               'out from behind CI as surely as a delete',
@@ -1497,28 +1517,31 @@ GQL_EMPTYING = re.compile(r'updateRepositoryRuleset|updateBranchProtectionRule',
 # in a GraphQL text: a field set to nothing, or to a $variable (looked up in the variables)
 GQL_EMPTY = re.compile(r'\b(requiresStatusChecks|requiredStatusCheckContexts|requiredStatusChecks|rules)\s*'
                        r'["\']?\s*:\s*(?:(false|null|\[\s*\])|\$(\w+))', re.I)
-GQL_CHECKS = re.compile(r'required_status_checks|requiredStatusChecks', re.I)
 
 
 def protect_kinds(tok):
     """Which protection endpoints a path can be: the whole protection (a PUT replaces it), its required checks, its
-    list of checks, one ruleset. Hidden text at the end can be any of them."""
+    list of checks, one ruleset. Hidden text at the end can be any of them. The query string is split off first,
+    also where it may start at hidden text: an unquoted `?` is a glob to the shell (left as written when it matches
+    no file) and `$Q` may hold one, so `.../protection?x=1` and `.../protection"$Q"x` are the protection too."""
     out = set()
     for f in set(forms(PLACEHOLDER.sub(HID, tok))) | ({canon(tok, cue=False)} if '\\' in tok else set()):
         path = re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', f, flags=re.I), maxsplit=1)[0]
         path = path.rstrip('/').lower()
         if path[-1:] in (HID, WILD):
             return set(ALL_KINDS)
-        out |= {k for k, rx in PROTECT_KINDS if rx.search(path.replace(WILD, HID))}
+        cuts = [path] + [path[:i].rstrip('/') for i, c in enumerate(path) if c in (HID, WILD)]
+        out |= {k for k, rx in PROTECT_KINDS for p in cuts if rx.search(p.replace(WILD, HID))}
     return out
 
 
-def gh_fields_body(typed, ctx):
+def gh_fields_body(typed, ctx, keep_hidden=False):
     """The JSON body `gh api` builds from -f/-F fields (key[sub]=v, key[]=v, `key[]` for an empty list; -F reads
-    true/false/null/numbers and @file), or None when part of it cannot be read."""
+    true/false/null/numbers and @file), or None when part of it cannot be read. keep_hidden: a value with hidden
+    text stays in as that text (an id from a variable); a hidden key is still None."""
     root = {}
     for magic, f in typed:
-        if hidden(f):
+        if hidden(f) and not (keep_hidden and not hidden(f.partition('=')[0])):
             return None
         key, eq, val = f.partition('=')
         m = re.fullmatch(r'([^\[\]]+)((?:\[[^\[\]]*\])*)', key)
@@ -1623,22 +1646,103 @@ def emptying_reason(kinds, bodies, eff, how):
     return None
 
 
-def gql_empties(texts):
-    """Why a GraphQL updateRepositoryRuleset / updateBranchProtectionRule may leave no required check, or ''."""
+def gql_hidden(text):
+    """Whether GraphQL text has hidden parts outside its "strings" (an id in quotes from a variable is fine; text
+    the guard cannot read where the operation, a field or a value goes is not)."""
+    i, n, quoted = 0, len(text), False
+    while i < n:
+        c = text[i]
+        if quoted and c == '\\':
+            i += 2
+            continue
+        if c == '"':
+            quoted = not quoted
+        elif not quoted and c in (HID, WILD):
+            return True
+        i += 1
+    return False
+
+
+def gql_unset(v):
+    """A GraphQL value that turns a required-check setting off: false, null, an empty list, or text the guard cannot
+    read."""
+    return v is None or v is False or v == [] or (isinstance(v, str) and (
+        hidden(v) or v.strip().lower() in ('', 'false', 'null', '[]')))
+
+
+def rules_keep_checks(rules):
+    """A ruleset's rules (GraphQL input) hold a REQUIRED_STATUS_CHECKS rule that names at least one check."""
+    return isinstance(rules, list) and any(
+        isinstance(r, dict) and str(r.get('type', '')).upper() == 'REQUIRED_STATUS_CHECKS'
+        and isinstance(r.get('parameters'), dict) and isinstance(r['parameters'].get('requiredStatusChecks'), dict)
+        and has_checks(r['parameters']['requiredStatusChecks'].get('requiredStatusChecks')) for r in rules)
+
+
+def gql_value_empties(v, ruleset, depth=0):
+    """Why a GraphQL variable's value (the whole input, as gh builds it from input[..] fields or an --input file's
+    "variables") leaves no required check, or ''."""
+    if depth > 32:
+        return 'nests deeper than the guard reads'
+    if isinstance(v, list):
+        return next((r for r in (gql_value_empties(x, ruleset, depth + 1) for x in v) if r), '')
+    if not isinstance(v, dict):
+        return ''
+    for k, x in v.items():
+        key = k.lower()
+        if key == 'requiresstatuschecks' and not (x is True or (isinstance(x, str) and x.strip().lower() == 'true')):
+            return f'sets {k} to {json.dumps(x) if not hidden(json.dumps(x)) else "a value the guard cannot read"}'
+        if key in ('requiredstatuscheckcontexts', 'requiredstatuschecks') and not isinstance(x, dict) \
+                and gql_unset(x):
+            return f'sets {k} to nothing (an empty list, null, or a value the guard cannot read)'
+        if key == 'rules' and ruleset and not rules_keep_checks(x):
+            return 'sets the ruleset rules without a REQUIRED_STATUS_CHECKS rule that names a check'
+        why = gql_value_empties(x, ruleset, depth + 1)
+        if why:
+            return why
+    return ''
+
+
+GQL_KEPT = re.compile(r'requiredStatusChecks["\']?\s*:\s*(?:\[\s*[^\]\s]|\$\w)', re.I)   # a list that names a check
+
+
+def gql_empties(texts, variables=()):
+    """Why a GraphQL updateRepositoryRuleset / updateBranchProtectionRule may leave no required check, or ''.
+    texts: the query and bodies as written; variables: the variables objects gh sends (from -f/-F fields, None when
+    the fields cannot be read, and from an --input file)."""
     joined = '\n'.join(t for t in texts if t)
     if not GQL_EMPTYING.search(joined):
         return ''
+    if any(v is None for v in variables):
+        return 'takes variables the guard cannot read'
+    ruleset = GQL_UPDATE.search(joined) is not None
+    known = {}
+    for v in variables:
+        if isinstance(v, dict):
+            known.update(v)
+    for v in variables:
+        why = gql_value_empties(v, ruleset)
+        if why:
+            return why
     for m in GQL_EMPTY.finditer(joined):
         if m.group(2):
             return f'sets {m.group(1)} to {m.group(2)}'
         var = m.group(3)   # its value: -F var=.., or "var": .. in a variables object
+        if var in known:
+            if gql_unset(known[var]) or (m.group(1).lower() == 'rules' and ruleset
+                                         and not rules_keep_checks(known[var])):
+                return f'sets {m.group(1)} from ${var} to nothing (or to a value the guard cannot read)'
+            continue
         vals = re.findall(r'(?:^|[\s"\'{,])%s["\']?\s*[:=]\s*(false|null|\[\s*\]|[^\s,}]+)' % re.escape(var), joined,
                           re.I | re.M)
         vals += ['[]'] if re.search(r'(?:^|\s)%s\[\](?:\s|$)' % re.escape(var), joined, re.M) else []
         if not vals or any(re.fullmatch(r'false|null|\[\s*\]', v, re.I) for v in vals):
             return f'sets {m.group(1)} from ${var} to nothing (or to a value the guard cannot find)'
-    if re.search(r'updateRepositoryRuleset', joined, re.I) and re.search(r'\brules\b', joined, re.I) \
-            and not GQL_CHECKS.search(joined):
+    # a variable that holds the whole input (input: $input) must be there to read: gh sends null for one it lacks
+    for var in dict.fromkeys(re.findall(r'(?<![\w$])\w+\s*:\s*\$(\w+)', joined)):
+        if var not in known and not re.search(r'(?:^|[\s"\'{,])%s["\']?\s*[:=]' % re.escape(var), joined, re.M):
+            return f'takes ${var}, whose value the guard cannot find'
+    if ruleset and re.search(r'\brules(?:["\']?\s*:|\])', joined, re.I) and not GQL_KEPT.search(
+            '\n'.join([joined] + [json.dumps(v, ensure_ascii=False) for v in variables])):
         return 'sets the ruleset rules without a required status check'
     return ''
 
@@ -2002,13 +2106,46 @@ def guard_sig():
     return file_sig(SELF) if SELF else None
 
 
+def path_links(path, limit=40):
+    """[dev, inode, mtime_ns, ctime_ns] of every symbolic link met on the way from path to the file it names (the
+    kit's bin link, its `current` link, a link in a folder above them), or None when the path cannot be followed."""
+    out, parts, at = [], [p for p in path.split('/') if p], '/'
+    while parts:
+        part = parts.pop(0)
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            at = os.path.dirname(at)
+            continue
+        p = os.path.join(at, part)
+        try:
+            st = os.lstat(p)
+            target = os.readlink(p) if S_ISLNK(st.st_mode) else None
+        except (OSError, ValueError):
+            return None
+        if target is None:
+            at = p
+            continue
+        out.append([st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns])
+        if len(out) > limit:
+            return None
+        parts[:0] = [x for x in target.split('/') if x]
+        at = '/' if target.startswith('/') else at
+    return out
+
+
 def start_sig():
-    """The guard file's stat, taken when this module has run its top part: only when the file was last changed
-    before this process started (from /proc). Python compiled and ran ~2000 lines before this line, and a reinstall
-    in that window would give the old code in memory the new file's stat: then None, and this run uses no cache."""
+    """The guard file's stat, taken when this module has run its top part: only when the file, and every link on
+    the way to it from the path Python ran (the bin link, the kit's `current` link), were last changed before this
+    process started (from /proc). An update writes the new release first and then switches `current`: the new file
+    is older than a hook that opened the old one just before the switch, but the switched link is not. Python
+    compiled and ran ~2000 lines before this line, and a switch in that window would give the old code in memory
+    the new file's stat: then None, and this run uses no cache."""
     sig = guard_sig()
+    links = path_links(os.path.abspath(__file__)) if '__file__' in globals() else []
     started = time.time() - since_start()
-    return sig if sig and max(sig[3], sig[4]) / 1e9 < started - START_SLACK else None
+    times = [max(sig[3], sig[4])] + [max(x[2], x[3]) for x in links] if sig and links is not None else []
+    return sig if times and max(times) / 1e9 < started - START_SLACK else None
 
 
 START_SLACK = 0.05   # /proc gives the start in clock ticks (10 ms): a file changed that close to it is not trusted
@@ -2951,6 +3088,20 @@ def data_token(tok, ctx):
         t = f['named'] if f['text'] else ctx.get('feeds_code') and file_token(p)
         if t:
             return t
+        t = f['text'] and refuse_script_named(body(p, ctx))
+        if t:
+            return t
+    return None
+
+
+def refuse_script_named(text):
+    """A machine file refuseScripts entry that a line of the text calls (its name and its flag as words on one line,
+    `python3 garden.py --fix`), as a label for unproven(), or None. Text that a shell runs (sed e, cat f | bash,
+    eval "$(cat f)") would run it, as the same line in a script does."""
+    for rs in REFUSE_SCRIPTS if text else ():
+        rx = r'(?<![\w.-])%s(?![\w.-])[^\n]*?(?<![\w-])%s(?![\w-])' % (re.escape(rs['name']), re.escape(rs['flag']))
+        if re.search(rx, text):
+            return f'`{rs["name"]} {rs["flag"]}` (this machine\'s refuseScripts: {rs.get("why") or "refused"})'
     return None
 
 
@@ -3490,8 +3641,9 @@ def segment_reason(toks, ctx, loose):
     if how and h is not None:   # echo/printf/tee .. > x.sh; sh x.sh: the words are the script
         said = toks[h + 1:]
         filed, made = [], []
-        if kind in READERS | COPIERS and kind != 'tee':   # cat p.txt > x.sh, cp p.txt x.sh: the files are
-            for a in (a for a in said if not a.startswith('-') and not hidden(a)):
+        if kind in READERS | COPIERS | FILE_WRITERS and kind != 'tee':   # cat p.txt > x.sh, cp p.txt x.sh: the
+            srcs = file_writes(toks, h)[1] if kind in FILE_WRITERS else said   # files are the script
+            for a in (a for a in srcs if not a.startswith('-') and not hidden(a)):
                 text = read_named(a, ctx)
                 tok = text is None and named_file(a, ctx)
                 if tok:
@@ -3662,11 +3814,7 @@ def written(toks, cmd, env, ran):
     h, _ = head(toks)
     targets = [t for op, w in cmd['redirs'] if op.startswith(('>', '&>')) for r in readings({'words': [w]}, env)
                for t in [''.join(r)]]
-    if h is not None and os.path.basename(toks[h]) == 'tee':
-        targets += [t for t in toks[h + 1:] if not t.startswith('-')]
-    if h is not None and os.path.basename(toks[h]) in COPIERS:   # cp p.txt ~/.local/bin/ls, cp ls ~/.local/bin/
-        targets += [t.partition('=')[2] or t for t in toks[h + 1:] if not t.startswith('-') or
-                    t.startswith('--target-directory=')]
+    targets += file_writes(toks, h)[0]
     names = {os.path.basename(t) for t in targets if os.path.basename(t)}
     # tee ~/.local/bin/* (also ??, *?, $n): a name that is only hidden text can be any file of its folder, so any
     # name the text runs, when the folder is named or the name is unquoted (a glob, $f); a quoted "$f" alone still
@@ -3676,6 +3824,44 @@ def written(toks, cmd, env, ran):
                   for t in targets if not t.endswith('/'))
     return next((k for k in ('shell', 'exec', 'code') if ran[k] and anyname
                  or any(same_name(a, b) for a in names for b in ran[k])), '')
+
+
+FILE_WRITERS = {'install', 'dd'} | AWKS   # words that write the text of files they name into other files
+
+
+def file_writes(toks, h):
+    """(files the command word writes, files whose text it writes there) as the text shows them: tee FILE, cp/mv/ln
+    and install (cp p.txt ~/.local/bin/ls, cp ls ~/.local/bin/: every word, the sources' names land there too), dd
+    of=/if=, sed w FILE and s///w FILE, awk print > "FILE". Other writers (a program's -o FILE) are not read."""
+    if h is None:
+        return [], []
+    word, args = os.path.basename(toks[h]), toks[h + 1:]
+    if word == 'tee':
+        return [t for t in args if not t.startswith('-')], []
+    if word in COPIERS or word == 'install':
+        words = [t.partition('=')[2] or t for t in args if not t.startswith('-') or t.startswith('--target-directory=')]
+        return words, [t for t in args if not t.startswith('-')]
+    if word == 'dd':
+        return [a[3:] for a in args if a.startswith('of=')], [a[3:] for a in args if a.startswith('if=')]
+    if word == 'sed':
+        scripts, _, inputs, sandbox = sed_args(args)
+        return ([] if sandbox else [w for t in scripts for w in sed_program(t)[2]]), inputs
+    if word in AWKS:
+        progs, inputs, i = [], [], 0
+        while i < len(args):
+            a = args[i]
+            i += 1
+            if a in ('-F', '-v', '-f') or a in ('--field-separator', '--assign', '--file'):
+                progs += [args[i]] if a in ('-f', '--file') and i < len(args) else []
+                i += 1
+            elif a.startswith('-') and a != '-':
+                continue
+            elif not progs:
+                progs.append(a)
+            else:
+                inputs.append(a)
+        return [t for p in progs for t in re.findall(r'>>?\s*"([^"]+)"', p)], inputs
+    return [], []
 
 
 def visible(text):

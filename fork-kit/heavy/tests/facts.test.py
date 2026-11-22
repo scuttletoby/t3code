@@ -939,6 +939,14 @@ class T3Capacity(Case):
         self.assertIn('exit status is kept', p.stderr)
         with open(out_file) as f:
             self.assertTrue(f.read().splitlines()[-1].startswith('NOT OK'))
+        with open(os.devnull, 'w') as f:   # the usual gate, `t3-capacity N >/dev/null && cmd`: no "file" there
+            p = subprocess.run([T3CAP, '99999'], stdout=f, stderr=subprocess.PIPE, text=True, timeout=30,
+                               cwd=self.work, env=self.m.env(PWD=self.work))
+        self.assertEqual(p.returncode, 1)
+        self.assertNotIn('pipe', p.stderr)
+        self.assertNotIn('to a file', p.stderr)
+        self.assertIn('/dev/null', p.stderr)
+        self.assertIn('exit status is kept', p.stderr)
         self.assertIn('need=3072MB', self.cli([T3CAP])[1].splitlines()[0])
         code, out, _ = self.cli([T3CAP, '--kind', WRITER])
         self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'))

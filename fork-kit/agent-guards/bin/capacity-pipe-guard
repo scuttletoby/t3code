@@ -17,7 +17,9 @@ How it reads a command (small on purpose; actions-disable-guard is the full shel
 attack, this is a mistake):
   - shell text as a shell reads it: quotes, backslashes, comments, redirections, `&& || ; & |` and newlines;
   - the check must be the command word (any path; after NAME=value, `!`, if/while/until/then/do/else, and the
-    wrappers sudo, env, command, exec, nohup, nice, ionice, timeout, stdbuf, setsid, time, builtin with their flags,
+    wrappers sudo, env, command, exec, nohup, nice, ionice, timeout, stdbuf, setsid, time, builtin, chrt, taskset,
+    flock, numactl, doas, runuser, systemd-run, unbuffer, chronic with their flags (and the priority, CPU mask or
+    lock file the first three take before the command),
     read letter by letter so a glued value is a value (`sudo -uroot`, `sudo -iu someone`); `env -S 'TEXT'` and
     `--split-string` run the words of TEXT, which are read as the command; the keyword `time [-p]` before a group);
   - commands inside `$(..)`, backticks, `<(..)`, and a `( .. )` or `{ ..; }` group whose LAST command is the check;
@@ -29,7 +31,8 @@ Not covered (the check's own stderr line is the second layer when it has one: sa
 stderr whenever it answers NOT OK into a pipe or a file): a command kept in a variable (`$C | tail`), a script file,
 `sh t3-capacity`, a heredoc piped into a shell (`cat <<EOF | bash`), `$(..)` inside `${..}` or inside an unquoted
 heredoc into a non-shell, xargs / find -exec, a wrapper's long flag with its value as the next word
-(`sudo --user someone`), text more than 40 levels deep. Tools other than Bash and Monitor are not read.
+(`sudo --user someone`), `flock FILE -c TEXT`, text more than 40 levels deep. Tools other than Bash and
+Monitor are not read.
 
 Fail open: on its own failure (broken input, a bug) it writes one line to stderr and exits 1, which Claude Code
 treats as "hook failed, run the command". Exit 2 (refuse) is only ever the answer to a pipe it found. The settings
@@ -60,7 +63,10 @@ TEXT_ARGS = {'ssh', 'watch'}                           # each argument that name
 TOOLS = {'Bash', 'Monitor'}                            # the tools whose `command` is shell text
 WRAPPERS = {   # a command follows them; value: their one-letter flags that take a value (glued or the next word)
     'sudo': 'ughpCDRTUrt', 'env': 'uCS', 'timeout': 'ks', 'nice': 'n', 'ionice': 'cnp', 'stdbuf': 'ioe', 'exec': 'a',
-    'time': 'fo', 'command': '', 'builtin': '', 'nohup': '', 'setsid': ''}
+    'time': 'fo', 'command': '', 'builtin': '', 'nohup': '', 'setsid': '', 'chrt': 'TPD', 'taskset': '',
+    'flock': 'wEc', 'numactl': 'CNmpiu', 'doas': 'uC', 'runuser': 'ugGw', 'systemd-run': 'puEMHd', 'unbuffer': '',
+    'chronic': ''}
+POSITIONAL = {'chrt': 1, 'taskset': 1, 'flock': 1}   # words they take before the command: priority, mask, lock file
 KEYWORDS = {'!', '{', 'if', 'then', 'elif', 'else', 'while', 'until', 'do'}   # a command follows them
 OPENERS = {'{', 'if', 'while', 'until'}        # ... and these open a group that CLOSERS end
 HEADS = {'for', 'case', 'select'}              # open a group too; the rest of their line is no command
@@ -111,10 +117,13 @@ def command_at(ws):
         if base(ws[i]) not in WRAPPERS:
             return ws, i
         name = base(ws[i])
-        asks, values = name == 'command', WRAPPERS[name]
+        asks, values, left = name == 'command', WRAPPERS[name], POSITIONAL.get(name, 0)
         i += 1
-        while i < len(ws) and (PLAIN.match(ws[i]) or ASSIGN.match(ws[i])):
+        while i < len(ws) and (PLAIN.match(ws[i]) or ASSIGN.match(ws[i]) or left):
             w = ws[i]
+            if left and not w.startswith('-'):   # chrt 10 / taskset 0x3 / flock FILE, then the command
+                left, i = left - 1, i + 1
+                continue
             if asks and w in ('-v', '-V'):
                 return ws, len(ws)   # `command -v x` only looks x up
             split = None   # env -S TEXT / --split-string TEXT: the words env runs are the words of TEXT

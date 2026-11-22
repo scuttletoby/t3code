@@ -434,6 +434,8 @@ class Install(fx.FakeHost):
         self.assertFalse(os.path.lexists(self.path(self.LEFTOVER)))
 
     def test_931_uninstall_is_not_refused_by_the_kits_own_temp_copy(self):
+        """A killed install's `.agent-guards.json.XXXXXXXX.tmp` beside the drop-in: no settings file (foreign_settings
+        reads the folder's `*`, which leaves dot files out), and settings_off() removes it with the drop-in."""
         self.assertEqual(self.install('--settings')[0], 0)
         self.leave_temp_copy()
         code, out, err = self.run_main('uninstall')

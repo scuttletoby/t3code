@@ -297,7 +297,6 @@ class AgentGuardsInstaller(kit_install.Installer):
 
     @contextlib.contextmanager
     def uninstall_guard(self):
-        self.drop_temp_leftovers(wiring.DROP_IN)   # the kit's own: a killed install's temp copy is no foreign file
         sessions = self.sessions()
         foreign = self.foreign_settings(sessions)
         if foreign:
