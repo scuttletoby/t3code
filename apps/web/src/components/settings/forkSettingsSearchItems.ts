@@ -75,7 +75,9 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     id: "usage-pacing",
     title: "Usage reserve per account",
     to: FORK_PAGE,
-    searchTerms: ["usagePacing reservePercent burn first no limits api key provider account"],
+    searchTerms: [
+      "usagePacing reservePercent burn first burnFirstWindows window weekly monthly 5-hour no limits api key provider account",
+    ],
     environmentOnly: true,
     scope: "environment-defaults",
   },
