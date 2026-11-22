@@ -547,13 +547,23 @@ after another, up to the group's ceiling), the memory budget, the queue and note
 - **T3 down or not installed:** no agent scopes, still an answer from the kernel.
 - **Tiers:** full with cgroup v2 and a systemd user manager. Machine with cgroup v2 and `user.slice` but no user
   manager of the caller's (a CI runner's user without lingering or a login session): it has no agents or heavy
-  jobs of its own, every user's are counted as usual, and so is every person's `reserve.d` (the users of
-  `/etc/passwd` and of `user.slice` from `UID_MIN` to `UID_MAX`; root and system users are not read), so it gets
-  the answer a caller with a user manager gets (`tier: "machine"`, a note, and the reason says "machine-wide
-  numbers"). A person's `reserve.d` it cannot read (a home closed to others, mode 750 or 700), or a user with a
-  session but no home it can find, makes it Basic: it never takes room it cannot see. Without cgroup v2, or without both a user
-  manager and `user.slice` (Basic), agents and other users' work cannot be counted, so the answer is never free and
-  every `fits` is 0 (a note says why). An other user's folder that exists but cannot be listed is Basic too.
+  jobs of its own, every user's are counted as usual, and so are other people's reservations (`tier: "machine"`, a
+  note, and the reason says "machine-wide numbers"). Its limits:
+  - It reads only each person's default `~/.config/t3-capacity/reserve.d`, not a `T3_CAPACITY_RESERVE_DIR` they
+    set for themselves.
+  - It reads the people of `/etc/passwd` with a UID from `UID_MIN` to `UID_MAX`, and anyone with a `user.slice`
+    session. Not read: root and system users (below `UID_MIN`), people known only through NSS (LDAP, sssd) who have
+    no session now, and homes that are `/` or not absolute.
+  - Each `.conf` there must be a plain file: a link (stow-style dotfiles) is refused and makes the tier Basic.
+  - A person's `reserve.d` it cannot read (a home closed to others, mode 750 or 700), or a user with a session but
+    no home it can find, makes it Basic.
+  - A caller that is not root cannot see another person's working folders, so their reservations hold their whole
+    size, and their agents' debts are counted too. That is stricter than a caller with a user manager, never looser.
+
+  Without cgroup v2, or without both a user manager and `user.slice` (Basic), agents and other users' work cannot
+  be counted, so the answer is never free and every `fits` is 0 (a note says why). An other user's folder that
+  exists but cannot be listed is Basic too.
+
 - **Unreadable signals** (PSI, a box with a live piece but without its `memory.pressure`, or with no folder at
   all) give "elevated", never "ok"; a missing MemAvailable or a container limit that cannot be read gives busy for
   every kind. A box with no live piece of its own passes no box pressure (as the server's observer). A piece whose
@@ -577,13 +587,17 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   Not there: nothing runs in it. There without a memory controller (no `memory.stat`): its whole `budgetMb` is held,
   with a note. Its use cannot be read: the whole budget is held, with a note. A reservation file named like a hold
   (`<label>.conf`) gives a note; both hold.
-- **Cache:** `/run/user/<uid>/heavy-facts.json` (or `$HEAVY_FACTS_CACHE`), 0600, read again after 5 s (`--fresh`:
-  now). A user without `/run/user/<uid>` (no user manager) uses `heavy-facts-<uid>/` in the temporary folder
-  (`$TMPDIR`, else `/tmp`, never the working folder), made 0700; one that is a link, another user's or open to
+- **Cache:** `/run/user/<uid>/heavy-facts-v<version>-<hash>.json`, one file per kit version and settings (slice,
+  queue, reservations folder, user, holds), so two callers of one user with other settings, or an old and a new
+  kit, never share one and each one's hold-down steps down on its own (or one file, `$HEAVY_FACTS_CACHE`), 0600,
+  read again after 5 s (`--fresh`: now). A user without `/run/user/<uid>` (no user manager) uses
+  `heavy-facts-<uid>/` in the temporary folder (`$TMPDIR`, else `/tmp`, never the working folder), made 0700; one that is a link, another user's or open to
   others, or no temporary folder this user can write, is no cache (a note). Pressure levels carry from it (at most
-  5 minutes old) so calm must last before a level drops. Without a cache folder, or with a cache file that is there
-  but cannot be used (another version, as once after an update, other settings, broken, from the future), nothing
-  carries, so the call starts "elevated" (only the rule's floors admit; never straight to "ok").
+  5 minutes old) so calm must last before a level drops. Without a cache folder, with a cache file that is there
+  but cannot be used (broken, from the future, other settings in `$HEAVY_FACTS_CACHE`), or with no file of its own
+  yet but another cache file of this user's written in the last 5 minutes beside it (another version, as once after
+  an update, or other settings), nothing carries, so the call starts "elevated" (only the rule's floors admit; never
+  straight to "ok"). Cache files of other settings or versions older than 5 minutes are removed.
 
 Two thin callers come with it:
 
@@ -683,8 +697,8 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | `/run/user/<uid>/heavy-queue/<slice>/`          | the memory queue: its lock and one ticket per queued job (tmpfs)          |
 | `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
 |                                                 | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
-| `/run/user/<uid>/heavy-facts.json`              | `heavy facts`' 5 s cache (tmpfs)                                          |
-| `/tmp/heavy-facts-<uid>/heavy-facts.json`       | the same, for a user without `/run/user/<uid>` (no user manager)          |
+| `/run/user/<uid>/heavy-facts-*.json`            | `heavy facts`' 5 s cache (tmpfs), one per version and settings            |
+| `/tmp/heavy-facts-<uid>/heavy-facts-*.json`     | the same, for a user without `/run/user/<uid>` (no user manager)          |
 | `~/.config/t3-capacity/reserve.d/*.conf`        | each user's reservations for `heavy facts` and its callers                |
 
 ## Install (owner, as root)

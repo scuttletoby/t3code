@@ -949,8 +949,14 @@ class Sweep:
             if i == 1 and not parent_ok(os.path.dirname(os.path.dirname(folder))):
                 if os.path.lexists(folder):         # #945: said, never dropped silently (a ~/.local of mode 775)
                     parent = os.path.dirname(os.path.dirname(os.path.dirname(folder)))
+                    try:
+                        st = os.lstat(parent)
+                        fix = ('chmod go-w' if st.st_uid == self.uid else 'sudo chown "$USER:"') \
+                            if stat.S_ISDIR(st.st_mode) else 'replace with a real folder:'
+                    except OSError:
+                        fix = 'make the folder'
                     self.note(f'old docker-label notes in {folder} are left: {parent} must be a real folder of this '
-                              f'user\'s that no one else can write (`chmod go-w {parent}`)')
+                              f'user\'s that no one else can write (`{fix} {parent}`)')
                 continue
             try:
                 # the folder, heavy/ and the base: each a real folder of this user's only it can write (own_folder)

@@ -853,7 +853,8 @@ class State(Case):
             again = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=4), env={'HEAVY_FACTS_CACHE': ''})
             self.assertEqual(again[1]['memory'], d['memory'], 'a second call within 5 s is answered from the cache')
             self.assertEqual(os.lstat(folder).st_mode & 0o777, 0o700)
-            self.assertEqual(os.listdir(folder), ['heavy-facts.json'])
+            self.assertEqual(len(os.listdir(folder)), 1)
+            self.assertRegex(os.listdir(folder)[0], r'^heavy-facts-v%d-[0-9a-f]{16}\.json$' % hf.CACHE_VERSION)
             for planted in ('link', 'file', 'open'):     # a folder that is not one only this user can use: no cache
                 with self.subTest(planted=planted):
                     shutil.rmtree(folder)
@@ -875,6 +876,34 @@ class State(Case):
                     else:
                         os.unlink(folder)
                     os.mkdir(folder, 0o700)
+
+    def test_callers_with_other_settings_taking_turns_each_reach_ok(self):
+        # #945: two callers of one user with other settings (here another reservations folder) shared one cache file
+        # and each read the other's as unusable, so every call started "elevated": NOT OK on a calm machine for as
+        # long as they took turns. Now each has its own file: the first call beside another caller's recent file
+        # starts "elevated" (never straight to ok), then each one's own hold-down steps down
+        run = os.path.join(self.tmp, 'run')
+        os.makedirs(os.path.join(run, str(UID)), mode=0o700)
+        other = os.path.join(self.tmp, 'reserve-b.d')
+        os.makedirs(other)
+        callers = ({'HEAVY_FACTS_CACHE': ''}, {'HEAVY_FACTS_CACHE': '', 'T3_CAPACITY_RESERVE_DIR': other})
+        seen = []
+        with mock.patch.object(hf, 'RUN_USER', run):
+            for i in range(12):                     # A and B take turns every 20 s on a calm machine
+                code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=20 * i), env=callers[i % 2])
+                seen.append((code, d['level']))
+        self.assertEqual(seen[:2], [(0, 'ok'), (75, 'elevated')], 'B starts "elevated" beside A\'s fresh file')
+        self.assertEqual(seen[-6:], [(0, 'ok')] * 6, seen)
+        files = sorted(os.listdir(os.path.join(run, str(UID))))
+        self.assertEqual(len(files), 2, files)
+        # a cache file of other settings past the carry window carries nothing and is removed on the next write
+        stale = os.path.join(run, str(UID), 'heavy-facts.json')     # an older kit's
+        open(stale, 'w').close()
+        os.utime(stale, (time.time() - hf.CARRY_SECONDS - 60,) * 2)
+        with mock.patch.object(hf, 'RUN_USER', run):
+            self.facts('--mb', '64', '--fresh', now=NOW + datetime.timedelta(seconds=240), env=callers[0])
+        self.assertFalse(os.path.exists(stale))
+        self.assertEqual(sorted(os.listdir(os.path.join(run, str(UID)))), files)
 
 
 def fake_heavy(tmp, body):
@@ -1221,8 +1250,9 @@ class RedCheck(Case):
                 ("        return None, f'no cache: {folder} is not a folder only this user can use: every call starts "
                  "\"elevated\"'\n", "        pass\n", State,
                  'test_without_run_user_the_cache_is_a_private_temporary_folder'),
-                ("    if os.path.isdir(run):\n        return run + '/heavy-facts.json', None\n",
-                 "    return (run + '/heavy-facts.json', None) if os.path.isdir(run) else (None, 'no cache')\n", State,
+                ("    if os.path.isdir(run):\n        return os.path.join(run, cache_name(key)), None\n",
+                 "    return (os.path.join(run, cache_name(key)), None) if os.path.isdir(run) else (None, 'no cache')\n",
+                 State,
                  'test_without_run_user_the_cache_is_a_private_temporary_folder')):
             with self.subTest(line=line[:60]):
                 self.assertGreater(self.failing(cls, name, self.broken(line, instead)), 0, line)
@@ -1247,6 +1277,13 @@ class RedCheck(Case):
                  'test_the_machine_tier_sees_every_person_s_reservations'),
                 ("        return None, no_carry()\n    age = now_ms", "        return None, None\n    age = now_ms", State,
                  'test_a_cache_of_another_version_never_skips_the_hold_down'),
+                # one cache file for every setting and version (the round-2 file): callers keep each other elevated
+                ("    return f'heavy-facts-v{CACHE_VERSION}-{hashlib.sha256(key.encode()).hexdigest()[:16]}.json'\n",
+                 "    return 'heavy-facts.json'\n", State, 'test_callers_with_other_settings_taking_turns_each_reach_ok'),
+                ("    for old in other_caches(path, recent=False):", "    for old in []:", State,
+                 'test_callers_with_other_settings_taking_turns_each_reach_ok'),
+                ("        return None, (no_carry() if other_caches(path, recent=True) else None)\n",
+                 "        return None, None\n", State, 'test_callers_with_other_settings_taking_turns_each_reach_ok'),
                 ("    root = TMP_ROOT or temp_root()\n", "    root = TMP_ROOT or __import__('tempfile').gettempdir()\n",
                  State, 'test_without_a_temporary_folder_it_can_write_there_is_no_cache')):
             with self.subTest(line=line[:60]):

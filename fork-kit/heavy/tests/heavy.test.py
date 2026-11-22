@@ -1175,6 +1175,12 @@ class Parts(unittest.TestCase):
         # #945: said, not dropped silently (a ~/.local of mode 775, as umask 002 makes it), with the repair
         self.assertIn(f'chmod go-w {os.path.join(mine, ".local")}', err.getvalue())
         self.assertEqual(os.listdir(os.path.join(mine, '.local')), [])
+        # a ~/.local another user owns (root's, from an older heavy run as root): the repair is chown, not chmod
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.mod.own_folder(os.path.join(theirs, 'state'), make_base=True), '')
+        self.assertIn(f'sudo chown "$USER:" {theirs}', err.getvalue())
+        self.assertNotIn('chmod go-w', err.getvalue())
         os.chmod(os.path.join(mine, '.local'), 0o700)
         self.assertEqual(state(mine, pw_home)[0], labelled(mine))
         # #771 nit: a HOME given as a link is resolved once, so a link swapped after the check changes nothing

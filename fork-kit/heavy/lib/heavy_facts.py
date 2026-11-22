@@ -34,18 +34,22 @@ then the first by name), and a piece's debt is split over its processes by their
 reservations (#945). It does not hold back a caller whose working folder is in it; past its until date, or broken,
 it holds nothing (a note says so).
 
-Readings are kept 5 seconds in /run/user/<uid>/heavy-facts.json ($HEAVY_FACTS_CACHE; --fresh reads again; a user
-without /run/user/<uid>, as one with no user manager, uses $TMPDIR or /tmp /heavy-facts-<uid>/, a folder only it
-can use: one that is not, or no such temporary folder, is no cache), written whole through a rename; a cache that
-is old, from the future, broken, of another version, of other settings (slice, queue, reservations folder) or not
-this user's own is read again. The pressure level (and the swap free its trend needs; a state without it waits one
-more read before it can step down) carries from one reading to the next (the rule's hysteresis) while the last one
-is at most 5 minutes old; without a cache folder, or with a cache file that is there but cannot be used, nothing can
-carry, so the level starts "elevated" (it never drops straight to ok). Learned
+Readings are kept 5 seconds in /run/user/<uid>/heavy-facts-v<version>-<hash of the settings>.json, one file per
+version and settings, so callers of one user with other settings (slice, queue, reservations folder) or another
+kit version never read each other's file and each one's hold-down steps down on its own (#945) ($HEAVY_FACTS_CACHE
+names one file instead; --fresh reads again; a user without /run/user/<uid>, as one with no user manager, uses
+$TMPDIR or /tmp /heavy-facts-<uid>/, a folder only it can use: one that is not, or no such temporary folder, is no
+cache), written whole through a rename; a cache that is old, from the future, broken, of another version, of other
+settings or not this user's own is read again. The pressure level (and the swap free its trend needs; a state
+without it waits one more read before it can step down) carries from one reading to the next (the rule's
+hysteresis) while the last one is at most 5 minutes old; without a cache folder, with a cache file that is there but
+cannot be used, or with no file of its own yet but another caller's written in the last 5 minutes beside it (another
+version after an update, other settings), nothing can carry, so the level starts "elevated" (it never drops straight
+to ok). Cache files of other settings or versions older than 5 minutes are removed. Learned
 job costs: heavy's peaks (lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost,
 not heavy's own reservation for it (heavy's queue holds that one back itself).
 """
-import datetime, errno, fcntl, fnmatch, json, math, os, pwd, re, signal, stat, subprocess, sys, time
+import datetime, errno, fcntl, fnmatch, hashlib, json, math, os, pwd, re, signal, stat, subprocess, sys, time
 
 CACHE_SECONDS, CARRY_SECONDS, ANSWER_SECONDS, STALE_TMP_SECONDS = 5, 300, 5, 60
 EXIT_FREE, EXIT_BUSY, EXIT_ERROR = 0, 75, 1
@@ -57,6 +61,7 @@ KIND_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,59}\Z')
 USER_RE = re.compile(r'^user-([0-9]{1,10})\.slice\Z')
 HOLD_LABEL_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,39}\Z')
 CG_PART_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\Z')
+CACHE_FILE_RE = re.compile(r'^heavy-facts(-v[0-9]{1,4}-[0-9a-f]{16})?\.json\Z')   # an older kit's: heavy-facts.json
 CACHE_KEYS = {'v', 'key', 'atMs', 'tier', 'facts', 'boxPsi', 'reservations', 'learned', 'carry', 'notes', 'load1',
               'queue', 'pressure'}
 USERS = '/sys/fs/cgroup/user.slice'
@@ -596,11 +601,13 @@ def read_cache(path, now_ms, key):
     """(readings while fresh, else None; the pressure state to carry on, else None). Anything odd is not trusted. No
     file, or one older than CARRY_SECONDS: nothing to carry (None). A file that is there but cannot be used (another
     version, as once after an update or while an old heavy writes it too; other settings, broken, from the future,
-    not this user's own): no_carry(), so the hold-down is never skipped (#945)."""
+    not this user's own): no_carry(), so the hold-down is never skipped (#945). No file of its own yet, but another
+    cache file of this user's beside it written in the last CARRY_SECONDS (another version just after an update, or
+    other settings): no_carry() too; from its own file on, it steps down by its own hold-down."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     except FileNotFoundError:
-        return None, None
+        return None, (no_carry() if other_caches(path, recent=True) else None)
     except OSError:
         return None, no_carry()
     try:
@@ -623,9 +630,32 @@ def read_cache(path, now_ms, key):
     return (data if age < CACHE_SECONDS * 1000 and carry is not None else None), carry
 
 
+def other_caches(path, recent):
+    """The other cache files of this user's (any version or settings, an older kit's heavy-facts.json too) beside
+    `path`, written in the last CARRY_SECONDS (recent) or before (not recent). A file from the future is recent."""
+    folder, own_name = os.path.split(path)
+    try:
+        names = os.listdir(folder or '.')
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if name == own_name or not CACHE_FILE_RE.match(name):
+            continue
+        try:
+            st = os.lstat(os.path.join(folder, name))
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and \
+                (time.time() - st.st_mtime <= CARRY_SECONDS) == recent:
+            out.append(os.path.join(folder, name))
+    return out
+
+
 def write_cache(path, data):
     """Whole or not at all: a unique temporary file renamed over the cache. A temporary file left by a writer that
-    stopped half-way is removed once it is a minute old."""
+    stopped half-way is removed once it is a minute old, and this user's cache files of other settings or versions
+    once they are past the carry window (they can carry nothing then), so they do not pile up."""
     folder, base = os.path.split(path)
     for name in os.listdir(folder or '.'):
         if name.startswith(base + '.') and name.endswith('.tmp'):
@@ -634,6 +664,11 @@ def write_cache(path, data):
                     os.unlink(os.path.join(folder, name))
             except OSError:
                 pass
+    for old in other_caches(path, recent=False):    # other settings or versions, past the carry window: no use
+        try:
+            os.unlink(old)
+        except OSError:
+            pass
     tmp = f'{path}.{os.getpid()}.{os.urandom(4).hex()}.tmp'
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
@@ -723,12 +758,18 @@ def temp_root():
     return None
 
 
-def cache_path(run):
+def cache_name(key):
+    """One cache file per version and settings (#945): two callers of one user with other settings, or an old and a
+    new kit, that took turns on one file read each other's as unusable and kept each other "elevated" for good."""
+    return f'heavy-facts-v{CACHE_VERSION}-{hashlib.sha256(key.encode()).hexdigest()[:16]}.json'
+
+
+def cache_path(run, key):
     """(the cache file, None) or (None, why there is none). /run/user/<uid> when it is there; else (#844: a user with
     no user manager and no login session has none) a folder only this user can use in the temporary folder, made if
     missing: one that is a link, another user's or open to others (planted first) is no cache, and so no carry."""
     if os.path.isdir(run):
-        return run + '/heavy-facts.json', None
+        return os.path.join(run, cache_name(key)), None
     root = TMP_ROOT or temp_root()
     if not root:
         return None, 'no cache: no temporary folder this user can write ($TMPDIR, /tmp): every call starts "elevated"'
@@ -743,7 +784,7 @@ def cache_path(run):
         return None, f'no cache: {folder} cannot be made ({e.strerror or e}): every call starts "elevated"'
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
         return None, f'no cache: {folder} is not a folder only this user can use: every call starts "elevated"'
-    return os.path.join(folder, 'heavy-facts.json'), None
+    return os.path.join(folder, cache_name(key)), None
 
 
 def facts_main(argv, slice_name, queue_root, hq, now=None):
@@ -785,7 +826,7 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
         where['key'] = '\n'.join((slice_name, where['queueDir'], where['reserveDir'], where['user'],
                                   json.dumps(where['holds'], sort_keys=True)))
         cache, why = (os.environ['HEAVY_FACTS_CACHE'], None) if os.environ.get('HEAVY_FACTS_CACHE') else \
-            cache_path(run)
+            cache_path(run, where['key'])
         now = now or datetime.datetime.now(datetime.timezone.utc)
         now_ms = int(now.timestamp() * 1000)
         # Without a cache folder nothing carries the pressure level from one call to the next: start every call
