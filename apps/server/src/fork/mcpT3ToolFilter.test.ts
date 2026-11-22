@@ -48,6 +48,7 @@ import { Waits } from "../waits/WaitWorker.ts";
 import { makeClaudeMcpProfiles } from "./claudeMcpProfile.ts";
 import * as McpT3ToolFilter from "./mcpT3ToolFilter.ts";
 import * as McpT3ToolRule from "./mcpT3ToolRule.ts";
+import * as LensStartVisibility from "./reviewRules/lensStartVisibility.ts";
 import * as T3ToolSets from "./mcpT3ToolSets.ts";
 
 const ENVIRONMENT = EnvironmentId.make("environment-t3-tool-groups");
@@ -470,6 +471,59 @@ describe("the T3 tool filter on /mcp", () => {
 /** Moves test time on by `millis` (each sleep in turn wakes), then joins the fiber. */
 const drive = <A>(fiber: Fiber.Fiber<A>, millis: number) =>
   TestClock.adjust(millis).pipe(Effect.andThen(Fiber.join(fiber)));
+
+describe("lens_start: off means off (review rules, fork issue #888)", () => {
+  const LENS = "lens_start";
+  const found = (reply: RpcReply) =>
+    (
+      (reply.result?.structuredContent as { tools?: ReadonlyArray<{ name: string }> })?.tools ?? []
+    ).map((tool) => tool.name);
+
+  it.effect("review rules off (the default): not listed, refused, not found by tool_search", () =>
+    withServer(({ list, call }) =>
+      Effect.gen(function* () {
+        LensStartVisibility.__testing.clear();
+        expect(yield* list("all")).not.toContain(LENS);
+        const refused = yield* call("all", LENS, { pr: 7 });
+        expect(refused.error?.message).toBe(LensStartVisibility.LENS_START_OFF);
+        expect(
+          found(yield* call("all", "tool_search", { query: "lens_start review lenses" })),
+        ).not.toContain(LENS);
+      }),
+    ),
+  );
+
+  it.effect("review rules on: listed in the orchestration group only", () =>
+    withServer(
+      ({ list, call }) =>
+        Effect.gen(function* () {
+          LensStartVisibility.__testing.clear();
+          expect(yield* list("all")).toContain(LENS);
+          expect(
+            found(yield* call("all", "tool_search", { query: "lens_start review lenses" })),
+          ).toContain(LENS);
+          // A profile without `orchestration` (it starts delegated children) does not keep it.
+          expect(yield* list("waits")).not.toContain(LENS);
+        }),
+      { ...SETTINGS, reviewRules: { preset: "recommended" } },
+    ),
+  );
+
+  it.effect("a project whose own review rules are off: not listed there", () =>
+    withServer(
+      ({ list }) =>
+        Effect.gen(function* () {
+          LensStartVisibility.__testing.clear();
+          expect(yield* list("all")).not.toContain(LENS);
+        }),
+      {
+        ...SETTINGS,
+        reviewRules: { preset: "recommended" },
+        projectSettingsOverrides: { [PROJECT]: { reviewRules: { preset: "off" } } },
+      },
+    ),
+  );
+});
 
 describe("a set worked out by a request, not a turn (fork issues #812, #918)", () => {
   it.effect("a refused set is not remembered: it is reused briefly, then worked out again", () =>

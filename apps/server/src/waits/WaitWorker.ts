@@ -16,6 +16,7 @@ import * as Stream from "effect/Stream";
 import { ServerConfig } from "../config.ts";
 import * as ContinuationSlot from "../fork/continuationSlot.ts";
 import * as LimitResumeSlot from "../fork/limitResumeSlot.ts";
+import * as LensStartServer from "../fork/reviewRules/lensStartServer.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -36,9 +37,14 @@ import { makePrJudge } from "./WaitPrJudge.ts";
 import * as WaitService from "./WaitService.ts";
 import { WAIT_STORE_FILE } from "./WaitStore.ts";
 
-export class Waits extends Context.Service<Waits, WaitService.WaitService>()(
-  "t3/waits/WaitWorker/Waits",
-) {}
+/**
+ * The server's wait service. Fork (review rules): it also carries lens_start's reads and starts
+ * (`lensStart`), built here with the waits whose `then` it runs; absent where none was built.
+ */
+export class Waits extends Context.Service<
+  Waits,
+  WaitService.WaitService & { readonly lensStart?: LensStartServer.LensStartServer }
+>()("t3/waits/WaitWorker/Waits") {}
 
 /** A thread that ran, stopped, was archived or deleted may let a held message go. */
 const affectsWaits = (event: OrchestrationV2DomainEvent) =>
@@ -83,6 +89,7 @@ export const layer = Layer.effect(
     const scheduler = yield* Scheduler.Scheduler;
     const due = DueHint.make();
     const checkPlaceOf = yield* makeCheckPlaceOf();
+    const lensStart = yield* LensStartServer.makeLensStartServer();
     const waits = yield* WaitService.make({
       filePath: path.join(config.stateDir, WAIT_STORE_FILE),
       // The wake-ups it sends take a slot like any start (the same gate as below).
@@ -97,6 +104,8 @@ export const layer = Layer.effect(
       checkPlaceOf,
       // The server's one gate (layers memoize by reference): slot waits and delegate_task share it.
       slots: yield* SlotGate.SlotGate,
+      // lens_start {afterCi}: starts the head's lenses once its wake is in the thread.
+      action: lensStart.action,
     });
     yield* forkParked(
       Stream.runForEach(orchestrator.streamDomainEvents, (event) =>
@@ -118,7 +127,7 @@ export const layer = Layer.effect(
         yield* due.record(readVersion, nextDueAt, nowMs);
       }),
     );
-    return waits;
+    return { ...waits, lensStart };
   }),
 ).pipe(
   Layer.provide(ProcessRunner.layer),

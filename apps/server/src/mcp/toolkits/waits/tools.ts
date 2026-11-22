@@ -23,6 +23,10 @@ import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import { Playtest } from "../../../playtest/PlaytestLayer.ts";
 import { Waits } from "../../../waits/WaitWorker.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import {
+  LensStartToolInput,
+  LensStartToolResult,
+} from "../../../fork/reviewRules/lensStartTool.ts";
 import { TaskListInput, TaskListResult } from "./taskList.ts";
 
 const dependencies = [
@@ -124,10 +128,34 @@ const PlaytestTool = Tool.make("playtest", {
   .annotate(Tool.OpenWorld, true)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
+// Fork (review rules, issue 888): one read-only review child per lens the head still needs, through
+// delegate_task; the server writes each prompt. In the orchestration group; hidden while review rules are off.
+const LensStartTool = Tool.make("lens_start", {
+  description:
+    "Start the review lenses a PR head still needs (project review config, changed paths, lens comments): one read-only review child per lens; the server writes each prompt. A repeat returns running children.",
+  parameters: LensStartToolInput,
+  success: LensStartToolResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: [
+    McpInvocationContext.McpInvocationContext,
+    ThreadManagementService.ThreadManagementService,
+    Waits,
+  ],
+})
+  .annotate(Tool.Title, "Start review lenses")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  // The same head twice returns the same children.
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
 export const WaitsToolkit = Toolkit.make(
   WaitForTool,
   WaitListTool,
   WaitCancelTool,
   TaskListTool,
   PlaytestTool,
+  LensStartTool,
 );

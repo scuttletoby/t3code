@@ -408,8 +408,14 @@ export function judgePrChecks(input: {
   readonly seen: PrSeen | null;
   readonly now: number;
   readonly settings: Pick<WaitForSettings, "prSweepSeconds" | "noChecksGraceSeconds">;
+  /**
+   * Fork (review rules): only the checks of these names count (a named one not listed yet is not
+   * met), and only at this head (another head is met as `moved`). From the wait's spec.
+   */
+  readonly only?: { readonly checks?: ReadonlyArray<string>; readonly head?: string };
 }): PrJudgement {
   const { detail, until, seen, now, settings } = input;
+  const only = input.only;
   if (detail.state === "merged")
     return { type: "met", outcome: "merged", detail: "Merged.", seen: null };
   if (detail.state === "closed") {
@@ -421,10 +427,35 @@ export function judgePrChecks(input: {
   }
   const headSha = detail.headSha ?? null;
   const head = headText(headSha);
+  if (only?.head !== undefined) {
+    if (headSha === null) return { type: "notYet", detail: `${head}`, seen: null };
+    if (headSha.toLowerCase() !== only.head) {
+      return {
+        type: "met",
+        outcome: "moved",
+        detail: `The head moved from ${only.head.slice(0, 7)} to ${headSha.slice(0, 7)}; this wait was for ${only.head.slice(0, 7)}.`,
+        seen: null,
+      };
+    }
+  }
   if (input.checks.checks.some((check) => check.placeholder === true)) {
     return { type: "notYet", detail: `${head} Some checks could not be listed.`, seen: null };
   }
-  const checks = input.checks.checks;
+  const named = only?.checks;
+  const checks =
+    named === undefined
+      ? input.checks.checks
+      : input.checks.checks.filter((check) => named.includes(check.name));
+  if (named !== undefined) {
+    const missing = named.filter((name) => !checks.some((check) => check.name === name));
+    if (missing.length > 0) {
+      return {
+        type: "notYet",
+        detail: `${head} Not listed yet: ${missing.join(", ")}.`,
+        seen: null,
+      };
+    }
+  }
   if (checks.length === 0) {
     if (seen === null || seen.headSha !== headSha || seen.noChecks !== true) {
       return {
@@ -991,8 +1022,11 @@ export function deliveryCommandId(group: DeliveryGroup): string {
 /** The kind and target as people read them, such as `pr 123 checks`. */
 export function waitTargetText(target: WaitTarget): string {
   switch (target.kind) {
-    case "pr":
-      return `pr ${target.spec.repository === undefined ? "" : `${target.spec.repository}#`}${target.spec.number} ${target.spec.until}`;
+    case "pr": {
+      const { checks, head } = target.spec;
+      const narrowed = `${checks === undefined ? "" : ` (${checks.join(", ")})`}${head === undefined ? "" : ` at ${head.slice(0, 7)}`}`;
+      return `pr ${target.spec.repository === undefined ? "" : `${target.spec.repository}#`}${target.spec.number} ${target.spec.until}${narrowed}`;
+    }
     case "file":
       return `file ${target.spec.path}`;
     case "unit":
@@ -1033,7 +1067,19 @@ function wakeLine(wait: WaitRecord): string {
     wait.result === undefined
       ? "not ended yet. This wait ends here; check it yourself if you still need it."
       : `${wait.result.outcome}.${wait.result.detail === "" ? "" : ` ${messageText(wait.result.detail, DETAIL_MAX)}`}`;
-  return `[wait ${wait.id}] ${handedOver}${messageText(waitTargetText(wait), TARGET_TEXT_MAX)}: ${result}`;
+  return `[wait ${wait.id}] ${handedOver}${messageText(waitTargetText(wait), TARGET_TEXT_MAX)}: ${result}${actionText(wait)}`;
+}
+
+/**
+ * Fork (review rules): what a wait's `action` does with this result, on the same line. The text is
+ * fixed: the server starts the lenses after this message is in the thread, and a second message
+ * says why when it could not.
+ */
+function actionText(wait: WaitRecord): string {
+  if (wait.action !== "lens_start" || wait.result === undefined) return "";
+  return wait.result.outcome === "passed"
+    ? " The server starts the review lenses for this head now (lens_start); do not start them yourself. Their results wake this thread; if they cannot start, a second message says why."
+    : " No review lens starts for this head. Fix and push, then call lens_start {afterCi: true} for the new head.";
 }
 
 /**
