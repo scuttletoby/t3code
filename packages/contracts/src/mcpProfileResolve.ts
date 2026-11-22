@@ -8,6 +8,7 @@ import {
   MCP_BUILTIN_TOOLS_NONE,
   MCP_CARRIED_PROFILES_REFUSE,
   MCP_PROFILE_ALL,
+  MCP_PROFILE_ASSISTANT,
   MCP_PROFILE_T3_ONLY,
   MCP_SUBAGENT_INHERIT,
   MCP_T3_TOOL_GROUPS,
@@ -24,7 +25,13 @@ import type { ServerSettings } from "./settings.ts";
 export type McpProfileSettings = Pick<
   ServerSettings,
   "mcpProfiles" | "mcpProfile" | "mcpSubagentProfile" | "mcpThreadProfiles" | "mcpCarriedProfiles"
->;
+> & {
+  /**
+   * The role pointers; only `assistant` is read: that thread never gets more than the built-in
+   * `assistant` profile (see {@link resolveMcpProfile}).
+   */
+  readonly threadRoles: { readonly assistant: string | null };
+};
 
 /** One thread of a lineage, as the resolver needs it. */
 export interface McpProfileThread {
@@ -48,8 +55,16 @@ export interface McpProfileSet {
   readonly builtinTools?: typeof MCP_BUILTIN_TOOLS_NONE;
 }
 
-/** Where a thread's profile came from. */
-export type McpProfileSource = "thread-pick" | "subagent-rule" | "project" | "environment";
+/**
+ * Where a thread's profile came from. `assistant-role`: the thread is `threadRoles.assistant` and
+ * what it would get otherwise keeps more than the built-in `assistant` profile, so it gets that.
+ */
+export type McpProfileSource =
+  | "thread-pick"
+  | "subagent-rule"
+  | "project"
+  | "environment"
+  | "assistant-role";
 
 export interface McpProfileResolved {
   readonly _tag: "Resolved";
@@ -108,9 +123,15 @@ export type McpProfileResolution = McpProfileResolved | McpProfileCannotApply;
 /** Longer lineages are refused; real delegation chains are a few threads deep. */
 export const MCP_PROFILE_MAX_LINEAGE = 64;
 
-const BUILT_IN_PROFILES: Readonly<Record<string, McpProfileSet>> = {
+/** What each built-in profile gives; Settings lists them from here. */
+export const MCP_BUILT_IN_PROFILES: Readonly<Record<string, McpProfileSet>> = {
   [MCP_PROFILE_ALL]: { servers: "all", t3Tools: "all" },
   [MCP_PROFILE_T3_ONLY]: { servers: [], t3Tools: "all" },
+  [MCP_PROFILE_ASSISTANT]: {
+    servers: [],
+    t3Tools: ["orchestration", "threads", "projects"],
+    builtinTools: MCP_BUILTIN_TOOLS_NONE,
+  },
 };
 
 const KNOWN_GROUPS: ReadonlySet<string> = new Set(MCP_T3_TOOL_GROUPS);
@@ -181,7 +202,9 @@ type Lookup =
 /** A named profile: a built-in, or an entry of `mcpProfiles` checked now. */
 function lookUp(settings: McpProfileSettings, name: string): Lookup {
   const profiles: unknown = settings.mcpProfiles;
-  const builtIn = Object.hasOwn(BUILT_IN_PROFILES, name) ? BUILT_IN_PROFILES[name] : undefined;
+  const builtIn = Object.hasOwn(MCP_BUILT_IN_PROFILES, name)
+    ? MCP_BUILT_IN_PROFILES[name]
+    : undefined;
   if (builtIn !== undefined) {
     // A save never writes an entry under a built-in's name, so one is a hand edit. Which of the
     // two the owner meant is unknown, so neither is used.
@@ -416,7 +439,34 @@ function cannotApply(
   };
 }
 
+/**
+ * The thread's profile, held within the built-in `assistant` for the `threadRoles.assistant` thread,
+ * so a managed policy that drops its pick cannot give it the wide defaults. Within stands; wider is
+ * cut to `assistant`; a broken `assistant` refuses.
+ */
 function resolveAt(
+  settings: McpProfileSettings,
+  lineage: ReadonlyArray<McpProfileThread>,
+  index: number,
+  carried: unknown,
+): McpProfileResolution {
+  const thread = lineage[index]!;
+  const resolved = resolveOwnAt(settings, lineage, index, carried);
+  const roles: unknown = settings.threadRoles;
+  const assistant = isRecord(roles) ? roles.assistant : undefined;
+  if (resolved._tag === "CannotApply" || assistant !== thread.threadId) return resolved;
+  const bound = lookUp(settings, MCP_PROFILE_ASSISTANT);
+  if (!bound.ok) return cannotApply(bound.problem, thread, MCP_PROFILE_ASSISTANT, bound.issue);
+  if (isWithinMcpProfile(resolved.profile, bound.profile)) return resolved;
+  return {
+    ...resolved,
+    name: MCP_PROFILE_ASSISTANT,
+    source: "assistant-role",
+    profile: cutTo(resolved.profile, bound.profile),
+  };
+}
+
+function resolveOwnAt(
   settings: McpProfileSettings,
   lineage: ReadonlyArray<McpProfileThread>,
   index: number,

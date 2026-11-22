@@ -29,7 +29,11 @@ import {
   runId,
   threadId,
 } from "./handoff.testkit.ts";
-import { HANDOFF_LOUD_SUFFIX, HANDOFF_RETRY_SUFFIX } from "./handoffFacts.ts";
+import {
+  HANDOFF_FALLBACK_SUFFIX,
+  HANDOFF_LOUD_SUFFIX,
+  HANDOFF_RETRY_SUFFIX,
+} from "./handoffFacts.ts";
 import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
 import { quietHandoffShellMark, RELAY_COMPLETION_HOLD_MS } from "./handoffShell.ts";
 
@@ -292,6 +296,52 @@ describe("the thread shell of a completed quiet handoff run", () => {
           false,
         );
         yield* caseOf(writeWorld(MessageId.make(`handoff-write:${threadId}:`)), false);
+      }),
+  );
+
+  it.effect(
+    "a failed quiet write turn the fallback follows reads as stopped (#836); idle, loud, steered or a failed handoff run does not",
+    () =>
+      Effect.gen(function* () {
+        const write = MessageId.make(`handoff-write:${threadId}:${runId}`);
+        const writeWorld = (
+          id: MessageId,
+          status: OrchestrationV2Run["status"],
+          extra: ReadonlyArray<OrchestrationV2ConversationMessage> = [],
+        ): World => ({
+          runs: [run(), handoffRun({ userMessageId: id, status })],
+          messages: [userMessage, handoffMessage(id), ...extra],
+        });
+        /**
+         * Every shell read's mark, in a fresh store. The relay's phase is left out: upstream reads
+         * the mark for a failed run only once the awareness line the seam list announces is in.
+         */
+        const marks = (world: World) =>
+          Effect.gen(function* () {
+            yield* seed(world);
+            const { relayPhase: _relayPhase, latestRunId, ...read } = yield* readStop();
+            assert.equal(latestRunId, handoffRunId);
+            return [...new Set(Object.values(read))];
+          }).pipe(Effect.provide(storeLayer));
+        // Started where the fallback follows its failure (`:fallback`): quiet when it fails, and
+        // when it completes (the suffix is not part of the source run's id).
+        const fallback = MessageId.make(`${write}${HANDOFF_FALLBACK_SUFFIX}`);
+        assert.deepStrictEqual(yield* marks(writeWorld(fallback, "failed")), [true]);
+        assert.deepStrictEqual(yield* marks(writeWorld(fallback, "completed")), [true]);
+        // At the idle trigger nothing follows a failed write turn, so its failure alerts; a
+        // completed one stays quiet as before.
+        assert.deepStrictEqual(yield* marks(writeWorld(write, "failed")), [false]);
+        assert.deepStrictEqual(yield* marks(writeWorld(write, "completed")), [true]);
+        const loud = MessageId.make(`${fallback}${HANDOFF_LOUD_SUFFIX}`);
+        assert.deepStrictEqual(yield* marks(writeWorld(loud, "failed")), [false]);
+        const steer = message({ id: MessageId.make("message-steer"), runId: handoffRunId });
+        assert.deepStrictEqual(yield* marks(writeWorld(fallback, "failed", [steer])), [false]);
+        // A failed handoff run gets a retry, not a handoff after it: it alerts as before.
+        assert.deepStrictEqual(yield* marks(writeWorld(handoffMessageId, "failed")), [false]);
+        // An interrupted or cancelled write turn raises no failed alert upstream: left as it was.
+        for (const status of ["interrupted", "cancelled"] as const) {
+          assert.deepStrictEqual(yield* marks(writeWorld(fallback, status)), [false]);
+        }
       }),
   );
 
