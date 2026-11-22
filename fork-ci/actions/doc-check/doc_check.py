@@ -59,6 +59,8 @@ LINK = re.compile(r'\]\(\s*(?:<([^<>\n]+)>|([^()\s<>]+))(?:\s+(?:"[^"\n]*"|\'[^\
 # CommonMark: a fence opens or closes with 0-3 spaces of indent, counted from the content of the list item it is in.
 FENCE = re.compile(r'(`{3,}|~{3,})')
 LIST_ITEM = re.compile(r'([-*+]|\d{1,9}[.)])(?=[ \t]|$)')
+THEMATIC = re.compile(r'([-*_])(?:[ \t]*\1){2,}[ \t]*$')   # "- - -" is a thematic break, not a list item
+HEADING = re.compile(r'#{1,6}(?=[ \t]|$)')
 INLINE_CODE = re.compile(r'(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)')   # whole runs only: an unmatched run is text
 SCHEME = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:')
 GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1',
@@ -200,13 +202,20 @@ def opens_fence(body):
     return m.group(1) if m and not (m.group(1)[0] == '`' and '`' in body[len(m.group(1)):]) else None
 
 
+def starts_block(body):
+    """Whether a line's content (0-3 spaces in) starts a block that ends a paragraph, so it is no lazy line."""
+    return bool(LIST_ITEM.match(body) or THEMATIC.match(body) or HEADING.match(body) or opens_fence(body)
+                or body.startswith('>'))
+
+
 def link_lines(text):
     """(line number, target) of each link outside code blocks. As in CommonMark, a fence opens with 0-3 spaces of
     indent (a tab is 4) counted from the content column of the list item it is in (on the item's own line too), and
-    a fence in a list item ends with the item; a line 4 or more past that column after a blank line (or in such a
-    block) is indented code."""
+    a fence in a list item ends with the item; a line 4 or more past that column is indented code unless it goes on
+    with a paragraph. A line less indented than an item's content ends the item, unless it continues the
+    item's paragraph (a lazy line); each marker of a line like "- - item" opens an item."""
     fence, fence_col, items = None, 0, []   # items: the content columns of the open list items
-    code, blank = False, True               # in indented code; the line before was blank (or none)
+    code, para = False, False               # in indented code; the line before is paragraph text (lazy lines go on)
     for no, line in enumerate(text.split('\n'), 1):
         wide = line.expandtabs(4)
         body = wide.lstrip(' ')
@@ -214,29 +223,43 @@ def link_lines(text):
         if body and fence is not None and indent < fence_col:
             fence = None                        # the list item the fence was in has ended
         if body:
-            while items and indent < items[-1]:
-                items.pop()
+            kept = len(items)
+            while kept and indent < items[kept - 1]:
+                kept -= 1
+            in_para = para and kept == len(items)   # the line is in the paragraph's own block
+            # a lazy line goes on with the paragraph of an item it is not indented into: text, nothing opens
+            lazy = para and kept < len(items) and not (indent - (items[kept - 1] if kept else 0) <= 3
+                                                       and starts_block(body))
+            if not lazy:
+                del items[kept:]
         col = fence_col if fence is not None else (items[-1] if items else 0)
         m = FENCE.match(body) if body and indent - col <= 3 else None
         if fence is not None:
             if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not body[len(m.group(1)):].strip():
                 fence = None
             continue
-        was_blank, blank = blank, not body
         if body:
-            code = indent - col >= 4 and (code or was_blank)
-        if code:
+            code = indent - col >= 4 and (code or not para)   # indented code cannot interrupt a paragraph
+        if code or not body:
+            para = False
             continue
-        if body and indent - col <= 3 and opens_fence(body):
-            fence, fence_col = opens_fence(body), col
+        text_only = lazy or indent - col > 3     # 4 or more in and not code: the paragraph goes on too
+        if not text_only and opens_fence(body):
+            fence, fence_col, para = opens_fence(body), col, False
             continue
-        item = LIST_ITEM.match(body) if body and indent - col <= 3 else None
-        if item:
-            rest = body[item.end():]
-            gap = len(rest) - len(rest.lstrip(' '))
-            items.append(indent + item.end() + (gap if rest.strip() and 1 <= gap <= 4 else 1))
-            if rest.strip() and gap <= 4 and opens_fence(rest.lstrip(' ')):
-                fence, fence_col = opens_fence(rest.lstrip(' ')), items[-1]
+        at, rest = indent, '' if text_only else body
+        while rest and not THEMATIC.match(rest) and LIST_ITEM.match(rest):
+            item = LIST_ITEM.match(rest)
+            after = rest[item.end():]
+            if in_para and (not after.strip() or item.group(1)[0].isdigit() and int(item.group(1)[:-1]) != 1):
+                break   # an empty item, or a numbered one not at 1, cannot interrupt a paragraph: text
+            in_para = False
+            gap = len(after) - len(after.lstrip(' '))
+            items.append(at + item.end() + (gap if after.strip() and gap <= 4 else 1))
+            at, rest = items[-1], after.lstrip(' ') if gap <= 4 else ''
+        if rest and opens_fence(rest):
+            fence, fence_col = opens_fence(rest), items[-1]
+        para = text_only or bool(rest) and fence is None and not (THEMATIC.match(rest) or HEADING.match(rest))
         if fence is None:
             for lm in LINK.finditer(INLINE_CODE.sub('', line)):
                 target = re.split(r'[#?]', lm.group(1) or lm.group(2), maxsplit=1)[0]

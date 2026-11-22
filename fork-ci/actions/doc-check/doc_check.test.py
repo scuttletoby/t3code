@@ -307,6 +307,37 @@ class Links(Repo):
                 code, out = self.run_check('--files', 'docs/a.md')
                 self.assertIn('DOC  docs/a.md:2: broken link nope.md', out)
 
+    def test_a_list_item_stays_open_on_a_lazy_line_and_every_marker_on_a_line_counts(self):
+        # #1020 round 1: an unindented line that continues an item's paragraph (lazy) keeps the item open, and in
+        # "- - item" both markers open an item, so the item's next paragraph is text, not indented code: a link. A
+        # lazy line opens nothing; an empty item or one numbered from 2 cannot interrupt a paragraph; a line 4 in
+        # after a closed list is code, so "10." opens a list. (commonmark.js 0.31.2 reads each case so.)
+        for text in ['1. Step one that wraps\nonto the next line.\n\n    More about step one, see [g](nope.md).\n',
+                     '- item\nlazy\n\n    [x](nope.md)\n',
+                     '1. a\n   - b\nlazy\n\n      [x](nope.md)\n',
+                     '- - nested item\n\n      more text [x](nope.md)\n',
+                     '1. - item\n\n       [x](nope.md)\n',
+                     '- - item\nlazy\n\n      [x](nope.md)\n',
+                     'para\n2) ```\n   [x](nope.md)\n',
+                     '  1. [g](a.md)\n    ```sh\n      1. [x](nope.md)\n',
+                     '   * ```\n    ```sh\n 10. text\n\n       - text [x](nope.md)\n',
+                     'para\n-\n  [x](nope.md)\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 1, out)
+                self.assertIn(f'DOC  docs/a.md:{text.count(chr(10))}: broken link nope.md', out)
+        # A heading, a thematic break or a fence is no lazy line: it ends the item, and "- - -" is a thematic
+        # break, not three items; the indented line after it is code (no blank needed after a heading or a fence).
+        for text in ['- item\n# heading\n\n    [in](nope.md)\n', '- item\n---\n\n    [in](nope.md)\n',
+                     '- item\n```\n```\n\n    [in](nope.md)\n', '- - -\n\n    [in](nope.md)\n',
+                     '- item\n\nnot lazy\n\n    [in](nope.md)\n', '# h\n    [in](nope.md)\n',
+                     '```\n```\n    [in](nope.md)\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 0, out)
+
     def test_a_link_that_is_no_path_is_a_broken_link_not_a_traceback(self):
         self.commit({'docs/a.md': '[nul](x%00.md)\n', 'docs/b.md': 'b\n'})
         base = self.branch({'docs/b.md': None})   # the removed-link scan reads the untouched a.md
@@ -338,6 +369,14 @@ class Removed(Repo):
         base = self.branch({'docs/b.md': None})
         code, out = self.run_check('--base', base)
         self.assertEqual(code, 0, out)
+
+    def test_a_deleted_doc_named_like_a_pathspec_magic_word(self):
+        # GIT_LITERAL_PATHSPECS: git reads ":(top)A.md" as the name it is, not as "A.md" from the top.
+        self.commit({'a.md': '[a](%3A%28top%29A.md)\n', ':(top)A.md': 'a\n'})
+        base = self.branch({':(top)A.md': None})
+        code, out = self.run_check('--base', base)
+        self.assertEqual(code, 1, out)
+        self.assertIn('DOC  a.md:1: broken link %3A%28top%29A.md: this change removed :(top)A.md', out)
 
     def untouched_symlink_loses_its_target(self, how):
         """Base: docs/AGENTS.md and CLAUDE.md -> docs/AGENTS.md; the change touches only the target."""
@@ -391,7 +430,7 @@ class Removed(Repo):
         self.assertIn(want, out)
         self.assertIn('1 problem(s)', out)
 
-    def test_the_target_of_an_untouched_symlink_through_a_folder_symlink_deleted_or_renamed(self):
+    def test_the_target_of_an_untouched_symlink_through_a_folder_symlink_deleted(self):
         want = 'DOC  CLAUDE.md: a symlink that points to no file: make it a file: this change removed real/A.md'
         self.through_a_folder_symlink(lambda: os.remove('real/A.md'), want)
 
