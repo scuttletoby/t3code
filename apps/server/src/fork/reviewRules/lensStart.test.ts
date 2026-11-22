@@ -6,7 +6,7 @@ import * as NodeFS from "node:fs";
 import { effectiveReviewRules } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 
-import { NO_HEADER, lensKey, lensScan } from "./lensComment.ts";
+import { NO_HEADER, NO_MARKER, REPOST, lensKey, lensScan } from "./lensComment.ts";
 import { readFindings } from "./findings.ts";
 import { byCodePoint } from "./pyText.ts";
 import { vectorPosts, type VectorPost } from "./vectors.testkit.ts";
@@ -1030,6 +1030,52 @@ describe("lens_start plans what the gate reads (fix round A+B)", () => {
     const after = planLensStart(input({ pullList: [pull(1, { posts: covered })] }));
     assert.deepStrictEqual(lensesOf(after), ["code"]);
     assert.isTrue(gatePasses(basic, [], ["code"], carryOut(covered, after), A));
+  });
+
+  it("a look-alike without the lens marker (#865): ignored and said so, or, with an open finding, held with the fix", () => {
+    const note: LensStartPost = {
+      ...report("code", A),
+      body: "## Code lens\nAll fine.",
+      where: "note",
+    };
+    const plan = planLensStart(input({ pullList: [pull(1, { posts: [note] })] }));
+    assert.deepStrictEqual(lensesOf(plan), ["code"], "the lens has not reported: it starts");
+    const said = plan.notes.filter((n) =>
+      n.startsWith("#1: the comment note looks like a lens report"),
+    );
+    assert.lengthOf(said, 1);
+    assert.include(said[0], "the gate ignores it");
+    assert.include(said[0], NO_MARKER);
+    assert.include(said[0], REPOST);
+    assert.deepStrictEqual(planLensStart(input({ pullList: [pull(1, { posts: [note] })] })), plan);
+    const twice = planLensStart(
+      input({ pullList: [pull(1, { posts: [note, { ...note, where: "again" }] })] }),
+    );
+    assert.lengthOf(
+      twice.notes.filter((n) => n.includes("the gate ignores it")),
+      2,
+    );
+    const held: LensStartPost = {
+      ...report("code", A),
+      body: "## Code lens\nblocker: a re-run loses data\nmajor: none",
+      where: "held",
+    };
+    for (const posts of [
+      [report("code", A), held],
+      [held, report("code", A)],
+    ]) {
+      const stuck = planLensStart(input({ pullList: [pull(1, { posts })] }));
+      assert.deepStrictEqual(
+        stuck.starts,
+        [],
+        "an older or newer clean read never lets it through",
+      );
+      assert.include(stuck.refused[0]!.reason, "a comment that reads nothing");
+      assert.include(stuck.refused[0]!.reason, REPOST);
+      assert.isFalse(gatePasses(basic, [], ["code"], posts, A));
+    }
+    const optedOut = { ...held, body: `not a lens: ${held.body}` };
+    assert.isTrue(gatePasses(basic, [], ["code"], [report("code", A), optedOut], A));
   });
 
   it("a newer override the gate counts is honoured: nothing starts again", () => {
