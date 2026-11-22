@@ -109,8 +109,8 @@ export interface ReviewPlan {
 /**
  * The plan for `changes` as `git diff --name-status -M` names them ([status, path] or [R|C<score>, old, new]) under a
  * valid `review` block; `configPath` is the config file (repo-relative). A rename or copy counts under both paths; a
- * protected path also counts for the first critical rule; the heaviest weight hit decides; no change at all counts as
- * the catch-all rule.
+ * protected path also counts for the first critical rule; the heaviest weight hit is the weight; the lenses are those
+ * of every rule hit, in rule order, each once; no change at all counts as the catch-all rule.
  */
 export function planReview(
   review: ReviewBlock,
@@ -165,8 +165,9 @@ export function planReview(
       : [];
   });
   const weight = WEIGHTS.find((w) => hits.some((h) => h.weight === w))!;
+  // Every rule hit gives its lenses, whatever its weight (owner decision: fork issue 82, one extra review).
   const lenses = review.rules
-    .filter((r) => r.weight === weight && hits.some((h) => h.rule === r.name))
+    .filter((r) => hits.some((h) => h.rule === r.name))
     .flatMap((r) => r.lenses);
   return { weight, lenses: [...new Set(lenses)], hits, protected: isProtected };
 }

@@ -9,8 +9,10 @@ every time, and the TypeScript side can be tested on the same vectors (review.ve
   - Built-in protected paths, not configurable: the config file itself, every lens prompt file named in `lenses`, and
     `.github/workflows/**`. Such a path also counts for the first critical rule of the list, whatever rule it
     belongs to.
-  - The heaviest weight hit decides. The required lenses are the lenses of every rule of that weight that was hit, in
-    the order of the rules and of each rule's list, each name once.
+  - The heaviest weight hit is the change's weight. The required lenses are the lenses of every rule that was hit,
+    whatever its weight, in the order of the rules and of each rule's list, each name once: each rule's paths get
+    their own rule's read, so an app change plus one gate file needs the code lens and the gate lenses (owner
+    decision: issue #82, "one extra review"), never the gate lenses alone.
   - No changed path at all (an empty diff) counts as the catch-all rule: the change is judged as a new folder would
     be, never as "no lens needed".
 Unknown never judges: a path no rule matches, a protected path with no critical rule (the parser refuses both, so
@@ -169,8 +171,7 @@ def judge(review, changes, config_path):
     hits = tuple(Hit(r.name, r.weight, tuple(counted[r.name] or ())) for r in review.rules
                  if counted[r.name] is None or counted[r.name])
     weight = next(w for w in review_config.WEIGHTS if any(h.weight == w for h in hits))
-    lenses = tuple(dict.fromkeys(n for r in review.rules if r.weight == weight
-                                 and any(h.rule == r.name for h in hits) for n in r.lenses))
+    lenses = tuple(dict.fromkeys(n for r in review.rules if any(h.rule == r.name for h in hits) for n in r.lenses))
     return Judgement(weight, lenses, hits, tuple(protected), len(paths))
 
 

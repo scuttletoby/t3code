@@ -15,12 +15,32 @@
   "head_check": "head_check",
   "review": {
     "version": 1,
-    "mode": "shadow",
+    "mode": "enforce",
     "rules": [
       {
         "name": "gate",
         "weight": "critical",
-        "paths": [".github/**", "fork-ci/**"],
+        "paths": [
+          ".github/*/*/**",
+          ".github/*.md",
+          ".github/*.td",
+          ".github/*.yml",
+          ".github/*.yaml",
+          ".github/fork-actions-policies.json",
+          ".github/fork-ci-release*.json",
+          ".github/fork-ci-rerun.json",
+          ".github/fork-fleet.json",
+          ".github/fork-owned-paths.txt",
+          ".github/fork-pr-queue.json",
+          ".github/fork-removed-workflows.txt",
+          ".github/fork-secret-sweep-gone-tips.txt",
+          ".github/fork-tests-upstream.json",
+          ".github/fork-upstream.json",
+          "docs/fork/gate-trust.md",
+          "fork-ci/**",
+          "fork-kit/gh-apps/**",
+          "fork-kit/review/**"
+        ],
         "lenses": ["merge-path", "state"]
       },
       { "name": "code", "weight": "normal", "paths": ["**"], "lenses": ["code"] }
@@ -34,6 +54,7 @@
     "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
     "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
     "findings": true,
+    "override_authors": [],
     "state_line": false
   }
 }
