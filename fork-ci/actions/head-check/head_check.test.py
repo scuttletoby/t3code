@@ -385,15 +385,87 @@ class Rules(unittest.TestCase):
                 self.assertTrue(self.verdict([self.p.lens('correctness', A), self.p.lens('x', B, login=login)])[0])
 
     def test_an_old_format_report_reads_nothing(self):   # old state: reports from before the fixed grammar
-        for body in (f'## Correctness {LENS}\nsafe to merge: yes', f'Review (correctness) read at: {A}',
-                     f'```\n{LENS}: correctness · read at: {A}\n```', 'covered: all\nchecks: ran the tests'):
-            with self.subTest(body=body):
+        for body in (f'## Correctness {LENS}\nread at: {A}', f'Review (correctness) read at: {A}',
+                     f'```\n{LENS}: correctness · read at: {A}\n```', f'covered: all\n{LENS}: correctness'):
+            with self.subTest(body=body):   # each carries the lens marker: a lens report, broken, so it blocks
                 ok, _, rows = self.verdict([self.p.lens('correctness', A), self.p.post(body)])
                 self.assertFalse(ok)
                 self.assertIn(lens.NO_HEADER, ' '.join(name for name, _, _ in rows))
 
+    def test_a_look_alike_without_the_lens_marker_passes_and_is_named(self):   # issue #865
+        for body in (f'## Correctness {LENS}\nsafe to merge: yes', 'covered: all\nchecks: ran the tests',
+                     f'## {LENS.title()} A\nblocker: none\nmajor: none'):
+            with self.subTest(body=body):
+                ok, why, rows = self.verdict([self.p.lens('correctness', A), self.p.post(body)])
+                self.assertTrue(ok, why)
+                self.assertEqual([(name.split(' (')[0], good) for name, good, _ in rows],
+                                 [('correctness', True), (lens.NOT_LENS, H.WARN)])   # passes, but never green
+                self.assertIn(lens.NO_MARKER, rows[1][2])
+                ok, why, rows = self.verdict([self.p.post(body)])   # alone: no lens comments, still named
+                self.assertTrue(ok, why)
+                self.assertEqual([(name.split(' (')[0], good) for name, good, _ in rows], [(lens.NOT_LENS, H.WARN)])
+                ok, why, rows = self.verdict([self.p.post(body)], required='correctness')   # fail closed
+                self.assertFalse(ok)
+                self.assertTrue(why.startswith(H.marker_hint(1)), why)   # the fix first, with the header line
+                self.assertIn(lens.REPOST, why)
+                self.assertNotIn('required-lenses', why, 'no config hint when a look-alike is there')
+        ok, why, _ = self.verdict([self.p.post('Thanks')], required='correctness')   # no look-alike: the config hint
+        self.assertFalse(ok)
+        self.assertIn('check it in required-lenses', why)
+        self.assertNotIn(lens.REPOST, why)
+
+    def test_an_unmarked_look_alike_with_an_open_finding_still_fails(self):   # issue #865 round 1
+        for body in (f'## {LENS.title()} correctness, round 2\nblocker: a re-run loses data\nmajor: none',
+                     f'## {LENS.title()} correctness, round 2\nverdict: not safe to merge',
+                     'covered: all\nchecks: ran the tests\nmajor: the retry drops a row'):
+            with self.subTest(body=body):
+                for comments in ([self.p.lens('correctness', A), self.p.post(body)],
+                                 [self.p.post(body), self.p.lens('correctness', A)]):
+                    ok, why, rows = self.verdict(comments, required='correctness')
+                    self.assertFalse(ok, 'an older or newer clean read never lets it through')
+                    self.assertTrue(why.startswith(H.marker_hint(1)), why)
+                    self.assertEqual([good for _, good, _ in rows], [False, False], 'no one head while it holds')
+                    self.assertEqual(sum(lens.NO_MARKER in name for name, _, _ in rows), 1, rows)
+                ok, why, rows = self.verdict([self.p.post(body)])   # no required lens: still held
+                self.assertFalse(ok, why)
+                self.assertTrue(why.startswith(H.marker_hint(1)), why)
+                self.assertEqual([name.split(' (')[0] for name, _, _ in rows], [lens.NO_HEADER])
+                ok, why, _ = self.verdict([self.p.post(body)], required='correctness')
+                self.assertFalse(ok)
+                self.assertTrue(why.startswith(H.marker_hint(1)), why)
+                self.assertNotIn('required-lenses', why)
+
+    def test_not_safe_under_the_heading_or_in_a_sentence_still_fails(self):   # issue #865 round 2: main blocked these
+        for body in (f'## {LENS.title()} merge-path, round 2\n\nNot safe to merge: the gate passes an unread head.',
+                     '## Merge-path review\n\nNOT SAFE TO MERGE\n\ncovered: x\nchecks: y',
+                     f'## {LENS.title()} correctness, round 2\n\n**NOT SAFE to merge**\n\ncovered: x\nchecks: y',
+                     f'## {LENS.title()} correctness, round 2\n\ncovered: x\nchecks: y\n\nNot safe to merge: no.'):
+            for required in ('correctness', ''):
+                with self.subTest(body=body, required=required):
+                    comments = [self.p.lens('correctness', A), self.p.post(body)]
+                    ok, why, rows = self.verdict(comments, required=required)
+                    self.assertFalse(ok, 'a clean read of the head never lets it through')
+                    self.assertNotIn(lens.NOT_LENS, ' '.join(name for name, _, _ in rows))
+                    self.assertEqual(self.verdict(comments, required=required), (ok, why, rows), 'run again')
+        prose = (f'## {LENS.title()} correctness, round 2\n\ncovered: x\nchecks: y\n\n'
+                 'The old code was not safe to run twice.')
+        ok, why, rows = self.verdict([self.p.lens('correctness', A), self.p.post(prose)], required='correctness')
+        self.assertTrue(ok, why)
+        self.assertEqual([good for _, good, _ in rows], [True, H.WARN])
+
+    def test_a_held_reason_says_the_fix_and_the_way_out_once(self):   # round 2: "post a NEW comment" was there twice
+        body = f'## {LENS.title()} correctness, round 2\nblocker: a re-run loses data\nmajor: none'
+        for required in ('correctness', 'correctness\nsecurity', ''):
+            with self.subTest(required=required):
+                ok, why, rows = self.verdict([self.p.lens('correctness', A), self.p.post(body)], required=required)
+                self.assertFalse(ok)
+                self.assertTrue(why.startswith(H.marker_hint(1, ['held'])), why)
+                self.assertEqual((why.count('post a NEW comment'), why.count(lens.HELD_WAY_OUT)), (1, 1), why)
+                self.assertNotIn(lens.NO_MARKER, why, 'a held comment is named by where it is; its row says why')
+                self.assertEqual(sum(lens.NO_MARKER in name for name, _, _ in rows), 1, rows)
+
     def test_a_deleted_comment_counts_no_more(self):   # deleted: GitHub no longer lists it
-        look_alike = self.p.post('safe to merge')
+        look_alike = self.p.post(f'read at: {A[:7]}')
         good = self.p.lens('correctness', A)
         self.assertFalse(self.verdict([look_alike, good])[0])
         self.assertTrue(self.verdict([good])[0])
@@ -2185,7 +2257,7 @@ class Runs(unittest.TestCase):
         for node, says in ((self.inline_lens(self.read[:7]), 'reads nothing'),
                            (self.inline_lens(self.read, includesCreatedEdit=True), 'edited after posting'),
                            (self.inline_lens(self.read, isMinimized=True), 'hidden'),
-                           (inline_node('safe to merge'), 'reads nothing')):
+                           (inline_node(f'read at: {self.read}'), 'reads nothing')):
             with self.subTest(node=node['body'][:30], says=says):
                 code, out = run_cli(self.path, fake_gh((0, bare), flags=[flags_page(inline=[node])]))
                 self.assertEqual(code, 1, out)
@@ -2241,6 +2313,14 @@ class Runs(unittest.TestCase):
         code, out = run_cli(self.path, fake_gh((0, bare), flags=pages[:1]))   # page 2 fails every time
         self.assertEqual(code, 1, out)
         self.assertIn('could not read the pull request', out)
+
+    def test_a_near_miss_passes_and_the_summary_names_it(self):   # issue #865
+        answer = json.dumps(pr([self.p.lens('correctness', self.read), self.p.post('## Lens A\nmajor: none')],
+                               head=self.read))
+        code, out = run_cli(self.path, fake_gh((0, answer)), env=self.env)
+        self.assertEqual(code, 0, out)
+        self.assertRegex(self.read_file('summary.md'), rf'\| {lens.NOT_LENS} \([^|]*\) \| warn \| no lens marker')
+        self.assertIn(f'WARN {lens.NOT_LENS}', out)
 
     def test_pass_and_fail_reach_the_exit_code_summary_and_output(self):
         code, out = run_cli(self.path, fake_gh((0, self.good)), env=self.env)
