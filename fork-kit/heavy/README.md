@@ -61,8 +61,9 @@ reads too; the home is `$HOME`, else the password database's, and only one this 
 write (not `/`), so heavy run as root with a user's `HOME` (`sudo -E heavy ...`) or `HOME=/tmp` uses root's own home
 and never makes a root-owned folder in the user's; `~/.local` must be a real folder (not a link, even to a folder
 of the user's: kept fail-closed) of the user's that no one else can write; an older heavy run as root with your
-`HOME` may have left a root-owned `~/.local` or `~/.local/state` (heavy then skips it):
-`sudo chown "$USER:" ~/.local && sudo chown -R "$USER:" ~/.local/state` gives them back;
+`HOME` may have left a root-owned `~/.local` or `~/.local/state`, and a umask of 002 a `~/.local` of mode 775
+(heavy then skips it and says so):
+`sudo chown "$USER:" ~/.local && sudo chown -R "$USER:" ~/.local/state && chmod go-w ~/.local` gives them back;
 heavy tells `docker-label` which folders it reads in `HEAVY_MARKS`; without either folder heavy asks after every
 run), so a run with no containers costs no `docker ps`. No Docker, or none this user can reach (a
 rootless Docker through `docker context use` counts as reachable): nothing to do, nothing said. Docker down: one
@@ -546,8 +547,11 @@ after another, up to the group's ceiling), the memory budget, the queue and note
 - **T3 down or not installed:** no agent scopes, still an answer from the kernel.
 - **Tiers:** full with cgroup v2 and a systemd user manager. Machine with cgroup v2 and `user.slice` but no user
   manager of the caller's (a CI runner's user without lingering or a login session): it has no agents or heavy
-  jobs of its own, every user's are counted as usual, so it gets the answer a caller with a user manager gets
-  (`tier: "machine"`, a note, and the reason says "machine-wide numbers"). Without cgroup v2, or without both a user
+  jobs of its own, every user's are counted as usual, and so is every person's `reserve.d` (the users of
+  `/etc/passwd` and of `user.slice` from `UID_MIN` to `UID_MAX`; root and system users are not read), so it gets
+  the answer a caller with a user manager gets (`tier: "machine"`, a note, and the reason says "machine-wide
+  numbers"). A person's `reserve.d` it cannot read (a home closed to others, mode 750 or 700), or a user with a
+  session but no home it can find, makes it Basic: it never takes room it cannot see. Without cgroup v2, or without both a user
   manager and `user.slice` (Basic), agents and other users' work cannot be counted, so the answer is never free and
   every `fits` is 0 (a note says why). An other user's folder that exists but cannot be listed is Basic too.
 - **Unreadable signals** (PSI, a box with a live piece but without its `memory.pressure`, or with no folder at
@@ -557,12 +561,15 @@ after another, up to the group's ceiling), the memory budget, the queue and note
 - **Reservations:** files `~/.config/t3-capacity/reserve.d/*.conf` (or `$T3_CAPACITY_RESERVE_DIR`), lines
   `<MB> <absolute folder> [until=YYYY-MM-DD]`. The folder matches itself and what is below it, with or without a
   trailing `/`, never a sibling sharing its first letters (`/x/app` is not `/x/app-x`); its real path (links
-  resolved) matches too. A reservation holds back its MB less what this user's processes working in that folder
-  already use, and less what this user's agents and heavy jobs with a process working there still owe the rule
-  (their cost less their demand, `owedMb`): that room is already held as their debt, so it is counted once (one
-  idle 300 MB agent under a 1536 MB reservation holds 1536 MB in all, not 1536 + 768 - 300). A caller working
+  resolved) matches too. A reservation holds back its MB less what its user's processes working in that folder
+  already use, and less what agents and heavy jobs with a process working there still owe the rule (their cost
+  less their demand, `owedMb`): that room is already held as their debt, so it is counted once (one idle 300 MB
+  agent under a 1536 MB reservation holds 1536 MB in all, not 1536 + 768 - 300). Each process counts toward one
+  reservation only (the deepest folder that holds it, then the first by file name), and a piece's debt is split
+  over its processes by their use, so with two or nested reserved folders nothing is taken off twice. A caller working
   inside the folder (its real working folder) is not held back by its own reservation. Ended, broken or unreadable
-  lines hold nothing and give a note. Limit: another user's reservations are not seen.
+  lines hold nothing and give a note. Limit: in the full tier another user's reservations are not seen (the
+  machine tier reads them, above).
 - **Holds (machine file):** a cgroup outside the user managers, such as a CI runners' slice, is not in the ledger.
   `heavy.capacity.holds` names such cgroups; one that uses more than `inUseFromMb` (anon + shmem + swap) keeps its
   budget (its `memory.max`, or `budgetMb` when it has none) less the RAM it uses (anon + shmem: `memory.max` limits
@@ -572,9 +579,11 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   (`<label>.conf`) gives a note; both hold.
 - **Cache:** `/run/user/<uid>/heavy-facts.json` (or `$HEAVY_FACTS_CACHE`), 0600, read again after 5 s (`--fresh`:
   now). A user without `/run/user/<uid>` (no user manager) uses `heavy-facts-<uid>/` in the temporary folder
-  (`$TMPDIR`, else `/tmp`), made 0700; one that is a link, another user's or open to others is no cache (a note).
-  Pressure levels carry from it (at most 5 minutes old) so calm must last before a level drops. Without a cache
-  folder nothing carries, so every call starts "elevated" (only the rule's floors admit; never straight to "ok").
+  (`$TMPDIR`, else `/tmp`, never the working folder), made 0700; one that is a link, another user's or open to
+  others, or no temporary folder this user can write, is no cache (a note). Pressure levels carry from it (at most
+  5 minutes old) so calm must last before a level drops. Without a cache folder, or with a cache file that is there
+  but cannot be used (another version, as once after an update, other settings, broken, from the future), nothing
+  carries, so the call starts "elevated" (only the rule's floors admit; never straight to "ok").
 
 Two thin callers come with it:
 

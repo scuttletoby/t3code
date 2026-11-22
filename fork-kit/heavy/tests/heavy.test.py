@@ -1088,7 +1088,7 @@ class Parts(unittest.TestCase):
         # #761 items 1 and 8. heavy makes ~/.local/state when it is missing: never in another user's home (root with a
         # user's HOME, `sudo -E heavy ...`, would leave a root-owned folder there) and never in the job's working
         # folder (no HOME and no passwd entry: expanduser('~') is a relative '~'). docker-label finds the same folder.
-        import contextlib, pwd, types
+        import contextlib, io, pwd, types
         from unittest import mock
         sweep = load_sweep_of_wrapper()
         mine, pw_home, work = (os.path.join(self.dir, n) for n in ('mine', 'pw-home', 'work'))
@@ -1169,7 +1169,11 @@ class Parts(unittest.TestCase):
         # nothing made in it; only this user's again: used
         os.mkdir(os.path.join(mine, '.local'), 0o700)
         os.chmod(os.path.join(mine, '.local'), 0o777)
-        self.assertEqual(state(mine, pw_home)[0], '')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(state(mine, pw_home)[0], '')
+        # #945: said, not dropped silently (a ~/.local of mode 775, as umask 002 makes it), with the repair
+        self.assertIn(f'chmod go-w {os.path.join(mine, ".local")}', err.getvalue())
         self.assertEqual(os.listdir(os.path.join(mine, '.local')), [])
         os.chmod(os.path.join(mine, '.local'), 0o700)
         self.assertEqual(state(mine, pw_home)[0], labelled(mine))

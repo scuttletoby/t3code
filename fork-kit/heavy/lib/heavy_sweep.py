@@ -947,6 +947,10 @@ class Sweep:
         removed = 0
         for i, folder in enumerate(self.note_folders()):
             if i == 1 and not parent_ok(os.path.dirname(os.path.dirname(folder))):
+                if os.path.lexists(folder):         # #945: said, never dropped silently (a ~/.local of mode 775)
+                    parent = os.path.dirname(os.path.dirname(os.path.dirname(folder)))
+                    self.note(f'old docker-label notes in {folder} are left: {parent} must be a real folder of this '
+                              f'user\'s that no one else can write (`chmod go-w {parent}`)')
                 continue
             try:
                 # the folder, heavy/ and the base: each a real folder of this user's only it can write (own_folder)

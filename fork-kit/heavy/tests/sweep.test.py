@@ -857,8 +857,10 @@ class SweepTests(unittest.TestCase):
         self.notes('heavy-gone-0a1b2c3d.scope')
         os.chmod(local, 0o777)
         self.addCleanup(os.chmod, local, 0o700)
-        self.assertEqual(self.run_sweep()[0], 0)
+        code, out, err = self.run_sweep()
+        self.assertEqual(code, 0)
         self.assertEqual(self.left_notes(), [[], ['heavy-gone-0a1b2c3d.scope']])
+        self.assertIn(f'chmod go-w {local}', out + err, '#945: said, not left silently')
         os.chmod(local, 0o700)                                  # only this user's again: removed
         self.assertEqual(self.run_sweep()[0], 0)
         self.assertEqual(self.left_notes(), [[], []])
