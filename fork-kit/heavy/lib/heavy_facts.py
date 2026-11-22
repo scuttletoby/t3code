@@ -21,7 +21,7 @@ work cannot be counted, so the answer is never free (a note says why). A signal 
 
 Reservations: lines `<MB> <folder> [until=YYYY-MM-DD]` in *.conf files of $T3_CAPACITY_RESERVE_DIR, else
 ~/.config/t3-capacity/reserve.d. A folder matches itself and what is below it, never a sibling that shares its
-first letters (`/x/kotoba` is not `/x/kotoba-x`); its real path (links resolved) matches too. Each holds MB less what
+first letters (`/x/app` is not `/x/app-x`); its real path (links resolved) matches too. Each holds MB less what
 this user's processes working in the folder use (RssAnon + RssShmem + VmSwap); it does not hold back a caller whose
 working folder is in it; past its until date, or broken, it holds nothing (a note says so).
 
@@ -250,6 +250,11 @@ def capacity_settings(mf, section_spec, path=None, owner_uid=0):
         h = mf.fields(h, spec, f'{where}: heavy.capacity.holds[{i}]')
         if any(h['label'] == o['label'] for o in holds):
             raise mf.MachineFileError(f'{where}: heavy.capacity.holds[{i}]: label {h["label"]!r} is there twice')
+        for o in holds:                             # one in the other: the same room would be held twice
+            a, b = sorted((h['cgroup'], o['cgroup']), key=len)
+            if (b + '/').startswith(a + '/'):
+                raise mf.MachineFileError(f'{where}: heavy.capacity.holds[{i}]: cgroup {h["cgroup"]!r} is in or the '
+                                          f'same as {o["cgroup"]!r} of hold {o["label"]!r} (held twice)')
         holds.append(h)
     return {'holds': holds}
 
@@ -273,6 +278,13 @@ def held_cgroups(host, holds, user):
             continue                                # not there: nothing runs in it
         use = rd.read_piece_demand(host, 'v2', cg(folder))
         if use.get('gone'):
+            if not os.path.isdir(ROOT + folder):
+                continue                            # ended between the two looks: nothing runs in it
+            # There, but no memory.stat: the memory controller is off for it (its parent's cgroup.subtree_control),
+            # so its use and limit cannot be known: it holds its whole budgetMb.
+            notes.append(f'hold {h["label"]}: no memory controller (no memory.stat): holds its whole budget '
+                         f'{h["budgetMb"]} MB')
+            out.append({'name': h['label'], 'prefixes': [], 'mb': h['budgetMb'], 'useMb': 0})
             continue
         if use['demandMb'] is None:
             notes.append(f'hold {h["label"]}: its memory.stat cannot be read: holds its whole budget')
@@ -284,7 +296,12 @@ def held_cgroups(host, holds, user):
         except (OSError, ValueError):
             mb = h['budgetMb']
             notes.append(f'hold {h["label"]}: its memory.max cannot be read: budget {mb} MB')
-        out.append({'name': h['label'], 'prefixes': [], 'mb': mb, 'useMb': use['demandMb'] or 0})
+        # In use counts its swap (a swapped-out slice has run), but memory.max limits RAM only (swap has its own
+        # memory.swap.max): the room it can still take is its budget less the RAM it uses, so its swap is left out
+        # here (missing or unreadable swap: 0, as in the shared reader).
+        swap = rd._mb_of(rd._one_number(rd._text_of(host, folder + '/memory.swap.current'))) or 0
+        ram = None if use['demandMb'] is None else max(0, use['demandMb'] - swap)
+        out.append({'name': h['label'], 'prefixes': [], 'mb': mb, 'useMb': ram or 0})
     return out, notes
 
 
@@ -372,6 +389,8 @@ def read_machine(rule, where, carry, now):
     res, more = reservations(where['reserveDir'], now.date())
     notes += more
     held, more = held_cgroups(host, where['holds'], where['user'])
+    notes += [f'reservation {n}.conf has the name of a machine-file hold: both hold; rename the file'
+              for n in sorted({r['name'] for r in res} & {h['label'] for h in where['holds']})]
     res += held
     notes += more
     notes += [f'{g["reading"]}: {g["instead"]}' for g in m['gaps']]
