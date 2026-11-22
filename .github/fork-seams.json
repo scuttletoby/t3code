@@ -113,7 +113,16 @@
         "automaticUpdates: false,",
         "import * as ForkPolicy from \"./fork/modelPolicyFile.ts\"; // Fork: model policy",
         "modelPolicy: yield* ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import { decodeSettingsFile, prepareSettingsFile } from \"./fork/settingsFileRead.ts\"; // Fork: load",
+          "* decode. Synchronous: the load and `__fork-report` use fork/settingsFileRead.ts's Effect form.",
+          "const decoded = yield* decodeSettingsFile(raw, managed.withDefaults, decodePersistedSettings);",
+          "export const decodePersistedSettings = Schema.decodeUnknownEffect(PersistedServerSettings);"
+        ]
+      }
     },
     "packages/shared/src/AgentScope.ts": {
       "why": "The slot observer (apps/server/src/slots/SlotObserver.ts) reads an agent's memory from its own systemd scope; one optional method on upstream's interface asks for it.",
