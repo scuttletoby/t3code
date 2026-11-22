@@ -338,6 +338,17 @@ class Links(Repo):
                 code, out = self.run_check('--files', 'docs/a.md')
                 self.assertEqual(code, 0, out)
 
+    def test_a_block_quote_line_is_no_paragraph_the_next_line_goes_on(self):
+        # #1020 narrow check: this checker does not model block quotes, so a ">" line must not count as a paragraph
+        # that the next line continues: "2." right below a quote opens an item (commonmark.js 0.31.2 renders the link).
+        for text in ['> **Note:** this needs a recent runtime.\n2. Run it.\n\n    See [setup](nope.md) for flags.\n',
+                     '> quote\n    [x](nope.md)\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 1, out)
+                self.assertIn(f'DOC  docs/a.md:{text.count(chr(10))}: broken link nope.md', out)
+
     def test_a_link_that_is_no_path_is_a_broken_link_not_a_traceback(self):
         self.commit({'docs/a.md': '[nul](x%00.md)\n', 'docs/b.md': 'b\n'})
         base = self.branch({'docs/b.md': None})   # the removed-link scan reads the untouched a.md

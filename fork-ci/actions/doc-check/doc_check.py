@@ -216,6 +216,7 @@ def link_lines(text):
     item's paragraph (a lazy line); each marker of a line like "- - item" opens an item."""
     fence, fence_col, items = None, 0, []   # items: the content columns of the open list items
     code, para = False, False               # in indented code; the line before is paragraph text (lazy lines go on)
+    quote = False                           # that paragraph is in a block quote, which this checker does not model
     for no, line in enumerate(text.split('\n'), 1):
         wide = line.expandtabs(4)
         body = wide.lstrip(' ')
@@ -226,7 +227,9 @@ def link_lines(text):
             kept = len(items)
             while kept and indent < items[kept - 1]:
                 kept -= 1
-            in_para = para and kept == len(items)   # the line is in the paragraph's own block
+            # the line is in the paragraph's own block; a line without ">" after a quote's paragraph goes on with it
+            # only lazily, so it opens what it would open outside the quote ("2." too)
+            in_para = para and kept == len(items) and not quote
             # a lazy line goes on with the paragraph of an item it is not indented into: text, nothing opens
             lazy = para and kept < len(items) and not (indent - (items[kept - 1] if kept else 0) <= 3
                                                        and starts_block(body))
@@ -241,7 +244,7 @@ def link_lines(text):
         if body:
             code = indent - col >= 4 and (code or not para)   # indented code cannot interrupt a paragraph
         if code or not body:
-            para = False
+            para = quote = False
             continue
         text_only = lazy or indent - col > 3     # 4 or more in and not code: the paragraph goes on too
         if not text_only and opens_fence(body):
@@ -260,6 +263,7 @@ def link_lines(text):
         if rest and opens_fence(rest):
             fence, fence_col = opens_fence(rest), items[-1]
         para = text_only or bool(rest) and fence is None and not (THEMATIC.match(rest) or HEADING.match(rest))
+        quote = rest.startswith('>') if rest else quote and text_only
         if fence is None:
             for lm in LINK.finditer(INLINE_CODE.sub('', line)):
                 target = re.split(r'[#?]', lm.group(1) or lm.group(2), maxsplit=1)[0]
