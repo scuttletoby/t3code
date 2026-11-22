@@ -50,6 +50,13 @@ export const ResultFields = {
 /** The gate's own read waits up to `COUNT_READ_TIMEOUT`; one second more, then it is unread. */
 const USAGE_READ_TIMEOUT = Duration.sum(SlotGate.COUNT_READ_TIMEOUT, Duration.seconds(1));
 
+/**
+ * The host sample's own limit (a Linux read is a few files; macOS runs `vm_stat`). Longer, and the
+ * answer leaves `hostResources` out, as for a failed read. It runs beside the slot read, so the
+ * whole read stays within `USAGE_READ_TIMEOUT`.
+ */
+export const HOST_READ_TIMEOUT = Duration.seconds(2);
+
 export const REASON_GATE_MISSING = "The agent slot gate is not running on this machine.";
 export const REASON_GATE_UNREAD =
   "The agent slot gate could not count the agents here now, so no slot count is given.";
@@ -97,13 +104,13 @@ const slotFacts = Effect.gen(function* () {
  */
 export const read = Effect.gen(function* () {
   const host = yield* Effect.serviceOption(HostResources.HostResources);
-  const hostResources = Option.isNone(host)
-    ? Option.none()
-    : yield* host.value.read.pipe(
-        Effect.asSome,
+  const hostRead = Option.isNone(host)
+    ? Effect.succeedNone
+    : host.value.read.pipe(
+        Effect.timeoutOption(HOST_READ_TIMEOUT),
         Effect.catchCause(() => Effect.succeedNone),
       );
-  const slots = yield* slotFacts;
+  const [hostResources, slots] = yield* Effect.all([hostRead, slotFacts], { concurrency: 2 });
   const placement: Placement = {
     labels: [],
     ...slots,
@@ -114,3 +121,36 @@ export const read = Effect.gen(function* () {
     placement,
   };
 }).pipe(Effect.withSpan("EnvironmentFacts.read"));
+
+const AnswerFacts = Schema.Struct(ResultFields);
+const decodeAnswerFacts = Schema.decodeUnknownSync(AnswerFacts);
+
+/**
+ * A linked machine's forwarded answer, decoded with these schemas, as the rule engine's
+ * `MachineFacts`. Neither field (an older build): `null`, no facts. Refused by the schemas: only
+ * `problem`, so the engine refuses the machine, named too. A newer build's extra field is ignored.
+ */
+export const factsFromAnswer = (
+  answer: unknown,
+  receivedAt: number,
+): {
+  readonly hostResources?: HostResourcesSnapshot;
+  readonly placement?: Placement;
+  readonly problem?: string;
+  readonly receivedAt: number;
+} | null => {
+  let decoded: typeof AnswerFacts.Type;
+  try {
+    decoded = decodeAnswerFacts(answer);
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error);
+    const problem = text.replaceAll(/\s+/gu, " ").trim().slice(0, 300) || "not a valid answer";
+    return { problem, receivedAt };
+  }
+  if (decoded.hostResources === undefined && decoded.placement === undefined) return null;
+  return {
+    ...(decoded.hostResources === undefined ? {} : { hostResources: decoded.hostResources }),
+    ...(decoded.placement === undefined ? {} : { placement: decoded.placement }),
+    receivedAt,
+  };
+};

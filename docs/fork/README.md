@@ -455,8 +455,12 @@ wiring). Fields, each with its default:
   Linux and macOS; `C:\…` or `\\server\…` on Windows). It is a path, never a command line: a
   space is part of the path, and no shell runs it. A relative path or a control character is not
   valid; a save that sets another OS's path is refused, and placing reads one in the file as `off` (below).
-  Exit 0 means free for work, and each line it prints is one more label; any other exit or a timeout
-  means not available.
+  Exit 0 means free for work, and each line it prints is one more label (trimmed and lower-cased as
+  for `labels`; a line that is not one label is skipped, at most 64); any other exit, a program that
+  cannot start, or no answer within 5 seconds means not available, with the reason. The machine
+  that runs it checks the path again on its own OS first and runs it with no arguments; on Windows
+  only an `.exe` runs, since a `.cmd`, `.bat` or script needs a shell. The runner is in the fork
+  (`apps/server/src/fork/factsCommand.ts`); placement row P4 wires it into the facts read.
 - `never`: `[]`. Label groups that must not meet on one machine, such as
   `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
   lower-casing (`["GPU", "gpu"]` is one label, so not a group).
@@ -478,6 +482,14 @@ save of `placement` on this build drops it. Only a person changes it: no agent t
 managed policy can lock it as a whole value (not one field inside it, as for `modelPolicy`).
 "Person-only" means no T3 tool takes it; an agent with a shell can still edit the settings file or
 call the settings RPC, as for `modelPolicy`.
+
+Threat notes for the rows that act on it (P4 and later). `placement` (and `factsCommand` with it)
+is a guard against mistakes, not against an agent that sets out to get around it: an agent with a
+shell on a machine can change that machine's `placement`, point `factsCommand` at its own program,
+or start work there without `delegate_task`. `factsCommand` runs with the server's own rights, so
+only a program the person put there belongs in it. What a linked machine reports about itself
+(labels, `available`, the counts) is taken as that machine's word; a machine whose answer the
+schemas refuse is refused, never read as busy or free.
 
 ```json
 {
@@ -1290,9 +1302,24 @@ upstream's, for this machine and for a linked one (the read is forwarded there a
 When the slot gate cannot be read (its count read fails or takes longer than its own limit, the
 gate is not running, or the settings cannot be read), `placement` says `available: false` with a
 reason and gives no count, so an agent never sees a guessed "slots free". A linked machine on an
-older T3 leaves both fields out, which means "no facts", never a failed read. Nothing is stored:
-each read measures again. The fields are part of the tool's result, not of the tool list an agent
-loads, so the tool context budget is unchanged.
+older T3 leaves both fields out, which means "no facts", never a failed read. The host sample has its
+own limit (2 seconds), and it and the slot count are read at the same time, so a slow sampler leaves
+out `hostResources` without delaying `placement`. Facts are never stored: each read measures again.
+The gate's status read does its own clean-up first (it drops used-up slot holds of waits, the same
+step `wait_list` runs); the facts read gives that status read at most 6 seconds (the gate's own
+count limit plus one), so a read can take that long on a busy machine, and it changes nothing but
+those spent holds. `available` and `slotsFree` count the
+machine limit and the memory floor only: the per-account limits of `agentSlots` are not in them, so
+a machine with free slots can still refuse a task for one account; the later placement rows check
+the account at launch (the gate does). The fields are part of the tool's result, not of the tool
+list an agent loads, so the tool context budget is unchanged.
+
+When placement reads a linked machine's answer (`factsFromAnswer` in the same file), it decodes it
+with these schemas: neither field is "no facts", as above; an answer they refuse is "facts not
+valid", and the machine is refused, even when it is named. This machine with no CPU and memory
+sample (no sampler, or one that cannot measure CPU) is still a place for work when every other
+rule passes, ranked last, because its own slot gate checks again at launch; a linked machine
+without them is not.
 
 ## Install the fork today
 
