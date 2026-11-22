@@ -163,8 +163,8 @@ The new session's first message has these parts:
      guards against mistakes, not against the person (the setting is theirs alone). It refuses:
      - a program that is not a full path on the server's OS, not a file, or inside a git checkout
        (a folder above it, or above the file a link points to, holds `.git`);
-     - for a known interpreter (shells, `python`, `node`, `ruby`, `perl`, `php`,
-       `lua`, `tclsh`, `pwsh`, `Rscript`): its script (the first argument that is not an option,
+     - for a known interpreter (shells, `python`, `node`, `ruby`, `perl`, `php`, `lua`, `tclsh`,
+       `pwsh`, `Rscript --vanilla`): its script (the first argument that is not an option,
        whatever its ending) by a relative path, missing, or inside a checkout, a folder Python
        would run (`__main__.py`) too; and a module found by name (`python -m x`, `node -r x`,
        `--import x`), as that is looked up from the project folder;
@@ -179,7 +179,9 @@ The new session's first message has these parts:
        `npx`, `pnpm`, `yarn`, `cargo`, `go`, `gradle`, `mvn`, `ant`, `task`, `tox`, `nox`,
        `poetry`, `pipenv`, `uv`, `composer`; and `bun`, `bunx` and `deno`, whatever script they
        are given, as they read their config from it first (`bunfig.toml`'s `preload` runs project
-       code, `deno.json`'s import map changes what a script imports).
+       code, `deno.json`'s import map changes what a script imports); `R`, whatever it is given,
+       and `Rscript` without `--vanilla` among its options (before its script or `-e`), as R
+       sources `.Rprofile` and reads `.Renviron` from its working folder before the script.
 
      It does not catch: code given inline (`sh -c '…'`, `python -c '…'`, which may itself run
      project files); wrappers other than `env` (`nice`, `timeout`, `xargs`, …), whose program is

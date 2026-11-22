@@ -318,10 +318,9 @@ export const make = Effect.gen(function* () {
     );
 
   /**
-   * What follows a write turn (or continuation) a restart cut short: its continuation (`next`), one
-   * upstream still owes (`owed`: its outbox row is not settled yet, or upstream retries a
-   * continuation that failed before its prompt and has not written that row yet, due at `dueMs`),
-   * or none. The row is read before the runs, so a row that settles between the reads shows its run.
+   * What follows a write turn a restart cut short: its continuation, or one upstream owes (`row`
+   * not settled; `retry` of a failed start, row not yet written, due at `dueMs`; `unread` row,
+   * never "no row", read again shortly), or none. Row first: one settling meanwhile shows its run.
    */
   const continuationOf = Effect.fn("HandoffService.continuationOf")(function* (
     threadId: ThreadId,
@@ -334,7 +333,7 @@ export const make = Effect.gen(function* () {
           threadId,
           runId: write.id,
           cause,
-        }).pipe(Effect.as(Option.none<EffectOutbox.OrchestrationEffectV2>())),
+        }).pipe(Effect.as("unread" as const)),
       ),
     );
     const projection = yield* projections.getThreadRecords(
@@ -346,11 +345,13 @@ export const make = Effect.gen(function* () {
       (candidate) => candidate.restartContinuationOfRunId === write.id,
     );
     if (next !== undefined) return { kind: "next", next } as const;
+    if (effect === "unread") return { kind: "owed", wait: "unread" } as const;
     if (Option.isSome(effect)) {
       const { status, availableAt } = effect.value;
       return status === "pending" || status === "running"
         ? ({
             kind: "owed",
+            wait: "row",
             effectId,
             dueMs: DateTime.toEpochMillis(DateTime.makeUnsafe(availableAt)),
           } as const)
@@ -361,7 +362,7 @@ export const make = Effect.gen(function* () {
       ? ({ kind: "none" } as const)
       : ({
           kind: "owed",
-          effectId: undefined,
+          wait: "retry",
           dueMs: DateTime.toEpochMillis(write.completedAt) + delayMs,
         } as const);
   });
@@ -416,11 +417,11 @@ export const make = Effect.gen(function* () {
           if (after.kind === "owed") {
             // Upstream still starts it: judging now would drop the continuation's notes. A
             // written row is waited for until it settles, however late a busy effect worker
-            // runs it; a retry whose row is not written yet (it is, right after the failure) is
-            // given up a minute past its due time.
+            // runs it, and an unread one is read again until it can be; a retry whose row is not
+            // written yet (it is, right after the failure) is given up a minute past its due time.
             const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
             const giveUpMs =
-              after.effectId === undefined ? after.dueMs + stopWaitMs : Number.POSITIVE_INFINITY;
+              after.wait === "retry" ? after.dueMs + stopWaitMs : Number.POSITIVE_INFINITY;
             if (nowMs >= giveUpMs) {
               yield* Effect.logWarning(
                 "handoff: upstream's restart continuation did not start; the write turn is judged as it is",
@@ -435,25 +436,27 @@ export const make = Effect.gen(function* () {
                 {
                   threadId,
                   runId: write.id,
-                  dueAt: DateTime.formatIso(DateTime.makeUnsafe(after.dueMs)),
+                  ...(after.wait === "unread"
+                    ? {}
+                    : { dueAt: DateTime.formatIso(DateTime.makeUnsafe(after.dueMs)) }),
                 },
               );
             }
-            yield* after.effectId === undefined
-              ? Deferred.await(wake).pipe(
+            yield* after.wait === "row"
+              ? Effect.raceFirst(
+                  Deferred.await(wake),
+                  // A failed wait reads the row again shortly.
+                  outbox
+                    .awaitSettled(after.effectId)
+                    .pipe(Effect.catch(() => Effect.sleep(CONTINUATION_RECHECK))),
+                )
+              : Deferred.await(wake).pipe(
                   Effect.timeoutOrElse({
                     duration: Duration.millis(
                       Math.min(Duration.toMillis(CONTINUATION_RECHECK), giveUpMs - nowMs),
                     ),
                     orElse: () => Effect.void,
                   }),
-                )
-              : Effect.raceFirst(
-                  Deferred.await(wake),
-                  // A failed wait reads the row again shortly.
-                  outbox
-                    .awaitSettled(after.effectId)
-                    .pipe(Effect.catch(() => Effect.sleep(CONTINUATION_RECHECK))),
                 );
             continue;
           }

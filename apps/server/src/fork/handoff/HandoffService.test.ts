@@ -128,6 +128,8 @@ const harness = (state: {
    * `HandoffService.continuationEffectId`); read at each lookup. None: no row.
    */
   effects?: Map<string, { status: EffectOutbox.OrchestrationEffectStatusV2; availableAt: number }>;
+  /** How many of the next outbox reads (`get`) or waits (`awaitSettled`) fail, counted down. */
+  outboxFails?: { get?: number; awaitSettled?: number };
   /** What the `command` source answers (none: a failure); every run is recorded. */
   command?: HandoffCommand.HandoffCommandResult;
   /**
@@ -209,6 +211,15 @@ const harness = (state: {
         settled.delete(effectId);
         return signal === undefined ? Effect.void : Deferred.succeed(signal, undefined);
       });
+    /** Whether this outbox call fails (`state.outboxFails`); counts it down. */
+    const outboxFails = (operation: "get" | "awaitSettled") => {
+      const left = state.outboxFails?.[operation] ?? 0;
+      if (left <= 0) return false;
+      state.outboxFails = { ...state.outboxFails, [operation]: left - 1 };
+      return true;
+    };
+    const outboxError = (operation: string) =>
+      Effect.fail(new EffectOutbox.EffectOutboxError({ operation, cause: "database is locked" }));
     const dependencies = Layer.mergeAll(
       Layer.mock(Orchestrator.OrchestratorV2)({
         streamDomainEvents: Stream.fromQueue(events),
@@ -299,6 +310,7 @@ const harness = (state: {
         // As upstream's: resolves once the row is neither pending nor running (`settleEffect`).
         awaitSettled: (effectId) =>
           Effect.suspend(() => {
+            if (outboxFails("awaitSettled")) return outboxError("awaitSettled");
             const row = state.effects?.get(effectId);
             if (row === undefined || (row.status !== "pending" && row.status !== "running"))
               return Effect.void;
@@ -307,24 +319,27 @@ const harness = (state: {
             return Deferred.await(signal);
           }),
         get: (effectId) =>
-          Effect.sync(() => {
+          Effect.suspend(() => {
+            if (outboxFails("get")) return outboxError("get");
             const row = state.effects?.get(effectId);
-            return row === undefined
-              ? Option.none()
-              : Option.some({
-                  id: effectId,
-                  commandId: CommandId.make(`command:${effectId}`),
-                  threadId,
-                  request: { type: "provider-runtime.continue", sourceRunId: RunId.make("any") },
-                  status: row.status,
-                  attemptCount: 0,
-                  availableAt: DateTime.formatIso(DateTime.makeUnsafe(row.availableAt)),
-                  leaseOwner: null,
-                  createdAt: DateTime.formatIso(at()),
-                  updatedAt: DateTime.formatIso(at()),
-                  completedAt: null,
-                  lastError: null,
-                } satisfies EffectOutbox.OrchestrationEffectV2);
+            return Effect.succeed(
+              row === undefined
+                ? Option.none()
+                : Option.some({
+                    id: effectId,
+                    commandId: CommandId.make(`command:${effectId}`),
+                    threadId,
+                    request: { type: "provider-runtime.continue", sourceRunId: RunId.make("any") },
+                    status: row.status,
+                    attemptCount: 0,
+                    availableAt: DateTime.formatIso(DateTime.makeUnsafe(row.availableAt)),
+                    leaseOwner: null,
+                    createdAt: DateTime.formatIso(at()),
+                    updatedAt: DateTime.formatIso(at()),
+                    completedAt: null,
+                    lastError: null,
+                  } satisfies EffectOutbox.OrchestrationEffectV2),
+            );
           }),
       }),
       Layer.mock(HandoffCommand.HandoffCommand)({
@@ -2046,9 +2061,12 @@ describe("HandoffService, agent source", () => {
         yield* emit(runUpdated(write), "readThread", 1);
         // Upstream's effect worker runs a few rows at a time: after a busy restart it claims this
         // one long after it was due, and the continuation starts later still. The chain is not
-        // judged meanwhile.
+        // judged meanwhile, nor when a thread event wakes the wait long after the row was due.
         yield* TestClock.adjust(10 * MINUTE_MS);
+        yield* Queue.offer(events, runUpdated(write));
+        yield* TestClock.adjust(MINUTE_MS);
         expect(ended.get("HandoffService.finishWrite") ?? 0).toBe(0);
+        expect(sent).toEqual([]);
         state.effects!.set(effectId, { status: "running", availableAt: NOW_MS });
         yield* TestClock.adjust(10 * MINUTE_MS);
         expect(ended.get("HandoffService.finishWrite") ?? 0).toBe(0);
@@ -2063,6 +2081,73 @@ describe("HandoffService, agent source", () => {
         expect(messages(sent).map((one) => one.messageId)).toEqual([handoffMessageId]);
         expect(part2(sent)[0]).toContain("Goal: ship X.");
         expect(writes(sent)).toEqual([]);
+      }),
+    SHORT_TIMEOUT_MS,
+  );
+
+  it.effect(
+    "an outbox row that cannot be read is owed (#973): read again after 5 s, then the notes once, never the fallback without them",
+    () =>
+      Effect.gen(function* () {
+        const { state, write, continuation, put } = cutShort();
+        const effectId = HandoffService.continuationEffectId(write.id);
+        state.effects!.set(effectId, { status: "pending", availableAt: NOW_MS });
+        // The first read of the row fails (the database is busy, say); the row is there.
+        state.outboxFails = { get: 1 };
+        const { sent, emit, events, settleEffect, ended } = yield* harness(state);
+        yield* emit(runUpdated(write), "continuationOf", 1);
+        // Not "no row": judging now would send the fallback without the continuation's notes.
+        yield* TestClock.adjust(1_000);
+        expect(ended.get("HandoffService.finishWrite") ?? 0).toBe(0);
+        expect(sent).toEqual([]);
+        // Read again after 5 s, with no thread event: the row is pending, so the loop waits on it.
+        yield* TestClock.adjust(4_000);
+        yield* emit(null, "continuationOf", 2);
+        expect(state.outboxFails).toEqual({ get: 0 });
+        yield* TestClock.adjust(10 * MINUTE_MS);
+        expect(ended.get("HandoffService.finishWrite") ?? 0).toBe(0);
+        expect(sent).toEqual([]);
+        const later = at(10 * MINUTE_MS);
+        const next = put(continuation(3, write.id, { requestedAt: later, startedAt: later }));
+        yield* Queue.offer(events, runUpdated(next));
+        yield* settleEffect(effectId, "succeeded");
+        const done = put({ ...next, status: "completed", completedAt: later }, WRITTEN);
+        yield* Queue.offer(events, runUpdated(done));
+        yield* emit(null, "finishWrite", 1);
+        expect(messages(sent).map((one) => one.messageId)).toEqual([handoffMessageId]);
+        expect(part2(sent)[0]).toContain("Goal: ship X.");
+      }),
+    SHORT_TIMEOUT_MS,
+  );
+
+  it.effect(
+    "a failed wait on the outbox row reads it again after 5 s (#973), with no thread event",
+    () =>
+      Effect.gen(function* () {
+        const { state, write, continuation, put } = cutShort();
+        // The continuation failed before its prompt; upstream's retry row is pending.
+        const failed = put(
+          continuation(3, write.id, {
+            status: "failed",
+            activeAttemptId: RunAttemptId.make("attempt-3"),
+            completedAt: at(),
+          }),
+        );
+        const effectId = HandoffService.continuationEffectId(failed.id);
+        state.effects!.set(effectId, { status: "pending", availableAt: NOW_MS });
+        state.outboxFails = { awaitSettled: 1 };
+        const { sent, emit, settleEffect, ended } = yield* harness(state);
+        yield* emit(runUpdated(failed), "continuationOf", 1);
+        yield* TestClock.adjust(1_000);
+        expect(state.outboxFails).toEqual({ awaitSettled: 0 });
+        // Meanwhile upstream's retry ran and started no run: no thread event, and no waiter woken.
+        yield* settleEffect(effectId, "succeeded");
+        yield* TestClock.adjust(3_000);
+        expect(ended.get("HandoffService.finishWrite") ?? 0).toBe(0);
+        // The read after 5 s finds the row settled with no continuation: judged, the fallback once.
+        yield* TestClock.adjust(1_000);
+        yield* emit(null, "finishWrite", 1);
+        expect(part2(sent)).toEqual([notCounted("the write turn failed")]);
       }),
     SHORT_TIMEOUT_MS,
   );

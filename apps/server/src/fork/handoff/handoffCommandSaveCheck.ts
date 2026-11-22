@@ -41,6 +41,22 @@ const PROJECT_RUNNER =
  */
 const PROJECT_CONFIG_RUNTIME = /^(?:bun|bunx|deno)$/u;
 
+/**
+ * Whether R reads `.Rprofile` (sourced first) and `.Renviron` from its working folder, the project
+ * folder. `R` itself is refused whatever it is given (its `R CMD` tools read project files of their
+ * own); `Rscript` unless `--vanilla` comes among its options, before its script or `-e` (after
+ * them, it is an argument of the script).
+ */
+const readsRProfile = (name: string, args: ReadonlyArray<string>) => {
+  if (name === "r") return true;
+  if (name !== "rscript") return false;
+  for (const arg of args) {
+    if (arg === "--vanilla") return false;
+    if (!arg.startsWith("-") || arg === "-e") return true;
+  }
+  return true;
+};
+
 /** A program's name as the checks compare it: its last path part, lower case, no `.exe` or version. */
 const programName = (program: string) =>
   (program.split(/[\\/]/u).at(-1) ?? "")
@@ -221,6 +237,9 @@ const commandProblem = Effect.fn("HandoffCommandSaveCheck.commandProblem")(funct
   }
   if (PROJECT_CONFIG_RUNTIME.test(name)) {
     return `${where} runs "${program}", which reads its config (bunfig.toml, deno.json and the like) from the project folder, and agents can edit that folder: it can run project code before any script. Give the full path of another program or script outside any repository instead.`;
+  }
+  if (readsRProfile(name, args)) {
+    return `${where} runs "${program}", which reads .Rprofile and .Renviron from the project folder, and agents can edit that folder: it can run project code before any script. Give Rscript --vanilla before its script, or the full path of another program or script outside any repository.`;
   }
   const scripts: Array<string> = [];
   if (INTERPRETER.test(name)) {
