@@ -13,7 +13,38 @@ export interface SlotLimits {
   readonly account: (instanceId: string) => number | null;
   readonly minFreeMemoryBytes: number | null;
   readonly startGraceMs: number;
+  /** `enforce` mode: the capacity rule decides after the count limits (the gate sets `capacity`). */
+  readonly enforce?: boolean;
+  /**
+   * The capacity rule on one more agent of `kind`, with everything counted: `null` lets it start.
+   * Absent: no capacity rule (`fixed`).
+   */
+  readonly capacity?: (input: CapacityAsk) => CapacityRefusal | null;
 }
+
+/** What the capacity rule is asked: the counted agents, as `slotDecision` counts them. */
+export interface CapacityAsk {
+  readonly running: ReadonlyArray<RunningAgent>;
+  readonly starting: ReadonlyArray<StartingEntry>;
+  readonly reservations: number;
+  readonly kind: string | undefined;
+}
+
+export interface CapacityRefusal {
+  readonly reason: string;
+  /**
+   * Free MB and the agent's cost (budget); agents counted and the ceiling (ceiling), or the floor
+   * (unreadable); writers counted (writers); else agents counted.
+   */
+  readonly used: number;
+  readonly max: number;
+}
+
+/**
+ * `enforce` without a typed machine limit counts up to the highest derived ceiling; the capacity
+ * rule's own ceiling (derived, or fixed in fallback) is checked with the rest of the rule.
+ */
+export const ENFORCE_COUNT_LIMIT = 64;
 
 /**
  * The limits of `agentSlots`, or `null` when the gate is off or has nothing to limit. A `0` is "no
@@ -21,13 +52,27 @@ export interface SlotLimits {
  * account is also no limit). To keep an account from starting agents, turn it off for the project.
  */
 export function effectiveSlotLimits(settings: AgentSlotsSettings): SlotLimits | null {
-  if (!settings.enabled) return null;
-  const machine = settings.maxPerMachine > 0 ? settings.maxPerMachine : null;
+  // `enforce` (the default) limits while switched off too; switched on, the typed limits also apply.
+  const enforce = agentSlotsMode(settings) === "enforce";
+  if (!settings.enabled && !enforce) return null;
+  const typed = settings.enabled;
+  const machine = typed && settings.maxPerMachine > 0 ? settings.maxPerMachine : null;
   const accounts = new Map(
-    Object.entries(settings.maxPerAccount).filter(([, max]) => max > 0) as Array<[string, number]>,
+    Object.entries(typed ? settings.maxPerAccount : {}).filter(([, max]) => max > 0) as Array<
+      [string, number]
+    >,
   );
   const minFreeMemoryBytes =
-    settings.minFreeMemoryMb > 0 ? settings.minFreeMemoryMb * BYTES_PER_MB : null;
+    typed && settings.minFreeMemoryMb > 0 ? settings.minFreeMemoryMb * BYTES_PER_MB : null;
+  if (enforce) {
+    return {
+      machine: Math.min(machine ?? ENFORCE_COUNT_LIMIT, ENFORCE_COUNT_LIMIT),
+      account: (instanceId) => accounts.get(instanceId) ?? null,
+      minFreeMemoryBytes,
+      startGraceMs: settings.startGraceSeconds * 1000,
+      enforce: true,
+    };
+  }
   if (machine === null && accounts.size === 0 && minFreeMemoryBytes === null) return null;
   return {
     machine,
@@ -38,15 +83,18 @@ export function effectiveSlotLimits(settings: AgentSlotsSettings): SlotLimits | 
 }
 
 /**
- * The gate's mode (`AgentSlotsMode`). A file without `mode` keeps its old behaviour: switched on
- * with typed numbers is `fixed`, exactly those numbers; switched off (the default) is `observe`,
- * which never changes a decision. Any other text, such as a mode of a newer build, is `fixed`.
+ * The gate's mode (`AgentSlotsMode`). A file without `mode` that is switched on with typed numbers
+ * keeps its old behaviour, `fixed` (exactly those numbers); switched off (the default) is `enforce`:
+ * the capacity rule decides (owner decision: on by default). Any other text, such as a mode of a
+ * newer build, is `fixed`. To turn the gate off: `mode: "fixed"` while switched off.
  */
 export function agentSlotsMode(
   settings: Pick<AgentSlotsSettings, "enabled" | "mode">,
 ): AgentSlotsMode {
-  if (settings.mode === "observe" || settings.mode === "fixed") return settings.mode;
-  if (settings.mode === undefined && !settings.enabled) return "observe";
+  if (settings.mode === "observe" || settings.mode === "fixed" || settings.mode === "enforce") {
+    return settings.mode;
+  }
+  if (settings.mode === undefined && !settings.enabled) return "enforce";
   return "fixed";
 }
 
@@ -117,6 +165,8 @@ export interface StartingEntry {
    * starts the next one). Never named: it ends by time only (`liveStarting`).
    */
   readonly queuedInto?: string;
+  /** The capacity kind of the start (`kindOfRole`); absent: a writer. */
+  readonly kind?: string;
 }
 
 /**
@@ -235,7 +285,7 @@ export function pendingWakes(
   return [...threads].map((_, index) => ({ token: -1_000 - index, instanceId: "", atMs: 0 }));
 }
 
-export type SlotRule = "machine" | "account" | "memory";
+export type SlotRule = "machine" | "account" | "memory" | "capacity";
 
 export type SlotDecision =
   | { readonly type: "allow" }
@@ -252,6 +302,8 @@ export type SlotDecision =
        * not running yet, so `wait_list` does not show them.
        */
       readonly inLine?: number | undefined;
+      /** The capacity rule's reason (`capacity`): `budget`, `elevated`, `ceiling`, ... */
+      readonly capacity?: string | undefined;
     };
 
 export interface SlotDecisionInput {
@@ -270,6 +322,8 @@ export interface SlotDecisionInput {
   readonly targetInstanceId: string;
   /** `null` when the memory floor is off. */
   readonly freeMemoryBytes: number | null;
+  /** The capacity kind of this start; absent: a writer. */
+  readonly kind?: string | undefined;
 }
 
 /** Threads whose `accountOnly` holds are on `account` and not already counted there. */
@@ -327,6 +381,22 @@ export function slotDecision(input: SlotDecisionInput): SlotDecision {
       limits.minFreeMemoryBytes / BYTES_PER_MB,
     );
   }
+  const capacity = limits.capacity?.({
+    running,
+    starting,
+    reservations: reservations.length,
+    kind: input.kind,
+  });
+  if (capacity !== undefined && capacity !== null) {
+    return {
+      type: "refuse",
+      rule: "capacity",
+      used: capacity.used,
+      max: capacity.max,
+      instanceId: targetInstanceId,
+      capacity: capacity.reason,
+    };
+  }
   return { type: "allow" };
 }
 
@@ -353,7 +423,32 @@ export function slotRefusalReason(
     ? `${slotRunningText(decision, " on this machine")}, and the limit is ${decision.max}`
     : decision.rule === "account"
       ? `${slotRunningText(decision, ` on account ${decision.instanceId}`)}, and the limit is ${decision.max}`
-      : `only ${decision.used} MB of memory is free, and a new agent needs at least ${decision.max} MB`;
+      : decision.rule === "capacity"
+        ? capacityRefusalReason(decision.capacity, decision.used, decision.max, "this machine")
+        : `only ${decision.used} MB of memory is free, and a new agent needs at least ${decision.max} MB`;
+}
+
+/** The capacity rule's refusal, in one clause; `where`: "this machine", or "there". */
+export function capacityRefusalReason(
+  reason: string | undefined,
+  used: number,
+  max: number,
+  where: string,
+): string {
+  switch (reason) {
+    case "budget":
+      return `only ${used} MB of memory is free for new work on ${where}, and this agent needs ${max} MB`;
+    case "ceiling":
+      return `${used} agents are running or starting on ${where}, and the limit is ${max} now`;
+    case "writers":
+      return `${used} writing agents are running or starting on ${where}, as many as its build room allows`;
+    case "starting":
+      return `the slot gate on ${where} started a short while ago and waits for about a minute of calm memory readings`;
+    case "unreadable":
+      return `the memory of ${where} cannot be read now and ${used} agents are running or starting; only ${max} start without readings, and the fixed limit applies if they stay unreadable for 2 minutes`;
+    default:
+      return `the memory of ${where} is under pressure (${reason ?? "unknown"})`;
+  }
 }
 
 /**

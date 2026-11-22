@@ -176,11 +176,11 @@ export const WaitChecksFromSettingsFile = Schema.Record(Schema.String, Schema.Un
 );
 
 /**
- * How the slot gate decides. `fixed`: the typed limits below, nothing else. `observe`: the same
- * decision, and the capacity rule runs beside it on live memory readings and only records what it
- * would do (`wait_list` shows the last result). A later mode lets the rule decide.
+ * How the slot gate decides. `fixed`: the typed limits only. `observe`: the same, the capacity rule
+ * only records what it would do. `enforce` (default): the rule decides, derived ceilings, fixed
+ * ones after an OOM kill or full swap; typed limits too while `enabled`.
  */
-export const AgentSlotsMode = Schema.Literals(["fixed", "observe"]);
+export const AgentSlotsMode = Schema.Literals(["fixed", "observe", "enforce"]);
 export type AgentSlotsMode = typeof AgentSlotsMode.Type;
 
 /**
@@ -192,7 +192,7 @@ export const AgentSlotsSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /**
    * {@link AgentSlotsMode}, read by `agentSlotsMode` (shared/agentSlots.ts): absent is `fixed` while
-   * `enabled` (a file from before the key decides exactly as it did) and `observe` while off; any
+   * `enabled` (a file from before the key decides exactly as it did) and `enforce` while off; any
    * other text (a mode of a newer build) is `fixed`. Kept as written.
    */
   mode: Schema.optionalKey(Schema.String),
@@ -485,9 +485,11 @@ export const SlotRuleObservation = Schema.Struct({
 });
 export type SlotRuleObservation = typeof SlotRuleObservation.Type;
 
-/** The rule beside the gate since the server started (memory only). */
+/** The rule beside the gate, or deciding (`enforce`), since the server started (memory only). */
 export const SlotRuleStatus = Schema.Struct({
-  mode: Schema.Literal("observe"),
+  mode: Schema.Literals(["observe", "enforce"]),
+  /** `enforce`: on the fixed ceilings after an OOM kill or a swap-full reading (and after a start). */
+  fallback: Schema.optionalKey(Schema.Boolean),
   last: Schema.NullOr(SlotRuleObservation),
   /** Decisions observed, and how many the rule answered the other way. */
   observed: NonNegativeInt,

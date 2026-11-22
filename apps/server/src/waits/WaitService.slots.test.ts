@@ -361,7 +361,8 @@ describe("WaitService slot waits", () => {
           send.sent.map((message) => message.threadId),
           [T1],
         );
-        yield* settings.updateSettings({ agentSlots: { enabled: false } });
+        // Off in `fixed` mode (the default `enforce` lets the capacity rule decide even while off).
+        yield* settings.updateSettings({ agentSlots: { enabled: false, mode: "fixed" } });
         yield* service.runDue();
         assert.deepStrictEqual(
           send.sent.map((message) => message.threadId),
@@ -599,15 +600,18 @@ describe("WaitService slot waits", () => {
         assert.deepStrictEqual(store.counts, { reads: 0, writes: 0 });
         assert.strictEqual(store.files.get(FILE), before);
       }).pipe(Effect.provide(serverLayer(world, settings)));
-      // Slots off too: nothing is counted at all (fixed mode; the default only observes, off the
-      // decision path, see SlotObserver.test.ts).
-      for (const off of [{ agentSlots: { mode: "fixed" } }, {}]) {
+      // Slots off too: nothing is counted at all (fixed mode; the default enforces the capacity
+      // rule, see SlotObserver.test.ts).
+      for (const off of [
+        { agentSlots: { mode: "fixed" } },
+        { agentSlots: { enabled: false, mode: "fixed" } },
+      ]) {
         world.snapshotReads = 0;
         yield* Effect.gen(function* () {
           const { delegate, service } = yield* startService(store.fs, send.delivery);
           assert.strictEqual(yield* delegate(OUTSIDER), "allow");
           yield* service.runDue();
-          if ("agentSlots" in off) assert.strictEqual(world.snapshotReads, 0);
+          assert.strictEqual(world.snapshotReads, 0);
           assert.deepStrictEqual(store.counts, { reads: 0, writes: 0 });
         }).pipe(Effect.provide(serverLayer(world, off)));
       }

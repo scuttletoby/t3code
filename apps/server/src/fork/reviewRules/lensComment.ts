@@ -128,7 +128,7 @@ export function lensKey(name: string): string {
 }
 
 /** The name has a letter or digit, is no `<...>` placeholder and is more than a round marker. */
-function namesALens(name: string): boolean {
+export function namesALens(name: string): boolean {
   const key = lensKey(name);
   return (
     new RegExp(ALNUM, "u").test(key) &&
