@@ -319,9 +319,13 @@ pull request of its own on the default branch.
    a project never makes one. The path rules (`review`, `shadow` and `enforce`)
    are in `ci/v15` and later. Findings, rounds and `override_authors` are in
    `ci/v21` and later
-   ([RELEASE-NOTES.md](../../RELEASE-NOTES.md), #740). Up to `ci/v22` the
-   lenses of the heaviest weight hit only were required; every rule hit gives
-   its lenses from the first release after `ci/v22`. Take the newest
+   ([RELEASE-NOTES.md](../../RELEASE-NOTES.md), #740). Every rule hit gives
+   its lenses from the first release after `ci/v22` (#82); up to `ci/v22` only
+   the lenses of the heaviest weight hit were required. So a caller of a
+   config in `enforce` pins the first release after `ci/v22` or a later one:
+   `ci/v21` and `ci/v22` accept the config but judge mixed changes the old,
+   looser way (an app change plus one critical file passes on the critical
+   lenses alone, and no lens reads the app code). Take the newest
    `ci/vN` and its release sha as in
    [Pinning](../../README.md#pinning).
 2. **Pin.** In one pull request, move every `uses:` of fork-ci in the
@@ -378,7 +382,9 @@ pull request of its own on the default branch.
 5. **Enforce.** When the rows have matched the real verdicts over the
    number of merged pull requests the project picked, and no row shows a
    config warning, one pull request sets `"mode": "enforce"`. It changes the
-   config, so ask for the critical lenses: the gate does not require them yet
+   config, so ask for the critical lenses plus the lenses of every other
+   rule its paths hit (a config under a normal catch-all also needs that
+   rule's lens): the gate does not require them yet
    (the base is still in `shadow`, where only the input decides). Dispatch
    the backfill right after it merges, and arm no pull request before the
    backfill has run: each open pull request is judged by the new rules only at
@@ -419,15 +425,20 @@ pull request of its own on the default branch.
    ([issue 78](https://github.com/scuttletoby/t3code/issues/78)), and
    `ci/v20` and older refuse the key, so a caller pinned to one of them fails
    closed instead of enforcing the path rules without findings and rounds. A
-   caller of this config pins `ci/v21` or later; the first release after
-   `ci/v22` adds the code lens to mixed changes (above). Its critical
+   caller of this config pins the first release after `ci/v22` or a later
+   one (step 1): `ci/v21` and `ci/v22` accept it but judge mixed changes the
+   old, looser way. The fork's gate caller
+   ([issue 81](https://github.com/scuttletoby/t3code/issues/81)) starts at
+   that floor. Its critical
    rule names the workflow and gate-setting files under `.github` one by one
    instead of `.github/**`: the seam list and the test list, which most pull
    requests add a line to, stay normal, or plain app changes would need the
    gate lenses and no `code` lens. It also holds `fork-ci/**`,
    `fork-kit/review/**` (the lens format checker and lens skill: what a lens
    report must say) and `fork-kit/gh-apps/**` (the gate App's key and
-   tokens). Tests in `review_judge.test.py` fail when a new file under
+   tokens), and `docs/fork/gate-trust.md` (the owner's paste commands that
+   set up that key and those tokens); the rest of `docs/fork` stays normal.
+   Tests in `review_judge.test.py` fail when a new file under
    `.github` or a new folder under `fork-kit` is not sorted. The fork runs no
    gate on its own pull requests yet (no caller, App or ruleset,
    [issue 81](https://github.com/scuttletoby/t3code/issues/81)), so the block

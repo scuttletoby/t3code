@@ -471,7 +471,8 @@ class ForkConfig(unittest.TestCase):
                      '.github/actions/setup-ci-deps/action.yml', '.github/fork-ci-release-rulesets.json',
                      '.github/fork-actions-policies.json', '.github/scripts/fork-contracts.test.py',
                      '.github/workflows/new.yml', '.github/new-folder/x.json', '.github/new.md', 'fork-ci/new.txt',
-                     'fork-kit/review/lib/review_kit.py', 'fork-kit/gh-apps/libexec/x', 'fork-kit/review/SKILL.md'):
+                     'fork-kit/review/lib/review_kit.py', 'fork-kit/gh-apps/libexec/x', 'fork-kit/review/SKILL.md',
+                     'docs/fork/gate-trust.md'):
             with self.subTest(path):
                 j = self.judge(path)
                 self.assertEqual((j.weight, j.lenses), ('critical', self.critical.lenses))
@@ -491,6 +492,21 @@ class ForkConfig(unittest.TestCase):
                 else:
                     self.assertEqual(weight, 'critical', f'{path} is not in the gate rule: add it to the gate rule of '
                                      f'{FORK_CONFIG} (a workflow file or a gate setting, #82), or to NOT_GATE with why')
+
+    def test_only_the_gate_trust_page_of_docs_fork_is_critical(self):
+        # docs/fork/gate-trust.md holds the owner's paste commands that set up the gate App's key and tokens (a gate
+        # setting, like fork-kit/gh-apps); the other docs/fork pages are runbooks and stay normal, with the code lens,
+        # never a no-lens rule (a changed owner command would merge unread).
+        self.assertEqual(self.judge('docs/fork/gate-trust.md').hits[0].rule, self.critical.name)
+        for name in sorted(os.listdir(os.path.join(ROOT, 'docs', 'fork'))):
+            if name == 'gate-trust.md':
+                continue
+            with self.subTest(name):
+                j = self.judge(f'docs/fork/{name}')
+                self.assertEqual((j.weight, j.lenses), ('normal', ('code',)))
+        j = rj.judge(self.review, [('M', ('docs/fork/gate-trust.md',)), ('M', ('docs/fork/host-tools.md',))],
+                     FORK_CONFIG)
+        self.assertEqual((j.weight, j.lenses), ('critical', self.critical.lenses + ('code',)))
 
     def test_every_fork_kit_folder_is_sorted(self):   # a new kit must be sorted too
         top = sorted(os.listdir(os.path.join(ROOT, 'fork-kit')))

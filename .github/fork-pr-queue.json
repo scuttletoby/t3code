@@ -36,6 +36,7 @@
           ".github/fork-secret-sweep-gone-tips.txt",
           ".github/fork-tests-upstream.json",
           ".github/fork-upstream.json",
+          "docs/fork/gate-trust.md",
           "fork-ci/**",
           "fork-kit/gh-apps/**",
           "fork-kit/review/**"

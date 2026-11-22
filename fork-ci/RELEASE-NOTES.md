@@ -23,7 +23,9 @@ First in the release after `ci/v22`.
 
 **Upgrade:** a config in `enforce` needs more lens reads on mixed changes after the move, and a built-in protected path
 (the config, a lens prompt, a workflow) under a lighter rule also needs that rule's lenses. To keep the protected paths
-at the critical lenses only, put them in a critical rule. In `shadow` only the summary row changes.
+at the critical lenses only, put them in a critical rule. In `shadow` only the summary row changes. `ci/v21` and `ci/v22`
+accept the same config but judge mixed changes the old, looser way, so a caller of a config in `enforce` pins this release
+or a later one (pr-queue README, "Turning it on: release, pin, then config", step 1).
 
 ### pr-queue and head-check: review findings, rounds and `override_authors` (#740)
 

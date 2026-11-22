@@ -1600,7 +1600,7 @@ class ForkConfigRules(unittest.TestCase):
         self.assertEqual(FORK_RAW['review']['override_authors'], [])
 
     def test_a_workflow_or_gate_change_needs_the_extra_review(self):   # #82
-        for changed in ('.github/workflows/ci.yml', 'fork-ci/actions/x.py'):
+        for changed in ('.github/workflows/ci.yml', 'fork-ci/actions/x.py', 'docs/fork/gate-trust.md'):
             with self.subTest(changed):
                 base, head = self.pair(changed)
                 code, out = self.check(base, head, [self.said('code', head)])
