@@ -575,6 +575,22 @@ class Reservations(Case):
         os.utime(path, (NOW.timestamp() - 60,) * 2)     # nobody there, but written a minute ago: it holds
         self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 1536)
 
+    def test_idle_keeps_holding_while_someone_works_in_a_deeper_reservation_s_folder(self):
+        # a process counts its use toward the deepest reservation only (#945), but it works in the outer folder too:
+        # the outer one's idle= must not release it while work goes on below it
+        folder = os.path.join(self.tmp, 'game')
+        self.reserve_line(f'1536 {folder}/ idle=30m', age_s=31 * 60)
+        inner = os.path.join(self.m.reserve, 'inner.conf')
+        with open(inner, 'w') as f:
+            f.write(f'512 {folder}/sub/\n')
+        os.utime(inner, (NOW.timestamp(),) * 2)
+        self.m.process(4001, folder + '/sub/deep', 0)
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual(d['memory']['holdMb'], 1536 + 512, d['notes'])
+        self.assertFalse(any('reservation r is idle' in n for n in d['notes']), d['notes'])
+        shutil.rmtree(f'{self.m.root}/proc/4001')      # nobody works anywhere below it now: the outer one is idle
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 512)
+
     def test_a_bad_or_unknown_option_never_makes_a_line_hold_less(self):
         folder = os.path.join(self.tmp, 'game')
         for line in (f'1536 {folder}/ ttl=soon', f'1536 {folder}/ idle=-1m', f'1536 {folder}/ # the game',
@@ -1066,6 +1082,30 @@ class T3Capacity(Case):
             json.dump(state, f)
         self.assertEqual(self.cli([T3CAP, '1536'])[0], 0, 'the hold has ended')
 
+    def test_heavy_s_own_checks_share_t3_capacity_s_hold(self):
+        """#866 with #861: heavy's capacity check (a queued job's and a plain job's) is hf.checked too, so a NOT OK
+        that t3-capacity gave holds 20 s for heavy's same question, and heavy's own NOT OK holds its next ask."""
+        ask = ('import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("h", '
+               'sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader("h", l)); '
+               'l.exec_module(m); c = m.capacity_check(); a = sys.argv[3] or None; '
+               'print(repr(c(a, int(sys.argv[2]) if sys.argv[2] else None)))')
+
+        def heavy_check(kind=None, mb=None):
+            code, out, err = self.cli([sys.executable, '-I', '-B', '-c', ask, HEAVY, '' if mb is None else str(mb),
+                                       kind or ''])
+            self.assertEqual(code, 0, err)
+            return eval(out)            # (free?, why) from our own print
+        self.m.write('/proc/meminfo', self.m.meminfo(16384, 2048))      # busy for a build of 2048 MB and a job
+        self.assertEqual(self.cli([T3CAP, '--kind', 'job-build', '2048'])[0], 1)
+        self.assertFalse(heavy_check()[0])                               # heavy's plain ask: busy, held from now
+        self.m.write('/proc/meminfo', self.m.meminfo(16384, 12288))     # free again a second later
+        os.unlink(self.m.cache)
+        free, why = heavy_check('job-build', 2048)
+        self.assertEqual((free, why.startswith('held: NOT OK ')), (False, True), f't3-capacity\'s NOT OK: {why}')
+        free, why = heavy_check()
+        self.assertEqual((free, why.startswith('held: NOT OK ')), (False, True), f'heavy\'s own NOT OK: {why}')
+        self.assertEqual(heavy_check('job-test', 512), (True, ''), 'another question is not held')
+
     def test_the_hold_runs_again_and_meets_old_broken_or_foreign_state(self):
         folder = os.path.join(self.tmp, 'hold')
         os.makedirs(folder, mode=0o700)
@@ -1099,6 +1139,77 @@ class T3Capacity(Case):
             self.assertFalse(name.endswith('.tmp'), name)
         with mock.patch.object(hf, 'state_folder', lambda: (None, 'no temporary folder')):
             self.assertEqual(hf.hold('k:1', 'free', t)[0::2], ('free', 'no hold of a NOT OK (no temporary folder)'))
+
+    def test_a_broken_hold_file_in_a_folder_that_cannot_be_written_holds_only_its_20_s(self):
+        # a hold file that cannot be read fails closed, but when it cannot be written again either it must not hold
+        # every later OK for good: it holds HOLD_SECONDS from when it last changed (its ctime), then it is ignored
+        folder = os.path.join(self.tmp, 'hold')
+        os.makedirs(folder, mode=0o700)
+        path = os.path.join(folder, hf.HOLD_FILE)
+        for bad in ('{broken', '{"busy": {"k:1": 5}}', '{"v": 0, "busy": []}'):    # broken, older formats
+            with self.subTest(bad=bad):
+                with open(path, 'w') as f:
+                    f.write(bad)
+                changed = int(os.lstat(path).st_ctime * 1000)
+                with mock.patch.object(hf, 'write_cache', side_effect=PermissionError(13, 'Permission denied')):
+                    verdict, why, note = hf.hold('k:1', 'free', changed + 5_000, folder)
+                    self.assertEqual(verdict, 'busy', 'within its 20 s: held (fails closed)')
+                    self.assertIn('cannot be read', why)
+                    self.assertIn('was not written', note)
+                    self.assertEqual(hf.hold('k:1', 'free', changed + hf.HOLD_SECONDS * 1000, folder)[0], 'free')
+                    self.assertEqual(hf.hold('k:1', 'free', changed + 3_600_000, folder)[0], 'free', 'an hour on')
+                    self.assertEqual(hf.hold('k:1', 'busy', changed + 3_600_000, folder)[0], 'busy')
+        lstat = os.lstat
+
+        def blind(p, *a, **k):                      # it cannot even be looked at: ignored, with a note
+            if p == path:
+                raise PermissionError(13, 'Permission denied', p)
+            return lstat(p, *a, **k)
+        with mock.patch('os.lstat', blind), mock.patch('os.open', side_effect=PermissionError(13, 'denied')), \
+                mock.patch.object(hf, '_hold_lock', return_value=(None, None)):
+            verdict, why, note = hf.hold('k:1', 'free', int(time.time() * 1000), folder)
+        self.assertEqual((verdict, why), ('free', None))
+        self.assertIn('ignored', note)
+
+    def test_two_not_oks_at_once_are_both_kept(self):
+        # the hold is a read, then a write: without a lock the second caller's write would drop the first's NOT OK
+        folder = os.path.join(self.tmp, 'hold')
+        os.makedirs(folder, mode=0o700)
+        read = os.path.join(self.tmp, 'read')
+        slow = f"""
+import importlib.machinery, importlib.util, os, sys, time
+loader = importlib.machinery.SourceFileLoader('hf', {FACTS!r})
+hf = importlib.util.module_from_spec(importlib.util.spec_from_loader('hf', loader)); loader.exec_module(hf)
+real = hf.write_cache
+def slow_write(path, data):
+    open({read!r}, 'w').close()             # it has read the file and decided: the other caller comes now
+    time.sleep(1.5)
+    real(path, data)
+hf.write_cache = slow_write
+print(hf.hold('a:1', 'busy', None, {folder!r}))
+"""
+        p = subprocess.Popen([sys.executable, '-I', '-B', '-c', slow], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(p.kill)
+        deadline = time.monotonic() + 20
+        while not os.path.exists(read):
+            self.assertLess(time.monotonic(), deadline, 'the slow caller never got to its write')
+            time.sleep(0.01)
+        self.assertEqual(hf.hold('b:1', 'busy', None, folder)[0], 'busy')
+        self.assertEqual(p.wait(timeout=20), 0)
+        with open(os.path.join(folder, hf.HOLD_FILE)) as f:
+            self.assertEqual(set(json.load(f)['busy']), {'a:1', 'b:1'}, 'both NOT OKs are kept')
+
+    def test_a_hold_lock_that_stays_taken_never_stops_the_answer(self):
+        folder = os.path.join(self.tmp, 'hold')
+        os.makedirs(folder, mode=0o700)
+        fd = os.open(os.path.join(folder, hf.HOLD_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)              # another caller stopped while it held it (a live one, here)
+        t = time.monotonic()
+        verdict, why, note = hf.hold('k:1', 'busy', None, folder)
+        self.assertLess(time.monotonic() - t, hf.HOLD_LOCK_SECONDS + 2)
+        self.assertEqual(verdict, 'busy')
+        self.assertIn('held without it', note)
 
     def test_reservations_line_and_available_after_them(self):
         other = os.path.join(self.tmp, 'other')
@@ -1280,6 +1391,32 @@ class Kinds(Case):
                 code, d = self.facts('--kind', kind, '--fresh')
                 self.assertEqual((code, d['kind'], d['queue']['running']), (0, self.JOB, 1))
                 self.assertEqual(d['memory']['owedMb'], self.cost(self.JOB) - 10)
+
+    def test_plain_heavy_jobs_with_no_ticket_are_counted_from_the_slice(self):
+        # a plain `heavy <cmd>` takes no ticket: its scope in this user's heavy slice is the only sign of it. Five of
+        # them must not read as an idle machine; a scope a live ticket names is counted once, from its ticket
+        box = MANAGER + '/heavy.slice'
+        for i in range(5):
+            self.m.write(f'{box}/heavy-plain{i}-0a1b2c3d.scope/memory.stat', f'anon {10 * MB}\nshmem 0\n')
+        self.m.job('test', 64, demand_mb=10)                 # its scope run-j1.scope: named by its ticket
+        os.makedirs(self.m.root + box + '/heavy-gone-0a1b2c3d.scope')      # ended: no memory.stat
+        code, d = self.facts('--kind', 'build')
+        self.assertEqual(code, 75, d)
+        self.assertFalse(d['free'])
+        self.assertIn('ceiling', d['reason'])
+        self.assertEqual(d['queue'], {'running': 6, 'waiting': 0, 'agents': 0})
+        self.assertEqual(d['memory']['owedMb'], 5 * (self.cost(self.JOB) - 10) + self.cost('job-test') - 10)
+
+    def test_with_a_kind_the_rule_alone_decides_even_for_a_declared_size(self):
+        # the queue asks `heavy facts --kind K --mb N`: free is exactly the rule's admit, with no stricter check of
+        # its own. Free here is 12288 - 1639 = 10649; a build declaring 10700 does not fit it, but it is the first
+        # job and leaves 12288 - 10700 = 1588 MB, above the severe line (50 % of the margin): the job floor admits it
+        code, d = self.facts('--kind', 'build', '--mb', '10700')
+        self.assertEqual((code, d['free'], d['memory']['freeMb'], d['memory']['costMb']), (0, True, 10649, 10700))
+        self.m.job('test', 64, demand_mb=64)                # one job runs: no floor left, the budget refuses
+        code, d = self.facts('--kind', 'build', '--mb', '10700', '--fresh')
+        self.assertEqual((code, d['free']), (75, False))
+        self.assertIn('budget', d['reason'])
 
     def test_a_known_job_kind_keeps_its_own_cost(self):
         self.m.job('test', 64, demand_mb=10)

@@ -2474,6 +2474,20 @@
       "expect": { "owedMb": 6144, "freeMb": 3247 }
     },
     {
+      "name": "#800: a fractional declared size above the kind's cost rounds up",
+      "why": "A test job (768 MB) declaring 4000.4 MB costs 4001: a declared size rounds up (never down to 4000).",
+      "facts": "host-12gb-idle",
+      "ask": { "kind": "job-test", "declaredMb": 4000.4 },
+      "expect": { "admit": true, "reason": "fits", "costMb": 4001 }
+    },
+    {
+      "name": "#800: a declared size of exactly maxTotalMb is a floor",
+      "why": "1048575 is maxTotalMb itself: still a size (the bound is inclusive), so the test job costs 1048575 and free 9391 cannot hold it. Were the bound exclusive it would cost 768 and fit.",
+      "facts": "host-12gb-idle",
+      "ask": { "kind": "job-test", "declaredMb": 1048575 },
+      "expect": { "admit": false, "reason": "budget", "costMb": 1048575 }
+    },
+    {
       "name": "#800: a learned cost above the declared size wins",
       "why": "The build kind learned 6000 MB; the piece declared 3000: the cost is the larger, 6000. Free 10600 - 1209 - 6000 = 3391.",
       "facts": "host-12gb-idle",

@@ -72,6 +72,7 @@ INSTALLED = '/etc/heavy/installed.tsv'
 DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 30}
 SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
 CGROUP_ROOTS = ('/sys/fs/cgroup', '/sys/fs/cgroup/unified')
+SCOPE_START_SECONDS = 5  # a job without --kind keeps the queue lock at most this long, until its scope can be counted
 SETTLE = 1               # seconds stop_scope still looks after a step that sent nothing (processes ending anyway)
 WATCH = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)   # stop the scope after the grace time
 FORWARD = (signal.SIGUSR1, signal.SIGUSR2)                               # only passed on to the command
@@ -849,23 +850,64 @@ def queue_root():
     return root or None
 
 
-def queue_for(hq, cfg, systemctl, slice_cg, limits, capacity=None):
+def queue_for(hq, cfg, systemctl, slice_cg, limits, capacity=None, settings=None):
     """The memory queue of the slice (lib/heavy_queue.py), with its settings from the machine file."""
     box = hq.Box(cfg['slice'], slice_cg, limits.get('MemoryHigh') or limits.get('MemoryMax'), cg_root=cgroup_root(),
                  queue_root=queue_root(), resolve=lambda: slice_cgroup(systemctl, cfg['slice']))
-    return hq.Queue(box, hq.settings(), capacity=capacity)
+    return hq.Queue(box, settings or hq.settings(), capacity=capacity)
 
 
 def capacity_check():
-    """(kind, mb) -> (free?, why): this kit's `heavy facts --fresh` for the job (#866), judged by free/v1's reader;
-    busy, no answer within 5 s or a broken answer is not free."""
+    """(kind, mb) -> (free?, why): this kit's `heavy facts --fresh` for the job (#866), judged by free/v1's reader,
+    with the same 20 s hold of a NOT OK as t3-capacity (lib/heavy_facts.py checked: one source); busy, no answer
+    within 5 s or a broken answer is not free. Raises CheckCannotRun when this kit's facts can never answer (the
+    capacity rule not installed with it, a broken machine file): waiting would only end at --wait."""
     hf = kit_module('heavy_facts')
-    heavy = os.path.realpath(__file__)
+    heavy = hf.test_env('HEAVY_CHECK_HEAVY') or os.path.realpath(__file__)     # tests: a fake `heavy facts`
+    if heavy == os.path.realpath(__file__):
+        why = hf.ready(queue_module())
+        if why:
+            raise CheckCannotRun(why)
 
     def check(kind, mb):
-        verdict, why, _ = hf.ask(heavy, kind, mb, fresh=True)
+        verdict, why, _ = hf.checked(heavy, kind, mb, fresh=True)
         return verdict == 'free', why
     return check
+
+
+class CheckCannotRun(Exception):
+    pass
+
+
+def checker(argv):
+    """capacity_check(), or None after saying why heavy does not run argv (exit 1)."""
+    try:
+        return capacity_check()
+    except Exception as e:      # CheckCannotRun, or a kit that cannot load its facts: never a wait for nothing
+        say(f'the capacity check cannot run: {e}; not running {argv[0]} (install the kit again with heavy-install, '
+            f'fix the machine file, or set heavy.queue.capacityCheck to false)')
+        return None
+
+
+def scope_counted(box, unit, child, limit=SCOPE_START_SECONDS):
+    """Wait until heavy facts can count the new scope (its cgroup has a memory.stat), at most `limit` seconds, or
+    until the command has ended already (peeked at with WNOWAIT: wait_and_clean still reaps it)."""
+    deadline = time.monotonic() + limit
+    refreshed = 0.0
+    while time.monotonic() < deadline:
+        if not box.slice_cg and time.monotonic() - refreshed >= 0.25:
+            box.refresh()                           # the slice was not active before: its first scope starts it
+            refreshed = time.monotonic()
+        folder = box.folder(unit)
+        if folder and os.path.exists(os.path.join(folder, 'memory.stat')):
+            return True
+        try:
+            if os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return False
+        except ChildProcessError:
+            return False
+        time.sleep(0.02)
+    return False
 
 
 def run(argv, cfg, job=None):
@@ -888,16 +930,27 @@ def run(argv, cfg, job=None):
     grace = cfg['grace_seconds']
     unit = unit_name(argv[0], keep)
     env[b'HEAVY_SCOPE'] = unit.encode()
-    queue = ticket = sampler = child_mask = None
+    queue = ticket = sampler = child_mask = admission = None
     if not nested and not (job is not None and job['kind']):
         # #866: a job without --kind waits for the machine's capacity rule too (a queued one asks it in the queue)
         hq = queue_module()
-        settings = hq.settings()
+        try:
+            settings = hq.settings()
+        except Refused as e:        # the queue's settings only steer this wait: warn and wait as by default
+            say(f'{e}; a job without --kind goes on with the default queue settings')
+            settings = hq.default_settings()
         if settings['capacityCheck']:
-            check = capacity_check()
+            check = checker(argv)
+            if check is None:
+                return 1
+            # under the queue lock, held until the scope can be counted: two waiters never take the same room
+            admission = queue_for(hq, cfg, systemctl, slice_cg, limits, settings=settings)
             try:
                 hq.capacity_wait(lambda: check(None, None), (job or {}).get('wait', DEFAULT_WAIT),
-                                 settings['pollSeconds'])
+                                 settings['pollSeconds'], lock=admission)
+            except OSError as e:
+                say(f'memory queue: {e}; not running {argv[0]}')
+                return 1
             except hq.GaveUp as e:
                 say(f'{e}; not running {argv[0]}')
                 return hq.EXIT_GAVE_UP
@@ -907,8 +960,13 @@ def run(argv, cfg, job=None):
     if job is not None and job['kind'] and not nested:
         hq = queue_module()
         child_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])     # the mask now: the command's, as without a queue
+        capacity = None
+        if hq.settings()['capacityCheck']:
+            capacity = checker(argv)
+            if capacity is None:
+                return 1
         try:
-            queue = queue_for(hq, cfg, systemctl, slice_cg, limits, capacity=capacity_check())
+            queue = queue_for(hq, cfg, systemctl, slice_cg, limits, capacity=capacity)
             hq.check_kind(job['kind'])
             mb, _how = queue.reservation(job['kind'], job['mb'])
             # admitted: INT/TERM/HUP stay blocked from here until run_scope takes them, so one that comes just after
@@ -944,14 +1002,23 @@ def run(argv, cfg, job=None):
             sampler = hm.Measurer(box, unit, measure_kind, hm.state_dir(), hq.cgroup_used, inner=sampler, out=say)
         except Exception as e:      # the measurement is never a reason not to run the job
             say(f'not recording the memory of {measure_kind}: {e}')
+    started = None
+    if admission is not None:
+        def started(child):
+            try:
+                scope_counted(admission.box, unit, child)
+            finally:
+                admission.drop()
     try:
-        return run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask)
+        return run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask, started)
     finally:
+        if admission is not None:
+            admission.drop()
         if ticket is not None:
             hq.release(queue, ticket)
 
 
-def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask=None):
+def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask=None, started=None):
 
     ignored = [s for s in WATCH + FORWARD if signal.getsignal(s) == signal.SIG_IGN]
     watch = [s for s in WATCH if s not in ignored]
@@ -978,6 +1045,8 @@ def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler
         say(f'cannot start systemd-run: {e}')
         return 1
     try:
+        if started is not None:     # the command runs: heavy's admission ends once its scope can be counted
+            started(child)
         return wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, sampler, docker, guard,
                               marks)
     finally:

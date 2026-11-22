@@ -95,7 +95,14 @@ of the rule's `unknownKinds.job`; heavy says why every time that changes and onc
 capacity: ...`) and gives up after `--wait` seconds (default 7200) with exit 76 and `heavy: gave up after waiting
 ... for capacity`, without running the command. A queued job (`--kind`) asks it in the queue (below). Not asked: a
 nested heavy (the outer one holds the room). Anything but a clear "free" (busy, no answer within 5 s, a broken
-answer, a check that cannot run) is not free. The machine file's `heavy.queue.capacityCheck: false` turns it off.
+answer) is not free. It is one check with `t3-capacity`'s (`lib/heavy_facts.py` `checked`), so a NOT OK holds 20 s
+for the same question in heavy too, whichever of them read it (below). Two waiters without `--kind` are admitted one
+at a time: each asks under the user's queue lock, and one told free keeps the lock until `heavy facts` can count
+its new scope (at most 5 s), so both never take the same room. A kit whose `heavy facts` can never answer (the
+capacity rule not installed with it, a broken `heavy` section of the machine file) refuses at once (exit 1, `heavy:
+the capacity check cannot run: ...`) instead of waiting `--wait` for nothing; a broken `heavy.queue` section is a
+warning, and the wait goes on with the default queue settings (a queued job is refused, as its admission needs
+them). The machine file's `heavy.queue.capacityCheck: false` turns it off.
 
 **Never uncapped.** heavy refuses (exit 1, the reason on stderr, the command not run) when the systemd user
 manager cannot be reached, when the slice has no unit file (systemd would make an empty one up on the fly, with no
@@ -109,8 +116,9 @@ up and prints the one line. With `HEAVY_KEEP=1`, the inner one gets a scope of i
 
 One queue for every heavy job of a user on the machine (CI jobs, agent builds, test servers), instead of a fixed
 number of build slots: `heavy --kind <name> [--mb N] <command>` reserves the memory the job needs and starts it only
-when that fits; the others wait in order. Without `--kind` heavy runs at once, as before (such jobs still count:
-their real use is in the slice's figures).
+when that fits; the others wait in order. Without `--kind` a job does not queue: it waits only for the capacity
+rule (Capacity first, above), and still counts (its real use is in the slice's figures, and `heavy facts` counts
+its scope as a job).
 
 - **What a job reserves:** `--mb` (the project's start value for the kind), else 3072 MB, raised by what the kind
   has used. While a queued job runs, heavy samples its scope's memory every second and once more when the command
@@ -554,7 +562,9 @@ the TypeScript one) on a ledger read from the kernel. Memory, swap, PSI, cores a
 root's `memory.max` and `cpu.max`) come from `lib/capacity_readings.py`, the port of the shared reader that runs the
 same `capacity-readings.json` cases. Pieces: heavy's live queue tickets (admitted jobs with their scope's demand;
 waiting ones are counted only; every ticket is a job: of the rule's kind for its name, `build` is `job-build`,
-else of a kind the rule does not know, `unknownKinds.job`, never an agent), T3's agent scopes (every scope right below an
+else of a kind the rule does not know, `unknownKinds.job`, never an agent), heavy's scopes in the slice with no
+live ticket (jobs without `--kind`: each one job of `unknownKinds.job` with its scope's demand, counted once), T3's
+agent scopes (every scope right below an
 `app-t3code*.slice` of the user manager, whatever its name, an escaped label too; a `t3code-*.scope` elsewhere
 below the manager counts as well, with a note; no kind label yet, so each counts as a writer), and the same two
 of every other user, read from their user managers' cgroups (so a CI runner under its own user sees this user's
@@ -564,7 +574,9 @@ size as a floor of its cost). The object adds `fits` (how many more of each kind
 after another, up to the group's ceiling), the memory budget, the queue and notes.
 
 - **--kind K:** does the rule admit one piece of K (`agent-writer`, `job-build`, or heavy's own `build`). **--mb
-  MB** alone: do MB fit the free budget at level "ok"; with --kind, the piece declares MB.
+  MB** alone: do MB fit the free budget at level "ok"; with --kind, the piece declares MB (a floor of its cost) and
+  the rule alone decides, its job floor too (one job may start above the free budget while nothing else runs and
+  the level is not severe).
 - **T3 down or not installed:** no agent scopes, still an answer from the kernel.
 - **Tiers:** full with cgroup v2 and a systemd user manager. Machine with cgroup v2 and `user.slice` but no user
   manager of the caller's (a CI runner's user without lingering or a login session): it has no agents or heavy
@@ -594,7 +606,8 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   in place of MB (`build /x/app/`) is sized by the rule's cost of one piece of it, learned from heavy's peaks for a
   job kind (an unknown name: the job default), so the room kept follows what that work really used. `ttl=` ends the
   line DUR after its file was last written (the writer touches the file to keep it). `idle=` lets it hold nothing
-  once no process of its user works in its folder and its file was not written for DUR; it applies only where
+  once no process of its user works in its folder (or below it, in a deeper reservation's folder too) and its file
+  was not written for DUR; it applies only where
   those processes can be seen (the caller's own reservations, or any for root), else the line holds. A bad
   `ttl=`/`idle=` or another word after the folder is a note and the line holds as without it. The folder matches itself and what is below it, with or without a
   trailing `/`, never a sibling sharing its first letters (`/x/app` is not `/x/app-x`); its real path (links
@@ -639,9 +652,12 @@ Two thin callers come with it:
   an older copy, for one, counts no reservations). **A NOT OK holds 20 s** for the same question (kind and MB): an
   OK read within that time is `NOT OK: held: ...`, so a check that flips between OK and NOT OK within seconds never
   lets work start just before it turns NOT OK again (the time starts at each NOT OK read from the machine; a held
-  answer does not extend it). It is kept in `t3-capacity-hold.json` in heavy facts' cache folder; one that cannot
-  be read (broken, another owner's, a link, open to others) holds once more and is written again; a time in the
-  future holds and starts again; no cache folder: no hold, with a note.
+  answer does not extend it). heavy's own check before a job holds the same way (Capacity first, above). It is kept
+  in `t3-capacity-hold.json` in heavy facts' cache folder, read and written under `t3-capacity-hold.lock` (two NOT
+  OKs at once are both kept; a lock that stays taken 2 s: the answer without the hold, with a note); one that
+  cannot be read (broken, another owner's, a link, open to others) holds 20 s from when it last changed and is
+  written again, and when it cannot be written either (a folder it may not write) it holds no longer than that; a
+  time in the future holds and starts again; no cache folder: no hold, with a note.
 - `bin/agent-slots` (not linked onto PATH: a host wires it in itself): a Claude Code hook (UserPromptSubmit, Stop)
   for orchestrator sessions: free agent slots are the smaller of the process limit and the machine's `fits` for
   its kind.
@@ -839,7 +855,7 @@ case, and its reader against every `capacity-readings.json` case, of `packages/s
 TypeScript tests read); each number of the rule, changed by +1 and changed by -1, turns a vector red. `python3 -I -B fork-kit/heavy/tests/facts.test.py`: `heavy facts`, `t3-capacity` and
 `agent-slots` on a fake `/proc` and `/sys` (`HEAVY_FACTS_ROOT`), a temporary queue, home and cache, and fake slow
 or failing `heavy` scripts. The test-only settings (`HEAVY_FACTS_ROOT`, `T3_CAPACITY_HEAVY`, `AGENT_SLOTS_HEAVY`,
-`AGENT_SLOTS_ALIVE`) are read only while `HEAVY_TESTING=1` is set too, so one that leaks into a real caller's
+`AGENT_SLOTS_ALIVE`, and heavy's `HEAVY_CHECK_HEAVY`: the `heavy facts` its capacity check asks) are read only while `HEAVY_TESTING=1` is set too, so one that leaks into a real caller's
 environment changes nothing. Its red checks take out of a copy of `lib/heavy_facts.py` the agent-scope count,
 unknown kinds as jobs and the folder's trailing `/`, and show the test for each then fails.
 
@@ -858,4 +874,8 @@ container of a command outliving it (after the grace time and at a second signal
 never signals a pid no longer in the scope, a heavy gone before its command starts, and a Docker context. Container tests use
 a fake `docker` (`HEAVY_DOCKER`, `tests/fake_tools.py`), never the machine's. Run `heavy.test.py` itself without
 heavy: inside a heavy scope the heavy under test would run nested, so it refuses there; every command it runs gets
-a heavy scope of its own.
+a heavy scope of its own. Its jobs ask a fake capacity check that answers free at once (`HEAVY_CHECK_HEAVY`, its
+hold in the test folder), so no test waits on the tester's busy machine; one test asks the kit's own check, one a
+kit copy without the capacity rule (it must refuse within seconds), and two waiters show they are admitted one at
+a time. A heavy that does not end in time fails its test with what it said so far, and every later test then fails
+at once, so a hang shows in a minute, never at CI's job limit.

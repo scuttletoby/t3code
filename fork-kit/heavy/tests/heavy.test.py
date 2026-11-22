@@ -10,7 +10,7 @@ temporary folder in the command line, scopes by those processes.
 """
 # How CI runs it (.github/scripts/fork-ci-tests.cjs, which records what it ran; fork-ci-result checks that):
 # fork-ci: run with HEAVY_REAL_TESTS=1
-import json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
+import json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAKE_TOOLS = os.path.join(KIT, 'tests', 'fake_tools.py')
@@ -51,6 +51,8 @@ def nested_problem():
 
 
 PROBLEM = nested_problem() or manager_problem()
+# a failure that means heavy (or what it ran) did not end in time: the helpers' messages and subprocess's own
+HUNG = r'still running after|no line from pid|TimeoutExpired'
 
 
 def comm(pid):
@@ -102,6 +104,8 @@ class Heavy(unittest.TestCase):
     def setUp(self):
         if PROBLEM:
             self.fail(f'HEAVY_REAL_TESTS=1 but: {PROBLEM}')
+        if Heavy.hung:
+            self.fail(f'not run: heavy hung in {Heavy.hung} (its failure says where); the rest would only wait too')
         self.dir = os.path.realpath(tempfile.mkdtemp(prefix='heavy-test-'))
         self.addCleanup(self.cleanup)
         # Every test process has the test folder in its command line (that is how ours() finds it)
@@ -122,9 +126,35 @@ class Heavy(unittest.TestCase):
         self.docker = self.script('docker', f'exec "{sys.executable}" -I -B "{FAKE_TOOLS}" "{self.docker_state}" '
                                             f'docker "$@"')
         # HOME: heavy makes ~/.local/state/heavy/labelled; a test never makes it in the tester's real home (#761)
+        # the capacity check of a job without --kind (#866): a fake that answers free at once, so no test waits on the
+        # tester's busy machine; test_the_real_capacity_check_answers runs the kit's own. Its 20 s hold goes into the
+        # test folder, never the user's live one
+        os.makedirs(os.path.join(self.dir, 'facts'))
         self.env = dict(os.environ, HEAVY_SLICE=SLICE, HEAVY_CONFIG=os.path.join(self.dir, 'no-config.json'),
-                        HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root, HEAVY_DOCKER=self.docker, HOME=self.dir)
+                        HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root, HEAVY_DOCKER=self.docker, HOME=self.dir,
+                        HEAVY_TESTING='1', HEAVY_CHECK_HEAVY=self.check_script('free-check', True),
+                        HEAVY_FACTS_CACHE=os.path.join(self.dir, 'facts', 'heavy-facts.json'))
         self.env.pop('HEAVY_KEEP', None)
+
+    hung = None     # the first test whose heavy did not end in time: every later test fails at once, not at its timeout
+
+    def run(self, result=None):
+        result = result or self.defaultTestResult()
+        seen = len(result.errors), len(result.failures)
+        try:
+            return super().run(result)
+        finally:
+            for _, trace in result.errors[seen[0]:] + result.failures[seen[1]:]:
+                if Heavy.hung is None and re.search(HUNG, trace):
+                    Heavy.hung = self.id()
+
+    def check_script(self, name, free, before=''):
+        """A fake `heavy facts` (HEAVY_CHECK_HEAVY): runs the shell text BEFORE, then answers one valid free/v1 object,
+        free or busy, dated now."""
+        code = ('import datetime, json, sys; at = datetime.datetime.now(datetime.timezone.utc).isoformat(); '
+                f'print(json.dumps({{"v": 1, "free": {free}, "at": at, "notes": [], "reason": "test busy"}})); '
+                f'sys.exit({0 if free else 75})')
+        return self.script(name, f'{before}\nexec "{sys.executable}" -I -c {shlex.quote(code)}')
 
     def containers(self):
         with open(self.docker_state) as f:
@@ -249,9 +279,13 @@ class Heavy(unittest.TestCase):
         if not getattr(self, 'leaves_on_purpose', False):
             self.assertEqual(stray, [], 'a test left processes running (stopped by the cleanup)')
 
-    def heavy(self, *args, env=None, wrapper=None, **kw):
-        return subprocess.run([wrapper or HEAVY, *args], capture_output=True, text=True, timeout=60,
-                              env=env or self.env, cwd=self.dir, **kw)
+    def heavy(self, *args, env=None, wrapper=None, timeout=60, **kw):
+        try:
+            return subprocess.run([wrapper or HEAVY, *args], capture_output=True, text=True, timeout=timeout,
+                                  env=env or self.env, cwd=self.dir, **kw)
+        except subprocess.TimeoutExpired as e:        # what it said till then shows where it hangs
+            said = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else e.stderr or ''
+            raise AssertionError(f'heavy {" ".join(args)} still running after {timeout:g} s; it said: {said!r}')
 
     def heavy_lines(self, stderr):
         return [line for line in stderr.splitlines() if line.startswith('heavy:')]
@@ -570,7 +604,8 @@ class Heavy(unittest.TestCase):
     def test_environment_is_the_callers_in_a_c_locale_too(self):
         # Python's C-locale coercion (PEP 538) adds LC_CTYPE=C.UTF-8 to heavy's own environment: not to the command's
         env = {k: v for k, v in self.env.items() if k in ('PATH', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
-                                                          'HEAVY_SLICE', 'HEAVY_CONFIG', 'HEAVY_GRACE', 'HEAVY_DOCKER')}
+                                                          'HEAVY_SLICE', 'HEAVY_CONFIG', 'HEAVY_GRACE', 'HEAVY_DOCKER',
+                                                          'HEAVY_TESTING', 'HEAVY_CHECK_HEAVY', 'HEAVY_FACTS_CACHE')}
         env['LANG'] = 'C'
         r = self.heavy('env', '-0', env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -876,6 +911,105 @@ class Heavy(unittest.TestCase):
             hq.release(q, t)
         self.assertEqual(r.returncode, 76, r.stderr)
         self.assertIn('gave up after waiting', r.stderr)
+
+    # --- the capacity check of a job without --kind (#866) -------------------------------------------------------
+
+    def real_check(self, env=None):
+        """The environment with the kit's own capacity check (`heavy facts`) instead of the fake one."""
+        return {k: v for k, v in (env or self.env).items() if k != 'HEAVY_CHECK_HEAVY'}
+
+    def test_a_kit_without_the_capacity_rule_refuses_at_once_and_runs_nothing(self):
+        """The CI hang (#866): a checkout without packages/shared/src/capacity has a heavy whose facts can never
+        answer, and every job without --kind waited its whole --wait (2 hours) for an answer that never came."""
+        kit = os.path.join(self.dir, 'kit', 'fork-kit')
+        for part in ('heavy', 'common'):
+            shutil.copytree(os.path.join(os.path.dirname(KIT), part), os.path.join(kit, part),
+                            ignore=shutil.ignore_patterns('tests', '__pycache__'))
+        ran = os.path.join(self.dir, 'ran')
+        start = time.monotonic()
+        r = self.heavy('sh', '-c', f'touch {ran}', env=self.real_check(),
+                       wrapper=os.path.join(kit, 'heavy', 'bin', 'heavy'), timeout=30)
+        self.assertLess(time.monotonic() - start, 15, r.stderr)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn('the capacity check cannot run', r.stderr)
+        self.assertIn('capacity-rule.json', r.stderr)
+        self.assertFalse(os.path.exists(ran), 'the command ran without a capacity check')
+
+    def test_the_real_capacity_check_answers_within_its_wait(self):
+        start = time.monotonic()
+        r = self.heavy('--wait', '0', 'true', env=self.real_check(), timeout=30)
+        self.assertLess(time.monotonic() - start, 20, r.stderr)
+        if REQUIRED or r.returncode == 0:           # CI's runner has room for one job; a tester's machine may not
+            self.assertEqual((r.returncode, self.heavy_lines(r.stderr)), (0, []), r.stderr)
+        else:
+            self.assertEqual(r.returncode, 76, r.stderr)
+            self.assertIn('gave up', r.stderr)
+
+    def test_a_busy_capacity_check_gives_up_at_its_wait_and_runs_nothing(self):
+        ran = os.path.join(self.dir, 'ran')
+        r = self.heavy('--wait', '1', 'sh', '-c', f'touch {ran}',
+                       env=dict(self.env, HEAVY_CHECK_HEAVY=self.check_script('busy-check', False)))
+        self.assertEqual(r.returncode, 76, r.stderr)
+        self.assertIn('gave up', r.stderr)
+        self.assertIn('test busy', r.stderr)
+        self.assertFalse(os.path.exists(ran))
+
+    def stop(self, *procs):
+        for p in procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGTERM)
+            p.communicate(timeout=60)
+        wait_for(lambda: not self.ours(), what='the commands to stop')
+
+    def test_heavy_facts_counts_a_running_job_without_kind(self):
+        p = self.start('sh', '-c', f'exec {self.sleeper}')
+        wait_for(lambda: len(self.ours()) == 1, what='the command')
+        r = self.heavy('facts', '--fresh')          # facts is the kit's own (the fake only answers heavy's check)
+        self.assertIn(r.returncode, (0, 75), r.stderr)
+        running = json.loads(r.stdout)['queue']['running']
+        if REQUIRED:                                # CI: nothing else runs in the slice
+            self.assertEqual(running, 1, r.stdout)
+        else:
+            self.assertGreaterEqual(running, 1, r.stdout)
+        self.stop(p)
+
+    def test_two_waiters_without_kind_are_admitted_one_at_a_time(self):
+        """Both see room for one more job: without the admission lock both checks answer before either scope can be
+        counted, and both start (#866). The fake check writes how many of this test's scopes it can see."""
+        tag = 'w' + os.urandom(4).hex()
+        log = os.path.join(self.dir, 'checks.log')
+        count = (f'cg=$(systemctl --user show {SLICE} -p ControlGroup --value); '
+                 f'n=$(ls "/sys/fs/cgroup$cg" 2>/dev/null | grep -c "^heavy-{tag}-"); echo "$n" >> {log}; sleep 0.5')
+        env = dict(self.env, HEAVY_CHECK_HEAVY=self.check_script('counting-check', True, count))
+        cmd = self.script(tag, f'exec {self.sleeper}')
+        a, b = self.start('--wait', '60', cmd, env=env), self.start('--wait', '60', cmd, env=env)
+        try:
+            wait_for(lambda: len(self.ours()) == 2, timeout=30, what='both commands')
+            with open(log) as f:
+                seen = sorted(int(n) for n in f.read().split())
+        finally:
+            self.stop(a, b)
+        self.assertEqual(seen, [0, 1], 'the second check ran before the first job could be counted')
+
+    def test_a_waiter_killed_while_it_holds_the_admission_lock_lets_the_next_one_in(self):
+        """Stops half-way: the lock is an flock that no child of heavy keeps, so a waiter killed in its check frees it
+        at once, though the check it started lives on."""
+        log = os.path.join(self.dir, 'checks.log')
+        hang = f'echo "$WAITER" >> {log}; if [ "$WAITER" = a ]; then {self.sleeper}; fi'
+        env = dict(self.env, HEAVY_CHECK_HEAVY=self.check_script('hanging-check', True, hang))
+        a = self.start('--wait', '60', 'true', env=dict(env, WAITER='a'))
+        wait_for(lambda: os.path.exists(log), what='the first check')
+        a.kill()
+        a.communicate(timeout=60)
+        start = time.monotonic()
+        r = self.heavy('--wait', '30', 'true', env=dict(env, WAITER='b'))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(time.monotonic() - start, 10, 'the killed waiter\'s lock was still held')
+        with open(log) as f:
+            self.assertEqual(f.read().split(), ['a', 'b'])
+        for pid in self.ours():                     # the first check's sleeper
+            os.kill(pid, signal.SIGKILL)
+        wait_for(lambda: not self.ours(), what='the hanging check to end')
 
     # --- measured need (lib/heavy_measure.py; the history and the capacity front are in measure.test.py) ----------
 

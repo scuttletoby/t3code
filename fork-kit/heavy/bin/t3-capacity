@@ -4,7 +4,8 @@
   t3-capacity [--kind KIND] [MB]
 
 MB alone (default 3072): do MB fit the free budget at pressure level "ok". --kind: does the capacity rule admit one
-piece of KIND (agent-writer, job-build, build, ...); with MB too, that piece declares MB and they must fit as well.
+piece of KIND (agent-writer, job-build, build, ...); with MB too, that piece declares MB (a floor of its cost), and
+the rule alone decides (its job floor too).
 
 Output, kept as the older t3-capacity had it so hooks and scripts that read it keep working:
   line 1   available=<MB>MB swapfree=<MB>MB load=<load>/<n>cores agents=<n> jobs=<n> waiting=<n> reserved=<MB>MB
@@ -54,11 +55,8 @@ def main(argv):
     need = 3072 if need is None and kind is None else need
     try:
         hf = facts_module()
-        verdict, why, d = hf.ask(hf.test_env('T3_CAPACITY_HEAVY') or os.path.join(KIT, 'bin', 'heavy'), kind, need)
-        verdict, held_why, note = hf.hold(f'{kind or ""}:{"" if need is None else need}', verdict)
-        why = held_why or why
-        if note and d is not None:
-            d['notes'].append(note)
+        # ask, then the 20 s hold: the same check heavy makes before a job starts (#866, one source)
+        verdict, why, d = hf.checked(hf.test_env('T3_CAPACITY_HEAVY') or os.path.join(KIT, 'bin', 'heavy'), kind, need)
     except Exception as e:      # the caller itself cannot run: never OK
         verdict, why, d = 'unavailable', f'{e.__class__.__name__}: {e}', None
     if d is None:

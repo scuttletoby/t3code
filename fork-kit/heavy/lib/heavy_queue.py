@@ -72,7 +72,8 @@ LEARN_ROUND_MB = 128
 WAITS_KEEP_LINES = 5000
 WAITS_MAX_BYTES = 1 << 20
 SAMPLE_SECONDS = 3
-CAPACITY_SECONDS = 5        # one `heavy facts` answer (heavy_facts.ANSWER_SECONDS) under the queue lock
+CAPACITY_SECONDS = 7        # one `heavy facts` answer (heavy_facts.ANSWER_SECONDS, 5) and its hold (HOLD_LOCK_SECONDS,
+                            # 2) under the queue lock
 
 
 def _load_machine_file():
@@ -163,6 +164,12 @@ def settings(machine_path=None, owner_uid=0):
         return machine_file.fields(section['queue'] or {}, SETTINGS, f'{path}: heavy.queue')
     except machine_file.MachineFileError as e:
         raise Refused(str(e))
+
+
+def default_settings():
+    """The settings with nothing set: what a run without --kind uses when the machine file's queue section is
+    broken (it warns; a queued job is refused instead, since its admission depends on them)."""
+    return machine_file.fields({}, SETTINGS, 'heavy.queue defaults')
 
 
 def check_kind(kind):
@@ -734,17 +741,31 @@ def run_hook(argv, timeout):
     return p.returncode, (lines[-1][:200] if lines else '')
 
 
-def capacity_wait(check, limit, poll_s, out=say, monotonic=time.monotonic, sleep=None):
+def capacity_wait(check, limit, poll_s, out=say, monotonic=time.monotonic, sleep=None, lock=None):
     """#866: a heavy job without --kind waits here until the machine's capacity rule says free (check() ->
     (free?, why); an error or anything but True is not free), asking every poll_s seconds and saying why when that
-    changes and once a minute. Raises GaveUp after limit seconds, Stopped on INT/TERM/HUP (blocked meanwhile and taken only
-    between asks, as in the queue). Returns the seconds waited."""
+    changes and once a minute. Raises GaveUp after limit seconds, Stopped on INT/TERM/HUP (blocked meanwhile and taken
+    only between asks, as in the queue). Returns the seconds waited.
+
+    lock: the user's Queue: every ask is made under its queue lock, and a "free" returns with the lock still held, so
+    two waiters (plain or queued) are admitted one at a time; the caller drops it once its job can be counted (its
+    scope is there). The lock is tried until the wait ends (at least LOCK_MIN s), never blocking in flock; a waiter
+    that is killed holding it loses it with its fd."""
     sigs = [s for s in STOP_SIGS if signal.getsignal(s) != signal.SIG_IGN]
     before = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
     start = monotonic()
     last = last_print = None
+    held = False
     try:
         while True:
+            if lock is not None:
+                lock.sigs = sigs                # a stop while trying for the lock ends the wait (Stopped)
+                try:
+                    lock.take(start + max(limit, LOCK_MIN))
+                except LockBusy as e:
+                    raise GaveUp(f'gave up after waiting {_dur(monotonic() - start)} for capacity: {e}') from None
+                finally:
+                    lock.sigs = None
             try:
                 ok, why = check()
             except Exception as e:
@@ -753,7 +774,10 @@ def capacity_wait(check, limit, poll_s, out=say, monotonic=time.monotonic, sleep
             if ok is True:
                 if waited >= 1:
                     out(f'the capacity check says free after waiting {_dur(waited)}')
+                held = True
                 return waited
+            if lock is not None:
+                lock.drop()
             if waited >= limit:
                 raise GaveUp(f'gave up after waiting {_dur(waited)} for capacity: {why}')
             if why != last or last_print is None or monotonic() - last_print >= PRINT_EVERY:
@@ -769,6 +793,8 @@ def capacity_wait(check, limit, poll_s, out=say, monotonic=time.monotonic, sleep
             if info is not None:
                 raise Stopped(info.si_signo)
     finally:
+        if lock is not None and not held:
+            lock.drop()
         signal.pthread_sigmask(signal.SIG_SETMASK, before)
 
 

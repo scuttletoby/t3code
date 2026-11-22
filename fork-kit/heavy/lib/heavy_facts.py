@@ -376,7 +376,9 @@ def count_in_reservations(res, owners, debts):
         r = best(res, uid, cwd) if cwd else None
         if r:
             r['useMb'] += kb / 1024
-            r['procs'] = r.get('procs', 0) + 1
+        for o in res if cwd else ():                # works in every folder of that user's that holds cwd: an outer
+            if o['uid'] == uid and under(cwd, o['prefixes']):   # one with idle= is not idle (its use goes to one)
+                o['procs'] = o.get('procs', 0) + 1
     members = {}
     for pid, i in owners.items():
         if pid in procs:
@@ -591,8 +593,10 @@ def read_machine(rule, where, carry, now):
     full = tier != 'basic'
     heavy_rel = '/' + slice_path(where['slice'])
     heavy_box = manager + heavy_rel
-    pieces, running, waiting, owners = [], 0, 0, {}
+    pieces, running, waiting, owners, ticketed = [], 0, 0, {}, set()
     for t in tickets(where['queueDir']):
+        if isinstance(t.get('scope'), str):
+            ticketed.add(t['scope'])
         if t['state'] == 'waiting':
             waiting += 1
             continue
@@ -604,6 +608,23 @@ def read_machine(rule, where, carry, now):
             demand = rd.read_piece_demand(host, 'v2', cg(heavy_box + '/' + scope)).get('demandMb')
             owners.update(dict.fromkeys(scope_pids(heavy_box + '/' + scope), len(pieces)))
         pieces.append({'kind': ticket_kind(rule, t['kind']), 'demandMb': demand, 'declaredMb': t.get('mb')})
+    if mine:
+        # a plain heavy (no --kind: no ticket) and a kept scope are jobs too: every scope in this user's heavy slice
+        # that no live ticket names is one of the rule's unknownKinds.job, as another user's are (other_users)
+        try:
+            plain = sorted(n for n in os.listdir(ROOT + heavy_box) if SCOPE_RE.match(n) and n not in ticketed)
+        except FileNotFoundError:
+            plain = []
+        except OSError as e:
+            plain = []
+            notes.append(f'{heavy_box} cannot be listed ({e.strerror}): plain heavy jobs not counted')
+            full, tier = False, 'basic'
+        for n in plain:
+            demand = scope_demand(host, f'{heavy_box}/{n}')
+            if demand is not False:
+                owners.update(dict.fromkeys(scope_pids(f'{heavy_box}/{n}'), len(pieces)))
+                pieces.append({'kind': rule['unknownKinds']['job'], 'demandMb': demand})
+                running += 1
     own_jobs = running
     agents, agent_box = 0, None
     if mine:
@@ -782,8 +803,10 @@ def answer(rule, readings, kind=None, need_mb=None, cwds=()):
         ask['declaredMb'] = need_mb
     d = cr.decision(rule, facts_for(readings, group, cwds), ask, learned, carry.get(group), now_ms)
     basic = readings['tier'] not in ('full', 'machine')
-    free = not basic and (d['admit'] if kind else d['level'] == 'ok') and (
-        need_mb is None or d['freeMb'] is not None and need_mb <= d['freeMb'])
+    # with a kind the rule alone decides (its floor too: a declared size is already a floor of the cost); MB alone
+    # asks only whether they fit the free budget at level ok
+    free = not basic and (d['admit'] if kind else d['level'] == 'ok' and d['freeMb'] is not None
+                          and need_mb <= d['freeMb'])
     fits = {}
     for k, spec in rule['kinds'].items():
         g = spec['group']
@@ -873,6 +896,8 @@ def cache_path(run, key):
 
 HOLD_SECONDS = 20                               # #861: a NOT OK holds this long for the same question
 HOLD_FILE = 't3-capacity-hold.json'
+HOLD_LOCK = 't3-capacity-hold.lock'           # one hold at a time (its read, then its write)
+HOLD_LOCK_SECONDS = 2
 
 
 def state_folder():
@@ -884,21 +909,54 @@ def state_folder():
     return (os.path.dirname(path), None) if path else (None, why)
 
 
+def _hold_lock(folder):
+    """The hold's own lock (#861 round 1: two callers' read-modify-write of the hold file must not lose a NOT OK):
+    (fd or None, a note or None). Waits HOLD_LOCK_SECONDS at most, never blocking in flock; without it the hold goes
+    on unlocked, with a note (a hold is never a reason not to answer)."""
+    path = os.path.join(folder, HOLD_LOCK)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        return None, f'the hold lock {path} cannot be opened ({e.strerror}): held without it'
+    deadline = time.monotonic() + HOLD_LOCK_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd, None
+        except OSError as e:
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN) or time.monotonic() >= deadline:
+                os.close(fd)
+                return None, f'the hold lock {path} stayed taken {HOLD_LOCK_SECONDS:g} s: held without it'
+        time.sleep(0.01)
+
+
 def hold(question, verdict, now_ms=None, folder=None):
     """#861: hysteresis for a capacity check that flips between OK and NOT OK within seconds, so a "check, then
     start" never starts work just before the answer turns NOT OK again. A NOT OK for a question (kind and MB) holds
     HOLD_SECONDS: within that time the same question answers NOT OK, however the machine reads. The time starts at
     each NOT OK read from the machine (a held one does not extend it). (verdict, why it was held or None, a note or
-    None). Fails closed: a hold file that cannot be read (broken, another owner's, a link, open to others) holds
-    this question once more and is written again; a time in the future (a clock that went back) holds and starts
-    again. No folder to keep it in: no hold, with a note (as before #861)."""
+    None). One caller at a time (the hold lock), so two NOT OKs at once are both kept. A hold file that cannot be
+    read (broken, an older format, another owner's, a link, open to others) holds the question asked HOLD_SECONDS from
+    when that file last changed (its ctime, which no caller can set), and is written again; so a broken file in a
+    folder that cannot be written holds for HOLD_SECONDS, never for good. One that cannot even be looked at is
+    ignored, with a note. A time in the future (a clock that went back) holds and starts again. No folder to keep it
+    in: no hold, with a note (as before #861)."""
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     if folder is None:
         folder, why = state_folder()
         if folder is None:
             return verdict, None, f'no hold of a NOT OK ({why})'
-    path = os.path.join(folder, HOLD_FILE)
-    busy, broken = {}, False
+    lock, lock_note = _hold_lock(folder)
+    try:
+        verdict, why, note = _hold(question, verdict, now_ms, os.path.join(folder, HOLD_FILE))
+    finally:
+        if lock is not None:
+            os.close(lock)
+    return verdict, why, '; '.join(n for n in (lock_note, note) if n) or None
+
+
+def _hold(question, verdict, now_ms, path):
+    busy, broken, notes = {}, None, []
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
         try:
@@ -915,25 +973,28 @@ def hold(question, verdict, now_ms=None, folder=None):
     except FileNotFoundError:
         pass
     except (OSError, ValueError):
-        broken = True
+        try:
+            broken = int(os.lstat(path).st_ctime * 1000)    # when it last changed: what it may still hold from
+        except OSError as e:
+            notes.append(f'the hold file {path} cannot be read or looked at ({e.strerror}): ignored')
+        else:
+            busy = {question: broken}
     at = busy.get(question)
     why = None
-    if verdict == 'free':
-        if broken:
-            why = f'held: the hold file {path} cannot be read, so a NOT OK of the last {HOLD_SECONDS} s may be in it'
-        elif at is not None and (at > now_ms or now_ms - at < HOLD_SECONDS * 1000):
-            why = (f'held: NOT OK {max(0, now_ms - at) // 1000} s ago for this question; OK needs {HOLD_SECONDS} s '
-                   f'without one (a check that flips must not let work start just before it turns NOT OK)')
-    if verdict != 'free' or broken or (at is not None and at > now_ms):
-        busy[question] = now_ms                     # a NOT OK read now (or a broken or future state): start again
+    if verdict == 'free' and at is not None and (at > now_ms or now_ms - at < HOLD_SECONDS * 1000):
+        why = (f'held: the hold file {path} cannot be read, so a NOT OK of the last {HOLD_SECONDS} s may be in it'
+               if broken is not None else
+               f'held: NOT OK {max(0, now_ms - at) // 1000} s ago for this question; OK needs {HOLD_SECONDS} s '
+               f'without one (a check that flips must not let work start just before it turns NOT OK)')
+    if verdict != 'free' or (at is not None and at > now_ms):
+        busy[question] = now_ms                     # a NOT OK read now (or a future state): start again
     keep = {k: v for k, v in busy.items() if 0 <= now_ms - v < HOLD_SECONDS * 1000}
-    note = None
-    if keep != busy or broken or verdict != 'free':
+    if keep != busy or broken is not None or verdict != 'free':
         try:
             write_cache(path, {'v': 1, 'busy': keep})  # whole or not at all; old temporary files go too
         except OSError as e:
-            note = f'the hold of a NOT OK was not written ({e.strerror or e})'
-    return ('busy' if why else verdict), why, note
+            notes.append(f'the hold of a NOT OK was not written ({e.strerror or e})')
+    return ('busy' if why else verdict), why, '; '.join(notes) or None
 
 
 def facts_main(argv, slice_name, queue_root, hq, now=None):
@@ -1032,6 +1093,35 @@ def ask(heavy, kind=None, mb=None, timeout=ANSWER_SECONDS, fresh=False):
         last = err.decode('utf-8', 'replace').strip().splitlines()[-1:]
         why = f'heavy facts: {why}' + (f' ({last[0][:200]})' if last else '')
     return verdict, why, obj
+
+
+def question(kind, mb):
+    """The hold's key for one question: the same kind and MB is the same question for every caller."""
+    return f'{kind or ""}:{"" if mb is None else mb}'
+
+
+def checked(heavy, kind=None, mb=None, fresh=False, timeout=ANSWER_SECONDS):
+    """The one capacity check of t3-capacity and of heavy's own start (#866): ask(), then hold() for the same
+    question, so a NOT OK holds HOLD_SECONDS for each of them alike (#861). (verdict, why, the object or None); a
+    note of the hold goes into the object's notes."""
+    verdict, why, d = ask(heavy, kind, mb, timeout, fresh)
+    verdict, held, note = hold(question(kind, mb), verdict)
+    if note and d is not None and isinstance(d.get('notes'), list):     # another script's object may have none
+        d['notes'].append(note)
+    return verdict, held or why, d
+
+
+def ready(hq):
+    """None when this kit's `heavy facts` can answer at all, else why not: what no wait would fix (the capacity rule
+    not shipped with the kit, a machine file whose heavy section is broken). heavy asks this before it waits for
+    capacity, so a kit that can never answer refuses at once instead of waiting --wait (7200 s) for nothing."""
+    try:
+        cr.shipped_rule()
+        mf = hq.machine_file
+        capacity_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None, os.getuid() if ROOT else 0)
+    except Exception as e:
+        return f'{e.__class__.__name__}: {e}'
+    return None
 
 
 def load(name, rel):
