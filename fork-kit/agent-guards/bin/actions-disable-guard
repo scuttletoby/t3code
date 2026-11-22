@@ -41,9 +41,9 @@ How it reads a command (by parsing, not by pattern):
      wrapper only under its own name or in a system folder: `./sudo` and the `nice` of `bash nice` are files.
      Files that carry arguments are read: `curl -K`, `wget -i`, `xargs -a`.
   5. Flow. Token text that goes on (a pipe into anything but a DATA word, a file, $(..), an exported variable, a
-     file that names a token and gets another name with cp/mv/ln) in a command that also runs a word the guard
-     cannot read is refused: `echo '<the command>' | at now`, `cp x.txt run.sh && bash run.sh`,
-     `curl -q -X PUT "$(cat url.txt)"`.
+     file that names a token and gets another name with cp/mv/ln/install, dd of=, sed w or awk print >) in a
+     command that also runs a word the guard cannot read is refused: `echo '<the command>' | at now`,
+     `cp x.txt run.sh && bash run.sh`, `curl -q -X PUT "$(cat url.txt)"`.
   6. It answers in time: the hook has a 10 s limit and a hook that is not done by then does not stop the
      command, so 5 s after the hook process started the guard refuses the command itself. Before that:
        - fast exit: a command of plain words that cannot name or run anything guarded (ls, git status, cat a > b,
@@ -51,8 +51,10 @@ How it reads a command (by parsing, not by pattern):
        - cache: what it learns from files (a code file names a token or not, a `#!` line, the gh aliases) is kept
          60 s in <stateDir>/cache-v1.json (default ~/.local/state/actions-disable-guard), per file name + inode + size + change times.
          A file changed within the last 2 s is not cached; a missing, broken, old, foreign or odd cache is ignored
-         and written new (temp file, then rename). Shell scripts are still read every time (their reading depends
-         on the command around them).
+         and written new (temp file, then rename). A run whose guard file, or a link on the way to it (the kit's
+         bin link and `current`), changed after the run started neither reads nor writes it: the code in memory may
+         be another release's. Shell scripts are still read every time (their reading depends on the command
+         around them).
 
 Refused:
   - gh workflow disable ...                    (also through gh aliases: existing ones are expanded, new ones refused;
@@ -71,13 +73,23 @@ Refused:
   - DELETE of branch protection (`.../branches/<b>/protection[/...]`, also for a branch name with slashes) or of a
     ruleset, the GraphQL mutations that do the same, a write that switches one ruleset off (`enforcement=disabled`,
     updateRepositoryRuleset with DISABLED, also written with \\u escapes) or carries a body the guard cannot
-    read. Other changes to protection with PUT/PATCH/POST pass (an owner decision)
+    read, and (owner decision, #930) a write that leaves no required check: a protection PUT with
+    required_status_checks null, left out or with empty contexts/checks, an empty PATCH of required_status_checks or
+    PUT of its contexts, a ruleset write whose `rules` hold no required_status_checks rule with a check, the GraphQL
+    updateBranchProtectionRule / updateRepositoryRuleset that does the same (requiresStatusChecks false, [] lists, a
+    REQUIRED_STATUS_CHECKS rule with an empty list, also through a variable or the whole input as one variable from
+    -F 'input[..]' fields or an --input file, and a variable the guard cannot read), by gh api (-f/-F nested
+    fields, --input) or curl/wget (-d, --json, --post-data ..), and such a write whose body the guard cannot read.
+    A write that keeps or adds checks passes
   - everything rule 3 cannot prove and rule 5 catches (see there)
   - `gh` with a word that is no gh command when the gh config holds YAML outside the small subset this reader
     follows (`!!str` tags, `? ` keys, anchors, flow maps ..), or sits in a folder the guard cannot read
     (GH_CONFIG_DIR, XDG_CONFIG_HOME or HOME from a variable): the word may be an alias
   - each script of the machine file's actionsDisable.refuseScripts run with its flag (a project tool that
-    disables workflows itself: {"name": "garden.py", "flag": "--fix", "why": "disables ..."}), where the file is real
+    disables workflows itself: {"name": "garden.py", "flag": "--fix", "why": "disables ..."}), where the file is real;
+    and a line that calls one in a file whose text goes on (sed e, `cat f | bash`, eval "$(cat f)", `$(cat f)`,
+    `cat f | heavy bash`, `cat f | at now` ..)
+  - a GraphQL call whose query (or a field name that can be `query`) the guard cannot read
   - a command the guard cannot finish reading in time
 Passes: reads (GET), gh workflow enable/list/view/run, PUT .../enable, searching and writing text about all this
 (rg/grep, notes, commit messages, issue and PR bodies through gh), and every command that names no guarded token.
@@ -93,23 +105,39 @@ Known over-refusals (harmless, but not provable from the text; the message says 
     the same command that runs such a tool
   - a code file that names a token (this guard, its tests) as an argument of a tool the guard does not know
     (`pytest tests/test_x.py`, `ruff check x.py`, a project commit tool): name the folder, or use git add
+  - a code file too big to read whole, as an argument of a tool the guard does not know (`gzip -c big.js`): pipe
+    it in (`cat big.js | gzip`)
   - an exported variable or a `VAR=.. command` prefix that carries a token
+  - a file that only mentions a refuseScripts line, piped or substituted into a program that reads it as data
+    (`cat msg.md | python3 tools/check.py`): give it as a redirect (`python3 tools/check.py < msg.md`)
   - a GraphQL body piped into gh (`echo '{..}' | gh api graphql --input -`): use `--input - <<< '{..}'` or -f query=
+  - a GraphQL query from a variable or command output, also a read (`-f query="$(cat q.graphql)"`): use
+    `-F query=@q.graphql`; a $variable inside "quotes" in the query (an id) is fine
   - a gh word that is no gh command (an alias) while the gh config is half-written or uses YAML outside the subset
+  - a rules write to a ruleset that never had required checks (a tag ruleset), or a protection body written by the
+    same command: the owner marker, or write the body file in a command before
 
 Not covered (a text guard cannot): a value hidden in a variable, file or command output that the command gets at
-run time (a download, base64, a file renamed by a tool other than cp/mv/ln), code that builds the words at run
-time or loads them from another file (import, require), a file of commands that is no shell script and does not
-look like code, written by an earlier command and handed to a tool the guard does not know (`at -f job.txt`,
-`make -f x.mk`, a Makefile, package.json scripts), a gh copy made by an earlier command when there is no gh on
-PATH to compare it with, a program that shadows a DATA or wrapper word on PATH, a remote shell's own config,
-emptying branch protection with PUT/PATCH/POST, raw clients (openssl s_client). Also not covered (a review round;
-each needs a command built to hide the action; closed by the token layer):
-  - known words that run code: sed `e`, rg --pre, find -exec, BASH_ENV, git diff.external / core.fsmonitor
+run time (a download, base64, a file renamed by a tool other than cp/mv/ln/install/dd, awk -f programs), code
+that builds the words at run time or loads them from another file (import, require), a file of commands that is no
+shell script and does not look like code, written by an earlier command and handed to a tool the guard does not
+know (`at -f job.txt`, `make -f x.mk`, a Makefile, package.json scripts), a gh copy made by an earlier command when
+there is no gh on PATH to compare it with, a compiled program that shadows a DATA or wrapper word on PATH (a text
+script there is read), a PATH set by the command itself, a remote shell's own config, raw clients (openssl
+s_client), GraphQL sent through curl/wget. Also not covered (a review round; each needs a command built to hide the
+action; closed by the token layer):
+  - known words that run code: find -exec, BASH_ENV, git diff.external / core.fsmonitor
+  - protection writes that keep a check but weaken the rest: a PUT that replaces the checks with other ones, drops
+    the review rules or enforce_admins, a ruleset whose conditions leave `main` out or that adds bypass actors (the
+    guard cannot ask GitHub what is there now)
+  - on a system without /proc the start-time check of the cache (an edited guard during a run) is skipped
+  - a wall clock stepped forward across a reinstall during a run: the start-time check compares file and link
+    times with the process start
+  - the guard is read from source on each call (python3 -IB, no bytecode): an entry file compiled at install time
+    would save some ms, a larger design (#930 item 12)
   - a command kept in a variable and run as the command word (`read -r c <<< '..'; $c`)
   - a script changed by the same command before it runs it (mv, ln, >, >>, sed -i, then bash)
-  - a GraphQL query from a variable or command output (`-f query="$Q"`)
-A guarded call only in a script 4 or more levels deep (a.sh -> b.sh -> c.sh -> d.sh) passes as an unknown program
+A guarded call only in a script 5 or more levels deep (a.sh -> b.sh -> c.sh -> d.sh -> e.sh) passes as an unknown program
 unless other text in the command flows on.
 gh has no request hook, so this hook is the command-text layer; the wall is a token that cannot do it.
 
@@ -144,7 +172,7 @@ machine file or section gives those defaults; a broken one too, with one line on
 Tests: fork-kit/agent-guards/tests/actions-disable.test.py
 """
 import fnmatch, itertools, json, os, re, shlex, signal, sys, time
-from stat import S_ISDIR, S_ISREG
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from urllib.parse import unquote
 
 
@@ -926,6 +954,19 @@ def seg_match(segs, pat, more):
     return any(go(i, 0, False) for i in range(len(segs)))
 
 
+def url_path(form):
+    """A path or URL (one form of a word) without its scheme and host, and without its query string or fragment."""
+    return re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', form, flags=re.I), maxsplit=1)[0]
+
+
+def path_cuts(path):
+    """The paths a request may go to: the path, and the path cut at each hidden or glob part. An unquoted `?` is a
+    glob to the shell (left as written when it matches no file) and `$Q` may hold one, so the query string may start
+    at any of them: `graphql?x=1` and `.../protection"$Q"x` are the GraphQL endpoint and the protection. Every path
+    check reads its path through this (protect_kinds, may_be_graphql)."""
+    return [path] + [path[:i].rstrip('/') for i, c in enumerate(path) if c in (HID, WILD)]
+
+
 def hits(tok, kind):
     """2: the word spells the guarded path; 1: hidden text in it could complete it; 0: neither."""
     rx, pats = GUARDED[kind]
@@ -935,7 +976,7 @@ def hits(tok, kind):
             return 2
         g = PLACEHOLDER.sub(HID, f)
         if hidden(g):
-            path = re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', g, flags=re.I), maxsplit=1)[0]
+            path = url_path(g)
             segs = [x.lower() for x in path.split('/') if x]
             if any(seg_match(segs, pat, more) for pat, more in pats):
                 best = 1
@@ -964,8 +1005,8 @@ def may_be_graphql(tok):
     if not visible_path(tok):
         return True
     for f in forms(PLACEHOLDER.sub(HID, tok)):
-        path = re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', f, flags=re.I), maxsplit=1)[0]
-        if GRAPHQL_END.search(path.rstrip(HID + WILD)):
+        path = url_path(f)
+        if any(GRAPHQL_END.search(p.rstrip(HID + WILD)) for p in path_cuts(path)):
             return True
         if hidden(path) and seg_match([x.lower() for x in path.split('/') if x], ['graphql'], False):
             return True
@@ -1368,13 +1409,14 @@ def api_reason(args, ctx, top=False):
     if not bad and len(pos) > 1 and any(a[:1] in (HID, WILD) for a in pos):
         bad = 'a hidden word that may be a flag'   # `gh api "$X" path`: X may be -XPUT
     exact = not bad
-    method, fields, inputs = None, [], []
+    method, fields, inputs, typed = None, [], [], []
     override = any('x-http-method-override' in a.lower() for a in args)
     for name, val in flags:
         if name == 'method':
             method = val
         elif name in ('field', 'raw-field'):
             fields.append(val)
+            typed.append((name == 'field', val))
         elif name == 'input':
             inputs.append(val)
         elif name == 'header' and override_header(val):
@@ -1418,6 +1460,15 @@ def api_reason(args, ctx, top=False):
             return reason(f'{how} `gh api` to a ruleset with a body the guard cannot read (a pipe, a file that is '
                           'not there yet, a file named by a variable): it may switch the ruleset off',
                           'Write the body to a file in a command before this one and name the file in full.')
+        if best['protect'] and exact:   # a write that leaves no required check (DELETE and unread ones are above)
+            kinds = set().union(*[protect_kinds(a) for a in pos]) if pos else set(ALL_KINDS)
+            if inputs:   # with --input the fields go into the query string
+                parsed = [json_body(b) for _, b in known[:len(inputs)]]
+            else:
+                parsed = [gh_fields_body(typed, ctx)]
+            why = emptying_reason(kinds, parsed, '?' if override else eff, f'{how} `gh api` that sends')
+            if why:
+                return why
         # GraphQL only when the path can be the GraphQL endpoint: a comment posted to `repos/o/r/issues/$n/comments`
         # with its text from a file named by a variable is no GraphQL call
         path = certain_path(args)
@@ -1431,6 +1482,24 @@ def api_reason(args, ctx, top=False):
             return reason('a GraphQL updateRepositoryRuleset that switches the ruleset off (enforcement: DISABLED '
                           'or EVALUATE), '
                           'or one with a body the guard cannot read')
+        if gql:   # gh sends every -f/-F field but `query` as a GraphQL variable (input[rules][][type]=.. nests)
+            hid_q = next((f for _, f in typed if spells(f.partition('=')[0], 'query') and (
+                hidden(f.partition('=')[0]) or gql_hidden(f.partition('=')[2]))), None)
+            if hid_q is not None:
+                return reason('a GraphQL call whose query (or a field name) the guard cannot read (command output, '
+                              'a variable): it may delete or empty branch protection or a ruleset',
+                              'Write the query to a file in a command before this one and pass it with '
+                              '`-F query=@<file>`; give ids and numbers as variables, never inside the query: '
+                              '`-F n="$N"` with `query($n: Int!)` and `number: $n`, `-f id="$ID"` with `$id: ID!`.')
+            vb = gh_fields_body([(m, f) for m, f in typed if f.partition('=')[0] not in ('query', 'operationName')],
+                                ctx, keep_hidden=True)
+            gvars = [vb] + [j['variables'] for _, b in known[:len(inputs)] for j in [json_body(b)]
+                            if isinstance(j, dict) and j.get('variables') is not None]
+            why = gql_empties([canon(gql_code(x), cue=False) for x in list(args) + bodies], gvars)
+            if why:
+                return reason(f'a GraphQL update of branch protection or a ruleset that {why}: that takes `main` '
+                              'out from behind CI as surely as a delete',
+                              'An update that keeps (or adds) the required checks passes.')
         if gql and unread:
             return reason('a GraphQL call with a body the guard cannot read (a pipe, a file that is not there yet, '
                           'a file named by a variable): it may delete branch protection or a ruleset',
@@ -1451,6 +1520,279 @@ def reenables(fields):
             return False
         seen.add(k)
     return 'enabled' in seen
+
+
+# ---------- writes that empty branch protection or a ruleset (the guard cannot ask GitHub what is there now, so a
+# write that replaces the checks must name at least one; one that only adds checks passes)
+
+PROTECT_KINDS = (('ctx', re.compile(r'branches/.+/protection/required_status_checks/contexts$')),
+                 ('rsc', re.compile(r'branches/.+/protection/required_status_checks$')),
+                 ('prot', re.compile(r'branches/.+/protection$')),
+                 ('ruleset', re.compile(r'(?:^|/)rulesets/[^/]+$')))
+ALL_KINDS = frozenset(k for k, _ in PROTECT_KINDS)
+GQL_EMPTYING = re.compile(r'updateRepositoryRuleset|updateBranchProtectionRule', re.I)
+# in a GraphQL text: a field set to nothing, or to a $variable (looked up in the variables)
+GQL_EMPTY = re.compile(r'\b(requiresStatusChecks|requiredStatusCheckContexts|requiredStatusChecks|rules)\s*'
+                       r'["\']?\s*:\s*(?:(false|null|\[[\s,]*\])|\$(\w+))', re.I)   # commas are blanks: [,] is []
+
+
+def protect_kinds(tok):
+    """Which protection endpoints a path can be: the whole protection (a PUT replaces it), its required checks, its
+    list of checks, one ruleset. Hidden text at the end can be any of them. The query string is split off first,
+    also where it may start at hidden text: an unquoted `?` is a glob to the shell (left as written when it matches
+    no file) and `$Q` may hold one, so `.../protection?x=1` and `.../protection"$Q"x` are the protection too."""
+    out = set()
+    for f in set(forms(PLACEHOLDER.sub(HID, tok))) | ({canon(tok, cue=False)} if '\\' in tok else set()):
+        path = url_path(f).rstrip('/').lower()
+        if path[-1:] in (HID, WILD):
+            return set(ALL_KINDS)
+        out |= {k for k, rx in PROTECT_KINDS for p in path_cuts(path) if rx.search(p.replace(WILD, HID))}
+    return out
+
+
+def gh_fields_body(typed, ctx, keep_hidden=False):
+    """The JSON body `gh api` builds from -f/-F fields (key[sub]=v, key[]=v, `key[]` for an empty list; -F reads
+    true/false/null/numbers and @file), or None when part of it cannot be read. keep_hidden: a value with hidden
+    text stays in as that text (an id from a variable); a hidden key is still None."""
+    root = {}
+    for magic, f in typed:
+        if hidden(f) and not (keep_hidden and not hidden(f.partition('=')[0])):
+            return None
+        key, eq, val = f.partition('=')
+        m = re.fullmatch(r'([^\[\]]+)((?:\[[^\[\]]*\])*)', key)
+        if not m:
+            return None
+        parts = [m.group(1)] + re.findall(r'\[([^\[\]]*)\]', m.group(2))
+        if not eq:
+            if parts[-1] != '':
+                return None
+            value, parts = [], parts[:-1]
+        elif magic and val.startswith('@'):
+            value = ctx.get('stdin') if val == '@-' else read_named(val[1:], ctx)
+            if value is None:
+                return None
+        elif magic and val in ('true', 'false', 'null'):
+            value = {'true': True, 'false': False, 'null': None}[val]
+        elif magic and re.fullmatch(r'-?\d+', val):
+            value = int(val)
+        else:
+            value = val
+        cur = root
+        for i, p in enumerate(parts):
+            last = i == len(parts) - 1
+            nxt = None if last else parts[i + 1]
+            if isinstance(cur, list):
+                if p != '':
+                    return None
+                if last:
+                    cur.append(value)
+                    break
+                if not cur or not isinstance(cur[-1], dict) or nxt in cur[-1]:
+                    cur.append({} if nxt != '' else [])
+                cur = cur[-1]
+                continue
+            if not isinstance(cur, dict) or p == '':
+                return None
+            if last:
+                cur[p] = value
+            else:
+                if p not in cur:
+                    cur[p] = [] if nxt == '' else {}
+                cur = cur[p]
+    return root
+
+
+def json_body(text):
+    """A request body as JSON, or None when it is no JSON (or holds hidden text)."""
+    if text is None or hidden(text):
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def has_checks(value):
+    return isinstance(value, list) and len(value) > 0
+
+
+def empties(kind, body, eff):
+    """Why a body sent to this kind of protection endpoint leaves no required check, or ''."""
+    if kind == 'prot':   # PUT replaces the whole protection
+        rsc = body.get('required_status_checks') if isinstance(body, dict) else None
+        if not isinstance(rsc, dict) or not (has_checks(rsc.get('contexts')) or has_checks(rsc.get('checks'))):
+            return 'a branch protection write with no required check (required_status_checks null, left out or ' \
+                'with empty contexts/checks)'
+    elif kind == 'rsc':
+        given = [body[k] for k in ('contexts', 'checks') if k in body] if isinstance(body, dict) else [None]
+        if given and not any(has_checks(v) for v in given):
+            return 'a write to the required status checks that empties them'
+    elif kind == 'ctx' and eff != 'POST':   # POST adds checks; PUT replaces the list
+        lst = body.get('contexts') if isinstance(body, dict) else body
+        if not has_checks(lst):
+            return 'a write that replaces the list of required checks with an empty one'
+    elif kind == 'ruleset' and isinstance(body, dict) and 'rules' in body:   # rules replace the ruleset's rules
+        rules = body['rules'] if isinstance(body['rules'], list) else []
+        if not any(isinstance(r, dict) and str(r.get('type', '')).lower() == 'required_status_checks'
+                   and isinstance(r.get('parameters'), dict)
+                   and has_checks(r['parameters'].get('required_status_checks')) for r in rules):
+            return 'a ruleset write whose rules hold no required status check (rules [] or without a ' \
+                'required_status_checks rule that names a check)'
+    elif kind == 'ruleset' and not isinstance(body, dict):
+        return 'a ruleset write whose body is no JSON object'
+    return ''
+
+
+def emptying_reason(kinds, bodies, eff, how):
+    """A refusal when a write to protection endpoints (kinds) may leave no required check. bodies: the parsed
+    bodies, None for one the guard cannot read."""
+    if not kinds:
+        return None
+    if any(b is None for b in bodies) or not bodies:
+        return reason(f'{how} a body the guard cannot read (no JSON, a pipe, a file that is not there yet, hidden '
+                      'text) to branch protection or a ruleset: it may remove the required checks',
+                      'Write the body as JSON to a file in a command before this one and name the file in full.')
+    for kind in sorted(kinds):
+        for b in bodies:
+            why = empties(kind, b, eff)
+            if why:
+                return reason(f'{how} {why}: that takes `main` out from behind CI as surely as a DELETE',
+                              'A write that keeps (or adds) the required checks passes.')
+    return None
+
+
+def gql_hidden(text):
+    """Whether GraphQL text has hidden parts outside its "strings" (an id in quotes from a variable is fine; text
+    the guard cannot read where the operation, a field or a value goes is not)."""
+    i, n, quoted = 0, len(text), False
+    while i < n:
+        c = text[i]
+        if quoted and c == '\\':
+            i += 2
+            continue
+        if c == '"':
+            quoted = not quoted
+        elif not quoted and c in (HID, WILD):
+            return True
+        i += 1
+    return False
+
+
+def gql_code(text):
+    """GraphQL text as the rules below read it: each "string" and \"\"\"block string\"\"\" stands as one word
+    (`"_"`) and # comments are gone, so `name: "requiredStatusChecks: [ci]"` or a comment names no kept check. A
+    JSON request body (--input) gives its query (its variables are read as variables). Before canon(), which drops
+    all quotes."""
+    try:
+        j = json.loads(text) if text.lstrip()[:1] == '{' else None
+    except ValueError:
+        j = None
+    if isinstance(j, dict) and isinstance(j.get('query'), str):
+        text = j['query']
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '#':
+            end = text.find('\n', i)
+            i = n if end < 0 else end
+        elif text.startswith('"""', i):
+            end = re.search(r'(?<!\\)"""', text[i + 3:])   # \""" is a quote inside a block string
+            out.append(' "_" ')
+            i = n if end is None else i + 3 + end.end()
+        elif c == '"':
+            i += 1
+            while i < n and text[i] not in '"\n':
+                i += 2 if text[i] == '\\' else 1
+            out.append(' "_" ')
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out)
+
+
+def gql_unset(v):
+    """A GraphQL value that turns a required-check setting off: false, null, an empty list, or text the guard cannot
+    read."""
+    return v is None or v is False or v == [] or (isinstance(v, str) and (
+        hidden(v) or re.fullmatch(r'\s*(?:false|null|\[[\s,]*\])?\s*', v, re.I) is not None))
+
+
+def rules_keep_checks(rules):
+    """A ruleset's rules (GraphQL input) hold a REQUIRED_STATUS_CHECKS rule that names at least one check."""
+    return isinstance(rules, list) and any(
+        isinstance(r, dict) and str(r.get('type', '')).upper() == 'REQUIRED_STATUS_CHECKS'
+        and isinstance(r.get('parameters'), dict) and isinstance(r['parameters'].get('requiredStatusChecks'), dict)
+        and has_checks(r['parameters']['requiredStatusChecks'].get('requiredStatusChecks')) for r in rules)
+
+
+def gql_value_empties(v, ruleset, depth=0):
+    """Why a GraphQL variable's value (the whole input, as gh builds it from input[..] fields or an --input file's
+    "variables") leaves no required check, or ''."""
+    if depth > 32:
+        return 'nests deeper than the guard reads'
+    if isinstance(v, list):
+        return next((r for r in (gql_value_empties(x, ruleset, depth + 1) for x in v) if r), '')
+    if not isinstance(v, dict):
+        return ''
+    for k, x in v.items():
+        key = k.lower()
+        if key == 'requiresstatuschecks' and not (x is True or (isinstance(x, str) and x.strip().lower() == 'true')):
+            return f'sets {k} to {json.dumps(x) if not hidden(json.dumps(x)) else "a value the guard cannot read"}'
+        if key in ('requiredstatuscheckcontexts', 'requiredstatuschecks') and not isinstance(x, dict) \
+                and gql_unset(x):
+            return f'sets {k} to nothing (an empty list, null, or a value the guard cannot read)'
+        if key == 'rules' and ruleset and not rules_keep_checks(x):
+            return 'sets the ruleset rules without a REQUIRED_STATUS_CHECKS rule that names a check'
+        why = gql_value_empties(x, ruleset, depth + 1)
+        if why:
+            return why
+    return ''
+
+
+GQL_KEPT = re.compile(r'requiredStatusChecks["\']?\s*:\s*(?:\[[\s,]*[^\]\s,]|\$\w)', re.I)   # a list that names a check
+
+
+def gql_empties(texts, variables=()):
+    """Why a GraphQL updateRepositoryRuleset / updateBranchProtectionRule may leave no required check, or ''.
+    texts: the query and bodies as written; variables: the variables objects gh sends (from -f/-F fields, None when
+    the fields cannot be read, and from an --input file)."""
+    joined = '\n'.join(t for t in texts if t)
+    if not GQL_EMPTYING.search(joined):
+        return ''
+    if any(v is None for v in variables):
+        return 'takes variables the guard cannot read'
+    ruleset = GQL_UPDATE.search(joined) is not None
+    known = {}
+    for v in variables:
+        if isinstance(v, dict):
+            known.update(v)
+    for v in variables:
+        why = gql_value_empties(v, ruleset)
+        if why:
+            return why
+    for m in GQL_EMPTY.finditer(joined):
+        if m.group(2):
+            return f'sets {m.group(1)} to {m.group(2)}'
+        var = m.group(3)   # its value: -F var=.., or "var": .. in a variables object
+        if var in known:
+            if gql_unset(known[var]) or (m.group(1).lower() == 'rules' and ruleset
+                                         and not rules_keep_checks(known[var])):
+                return f'sets {m.group(1)} from ${var} to nothing (or to a value the guard cannot read)'
+            continue
+        vals = re.findall(r'(?:^|[\s"\'{,])%s["\']?\s*[:=]\s*(false|null|\[[\s,]*\]|[^\s,}]+)' % re.escape(var), joined,
+                          re.I | re.M)
+        vals += ['[]'] if re.search(r'(?:^|\s)%s\[\](?:\s|$)' % re.escape(var), joined, re.M) else []
+        if not vals or any(re.fullmatch(r'false|null|\[[\s,]*\]', v, re.I) for v in vals):
+            return f'sets {m.group(1)} from ${var} to nothing (or to a value the guard cannot find)'
+    # a variable that holds the whole input (input: $input) must be there to read: gh sends null for one it lacks
+    for var in dict.fromkeys(re.findall(r'(?<![\w$])\w+\s*:\s*\$(\w+)', joined)):
+        if var not in known and not re.search(r'(?:^|[\s"\'{,])%s["\']?\s*[:=]' % re.escape(var), joined, re.M):
+            return f'takes ${var}, whose value the guard cannot find'
+    if ruleset and re.search(r'\brules(?:["\']?\s*:|\])', joined, re.I) and not GQL_KEPT.search(
+            '\n'.join([joined] + [json.dumps(v, ensure_ascii=False) for v in variables])):
+        return 'sets the ruleset rules without a required status check'
+    return ''
 
 
 # ---------- curl, wget, httpie
@@ -1475,6 +1817,11 @@ def net_reason(word, args, ctx):
     if any('DELETE' in a.upper() or hidden(a) for a in args if a not in paths):
         return reason('a DELETE (or a request the guard cannot read) to branch protection or a ruleset: it removes '
                       'the rules that keep `main` behind CI and review')
+    kinds = set().union(*[protect_kinds(a) for a in paths])
+    if kinds:   # a write that leaves no required check
+        why = emptying_reason(kinds, net_bodies(word, args, paths, ctx), '?', 'a request with')
+        if why:
+            return why
     if best['ruleset']:   # a body that switches the ruleset off, written out or in a file (-d @file)
         files = [m.group(1) for a in args for m in [re.search(r'@([^@=\s]+)$', a)] if m and a not in paths]
         texts = [read_named(f, ctx) for f in files]
@@ -1484,6 +1831,38 @@ def net_reason(word, args, ctx):
                           'ruleset with a '
                           'body file the guard cannot read')
     return None
+
+
+NET_BODY = {'curl': {'-d', '--data', '--data-raw', '--data-binary', '--data-ascii', '--json', '-T',
+                     '--upload-file'},
+            'wget': {'--post-data', '--body-data', '--post-file', '--body-file'}}
+NET_FILE = {'-T', '--upload-file', '--post-file', '--body-file'}   # these name a file; curl -d takes @file
+NET_RAW = {'--data-raw', '--post-data', '--body-data'}   # these take the text as it is, @ and all
+
+
+def net_bodies(word, args, paths, ctx):
+    """The JSON body of a curl/wget request ([None] when the guard cannot read it: another tool, a form, more than
+    one body, a body the command does not show)."""
+    flags = NET_BODY.get(word)
+    if flags is None or any(a.startswith(('-F', '--form')) for a in args if word == 'curl' and a not in paths):
+        return [None]
+    found = []
+    for i, a in enumerate(args):
+        name, eq, val = a.partition('=') if a.startswith('--') else (a[:2], '', a[2:]) if a[:2] in flags else (a, '', '')
+        if name not in flags:
+            continue
+        if not eq and not val:
+            val = args[i + 1] if i + 1 < len(args) else None
+        found.append((name, val))
+    if len(found) != 1 or found[0][1] is None:
+        return [None]
+    name, val = found[0]
+    if name in NET_FILE or (name not in NET_RAW and val.startswith('@')):
+        src = val[1:] if val.startswith('@') and name not in NET_FILE else val
+        text = ctx.get('stdin') if src == '-' else read_named(src, ctx)
+    else:
+        text = val
+    return [json_body(text)]
 
 
 def plain_read(tool, args, paths):
@@ -1775,9 +2154,52 @@ def guard_sig():
     return file_sig(SELF) if SELF else None
 
 
+def path_links(path, limit=40):
+    """[dev, inode, mtime_ns, ctime_ns] of every symbolic link met on the way from path to the file it names (the
+    kit's bin link, its `current` link, a link in a folder above them), or None when the path cannot be followed."""
+    out, parts, at = [], [p for p in path.split('/') if p], '/'
+    while parts:
+        part = parts.pop(0)
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            at = os.path.dirname(at)
+            continue
+        p = os.path.join(at, part)
+        try:
+            st = os.lstat(p)
+            target = os.readlink(p) if S_ISLNK(st.st_mode) else None
+        except (OSError, ValueError):
+            return None
+        if target is None:
+            at = p
+            continue
+        out.append([st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns])
+        if len(out) > limit:
+            return None
+        parts[:0] = [x for x in target.split('/') if x]
+        at = '/' if target.startswith('/') else at
+    return out
+
+
+def start_sig():
+    """The guard file's stat, taken when this module has run its top part: only when the file, and every link on
+    the way to it from the path Python ran (the bin link, the kit's `current` link), were last changed before this
+    process started (from /proc). An update writes the new release first and then switches `current`: the new file
+    is older than a hook that opened the old one just before the switch, but the switched link is not. Python
+    compiled and ran ~2000 lines before this line, and a switch in that window would give the old code in memory
+    the new file's stat: then None, and this run uses no cache."""
+    sig = guard_sig()
+    links = path_links(os.path.abspath(__file__)) if '__file__' in globals() else []
+    started = time.time() - since_start()
+    times = [max(sig[3], sig[4])] + [max(x[2], x[3]) for x in links] if sig and links is not None else []
+    return sig if times and max(times) / 1e9 < started - START_SLACK else None
+
+
+START_SLACK = 0.05   # /proc gives the start in clock ticks (10 ms): a file changed that close to it is not trusted
 # The guard file as this process found it when it started. If the file is replaced while the hook runs (an update),
 # the code in memory is the old guard: it must not keep facts under the new file's stat, nor use the new one's cache.
-GUARD_AT_START = guard_sig()
+GUARD_AT_START = start_sig()
 
 
 def guard_now():
@@ -2137,8 +2559,9 @@ def quick_words(cmd, globs=None):
                 return None
             word, quoted, started, i = word + cmd[i + 1:j], True, True, j + 1
             continue
-        if c in '#(){}!' or (c == '|' and cmd[i - 1:i] == '>'):   # >| writes a file, it is no pipe
-            return None
+        if c in '#(){}!' or (c == '|' and cmd[i - 1:i] in ('>', '&') and cmd[max(i - 2, 0):i] != '|&' and
+                                 (cmd[i - 1:i] == '>' or cmd[i - 2:i - 1] in ('>', '<'))):
+            return None   # >| (also zsh >>| >&|) writes a file, it is no pipe
         if c in ' \t':
             end_word()
         elif c in ';|\n' or (c == '&' and not (cmd[i - 1:i] in ('<', '>') or cmd[i + 1:i + 2] == '>')):
@@ -2231,6 +2654,31 @@ def quick_pass(cmd):
     return not heads & rest and not any(quick_glob_names(g, heads) for g in globs)
 
 
+def quick_shadowed(cmd, cwd, env):
+    """For a command quick_pass() took: whether a command word of it has a file of that name in a PATH folder under
+    $HOME (a script an earlier call left, ~/.local/bin/ls), or a cp/mv/ln of it puts files into such a folder. Then
+    the full reading decides. A few stat calls, no file is read."""
+    dirs = home_path_dirs(env.get('PATH') or '', env.get('HOME') or os.path.expanduser('~'))
+    if not dirs:
+        return False
+    real = None
+    for words in quick_words(cmd) or ():
+        words = [w for w, _ in words]
+        while words and words[0] in QUICK_FLOW:
+            words = words[1:]
+        if not words:
+            continue
+        if any(os.path.exists(os.path.join(d, words[0])) for d in dirs):
+            return True
+        if words[0] in COPIERS:
+            real = real or {os.path.realpath(d) for d in dirs}
+            home = env.get('HOME') or os.path.expanduser('~')
+            if any(os.path.realpath(os.path.join(cwd or os.getcwd(), re.sub(r'^~(?=/|$)', home, a))) in real
+                   for a in words[1:] if not a.startswith('-')):
+                return True
+    return False
+
+
 def quick_glob_names(word, heads):
     """Whether a word with * ? [ outside quotes may name one of heads (each part between / = < > & : , is a glob).
     A part with [ may name anything ([[:lower:]], [^x] ..: the guard does not read classes); * and ? are read the
@@ -2289,7 +2737,14 @@ def named(text):
     return None
 
 
+REFUSE_TAG = "this machine's refuseScripts"   # in the label refuse_script_named() gives
+MENTION_HINT = ('If the file only mentions the script (a message, notes), give it to the program as a redirect, '
+                '`python3 tools/check.py < msg.md`, which is read as data, or do not pipe or substitute a file that '
+                'names a refuse script.')
+
+
 def unproven(label, what, hint=SEPARATE):
+    hint = f'{MENTION_HINT} {hint}' if REFUSE_TAG in label else hint
     return reason(f'a command that names {label} {what}, so the guard cannot prove it is harmless', hint)
 
 
@@ -2484,25 +2939,288 @@ def git_gate(args, ctx, own, fed):
     return None
 
 
-def sed_scripts(args):
-    """The arguments sed reads as its script: after -e/--expression, else the first word that is no flag."""
-    out = [a.partition('=')[2] or (args[i + 1] if i + 1 < len(args) else '')
-           for i, a in enumerate(args) if a == '-e' or a.startswith('--expression')]
-    return out or [a for a in args if not a.startswith('-')][:1]
+SED_LONG = ('--expression', '--file', '--line-length', '--in-place', '--quiet', '--silent', '--sandbox', '--debug',
+            '--posix', '--regexp-extended', '--separate', '--unbuffered', '--null-data', '--zero-terminated',
+            '--follow-symlinks', '--binary', '--help', '--version')
 
 
-def data_token(tok, ctx):
+def sed_args(args):
+    """sed's arguments as GNU sed reads them: (scripts, script files, input files, --sandbox). A script is the value
+    of -e/--expression (also glued: -e1d, -ne1d, --expr=1d), a script file the value of -f/--file; without either
+    the first word that is no flag is the script. A long flag may be cut short (--expr)."""
+    scripts, files, inputs, sandbox, i, ended = [], [], [], False, 0, False
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if ended or a == '-' or not a.startswith('-'):
+            inputs.append(a)
+        elif a == '--':
+            ended = True
+        elif a.startswith('--'):
+            name, eq, value = a.partition('=')
+            full = [f for f in SED_LONG if f.startswith(name)]
+            full = full[0] if len(full) == 1 or name in full else name
+            if full in ('--expression', '--file', '--line-length') and not eq:
+                value, i = (args[i] if i < len(args) else ''), i + 1
+            if full == '--expression':
+                scripts.append(value)
+            elif full == '--file':
+                files.append(value)
+            sandbox = sandbox or full == '--sandbox'
+        else:
+            for j, ch in enumerate(a[1:], 1):   # a cluster: -ne SCRIPT, -nf FILE, -i.bak, -l 80
+                if ch in 'efl':
+                    value = a[j + 1:]
+                    if not value:
+                        value, i = (args[i] if i < len(args) else ''), i + 1
+                    (scripts if ch == 'e' else files if ch == 'f' else []).append(value)
+                    break
+                if ch == 'i':   # its suffix is the rest of the word
+                    break
+    if not scripts and not files and inputs:
+        scripts.append(inputs.pop(0))
+    return scripts, files, inputs, sandbox
+
+
+SED_PLAIN = set('=dDgGhHlnNpPxzF')        # sed commands with no argument
+SED_NUM = set('lLqQ')                     # ... with an optional number
+SED_LINE = set('aicrRwWbtTv:')            # ... whose argument is the rest of the line (b t T v: or up to ;)
+
+
+def sed_program(script):
+    """What a sed script runs: (commands of `e CMD`, whether it runs its input as shell: a bare `e` or the s///e
+    flag, files it writes: w/W and s///w). A script it cannot read (an unknown command, an open s///) counts as
+    running its input. GNU sed's grammar: [addr[,addr]][!]cmd, commands split by ; or line breaks, { } blocks."""
+    cmds, runs, writes, i, n = [], False, [], 0, len(script)
+
+    def regex(i, delim):   # index behind the closing delim of a regex or replacement that starts at i
+        while i < n and script[i] != delim:
+            if script[i] == '\\':
+                i += 1
+            elif script[i] == '\n' and delim != '\n':
+                return -1
+            i += 1
+        return i + 1 if i < n else -1
+
+    def addr(i):
+        if i < n and script[i] in '0123456789':
+            while i < n and script[i] in '0123456789~':
+                i += 1
+        elif i < n and script[i] == '$':
+            i += 1
+        elif i < n and script[i] in '/\\':
+            delim = script[i + 1:i + 2] if script[i] == '\\' else '/'
+            i = regex(i + (2 if script[i] == '\\' else 1), delim) if delim else -1
+            while 0 <= i < n and script[i] in 'IM':
+                i += 1
+        return i
+
+    def rest_of_line(i):
+        j = script.find('\n', i)
+        return n if j < 0 else j
+
+    while i < n:
+        c = script[i]
+        if c in ' \t\n;}':
+            i += 1
+            continue
+        if c == '#':
+            i = rest_of_line(i)
+            continue
+        i = addr(i)
+        if 0 <= i < n and script[i] == ',':
+            i += 1
+            while i < n and script[i] in ' \t':
+                i += 1
+            if i < n and script[i] in '+~':
+                i += 1
+                while i < n and script[i].isdigit():
+                    i += 1
+            else:
+                i = addr(i)
+        while 0 <= i < n and script[i] in ' \t!':
+            i += 1
+        if i < 0 or i >= n:
+            return cmds, runs or i < 0, writes
+        c, i = script[i], i + 1
+        if c == '{' or c == '}':
+            continue
+        if c == 'e':
+            j = rest_of_line(i)
+            text = script[i:j].strip()
+            if text:
+                cmds.append(text)
+            else:
+                runs = True
+            i = j
+            continue
+        if c in SED_LINE:
+            j = rest_of_line(i)
+            if c in 'btTv:':   # a label ends at ; too (GNU)
+                k = script.find(';', i, j)
+                j = j if k < 0 else k
+            while c in 'aic' and j < n and (len(script[:j]) - len(script[:j].rstrip('\\'))) % 2:
+                j = rest_of_line(j + 1)   # a\ text\ more: each line that ends in \ goes on
+            if c in 'wW':
+                writes.append(script[i:j].strip())
+            i = j
+            continue
+        if c in SED_NUM:
+            while i < n and script[i] in ' \t0123456789':
+                i += 1
+        elif c in 'sy':
+            if i >= n or script[i] in '\n\\':
+                return cmds, True, writes
+            delim = script[i]
+            i = regex(i + 1, delim)
+            i = regex(i, delim) if i >= 0 else -1
+            if i < 0:
+                return cmds, True, writes
+            while c == 's' and i < n and script[i] in 'gpiImMe0123456789w':
+                if script[i] == 'e':
+                    runs = True
+                if script[i] == 'w':
+                    j = rest_of_line(i)
+                    writes.append(script[i + 1:j].strip())
+                    i = j
+                    break
+                i += 1
+        elif c not in SED_PLAIN:
+            return cmds, True, writes   # not a sed command the guard knows: it may run something
+        while i < n and script[i] in ' \t':
+            i += 1
+        if i < n and script[i] not in ';\n}#':
+            return cmds, True, writes   # more after a command (an unknown flag, a hidden part): may be `e`
+    return cmds, runs, writes
+
+
+def sed_reason(args, ctx, own, fed):
+    """sed runs commands with `e CMD` (any address: 1e, $e, /x/e), runs its input as shell with a bare `e` or the
+    s///e flag, and writes files with w. Every script it gets is read (-e, -f files, the first word): `e CMD` as
+    shell text; a run of its input is refused when the input or the script names a guarded token."""
+    scripts, files, inputs, sandbox = sed_args(args)
+    flow, unknown = ctx['flow'], False
+    for f in files:
+        text = None if f == '-' else read_named(f, ctx)
+        if text is None:
+            tok = f != '-' and named_file(f, ctx)
+            if tok:
+                return unproven(tok, 'in a script file `sed` runs (-f), which the guard cannot read in full')
+            unknown = True   # stdin, a hidden name, a file that is not there yet
+        else:
+            scripts.append(text)
+    if sandbox:   # --sandbox: sed refuses e, r and w
+        return None
+    runs, writes = unknown, []
+    for script in scripts:   # a hidden part ($X) stays in: in a command or flag place it reads as unknown (runs),
+        cmds, ran, wrote = sed_program(script)   # inside a regex or replacement it is harmless
+        runs, writes = runs or ran, writes + wrote
+        for text in cmds:
+            flow['ran'] = True
+            r = decide_text(text, dict(ctx, stdin=None, cmd={}, leak=False, targets=()))
+            if r:
+                return r
+    tok = own or fed or next((t for t in (data_token(a, ctx, runs) for a in inputs if a != '-') if t), None)
+    if runs:
+        flow['ran'] = True
+        if tok:
+            return unproven(tok, 'where `sed` runs its text as shell commands (the `e` command or the s///e flag)')
+        flow['unknown'] = 'sed e'   # its input may come from anywhere
+    if writes and tok:   # sed -n 'w run.sh' p.txt: the text gets a name a later word may run
+        flow['free'] = tok
+    return None
+
+
+def data_token(tok, ctx, runs=False):
     """The guarded token in a file that cat/cp/.. hand on: its text as read_text() gives it, so data over MAX_FILE or
-    that cannot be opened passes unread (lockout care). A file that looks like a script, or one piped into a shell
-    or interpreter that runs its stdin (`cat f | bash`), is read in pieces and counts when unread (file_token)."""
+    that cannot be opened passes unread (lockout care), whatever its name (`cat app.js | gzip`). Only in a run
+    position, where a shell or interpreter runs the text (`cat f | grep x | bash`, `eval "$(cat f)"`; runs: the
+    command itself runs it, sed e), is a file read in pieces and counts when unread (file_token). A line that calls
+    a refuseScripts entry counts wherever the text goes on, as any guarded token does: the guard cannot tell every
+    place that runs it (`$(cat f)`, `| heavy bash`, `| bash /dev/stdin`, `| at now`, `| awk '{system($0)}'` ..), so
+    `cat msg.md | python3 check.py` is refused too, and the refusal names the way out (`< msg.md`). A copy under a
+    name the text runs is read where it is written (segment_reason)."""
+    runs = runs or ctx.get('feeds_code')
     for d in [] if hidden(tok) else folders(ctx):
         p = resolve_path(tok, d)
         f = facts(p, ctx, ('named',))
-        t = f['named'] if f['text'] else \
-            (ctx.get('feeds_code') or script_like(p, unopened=False)) and file_token(p)
+        t = f['named'] if f['text'] else runs and file_token(p)
+        if t:
+            return t
+        # the whole text is read (the cache holds no text): only when the cached names found nothing and the
+        # machine names a script at all
+        t = REFUSE_SCRIPTS and f['text'] and refuse_script_named(body(p, ctx))
         if t:
             return t
     return None
+
+
+def refuse_script_named(text):
+    """A machine file refuseScripts entry that a line of the text calls (its name and its flag as words on one line,
+    `python3 garden.py --fix`), as a label for unproven(), or None. Text that a shell runs (sed e, cat f | bash,
+    eval "$(cat f)") would run it, as the same line in a script does."""
+    for rs in REFUSE_SCRIPTS if text else ():
+        rx = r'(?<![\w.-])%s(?![\w.-])[^\n]*?(?<![\w-])%s(?![\w-])' % (re.escape(rs['name']), re.escape(rs['flag']))
+        if re.search(rx, text):
+            return f'`{rs["name"]} {rs["flag"]}` ({REFUSE_TAG}: {rs.get("why") or "refused"})'
+    return None
+
+
+RUN_FLAGS = {'rg': ('--pre', '--hostname-bin'), 'sort': ('--compress-program',)}
+
+
+def run_programs(word, args):
+    """The programs a data word runs by a flag: rg --pre X / --hostname-bin X (exact names), sort
+    --compress-program X (also any prefix of it from --co, as GNU getopt takes). A flag with no value: WILD."""
+    out = []
+    for i, a in enumerate(args):
+        if a == '--':
+            break
+        name, eq, val = a.partition('=')
+        long = RUN_FLAGS.get(word, ())
+        if name in long or (word == 'sort' and len(name) >= 4 and '--compress-program'.startswith(name)):
+            out.append(val if eq else (args[i + 1] if i + 1 < len(args) else WILD))
+    return out
+
+
+def into_path_reason(args, ctx):
+    """mv tools ~/.local/bin, cp -r tools/. ~/.local/bin, cp x ~/.local/bin: files that go into a PATH folder under
+    $HOME become command words a later word (or call) runs, so a file among them that names a guarded token is
+    refused. Up to 256 files of a folder are looked at."""
+    words = [a for a in args if not a.startswith('-')]
+    dest = next((a.partition('=')[2] for a in args if a.startswith('--target-directory=')), None) or \
+        next((args[i + 1] for i, a in enumerate(args[:-1]) if a == '-t'), None) or (words[-1] if words else None)
+    env = ctx['env']
+    dirs = {os.path.realpath(d) for d in home_path_dirs(env.get('PATH') or '',
+                                                         env.get('HOME') or os.path.expanduser('~'))}
+    if not dest or hidden(dest) or not dirs or \
+            not any(os.path.realpath(resolve_path(dest, d)) in dirs for d in folders(ctx)):
+        return None
+    for src in (w for w in words if w != dest):
+        top = os.path.dirname(src) if hidden(src) else src   # cp tools/* ~/.local/bin: the folder tools/
+        if hidden(top) or not top:
+            continue
+        for d in folders(ctx):
+            p = resolve_path(top, d)
+            try:
+                with os.scandir(p) as it:
+                    files = [e.path for _, e in zip(range(256), it) if e.is_file()]
+            except OSError:
+                files = [p] if not hidden(src) and os.path.isfile(p) else []
+            for f in files:
+                fx = facts(f, ctx, ('named',))
+                tok = fx['named'] if fx['text'] else file_token(f)
+                if tok:
+                    return unproven(tok, f'in a file of the folder {redact(top)}, which this command puts into a PATH '
+                                         'folder, where a command word of that name runs it')
+    return None
+
+
+# Interpreter flags that take the next word as their value (python3 -W ignore, node -r x, ruby -I lib, perl -I lib)
+INTERP_VALUE = {'python': ('-W', '-X', '-Q'), 'pypy': ('-W', '-X', '-Q'),
+                'node': ('-r', '--require', '--import', '--loader', '--experimental-loader', '--input-type', '-C',
+                         '--conditions', '--title', '--env-file'),
+                'ruby': ('-I', '-r', '-E', '-C', '-F'), 'perl': ('-I', '-M', '-m'), 'php': ('-d', '-c', '-z')}
 
 
 def stdin_runs(toks, how, loose):
@@ -2513,7 +3231,14 @@ def stdin_runs(toks, how, loose):
     h, via = head(toks)
     if 'shell' in via or h is None:   # head() takes the shell's script as the command word
         return h is None or '-s' in toks[:h]
-    return not any(a in ('-c', '-e', '-m', '--eval') or not a.startswith('-') for a in toks[h + 1:])
+    word, args, i = os.path.basename(toks[h]), toks[h + 1:], 0
+    takes = next((v for k, v in INTERP_VALUE.items() if word.startswith(k)), ())
+    while i < len(args):   # python3 -W ignore < f: the value of a flag is no script name
+        a = args[i]
+        if a in ('-c', '-e', '-m', '--eval', '-p', '--print') or not a.startswith('-') or a == '-':
+            return a == '-'
+        i += 2 if a in takes else 1
+    return True
 
 
 def data_gate(word, args, ctx, own, fed, loose):
@@ -2532,11 +3257,22 @@ def data_gate(word, args, ctx, own, fed, loose):
         if own and exported([word] + args, flow):
             flow['env'] = own
         return None
-    if own and (word == 'sed' and any(SED_RUNS.search(a) for a in sed_scripts(args))
-                or word == 'rg' and any(a.startswith(('--pre', '--hostname-bin')) for a in args)
-                or word == 'sort' and any(a.startswith('--compress-prog') for a in args)):
-        return unproven(own, f'in `{word}` arguments that can run a command (sed `e`, rg --pre, '
-                             'sort --compress-program)')
+    if word == 'sed':
+        r = sed_reason(args, ctx, own, fed)
+        if r:
+            return r
+    progs = run_programs(word, args)
+    if own and progs:
+        return unproven(own, f'in `{word}` arguments that can run a command (rg --pre, sort --compress-program)')
+    for prog in progs:   # rg --pre ./x.sh: x.sh runs on every file, read as the command it is
+        flow['ran'] = True
+        r = segment_reason([prog, WILD], dict(ctx, stdin=None, cmd={}, leak=False, targets=()), loose)
+        if r:
+            return r
+    if word in COPIERS:
+        r = into_path_reason(args, ctx)
+        if r:
+            return r
     tok, moved = own or fed, False
     if not tok and (ctx.get('leak') and word in READERS or word in COPIERS):
         # cat x | ..: the file's text goes on; cp x run.sh: it gets a name the next word may run
@@ -2645,6 +3381,12 @@ def flow_reason(flow):
 
 
 # ---------- decision
+
+def path_script(tok, ctx):
+    """A text file (a script, not a compiled program) of this name in a PATH folder under $HOME: `ls` there is
+    that script, not the system's ls, and is read as one (an earlier call may have left it)."""
+    return next((p for p, _ in cmd_files(tok, ctx, False) if facts(p, ctx)['text']), None)
+
 
 def cmd_files(tok, ctx, via_shell):
     """[(file, folder)]: the script files a command word may run, one per folder the command may run in."""
@@ -2932,7 +3674,8 @@ def segment_reason(toks, ctx, loose):
     word = os.path.basename(toks[h]) if h is not None else ''
     # plain: the word is the program of that name for certain (no function, no alias, no file in another folder)
     plain = h is not None and not hidden(toks[h]) and toks[h] not in ctx.get('funcs', ()) \
-        and toks[h] not in ctx.get('aliases', {}) and ('/' not in toks[h] or os.path.dirname(toks[h]) in STD_BINS)
+        and toks[h] not in ctx.get('aliases', {}) and ('/' not in toks[h] or os.path.dirname(toks[h]) in STD_BINS) \
+        and not (word in DATA and '/' not in toks[h] and path_script(toks[h], ctx))
     kind = word if plain else ''
     gh_word = h is not None and is_gh(toks[h], ctx)
     shellish = bool(via & {'shell', 'eval'})
@@ -2954,19 +3697,32 @@ def segment_reason(toks, ctx, loose):
         if t.startswith('-') and re.search(r'\s', t):
             texts += [t.partition('=')[2], t[2:]]
     how, proven = ctx.get('writes'), False
+    # echo .. | tee x.sh; sh x.sh: a pipe into a word that writes a file the text runs carries the script too
+    how = how or (ctx.get('feeds_script') if kind in READERS | {'echo', 'printf'} else '')
     if how and h is not None:   # echo/printf/tee .. > x.sh; sh x.sh: the words are the script
         said = toks[h + 1:]
-        made = [' '.join(said), ' '.join(said[1:])] + [t for t in said if re.search(r'\s', t)]
+        filed, made = [], []
+        if kind in READERS | COPIERS | FILE_WRITERS and kind != 'tee':   # cat p.txt > x.sh, cp p.txt x.sh: the
+            srcs = file_writes(toks, h)[1] if kind in FILE_WRITERS else said   # files are the script
+            for a in (a for a in srcs if not a.startswith('-') and not hidden(a)):
+                text = read_named(a, ctx)
+                tok = text is None and named_file(a, ctx)
+                if tok:
+                    return unproven(tok, f'in the file {redact(a)}, which the same command writes under a name '
+                                         'it runs, and which the guard cannot read in full')
+                filed += [] if text is None else [text]
+        else:
+            made = [' '.join(said), ' '.join(said[1:])] + [t for t in said if re.search(r'\s', t)]
         made += [t.replace('\\n', '\n') for t in made if '\\n' in t]
-        if how == 'code' or (how == 'exec' and any(shebang(t.lstrip()) not in SHELLS | {''} for t in made)):
-            tok = named(' '.join(toks)) or named(ctx.get('stdin') or '')
+        if how == 'code' or (how == 'exec' and any(shebang(t.lstrip()) not in SHELLS | {''} for t in made + filed)):
+            tok = named(' '.join(toks)) or named(ctx.get('stdin') or '') or next(filter(None, map(named, filed)), None)
             if tok:
                 return reason(f'a script that the same command writes and runs names {tok}; the guard reads shell '
                               'scripts only, not code', 'Run the calls as gh commands the guard can read.')
         else:
-            texts += made
+            texts += made + filed
             proven = True
-    ctx = dict(ctx, writes='', proven=proven)
+    ctx = dict(ctx, writes='', feeds_script='', proven=proven)
     texts += [t.replace('\\n', '\n') for t in texts if '\\n' in t]   # printf 'a\ngh ..' | sh
     inner = dict(ctx, nogate=True) if lost and not loose else ctx   # the gate below speaks for the whole command
     for text in dict.fromkeys(texts):
@@ -3093,10 +3849,11 @@ def segment_reason(toks, ctx, loose):
         if (own or fed) and not ctx.get('nogate'):
             return unproven(own or fed, f'and hands it to the script `{redact(word)}`, whose use of its '
                                         'arguments and input the guard cannot follow')
-        r = file_reason(p, dict(ctx, cwd=d))
+        # run as a command, a text file without a `#!` line is run by the shell itself (execve fails, bash reads it)
+        r = file_reason(p, dict(ctx, cwd=d), force_shell=f['bang'] is None)
         if r:
             return r
-        if not (p.endswith(('.sh', '.bash', '.zsh')) or f['bang'] in SHELLS):
+        if not (p.endswith(('.sh', '.bash', '.zsh')) or f['bang'] in SHELLS or f['bang'] is None):
             flow['unknown'] = redact(word)   # code in another language: only looked through for guarded tokens
     if read:
         return arg_scripts_reason(redact(word), toks[h + 1:], ctx)
@@ -3118,10 +3875,59 @@ def written(toks, cmd, env, ran):
     h, _ = head(toks)
     targets = [t for op, w in cmd['redirs'] if op.startswith(('>', '&>')) for r in readings({'words': [w]}, env)
                for t in [''.join(r)]]
-    if h is not None and os.path.basename(toks[h]) == 'tee':
-        targets += [t for t in toks[h + 1:] if not t.startswith('-')]
+    targets += file_writes(toks, h)[0]
     names = {os.path.basename(t) for t in targets if os.path.basename(t)}
-    return next((k for k in ('shell', 'exec', 'code') if any(same_name(a, b) for a in names for b in ran[k])), '')
+    # tee ~/.local/bin/* (also ??, *?, $n): a name that is only hidden text can be any file of its folder, so any
+    # name the text runs, when the folder is named or the name is unquoted (a glob, $f); a quoted "$f" alone still
+    # matches only hidden names
+    # a target that ends in / is a folder: cp/mv put the sources' own names there (in names already), > fails
+    anyname = any(not visible(os.path.basename(t)) and (visible(os.path.dirname(t)) or WILD in t)
+                  for t in targets if not t.endswith('/'))
+    return next((k for k in ('shell', 'exec', 'code') if ran[k] and anyname
+                 or any(same_name(a, b) for a in names for b in ran[k])), '')
+
+
+FILE_WRITERS = {'install', 'dd'} | AWKS   # words that write the text of files they name into other files
+
+
+def file_writes(toks, h):
+    """(files the command word writes, files whose text it writes there) as the text shows them: tee FILE, cp/mv/ln
+    and install (cp p.txt ~/.local/bin/ls, cp ls ~/.local/bin/: every word, the sources' names land there too), dd
+    of=/if=, sed w FILE and s///w FILE, awk print > "FILE". Other writers (a program's -o FILE) are not read."""
+    if h is None:
+        return [], []
+    word, args = os.path.basename(toks[h]), toks[h + 1:]
+    if word == 'tee':
+        return [t for t in args if not t.startswith('-')], []
+    if word in COPIERS or word == 'install':
+        words = [t.partition('=')[2] or t for t in args if not t.startswith('-') or t.startswith('--target-directory=')]
+        return words, [t for t in args if not t.startswith('-')]
+    if word == 'dd':
+        return [a[3:] for a in args if a.startswith('of=')], [a[3:] for a in args if a.startswith('if=')]
+    if word == 'sed':
+        scripts, _, inputs, sandbox = sed_args(args)
+        return ([] if sandbox else [w for t in scripts for w in sed_program(t)[2]]), inputs
+    if word in AWKS:
+        progs, inputs, i = [], [], 0
+        while i < len(args):
+            a = args[i]
+            i += 1
+            if a in ('-F', '-v', '-f') or a in ('--field-separator', '--assign', '--file'):
+                progs += [args[i]] if a in ('-f', '--file') and i < len(args) else []
+                i += 1
+            elif a.startswith('-') and a != '-':
+                continue
+            elif not progs:
+                progs.append(a)
+            else:
+                inputs.append(a)
+        return [t for p in progs for t in re.findall(r'>>?\s*"([^"]+)"', p)], inputs
+    return [], []
+
+
+def visible(text):
+    """The text of a word that is not hidden (no $X, glob or {a,b} part), without the / between folders."""
+    return text.replace(HID, '').replace(WILD, '').strip('/')
 
 
 def same_name(a, b):
@@ -3186,14 +3992,41 @@ def fed_texts(cmd, env, ctx):
     return out
 
 
+def runs_hidden(toks, cmd):
+    """Whether a command runs a word the text does not show as shell or code: eval/bash -c/source/python3 with a
+    hidden word, or a shell or interpreter fed by a hidden <<< word or < file (bash <<< "$(..)", sh < <(..))."""
+    if not toks:
+        return False
+    h, via = head(toks)
+    word = os.path.basename(toks[h]) if h is not None else ''
+    if not (via & {'shell', 'eval'} or word in ('source', '.', 'eval') or INTERPRETERS.match(word)):
+        return False
+    return any(hidden(t) for t in toks) or \
+        any(op in ('<', '<<<') and any(p[0] != 'L' for p in w) for op, w in cmd['redirs'])
+
+
+def pure_word(variants):
+    """Whether in every reading the command word is a data word (tee, grep, sort ..) that passes text on."""
+    return bool(variants) and all(toks and head(toks)[0] is not None and not head(toks)[1]
+                                  and os.path.basename(toks[head(toks)[0]]) in DATA for toks in variants)
+
+
 def pure_sink(variants):
     """Whether a command ends the text piped into it: in every reading its command word only handles text."""
     for toks in variants:
         h, via = head(toks) if toks else (None, set())
         if h is None or via or hidden(toks[h]) or os.path.basename(toks[h]) not in DATA - NO_SINK \
-                or ('/' in toks[h] and os.path.dirname(toks[h]) not in STD_BINS):
+                or ('/' in toks[h] and os.path.dirname(toks[h]) not in STD_BINS) \
+                or os.path.basename(toks[h]) == 'sed' and sed_runs_input(toks[h + 1:]):
             return False
     return bool(variants)
+
+
+def sed_runs_input(args):
+    """Whether a sed may run the text it reads as shell (a bare `e`, s///e, a script file the guard does not read
+    here): then it is no sink for a pipe into it."""
+    scripts, files, _, sandbox = sed_args(args)
+    return not sandbox and (bool(files) or any(sed_program(s)[1] for s in scripts))
 
 
 def stopped(text, what, flow, hint=''):
@@ -3296,6 +4129,22 @@ def decide_text(text, ctx, scan_raw=True):
         if how in ('shell', 'exec') and not cmd['docs'] and h is not None \
                 and os.path.basename(variants[0][h]) not in ('echo', 'printf'):
             loose = True
+    # Where a command's output is run as code: a pipe into a shell or interpreter that runs its stdin, or into a sed
+    # that runs its input (cat f | sed e), also through data filters (cat f | grep -v x | bash), and $(..) <(..) in
+    # a text that runs a hidden word as shell or code (eval "$(cat f)", source <(cat f), bash <<< "$(cat f)")
+    feeds_at = [False] * len(runs)
+    for k in range(len(runs) - 2, -1, -1):
+        if runs[k][0].get('pipe'):
+            nxt = runs[k + 1][1][0]
+            h = head(nxt)[0] if nxt else None
+            feeds_at[k] = stdin_runs(nxt, hows[k + 1], loose) or \
+                (h is not None and os.path.basename(nxt[h]) == 'sed' and sed_runs_input(nxt[h + 1:])) or \
+                (feeds_at[k + 1] and bool(runs[k + 1][0].get('pipe')) and pure_word(runs[k + 1][1]))
+    sub_runs = any(not cmd.get('sub') and runs_hidden(variants[0], cmd) for cmd, variants in runs)
+    outs = list(hows)   # cat p.txt | tee ~/.local/bin/ls; ls: the text a pipe carries into such a write
+    for k in range(len(runs) - 2, -1, -1):
+        if not outs[k] and runs[k][0].get('pipe') and outs[k + 1] and pure_word(runs[k + 1][1]):
+            outs[k] = outs[k + 1]
     for k, (how, (cmd, variants)) in enumerate(zip(hows, runs)):
         fed = list(cmd['docs']) + fed_texts(cmd, env, c)   # heredocs, <<< words, < files
         for op, w in cmd['redirs']:   # bash < big.sh: a file the shell runs that the guard could not read whole
@@ -3315,8 +4164,9 @@ def decide_text(text, ctx, scan_raw=True):
                 r = decide_text(body, c)
                 if r:
                     return r
-        feeds = bool(cmd.get('pipe')) and k + 1 < len(runs) and stdin_runs(runs[k + 1][1][0], hows[k + 1], loose)
-        cc = dict(c, stdin=stdin_of(cmd, env, c), writes=how, cmd=cmd, leak=leaks[k], targets=tgts[k], feeds_code=feeds)
+        feeds = feeds_at[k] or (cmd.get('sub') and sub_runs)
+        cc = dict(c, stdin=stdin_of(cmd, env, c), writes=how, cmd=cmd, leak=leaks[k], targets=tgts[k], feeds_code=feeds,
+                  feeds_script='' if how else outs[k])
         for toks in variants:
             r = toks and segment_reason(toks, cc, loose)
             if r:
@@ -3324,10 +4174,13 @@ def decide_text(text, ctx, scan_raw=True):
     return None
 
 
-def decide(cmd, cwd, env, budget=None, use_id=None):
+def decide(cmd, cwd, env, budget=None, use_id=None, saves=None):
     """None to let the command run, else the deny reason. budget: seconds the reading may take (None: no limit).
-    use_id: the tool call's id (an owner approval is used up by one call; the same call's second hook run passes)."""
-    if not cmd or (QUICK and quick_pass(cmd)):
+    use_id: the tool call's id (an owner approval is used up by one call; the same call's second hook run passes).
+    saves: a list to hand the cache save to (the hook prints its answer first, then saves); None: save here, last.
+    The owner marker is read before any save, while the hook's alarm still holds: a save that swallows an alarm
+    (cache_save catches it) must not leave the marker's reads with no time limit."""
+    if not cmd or (QUICK and quick_pass(cmd) and not quick_shadowed(cmd, cwd, env)):
         return None
     ctx = {'cwd': cwd or os.getcwd(), 'env': env, 'depth': 0, 'raw': cmd, 'all': cmd, 'memo': {}, 'flow': {},
            'stop_at': None if budget is None else time.monotonic() + budget, 'cache': {}}
@@ -3338,11 +4191,20 @@ def decide(cmd, cwd, env, budget=None, use_id=None):
         ctx['cache'] = {}   # a reading cut off half-way keeps nothing
     if why:
         why = owner_marker(why, cmd, ctx['cwd'], env, use_id)
-    try:   # last, with the answer known: an alarm or a failure in it changes nothing
-        cache_save(ctx)
-    except BaseException:
-        pass
+    if saves is not None:
+        saves.append(ctx)
+    else:
+        save_quietly([ctx])
     return why
+
+
+def save_quietly(ctxs):
+    """Last, with the answer known (and printed, in the hook): an alarm or a failure in the save changes nothing."""
+    for ctx in ctxs:
+        try:
+            cache_save(ctx)
+        except BaseException:   # noqa: BLE001
+            pass
 
 
 def owner_marker(why, cmd, cwd, env, use_id=None):
@@ -3479,13 +4341,18 @@ def answer():
             alarm_off()
             return passed()
         cmd = (ev.get('tool_input') or {}).get('command') or ''
-        if QUICK and quick_pass(cmd):
+        cwd = ev.get('cwd') or os.getcwd()
+        if QUICK and quick_pass(cmd) and not quick_shadowed(cmd, cwd, env):
             alarm_off()
             return passed()
         left = BUDGET - process_age()
         if left <= 0:
             raise Slow()
-        why = decide(cmd, ev.get('cwd') or os.getcwd(), env, max(left - 1.0, 0.0), ev.get('tool_use_id'))
+        saves = []
+        why = decide(cmd, cwd, env, max(left - 1.0, 0.0), ev.get('tool_use_id'), saves)
+        if why:
+            deny(why)   # the answer first: a slow or hung file system then holds up only the save, cut by the alarm
+        save_quietly(saves)
         alarm_off()
     except Slow:
         alarm_off()   # first: the handlers below must not be cut off by the alarm (that answers nothing)
@@ -3504,7 +4371,8 @@ def answer():
         else:
             return passed()
     if why:
-        deny(why)   # first: logging may be slow
+        if not ANSWERED:
+            deny(why)   # first: logging may be slow
         log(cmd, why, env)
         return 0
     return passed()
