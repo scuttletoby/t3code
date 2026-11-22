@@ -20,7 +20,7 @@ for the same question (kind and MB): an OK read within that time is "NOT OK: hel
 cache folder keeps it in t3-capacity-hold.json). A NOT OK with stdout
 not a terminal also says on stderr that a pipe would hide the exit status.
 """
-import os, sys
+import os, stat, sys
 
 
 KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -83,9 +83,26 @@ def main(argv):
     if verdict == 'free':
         return 0
     if not sys.stdout.isatty():
-        print('t3-capacity: NOT OK (exit 1). A pipe hides this exit status: gate with `t3-capacity N && cmd`, '
-              'never pipe it', file=sys.stderr)
+        print(not_ok_line(), file=sys.stderr)
     return 1
+
+
+def not_ok_line():
+    """The stderr line for NOT OK when stdout is no terminal (#931): a pipe or $(..) gets the warning, a file is told
+    the gate holds (`t3-capacity N > f && cmd` is right, and the line used to warn there too), /dev/null by name."""
+    try:
+        mode = os.fstat(sys.stdout.fileno()).st_mode
+        piped = stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
+    except (OSError, ValueError):
+        mode, piped = 0, True
+    if piped:
+        return ('t3-capacity: NOT OK (exit 1). If this output goes through a pipe (`| tail`), the pipe hides this exit '
+                'status: gate with `t3-capacity N && cmd`, never pipe it (`out=$(t3-capacity N) && cmd` is fine)')
+    if stat.S_ISCHR(mode):   # > /dev/null (or another device)
+        return ('t3-capacity: NOT OK (exit 1). The output went to /dev/null: the exit status is kept, so a gate like '
+                '`t3-capacity N >/dev/null && cmd` holds and cmd does not run')
+    return ('t3-capacity: NOT OK (exit 1). The output went to a file: the exit status is kept, so a gate like '
+            '`t3-capacity N > f && cmd` holds and cmd does not run')
 
 
 def held(r):
