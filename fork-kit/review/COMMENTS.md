@@ -81,8 +81,8 @@ The gate's rules for which comments count, in short (gate README,
 - **Where:** plain comments, reviews and inline review comments all count; a comment of a review not yet submitted
   (pending) never does.
 - **Who:** only comments whose author association is in the queue config's `lens_author_associations`.
-- **Which config:** the gate reads the queue config from the base tip, so a pull request is judged by the base's
-  rules, never by its own.
+- **Which config:** every rule that judges the head is the base tip's queue config. The gate reads the pull
+  request's merged config only to refuse one that does not parse (or is deleted, or gains a case twin).
 
 ## Verdicts
 

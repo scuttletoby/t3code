@@ -135,11 +135,13 @@ Each step is done by another agent than the author.
    `MINORS` in [lib/review_kit.py](lib/review_kit.py). With the default, a minor or nit is fixed in the pull request
    or dropped with a reason under "Left", and becomes an issue (with the project's labels) only as a real bug outside
    the pull request's scope. Blockers and majors are not minors: they are fixed before merge or the pull request is
-   stuck. A project that sets `issue` files the leftovers as **one** follow-up issue linked on the pull request.
-9. **Ready:** the project's ready command (the queue config's `ready_command`) arms the head every lens read. Push
-   after it only with the project's push command (`push_command`), which disarms it; a new head needs the lenses
-   again. Merging the base in to resolve a conflict makes a new head too. A pull request that is only behind its base
-   is left to the queue, which updates it.
+   stuck. A project that sets `issue` does what `MINORS['issue']` says instead.
+9. **Ready:** the project's ready command (the queue config's `ready_command`) arms the head every lens read. A push
+   after it leaves auto-merge on: the queue only quotes `push_command` in its comments, and nothing turns auto-merge
+   off on a push. Only the required `head_check` keeps the new, unread head from merging; it needs the lenses again
+   (or an override). Merging the base in to resolve a conflict makes a new head too. A project that wants a push to
+   disarm makes its push command turn auto-merge off. A pull request that is only behind its base is left to the
+   queue, which updates it.
 
 ## 4. Lenses
 

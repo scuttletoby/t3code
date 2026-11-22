@@ -105,6 +105,8 @@ moves that link when the pin moves. It never copies the kit's rules, and it neve
 differ is changed in the kit. It adds only project facts:
 
 - its tier names and examples, and how they map onto critical, normal and light;
-- its commands: build and test, ready and push, posting a comment, a check of a posted comment;
-- its domain lenses: their attack lists, test harnesses and end-to-end scenarios;
+- its commands: build and test, posting a comment, a check of a posted comment (ready and push are the queue
+  config's, above);
+- its domain lenses: the lens prompt files that hold their attack lists, and their test harnesses and end-to-end
+  scenarios;
 - its labels (risk labels for filed issues), its outside reviewers, and any effort raised for critical code.
