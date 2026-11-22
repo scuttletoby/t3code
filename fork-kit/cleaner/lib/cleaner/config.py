@@ -181,6 +181,12 @@ SPEC = {
     'daily': (dict, {}, None),
     'compressCold': (dict, {}, None),
     'dedupe': (dict, {}, None),
+    'report': (dict, {}, None),
+}
+# `fork-cleaner report` (report.py, #982): under warnFreeGB free on the home folder's disk the line ends with a LOW DISK
+# warning naming the largest folders in the home folder. 0 turns the warning off.
+REPORT_SPEC = {
+    'warnFreeGB': (int, 60, _at_least(0)),
 }
 WORKTREES_SPEC = {
     'repos': (list, (), None),
@@ -261,6 +267,7 @@ SOURCE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 # What each key can do. 'keeps more': it can only make the cleaner keep more. 'picks': it names what a rule looks
 # at or turns a rule on; every candidate still passes every refusal. 'floor': a number that cannot go below its
 # floor. 'own file': the cleaner's own log (it must be a new file or the cleaner's, never a must-keep path).
+# 'report only': read by `fork-cleaner report` alone, which deletes nothing.
 # 'loosens': it takes a refusal away for what it names. `regenerable` does, only for literal names it lists (never
 # a wildcard and never a credential-looking name), and `layered`, only the layered-filesystem refusal for the one
 # folder it is set on (every other check, the markers above it it can see among them, still holds). 'compare only': read by `fork-cleaner compare`
@@ -291,6 +298,8 @@ KEY_KINDS = {
     'agentScratch.days': 'floor', 'agentScratch.keepFirst': 'picks', 'agentScratch.transcripts': 'picks',
     'keepFirst.archive': 'own file', 'keepFirst.patterns': 'keeps more', 'keepFirst.outputs': 'keeps more',
     'keepFirst.maxFileBytes': 'floor', 'keepFirst.maxSessionBytes': 'picks',
+    # report: read by `fork-cleaner report` alone, which deletes nothing; it says when to warn of a low disk (#982).
+    'report': 'report only', 'report.warnFreeGB': 'report only',
 }
 
 
@@ -368,6 +377,7 @@ class Config:
         values = machine_file.fields(section, SPEC, where)
         self.home = os.path.realpath(home or pwd.getpwuid(os.getuid()).pw_dir)
         self.log_lines = values['logLines']
+        self.warn_free_gb = machine_file.fields(values['report'], REPORT_SPEC, f'{where}.report')['warnFreeGB']
         self.must_keep_text = MUST_KEEP + tuple(values['mustKeep'])
         # A path written through a symbolic link is kept as written and as the link resolves: both forms count.
         forms = []

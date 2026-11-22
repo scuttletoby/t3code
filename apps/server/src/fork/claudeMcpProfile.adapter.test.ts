@@ -248,6 +248,65 @@ const preToolUse = (
     return answers;
   });
 
+/** Hook input for `tool` whose `hook_event_name` is `eventName`, or left out when `omitEvent`. */
+const eventCall = (tool: string, eventName: unknown, omitEvent: boolean) => ({
+  ...(omitEvent ? {} : { hook_event_name: eventName }),
+  tool_name: tool,
+  tool_input: {},
+  tool_use_id: "toolu_profile",
+  session_id: NATIVE_THREAD,
+  transcript_path: "/tmp/transcript.jsonl",
+  cwd: "/workspace",
+});
+
+/** Event names a guard must not trust: missing, undefined, empty, another event, wrong case, a number. */
+const UNTRUSTED_EVENTS: ReadonlyArray<[label: string, eventName: unknown, omit: boolean]> = [
+  ["missing", undefined, true],
+  ["undefined", undefined, false],
+  ["empty", "", false],
+  ["PostToolUse", "PostToolUse", false],
+  ["lower case", "pretooluse", false],
+  ["not a string", 7, false],
+];
+
+const decision = (answer: unknown) =>
+  (answer as { hookSpecificOutput?: { permissionDecision?: string } } | undefined)
+    ?.hookSpecificOutput?.permissionDecision;
+
+/**
+ * Under every untrusted event name, `refusedTool` is refused and `allowedTool` passes. Each call is
+ * made twice: the same call made again gets the same answer, as nothing is remembered between calls.
+ */
+const expectPerEventName = (
+  options: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined,
+  refusedTool: string,
+  allowedTool: string,
+) =>
+  Effect.gen(function* () {
+    for (const [label, eventName, omit] of UNTRUSTED_EVENTS) {
+      for (const attempt of [1, 2]) {
+        const answers = yield* preToolUse(
+          options,
+          refusedTool,
+          eventCall(refusedTool, eventName, omit),
+        );
+        assert.isTrue(
+          answers.some((answer) => decision(answer) === "deny"),
+          `${refusedTool}, event ${label}, try ${attempt}: expected a deny`,
+        );
+        const passed = yield* preToolUse(
+          options,
+          allowedTool,
+          eventCall(allowedTool, eventName, omit),
+        );
+        assert.isNotEmpty(passed, `${allowedTool}, event ${label}, try ${attempt}: no hook ran`);
+        for (const answer of passed) {
+          assert.deepStrictEqual(answer, {}, `${allowedTool}, event ${label}, try ${attempt}`);
+        }
+      }
+    }
+  });
+
 describe("ClaudeAdapterV2 MCP profile", () => {
   it.effect("with no profile set, opens Claude as before and never checks its servers", () =>
     Effect.gen(function* () {
@@ -459,6 +518,28 @@ describe("ClaudeAdapterV2 MCP profile", () => {
         "could not check this tool call, so it refused it",
       );
     }),
+  );
+
+  it.effect(
+    'the builtinTools "none" guard passes only MCP tools, whatever the event name says (#946)',
+    () =>
+      Effect.gen(function* () {
+        const bare = { servers: "all", t3Tools: "all", builtinTools: "none" } as const;
+        const { opened } = yield* runTurns({ mcpProfile: "bare", mcpProfiles: { bare } }, []);
+        yield* expectPerEventName(opened[0], "Bash", "mcp__t3-code__t3_thread_list");
+      }),
+  );
+
+  it.effect(
+    "the server-list guard refuses a left-out server, whatever the event name says (#946)",
+    () =>
+      Effect.gen(function* () {
+        const gh = { servers: ["gh"], t3Tools: "all" } as const;
+        const { opened } = yield* runTurns({ mcpProfile: "gh", mcpProfiles: { gh } }, [
+          { name: "gh", status: "connected" },
+        ]);
+        yield* expectPerEventName(opened[0], "mcp__x__Bash", "mcp__gh__list_issues");
+      }),
   );
 
   it.effect("refuses the turn, without opening Claude, when the profile is missing", () =>
