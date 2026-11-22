@@ -526,6 +526,76 @@ class Reservations(Case):
         self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 2000)
 
 
+    def reserve_line(self, line, age_s=0):
+        """One reservation file written age_s seconds before NOW (its mtime: what ttl= and idle= count from)."""
+        path = os.path.join(self.m.reserve, 'r.conf')
+        with open(path, 'w') as f:
+            f.write(line + '\n')
+        os.utime(path, (NOW.timestamp() - age_s,) * 2)
+        return path
+
+    def test_a_reservation_by_kind_is_sized_from_the_rule_and_heavy_s_peaks(self):
+        # #861: sized from measured use per job kind, not a guessed MB that is held for good
+        folder = os.path.join(self.tmp, 'game')
+        self.reserve_line(f'build {folder}/')
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual([(r['name'], r['mb']) for r in d['reservations']], [('r', self.cost('job-build'))])
+        state = os.path.join(self.m.home, '.local', 'state', 'heavy')
+        os.makedirs(state)
+        with open(os.path.join(state, 'peaks.json'), 'w') as f:
+            json.dump({'v': 1, 'kinds': {'build': [self.cost('job-build') * 2]}}, f)
+        learned = hq.reservation('build', self.cost('job-build'), state, out=lambda m: None)[0]
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['reservations'][0]['mb'], learned)
+        self.reserve_line(f'tsc {folder}/')                  # a kind the rule does not know: the expensive job default
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['reservations'][0]['mb'],
+                         self.cost(RULE['unknownKinds']['job']))
+
+    def test_ttl_ends_a_reservation_its_writer_stopped_renewing(self):
+        folder = os.path.join(self.tmp, 'game')
+        path = self.reserve_line(f'1536 {folder}/ ttl=2h', age_s=2 * 3600 + 1)
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual(d['memory']['holdMb'], 0)
+        self.assertTrue(any('r.conf:1 ended: its ttl=' in n for n in d['notes']), d['notes'])
+        os.utime(path, (NOW.timestamp() - 60,) * 2)     # renewed (touched) a minute ago
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 1536)
+        os.utime(path, (NOW.timestamp() + 3600,) * 2)   # written "in the future" (a clock that went back): holds
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 1536)
+
+    def test_idle_releases_a_reservation_nobody_works_in(self):
+        # #861: 1536 MB held while using 0 for a long time kept other work out for memory nobody used
+        folder = os.path.join(self.tmp, 'game')
+        os.makedirs(folder)
+        path = self.reserve_line(f'1536 {folder}/ idle=30m', age_s=31 * 60)
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual(d['memory']['holdMb'], 0)
+        self.assertTrue(any('reservation r is idle' in n for n in d['notes']), d['notes'])
+        self.m.process(4001, folder + '/sub', 0)        # someone works there again (using nothing yet): it holds
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 1536)
+        shutil.rmtree(f'{self.m.root}/proc/4001')
+        os.utime(path, (NOW.timestamp() - 60,) * 2)     # nobody there, but written a minute ago: it holds
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 1536)
+
+    def test_a_bad_or_unknown_option_never_makes_a_line_hold_less(self):
+        folder = os.path.join(self.tmp, 'game')
+        for line in (f'1536 {folder}/ ttl=soon', f'1536 {folder}/ idle=-1m', f'1536 {folder}/ # the game',
+                     f'1536 {folder}/ ttl=', f'1536 {folder}/ owner=me'):
+            with self.subTest(line=line):
+                self.reserve_line(line, age_s=86400 * 30)
+                self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 1536)
+
+    def test_idle_is_not_applied_to_a_reservation_whose_processes_cannot_be_seen(self):
+        # another person's reservation (the machine tier): a caller that is not root cannot see their working
+        # folders, so it cannot tell idle from busy: it holds (stricter, never looser)
+        if os.geteuid() == 0:
+            self.skipTest('root sees every folder')
+        folder = os.path.join(self.tmp, 'game')
+        r = {'name': 'owner:game', 'prefixes': [folder + '/'], 'mb': 1536, 'useMb': 0, 'owedMb': 0,
+             'uid': os.getuid() + 1, 'idleAt': 0, 'procs': 0}
+        self.assertEqual(hf.release_idle([r], NOW.timestamp()), [])
+        self.assertEqual(r['mb'], 1536)
+
+
+
 class Holds(Case):
     """heavy.capacity.holds of the machine file: a cgroup outside the user managers (here a CI runners' slice) that
     is in use keeps its budget less its use for every other user."""
@@ -772,6 +842,22 @@ class State(Case):
         later = t2 + datetime.timedelta(seconds=6 + hf.CARRY_SECONDS + 1)
         self.assertEqual(self.facts('--mb', '64', now=later)[1]['level'], 'ok', 'a reading older than 5 min is not carried')
 
+    def test_the_last_swap_reading_carries_to_the_next_call(self):
+        # #839: swap that fills between two `heavy facts` calls is seen only through the swap free carried in the
+        # cache (the trend); without it each call would see no trend and stay "ok"
+        self.m.write('/proc/meminfo', self.m.meminfo(16384, 12288, swap_free=600))
+        self.assertEqual(self.facts('--mb', '64')[1]['level'], 'ok', 'no trend yet')
+        self.m.write('/proc/meminfo', self.m.meminfo(16384, 12288, swap_free=500))
+        t = NOW + datetime.timedelta(seconds=6)
+        fill = RULE['pressure']['swapFillingMb']
+        self.assertLess(fill, 100)
+        self.assertEqual(self.facts('--mb', '64', now=t)[1]['level'], 'elevated',
+                         f'it fell 100 MB (more than {fill}) since the last call, under 15% free: filling')
+        os.unlink(self.m.cache)                     # the same reading without the carried one: no trend
+        self.assertEqual(self.facts('--mb', '64', now=t)[1]['level'], 'ok')
+        with open(self.m.cache) as f:
+            self.assertEqual(json.load(f)['pressure']['job']['swapFreeMb'], 500, 'kept for the next call')
+
     def test_cost_file_missing_learned_broken(self):
         build = 'job-build'
         if build not in RULE['kinds']:
@@ -958,6 +1044,61 @@ class T3Capacity(Case):
         self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'))
         for bad in (['x'], ['1', '2'], ['--kind']):
             self.assertEqual(self.cli([T3CAP] + bad)[0], 2, bad)
+
+    def test_a_not_ok_holds_20_s_for_the_same_question(self):
+        # #861: the check flipped OK / NOT OK within seconds, so "check, then start" could start work just before it
+        # turned NOT OK; the orchestrator checked twice, 20 s apart. Now a NOT OK holds that long by itself.
+        self.m.write('/proc/meminfo', self.m.meminfo(16384, 2048))      # busy for 1536 MB
+        code, out, _ = self.cli([T3CAP, '1536'])
+        self.assertEqual(code, 1)
+        self.m.write('/proc/meminfo', self.m.meminfo(16384, 12288))     # free again a second later
+        os.unlink(self.m.cache)
+        code, out, _ = self.cli([T3CAP, '1536'])
+        self.assertEqual(code, 1, 'held')
+        self.assertRegex(out.splitlines()[0], self.FIRST, 'the first line callers parse is unchanged')
+        self.assertTrue(out.splitlines()[-1].startswith('NOT OK: held: NOT OK '), out)
+        self.assertEqual(self.cli([T3CAP, '1024'])[0], 0, 'another question is not held')
+        hold_file = os.path.join(os.path.dirname(self.m.cache), hf.HOLD_FILE)
+        with open(hold_file) as f:
+            state = json.load(f)
+        state['busy'] = {k: v - 21_000 for k, v in state['busy'].items()}     # 21 s later
+        with open(hold_file, 'w') as f:
+            json.dump(state, f)
+        self.assertEqual(self.cli([T3CAP, '1536'])[0], 0, 'the hold has ended')
+
+    def test_the_hold_runs_again_and_meets_old_broken_or_foreign_state(self):
+        folder = os.path.join(self.tmp, 'hold')
+        os.makedirs(folder, mode=0o700)
+        path = os.path.join(folder, hf.HOLD_FILE)
+        t = 1_000_000_000_000
+        self.assertEqual(hf.hold('k:1', 'free', t, folder)[:2], ('free', None))
+        self.assertFalse(os.path.exists(path), 'nothing to keep: nothing written')
+        self.assertEqual(hf.hold('k:1', 'busy', t, folder)[:2], ('busy', None))
+        self.assertEqual(hf.hold('k:1', 'free', t + 19_999, folder)[0], 'busy')
+        self.assertEqual(hf.hold('k:1', 'free', t + 19_999, folder)[0], 'busy', 'runs again: still held')
+        self.assertEqual(hf.hold('k:1', 'free', t + 20_000, folder)[0], 'free', 'a held answer did not extend it')
+        self.assertEqual(json.load(open(path))['busy'], {}, 'an ended hold is dropped')
+        self.assertEqual(hf.hold('k:1', 'unavailable', t, folder)[0], 'unavailable')
+        self.assertEqual(hf.hold('k:1', 'free', t - 5_000, folder)[0], 'busy', 'a clock that went back: held')
+        self.assertEqual(hf.hold('k:1', 'free', t + 15_000, folder)[0], 'busy', 'and started again then')
+        for bad in ('{broken', '', '{"v": 2, "busy": {}}', '{"v": 1, "busy": {"k:1": "x"}}', '[]'):
+            with self.subTest(bad=bad):
+                with open(path, 'w') as f:
+                    f.write(bad)
+                verdict, why, _ = hf.hold('k:1', 'free', t, folder)
+                self.assertEqual(verdict, 'busy', 'a hold file that cannot be read holds (fails closed)')
+                self.assertIn('cannot be read', why)
+                self.assertEqual(hf.hold('k:1', 'free', t + 20_000, folder)[0], 'free', 'written again: it heals')
+        os.unlink(path)
+        os.symlink(os.path.join(self.tmp, 'elsewhere'), path)          # a link planted there
+        self.assertEqual(hf.hold('k:1', 'free', t, folder)[0], 'busy')
+        self.assertFalse(os.path.islink(path), 'replaced by a file of its own')
+        os.chmod(path, 0o644)                                           # open to others
+        self.assertEqual(hf.hold('k:1', 'free', t + 40_000, folder)[0], 'busy')
+        for name in os.listdir(folder):                                 # a writer stopped half-way leaves a .tmp
+            self.assertFalse(name.endswith('.tmp'), name)
+        with mock.patch.object(hf, 'state_folder', lambda: (None, 'no temporary folder')):
+            self.assertEqual(hf.hold('k:1', 'free', t)[0::2], ('free', 'no hold of a NOT OK (no temporary folder)'))
 
     def test_reservations_line_and_available_after_them(self):
         other = os.path.join(self.tmp, 'other')

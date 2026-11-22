@@ -14,7 +14,9 @@ Output, kept as the older t3-capacity had it so hooks and scripts that read it k
   then     reservations: <name>:<MB>MB(using <MB>,holding <MB>) or <name>:own (a reservation of the caller's folder;
            holding is what is left after its use and the debts of agents and jobs working in it, ", owed <MB>")
            note: <text>, fits: <kind>=<n> ..., and last "NOT OK: <why>" or "OK".
-Exit 0 OK, 1 NOT OK (busy, or heavy facts did not answer within 5 s: never OK), 2 a wrong call. A NOT OK with stdout
+Exit 0 OK, 1 NOT OK (busy, or heavy facts did not answer within 5 s: never OK), 2 a wrong call. A NOT OK holds 20 s
+for the same question (kind and MB): an OK read within that time is "NOT OK: held: ..." (#861; heavy facts'
+cache folder keeps it in t3-capacity-hold.json). A NOT OK with stdout
 not a terminal also says on stderr that a pipe would hide the exit status.
 """
 import os, sys
@@ -53,6 +55,10 @@ def main(argv):
     try:
         hf = facts_module()
         verdict, why, d = hf.ask(hf.test_env('T3_CAPACITY_HEAVY') or os.path.join(KIT, 'bin', 'heavy'), kind, need)
+        verdict, held_why, note = hf.hold(f'{kind or ""}:{"" if need is None else need}', verdict)
+        why = held_why or why
+        if note and d is not None:
+            d['notes'].append(note)
     except Exception as e:      # the caller itself cannot run: never OK
         verdict, why, d = 'unavailable', f'{e.__class__.__name__}: {e}', None
     if d is None:

@@ -196,11 +196,27 @@ def under(cwd, prefixes):
     return any(c.startswith(p) for p in prefixes)
 
 
-def reservation_files(cfg_dir, today, owner=None):
-    """The reservations in one reserve.d: ([{name, prefixes, mb, useMb, owedMb, uid}], notes, blind). owner: None
-    for the caller's own folder (missing or unreadable files hold nothing, as before); (name, uid) for another
-    user's (the machine tier): a folder or file that is there but cannot be read is 'blind' (never free), and only
-    plain files are read (no FIFO can stop the reading)."""
+DURATION_RE = re.compile(r'^([0-9]{1,6})([smhd])\Z')
+
+
+def duration(text):
+    """Seconds of `30m`, `2h`, `1d`, `90s`; ValueError for anything else."""
+    m = DURATION_RE.match(text)
+    if not m:
+        raise ValueError(f'{text!r} is not a duration like 30m, 2h, 1d')
+    return int(m.group(1)) * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[m.group(2)]
+
+
+def reservation_files(cfg_dir, now, owner=None, size=None):
+    """The reservations in one reserve.d: ([{name, prefixes, mb, useMb, owedMb, uid, idleAt, procs}], notes, blind).
+    owner: None for the caller's own folder (missing or unreadable files hold nothing, as before); (name, uid) for
+    another user's (the machine tier): a folder or file that is there but cannot be read is 'blind' (never free),
+    and only plain files are read (no FIFO can stop the reading). A line is `<MB or kind> <folder> [until=DATE]
+    [ttl=DUR] [idle=DUR]` (#861): a kind is sized by size(kind), the rule's cost for it (learned from heavy's peaks);
+    ttl ends it DUR after its file was last written (touch it to renew); idle (see release_idle) lets it hold
+    nothing once nobody works in its folder and its file was not written for DUR. An unknown word is ignored with a
+    note, never read as a smaller size."""
+    today = now.date()
     out, notes, blind = [], [], []
     tag = f'{owner[0]}:' if owner else ''
     try:
@@ -216,7 +232,8 @@ def reservation_files(cfg_dir, today, owner=None):
             fd = os.open(os.path.join(cfg_dir, f), os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK |
                          (os.O_NOFOLLOW if owner else 0))
             try:
-                if owner and not stat.S_ISREG(os.fstat(fd).st_mode):
+                st = os.fstat(fd)
+                if owner and not stat.S_ISREG(st.st_mode):
                     raise OSError(errno.EINVAL, 'not a plain file')
                 data = os.read(fd, 1 << 16)
                 if len(data) == 1 << 16:            # longer than that: its whole lines only
@@ -236,16 +253,34 @@ def reservation_files(cfg_dir, today, owner=None):
                 continue
             until = [w[6:] for w in words[2:] if w.startswith('until=')]
             try:
-                if not (words[0].isdigit() and len(words) >= 2 and words[1].startswith('/')):
-                    raise ValueError('not "<MB> <absolute folder>"')
+                if not (len(words) >= 2 and words[1].startswith('/')
+                        and (words[0].isdigit() or size is not None and KIND_RE.match(words[0]))):
+                    raise ValueError('not "<MB or kind> <absolute folder>"')
                 if until and datetime.date.fromisoformat(until[0]) < today:
                     notes.append(f'reservation {tag}{f}:{n} ended {until[0]}: holds nothing')
                     continue
+                mb = int(words[0]) if words[0].isdigit() else size(words[0])
             except ValueError as e:
                 notes.append(f'reservation {tag}{f}:{n} ignored ({e})')
                 continue
-            out.append({'name': tag + f[:-5], 'prefixes': folder_prefixes(words[1]), 'mb': int(words[0]),
-                        'useMb': 0, 'owedMb': 0, 'uid': owner[1] if owner else os.getuid()})
+            # ttl= and idle= only ever let a line hold less once they are read whole: a bad one is a note and the
+            # line holds as if it were not there (never less than before #861)
+            ends = {}
+            for w in words[2:]:
+                key, _eq, value = w.partition('=')
+                if key in ('ttl', 'idle'):
+                    try:
+                        ends[key] = st.st_mtime + duration(value)
+                    except ValueError as e:
+                        notes.append(f'reservation {tag}{f}:{n}: {key}= not read ({e}): it holds as without it')
+            if ends.get('ttl') is not None and ends['ttl'] < now.timestamp():
+                notes.append(f'reservation {tag}{f}:{n} ended: its ttl= since its file was last written is over; '
+                             f'holds nothing (touch the file to renew it)')
+                continue
+            idle_at = ends.get('idle')
+            out.append({'name': tag + f[:-5], 'prefixes': folder_prefixes(words[1]), 'mb': mb,
+                        'useMb': 0, 'owedMb': 0, 'uid': owner[1] if owner else os.getuid(), 'idleAt': idle_at,
+                        'procs': 0})
     return out, notes, blind
 
 
@@ -338,6 +373,7 @@ def count_in_reservations(res, owners, debts):
         r = best(res, uid, cwd) if cwd else None
         if r:
             r['useMb'] += kb / 1024
+            r['procs'] = r.get('procs', 0) + 1
     members = {}
     for pid, i in owners.items():
         if pid in procs:
@@ -351,6 +387,23 @@ def count_in_reservations(res, owners, debts):
             r = best(res, uid, cwd) if cwd else None
             if r:
                 r['owedMb'] += debts[i] * (kb / total if total else 1 / len(pids))
+
+
+def release_idle(res, now_s):
+    """#861: a reservation with idle=DUR holds nothing once no process of its user works in its folder and its file
+    was not written for DUR (the room is kept for work that comes back soon, not for good). Only where the processes
+    can be seen: its user's own, or any for root; another user's processes in it cannot be seen by a caller that is
+    not root, so their idle= is not applied there (it holds, stricter). Returns notes."""
+    notes = []
+    for r in res:
+        if r.get('idleAt') is None or r['procs'] or now_s < r['idleAt']:
+            continue
+        if r['uid'] != os.getuid() and os.geteuid() != 0:
+            continue
+        notes.append(f'reservation {r["name"]} is idle (nobody works in its folder, its file not written since '
+                     f'{int(now_s - r["idleAt"])} s past its idle=): holds nothing')
+        r['mb'] = 0
+    return notes
 
 
 def _hold_cgroup(value):
@@ -571,7 +624,9 @@ def read_machine(rule, where, carry, now):
             notes += blind
     learned_notes = []
     learned = where['learned'](learned_notes)
-    res, more, _ = reservation_files(where['reserveDir'], now.date())
+    def size(kind):        # a reservation by kind (#861): the rule's cost of one piece of it, learned from peaks
+        return cr.cost_of(rule, ask_kind(rule, kind), learned, None)['mb']
+    res, more, _ = reservation_files(where['reserveDir'], now, size=size)
     notes += more
     if tier != 'basic':
         # #945: a caller with no user manager is often another user (a CI runner, root), whose own reserve.d is not
@@ -581,7 +636,7 @@ def read_machine(rule, where, carry, now):
         # was not read at all: a person who wants it seen makes ~/.config/t3-capacity/reserve.d readable to others.
         dirs, blind = other_reserve_dirs(uid)
         for name, u, folder in dirs:
-            more_res, more, cannot = reservation_files(folder, now.date(), (name, u))
+            more_res, more, cannot = reservation_files(folder, now, (name, u), size)
             res += more_res
             notes += more
             blind += cannot
@@ -592,6 +647,7 @@ def read_machine(rule, where, carry, now):
             notes += [b.replace(': never free here', '') + ': not counted' for b in blind[:8]]
     # #923, #945: a piece working in a reservation's folder owes its debt once, not there too, and never in two
     count_in_reservations(res, owners, {i: debt(rule, learned, pieces[i], m['totalMb']) for i in set(owners.values())})
+    notes += release_idle(res, now.timestamp())
     held, more = held_cgroups(host, where['holds'], where['user'])
     notes += [f'reservation {n}.conf has the name of a machine-file hold: both hold; rename the file'
               for n in sorted({r['name'] for r in res} & {h['label'] for h in where['holds']})]
@@ -810,6 +866,71 @@ def cache_path(run, key):
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
         return None, f'no cache: {folder} is not a folder only this user can use: every call starts "elevated"'
     return os.path.join(folder, cache_name(key)), None
+
+
+HOLD_SECONDS = 20                               # #861: a NOT OK holds this long for the same question
+HOLD_FILE = 't3-capacity-hold.json'
+
+
+def state_folder():
+    """(the folder of heavy facts' cache, None) or (None, why there is none): $HEAVY_FACTS_CACHE's folder, else
+    /run/user/<uid>, else this user's private folder in the temporary folder (cache_path)."""
+    if os.environ.get('HEAVY_FACTS_CACHE'):
+        return os.path.dirname(os.path.abspath(os.environ['HEAVY_FACTS_CACHE'])), None
+    path, why = cache_path(f'{RUN_USER}/{os.getuid()}', '')
+    return (os.path.dirname(path), None) if path else (None, why)
+
+
+def hold(question, verdict, now_ms=None, folder=None):
+    """#861: hysteresis for a capacity check that flips between OK and NOT OK within seconds, so a "check, then
+    start" never starts work just before the answer turns NOT OK again. A NOT OK for a question (kind and MB) holds
+    HOLD_SECONDS: within that time the same question answers NOT OK, however the machine reads. The time starts at
+    each NOT OK read from the machine (a held one does not extend it). (verdict, why it was held or None, a note or
+    None). Fails closed: a hold file that cannot be read (broken, another owner's, a link, open to others) holds
+    this question once more and is written again; a time in the future (a clock that went back) holds and starts
+    again. No folder to keep it in: no hold, with a note (as before #861)."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if folder is None:
+        folder, why = state_folder()
+        if folder is None:
+            return verdict, None, f'no hold of a NOT OK ({why})'
+    path = os.path.join(folder, HOLD_FILE)
+    busy, broken = {}, False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if st.st_uid != os.getuid() or st.st_mode & 0o077 or not stat.S_ISREG(st.st_mode):
+                raise ValueError('not a private file of this user')
+            data = cr.loads(os.read(fd, 1 << 16).decode('utf-8'))
+        finally:
+            os.close(fd)
+        if not (isinstance(data, dict) and data.get('v') == 1 and isinstance(data.get('busy'), dict)
+                and all(type(v) is int for v in data['busy'].values())):
+            raise ValueError('not a hold file of this version')
+        busy = data['busy']
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        broken = True
+    at = busy.get(question)
+    why = None
+    if verdict == 'free':
+        if broken:
+            why = f'held: the hold file {path} cannot be read, so a NOT OK of the last {HOLD_SECONDS} s may be in it'
+        elif at is not None and (at > now_ms or now_ms - at < HOLD_SECONDS * 1000):
+            why = (f'held: NOT OK {max(0, now_ms - at) // 1000} s ago for this question; OK needs {HOLD_SECONDS} s '
+                   f'without one (a check that flips must not let work start just before it turns NOT OK)')
+    if verdict != 'free' or broken or (at is not None and at > now_ms):
+        busy[question] = now_ms                     # a NOT OK read now (or a broken or future state): start again
+    keep = {k: v for k, v in busy.items() if 0 <= now_ms - v < HOLD_SECONDS * 1000}
+    note = None
+    if keep != busy or broken or verdict != 'free':
+        try:
+            write_cache(path, {'v': 1, 'busy': keep})  # whole or not at all; old temporary files go too
+        except OSError as e:
+            note = f'the hold of a NOT OK was not written ({e.strerror or e})'
+    return ('busy' if why else verdict), why, note
 
 
 def facts_main(argv, slice_name, queue_root, hq, now=None):
