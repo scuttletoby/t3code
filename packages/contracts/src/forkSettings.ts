@@ -46,8 +46,8 @@ import { ThreadRolesFromSettingsFile, ThreadRolesPatch } from "./threadRoles.ts"
 import { AssistantSettingsFromSettingsFile, AssistantSettingsPatch } from "./assistant.ts";
 import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
+  UsagePacingFromSettingsFile,
   UsagePacingGateMode,
-  UsagePacingInstanceSettings,
   UsagePacingInstanceSettingsPatch,
   UsagePacingLowerEffort,
 } from "./usagePacing.ts";
@@ -83,9 +83,7 @@ export const ForkServerSettingsFields = {
   /** Answers "is T3 busy?" read-only on loopback (GET /api/fork/activity); off: no such route. */
   activityProbe: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Usage pacing per provider instance; an instance without an entry has no reserve. */
-  usagePacing: Schema.Record(ProviderInstanceId, UsagePacingInstanceSettings).pipe(
-    Schema.withDecodingDefault(Effect.succeed({})),
-  ),
+  usagePacing: UsagePacingFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   /** The usage pacing gate on agent-delegated tasks; `off` keeps upstream's behaviour. */
   usagePacingGate: UsagePacingGateMode.pipe(Schema.withDecodingDefault(Effect.succeed("off"))),
   /** Effort levels the gate may lower to; empty never lowers one. */
