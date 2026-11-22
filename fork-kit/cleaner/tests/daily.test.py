@@ -96,7 +96,7 @@ class Case(fx.Case):
         lines = []
         report = lambda cfg, say, out=None: self.c.report.report(          # noqa: E731
             cfg, say, docker=lambda: {}, host='host-1', mounts=lambda: {'/'}, out=out,
-            disk_of=lambda cfg: (1 << 30, 1 << 31, os.stat(cfg.home).st_dev))
+            disk_of=lambda cfg: (1 << 30, 1 << 31, os.stat(cfg.home).st_dev, 1 << 30))
         code = self.c.daily.daily(cfg, lines.append, facts=self.facts, systemctl=self.systemctl, report=report,
                                   now=lambda: at or self.now)
         return code, lines

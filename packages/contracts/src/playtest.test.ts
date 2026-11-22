@@ -200,14 +200,27 @@ describe("playtest settings in the settings file", () => {
     expect(settings.projectSettingsOverrides[PROJECT]?.playtest).toEqual(DEFAULT_PLAYTEST_SETTINGS);
   });
 
-  it.effect("warns when it drops a bad value", () =>
+  it.effect("warns when it drops a bad value, naming an unknown field", () =>
     Effect.gen(function* () {
       const logged: Array<unknown> = [];
       const logger = Logger.make(({ message }) => logged.push(message));
-      yield* decodeFileEffect(without("claim")).pipe(
-        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
-      );
+      const drop = (bad: unknown) =>
+        decodeFileEffect(bad).pipe(
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        );
+      yield* drop(without("claim"));
       expect(JSON.stringify(logged)).toContain("invalid playtest settings read as off");
+      yield* drop({ ...ADAPTER, claim: { ...ADAPTER.claim, maxRuns: 1 } });
+      expect(String(logged.at(-1))).toContain(
+        'Expected no excess property at ["claim"]["maxRuns"]',
+      );
+      expect(String(logged.at(-1))).not.toMatch(/\s{2}/);
+      yield* drop({
+        ...ADAPTER,
+        claim: step(["game", "--token=SECRETVALUE"]),
+      });
+      expect(String(logged.at(-1))).toContain("invalid playtest settings read as off");
+      expect(String(logged.at(-1))).not.toContain("SECRETVALUE");
     }),
   );
 

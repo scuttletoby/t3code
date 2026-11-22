@@ -9,6 +9,7 @@ import {
   placementFactsCommandProblem,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -30,6 +31,24 @@ const notAvailable = (reason: string): FactsCommandResult => ({ available: false
 
 const isLabel = Schema.is(PlacementLabel);
 
+/**
+ * Whether PATHEXT, read as shared/shell's file lookup reads it (`resolveWindowsPathExtensions`: the
+ * key in any case, entries trimmed and upper-cased, a dot added; unset or no entries means its
+ * default list, which has .EXE), lists .EXE. Kept in step with it by the real-lookup tests.
+ */
+const pathextHasExe = (env: NodeJS.ProcessEnv): boolean => {
+  const raw =
+    env.PATHEXT ??
+    Object.entries(env).find(
+      ([key, value]) => key.toUpperCase() === "PATHEXT" && value !== undefined,
+    )?.[1];
+  const entries = (raw ?? "")
+    .split(";")
+    .map((entry) => entry.trim().toUpperCase())
+    .filter((entry) => entry !== "");
+  return entries.length === 0 || entries.some((entry) => entry === ".EXE" || entry === "EXE");
+};
+
 /** The first line of the program's output that says something, for the reason. */
 const firstLine = (text: string) =>
   text
@@ -39,25 +58,48 @@ const firstLine = (text: string) =>
     ?.slice(0, 200);
 
 /**
- * Exit 0: available, each printed line one more label (a line that is not one label is skipped).
- * Any other exit, a timeout or a failed start: not available, with the reason. Never fails. The path
- * is checked again on this OS (a hand edit skips the save's check) and run as one path, no shell,
- * no arguments; on Windows only an `.exe`, since a `.cmd` or `.bat` needs a shell.
+ * Exit 0: available, each printed line a label (others skipped); anything else: not available, with
+ * the reason. Never fails. The path is checked again on this OS and run as one path, no shell, no
+ * arguments; on Windows only an `.exe`, checked on the file the runner's own lookup would start, and
+ * only on a server whose PATHEXT lists .EXE (else that lookup could start a different file).
  */
 export const runFactsCommand = Effect.fn("FactsCommand.run")(function* (factsCommand: string) {
   if (factsCommand === "") return { available: true, labels: [] } satisfies FactsCommandResult;
   const platform = yield* HostProcess.Platform;
   const problem = placementFactsCommandProblem(factsCommand, platform);
   if (problem !== undefined) return notAvailable(problem);
-  if (platform === "win32" && !/\.exe$/iu.test(factsCommand)) {
-    return notAvailable(
-      `factsCommand "${factsCommand}" is not an .exe: on Windows a .cmd, .bat or script needs a shell, which placement never uses`,
-    );
+  let command = factsCommand;
+  if (platform === "win32") {
+    if (!/\.exe$/iu.test(factsCommand)) {
+      return notAvailable(
+        `factsCommand "${factsCommand}" is not an .exe: on Windows a .cmd, .bat or script needs a shell, which placement never uses`,
+      );
+    }
+    // Without .EXE in PATHEXT the lookup tries `facts.exe` plus each PATHEXT ending, and the runner
+    // looks up again before it starts the program: a `facts.exe.CMD` planted between the two would
+    // run through a shell. With .EXE listed, both lookups try only `.exe` spellings of the path.
+    if (!pathextHasExe(yield* HostProcess.Environment)) {
+      return notAvailable(
+        `factsCommand "${factsCommand}" cannot run on this server: its PATHEXT has no .EXE, so the file lookup would also start a planted "${factsCommand}.CMD" (or .BAT) through a shell, which placement never uses`,
+      );
+    }
+    const resolved = yield* resolveSpawnCommand(factsCommand, []);
+    if (resolved.shell) {
+      return notAvailable(
+        `factsCommand "${factsCommand}" would run through a shell on this server (as ${resolved.command}), which placement never uses`,
+      );
+    }
+    if (!/\.exe$/iu.test(resolved.command)) {
+      return notAvailable(
+        `factsCommand "${factsCommand}" runs as "${resolved.command}" on this server, not an .exe`,
+      );
+    }
+    command = resolved.command;
   }
   const runner = yield* ProcessRunner.ProcessRunner;
   const result = yield* runner
     .run({
-      command: factsCommand,
+      command,
       args: [],
       timeout: FACTS_COMMAND_TIMEOUT,
       timeoutBehavior: "timedOutResult",
@@ -79,7 +121,8 @@ export const runFactsCommand = Effect.fn("FactsCommand.run")(function* (factsCom
     );
   }
   if (code !== 0) {
-    const said = firstLine(`${stdout}\n${stderr}`);
+    // The error output first: a label line printed before the failure would hide it.
+    const said = firstLine(`${stderr}\n${stdout}`);
     return notAvailable(
       `factsCommand exited with ${code === null ? "no code" : `code ${code}`}${said === undefined ? "" : `: ${said}`}`,
     );

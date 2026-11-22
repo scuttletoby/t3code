@@ -1007,15 +1007,17 @@ SCAN_RUN_LINE = 'bash "${RUNNER_TEMP:?}/scan-from-default-branch.sh"'
 # runner (#701 review A); and the repository's caches outgrow their 10 GB, so the record was evicted
 # within hours (review B). The read step runs only for the sweep, holds only the job's read-only token
 # (no secret), takes the record only from a run of fork-secret-sweep.yml (that path, schedule or
-# workflow_dispatch, this branch, this repository and not a fork, ended success or failure, an ancestor
-# commit, not this run but for a re-run's own newest earlier attempt, in a run of the sweep's workflow) and its
+# workflow_dispatch, this branch, this repository and not a fork, ended success or failure or a reset run
+# in any state, #992, an ancestor commit, not this run but for a re-run's own newest earlier attempt, in a
+# run of the sweep's workflow, unless the re-run's run started before a listed reset run, #992) and its
 # one artifact of that name, never unpacks the archive (one plain file read in memory, every line
 # checked), and falls back to a first run on any doubt; it reads nothing while a tag is named like the
 # branch (#703); reset_record leaves an empty record instead (a reset run's re-run: its own newest
 # earlier attempt's record, else, or on any failed or doubtful read, the empty one, #791; "Re-run failed
 # jobs" is expected to leave that record in the run (not yet seen live), "Re-run all jobs" deletes it, and
-# such a re-run warns and reads as a new run does, #950); a reset run cancelled before it ended (known by
-# its run name) is read as no record and no older one is either: the empty one (#950). Its output `read`
+# such a re-run warns and reads as a new run does, #950); a reset run (known by its run name) whose record
+# is not read (cancelled, failed before its upload, a re-run under way, or on a commit this branch
+# lacks) leaves no older one read either: the empty one (#950, #992). Its output `read`
 # (found, none, reset, failed) tells the scan
 # step whether a partial record may replace the last one (#703). Its behaviour: the reader e2e below.
 # The keep step uploads only on a branch, once the scan step has written the record whole (its output
@@ -1074,28 +1076,45 @@ if ! tag="$(gh api -X GET "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$BRAN
   none failed "whether a tag is named like this branch cannot be checked"
 fi
 [[ -z "$tag" ]] || none failed "a tag is named like this branch, and a sweep run on it would pass for one on the branch"
+# The runs that ended in success or failure, and every reset run (known by its run name,
+# fork-secret-sweep.yml's run-name, #950) whatever its outcome, unfinished too: a re-run of one
+# that waits or runs (#992). So no status filter: the API then lists unfinished runs as well.
 runs=""
 if [[ "$RESET" != true ]] && ! runs="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/fork-secret-sweep.yml/runs" \
-    -f branch="$BRANCH" -f status=completed -f per_page=30 --jq '.workflow_runs[] |
+    -f branch="$BRANCH" -f per_page=30 --jq '.workflow_runs[] |
       select(.path == ".github/workflows/fork-secret-sweep.yml" and (.event == "schedule" or .event == "workflow_dispatch")
         and .head_branch == env.BRANCH and .repository.full_name == env.GITHUB_REPOSITORY
-        and .head_repository.full_name == env.GITHUB_REPOSITORY and .status == "completed"
-        and (.conclusion == "success" or .conclusion == "failure"
-          or (.conclusion == "cancelled" and .display_title == "Fork secret sweep (reset_record)"))) |
-      "\(.id) \(.head_sha) \(.conclusion)"')"; then
+        and .head_repository.full_name == env.GITHUB_REPOSITORY
+        and (.display_title == "Fork secret sweep (reset_record)"
+          or (.status == "completed" and (.conclusion == "success" or .conclusion == "failure")))) |
+      "\(.id) \(.head_sha) \(if .display_title == "Fork secret sweep (reset_record)" then "reset" else "sweep" end)"')"; then
   none failed "the sweep's earlier runs cannot be listed"
 fi
+# A re-run of a sweep run that started before a reset run (a higher run id: ids only go up) does
+# not read its own earlier attempt's record, which is from before that reset (#992): it reads as a
+# new run does, so the reset run's record or the empty one. It sees only the reset runs listed.
+if [[ -n "$self" ]]; then
+  while read -r id sha kind; do
+    [[ "$kind" == reset && "$id" =~ ^[1-9][0-9]{0,17}$ && "$id" -gt "$GITHUB_RUN_ID" ]] || continue
+    echo "::warning title=Secret scan::this re-run's run started before sweep run $id, a reset run (input reset_record), so its own earlier attempt's record, from before that reset, is not read: it reads as a new run does" >&2
+    self=""
+    break
+  done <<< "$runs"
+fi
+# unread WHY: a run whose record is not read. A reset run's (none kept: cancelled, failed before
+# its upload, a re-run of it still under way; expired; or on a commit this branch lacks): an older
+# record may be from before the reset, so none is read, and this run takes the empty record (kept
+# even if it fails), as that run did (#950, #992). So does a reset run waiting behind this one:
+# safe, only a second set of lookups. Any other run: the next one is tried.
+unread() {
+  [[ "$kind" == reset ]] || return 0
+  echo "::warning title=Secret scan::sweep run $id, a reset run (input reset_record), $1, so no record from before it is read" >&2
+  empty_record
+}
 from=""
-while read -r id sha how; do
+while read -r id sha kind; do
   [[ "$id" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
   [[ "$id" != "$GITHUB_RUN_ID" || "$id $sha" == "$self" ]] || continue
-  # A reset run cancelled before it ended (known by its run name, fork-secret-sweep.yml's
-  # run-name, #950): its record is not read, and an older one may be from before the reset,
-  # so none is read. This run takes the empty record (kept even if it fails), as that run did.
-  if [[ "$how" == cancelled ]]; then
-    echo "::warning title=Secret scan::sweep run $id, a reset run (input reset_record), was cancelled, so no record from before it is read" >&2
-    empty_record
-  fi
   # "LISTED KEPT [ID SIZE]": how many artifacts the API listed for the name, and how many of
   # them are this run's unexpired record (at most one, else no record is trusted).
   if ! found="$(RUN="$id" gh api -X GET "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" -f name=fork-secret-sweep-record \
@@ -1111,12 +1130,12 @@ while read -r id sha how; do
     echo "::notice title=Secret scan::this run's own records: the API listed $listed artifact(s) of that name, $kept of them this run's unexpired record"
     [[ "$kept" == 1 ]] || echo "::warning title=Secret scan::this re-run finds no record of its earlier attempt: that attempt kept none, its record expired, or this is a \"Re-run all jobs\", which deletes an earlier attempt's artifacts (#950; \"Re-run failed jobs\" is expected to keep them, as GitHub's docs say, not yet seen live), so it reads as a new run does" >&2
   fi
-  [[ "$kept" == 1 ]] || continue
+  [[ "$kept" == 1 ]] || { unread "kept no record (or it expired)"; continue; }
   [[ "$artifact" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && "$size" -le 4000000 ]] || none failed "the record of sweep run $id is not the sweep's own"
   if ! has="$(gh api -X GET "repos/$GITHUB_REPOSITORY/compare/$sha...$GITHUB_SHA" -f per_page=1 --jq .status)"; then
     none failed "whether this branch has the commit of sweep run $id cannot be checked"
   fi
-  [[ "$has" == ahead || "$has" == identical ]] || continue
+  [[ "$has" == ahead || "$has" == identical ]] || { unread "ran on a commit this branch does not have"; continue; }
   gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > "$zip" || none failed "the record of sweep run $id cannot be downloaded"
   [[ "$(stat -c %s -- "$zip")" -le 4000000 ]] || none failed "the record of sweep run $id is not the sweep's own"
   from="$id"
@@ -1649,8 +1668,8 @@ SWEEP_WITH = {"reset_record": "${{ inputs.reset_record == true }}"}
 # Sweeps of one ref one at a time, the running one never cancelled (#791): a sweep that starts while
 # a reset run runs waits for it and reads its record, so it cannot undo the reset unseen.
 SWEEP_CONCURRENCY = {"group": "fork-secret-sweep-${{ github.ref }}", "cancel-in-progress": False}
-# A reset run's run name (#950): the read step knows a cancelled reset run only by it, and then reads no
-# older record (the empty one instead), so a reset that never ended is done over, not undone.
+# A reset run's run name (#950): the read step knows a reset run only by it, and when it does not read
+# that run's record reads no older one (the empty one instead), so a reset is done over, not undone (#992).
 RESET_RUN_TITLE = "Fork secret sweep (reset_record)"
 SWEEP_RUN_NAME = "${{ inputs.reset_record && '" + RESET_RUN_TITLE + "' || 'Fork secret sweep' }}"
 # What a sweep that stops half-way tells to do (#703, #950): a run that may be re-run, and a reset run,
@@ -1690,7 +1709,7 @@ def sweep_problems(wfs):
                         "running sweep (a sweep started during a reset run would undo the reset, #791)")
     if sweep.get("run-name") != SWEEP_RUN_NAME:
         problems.append(f"{SWEEP_FILE}: the run name does not mark a reset run as {RESET_RUN_TITLE!r} (the read step "
-                        "knows a cancelled reset run by it and reads no older record, #950)")
+                        "knows a reset run by it and reads no record from before it, #950, #992)")
     jobs = sweep.get("jobs") or {}
     callers = [j for j, job in jobs.items() if job.get("uses") == SCAN_CALL]
     if len(callers) != 1:
@@ -1795,6 +1814,30 @@ check("secret-scan: fork-secret-scan.yml runs on pull requests and pushes, uncan
       "branch's script in a job that runs no checkout code; fork-tests.yml calls it with its tests, which "
       "cannot fail quietly; fork-secret-sweep.yml calls it daily and alerts by issue",
       not secret_scan_problems(real), "; ".join(secret_scan_problems(real)))
+
+# What the sweep's header must tell whoever starts or re-runs a sweep by hand, so a reset holds (#992):
+# a re-run of a sweep from before a reset run reads its record from before the reset (and on the
+# default branch its alert closes an open issue), and the job's time limit also leaves a run cancelled.
+# Comments only, so read from the file itself (words compared, line breaks and `#` aside).
+SWEEP_HEADER_RULES = ("never re-run a sweep that started before a reset run",
+                      "the scan job's 30-minute limit also leaves a run cancelled")
+
+
+def sweep_header_problems(text):
+    head = text.split("\nrun-name:", 1)[0]
+    words = " ".join(" ".join(line.strip().lstrip("#") for line in head.splitlines()).split()).lower()
+    return [f"{SWEEP_FILE}: its header does not say {rule!r} (#992)" for rule in SWEEP_HEADER_RULES if rule not in words]
+
+
+sweep_text = (workflows_dir / SWEEP_FILE).read_text()
+check("secret-scan: fork-secret-sweep.yml's header says never to re-run a sweep from before a reset run, and that "
+      "the scan job's time limit leaves a run cancelled (#992)",
+      not sweep_header_problems(sweep_text), "; ".join(sweep_header_problems(sweep_text)))
+for rule in SWEEP_HEADER_RULES:
+    # (each rule on one line of the header, so the mutant can drop it)
+    check(f"secret-scan: a sweep header without {rule!r} fails (#992)",
+          bool(re.search(re.escape(rule), sweep_text, re.I))
+          and bool(sweep_header_problems(re.sub(re.escape(rule), "x", sweep_text, flags=re.I))))
 
 
 def scan_mutant(mutate):
@@ -2039,7 +2082,7 @@ for label, mutate in {
     "an alert without its concurrency group": lambda w: w[SWEEP_FILE]["jobs"]["alert"].pop("concurrency"),
     # #791: the sweeps of one ref one at a time, the running one never cancelled.
     "a sweep without its concurrency group": lambda w: w[SWEEP_FILE].pop("concurrency"),
-    # #950: the read step knows a cancelled reset run by its run name.
+    # #950, #992: the read step knows a reset run by its run name.
     "a sweep without its run name": lambda w: w[SWEEP_FILE].pop("run-name"),
     "a sweep whose run name does not mark a reset run": lambda w: w[SWEEP_FILE].__setitem__(
         "run-name", "Fork secret sweep"),
@@ -2704,28 +2747,37 @@ check("secret-scan e2e: no clone (cat-file fails): the job fails before asking G
 # #701, end to end: the record's read step, as the workflow has it, with a gh stub that serves canned
 # answers through the real jq (as gh's --jq does) and archives built here. It takes the record only
 # from the newest run of fork-secret-sweep.yml (that path; schedule or workflow_dispatch; this branch;
-# this repository, not a fork; completed, success or failure; not this run; whose commit this run's
-# has) and its one live artifact of that name; never unpacks the archive (exactly one plain file
-# named deleted-tips, read in memory), checks every line, and on any doubt warns and leaves no record
-# (a first run). Run again, stopped half-way (a zip or record left in RUNNER_TEMP), a link where the
-# record's folder goes, reset_record, a tag: the same.
+# this repository, not a fork; completed, success or failure, or a reset run in any state, #992; not
+# this run; whose commit this run's has) and its one live artifact of that name; never unpacks the
+# archive (exactly one plain file named deleted-tips, read in memory), checks every line, and on any
+# doubt warns and leaves no record (a first run); a reset run whose record it does not read leaves the
+# empty one (#992); a re-run of a run that started before a listed reset run reads as a new run does
+# (#992). The stub applies the API's status filter, as GitHub does. Run again, stopped half-way (a zip or
+# record left in RUNNER_TEMP), a link where the record's folder goes, reset_record, a tag: the same.
 read_work = pathlib.Path(tempfile.mkdtemp(prefix="fork-contracts-read-"))
 read_stub = read_work / "bin"
 read_stub.mkdir()
 (read_stub / "gh").write_text(r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$GH_LOG"
 if [[ -n "${FAKE_FAIL:-}" && "$*" == *"$FAKE_FAIL"* ]]; then echo "gh stub: HTTP 502" >&2; exit 1; fi
-filter="" path=""
+filter="" path="" status=""
 args=("$@")
 for ((i = 1; i < ${#args[@]}; i++)); do
   case "${args[i]}" in
     --jq) filter="${args[i + 1]}"; i=$((i + 1)) ;;
-    -X|-f) i=$((i + 1)) ;;
+    -X) i=$((i + 1)) ;;
+    -f) [[ "${args[i + 1]}" != status=* ]] || status="${args[i + 1]#status=}"; i=$((i + 1)) ;;
     *) [[ -n "$path" ]] || path="${args[i]}" ;;
   esac
 done
 case "$path" in
-  repos/me/t3code/actions/workflows/fork-secret-sweep.yml/runs) file="$FAKE_DIR/runs.json" ;;
+  repos/me/t3code/actions/workflows/fork-secret-sweep.yml/runs)
+    file="$FAKE_DIR/runs.json"
+    # The API's own filter (#992): -f status=S lists only the runs in that state.
+    if [[ -n "$status" ]]; then
+      jq --arg s "$status" '.workflow_runs |= map(select(.status == $s))' < "$file" | jq -r "${filter:-.}"
+      exit
+    fi ;;
   repos/me/t3code/actions/runs/*/artifacts) id="${path#*/actions/runs/}"; file="$FAKE_DIR/artifacts-${id%/artifacts}.json" ;;
   repos/me/t3code/compare/*) base="${path#*/compare/}"; file="$FAKE_DIR/compare-${base%%...*}.json" ;;
   repos/me/t3code/actions/artifacts/*/zip) id="${path#*/actions/artifacts/}"; cat "$FAKE_DIR/zip-${id%/zip}.zip"; exit ;;
@@ -2848,6 +2900,16 @@ def reset_empty(s):
             and "actions/workflows" not in s.calls and "an empty record is kept even if this run fails" in s.out)
 
 
+def reset_by(n, why):
+    """A reset run (n) whose record is not read, for WHY (#950, #992): no older record read (801's is
+    from before the reset), the empty one kept even if this run fails, as the reset run's own would be."""
+    return lambda s: (
+        s.r.returncode == 0 and s.record == RECORD_HEAD and s.output == "read=reset\n" and s.left == []
+        and "runs/801/" not in s.calls and "artifacts/901/zip" not in s.calls
+        and f"sweep run {n}, a reset run (input reset_record), {why}, so no record from before it is read" in s.out
+        and "an empty record is kept even if this run fails" in s.out)
+
+
 # What a re-run whose own run keeps no record warns (#950): the cause ("Re-run all jobs" deletes an
 # earlier attempt's artifacts, seen live) and the re-run that keeps them.
 NO_OWN_RECORD = ("::warning title=Secret scan::this re-run finds no record of its earlier attempt: that attempt kept none, "
@@ -2870,6 +2932,21 @@ def rerun_log(matched=True, kept=None, listed=None):
                 and (own in s.out if kept is not None else "this run's own records" not in s.out)
                 and ((NO_OWN_RECORD in s.out) == (kept == 0)))
     return ok
+
+
+# What a re-run of a sweep run that started before a reset run warns (#992): it reads as a new run does.
+PRE_RESET_RERUN = ("::warning title=Secret scan::this re-run's run started before sweep run {}, a reset run (input "
+                   "reset_record), so its own earlier attempt's record, from before that reset, is not read: it reads "
+                   "as a new run does")
+
+
+def pre_reset_rerun(s, n):
+    """The run S without the warning PRE_RESET_RERUN for reset run n, which it must carry (else None's
+    record, so a found read's check fails)."""
+    line = PRE_RESET_RERUN.format(n)
+    if line not in s.out:
+        return types.SimpleNamespace(**{**vars(s), "record": None})
+    return types.SimpleNamespace(**{**vars(s), "out": s.out.replace(line, "")})
 
 
 def first_attempt_log(s):
@@ -3020,17 +3097,69 @@ READ_CASES = {
     "a cancelled reset run (by its run name) newer than every record: no older record read, the empty one "
     "kept (#950)": (
         {"runs": [a_run(802, conclusion="cancelled", display_title=RESET_RUN_TITLE), a_run(801)]},
-        lambda s: s.r.returncode == 0 and s.record == RECORD_HEAD and s.output == "read=reset\n" and s.left == []
-        and "runs/801/" not in s.calls and "artifacts/901/zip" not in s.calls
-        and "sweep run 802, a reset run (input reset_record), was cancelled, so no record from before it is read" in s.out
-        and "an empty record is kept even if this run fails" in s.out),
+        reset_by(802, "kept no record (or it expired)")),
     "a cancelled reset run older than the newest record (a sweep after it read it): that record (#950)": (
         {"runs": [a_run(802), a_run(801, conclusion="cancelled", display_title=RESET_RUN_TITLE)],
          "artifacts": {802: [an_artifact(902, 802)], 801: [an_artifact(901, 801)]}, "zips": {902: good_zip, 901: other_zip}},
         read_as(good_record, 802)),
     "a reset run's name on a run that ended (failure): read as usual (#950)": (
         {"runs": [a_run(801, conclusion="failure", display_title=RESET_RUN_TITLE)]}, read_as(good_record)),
+    # #992: one rule for a reset run, whatever its outcome or state: its own record is read when it has
+    # one (written after the reset, so safe), and when it is not read, no older record is either.
+    "a cancelled reset run that kept a record (a re-run of it cancelled, its earlier attempt's record still "
+    "listed): that record, no second set of lookups (#992)": (
+        {"runs": [a_run(802, conclusion="cancelled", display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {802: [an_artifact(902, 802)], 801: [an_artifact(901, 801)]}, "zips": {902: good_zip, 901: other_zip}},
+        read_as(good_record, 802)),
+    "a reset run that failed and kept no record (its upload failed), newer than every record: no older record "
+    "read, the empty one kept (#992)": (
+        {"runs": [a_run(802, conclusion="failure", display_title=RESET_RUN_TITLE), a_run(801)]},
+        reset_by(802, "kept no record (or it expired)")),
+    "a reset run that passed but whose record expired, newer than every record: the empty one (#992)": (
+        {"runs": [a_run(802, display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {802: [an_artifact(902, 802, expired=True)], 801: [an_artifact(901, 801)]}},
+        reset_by(802, "kept no record (or it expired)")),
+    "a reset run on a commit this branch lacks (diverged): the empty one, no older record (#992)": (
+        {"runs": [a_run(802, display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {802: [an_artifact(902, 802)], 801: [an_artifact(901, 801)]}, "zips": {902: other_zip, 901: good_zip},
+         "compare": {read_sha[802]: "diverged"}},
+        reset_by(802, "ran on a commit this branch does not have")),
+    "a reset run's re-run still waiting (queued), its earlier attempt's record deleted, newer than every "
+    "record: the empty one (#992)": (
+        {"runs": [a_run(802, status="queued", conclusion=None, display_title=RESET_RUN_TITLE), a_run(801)]},
+        lambda s: reset_by(802, "kept no record (or it expired)")(s) and "status=completed" not in s.calls),
+    "a reset run's re-run still running whose earlier attempt's record is listed: that record (#992)": (
+        {"runs": [a_run(802, status="in_progress", conclusion=None, display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {802: [an_artifact(902, 802)], 801: [an_artifact(901, 801)]}, "zips": {902: good_zip, 901: other_zip}},
+        read_as(good_record, 802)),
+    # #992: a re-run of a sweep run that started before a reset run (run ids only go up, so the reset
+    # run's id is higher) reads as a new run does, never its own earlier attempt's record, which is from
+    # before the reset. A reset run older than it, or a newer run that is not a reset run, changes nothing.
+    "a re-run of a sweep that started before a reset run (950) that kept a record: the reset run's record, "
+    "never its own from before the reset (#992)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802, id=950, display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {900: [an_artifact(903, 900)], 950: [an_artifact(902, 950)], 801: [an_artifact(901, 801)]},
+         "zips": {903: other_zip, 902: good_zip, 901: other_zip}},
+        lambda s: read_as(good_record, 950)(pre_reset_rerun(s, 950)) and "runs/900/" not in s.calls and rerun_log()(s)),
+    "a re-run of a sweep that started before a reset run (950) that kept none: the empty record, never its "
+    "own from before the reset (#992)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802, id=950, display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {900: [an_artifact(903, 900)], 801: [an_artifact(901, 801)]},
+         "zips": {903: other_zip, 901: other_zip}},
+        lambda s: reset_by(950, "kept no record (or it expired)")(s) and "runs/900/" not in s.calls
+        and PRE_RESET_RERUN.format(950) in s.out and "artifacts/903/zip" not in s.calls),
+    "a re-run of a sweep that started after a reset run (802): its own first attempt's record (#992)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802, display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {900: [an_artifact(903, 900)], 802: [an_artifact(902, 802)], 801: [an_artifact(901, 801)]},
+         "zips": {903: good_zip, 902: other_zip, 901: other_zip}},
+        lambda s: read_as(good_record, 900)(s) and rerun_log(kept=1)(s)),
+    "a re-run of a sweep before a newer run (950) that is not a reset run: its own first attempt's record (#992)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802, id=950), a_run(801)],
+         "artifacts": {900: [an_artifact(903, 900)], 950: [an_artifact(902, 950)], 801: [an_artifact(901, 801)]},
+         "zips": {903: good_zip, 902: other_zip, 901: other_zip}},
+        lambda s: read_as(good_record, 900)(s) and rerun_log(kept=1)(s)),
     "a run still in progress": (two_runs({"status": "in_progress", "conclusion": None}), read_as(good_record)),
+    "a run still waiting (queued)": (two_runs({"status": "queued", "conclusion": None}), read_as(good_record)),
     "a failed run (its record is whole: the scan step wrote it)": (
         {**two_runs({"conclusion": "failure"}), "zips": {902: good_zip, 901: other_zip}}, read_as(good_record, 802)),
     "a run whose commit this branch lacks (diverged)": (
@@ -3152,14 +3281,20 @@ for what, old, new in (
     ("the workflow path check", '.path == ".github/workflows/fork-secret-sweep.yml" and ', ""),
     ("the event check", '(.event == "schedule" or .event == "workflow_dispatch")', "true"),
     ("the branch check", ".head_branch == env.BRANCH and ", ""),
-    ("the repository check", ".repository.full_name == env.GITHUB_REPOSITORY\n", "true\n"),
-    ("the head repository check", ".head_repository.full_name == env.GITHUB_REPOSITORY and ", ""),
-    ("the conclusion check", '(.conclusion == "success" or .conclusion == "failure"\n'
-     '          or (.conclusion == "cancelled" and .display_title == "Fork secret sweep (reset_record)"))', "true"),
-    ("a cancelled reset run listed (#950)", '.conclusion == "cancelled" and .display_title', "false and .display_title"),
-    ("the reset run's name check (#950)", ' and .display_title == "Fork secret sweep (reset_record)"', ""),
-    ("no older record after a cancelled reset run (#950)", 'if [[ "$how" == cancelled ]]; then', "if false; then"),
+    ("the repository check", "env.BRANCH and .repository.full_name == env.GITHUB_REPOSITORY\n", "env.BRANCH and true\n"),
+    ("the head repository check", "and .head_repository.full_name == env.GITHUB_REPOSITORY\n", "and true\n"),
+    ("the conclusion check", '(.conclusion == "success" or .conclusion == "failure")', "true"),
+    ("every reset run listed, whatever its outcome (#950, #992)",
+     '(.display_title == "Fork secret sweep (reset_record)"\n          or ', "("),
+    ("the unfinished runs listed (#992)", '-f branch="$BRANCH" -f per_page=30', '-f branch="$BRANCH" -f status=completed -f per_page=30'),
+    ("the reset run's name check (#950)", 'then "reset" else "sweep" end', 'then "sweep" else "sweep" end'),
+    ("no older record after a reset run kept none (#950, #992)", '[[ "$kind" == reset ]] || return 0', "return 0"),
+    ("no older record after a reset run on a commit this branch lacks (#992)",
+     '|| { unread "ran on a commit this branch does not have"; continue; }', "|| continue"),
     ("this run's own skip", '[[ "$id" != "$GITHUB_RUN_ID" || "$id $sha" == "$self" ]] || continue', ":"),
+    ("a re-run from before a reset run reads as a new run (#992)", '    self=""\n    break\n', "    break\n"),
+    ("the reset run's kind in the re-run check (#992)", '[[ "$kind" == reset && "$id" =~ ^[1-9]', '[[ "$id" =~ ^[1-9]'),
+    ("the higher run id in the re-run check (#992)", ' && "$id" -gt "$GITHUB_RUN_ID" ]] ||', " ]] ||"),
     ("a re-run's own first attempt first (#703)", 'done <<< "$self"$\'\\n\'"$runs"', 'done <<< "$runs"'),
     ("the first attempt's check (#703)", '[[ "${GITHUB_RUN_ATTEMPT:-1}" != 1 \\', "[[ true \\"),
     ("the sweep's own workflow check for a re-run (#703)",
@@ -3180,7 +3315,7 @@ for what, old, new in (
     ("the artifact's run check", " and (.workflow_run.id | tostring) == env.RUN", ""),
     ("the one-artifact check", 'if length > 1 then error("more than one") else "\\(length)',
      'if false then empty else "\\([length, 1] | min)'),
-    ("the ancestor check", '[[ "$has" == ahead || "$has" == identical ]] || continue', ":"),
+    ("the ancestor check", '[[ "$has" == ahead || "$has" == identical ]] ||', ": ||"),
     ("the listed size check", ' && "$size" -le 4000000', ""),
     ("the archive's size check", '[[ "$(stat -c %s -- "$zip")" -le 4000000 ]] ||', ": ||"),
     ("reset_record", '[[ "$RESET" != true || -n "$self" ]] || empty_record\n', ""),
