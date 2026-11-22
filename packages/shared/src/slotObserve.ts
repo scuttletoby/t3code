@@ -117,9 +117,9 @@ export const FALLBACK_CALM_MS = 10 * 60 * 1000;
 export const FALLBACK_CALM_READINGS = 10;
 export const FALLBACK_READING_GAP_MS = 25 * 1000;
 /**
- * The swap trend compares a reading with one at least this old: a burst of start requests (a reading
- * each) must not hide slow filling by comparing readings a second apart. Until then the older reading
- * stays the one compared with.
+ * The swap trend compares a reading with a kept one, replaced by a newer reading only once it is at
+ * least this old: a burst of start requests (a reading each) must not hide slow filling by comparing
+ * readings a second apart. A reading just after a replacement compares with that newer one.
  */
 export const SWAP_TREND_MIN_MS = 25 * 1000;
 /** Each kill in the agents' own slices raises the agent costs by this much (design: 25 % per kill). */
@@ -200,7 +200,7 @@ export type FallbackEvent = "trip" | "recover" | "lower" | null;
  * One fallback reading: a new OOM kill or swap nearly full and filling trips it. Only an agent-slice
  * kill raises costs (an untold kill at most `UNTOLD_MAX_RAISES`). Each calm spell (time and readings)
  * ends it, each later one lowers one raise; an unreadable reading or a clock going back restarts the
- * wait. Swap fills when it fell past `swapFillingMb` since a reading `SWAP_TREND_MIN_MS` old.
+ * wait. Swap fills when it fell past `swapFillingMb` since the kept reading (`SWAP_TREND_MIN_MS`).
  */
 export function fallbackStep(
   rule: CapacityRule,
@@ -438,8 +438,8 @@ export function enforceStep(
     nowMs: reading.nowMs,
   });
   const whole = stepped.marginMb !== null;
-  // The swap trend compares with a reading at least `SWAP_TREND_MIN_MS` old: a burst of asks keeps
-  // the older swap free in the state (a clock that went back takes the new one).
+  // The swap trend compares with a kept reading, replaced once it is `SWAP_TREND_MIN_MS` old: a
+  // burst of asks keeps the older swap free in the state (a clock that went back takes the new one).
   const keepSwap =
     whole &&
     typeof state.pressure.swapFreeMb === "number" &&
@@ -456,7 +456,8 @@ export function enforceStep(
       ? reading.nowMs
       : null;
   // Pressure seen by itself in what was read (no hold-down; the parts that could not be read left
-  // out) ends the lenient bar of `afterUnread`; a reading with a part unread starts it.
+  // out) ends the lenient bar of `afterUnread`. A reading with a part unread starts it only from
+  // "ok": while the level is up from pressure seen, an unread reading keeps the full 150 % bar.
   const unread = (value: unknown) => (value === "unreadable" ? null : value);
   const partUnread =
     machine.psi === "unreadable" ||
@@ -480,7 +481,7 @@ export function enforceStep(
     raw !== null && raw !== "ok"
       ? false
       : !whole || partUnread
-        ? true
+        ? state.afterUnread || state.pressure.level === "ok"
         : level.level === "ok"
           ? false
           : state.afterUnread;

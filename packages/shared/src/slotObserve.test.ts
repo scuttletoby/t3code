@@ -627,6 +627,74 @@ describe("enforce: one reading steps the level, the fallback and the unread time
     expect(state.pressure.level).toBe("ok");
   });
 
+  it("a failed reading during real pressure keeps the 150 % bar", () => {
+    const marginMb = capacityLevel(CAPACITY_RULE, { facts: host(), previous: null }).marginMb!;
+    const near = host({ availableMb: Math.ceil(marginMb * 1.2) });
+    const settled = fromRestart(near).state;
+    /** 20 readings at 120 % of the margin, no stall, 30 s apart. */
+    const calmNear = (from: EnforceState, startMs: number) => {
+      let state = from;
+      for (let i = 0; i < 20; i += 1) {
+        state = enforceStep(CAPACITY_RULE, state, reading(startMs + i * 30_000, near)).state;
+      }
+      return state;
+    };
+    // Memory under the margin: a real "elevated".
+    const pressed = enforceStep(
+      CAPACITY_RULE,
+      settled,
+      reading(400_000, host({ availableMb: Math.floor(marginMb * 0.9) })),
+    ).state;
+    expect(pressed).toMatchObject({ afterUnread: false, pressure: { level: "elevated" } });
+    // One failed reading, then a second, and one partly unread: still pressure seen.
+    let state = enforceStep(CAPACITY_RULE, pressed, reading(430_000, null)).state;
+    expect(state).toMatchObject({ afterUnread: false, pressure: { level: "elevated" } });
+    state = enforceStep(CAPACITY_RULE, state, reading(460_000, null)).state;
+    state = enforceStep(
+      CAPACITY_RULE,
+      state,
+      reading(490_000, { ...near, psi: "unreadable" }),
+    ).state;
+    expect(state.afterUnread).toBe(false);
+    expect(calmNear(state, 520_000).pressure.level).toBe("elevated");
+
+    // The same while "severe": an unread reading keeps it severe and the full bar.
+    const severe = enforceStep(
+      CAPACITY_RULE,
+      settled,
+      reading(400_000, host({ availableMb: Math.floor(marginMb * 0.1) })),
+    ).state;
+    expect(severe.pressure.level).toBe("severe");
+    const blindSevere = enforceStep(CAPACITY_RULE, severe, reading(430_000, null)).state;
+    expect(blindSevere).toMatchObject({ afterUnread: false, pressure: { level: "severe" } });
+    expect(calmNear(blindSevere, 460_000).pressure.level).not.toBe("ok");
+  });
+
+  it("from ok, unread readings in a row keep the lenient bar; the fallback does not change it", () => {
+    const marginMb = capacityLevel(CAPACITY_RULE, { facts: host(), previous: null }).marginMb!;
+    const near = host({ availableMb: Math.ceil(marginMb * 1.2) });
+    const settled = fromRestart(near).state;
+    expect(settled.pressure.level).toBe("ok");
+    // A second unread reading keeps the lenient bar the first one started.
+    let state = enforceStep(CAPACITY_RULE, settled, reading(400_000, null)).state;
+    state = enforceStep(CAPACITY_RULE, state, reading(430_000, null)).state;
+    expect(state).toMatchObject({ afterUnread: true, pressure: { level: "elevated" } });
+    for (let nowMs = 460_000; nowMs <= 550_000; nowMs += 30_000) {
+      state = enforceStep(CAPACITY_RULE, state, reading(nowMs, near)).state;
+    }
+    expect(state).toMatchObject({ afterUnread: false, pressure: { level: "ok" } });
+    // Right after a kill trips the fallback (the level stays as read): an unread reading is
+    // still one bad reading from "ok", so the lenient bar applies.
+    const killed = enforceStep(CAPACITY_RULE, state, { ...reading(580_000, near), oomKills: 1 });
+    expect(killed.event).toBe("trip");
+    expect(killed.state).toMatchObject({ fallback: { on: true }, pressure: { level: "ok" } });
+    const blind = enforceStep(CAPACITY_RULE, killed.state, {
+      ...reading(610_000, null),
+      oomKills: 1,
+    }).state;
+    expect(blind).toMatchObject({ afterUnread: true, fallback: { on: true } });
+  });
+
   it("a burst of asks keeps the swap reading to compare with, so slow filling shows", () => {
     let state = enforceStep(CAPACITY_RULE, ENFORCE_START, reading(0)).state;
     for (let second = 1; second <= 3; second += 1) {
