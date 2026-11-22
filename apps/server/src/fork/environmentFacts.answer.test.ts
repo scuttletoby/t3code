@@ -92,7 +92,6 @@ describe("factsFromAnswer", () => {
     ["CPU above 1", { hostResources: { ...host, cpuUtilization: 2 } }],
     ["no facts time", { placement: { labels: [], available: true } }],
     ["not an object", "facts"],
-    ["null", null],
   ])("%s: reported as not valid, also when named", (_name, answer) => {
     const facts = factsFromAnswer(answer, NOW);
     expect(facts).toMatchObject({ receivedAt: NOW, problem: expect.any(String) });
@@ -103,6 +102,48 @@ describe("factsFromAnswer", () => {
       expect(result.kind === "none" && result.reason).toContain(
         "H2: The machine's facts are not valid: ",
       );
+    }
+  });
+
+  it('no answer at all (null or undefined): no facts, never "facts not valid"', () => {
+    for (const answer of [null, undefined]) {
+      expect(factsFromAnswer(answer, NOW)).toBeNull();
+      const result = place(factsFromAnswer(answer, NOW));
+      expect(result.kind === "none" && result.reason).toContain(
+        "H2: The machine sent no facts (no answer, or an older build).",
+      );
+      expect(result.kind === "none" && result.reason).not.toContain("not valid");
+      expect(place(factsFromAnswer(answer, NOW), "b")).toMatchObject({
+        kind: "picked",
+        why: "b was named and passes the hard rules that need no facts (H1, H3, H7, H9).",
+      });
+    }
+  });
+
+  it("one machine over time: never answered, empty, old, then answers again: ranked by what it sent", () => {
+    const answer = { hostResources: host, placement };
+    // Past the 15-second freshness window, within the link's minute.
+    const LATER = NOW + 30_000;
+    const reasonAt = (facts: ReturnType<typeof factsFromAnswer>, now: number) => {
+      const result = choosePlacement({
+        mode: "enforce",
+        task: { runtimeMode: "full-access", needs: [], never: [], fromPlacedChild: false },
+        machines: [linked(facts)],
+        now,
+      });
+      return result.kind === "none" ? result.reason : result.kind;
+    };
+    // Never answered (the read gave nothing back): no facts.
+    expect(reasonAt(factsFromAnswer(null, NOW), NOW)).toContain("The machine sent no facts");
+    // Answered with empty facts (an older build): no facts, the same.
+    expect(reasonAt(factsFromAnswer({}, NOW), NOW)).toContain("The machine sent no facts");
+    // Answered, but long ago: too old, not "not valid".
+    const old = factsFromAnswer(answer, NOW);
+    expect(reasonAt(old, LATER)).toContain("The machine's facts are too old.");
+    // Answers again later: the new answer is fresh and it is picked.
+    expect(reasonAt(factsFromAnswer(answer, LATER), LATER)).toBe("picked");
+    for (const facts of [null, {}, answer]) {
+      expect(reasonAt(factsFromAnswer(facts, NOW), LATER)).not.toContain("not valid");
     }
   });
 

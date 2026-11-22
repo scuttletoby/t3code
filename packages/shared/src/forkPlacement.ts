@@ -56,8 +56,8 @@ export interface PlacementFacts {
 
 /**
  * One `t3_environment_read` answer, as the server's `factsFromAnswer`
- * (apps/server/src/fork/environmentFacts.ts) decodes it. An answer with neither `hostResources` nor
- * `placement` (an older build) is `null` there, never this.
+ * (apps/server/src/fork/environmentFacts.ts) decodes it. No answer, or one with neither
+ * `hostResources` nor `placement` (an older build), is `null` there, never this.
  */
 export interface MachineFacts {
   readonly hostResources?: HostResourcesSnapshot;
@@ -436,7 +436,6 @@ const rankWithUpstream = (machines: ReadonlyArray<PlacementMachine>, now: number
   }
 };
 
-/** Why upstream's score left out a machine that passed every hard rule. */
 /** Upstream's memory limit: 5 % free or less is left out. Unknown (no sample) is not low. */
 const isLowOnMemory = (machine: PlacementMachine) => {
   const host = machine.facts?.hostResources;
@@ -450,6 +449,7 @@ const isUsableWeight = (machine: PlacementMachine) =>
 const fitsAsFallback = (machine: PlacementMachine) =>
   isHereWithoutHostFacts(machine) && isUsableWeight(machine) && !isLowOnMemory(machine);
 
+/** Why upstream's score left out a machine that passed every hard rule. */
 const unrankedReason = (machine: PlacementMachine) => {
   if (machine.weight === "manual") return "Set to manual: used only when named.";
   if (machine.weight !== undefined && !isWeightWord(machine.weight)) {

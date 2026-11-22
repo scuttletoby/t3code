@@ -37,8 +37,8 @@ const canonicalLabel = (label: string): string => label.trim().toLowerCase();
 
 /**
  * Labels' one stored and compared form: trimmed, lower-cased (no locale), blanks and repeats dropped.
- * Same as placement row P5's `canonicalLabels` (packages/shared/src/forkPlacement.ts): merge the two
- * into one later. Neither normalises Unicode (NFC), so two spellings of `café` are two labels.
+ * Placement row P5's `canonicalLabels` (packages/shared/src/forkPlacement.ts) calls this one, so
+ * there is one form. It does not normalise Unicode (NFC), so two spellings of `café` are two labels.
  */
 export const canonicalPlacementLabels = (labels: ReadonlyArray<string>): ReadonlyArray<string> => [
   ...new Set(labels.map(canonicalLabel).filter((label) => label.length > 0)),

@@ -11,6 +11,7 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -85,6 +86,133 @@ describe("factsCommand: checked again on the host that runs it", () => {
     }),
   );
 
+  it.effect(
+    "on Windows the rule holds for the path that runs: a lookup that finds a .CMD or .COM is refused",
+    () =>
+      Effect.gen(function* () {
+        const path = "C:\\tools\\facts.exe";
+        // Stand-ins for the file lookup the runner does (shared/shell's resolveSpawnCommand) that
+        // return another file than the path: the check refuses it even with .EXE in PATHEXT.
+        const withPathext =
+          (pathext: string) =>
+          <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+            effect.pipe(Effect.provideService(HostProcess.Environment, { PATHEXT: pathext }));
+        const planted = recording();
+        const refused = yield* runFactsCommand(path).pipe(
+          Effect.provideService(SpawnExecutableResolution, (command: string) => `${command}.CMD`),
+          withPathext(".COM;.EXE;.BAT;.CMD"),
+          on("win32", planted.layer),
+        );
+        expect(refused.available).toBe(false);
+        expect(refused.available === false && refused.reason).toMatch(
+          /^factsCommand "C:\\tools\\facts\.exe" would run through a shell on this server \(as .*facts\.exe\.CMD/u,
+        );
+        expect(planted.asked).toEqual([]);
+        // A planted facts.exe.COM needs no shell but is not an .exe either: refused too.
+        const com = recording();
+        const comResult = yield* runFactsCommand(path).pipe(
+          Effect.provideService(SpawnExecutableResolution, (command: string) => `${command}.COM`),
+          withPathext(".COM;.EXE;.BAT;.CMD"),
+          on("win32", com.layer),
+        );
+        expect(comResult).toEqual({
+          available: false,
+          reason: `factsCommand "${path}" runs as "${path}.COM" on this server, not an .exe`,
+        });
+        expect(com.asked).toEqual([]);
+        // A lookup that finds the path itself: it runs, as the path that was checked.
+        const plain = recording({ stdout: "gpu\n" });
+        expect(
+          yield* runFactsCommand(path).pipe(
+            Effect.provideService(SpawnExecutableResolution, (command: string) => command),
+            withPathext(".COM;.EXE;.BAT;.CMD"),
+            on("win32", plain.layer),
+          ),
+        ).toEqual({ available: true, labels: ["gpu"] });
+        expect(plain.asked.map(({ command, args }) => ({ command, args }))).toEqual([
+          { command: path, args: [] },
+        ]);
+      }),
+  );
+
+  describe("on Windows with the real file lookup (shared/shell's, C:\\tools\\ mapped to a temp dir)", () => {
+    const path = "C:\\tools\\facts.exe";
+    const scratch = () => {
+      const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-facts-pathext-"));
+      NodeFS.writeFileSync(NodePath.join(dir, "facts.exe"), "");
+      return dir;
+    };
+    /** The default lookup, its result mapped back to `C:\tools\` so the runner sees what Windows would. */
+    const realLookup = (dir: string) =>
+      Effect.gen(function* () {
+        const real = yield* SpawnExecutableResolution;
+        return (command: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv) =>
+          real(command.replace("C:\\tools\\", `${dir}/`), platform, env)?.replace(
+            `${dir}/`,
+            "C:\\tools\\",
+          );
+      });
+    const withEnv =
+      (dir: string, env: NodeJS.ProcessEnv) =>
+      <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        Effect.gen(function* () {
+          const lookup = yield* realLookup(dir);
+          return yield* effect.pipe(
+            Effect.provideService(SpawnExecutableResolution, lookup),
+            Effect.provideService(HostProcess.Environment, env),
+          );
+        });
+
+    it.effect(
+      "PATHEXT without .EXE, the real facts.exe present, nothing planted: refused, never run",
+      () =>
+        Effect.gen(function* () {
+          // The check would pass here, then a facts.exe.CMD planted before the runner's own lookup
+          // would run through a shell: so the path is refused whatever is on disk.
+          for (const env of [
+            { PATHEXT: ".COM;.BAT;.CMD" },
+            { PathExt: "com; bat ;.cmd" },
+            { PATHEXT: ".EXE.;.CMD" },
+          ] satisfies ReadonlyArray<NodeJS.ProcessEnv>) {
+            const dir = scratch();
+            const { asked, layer } = recording({ stdout: "gpu\n" });
+            const result = yield* runFactsCommand(path).pipe(withEnv(dir, env), on("win32", layer));
+            expect(result).toEqual({
+              available: false,
+              reason: `factsCommand "${path}" cannot run on this server: its PATHEXT has no .EXE, so the file lookup would also start a planted "${path}.CMD" (or .BAT) through a shell, which placement never uses`,
+            });
+            expect(asked).toEqual([]);
+            NodeFS.rmSync(dir, { recursive: true, force: true });
+          }
+        }),
+    );
+
+    it.effect(
+      "PATHEXT with .EXE (or unset, or empty: the default list): runs the checked file, even with a facts.exe.CMD beside it",
+      () =>
+        Effect.gen(function* () {
+          for (const env of [
+            { PATHEXT: ".COM;.EXE;.BAT;.CMD" },
+            { pathext: "cmd;exe" },
+            { PATHEXT: "" },
+            { PATHEXT: " ; " },
+            {},
+          ] satisfies ReadonlyArray<NodeJS.ProcessEnv>) {
+            const dir = scratch();
+            NodeFS.writeFileSync(NodePath.join(dir, "facts.exe.CMD"), "");
+            const { asked, layer } = recording({ stdout: "gpu\n" });
+            expect(
+              yield* runFactsCommand(path).pipe(withEnv(dir, env), on("win32", layer)),
+            ).toEqual({ available: true, labels: ["gpu"] });
+            expect(asked.map(({ command, args }) => ({ command, args }))).toEqual([
+              { command: path, args: [] },
+            ]);
+            NodeFS.rmSync(dir, { recursive: true, force: true });
+          }
+        }),
+    );
+  });
+
   it.effect("output cut at its limit: the last, maybe partial, line is not a label", () =>
     Effect.gen(function* () {
       const cut = recording({ stdout: "ci-runner\ngpu-large\ngpu", stdoutTruncated: true });
@@ -122,6 +250,22 @@ describe("factsCommand: checked again on the host that runs it", () => {
       expect(yield* runFactsCommand("/x/facts").pipe(on("linux", busy.layer))).toEqual({
         available: false,
         reason: "factsCommand exited with code 3: busy building",
+      });
+      // A label line on stdout does not hide the error: the error output comes first.
+      const labelFirst = recording({
+        code: ChildProcessSpawner.ExitCode(2),
+        stdout: "gpu\n",
+        stderr: "all slots used\n",
+      });
+      expect(yield* runFactsCommand("/x/facts").pipe(on("linux", labelFirst.layer))).toEqual({
+        available: false,
+        reason: "factsCommand exited with code 2: all slots used",
+      });
+      // No error output: the first stdout line still says why.
+      const quiet = recording({ code: ChildProcessSpawner.ExitCode(4), stdout: "\nno gpu here\n" });
+      expect(yield* runFactsCommand("/x/facts").pipe(on("linux", quiet.layer))).toEqual({
+        available: false,
+        reason: "factsCommand exited with code 4: no gpu here",
       });
       const broken = Layer.mock(ProcessRunner.ProcessRunner)({
         run: (input) =>
@@ -206,7 +350,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
         const busy = script(dir, "busy", "echo gpu\necho 'all slots used' >&2\nexit 2");
         expect(yield* runFactsCommand(busy).pipe(Effect.provide(layer))).toEqual({
           available: false,
-          reason: "factsCommand exited with code 2: gpu",
+          reason: "factsCommand exited with code 2: all slots used",
         });
         const missing = yield* runFactsCommand(NodePath.join(dir, "nope")).pipe(
           Effect.provide(layer),

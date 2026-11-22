@@ -127,7 +127,8 @@ const decodeAnswerFacts = Schema.decodeUnknownSync(AnswerFacts);
 
 /**
  * A linked machine's forwarded answer, decoded with these schemas, as the rule engine's
- * `MachineFacts`. Neither field (an older build): `null`, no facts. Refused by the schemas: only
+ * `MachineFacts`. No answer (`null` or `undefined`: the machine did not answer) or neither field
+ * (an older build): `null`, no facts, never "not valid". Refused by the schemas: only
  * `problem`, so the engine refuses the machine, named too. A newer build's extra field is ignored.
  */
 export const factsFromAnswer = (
@@ -139,6 +140,7 @@ export const factsFromAnswer = (
   readonly problem?: string;
   readonly receivedAt: number;
 } | null => {
+  if (answer === null || answer === undefined) return null;
   let decoded: typeof AnswerFacts.Type;
   try {
     decoded = decodeAnswerFacts(answer);
