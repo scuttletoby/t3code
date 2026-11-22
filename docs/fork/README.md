@@ -279,11 +279,12 @@ In the app: **Settings → Fork**, section Playtest: the switch (it stays off un
 set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
 
 Only the person can change it; agents cannot. A save that is on without all four steps, repeats a
-push step's name (or names one `claim`, `renew` or `release`), or names a program by anything but
-its full path on the server's OS is refused. A hand-edited
-value that is not valid reads as off (with a warning in the server log), and the next save of any
-setting writes the default in its place; fields a newer build added are dropped the same way (as for
-`waitChecks`). Other fields: how often a claim is renewed (`renewMinutes`), when an idle
+push step's name (or names one `claim`, `renew` or `release`), names a program by anything but its
+full path on the server's OS, or has a field this build does not know is refused. A hand-edited
+value that is not valid, or has a field this build does not know (a newer build's limit, a typo),
+reads as off (with a warning in the server log), and the next save of any setting writes the default
+in its place. So after moving back to an older build, copy the playtest value first: the older
+build's next save replaces a newer build's value. Other fields: how often a claim is renewed (`renewMinutes`), when an idle
 session ends (`idleMinutes`) and the longest session (`maxHours`).
 
 ```json
