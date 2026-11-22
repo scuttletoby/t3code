@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from "@effect/vitest";
 import {
+  CommandId,
   DEFAULT_HANDOFF_SETTINGS,
   DEFAULT_SERVER_SETTINGS,
   EventId,
@@ -15,6 +16,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
   ProviderDriverKind,
+  RunAttemptId,
   RunId,
   RuntimeRequestId,
   type ServerSettings as ServerSettingsValue,
@@ -24,13 +26,16 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import { continuationStartRetryDelayMs } from "../../orchestration-v2/RestartBackgroundNote.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as SlotGate from "../../slots/SlotGate.ts";
 import * as HandoffService from "./HandoffService.ts";
@@ -69,7 +74,7 @@ import {
 } from "./handoffMessage.ts";
 import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
 import { RELAY_COMPLETION_HOLD_MS } from "./handoffShell.ts";
-import { HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
+import { HANDOFF_FALLBACK_SUFFIX, HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
 
 /** The old session's default handoff in the write turn. */
 const WRITTEN = `${HANDOFF_AGENT_MARKER}\nGoal: ship X. Next: run the tests.`;
@@ -115,6 +120,11 @@ const harness = (state: {
   missing?: Set<string>;
   /** The server's agent slot gate (none: a server without one). */
   gate?: Layer.Layer<SlotGate.SlotGate>;
+  /**
+   * Upstream's effect outbox rows by id (the restart continuation's `effect:restart-continuation:`
+   * rows); read at each lookup. None: no row.
+   */
+  effects?: Map<string, { status: EffectOutbox.OrchestrationEffectStatusV2; availableAt: number }>;
   /** What the `command` source answers (none: a failure); every run is recorded. */
   command?: HandoffCommand.HandoffCommandResult;
   /**
@@ -186,6 +196,16 @@ const harness = (state: {
         ],
       };
     };
+    const settled = new Map<string, Deferred.Deferred<void>>();
+    /** Upstream's effect worker settles a row: its waiters wake, with no thread event. */
+    const settleEffect = (effectId: string, status: EffectOutbox.OrchestrationEffectStatusV2) =>
+      Effect.suspend(() => {
+        const row = state.effects?.get(effectId);
+        if (row !== undefined) state.effects?.set(effectId, { ...row, status });
+        const signal = settled.get(effectId);
+        settled.delete(effectId);
+        return signal === undefined ? Effect.void : Deferred.succeed(signal, undefined);
+      });
     const dependencies = Layer.mergeAll(
       Layer.mock(Orchestrator.OrchestratorV2)({
         streamDomainEvents: Stream.fromQueue(events),
@@ -272,6 +292,38 @@ const harness = (state: {
       }),
       adapterRegistry(() => state.missing ?? new Set()),
       state.gate ?? Layer.empty,
+      Layer.mock(EffectOutbox.EffectOutboxV2)({
+        // As upstream's: resolves once the row is neither pending nor running (`settleEffect`).
+        awaitSettled: (effectId) =>
+          Effect.suspend(() => {
+            const row = state.effects?.get(effectId);
+            if (row === undefined || (row.status !== "pending" && row.status !== "running"))
+              return Effect.void;
+            const signal = settled.get(effectId) ?? Deferred.makeUnsafe<void>();
+            settled.set(effectId, signal);
+            return Deferred.await(signal);
+          }),
+        get: (effectId) =>
+          Effect.sync(() => {
+            const row = state.effects?.get(effectId);
+            return row === undefined
+              ? Option.none()
+              : Option.some({
+                  id: effectId,
+                  commandId: CommandId.make(`command:${effectId}`),
+                  threadId,
+                  request: { type: "provider-runtime.continue", sourceRunId: RunId.make("any") },
+                  status: row.status,
+                  attemptCount: 0,
+                  availableAt: DateTime.formatIso(DateTime.makeUnsafe(row.availableAt)),
+                  leaseOwner: null,
+                  createdAt: DateTime.formatIso(at()),
+                  updatedAt: DateTime.formatIso(at()),
+                  completedAt: null,
+                  lastError: null,
+                } satisfies EffectOutbox.OrchestrationEffectV2);
+          }),
+      }),
       Layer.mock(HandoffCommand.HandoffCommand)({
         run: (input) =>
           Effect.sync(() => {
@@ -295,7 +347,7 @@ const harness = (state: {
         if (event !== null) yield* Queue.offer(events, event);
         yield* Deferred.await(done);
       });
-    return { sent, emit, reads, events, commandRuns };
+    return { sent, emit, reads, events, commandRuns, ended, settleEffect };
   });
 
 /** For a test that hangs, not fails, when a check is gone: it ends in milliseconds when right. */
@@ -1309,7 +1361,8 @@ describe("HandoffService, agent source", () => {
         expect(write).toEqual({
           type: "message.dispatch",
           commandId: `server:handoff-write:${threadId}:${runId}`,
-          messageId: `handoff-write:${threadId}:${runId}`,
+          // The size backstop: the fallback follows a failure, so a failure is quiet.
+          messageId: `handoff-write:${threadId}:${runId}${HANDOFF_FALLBACK_SUFFIX}`,
           threadId,
           text: handoffWriteText("List the open PRs."),
           attachments: [],
@@ -1402,8 +1455,8 @@ describe("HandoffService, agent source", () => {
       yield* settle;
       yield* emit(null, "handOffWhenDue", 2);
       expect(writes(sent).map((one) => one.messageId)).toEqual([
-        `handoff-write:${threadId}:${runId}`,
-        `handoff-write:${threadId}:run-9`,
+        `handoff-write:${threadId}:${runId}${HANDOFF_FALLBACK_SUFFIX}`,
+        `handoff-write:${threadId}:run-9${HANDOFF_FALLBACK_SUFFIX}`,
       ]);
       expect(messages(sent).map((one) => one.messageId)).toEqual([`handoff:${threadId}:run-9`]);
     }),
@@ -1420,7 +1473,11 @@ describe("HandoffService, agent source", () => {
         };
         const { sent, emit } = yield* harness(state);
         yield* turnEnds(emit, trigger);
-        expect(writes(sent).length).toBe(1);
+        // Only the size backstop's write turn is marked as one the fallback follows, so only its
+        // failure is quiet; at the idle trigger nothing follows, and the failure alerts.
+        expect(writes(sent).map((one) => one.messageId)).toEqual([
+          `handoff-write:${threadId}:${runId}${trigger === "idle" ? "" : HANDOFF_FALLBACK_SUFFIX}`,
+        ]);
         expect(part2(sent)).toEqual(
           trigger === "idle" ? [] : [notCounted("the write turn failed")],
         );
@@ -1450,7 +1507,7 @@ describe("HandoffService, agent source", () => {
         const write = writeOf(state);
         expect(sent[1]).toEqual({
           type: "run.interrupt",
-          commandId: `server:handoff-write-stop:handoff-write:${threadId}:${runId}`,
+          commandId: `server:handoff-write-stop:handoff-write:${threadId}:${runId}${trigger === "idle" ? "" : HANDOFF_FALLBACK_SUFFIX}`,
           threadId,
           runId: write.id,
           reason: HANDOFF_WRITE_STOP_REASON,
@@ -1821,6 +1878,179 @@ describe("HandoffService, agent source", () => {
         expect(messages(sent).map((one) => one.messageId)).toEqual([handoffMessageId]);
         expect(part2(sent)[0]).toContain("Goal: ship X.");
         expect(writes(sent)).toEqual([]);
+      }),
+    SHORT_TIMEOUT_MS,
+  );
+
+  /** Upstream's restart: the write run ended cancelled; `continuation` carries it on. */
+  const cutShort = () => {
+    const data = projection(usage.size);
+    const write = run({
+      id: RunId.make("write-2"),
+      ordinal: 2,
+      userMessageId: MessageId.make(`handoff-write:${threadId}:${runId}`),
+      status: "cancelled",
+      requestedAt: at(),
+      startedAt: at(),
+      completedAt: at(),
+    });
+    const continuation = (ordinal: number, of: RunId, patch: Partial<OrchestrationV2Run> = {}) =>
+      run({
+        id: RunId.make(`continue-${ordinal}`),
+        ordinal,
+        userMessageId: MessageId.make(`message:restart-continuation:${of}`),
+        restartContinuationOfRunId: of,
+        status: "running",
+        requestedAt: at(),
+        startedAt: at(),
+        completedAt: null,
+        ...patch,
+      });
+    const state: Parameters<typeof harness>[0] = {
+      data: {
+        ...data,
+        runs: [...data.runs, write],
+        turnItems: [
+          turnItem(write.id, 1, {
+            type: "user_message",
+            messageId: write.userMessageId,
+            text: "Write it.",
+          }),
+          turnItem(write.id, 3, { type: "assistant_message", text: "Looking at the" }),
+        ],
+      },
+      settings: on,
+      effects: new Map(),
+    };
+    /** Adds or replaces `member`, with `reply` as its reply when given. */
+    const put = (member: OrchestrationV2Run, reply?: string) => {
+      state.data = {
+        ...state.data,
+        runs: [...state.data.runs.filter((one) => one.id !== member.id), member],
+        turnItems:
+          reply === undefined
+            ? state.data.turnItems
+            : [
+                ...state.data.turnItems,
+                turnItem(member.id, 3, { type: "assistant_message", text: reply }),
+              ],
+      };
+      return member;
+    };
+    return { state, write, continuation, put };
+  };
+
+  it.effect.each([
+    ["the cancel is seen before upstream dispatches the continuation", "pending"],
+    ["a continuation failed before its prompt and upstream retries it later", "retry"],
+  ] as const)(
+    "a restart continuation upstream has not started yet (#837): %s; the handoff waits for it, once",
+    ([, kind]) =>
+      Effect.gen(function* () {
+        const { state, write, continuation, put } = cutShort();
+        let last: RunId = write.id;
+        if (kind === "pending") {
+          // The recovery service writes the cancel and its continuation effect together; the
+          // effect worker dispatches it later.
+          state.effects!.set(`effect:restart-continuation:${write.id}`, {
+            status: "pending",
+            availableAt: NOW_MS,
+          });
+        } else {
+          // The first continuation failed before the provider took its prompt: upstream continues
+          // it again after its own delay, and has not written that effect yet.
+          const failed = put(
+            continuation(3, write.id, {
+              status: "failed",
+              activeAttemptId: RunAttemptId.make("attempt-3"),
+              completedAt: at(),
+            }),
+          );
+          expect(continuationStartRetryDelayMs(failed, state.data)).toBeGreaterThan(0);
+          last = failed.id;
+        }
+        const { sent, emit, events, settleEffect } = yield* harness(state);
+        const latest = state.data.runs.find((one) => one.id === last)!;
+        yield* emit(runUpdated(latest), "readThread", 1);
+        // Not judged as failed: no fallback while upstream still owes the continuation.
+        yield* TestClock.adjust(
+          kind === "pending" ? 10_000 : continuationStartRetryDelayMs(latest, state.data)! - 1,
+        );
+        expect(sent).toEqual([]);
+        // Upstream starts it: the run first, then its row settles.
+        const next = put(continuation(4, last));
+        yield* Queue.offer(events, runUpdated(next));
+        if (kind === "pending")
+          yield* settleEffect(`effect:restart-continuation:${write.id}`, "succeeded");
+        yield* TestClock.adjust(MINUTE_MS);
+        expect(sent).toEqual([]);
+        const done = put({ ...next, status: "completed", completedAt: at() }, WRITTEN);
+        yield* Queue.offer(events, runUpdated(done));
+        yield* emit(null, "finishWrite", 1);
+        expect(messages(sent).map((one) => one.messageId)).toEqual([handoffMessageId]);
+        expect(part2(sent)[0]).toContain("Goal: ship X.");
+        expect(writes(sent)).toEqual([]);
+      }),
+    SHORT_TIMEOUT_MS,
+  );
+
+  it.effect(
+    "a restart continuation upstream does not start after all (#837): the fallback once, after its wait",
+    () =>
+      Effect.gen(function* () {
+        const { state, write, continuation, put } = cutShort();
+        // The continuation failed before its prompt; upstream's retry is due after its delay.
+        const failed = put(
+          continuation(3, write.id, {
+            status: "failed",
+            activeAttemptId: RunAttemptId.make("attempt-3"),
+            completedAt: at(),
+          }),
+        );
+        const delayMs = continuationStartRetryDelayMs(failed, state.data)!;
+        const effectId = `effect:restart-continuation:${failed.id}`;
+        state.effects!.set(effectId, { status: "pending", availableAt: NOW_MS + delayMs });
+        const { sent, emit, settleEffect } = yield* harness(state);
+        yield* emit(runUpdated(failed), "readThread", 1);
+        yield* TestClock.adjust(delayMs);
+        expect(sent).toEqual([]);
+        // Upstream's retry ran and started no run (its instance is off, say): no thread event.
+        yield* settleEffect(effectId, "succeeded");
+        yield* emit(null, "finishWrite", 1);
+        expect(part2(sent)).toEqual([notCounted("the write turn failed")]);
+      }),
+    SHORT_TIMEOUT_MS,
+  );
+
+  it.effect(
+    "a chain judged with nothing sent is not kept in hand: its continuation reported long after is left alone",
+    () =>
+      Effect.gen(function* () {
+        const { state, write, continuation, put } = cutShort();
+        // Idle-sized, so the judged chain's failure sends nothing. The loop takes the write turn
+        // in hand while it runs; a restart then continues it in a new run.
+        state.data = { ...state.data, providerTurns: projection(usage.idle).providerTurns };
+        const running = put({ ...write, status: "running", completedAt: null });
+        const { sent, emit, events } = yield* harness(state);
+        yield* emit(runUpdated(running), "readThread", 1);
+        put(write);
+        const next = put(continuation(3, write.id));
+        yield* Queue.offer(events, runUpdated(write));
+        yield* Queue.offer(events, runUpdated(next));
+        // The loop carries the chain on to the continuation, and waits for its end.
+        yield* TestClock.adjust(MINUTE_MS);
+        const done = put({ ...next, status: "completed", completedAt: at() }, "No marker.");
+        // Its end wakes the loop through another event of the thread, so no late run update
+        // starts a second loop that would judge it again.
+        yield* Queue.offer(events, threadChanged(state.data));
+        yield* emit(null, "finishWrite", 1);
+        expect(sent).toEqual([]);
+        // Long after (past its timeout), at the size backstop, a restart reports it again: it ended
+        // long before, so it is left, and the next turn end decides.
+        yield* TestClock.adjust(Duration.toMillis(HandoffService.HANDOFF_WRITE_TIMEOUT) * 2);
+        state.data = { ...state.data, providerTurns: projection(usage.size).providerTurns };
+        yield* emit(runUpdated(done), "handOffWhenDue", 2);
+        expect(sent).toEqual([]);
       }),
     SHORT_TIMEOUT_MS,
   );

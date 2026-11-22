@@ -50,26 +50,37 @@ export function parseHandoffMessageId(
 
 /**
  * The write turn's (agent source) message id: `handoff-write:<thread>:<run>`, fixed per source run,
- * then `:loud` when its finish must alert (as a handoff's). The command id has no suffix, so a
- * second trigger for the run cannot start a second write turn.
+ * then `:fallback` when a failure is followed by the fallback handoff (any trigger but idle), then
+ * `:loud` when its finish must alert (as a handoff's). The command id has no suffix, so a second
+ * trigger for the run cannot start a second write turn.
  */
 export const HANDOFF_WRITE_PREFIX = "handoff-write:";
-export const handoffWriteIds = (threadId: ThreadId, sourceRunId: string, loud = false) => ({
+export const HANDOFF_FALLBACK_SUFFIX = ":fallback";
+export const handoffWriteIds = (
+  threadId: ThreadId,
+  sourceRunId: string,
+  marks: { readonly loud?: boolean; readonly fallback?: boolean } = {},
+) => ({
   commandId: `server:${HANDOFF_WRITE_PREFIX}${threadId}:${sourceRunId}`,
-  messageId: `${HANDOFF_WRITE_PREFIX}${threadId}:${sourceRunId}${loud ? HANDOFF_LOUD_SUFFIX : ""}`,
+  messageId: `${HANDOFF_WRITE_PREFIX}${threadId}:${sourceRunId}${marks.fallback === true ? HANDOFF_FALLBACK_SUFFIX : ""}${marks.loud === true ? HANDOFF_LOUD_SUFFIX : ""}`,
 });
 
-/** The source run a write turn's message id names, and whether it alerts; null for any other id. */
+/**
+ * The source run a write turn's message id names, whether it alerts, and whether the fallback
+ * follows its failure; null for any other id.
+ */
 export function parseHandoffWrite(
   threadId: ThreadId,
   messageId: string,
-): { readonly runId: string; readonly loud: boolean } | null {
+): { readonly runId: string; readonly loud: boolean; readonly fallback: boolean } | null {
   const prefix = `${HANDOFF_WRITE_PREFIX}${threadId}:`;
   if (!messageId.startsWith(prefix)) return null;
-  const rest = messageId.slice(prefix.length);
+  let rest = messageId.slice(prefix.length);
   const loud = rest.endsWith(HANDOFF_LOUD_SUFFIX);
-  const runId = loud ? rest.slice(0, -HANDOFF_LOUD_SUFFIX.length) : rest;
-  return runId === "" ? null : { runId, loud };
+  if (loud) rest = rest.slice(0, -HANDOFF_LOUD_SUFFIX.length);
+  const fallback = rest.endsWith(HANDOFF_FALLBACK_SUFFIX);
+  const runId = fallback ? rest.slice(0, -HANDOFF_FALLBACK_SUFFIX.length) : rest;
+  return runId === "" ? null : { runId, loud, fallback };
 }
 
 /** The source run a write turn's message id names; null for any other id. */
@@ -89,7 +100,7 @@ export function handoffWriteChain(
   run: OrchestrationV2Run,
   runs: ReadonlyArray<OrchestrationV2Run>,
 ): {
-  readonly write: { readonly runId: string; readonly loud: boolean };
+  readonly write: { readonly runId: string; readonly loud: boolean; readonly fallback: boolean };
   readonly chain: ReadonlyArray<OrchestrationV2Run>;
 } | null {
   const chain = [run];

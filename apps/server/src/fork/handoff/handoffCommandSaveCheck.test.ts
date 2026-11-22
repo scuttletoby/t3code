@@ -45,11 +45,29 @@ const layout = Effect.gen(function* () {
   const path = yield* Path.Path;
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "handoff-save-" });
   const at = (...parts: ReadonlyArray<string>) => path.join(root, ...parts);
-  for (const folder of ["outside", "repo/.git", "repo/scripts", "tree"]) {
+  for (const folder of [
+    "outside/bin",
+    "outside/tool",
+    "repo/.git",
+    "repo/scripts",
+    "repo/tool",
+    "tree",
+  ]) {
     yield* fs.makeDirectory(at(folder), { recursive: true });
   }
   yield* fs.writeFileString(at("tree", ".git"), "gitdir: /elsewhere\n");
-  for (const file of ["outside/run", "outside/notes.py", "repo/scripts/notes.py", "tree/notes"]) {
+  for (const file of [
+    "outside/run",
+    "outside/notes.py",
+    "outside/handoff",
+    "outside/tool/__main__.py",
+    "repo/scripts/notes.py",
+    "repo/scripts/handoff",
+    "repo/tool/__main__.py",
+    "tree/notes",
+    // Stand-ins for the programs, by name: the check reads names and the disk, it runs nothing.
+    ...["python3.12", "sh", "node", "env", "make", "npm"].map((name) => `outside/bin/${name}`),
+  ]) {
     yield* fs.writeFileString(at(file), "#!/bin/sh\n");
   }
   yield* fs.symlink(at("repo", "scripts", "notes.py"), at("outside", "link"));
@@ -119,6 +137,64 @@ describe("handoff command save check (#785)", () => {
       assert.include(
         yield* problemOf(withCommand([at("outside/run"), at("outside/missing.py")])),
         "not a file on this server: give the full path of a script that exists",
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("follows an interpreter to its script, whatever its ending, or a module by name", () =>
+    Effect.gen(function* () {
+      const at = yield* layout;
+      const [python, sh, node] = ["python3.12", "sh", "node"].map((name) =>
+        at(`outside/bin/${name}`),
+      );
+      const refused: ReadonlyArray<readonly [ReadonlyArray<string>, string]> = [
+        [[python!, "-m", "notes"], 'gives "-m notes", a module found by name'],
+        [[python!, "-mnotes"], 'gives "-m notes", a module found by name'],
+        [[node!, "-r", "./setup"], 'gives "-r ./setup", a module found by name'],
+        [[node!, "--import=setup"], 'gives "--import setup", a module found by name'],
+        [[sh!, "scripts/handoff"], 'gives "scripts/handoff", a script by a relative path'],
+        [[sh!, at("repo/scripts/handoff")], `inside the git checkout ${at("repo")}`],
+        // A folder Python runs by its __main__.py, and the checkout's own folder.
+        [[python!, at("repo/tool")], `inside the git checkout ${at("repo")}`],
+        [[python!, at("repo")], `inside the git checkout ${at("repo")}`],
+        [[python!, "-W", "ignore", at("outside/missing")], "not a file on this server"],
+      ];
+      for (const [command, problem] of refused) {
+        assert.include(yield* problemOf(withCommand(command)), problem, command.join(" "));
+      }
+      const taken: ReadonlyArray<ReadonlyArray<string>> = [
+        [python!, "-W", "ignore", at("outside/notes.py")],
+        [python!, at("outside/tool")],
+        [sh!, at("outside/handoff"), "--since", "1h"],
+        [sh!, "-c", "echo notes"],
+        [node!, "-r", at("outside/notes.py"), at("outside/handoff")],
+      ];
+      for (const command of taken) {
+        assert.strictEqual(yield* problemOf(withCommand(command)), undefined, command.join(" "));
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("checks the program env runs, and refuses programs that run the project's files", () =>
+    Effect.gen(function* () {
+      const at = yield* layout;
+      const [python, env, make, npm] = ["python3.12", "env", "make", "npm"].map((name) =>
+        at(`outside/bin/${name}`),
+      );
+      const refused: ReadonlyArray<readonly [ReadonlyArray<string>, string]> = [
+        [[env!, "notes"], 'runs "notes" through env, which finds it on the PATH'],
+        [[env!, "-i", "A=1", python!, at("repo/scripts/notes.py")], "inside the git checkout"],
+        [[env!, "-u", "HOME", at("repo/scripts/handoff")], "inside the git checkout"],
+        [[env!, "-S", "python3 -m notes"], 'gives env "-S", which this check cannot follow'],
+        [[make!, "handoff"], "runs what a file in the project folder"],
+        [[npm!, "run", "handoff"], "runs what a file in the project folder"],
+      ];
+      for (const [command, problem] of refused) {
+        assert.include(yield* problemOf(withCommand(command)), problem, command.join(" "));
+      }
+      assert.strictEqual(
+        yield* problemOf(withCommand([env!, "-i", "A=1", at("outside/run"), "--quiet"])),
+        undefined,
       );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );

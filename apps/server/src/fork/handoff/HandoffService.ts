@@ -24,9 +24,11 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 
+import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapterRegistry.ts";
+import { continuationStartRetryDelayMs } from "../../orchestration-v2/RestartBackgroundNote.ts";
 import { forkParked } from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as SlotGate from "../../slots/SlotGate.ts";
@@ -83,6 +85,17 @@ const WRITE_ENDED = new Set(["completed", "interrupted", "failed", "cancelled", 
  * a restart cut short, and continues again a continuation that failed before its prompt.
  */
 const CUT_SHORT = new Set(["cancelled", "failed"]);
+/**
+ * Upstream's outbox row that starts a run's restart continuation (`Orchestrator.ts`
+ * `retryContinuationStart`, `ProviderRuntimeRecoveryService.ts`): written with the cancel at a
+ * restart, or after a continuation failed before its prompt, due after upstream's own delay.
+ */
+const continuationEffectId = (runId: string) => `effect:restart-continuation:${runId}`;
+/**
+ * A continuation that failed before its prompt gets upstream's retry row just after its failure
+ * (no thread event marks it): read again this often until it is there.
+ */
+const CONTINUATION_RECHECK = Duration.seconds(5);
 
 /**
  * A write turn's chain (`handoffWriteChain`) as one turn's items, in order: the continuations'
@@ -136,6 +149,7 @@ export const make = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const adapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
+  const outbox = yield* EffectOutbox.EffectOutboxV2;
   const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
   const commandSource = yield* HandoffCommand.HandoffCommand;
   // One per waiting thread; any event of that thread completes it, so the wait reads again.
@@ -304,6 +318,55 @@ export const make = Effect.gen(function* () {
     );
 
   /**
+   * What follows a write turn (or continuation) a restart cut short: its continuation (`next`), one
+   * upstream still owes (`owed`: its outbox row is not settled yet, or upstream retries a
+   * continuation that failed before its prompt and has not written that row yet; due at `dueMs`),
+   * or none. The row is read before the runs, so a row that settles between the reads shows its run.
+   */
+  const continuationOf = Effect.fn("HandoffService.continuationOf")(function* (
+    threadId: ThreadId,
+    write: OrchestrationV2Run,
+  ) {
+    const effectId = continuationEffectId(write.id);
+    const effect = yield* outbox.get(effectId).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("handoff: a restart continuation's outbox row unread", {
+          threadId,
+          runId: write.id,
+          cause,
+        }).pipe(Effect.as(Option.none<EffectOutbox.OrchestrationEffectV2>())),
+      ),
+    );
+    const projection = yield* projections.getThreadRecords(
+      threadId,
+      ["runs", "providerTurns", "turnItems"],
+      { turnItemTypes: ["error"], turnItemRunIds: [write.id] },
+    );
+    const next = projection.runs.find(
+      (candidate) => candidate.restartContinuationOfRunId === write.id,
+    );
+    if (next !== undefined) return { kind: "next", next } as const;
+    if (Option.isSome(effect)) {
+      const { status, availableAt } = effect.value;
+      return status === "pending" || status === "running"
+        ? ({
+            kind: "owed",
+            effectId,
+            dueMs: DateTime.toEpochMillis(DateTime.makeUnsafe(availableAt)),
+          } as const)
+        : ({ kind: "none" } as const);
+    }
+    const delayMs = continuationStartRetryDelayMs(write, projection);
+    return delayMs === undefined || write.completedAt === null
+      ? ({ kind: "none" } as const)
+      : ({
+          kind: "owed",
+          effectId: undefined,
+          dueMs: DateTime.toEpochMillis(write.completedAt) + delayMs,
+        } as const);
+  });
+
+  /**
    * A write turn, from wherever it is, to its handoff: waits for its end, stops it at its timeout,
    * judges the reply and sends (fixed ids: at most once). Any loop that finds a write turn as the
    * latest run comes here. `reason`: the trigger that started it; else the size decides.
@@ -314,13 +377,16 @@ export const make = Effect.gen(function* () {
       found: OrchestrationV2Run,
       runs: ReadonlyArray<OrchestrationV2Run>,
       waiting: Waiting,
-      reason?: "size" | "idle" | "asked",
+      reason: "size" | "idle" | "asked" | undefined,
+      /** Every run of the chain this call took in hand (`carrying`), let go once it is decided. */
+      held: Set<string>,
     ) {
       // `found` is the write turn or its restart continuation: the chain is one write turn.
       const origin = handoffWriteChain(threadId, found, runs);
       if (origin === null) return;
       const parsed = origin.write;
       let chain = origin.chain;
+      for (const member of chain) held.add(member.id);
       carrying.add(found.id);
       yield* leavePlace(waiting);
       let write = found;
@@ -330,6 +396,7 @@ export const make = Effect.gen(function* () {
         DateTime.toEpochMillis(write.requestedAt) + Duration.toMillis(HANDOFF_WRITE_TIMEOUT);
       const stopWaitMs = Duration.toMillis(HANDOFF_WRITE_STOP_WAIT);
       let stopAsked = false;
+      let owedLogged: string | undefined;
       while (true) {
         // Set before the read, so the run's end between the read and the wait is not missed.
         const wake = yield* Deferred.make<void>();
@@ -342,16 +409,56 @@ export const make = Effect.gen(function* () {
         write = now;
         if (WRITE_ENDED.has(write.status)) {
           // A restart cut it short and upstream continued it: carry on with the continuation.
-          const next = CUT_SHORT.has(write.status)
-            ? (yield* projections.getThreadRecords(threadId, ["runs"], {})).runs.find(
-                (candidate) => candidate.restartContinuationOfRunId === write.id,
-              )
-            : undefined;
-          if (next === undefined) break;
+          const after = CUT_SHORT.has(write.status)
+            ? yield* continuationOf(threadId, write)
+            : ({ kind: "none" } as const);
+          if (after.kind === "none") break;
+          if (after.kind === "owed") {
+            // Upstream still starts it (at once, or after its retry delay): judging the chain
+            // now would send the fallback without the notes the continuation may write.
+            const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+            const giveUpMs = after.dueMs + stopWaitMs;
+            if (nowMs >= giveUpMs) {
+              yield* Effect.logWarning(
+                "handoff: upstream's restart continuation did not start; the write turn is judged as it is",
+                { threadId, runId: write.id },
+              );
+              break;
+            }
+            if (owedLogged !== write.id) {
+              owedLogged = write.id;
+              yield* Effect.logInfo(
+                "handoff write turn waits for upstream's restart continuation",
+                {
+                  threadId,
+                  runId: write.id,
+                  dueAt: DateTime.formatIso(DateTime.makeUnsafe(after.dueMs)),
+                },
+              );
+            }
+            yield* Effect.raceFirst(
+              Deferred.await(wake),
+              after.effectId === undefined
+                ? Effect.never
+                : outbox.awaitSettled(after.effectId).pipe(Effect.catch(() => Effect.never)),
+            ).pipe(
+              Effect.timeoutOrElse({
+                duration: Duration.millis(
+                  after.effectId === undefined
+                    ? Math.min(Duration.toMillis(CONTINUATION_RECHECK), giveUpMs - nowMs)
+                    : giveUpMs - nowMs,
+                ),
+                orElse: () => Effect.void,
+              }),
+            );
+            continue;
+          }
+          const next = after.next;
           yield* Effect.logInfo("handoff write turn continued after a restart", {
             threadId,
             runId: next.id,
           });
+          held.add(next.id);
           carrying.add(next.id);
           chain = [...chain.slice(0, -1), write, next];
           write = next;
@@ -426,12 +533,18 @@ export const make = Effect.gen(function* () {
         );
       }
       const size = handoffThreadFacts(read.records).usedTokens;
+      // Found after a restart: a write turn marked `:fallback` was started where the fallback
+      // follows its failure (and its failure is quiet for that), so it gets it; else the size
+      // decides.
       const trigger =
         reason ??
-        (size !== undefined && Number.isFinite(size) && size >= read.settings.sizeTokens
+        (parsed.fallback ||
+        (size !== undefined && Number.isFinite(size) && size >= read.settings.sizeTokens)
           ? "size"
           : "idle");
       if (!agent.ok) {
+        // At the idle trigger this log is all T3 adds: the write turn is not marked `:fallback`,
+        // so a failed one alerts as upstream's failed run.
         yield* Effect.logWarning("handoff write turn did not count", {
           threadId,
           reason: agent.reason,
@@ -461,13 +574,13 @@ export const make = Effect.gen(function* () {
         });
       }
     },
-    (effect, _threadId, found, _runs) =>
-      // Decided (sent, judged or left): no longer in hand. A loop replaced mid-way keeps it, so the
-      // loop that replaces it carries it on.
+    (effect, _threadId, _found, _runs, _waiting, _reason, held) =>
+      // Decided (sent, judged or left): no run of the chain is in hand any more. A loop replaced
+      // mid-way keeps them, so the loop that replaces it carries the chain on.
       effect.pipe(
         Effect.tap((kept) =>
           Effect.sync(() => {
-            if (kept !== "kept") carrying.delete(found.id);
+            if (kept !== "kept") for (const id of held) carrying.delete(id);
           }),
         ),
       ),
@@ -550,7 +663,7 @@ export const make = Effect.gen(function* () {
         ) {
           yield* endSettle;
           if (!carriesOn(latestRun, DateTime.toEpochMillis(yield* DateTime.now))) return;
-          yield* finishWrite(threadId, latestRun, read.records.runs, waiting);
+          yield* finishWrite(threadId, latestRun, read.records.runs, waiting, undefined, new Set());
           return;
         }
         const latest = handoffThreadFacts(read.records).lastRun;
@@ -665,7 +778,12 @@ export const make = Effect.gen(function* () {
           } else {
             // The `agent` source: one normal turn on the old session (its model, no fresh
             // context), with the same check before it as the handoff.
-            const writeIds = handoffWriteIds(threadId, run.id, settle.loud);
+            // `:fallback` where the fallback follows a failed write turn (any trigger but idle),
+            // so only that failure is quiet: at the idle trigger nothing follows it.
+            const writeIds = handoffWriteIds(threadId, run.id, {
+              loud: settle.loud,
+              fallback: decision.reason !== "idle",
+            });
             const written = yield* withStores(
               dispatchHandoff({
                 type: "message.dispatch",
@@ -686,7 +804,7 @@ export const make = Effect.gen(function* () {
               );
               if (write === undefined) return;
               yield* endSettle;
-              yield* finishWrite(threadId, write, runs, waiting, decision.reason);
+              yield* finishWrite(threadId, write, runs, waiting, decision.reason, new Set());
               return;
             }
             // Dropped or queued behind a newer run: that run's turn end decides.
@@ -894,6 +1012,9 @@ export const layer = Layer.effectDiscard(
 ).pipe(
   Layer.provide(HandoffCommand.layer),
   Layer.provide(ProjectionStore.layer),
+  // The runtime's own outbox (orchestration-v2/runtimeLayer.ts): layers memoize by reference, so
+  // `awaitSettled` hears the effect worker settle a row.
+  Layer.provide(EffectOutbox.layer),
   // Upstream's own lookup over the server's instance registry, as server.ts gives /mcp.
   Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
   // The server's one slot gate: layers memoize by reference.

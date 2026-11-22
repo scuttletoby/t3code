@@ -6,6 +6,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProjectId, ThreadId } from "@t3tools/contracts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -15,6 +16,7 @@ import * as Path from "effect/Path";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ProcessRunner from "../../processRunner.ts";
 import {
+  HANDOFF_COMMAND_ENV_KEYS,
   HANDOFF_COMMAND_MAX_BYTES,
   HANDOFF_COMMAND_TIMEOUT_SECONDS,
   HANDOFF_PROJECT_ENV,
@@ -82,6 +84,27 @@ describe("handoffCommand", () => {
       assert.strictEqual(yield* fs.realPath(printed.cwd), yield* fs.realPath(root));
       assert.strictEqual(printed.thread, threadId);
       assert.strictEqual(printed.project, projectId);
+    }).pipe(Effect.scoped, Effect.provide(services)),
+  );
+
+  it.live("gets a short list of the server's environment, not the whole of it (#785)", () =>
+    Effect.gen(function* () {
+      const { result } = yield* runIn(node("console.log(JSON.stringify(process.env))"));
+      const printed: Record<string, string> = JSON.parse(result.ok ? result.text : "{}");
+      // Only the list and the two ids: none of the server's tokens, keys or test settings.
+      const allowed = new Set<string>([
+        ...HANDOFF_COMMAND_ENV_KEYS,
+        HANDOFF_THREAD_ENV,
+        HANDOFF_PROJECT_ENV,
+      ]);
+      assert.deepStrictEqual(
+        Object.keys(printed).filter((key) => !allowed.has(key)),
+        [],
+      );
+      assert.strictEqual(printed.PATH, (yield* HostProcess.Environment).PATH);
+      assert.strictEqual(printed[HANDOFF_THREAD_ENV], threadId);
+      const odd = yield* runIn(["/opt/a=b/notes"]);
+      failedWith(odd.result, 'its program\'s path has an "="');
     }).pipe(Effect.scoped, Effect.provide(services)),
   );
 

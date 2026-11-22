@@ -14,6 +14,7 @@ import * as DateTime from "effect/DateTime";
 import type * as SqlClient from "effect/sql/SqlClient";
 
 import {
+  HANDOFF_FALLBACK_SUFFIX,
   HANDOFF_LOUD_SUFFIX,
   HANDOFF_MESSAGE_PREFIX,
   HANDOFF_RETRY_SUFFIX,
@@ -42,19 +43,19 @@ function quietCandidate(threadId: ThreadId, messageId: string): string | null {
 }
 
 /**
- * A run that may end quiet: a completed run, or a failed write turn. The handoff follows a
- * failed write turn at once, with the reason, so the failure is not lost; a failed handoff run is
- * not quiet, as no message follows it but its retry. Upstream gates a failed run's alert on the
- * mark only once the awareness line `.github/fork-seams.json` announces is in.
+ * A run that may end quiet: a completed run, or a failed write turn marked `:fallback`, as the
+ * fallback follows it with the reason. Unmarked (idle trigger) or a failed handoff run: nothing
+ * follows, so it alerts. Upstream reads the mark for a failed run once its announced seam is in.
  */
 const endsQuiet = (threadId: ThreadId, run: Pick<OrchestrationV2Run, "status" | "userMessageId">) =>
   run.status === "completed" ||
-  (run.status === "failed" && parseHandoffWrite(threadId, run.userMessageId) !== null);
+  (run.status === "failed" && parseHandoffWrite(threadId, run.userMessageId)?.fallback === true);
 
 /**
- * A completed first-send handoff run, or a completed or failed write turn, not loud, sent by the
- * server, with no message of the person's, requested at least the relay's hold after the person's
- * run finished. Anything else (a retry, a steered write turn, a failed handoff run) alerts.
+ * A completed first-send handoff run, a completed write turn or a failed one the fallback follows,
+ * not loud, sent by the server, with no message of the person's, requested at least the relay's
+ * hold after the person's run finished. Anything else (a retry, a steered write turn, a failed
+ * write turn at the idle trigger, a failed handoff run) alerts.
  */
 export function isQuietHandoffRun(
   threadId: ThreadId,
@@ -113,8 +114,11 @@ export const quietHandoffRunOrSql = (sql: SqlClient.SqlClient, alias: string) =>
       THEN substr(${messageId}, length(${prefixOf(HANDOFF_WRITE_PREFIX)}) + 1)
     ELSE '' END)`;
   const endsWith = (suffix: string) => sql`substr(${rest}, ${-suffix.length}) = ${suffix}`;
+  // The source run's id: `rest` without a write turn's `:fallback` (a loud id never reads quiet).
+  const source = sql`(CASE WHEN ${startsWith(HANDOFF_WRITE_PREFIX)} AND ${endsWith(HANDOFF_FALLBACK_SUFFIX)}
+    THEN substr(${rest}, 1, length(${rest}) - ${HANDOFF_FALLBACK_SUFFIX.length}) ELSE ${rest} END)`;
   return sql`COALESCE((CASE
-    WHEN (${run}.status = 'completed' OR (${run}.status = 'failed' AND ${startsWith(HANDOFF_WRITE_PREFIX)}))
+    WHEN (${run}.status = 'completed' OR (${run}.status = 'failed' AND ${startsWith(HANDOFF_WRITE_PREFIX)} AND ${endsWith(HANDOFF_FALLBACK_SUFFIX)}))
       AND ${rest} <> ''
       AND NOT ${endsWith(HANDOFF_RETRY_SUFFIX)}
       AND NOT ${endsWith(HANDOFF_LOUD_SUFFIX)}
@@ -129,7 +133,7 @@ export const quietHandoffRunOrSql = (sql: SqlClient.SqlClient, alias: string) =>
         AND json_extract(steer.payload_json, '$.createdBy') = 'user'
     ) AND EXISTS (
       SELECT 1 FROM orchestration_v2_projection_runs source
-      WHERE source.thread_id = ${run}.thread_id AND source.run_id = ${rest}
+      WHERE source.thread_id = ${run}.thread_id AND source.run_id = ${source}
         AND source.completed_at IS NOT NULL
         AND CAST(round(
           (julianday(${run}.requested_at) - julianday(source.completed_at)) * 86400000

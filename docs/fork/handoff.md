@@ -140,25 +140,53 @@ The new session's first message has these parts:
    - **`command`:** T3 runs the program in `command` in the project folder, with the runner wait
      checks use (`makeSettingsProgramRunner` in `waits/WaitJudges.ts`): no shell, a 60-second
      timeout (the process is killed; what it printed so far is not used), a 32 KB cap on stdout
-     and on stderr each (warnings count too), its stdin closed, and the server's environment plus
-     the thread and project ids (`T3CODE_THREAD_ID`, `T3CODE_PROJECT_ID`). Its output, trimmed, is
+     and on stderr each (warnings count too), its stdin closed, and a short list of the server's
+     environment plus the thread and project ids (`T3CODE_THREAD_ID`, `T3CODE_PROJECT_ID`). Its
+     output, trimmed, is
      the handoff, between begin and end lines that mark it as the command's notes. It must only
      read and be safe to run twice: a second trigger for the same run may run it again. It runs
      once the settle is over, right before the send; a handoff waiting for an agent slot keeps its
      result, a failure too, and does not run it again. A stale state file is caught by part 1,
      which T3 reads fresh. A program that is missing or cannot be run reads as "its program could
      not start" (exit code 126 or 127, as `timeout` reports it on Linux).
+   - **The environment** is only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`,
+     `LC_CTYPE`, `TZ`, `TMPDIR`, the `XDG_*` folders (those the server has) and the two ids, not
+     the server's tokens and keys (`HANDOFF_COMMAND_ENV_KEYS` in `handoffCommand.ts`). T3 starts
+     the command through `/usr/bin/env -i` with that list, as the runner it shares with wait checks
+     always adds to the server's whole environment (upstream's `processRunner.ts`). A program that
+     needs more sets it itself. On Windows there is no such program: the command gets the server's
+     whole environment there. A program path with `=` in it fails, as `env` would read it as a
+     setting.
    - Point `command` at a program outside the repository: one inside it (`./scripts/x`, or a
-     script an interpreter is given) can be edited by an agent, and runs with the server's
-     environment. A save that sets a new command checks this
-     (`fork/handoff/handoffCommandSaveCheck.ts`): the program must be a full path on the server's
-     OS, to a file that exists, outside any git checkout (a folder above it, or above the file a
-     link points to, holds `.git`); a script handed to an interpreter must be a full path, to a
-     file that exists, outside any checkout too. A command already stored at the same place is not
-     checked again, so a file moved since, or a hand edit, blocks no other save; it then fails at
-     the handoff as "its program could not start". The environment is the server's whole one: the
-     runner it shares with wait checks (upstream's `processRunner.ts`) always adds to it, so a
-     shorter list would need an upstream change.
+     script an interpreter is given) can be edited by an agent. A save that sets a new command
+     checks the command's words against the disk (`fork/handoff/handoffCommandSaveCheck.ts`). It
+     guards against mistakes, not against the person (the setting is theirs alone). It refuses:
+     - a program that is not a full path on the server's OS, not a file, or inside a git checkout
+       (a folder above it, or above the file a link points to, holds `.git`);
+     - for a known interpreter (shells, `python`, `node`, `deno`, `bun`, `ruby`, `perl`, `php`,
+       `lua`, `tclsh`, `pwsh`, `Rscript`): its script (the first argument that is not an option,
+       whatever its ending) by a relative path, missing, or inside a checkout, a folder Python
+       would run (`__main__.py`) too; and a module found by name (`python -m x`, `node -r x`,
+       `--import x`), as that is looked up from the project folder;
+     - for any program: an argument ending in a script ending (`.py`, `.sh`, …) by a relative
+       path, or by a full path that is missing; a full-path argument that is a file inside a
+       checkout;
+     - `env` running a program by name (found on the `PATH`), or with `-S` or `-C`; otherwise the
+       program after `env`'s options and settings is checked as above;
+     - programs that run what a file in their working folder says: `make`, `just`, `rake`, `npm`,
+       `npx`, `pnpm`, `yarn`, `cargo`, `go`, `gradle`, `mvn`, `ant`, `task`, `tox`, `nox`,
+       `poetry`, `pipenv`, `uv`, `composer`.
+
+     It does not catch: code given inline (`sh -c '…'`, `python -c '…'`, which may itself run
+     project files); wrappers other than `env` (`nice`, `timeout`, `xargs`, …), whose program is
+     not followed; interpreters and runners not named above, or under another name; an option
+     that takes a value the check does not know, which can hide the script; a program that reads
+     files or config from the project folder by itself (a script that imports a project file,
+     `git`, which reads `.git/config`, which can name programs to run); a folder argument to a
+     program that is not an interpreter; and anything changed on disk after the save. A command
+     already stored at the same place is not checked again, so a file moved since, or a hand
+     edit, blocks no other save; it then fails at the handoff as "its program could not start".
+
    - **`agent`:** once the settle is over, T3 sends the old session one normal turn, the write
      turn: the setting's `instructions` (empty: a built-in text), then "start your reply with this
      line, alone: `[T3 handoff notes]`" and the 32 KB cap. It runs on the old session as it is (no
@@ -169,7 +197,13 @@ The new session's first message has these parts:
      and end lines that mark it as the old session's notes (the last reply that starts with the
      marker, when the session wrote more than one). A line in the notes that could pass for one of
      the message's own (a begin or end line, `[T3 handoff`, `Recent conversation:`, the rules) is
-     quoted with `> `, so the notes cannot end their part early or fake another part.
+     quoted with `> `, so the notes cannot end their part early or fake another part. A line is
+     matched by its letters and digits only, after compatibility folding, with accents dropped and
+     look-alike Cyrillic, Greek and IPA letters read as Latin: so rules of any character, list,
+     table, quote and heading marks, `hand-off` and invisible characters do not hide one. Every
+     line break a reader may take as one (CR, CR LF, LF, vertical tab, form feed, NEL, U+2028,
+     U+2029) splits lines, and comes out as LF. A line that starts with "end" or "begin" and names a
+     handoff is quoted even in prose; that costs nothing.
      - **Part 3 leaves out** the write turn's prompt and its marked reply. A message the person
        steered into a write turn, and the answer to it, stay in later handoffs' part 3.
      - **No handoff at all** (the old session carries on with everything it had, and the next turn
@@ -195,16 +229,27 @@ The new session's first message has these parts:
        that chain of runs as the one write turn: the handoff waits for its last run, judges the
        chain's replies in order without upstream's prompts, and sends with the same ids, once; no
        second write turn starts (`handoffWriteChain` in `handoffFacts.ts`). Each run of the chain
-       gets the 4-minute timeout from its own request.
-     - **Quiet.** A write turn that completes, or fails, is marked quiet as the handoff run is
-       (same rule, same `:loud` suffix when the settle saw the relay not show the person's
-       finish), so its end does not alert: the handoff, or the fallback at the size backstop,
-       follows. One the person steered into alerts. Upstream's alerts for a failed run (the relay's
-       in `packages/shared/src/agentAwareness.ts`, the browser's in
-       `ThreadNotificationCoordinator.tsx`) honour the mark once their announced seam lines are
-       in (`.github/fork-seams.json`); until then a failed write turn still alerts there. Those
-       lines also quiet a failed run a person asked to stop, as a completed one already is. A
-       failed handoff run is not marked: its retry, or its alert, follows.
+       gets the 4-minute timeout from its own request. A run of the chain that ended cut short
+       with no continuation yet is judged only once upstream owes none: while upstream's
+       `effect:restart-continuation:<run>` row is pending (written with the cancel at a restart, or
+       due after upstream's retry delay for a continuation that failed before its prompt), or
+       upstream's `continuationStartRetryDelayMs` says a retry is coming and its row is not written
+       yet, the handoff waits for it, up to a minute past the time it is due. A continuation that
+       still does not come leaves the chain judged as it is (the log says so).
+     - **Quiet.** A write turn that completes is marked quiet as the handoff run is (same rule,
+       same `:loud` suffix when the settle saw the relay not show the person's finish), so its end
+       does not alert. A write turn started where the fallback follows its failure (the size
+       backstop, or a person asking) has `:fallback` in its message id, before `:loud`; it is quiet
+       when it fails too, as the fallback, with the reason, follows at once. At the idle trigger
+       nothing follows a failed write turn, so it has no `:fallback` and its failure alerts as
+       upstream's failed run, besides the server log's "handoff write turn did not count". Found
+       after a restart, a `:fallback` write turn gets the fallback. One the person steered into
+       alerts. Upstream's alerts for a failed run (the relay's in
+       `packages/shared/src/agentAwareness.ts`, the browser's in
+       `ThreadNotificationCoordinator.tsx`) honour the mark once their announced seam lines are in
+       (`.github/fork-seams.json`); until then any failed write turn still alerts there. Those lines
+       also quiet a failed run a person asked to stop, as a completed one already is. A failed
+       handoff run is not marked: its retry, or its alert, follows.
 
    **If the source fails** (for `command`: an exit code other than 0, a timeout, empty output,
    output over the cap, a program that cannot start, a project that cannot be read; for `agent`: a
