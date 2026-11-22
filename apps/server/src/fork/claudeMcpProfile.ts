@@ -137,14 +137,14 @@ export function claudeMcpProfilePlan(
 /**
  * Refuses a call to any tool but an MCP server's; hooks run in every mode and in sub-agents. Fails
  * closed: a tool name that is not a string, or any error while checking, refuses the call (a hook
- * that throws would count as a non-blocking error and let the call through).
+ * that throws would count as a non-blocking error and let the call through). It never trusts
+ * `hook_event_name`: whatever it says (missing, empty, another event), only an `mcp__` tool passes.
  */
 const claudeBuiltinToolsGuard =
   (name: string): HookCallback =>
   async (input) => {
     try {
-      if (input.hook_event_name !== "PreToolUse") return {};
-      const toolName: unknown = input.tool_name;
+      const toolName: unknown = (input as { tool_name?: unknown }).tool_name;
       if (typeof toolName === "string" && toolName.startsWith("mcp__")) return {};
       const shown = typeof toolName === "string" ? `the built-in tool "${toolName}"` : "a tool";
       return builtinToolDenial(

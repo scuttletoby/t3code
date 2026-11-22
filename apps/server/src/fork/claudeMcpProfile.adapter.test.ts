@@ -461,6 +461,45 @@ describe("ClaudeAdapterV2 MCP profile", () => {
     }),
   );
 
+  it.effect(
+    'the builtinTools "none" guard passes only MCP tools, whatever the event name says (#946)',
+    () =>
+      Effect.gen(function* () {
+        const bare = { servers: "all", t3Tools: "all", builtinTools: "none" } as const;
+        const { opened } = yield* runTurns({ mcpProfile: "bare", mcpProfiles: { bare } }, []);
+        const decision = (answer: unknown) =>
+          (answer as { hookSpecificOutput?: { permissionDecision?: string } } | undefined)
+            ?.hookSpecificOutput?.permissionDecision;
+        const call = (tool: string, eventName: unknown, omitEvent = false) => ({
+          ...(omitEvent ? {} : { hook_event_name: eventName }),
+          tool_name: tool,
+          tool_input: {},
+          tool_use_id: "toolu_profile",
+          session_id: NATIVE_THREAD,
+          transcript_path: "/tmp/transcript.jsonl",
+          cwd: "/workspace",
+        });
+        const events: ReadonlyArray<[label: string, eventName: unknown, omit: boolean]> = [
+          ["missing", undefined, true],
+          ["undefined", undefined, false],
+          ["empty", "", false],
+          ["PostToolUse", "PostToolUse", false],
+          ["lower case", "pretooluse", false],
+          ["not a string", 7, false],
+        ];
+        for (const [label, eventName, omit] of events) {
+          // The same call made again gets the same answer: nothing is remembered between calls.
+          for (const attempt of [1, 2]) {
+            const [refused] = yield* preToolUse(opened[0], "Bash", call("Bash", eventName, omit));
+            assert.strictEqual(decision(refused), "deny", `Bash, event ${label}, try ${attempt}`);
+            const mcpTool = "mcp__t3-code__t3_thread_list";
+            const [allowed] = yield* preToolUse(opened[0], mcpTool, call(mcpTool, eventName, omit));
+            assert.deepStrictEqual(allowed, {}, `${mcpTool}, event ${label}, try ${attempt}`);
+          }
+        }
+      }),
+  );
+
   it.effect("refuses the turn, without opening Claude, when the profile is missing", () =>
     Effect.gen(function* () {
       const { opened, refusal } = yield* runTurns({ mcpProfile: "lean" }, []);
