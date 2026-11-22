@@ -630,6 +630,28 @@ def tree(top, inside=None):
     return bad[:3] and '; '.join(bad[:3])
 
 
+def gpu_wall(c):
+    """(wall, what, why or None): whether the machine file's `gpu` turns GPU access on, and whether T3's unit on disk
+    says the same (systemd runs it as on disk: the units wall; T3 restarted since: the restart wall)."""
+    on = c['gpu']
+    # The unit skips ("-") whichever is missing, so T3 still runs: a note naming each, not a failure. No /dev/dxg:
+    # WSL gives this distro no GPU; no lib or drivers folder (a WSL update moved them, say): CUDA cannot load.
+    missing = [p for p in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers') if not k.lstat(p)]
+    what = ('GPU access is on (machine file "gpu": true): /dev/dxg, and /usr/lib/wsl/lib and /usr/lib/wsl/drivers '
+            'read-only' + (missing and ' (this distro has no ' + ', no '.join(missing) +
+                           ': the unit skips what is missing, so GPU jobs fail)' or '')
+            if on else 'GPU access is off (no "gpu": true in the machine file): no /dev/dxg, /usr/lib/wsl hidden')
+    try:
+        with open(k.ROOT + k.UNIT_DIRS[0] + '/' + k.UNIT, encoding='utf-8', errors='replace') as f:
+            has = k.gpu_lines(f.read())
+    except OSError as e:
+        return 'gpu', what, f'cannot read the unit ({e.strerror})'
+    word = {True: 'on', False: 'off'}
+    return 'gpu', what, None if has is on else \
+        'the unit has only some of the GPU lines, neither on nor off: run pc-agents setup' if has is None else \
+        f'the unit has GPU access {word[has]}, the machine file says {word[on]}: run pc-agents setup'
+
+
 def own_walls(c, before_enable=False):
     """(wall, what, why or None) for the walls this kit adds to fork-fleet-walls/wsl2. before_enable: setup asks
     before it enables T3 and the timer, so they need not be enabled yet."""
@@ -690,6 +712,7 @@ def own_walls(c, before_enable=False):
         if not rt and k.lstat(folder + '/t3') and k.file_sha(folder + '/t3') not in done.get(folder + '/t3', ()):
             rt = [f'{folder}/t3 is not the one pc-agents setup installed']
     out.append(('runtime', f'T3 {c["t3Version"]} is root\'s alone, as installed', rt and '; '.join(rt)))
+    out.append(gpu_wall(c))
     mounts = []
     try:
         with open(k.ROOT + '/proc/self/mountinfo', encoding='utf-8', errors='replace') as f:
