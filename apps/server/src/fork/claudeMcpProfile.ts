@@ -42,7 +42,13 @@ import {
   type McpProfileThread,
   resolveMcpProfile,
 } from "./mcpProfile.ts";
-import { type T3ToolSet, fixT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
+import {
+  MAX_T3_TOOL_SETS,
+  type T3ToolSet,
+  fixT3ToolSet,
+  refusedT3ToolSet,
+  t3ToolSetOf,
+} from "./mcpT3ToolSets.ts";
 import {
   type McpProfileFileKeys,
   mcpProfileFileKeysOf,
@@ -700,6 +706,22 @@ export const makeThreadMcpProfilesById = Effect.gen(function* () {
 });
 
 /**
+ * The plan key each thread's Claude process last opened with. Its T3 tool groups are part of the
+ * key, so a later plan with the same key has the same set as that process. Memory only, bounded
+ * like the sets: a thread dropped here just waits for its next process to fix its set.
+ */
+const openedPlanKeys = new Map<ThreadId, string | undefined>();
+
+const keepOpenedPlanKey = (threadId: ThreadId, key: string | undefined) => {
+  openedPlanKeys.delete(threadId);
+  openedPlanKeys.set(threadId, key);
+  for (const oldest of openedPlanKeys.keys()) {
+    if (openedPlanKeys.size <= MAX_T3_TOOL_SETS) break;
+    openedPlanKeys.delete(oldest);
+  }
+};
+
+/**
  * The plan with its T3 tool set fixed when its `options` are first read: ClaudeAdapterV2 reads
  * them only to open a new process, after the old one closed. A turn that keeps the live process (a
  * continuation, the same plan) or is refused before replacing it (background work still runs)
@@ -715,6 +737,7 @@ const fixedWhenOpened = (
     enumerable: true,
     get: () => {
       fixT3ToolSet(threadId, set);
+      keepOpenedPlanKey(threadId, planKey(plan));
       return options;
     },
   }) as ClaudeMcpProfilePlan;
@@ -740,7 +763,14 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
       fixT3ToolSet(thread.id, refusedT3ToolSet(plan.reason));
       return yield* plan;
     }
-    return fixedWhenOpened(plan, thread.id, t3ToolSetOf(resolved));
+    const set = t3ToolSetOf(resolved);
+    // The same plan as the thread's process opened with: the adapter keeps that process without
+    // reading the options, so its set is fixed here, the one that process has (never wider). This
+    // is how a good turn after a refused one gets its set back on the process the refusal kept.
+    if (openedPlanKeys.has(thread.id) && openedPlanKeys.get(thread.id) === planKey(plan)) {
+      fixT3ToolSet(thread.id, set);
+    }
+    return fixedWhenOpened(plan, thread.id, set);
   });
 
   return Effect.fn("ClaudeMcpProfile.plan")(function* (

@@ -35,6 +35,8 @@ import { MCP_T3_TOOL_NOT_ALLOWED, mcpT3ToolGroup } from "./mcpProfile.ts";
 import { installT3ToolSearchCheck } from "./mcpT3ToolFilter.ts";
 import {
   type T3ToolSet,
+  T3_TOOL_SET_HOLD_WAIT_MS as HOLD_WAIT_MS,
+  dropT3ToolSetHold,
   refusedT3ToolSet,
   rememberT3ToolSet,
   t3ToolSetFor,
@@ -132,10 +134,10 @@ const NO_SET_YET = "no MCP profile was worked out for this thread yet.";
 export const REFUSED_SET_REUSE_MS = 5_000;
 /** Threads whose refused set is reused at once; the oldest beyond this is worked out again. */
 const MAX_REFUSED_SETS = 1024;
-/** How long a request waits for a turn Codex started to fix its set before it is refused. */
-export const T3_TOOL_SET_HOLD_WAIT_MS = 10_000;
+/** How long a turn Codex started may hold the thread's requests while its set is fixed. */
+export const T3_TOOL_SET_HOLD_WAIT_MS = HOLD_WAIT_MS;
 const HOLD_TIMED_OUT =
-  "T3 is still working out this thread's MCP profile for the turn that just started. Try again in a moment.";
+  "T3 is still working out this thread's MCP profile for the turn that just started, or that check stopped; the profile applies again once it ends or the thread's next turn starts. Try again in a moment.";
 
 /** Recent refused sets, by thread, with when each stops being reused. */
 const refused = new Map<string, { readonly set: T3ToolSet; readonly until: number }>();
@@ -147,6 +149,74 @@ const searchable = (threadId: string, name: string) =>
     name,
   );
 
+/** The rule's check of one tool for one request, as {@link layer} runs it. */
+const makeVisible = Effect.gen(function* () {
+  const profileById = yield* makeThreadMcpProfilesById;
+  /** Worked out now from the settings: kept when it applies, reused briefly when refused. */
+  const workedOut = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const now = yield* Clock.currentTimeMillis;
+    const recent = refused.get(threadId);
+    if (recent !== undefined && recent.until > now) return recent.set;
+    const resolved = yield* profileById(threadId).pipe(
+      Effect.map(t3ToolSetOf),
+      Effect.catchTags({
+        ClaudeMcpProfileError: (refusal) => Effect.succeed(refusedT3ToolSet(refusal.reason)),
+      }),
+    );
+    if (resolved._tag === "Groups") {
+      refused.delete(threadId);
+      return rememberT3ToolSet(threadId, resolved);
+    }
+    // A turn may have fixed a set while this read ran: that one stands.
+    const fixed = t3ToolSetFor(threadId);
+    if (fixed !== undefined) return fixed;
+    refused.delete(threadId);
+    refused.set(threadId, { set: resolved, until: now + REFUSED_SET_REUSE_MS });
+    for (const oldest of refused.keys()) {
+      if (refused.size <= MAX_REFUSED_SETS) break;
+      refused.delete(oldest);
+    }
+    return resolved;
+  });
+  /**
+   * The thread's set: the one its turn fixed, else worked out now from the settings. While a turn
+   * Codex started is having its set fixed, wait for that set rather than use the one before.
+   */
+  const setFor: (threadId: ThreadId) => Effect.Effect<T3ToolSet> = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+  ) {
+    const hold = t3ToolSetHold(threadId, yield* Clock.currentTimeMillis);
+    if (hold !== undefined) {
+      // At most until the hold's bound, whichever request asks: a list request checks each tool
+      // in turn and only its first waits, so a hold never released costs one wait, not one per
+      // tool. It is then dropped, so the thread's later requests do not wait on it again.
+      const released =
+        hold.waitMs > 0
+          ? yield* Deferred.await(hold.done).pipe(Effect.timeoutOption(hold.waitMs))
+          : Option.none();
+      if (Option.isNone(released)) {
+        const timedOut = refusedT3ToolSet(HOLD_TIMED_OUT);
+        if (dropT3ToolSetHold(threadId, hold, timedOut)) return timedOut;
+        // Released, or a later turn's hold took its place, as the wait ended: look again.
+        return yield* setFor(threadId);
+      }
+    }
+    return t3ToolSetFor(threadId) ?? (yield* workedOut(threadId));
+  });
+  // Untraced: it runs once per tool on every list request.
+  return Effect.fnUntraced(function* ({ method, target }: McpServer.MiddlewareOptions) {
+    if (method !== "tools/list" && method !== "tools/call") return true;
+    const thread = callerThread(
+      yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
+    );
+    if (thread === undefined) return true;
+    const set = yield* setFor(thread.threadId);
+    if (t3ToolAllowed(set, target)) return true;
+    if (method === "tools/list") return false;
+    return yield* new T3ToolOutsideProfile({ message: t3ToolRefusal(set, target) });
+  });
+});
+
 /**
  * The global rule: on `tools/list` it hides, on `tools/call` it refuses, a T3 tool the calling
  * thread's set leaves out. Other methods (T3 serves no resources or prompts) pass.
@@ -157,62 +227,10 @@ export const layer = McpServer.visibility(
     // thread (no store) or reads every thread as `all` (no settings).
     yield* SqlClient.SqlClient;
     yield* ServerSettingsService.ServerSettingsService;
-    const profileById = yield* makeThreadMcpProfilesById;
     yield* installT3ToolSearchCheck(searchable);
-    /** Worked out now from the settings: kept when it applies, reused briefly when refused. */
-    const workedOut = Effect.fnUntraced(function* (threadId: ThreadId) {
-      const now = yield* Clock.currentTimeMillis;
-      const recent = refused.get(threadId);
-      if (recent !== undefined && recent.until > now) return recent.set;
-      const resolved = yield* profileById(threadId).pipe(
-        Effect.map(t3ToolSetOf),
-        Effect.catchTags({
-          ClaudeMcpProfileError: (refusal) => Effect.succeed(refusedT3ToolSet(refusal.reason)),
-        }),
-      );
-      if (resolved._tag === "Groups") {
-        refused.delete(threadId);
-        return rememberT3ToolSet(threadId, resolved);
-      }
-      // A turn may have fixed a set while this read ran: that one stands.
-      const fixed = t3ToolSetFor(threadId);
-      if (fixed !== undefined) return fixed;
-      refused.delete(threadId);
-      refused.set(threadId, { set: resolved, until: now + REFUSED_SET_REUSE_MS });
-      for (const oldest of refused.keys()) {
-        if (refused.size <= MAX_REFUSED_SETS) break;
-        refused.delete(oldest);
-      }
-      return resolved;
-    });
-    /**
-     * The thread's set: the one its turn fixed, else worked out now from the settings. While a turn
-     * Codex started is having its set fixed, wait for that set rather than use the one before.
-     */
-    const setFor = Effect.fnUntraced(function* (threadId: ThreadId) {
-      const hold = t3ToolSetHold(threadId);
-      if (hold !== undefined) {
-        const released = yield* Deferred.await(hold).pipe(
-          Effect.timeoutOption(T3_TOOL_SET_HOLD_WAIT_MS),
-        );
-        if (Option.isNone(released)) return refusedT3ToolSet(HOLD_TIMED_OUT);
-      }
-      return t3ToolSetFor(threadId) ?? (yield* workedOut(threadId));
-    });
-    // Untraced: it runs once per tool on every list request.
-    return Effect.fnUntraced(function* ({ method, target }: McpServer.MiddlewareOptions) {
-      if (method !== "tools/list" && method !== "tools/call") return true;
-      const thread = callerThread(
-        yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
-      );
-      if (thread === undefined) return true;
-      const set = yield* setFor(thread.threadId);
-      if (t3ToolAllowed(set, target)) return true;
-      if (method === "tools/list") return false;
-      return yield* new T3ToolOutsideProfile({ message: t3ToolRefusal(set, target) });
-    });
+    return yield* makeVisible;
   }).pipe(Effect.withSpan("McpT3ToolRule.make")),
   { global: true },
 );
 
-export const __testing = { t3ToolRefusal, clearRefused: () => refused.clear() };
+export const __testing = { t3ToolRefusal, clearRefused: () => refused.clear(), makeVisible };

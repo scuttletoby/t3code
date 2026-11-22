@@ -28,7 +28,9 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 
 import { makeTurnInput } from "../orchestration-v2/Adapters/AcpAdapterV2.testkit.ts";
@@ -1218,11 +1220,54 @@ describe("follow-ups: holds, sub-agents, unknown threads, per-call checks (fork 
       gated = true;
       yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
       // Held from the notification on, before the profile is read: no request sees the old set.
-      assert.isDefined(T3ToolSets.t3ToolSetHold("t"));
+      assert.isDefined(T3ToolSets.__testing.asked("t"));
       yield* Deferred.succeed(gate, undefined);
       yield* TestClock.withLive(Effect.sleep("20 millis"));
-      assert.isUndefined(T3ToolSets.t3ToolSetHold("t"));
+      assert.isUndefined(T3ToolSets.__testing.asked("t"));
       assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+    }),
+  );
+
+  it.effect("stopped half-way: a turn Codex starts as the client closes leaves no hold", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      const fake = makeFakeCodex({ servers: ["alpha"] });
+      const clientScope = yield* Scope.make();
+      const client = yield* withCodexMcpProfiles(
+        fake.client,
+        makeProfiles({ t: resolved("lean", "all", ["waits"]) }).profileFor,
+      ).pipe(Scope.provide(clientScope));
+      const id = (yield* start(client, "t")).thread.id;
+      // The session shuts down, then Codex's turn/started for the thread still arrives: the check
+      // never runs, and it must not leave the thread's T3 requests held.
+      yield* Scope.close(clientScope, Exit.void);
+      yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+      assert.isUndefined(T3ToolSets.__testing.asked("t"));
+    }),
+  );
+
+  it.effect("stopped half-way: a turn's check interrupted mid-way releases its hold", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      const fake = makeFakeCodex({ servers: ["alpha"] });
+      const reading = yield* Deferred.make<void>();
+      let gated = false;
+      const profileFor: ProfileById = () =>
+        gated
+          ? Deferred.succeed(reading, undefined).pipe(Effect.andThen(Effect.never))
+          : Effect.succeed(ALL);
+      const clientScope = yield* Scope.make();
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor).pipe(
+        Scope.provide(clientScope),
+      );
+      const id = (yield* start(client, "t")).thread.id;
+      gated = true;
+      yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+      yield* Deferred.await(reading);
+      assert.isDefined(T3ToolSets.__testing.asked("t"));
+      // The session closes while the check reads the profile: the check is interrupted.
+      yield* Scope.close(clientScope, Exit.void);
+      assert.isUndefined(T3ToolSets.__testing.asked("t"));
     }),
   );
 

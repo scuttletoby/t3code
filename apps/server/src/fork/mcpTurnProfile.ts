@@ -1,7 +1,7 @@
 /**
- * Fork: the MCP profile the turn check (mcpProfileTurnCheck.ts) worked out for the turn it is
- * starting, so the Codex wrapper (codexMcpProfile.ts) reads it instead of working it out again.
- * Only the fiber that starts the turn, and fibers it forks, see it.
+ * Fork: the profile the turn check (mcpProfileTurnCheck.ts) worked out for the turn it starts, read
+ * by the Codex wrapper (codexMcpProfile.ts). Keyed by thread, not turn: never fork work inside a turn
+ * start that outlives it (it would hand this turn's profile to a later turn); fork from the session.
  */
 import type { ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";

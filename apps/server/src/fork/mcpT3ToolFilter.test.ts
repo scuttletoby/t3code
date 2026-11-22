@@ -17,6 +17,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -492,7 +493,7 @@ describe("a set worked out by a request, not a turn (fork issues #812, #918)", (
   it.effect("while a turn's set is being fixed, a request waits for it", () =>
     withServer(({ list }) =>
       Effect.gen(function* () {
-        const release = T3ToolSets.holdT3ToolSet("thread-prs");
+        const release = T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
         const listing = yield* Effect.forkChild(list("prs"));
         yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
         expect(listing.pollUnsafe()).toBeUndefined();
@@ -505,7 +506,7 @@ describe("a set worked out by a request, not a turn (fork issues #812, #918)", (
         release();
         release();
         expect(grouped(yield* Fiber.join(listing))).toEqual({ waits: WAIT_TOOLS, prs: false });
-        expect(T3ToolSets.t3ToolSetHold("thread-prs")).toBeUndefined();
+        expect(T3ToolSets.__testing.asked("thread-prs")).toBeUndefined();
       }),
     ),
   );
@@ -514,7 +515,7 @@ describe("a set worked out by a request, not a turn (fork issues #812, #918)", (
     withServer(({ call }) =>
       Effect.gen(function* () {
         T3ToolSets.fixT3ToolSet("thread-all", { _tag: "Groups", name: "all", groups: "all" });
-        T3ToolSets.holdT3ToolSet("thread-all");
+        T3ToolSets.holdT3ToolSet("thread-all", yield* Clock.currentTimeMillis);
         const calling = yield* Effect.forkChild(call("all", "wait_list"));
         yield* Deferred.await(T3ToolSets.__testing.asked("thread-all")!);
         const refused = yield* drive(calling, McpT3ToolRule.T3_TOOL_SET_HOLD_WAIT_MS);
@@ -631,5 +632,78 @@ describe("the T3 tool sets in memory", () => {
       expect(T3ToolSets.t3ToolSetFor("thread-0")).toBeUndefined();
       expect(T3ToolSets.t3ToolSetFor(`thread-${T3ToolSets.MAX_T3_TOOL_SETS}`)).toBeDefined();
     }),
+  );
+});
+
+describe("the hold bound, without a socket (fork issue #918)", () => {
+  /** The rule's check of `targets`, one after another as upstream's list filter runs it. */
+  const checkAll = (
+    token: string,
+    method: "tools/list" | "tools/call",
+    targets: ReadonlyArray<string>,
+  ) =>
+    Effect.gen(function* () {
+      const visible = yield* McpT3ToolRule.__testing.makeVisible;
+      return yield* Effect.forEach(targets, (target) =>
+        visible({ method, target } as never).pipe(
+          Effect.orElseSucceed(() => false),
+          Effect.map((shown) => [target, shown] as const),
+        ),
+      );
+    }).pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, scopeFor(token)));
+
+  const prs: T3ToolSets.T3ToolSet = {
+    _tag: "Groups",
+    name: "prs",
+    groups: new Set(["pull-requests"]),
+  };
+
+  it.effect("tools/list waits once for the hold, not once per tool", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      McpT3ToolRule.__testing.clearRefused();
+      T3ToolSets.fixT3ToolSet("thread-prs", prs);
+      expect(yield* checkAll("prs", "tools/list", [PR_TOOL])).toEqual([[PR_TOOL, true]]);
+      T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
+      const listing = yield* Effect.forkChild(
+        checkAll("prs", "tools/list", [...WAIT_TOOLS, PR_TOOL]),
+      );
+      yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
+      yield* TestClock.adjust(McpT3ToolRule.T3_TOOL_SET_HOLD_WAIT_MS);
+      for (let turn = 0; turn < 10; turn += 1) yield* Effect.yieldNow;
+      // One wait for the whole list, then it is refused: never the set from before the hold.
+      const done = listing.pollUnsafe();
+      expect(done).toBeDefined();
+      expect(yield* Fiber.join(listing)).toEqual(
+        [...WAIT_TOOLS, PR_TOOL].map((name) => [name, false]),
+      );
+    }),
+  );
+
+  it.effect(
+    "a hold past its bound is dropped: later requests do not wait, later turns start fresh",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        McpT3ToolRule.__testing.clearRefused();
+        T3ToolSets.fixT3ToolSet("thread-prs", prs);
+        T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
+        const first = yield* Effect.forkChild(checkAll("prs", "tools/call", [PR_TOOL]));
+        yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
+        expect(yield* drive(first, McpT3ToolRule.T3_TOOL_SET_HOLD_WAIT_MS)).toEqual([
+          [PR_TOOL, false],
+        ]);
+        // Dropped: the next request does not wait 10 s again, and it keeps only the ungrouped tools
+        // (never the set from before the hold) until a turn fixes the thread's set.
+        expect(T3ToolSets.__testing.asked("thread-prs")).toBeUndefined();
+        expect(yield* checkAll("prs", "tools/call", [PR_TOOL])).toEqual([[PR_TOOL, false]]);
+        // The next turn's hold starts fresh, and its check's set applies once it releases.
+        const release = T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
+        const second = yield* Effect.forkChild(checkAll("prs", "tools/call", [PR_TOOL]));
+        yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
+        T3ToolSets.fixT3ToolSet("thread-prs", prs);
+        release();
+        expect(yield* Fiber.join(second)).toEqual([[PR_TOOL, true]]);
+      }),
   );
 });

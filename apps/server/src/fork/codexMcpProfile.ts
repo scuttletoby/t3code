@@ -7,6 +7,7 @@ import { MCP_BUILTIN_TOOLS_NONE, MCP_PROFILE_ALL, ThreadId } from "@t3tools/cont
 import type * as CodexClient from "effect-codex-app-server/client";
 import * as CodexError from "effect-codex-app-server/errors";
 import type * as CodexSchema from "effect-codex-app-server/schema";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
@@ -564,10 +565,19 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
         );
       }
       const own = !children.has(nativeId);
-      // Taken before the check forks, so no request of the turn can come before it.
-      const release = own ? holdT3ToolSet(threadId) : undefined;
-      return profileStep("turn/started", threadId, own).pipe(
-        Effect.ensuring(Effect.sync(() => release?.())),
+      // Held inside the check, which starts before this handler returns, and released however it
+      // ends: a closed scope never starts it, so no hold is left. Only the profile step is held;
+      // T3's tools carry the new set while the server step runs.
+      const held = own
+        ? Effect.acquireUseRelease(
+            Effect.flatMap(Clock.currentTimeMillis, (now) =>
+              Effect.sync(() => holdT3ToolSet(threadId, now)),
+            ),
+            () => profileStep("turn/started", threadId, own),
+            (release) => Effect.sync(release),
+          )
+        : profileStep("turn/started", threadId, own);
+      return held.pipe(
         Effect.flatMap((resolved) => serverStep("turn/started", nativeId, resolved)),
         Effect.catch(stop(nativeId, turnId)),
         Effect.forkIn(scope, { startImmediately: true }),

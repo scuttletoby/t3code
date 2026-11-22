@@ -941,9 +941,13 @@ until it ends. A Codex thread's T3 tool groups are cut on T3's own server, as on
 (above); each Codex turn fixes them as it starts, also one Codex starts on its own (a goal's next
 turn). A sub-agent's turn, and a goal set while a turn may run, are checked but never fix the set:
 the sub-agent uses its parent's T3 thread, and must not change the set of the parent's running
-turn. While a goal's turn has its set fixed, T3's server holds that thread's requests (up to 10
-seconds, then refuses them with a "try again" reason), so the turn's first T3 tool call already
-gets the new set.
+turn. While a goal's turn has its set fixed, T3's server holds that thread's requests, so the turn's
+first T3 tool call already gets the new set. The hold covers only working out the T3 tool set: the
+check of the thread's outside servers runs after it, so T3's own tools already carry the new set
+while that check runs. A hold lasts 10 seconds at most from when the turn started (a list request
+waits once, not once per tool); one still there then is dropped, and the thread keeps only the T3
+tools every profile keeps, with a "try again" reason, until the late check or the thread's next
+turn fixes its set. A hold is taken only by a check that runs, and released however it ends.
 
 Codex is checked at each call too, where it lets T3 see one
 ([#814](https://github.com/scuttletoby/t3code/issues/814)). A request the app sends to one MCP

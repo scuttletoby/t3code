@@ -126,7 +126,10 @@ const makeWrap = (profileFor: ProfileFor) => {
               cause,
             }),
         ),
-        // The driver's own checks (Codex's) read this profile rather than work it out again.
+        // The driver's own checks (Codex's) read this profile rather than work it out again. It is
+        // keyed by thread, not turn, so it assumes nothing forked here outlives this turn start:
+        // a fiber that did would hand this turn's profile to a later turn of the thread (wider,
+        // after a narrowing). Fork long-lived work from the session (openSession), never here.
         Effect.flatMap((resolved) =>
           run(input).pipe(
             Effect.provideService(CurrentTurnMcpProfile, {
