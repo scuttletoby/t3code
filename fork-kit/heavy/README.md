@@ -574,9 +574,9 @@ Two thin callers come with it:
 - `bin/t3-capacity [--kind KIND] [MB]`: the older host check's output (first line `available=..MB swapfree=..MB
   load=..`, available less the rule's whole reservation hold, last line `OK` or `NOT OK: why`, exit 0 or 1), now
   from `heavy facts`. MB defaults to 3072. The installer links `/usr/local/bin/t3-capacity` to it, so the command
-  has one source, the release in use; `heavy --self-check` warns when the `t3-capacity` found on PATH is another
-  copy (its readings can differ: an older copy, for one, counts no reservations). A host's installer that wrote
-  its own copy there stops doing so and runs `heavy-install` instead (Install, below).
+  has one source, the release in use (a host's own plain copy there only with `--replace-t3-capacity`: Install,
+  below); `heavy --self-check` warns when the `t3-capacity` found on PATH is another copy (its readings can differ:
+  an older copy, for one, counts no reservations).
 - `bin/agent-slots` (not linked onto PATH: a host wires it in itself): a Claude Code hook (UserPromptSubmit, Stop)
   for orchestrator sessions: free agent slots are the smaller of the process limit and the machine's `fits` for
   its kind.
@@ -684,11 +684,14 @@ removes them again). Upgrade: the same line again. Remove:
 back). Check: `heavy --self-check` (as the user: config, slice and files, and a warning when `t3-capacity` on the
 user's PATH is not the kit's) or `heavy-install self-check` (files only).
 
-A host whose own installer copies a `t3-capacity` to `/usr/local/bin` changes it to run `heavy-install` (or to check
-that `/usr/local/bin/t3-capacity` is the link to `/usr/local/libexec/heavy/current/bin/t3-capacity`) and never to
-write that path itself: a copy over the link would land in the release's own folder (`heavy-install self-check`
-then says `changed since install`), and one written beside it and renamed over it replaces the link with a copy
-again (`--self-check` says the link differs; the next install keeps that copy and links again).
+`/usr/local/bin/t3-capacity`: with nothing there, or the kit's link, the installer links it. A plain file there is a
+host's own copy, which the host's scripts may read or compare: the installer leaves it as it is and says so, until
+it is run once with `--replace-t3-capacity` (it keeps the copy in `replaced-capacity/`, links the kit's, and later
+runs keep the link without the option). A host whose own installer wrote that copy first changes it to stop writing
+that path and to run `heavy-install` (or check that the path is the link to
+`/usr/local/libexec/heavy/current/bin/t3-capacity`): a copy over the link would land in the release's own folder
+(`heavy-install self-check` then says `changed since install`), and one written beside it and renamed over it puts
+a plain copy back (`heavy --self-check` says the link differs and warns about the copy).
 
 ## Runs again, stops half-way, old or empty state
 
@@ -696,8 +699,9 @@ again (`--self-check` says the link differs; the next install keeps that copy an
 - **Stops half-way:** the steps run in this order: check, folders, copy, self-test, config, slice unit, switch,
   links, sweep units, record. A version folder is copied to a temporary name and renamed; a half-copied or changed
   one is made again. The old `/usr/local/bin/heavy` and `/usr/local/bin/t3-capacity` keep working until the links
-  step, which copies each to its `replaced` folder before its link replaces it in one rename. The sweep's units are written only after that, so a timer never runs
-  before the release it needs is in use. Running the same line again finishes the job.
+  step, which copies each to its `replaced` folder before its link replaces it in one rename. The sweep's units are
+  written only after that, so a timer never runs before the release it needs is in use. Running the same line again
+  finishes the job.
 - **Rollback:** the timer's service runs `/usr/local/libexec/heavy/current/lib/heavy_sweep.py` (the sweep of the
   release in use, never an older `heavy` without the `sweep` verb), and only when that file exists. Before going
   back to a release without the sweep, run the newer installer with `--no-sweep-timer`; if you did not, the
@@ -714,10 +718,11 @@ again (`--self-check` says the link differs; the next install keeps that copy an
   to `current/bin/t3-capacity`; every release since `heavy facts` has that file. Before going back further, run
   `heavy-install uninstall` (it puts the old copy back). The old copy is kept in `replaced-capacity/`, not in
   `replaced/`, because an older installer's uninstall puts the newest file of `replaced/` back as `heavy`.
-- **Old state:** a plain-file `/usr/local/bin/heavy` (the one-line wrapper from before) or `/usr/local/bin/t3-capacity`
-  (a host's own copy) is kept and put back by uninstall. A link there that points elsewhere, a folder where the kit expects its own, or a slice unit in
-  `/etc/systemd/user/` the kit did not write is refused with a message, never overwritten. Config values stay
-  unless an option names a new one.
+- **Old state:** a plain-file `/usr/local/bin/heavy` (the one-line wrapper from before) is kept and put back by
+  uninstall; a plain `/usr/local/bin/t3-capacity` (a host's own copy) is left alone, or with `--replace-t3-capacity`
+  kept and put back by uninstall. A link at either that points elsewhere, a folder where the kit expects its own, or
+  a slice unit in `/etc/systemd/user/` the kit did not write is refused with a message, never overwritten. Config
+  values stay unless an option names a new one.
 - **Empty state:** a fresh machine installs with the defaults. heavy then refuses to run commands until the slice
   has a unit with a memory limit (install with limit options, or add the unit).
 

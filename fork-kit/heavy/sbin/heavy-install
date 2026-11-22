@@ -3,7 +3,7 @@
 
   heavy-install install --source KIT_FOLDER --sha RELEASE_SHA [--slice NAME] [--grace SECONDS]
                         [--memory-high SIZE] [--memory-max SIZE] [--swap-max SIZE] [--cpu-weight N]
-                        [--sweep-timer | --no-sweep-timer]
+                        [--sweep-timer | --no-sweep-timer] [--replace-t3-capacity]
   heavy-install uninstall
   heavy-install self-check
 
@@ -11,12 +11,13 @@ install copies bin/heavy, sbin/heavy-install, lib/, systemd/, README.md and fork
 release into /usr/local/libexec/heavy/versions/<sha>/ (with MANIFEST.sha256), checks the copy, switches the link `current` to it,
 writes /etc/heavy/config.json and links /usr/local/bin/heavy, /usr/local/bin/t3-capacity and
 /usr/local/sbin/heavy-install to it. An old /usr/local/bin/heavy that is a plain file (a copy from before this kit) is
-kept in /usr/local/libexec/heavy/replaced/, an old plain /usr/local/bin/t3-capacity (a host's own copy) in
-/usr/local/libexec/heavy/replaced-capacity/; uninstall puts them back. With a --memory-*, --swap-max or
---cpu-weight option it also writes the slice unit /etc/systemd/user/<slice> (every user's manager reads it after
-`systemctl --user daemon-reload`; a user's own ~/.config/systemd/user/<slice> wins over it). With --sweep-timer it
-also writes the user units heavy-sweep.service and heavy-sweep.timer to /etc/systemd/user/ (each user enables the
-timer); --no-sweep-timer removes them. Safe to run again, and to stop at any step.
+kept in /usr/local/libexec/heavy/replaced/ and put back by uninstall. A plain /usr/local/bin/t3-capacity (a host's
+own copy, which its own scripts may read) is left alone, with a note, unless --replace-t3-capacity is given: then it
+is kept in /usr/local/libexec/heavy/replaced-capacity/, linked, and put back by uninstall. With a --memory-*,
+--swap-max or --cpu-weight option it also writes the slice unit /etc/systemd/user/<slice> (every user's manager reads
+it after `systemctl --user daemon-reload`; a user's own ~/.config/systemd/user/<slice> wins over it). With
+--sweep-timer it also writes the user units heavy-sweep.service and heavy-sweep.timer to /etc/systemd/user/ (each
+user enables the timer); --no-sweep-timer removes them. Safe to run again, and to stop at any step.
 """
 import argparse, contextlib, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
 
@@ -306,7 +307,8 @@ def ours_unit(path):
 
 
 def record_rows(sha, unit_path, sweep_timer=False):
-    rows = [(path, 'link', target) for path, target in sorted(LINKS.items())]
+    rows = [(path, 'link', target) for path, target in sorted(LINKS.items())
+            if path != CAPACITY or ours(path, target)]     # a host's own t3-capacity left in place is not recorded
     rows.append((CURRENT, 'link', f'{VERSIONS}/{sha}'))
     folder = p(f'{VERSIONS}/{sha}')
     for rel, digest in sorted(read_manifest(folder).items()):
@@ -386,6 +388,10 @@ def install(a, stop_after=None):
     switch_link(CURRENT, f'{VERSIONS}/{a.sha}')
     done('switch')
     for path, target in LINKS.items():
+        if path == CAPACITY and os.path.lexists(p(path)) and not ours(path, target) and not a.replace_t3_capacity:
+            say(f'note: {path} is a plain file this kit did not write: left as it is (its readings can differ from '
+                f'the kit\'s; --replace-t3-capacity keeps it in {REPLACED_CAPACITY}/ and links the kit\'s)')
+            continue
         keep_old(path)
         switch_link(path, target)
     done('links')
@@ -489,6 +495,7 @@ def main(argv, stop_after=None):
         i.add_argument('--' + key.replace('_', '-'), dest=key)
     i.add_argument('--sweep-timer', dest='sweep_timer', action='store_true', default=None)
     i.add_argument('--no-sweep-timer', dest='sweep_timer', action='store_false')
+    i.add_argument('--replace-t3-capacity', action='store_true')
     sub.add_parser('uninstall')
     sub.add_parser('self-check')
     a = ap.parse_args(argv)

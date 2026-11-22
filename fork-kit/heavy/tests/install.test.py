@@ -161,10 +161,28 @@ class Install(unittest.TestCase):
         self.assertEqual(self.run_main('uninstall')[0], 0)
         self.assertFalse(os.path.lexists(link))
 
+    def test_old_plain_t3_capacity_is_left_alone_without_the_option(self):
+        self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertIn('note: /usr/local/bin/t3-capacity is a plain file this kit did not write: left as it is', out)
+        self.assertIn('--replace-t3-capacity', out)
+        self.run_old_capacity()
+        self.assertTrue(os.path.islink(self.path('/usr/local/bin/heavy')))
+        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy/replaced-capacity')))
+        with open(self.path('/etc/heavy/installed.tsv')) as f:
+            self.assertNotIn('/usr/local/bin/t3-capacity', f.read())
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        before = self.snapshot()
+        self.assertEqual(self.install()[0], 0)                       # again: still left alone, nothing changes
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.run_old_capacity()
+
     def test_old_plain_t3_capacity_is_kept_linked_and_put_back_by_uninstall(self):
         self.write_old('/usr/local/bin/heavy', OLD_WRAPPER)
         self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
-        code, out, err = self.install()
+        code, out, err = self.install('--replace-t3-capacity')
         self.assertEqual(code, 0, err)
         self.assertIn('the old /usr/local/bin/t3-capacity (sha256 ', out)
         self.assertIn('is kept as /usr/local/libexec/heavy/replaced-capacity/t3-capacity.', out)
@@ -177,7 +195,7 @@ class Install(unittest.TestCase):
         self.assertEqual([n[:6] for n in os.listdir(self.path('/usr/local/libexec/heavy/replaced'))], ['heavy.'])
         self.assertEqual(self.run_main('self-check')[0], 0)
         before = self.snapshot()
-        code, out, err = self.install()                               # again: nothing changes, one backup
+        code, out, err = self.install()                               # again, the usual line: nothing changes
         self.assertEqual(code, 0, err)
         self.assertNotIn('is kept as', out)
         self.assertEqual(self.snapshot(), before)
@@ -200,11 +218,11 @@ class Install(unittest.TestCase):
 
         self.m.switch_link = broken
         with self.assertRaises(OSError):
-            self.install()
+            self.install('--replace-t3-capacity')
         self.m.switch_link = real_switch
         self.run_old_capacity()                                       # the old copy until the swap, whole
         self.assertTrue(os.path.islink(self.path('/usr/local/bin/heavy')))
-        code, out, err = self.install()
+        code, out, err = self.install('--replace-t3-capacity')
         self.assertEqual(code, 0, err)
         self.assertNotIn('is kept as', out)                           # kept already by the run that stopped
         self.assertEqual(os.readlink(self.path('/usr/local/bin/t3-capacity')), CAPACITY_LINK)
@@ -268,7 +286,8 @@ class Install(unittest.TestCase):
                 os.makedirs(self.path('/usr/local/bin'))
                 self.write_old('/usr/local/bin/heavy', OLD_WRAPPER)
                 self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
-                code, _, _ = self.install('--memory-high', '5G', '--sweep-timer', stop_after=step)
+                code, _, _ = self.install('--memory-high', '5G', '--sweep-timer', '--replace-t3-capacity',
+                                          stop_after=step)
                 self.assertEqual(code, f'stopped after {step} (test)')
                 # until the links step, the old wrapper and the old t3-capacity are what runs
                 if self.m.STEPS.index(step) < self.m.STEPS.index('links'):
@@ -279,7 +298,7 @@ class Install(unittest.TestCase):
                     current = os.readlink(self.path('/usr/local/libexec/heavy/current'))     # absolute, as installed
                     self.assertTrue(os.path.isfile(self.path(current + '/lib/heavy_sweep.py')))
                     self.assertTrue(os.path.islink(self.path('/usr/local/bin/heavy')))
-                code, _, err = self.install('--memory-high', '5G', '--sweep-timer')
+                code, _, err = self.install('--memory-high', '5G', '--sweep-timer', '--replace-t3-capacity')
                 self.assertEqual(code, 0, err)
                 self.assertTrue(os.path.isfile(self.path('/etc/systemd/user/heavy-sweep.timer')))
                 self.assertEqual(self.run_main('self-check')[0], 0)
