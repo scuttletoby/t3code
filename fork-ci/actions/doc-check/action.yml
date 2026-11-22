@@ -1,7 +1,8 @@
 name: doc-check
 description: >-
   Doc rules for the Markdown files agents read: size budgets for instruction files, no history in them, every
-  relative link resolves, no dated reports added to the repository. Rules from the project's optional config, read at
+  relative link resolves, no dated reports added to the repository; a checked file is UTF-8, and a symlink is
+  checked as its target, which must be a file in the repository (not in .git). Rules from the project's optional config, read at
   the base commit. Fails on a broken rule; warns near a budget. Usage: README.md next to this file.
 inputs:
   config:
