@@ -59,8 +59,9 @@ heavy asks Docker only after a run that labelled a container (`heavy docker-labe
 `/run/user/<uid>/heavy/labelled/`, a folder only this user can write; when that note cannot reach heavy, because
 `/run/user` is full or a sandbox has a `/run/user` of its own, in `~/.local/state/heavy/labelled/`, which heavy
 reads too; the home is `$HOME`, else the password database's, and only one this user owns and no one else can
-write (not `/`), so heavy run as root with a user's `HOME` (`sudo -E heavy ...`) or `HOME=/tmp` uses root's own home
-and never makes a root-owned folder in the user's; `~/.local` must be a real folder (not a link, even to a folder
+write (not `/`, and not in a folder someone else could swap it in: one not root's or this user's, or one others can
+write that is not sticky), so heavy run as root with a user's `HOME` (`sudo -E heavy ...`) or `HOME=/tmp` uses
+root's own home and never makes a root-owned folder in the user's; `~/.local` must be a real folder (not a link, even to a folder
 of the user's: kept fail-closed) of the user's that no one else can write; an older heavy run as root with your
 `HOME` may have left a root-owned `~/.local` or `~/.local/state`, and a umask of 002 a `~/.local` of mode 775
 (heavy then skips it and says so):
@@ -182,7 +183,9 @@ its scope as a job).
   decides whether a machine needs more memory.
 - **Nested:** a `heavy --kind` inside a heavy command does not queue again: the outer job holds the memory.
 - **Limits:** the queue is per user and slice. It does not cap a job at its reservation (a job that grows past it
-  is still counted, in `used`).
+  is still counted, in `used`). Jobs without `--kind` take no place in it: they wait only for the capacity rule, so
+  a steady stream of them can keep a large queued job waiting until it gives up (exit 76). Give such jobs a
+  `--kind` when they must wait in order.
 
 ### Queue settings
 
@@ -240,7 +243,12 @@ refuses it.
   `--wait` for a program that may never come back would hide the fault. Fix the program or remove the setting.
 - **The capacity rule gives no answer** (`heavy facts` broken, slow, or the machine file broken): not free, so
   the job waits and gives up after `--wait` with exit 76, the reason in the last waiting line. Never a start on a
-  missing answer.
+  missing answer. A kit or machine on which it can never answer free (the rule not installed, a broken machine
+  file, the Basic tier from the machine's cgroups: no cgroup v2, neither a user manager nor `user.slice`, or a heavy
+  slice that cannot be listed) refuses at once with exit 1 and a line saying why, instead of waiting `--wait` for
+  nothing.
+- **A live ticket that cannot be read** names no scope, so its job's scope is counted again as a job without
+  `--kind`: counted twice, the safe side.
 - **The admit command hangs, or its leftover holds its output:** not now after `admitTimeoutSeconds` (or 1 s after
   it exited); its process group is killed and the job asks again on the next look.
 - **One leaky run of a kind:** its peak counts (failed runs too), but the learned value is capped at the budget
@@ -586,7 +594,10 @@ after another, up to the group's ceiling), the memory budget, the queue and note
     set for themselves.
   - It reads the people of `/etc/passwd` with a UID from `UID_MIN` to `UID_MAX`, and anyone with a `user.slice`
     session. Not read: root and system users (below `UID_MIN`), people known only through NSS (LDAP, sssd) who have
-    no session now, and homes that are `/` or not absolute.
+    no session now, homes that are `/` or not absolute, and, for a person with no session now, a home behind an
+    automount trigger (`autofs`) that is not mounted: reading it on every call would mount every home. Their
+    reservations count again from their next login (then the home is mounted). A mount table that cannot be read:
+    every home is read, as before.
   - Each `.conf` there must be a plain file: a link (stow-style dotfiles) is refused and makes the tier Basic.
   - A person's `reserve.d` it cannot read (a home closed to others, mode 750 or 700), or a user with a session but
     no home it can find, makes it Basic.
@@ -595,7 +606,8 @@ after another, up to the group's ceiling), the memory budget, the queue and note
 
   Without cgroup v2, or without both a user manager and `user.slice` (Basic), agents and other users' work cannot
   be counted, so the answer is never free and every `fits` is 0 (a note says why). An other user's folder that
-  exists but cannot be listed is Basic too.
+  exists but cannot be listed is Basic too. heavy's own check refuses at once where the machine's cgroups make it
+  Basic (Memory queue, above), as no wait would change them.
 
 - **Unreadable signals** (PSI, a box with a live piece but without its `memory.pressure`, or with no folder at
   all) give "elevated", never "ok"; a missing MemAvailable or a container limit that cannot be read gives busy for
@@ -633,8 +645,13 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   queue, reservations folder, user, holds), so two callers of one user with other settings, or an old and a new
   kit, never share one and each one's hold-down steps down on its own (or one file, `$HEAVY_FACTS_CACHE`), 0600,
   read again after 5 s (`--fresh`: now). A user without `/run/user/<uid>` (no user manager) uses
-  `heavy-facts-<uid>/` in the temporary folder (`$TMPDIR`, else `/tmp`, never the working folder), made 0700; one that is a link, another user's or open to
-  others, or no temporary folder this user can write, is no cache (a note). Pressure levels carry from it (at most
+  `heavy-facts-<uid>/` in the temporary folder (`$TMPDIR`, else `/tmp`, never the working folder), made 0700. When
+  that one is a link, another user's or open to others (someone took the name first), or there is no temporary
+  folder this user can write, it uses `~/.cache/heavy-facts-<host>/` (made 0700) with a note, if the home (`$HOME`,
+  else the password database's) is this user's, no one else can write it, and no folder above it lets someone else
+  swap it (one not root's or this user's, or one others can write that is not sticky like `/tmp`). None of these: no
+  cache (a note). The folder is opened once without following a link, and every cache and hold file is reached
+  through that open folder, so one swapped for a link after its check is never followed. Pressure levels carry from it (at most
   5 minutes old) so calm must last before a level drops. Without a cache folder, with a cache file that is there
   but cannot be used (broken, from the future, other settings in `$HEAVY_FACTS_CACHE`), or with no file of its own
   yet but another cache file of this user's written in the last 5 minutes beside it (another version, as once after
@@ -657,7 +674,8 @@ Two thin callers come with it:
   OKs at once are both kept; a lock that stays taken 2 s: the answer without the hold, with a note); one that
   cannot be read (broken, another owner's, a link, open to others) holds 20 s from when it last changed and is
   written again, and when it cannot be written either (a folder it may not write) it holds no longer than that; a
-  time in the future holds and starts again; no cache folder: no hold, with a note.
+  time in the future (the clock went back) holds and starts again, and where it cannot start again (nothing can be
+  written) it does not hold, with a note, so no hold lasts past 20 s; no cache folder: no hold, with a note.
 - `bin/agent-slots` (not linked onto PATH: a host wires it in itself): a Claude Code hook (UserPromptSubmit, Stop)
   for orchestrator sessions: free agent slots are the smaller of the process limit and the machine's `fits` for
   its kind.
@@ -679,7 +697,8 @@ for one and not for the other. A machine with the kit from before the swap trend
   cache (each writes its own temporary file and renames it).
 - **Stops half-way:** a temporary cache file is left; the next run removes ones older than a minute.
 - **Old, empty, broken or foreign cache** (another owner, group or other access, a link, a time in the future, an
-  unknown key or version (an older kit's cache, without each reservation's `owedMb`, is version 2), or written with
+  unknown key or version (an older kit's cache: version 2 without each reservation's `owedMb`, version 3 with piece
+  caps in the machine tier), or written with
   other settings: slice, queue or reservations folder): read again from the kernel. A cache that cannot be written
   gives a note.
 - **Cost file** (`peaks.json`) missing, empty or broken: the rule's start costs, with the queue's note.
@@ -756,6 +775,7 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 |                                                 | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
 | `/run/user/<uid>/heavy-facts-*.json`            | `heavy facts`' 5 s cache (tmpfs), one per version and settings            |
 | `/tmp/heavy-facts-<uid>/heavy-facts-*.json`     | the same, for a user without `/run/user/<uid>` (no user manager)          |
+| `~/.cache/heavy-facts-<host>/heavy-facts-*.json`| the same, when the temporary one is taken or cannot be written            |
 | `<that folder>/t3-capacity-hold.json`           | `t3-capacity`'s 20 s hold of a NOT OK                                     |
 | `~/.config/t3-capacity/reserve.d/*.conf`        | each user's reservations for `heavy facts` and its callers                |
 
