@@ -599,7 +599,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork review rule
   const CUSTOM = {
     preset: "recommended",
     runner: { driver: "codex", model: "gpt-review", effort: "medium" },
-    minors: "same-round",
+    minors: "issue",
   };
 
   it.effect(
