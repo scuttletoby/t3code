@@ -267,6 +267,88 @@ class Links(Repo):
         self.assertIn('DOC  docs/a.md:10: broken link nope.md', out)
         self.assertIn('1 problem(s)', out)
 
+    def test_an_unmatched_backtick_run_hides_no_link(self):
+        # #947 item 3: inline code never starts in the middle of a run of backticks, so a run with no closing run of
+        # the same length is text and the link after it is still checked.
+        for text in ['`` [g](nope.md) `\n', 'close it with ``` and see [g](nope.md) and `x`\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 1, out)
+                self.assertIn('DOC  docs/a.md:1: broken link nope.md: no such file', out)
+
+    def test_a_fence_on_a_list_items_own_line(self):
+        # #947 item 4: "- ```sh" opens a fence in the item, so its closing line closes it (and opens nothing).
+        for marker in ['-', '1.', '10)']:
+            pad = ' ' * (len(marker) + 1)
+            text = f'{marker} ```sh\n{pad}[in](nope.md)\n{pad}```\n{pad}[after](nope.md)\n'
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 1, out)
+                self.assertIn('DOC  docs/a.md:4: broken link nope.md', out)
+                self.assertIn('1 problem(s)', out)   # not the fenced one
+
+    def test_a_link_in_indented_code_is_skipped(self):
+        # #947 item 5: as CommonMark reads it, a line 4 or more past its list item's content (or the margin), after a
+        # blank line, is indented code: no link. Without the blank line it continues the paragraph: a link.
+        for text in ['- item\n\n      ```\n      [in](nope.md)\n      ```\n\n  [after](nope.md)\n',
+                     '1. item\n\n       [in](nope.md)\n\n       [in](nope.md)\n[after](nope.md)\n',
+                     'Shown:\n\n    [in](nope.md)\n\t[in](nope.md)\n\n[after](nope.md)\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 1, out)
+                self.assertIn(f'DOC  docs/a.md:{text.count(chr(10))}: broken link nope.md', out)
+                self.assertIn('1 problem(s)', out)
+        for text in ['- item\n      [in](nope.md)\n', 'para\n    [in](nope.md)\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertIn('DOC  docs/a.md:2: broken link nope.md', out)
+
+    def test_a_list_item_stays_open_on_a_lazy_line_and_every_marker_on_a_line_counts(self):
+        # #1020 round 1: an unindented line that continues an item's paragraph (lazy) keeps the item open, and in
+        # "- - item" both markers open an item, so the item's next paragraph is text, not indented code: a link. A
+        # lazy line opens nothing; an empty item or one numbered from 2 cannot interrupt a paragraph; a line 4 in
+        # after a closed list is code, so "10." opens a list. (commonmark.js 0.31.2 reads each case so.)
+        for text in ['1. Step one that wraps\nonto the next line.\n\n    More about step one, see [g](nope.md).\n',
+                     '- item\nlazy\n\n    [x](nope.md)\n',
+                     '1. a\n   - b\nlazy\n\n      [x](nope.md)\n',
+                     '- - nested item\n\n      more text [x](nope.md)\n',
+                     '1. - item\n\n       [x](nope.md)\n',
+                     '- - item\nlazy\n\n      [x](nope.md)\n',
+                     'para\n2) ```\n   [x](nope.md)\n',
+                     '  1. [g](a.md)\n    ```sh\n      1. [x](nope.md)\n',
+                     '   * ```\n    ```sh\n 10. text\n\n       - text [x](nope.md)\n',
+                     'para\n-\n  [x](nope.md)\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 1, out)
+                self.assertIn(f'DOC  docs/a.md:{text.count(chr(10))}: broken link nope.md', out)
+        # A heading, a thematic break or a fence is no lazy line: it ends the item, and "- - -" is a thematic
+        # break, not three items; the indented line after it is code (no blank needed after a heading or a fence).
+        for text in ['- item\n# heading\n\n    [in](nope.md)\n', '- item\n---\n\n    [in](nope.md)\n',
+                     '- item\n```\n```\n\n    [in](nope.md)\n', '- - -\n\n    [in](nope.md)\n',
+                     '- item\n\nnot lazy\n\n    [in](nope.md)\n', '# h\n    [in](nope.md)\n',
+                     '```\n```\n    [in](nope.md)\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 0, out)
+
+    def test_a_block_quote_line_is_no_paragraph_the_next_line_goes_on(self):
+        # #1020 narrow check: this checker does not model block quotes, so a ">" line must not count as a paragraph
+        # that the next line continues: "2." right below a quote opens an item (commonmark.js 0.31.2 renders the link).
+        for text in ['> **Note:** this needs a recent runtime.\n2. Run it.\n\n    See [setup](nope.md) for flags.\n',
+                     '> quote\n    [x](nope.md)\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 1, out)
+                self.assertIn(f'DOC  docs/a.md:{text.count(chr(10))}: broken link nope.md', out)
+
     def test_a_link_that_is_no_path_is_a_broken_link_not_a_traceback(self):
         self.commit({'docs/a.md': '[nul](x%00.md)\n', 'docs/b.md': 'b\n'})
         base = self.branch({'docs/b.md': None})   # the removed-link scan reads the untouched a.md
@@ -298,6 +380,14 @@ class Removed(Repo):
         base = self.branch({'docs/b.md': None})
         code, out = self.run_check('--base', base)
         self.assertEqual(code, 0, out)
+
+    def test_a_deleted_doc_named_like_a_pathspec_magic_word(self):
+        # GIT_LITERAL_PATHSPECS: git reads ":(top)A.md" as the name it is, not as "A.md" from the top.
+        self.commit({'a.md': '[a](%3A%28top%29A.md)\n', ':(top)A.md': 'a\n'})
+        base = self.branch({':(top)A.md': None})
+        code, out = self.run_check('--base', base)
+        self.assertEqual(code, 1, out)
+        self.assertIn('DOC  a.md:1: broken link %3A%28top%29A.md: this change removed :(top)A.md', out)
 
     def untouched_symlink_loses_its_target(self, how):
         """Base: docs/AGENTS.md and CLAUDE.md -> docs/AGENTS.md; the change touches only the target."""
@@ -332,6 +422,150 @@ class Removed(Repo):
         base = self.branch({'docs/b.md': None})
         code, out = self.run_check('--base', base)
         self.assertEqual(code, 0, out)
+
+
+    def through_a_folder_symlink(self, how, want, link=False):
+        """#947 item 1. Base: real/A.md, docs -> real, an untouched CLAUDE.md -> docs/A.md (or, link: an untouched
+        a.md that links to docs/A.md); the change touches only real/ or docs."""
+        self.commit({'real/A.md': 'rules\n', 'a.md': '[a](docs/A.md)\n' if link else 'a\n'})
+        os.symlink('real', 'docs')
+        if not link:
+            os.symlink('docs/A.md', 'CLAUDE.md')
+        self.commit({})
+        self.git('checkout', '-q', '-b', 'change')
+        how()
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'change')
+        code, out = self.run_check('--base', 'main')
+        self.assertEqual(code, 1, out)
+        self.assertIn(want, out)
+        self.assertIn('1 problem(s)', out)
+
+    def test_the_target_of_an_untouched_symlink_through_a_folder_symlink_deleted(self):
+        want = 'DOC  CLAUDE.md: a symlink that points to no file: make it a file: this change removed real/A.md'
+        self.through_a_folder_symlink(lambda: os.remove('real/A.md'), want)
+
+    def test_the_target_of_an_untouched_symlink_through_a_folder_symlink_renamed(self):
+        want = 'DOC  CLAUDE.md: a symlink that points to no file: make it a file: this change removed real/A.md'
+        self.through_a_folder_symlink(lambda: os.rename('real', 'real2'), want)
+
+    def test_a_folder_symlink_retargeted_to_nothing_or_out_of_the_repository(self):
+        def to(target):
+            def how():
+                os.remove('docs')
+                os.symlink(target, 'docs')
+            return how
+        with open(os.path.join(self.tmp.name, 'A.md'), 'w') as f:
+            f.write('x\n')
+        for target, why in [('nowhere', 'points to no file'), (self.tmp.name, 'points outside the repository')]:
+            with self.subTest(target=target):
+                self.setUp()
+                self.through_a_folder_symlink(to(target), f'DOC  CLAUDE.md: a symlink that {why}: make it a file: '
+                                                          'this change changed the symlink docs')
+
+    def test_a_folder_symlink_removed(self):
+        self.through_a_folder_symlink(lambda: os.remove('docs'),
+                                      'DOC  CLAUDE.md: a symlink that points to no file: make it a file: '
+                                      'this change removed docs')
+
+    def test_a_link_through_a_folder_symlink(self):
+        self.through_a_folder_symlink(lambda: os.remove('real/A.md'),
+                                      'DOC  a.md:1: broken link docs/A.md: this change removed real/A.md', link=True)
+        self.setUp()
+        def how():
+            os.remove('docs')
+            os.symlink('nowhere', 'docs')
+        self.through_a_folder_symlink(how, 'DOC  a.md:1: broken link docs/A.md: this change changed the symlink docs',
+                                      link=True)
+
+    def test_already_dangling_on_the_base_or_a_loop_through_a_changed_symlink_is_not_this_change(self):
+        # docs -> real is retargeted to real2 (which has A.md); CLAUDE.md -> docs/missing.md pointed to no file on the
+        # base already, a.md's link too, and loop.md loops on both sides.
+        self.commit({'real/A.md': 'a\n', 'real2/A.md': 'a\n', 'a.md': '[m](docs/missing.md) [l](loop.md)\n'})
+        os.symlink('real', 'docs')
+        os.symlink('docs/missing.md', 'CLAUDE.md')
+        os.symlink('loop.md', 'loop.md')
+        os.symlink('docs/A.md', 'AGENTS.md')
+        self.commit({})
+        base = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-q', '-b', 'change')
+        os.remove('docs')
+        os.symlink('real2', 'docs')
+        os.remove('real/A.md')
+        self.commit({})
+        code, out = self.run_check('--base', base)
+        self.assertEqual(code, 0, out)
+
+
+    def test_git_failing_on_the_base_tree_is_an_error_not_a_pass(self):
+        self.commit({'real/A.md': 'a\n', 'a.md': '[a](docs/A.md)\n'})
+        os.symlink('real', 'docs')
+        self.commit({})
+        base = self.branch({'real/A.md': None})
+        real_git = DC.git
+        with mock.patch.object(DC, 'git', lambda *a: None if a[0] == 'ls-tree' else real_git(*a)):
+            code, out = self.run_check('--base', base)
+        self.assertEqual(code, 2, out)
+        self.assertIn('git ls-tree', out)
+
+class SymlinkParity(Repo):
+    """#947 item 2 and the state question: --base fails a change exactly when it makes --all fail an untouched symlink
+    (the same line); what was already broken on the base fails --all only."""
+
+    def both(self, base_files, links, how, fails=True):
+        self.commit(base_files)
+        for name, target in links.items():
+            os.symlink(target, name)
+        self.commit({})
+        self.git('checkout', '-q', '-b', 'change')
+        how()
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'change')
+        code_base, out_base = self.run_check('--base', 'main')
+        code_all, out_all = self.run_check('--all')
+        self.assertEqual(code_all, 1, out_all)
+        self.assertIn('DOC  CLAUDE.md:', out_all)
+        if fails:
+            self.assertEqual(code_base, 1, out_base)
+            line_all = re.search(r'DOC  CLAUDE\.md: [^:\n]*', out_all).group(0)
+            self.assertIn(line_all, out_base)
+        else:
+            self.assertEqual(code_base, 0, out_base)
+        return out_base
+
+    def test_an_untouched_symlink_is_judged_by_its_own_budget_when_its_target_grows(self):
+        out = self.both({'AGENTS.md': lines(30)}, {'CLAUDE.md': 'AGENTS.md'},
+                        lambda: self.write({'AGENTS.md': lines(61)}))
+        self.assertIn('DOC  CLAUDE.md: 61 lines / 671 B, budget 40 lines', out)
+        self.assertNotIn('DOC  AGENTS.md', out)
+
+    def test_an_untouched_symlink_through_a_retargeted_folder_symlink(self):
+        def how():
+            os.remove('docs')
+            os.symlink('big', 'docs')
+        out = self.both({'small/A.md': lines(5), 'big/A.md': lines(61)}, {'docs': 'small', 'CLAUDE.md': 'docs/A.md'},
+                        how)
+        self.assertIn('DOC  CLAUDE.md: 61 lines', out)
+
+    def test_a_symlink_retargeted_removed_half_way_or_looped(self):
+        def retarget(name, target):
+            def how():
+                os.remove(name)
+                os.symlink(target, name)
+            return how
+        cases = [('retargeted', retarget('docs', 'nowhere')),
+                 ('removed half-way', lambda: os.remove('X.md')),
+                 ('looped', retarget('docs', 'docs'))]
+        for name, how in cases:
+            with self.subTest(name):
+                self.setUp()
+                self.both({'real/A.md': 'a\n'}, {'docs': 'real', 'X.md': 'docs/A.md', 'CLAUDE.md': 'X.md'}, how)
+
+    def test_already_dangling_on_the_base_fails_all_only(self):
+        for links in [{'CLAUDE.md': 'missing.md'}, {'CLAUDE.md': 'loop.md', 'loop.md': 'loop.md'}]:
+            with self.subTest(links=links):
+                self.setUp()
+                self.both({'docs/b.md': 'b\n'}, links, lambda: os.remove('docs/b.md'), fails=False)
 
 
 class FailClosed(Repo):

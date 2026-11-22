@@ -939,22 +939,30 @@ def remove_branch(cwd, branch, oid):
 
 
 # --- GitHub -------------------------------------------------------------------------------------------------------
-PR_FIELDS = 'number,headRefName,headRefOid,mergedAt,baseRefName,isCrossRepository'
+PR_FIELDS = 'number,headRefName,headRefOid,mergedAt,baseRefName,isCrossRepository,state,closedAt'
+# What `gh pr list --state <list>` may print in each row's state: `closed` lists the merged ones and the ones closed
+# without a merge (#982), `open` the open ones.
+PR_STATES = {'closed': ('MERGED', 'CLOSED'), 'open': ('OPEN',)}
 
 
 def valid_pr(row, state):
+    """state: the row's own (MERGED, CLOSED or OPEN). A merged row needs its merge time, a closed one its close time."""
     return (isinstance(row, dict) and type(row.get('number')) is int and isinstance(row.get('headRefName'), str)
             and bool(row['headRefName']) and isinstance(row.get('headRefOid'), str) and bool(OID.match(row['headRefOid']))
             and isinstance(row.get('baseRefName'), str) and type(row.get('isCrossRepository')) is bool
-            and (state != 'merged' or isinstance(row.get('mergedAt'), str)))
+            and row.get('state') == state
+            and (state != 'MERGED' or isinstance(row.get('mergedAt'), str))
+            and (state != 'CLOSED' or isinstance(row.get('closedAt'), str)))
 
 
 def github_prs(repo):
-    """{'merged': rows, 'open': rows} for one GitHub repository, each row with the PR_FIELDS (isCrossRepository:
-    the head branch is in a fork, not in this repository). Raises Unreadable when gh fails, prints something else, or a list may be cut off: a missing open pull
-    request would look like "no open pull request"."""
-    out = {}
-    for state in ('merged', 'open'):
+    """{'merged': rows, 'closed': rows, 'open': rows} for one GitHub repository, each row with the PR_FIELDS
+    (isCrossRepository: the head branch is in a fork, not in this repository; closed: closed without a merge). Two
+    lists, as before #982: `--state closed` gives the merged and the closed ones. Raises Unreadable when gh fails,
+    prints something else, or a list may be cut off: a missing open pull request would look like "no open pull
+    request"."""
+    out = {'merged': [], 'closed': []}
+    for state in ('closed', 'open'):
         done = _run([GH, 'pr', 'list', '-R', repo, '--state', state, '--limit', str(PR_LIMIT),
                      '--json', PR_FIELDS], 'GitHub (gh)')
         if done.returncode != 0:  # gh
@@ -966,19 +974,23 @@ def github_prs(repo):
         if not isinstance(rows, list):
             raise Unreadable('GitHub (gh pr list did not print a list)')
         for row in rows:
-            if not valid_pr(row, state):
+            if not (isinstance(row, dict) and row.get('state') in PR_STATES[state] and valid_pr(row, row['state'])):
                 raise Unreadable(f'GitHub (gh pr list printed a row it cannot use: {str(row)[:120]})')
-        # A cut-off merged list only hides old merged pull requests, and "no merged pull request" keeps.
+        # A cut-off closed list only hides old merged or closed pull requests, and "no merged PR" keeps.
         if state == 'open' and len(rows) >= PR_LIMIT:
             raise Unreadable(f'GitHub ({repo} has {PR_LIMIT} or more open pull requests: the list may be cut off)')
-        out[state] = rows
+        if state == 'open':
+            out['open'] = rows
+        else:
+            out['merged'] = [row for row in rows if row['state'] == 'MERGED']
+            out['closed'] = [row for row in rows if row['state'] == 'CLOSED']
     return out
 
 
-def merged_seconds(row):
-    """When a pull request merged, in seconds since 1970; None when the row does not say."""
+def merged_seconds(row, key='mergedAt'):
+    """When a pull request merged (or, key closedAt, closed), in seconds since 1970; None when the row does not say."""
     try:
-        return calendar.timegm(time.strptime(row['mergedAt'], '%Y-%m-%dT%H:%M:%SZ'))
+        return calendar.timegm(time.strptime(row[key], '%Y-%m-%dT%H:%M:%SZ'))
     except (KeyError, TypeError, ValueError):
         return None  # no merge time
 
