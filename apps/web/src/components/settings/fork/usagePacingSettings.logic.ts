@@ -1,12 +1,14 @@
 /** Fork: the pure parts of the usage pacing panel (`usagePacing`, `usagePacingGate`, `usagePacingLowerEffort`). */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
 import {
+  burnFirstWindowKinds,
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   type ProviderInstanceId,
   type ProviderOptionDescriptor,
   type UsagePacingGateMode,
   type UsagePacingInstanceSettings,
   type UsagePacingLowerEffort,
+  UsagePacingWindowKind,
 } from "@t3tools/contracts";
 
 export interface UsagePacingAccountRow {
@@ -56,11 +58,51 @@ export function usagePacingAccountRows(
   return rows;
 }
 
+/** Every window kind, in upstream's order, as the panel lists them. */
+export const USAGE_PACING_WINDOW_KINDS: ReadonlyArray<UsagePacingWindowKind> =
+  UsagePacingWindowKind.literals;
+
+export const USAGE_PACING_WINDOW_LABELS: Readonly<Record<UsagePacingWindowKind, string>> = {
+  session: "5-hour",
+  weekly: "weekly",
+  monthly: "monthly",
+  other: "other",
+};
+
+const inKindOrder = (kinds: Iterable<UsagePacingWindowKind>): Array<UsagePacingWindowKind> => {
+  const listed = new Set(kinds);
+  return USAGE_PACING_WINDOW_KINDS.filter((kind) => listed.has(kind));
+};
+
+/** `a`, `a and b`, `a, b and c`. */
+const listText = (items: ReadonlyArray<string>): string =>
+  items.length <= 1 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+
 export function usagePacingAccountSummary(settings: UsagePacingInstanceSettings): string {
   if (settings.noLimits) return "No usage limits";
   const reserve =
     settings.reservePercent > 0 ? `${settings.reservePercent}% kept free` : "No reserve";
-  return settings.burnFirst ? `${reserve}, spent first` : reserve;
+  if (!settings.burnFirst) return reserve;
+  // Only the listed window kinds burn first (all of them without a list).
+  const kinds = inKindOrder(burnFirstWindowKinds(settings));
+  if (kinds.length === USAGE_PACING_WINDOW_KINDS.length) return `${reserve}, spent first`;
+  if (kinds.length === 0) return `${reserve}, no window spent first`;
+  return `${reserve}, ${listText(kinds.map((kind) => USAGE_PACING_WINDOW_LABELS[kind]))} spent first`;
+}
+
+/**
+ * The `burnFirstWindows` list a save writes when one window kind is ticked or unticked. No list
+ * yet means every kind, so unticking one lists the others.
+ */
+export function burnFirstWindowsAfterToggle(
+  settings: Pick<UsagePacingInstanceSettings, "burnFirstWindows">,
+  kind: UsagePacingWindowKind,
+  on: boolean,
+): Array<UsagePacingWindowKind> {
+  const kinds = new Set(settings.burnFirstWindows ?? USAGE_PACING_WINDOW_KINDS);
+  if (on) kinds.add(kind);
+  else kinds.delete(kind);
+  return inKindOrder(kinds);
 }
 
 export const USAGE_PACING_GATE_OPTIONS: ReadonlyArray<{

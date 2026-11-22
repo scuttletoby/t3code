@@ -49,7 +49,11 @@ import * as ServerConfig from "./config.ts";
 import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { renameRetiredAutoUpdateKeys } from "./cloud/autoUpdateSettings.ts";
-import { prepareSettingsFile } from "./fork/settingsFileRead.ts"; // Fork: renames, bad intervals
+import {
+  decodeSettingsFileSilently,
+  logSettingsFileRead,
+  prepareSettingsFile,
+} from "./fork/settingsFileRead.ts"; // Fork: load
 import * as ForkPolicy from "./fork/modelPolicyFile.ts"; // Fork: model policy
 import {
   deriveLegacyProjectOverrides,
@@ -403,6 +407,7 @@ const PersistedServerSettings = Schema.Struct({
 // Parse first and decode second, so a managed policy can fill its defaults in between.
 const decodeSettingsFileJsonExit = Schema.decodeUnknownExit(fromLenientJson(Schema.Unknown));
 const decodePersistedServerSettingsExit = Schema.decodeUnknownExit(PersistedServerSettings);
+export const decodePersistedSettings = Schema.decodeUnknownEffect(PersistedServerSettings);
 
 /**
  * The settings on disk with the managed policy laid over them, read without the service: no
@@ -437,9 +442,7 @@ function decodeSettingsFile(
   const parsed = decodeSettingsFileJsonExit(raw);
   const decoded = Exit.isFailure(parsed)
     ? parsed
-    : decodePersistedServerSettingsExit(
-        managed.withDefaults(renameRetiredAutoUpdateKeys(parsed.value)),
-      );
+    : decodeSettingsFileSilently(raw, managed.withDefaults, decodePersistedSettings); // Fork: read
   const legacy = decodeLegacyProviderSettingsJsonExit(raw);
   const failure = Exit.isFailure(decoded)
     ? decoded.cause
@@ -466,7 +469,8 @@ function decodeSettingsFile(
 
 /**
  * Fork: the load's decode of a settings file's text: parse, rename retired keys, fill policy
- * defaults, decode. Pure, so the fork's read-only report (`__fork-report`) decodes as a load does.
+ * defaults, decode. Synchronous; upstream's decodeSettingsFile reads as this does, silently, and
+ * the load logs what it drops through fork/settingsFileRead.ts's Effect form.
  */
 export function decodeSettingsFileText(
   raw: string,
@@ -878,6 +882,8 @@ const make = Effect.gen(function* () {
     let parseFailure = Option.none<unknown>();
 
     if (yield* readConfigExists) {
+      // Fork: what the read renames or drops is logged through the server's logger.
+      yield* logSettingsFileRead(yield* readRawConfig, managed.withDefaults, decodePersistedSettings);
       const file = decodeSettingsFile(yield* readRawConfig, managed);
       if (file.legacy !== undefined) {
         legacyProviders = file.legacy.providers;

@@ -5,6 +5,7 @@
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
 import {
+  burnFirstWindowKinds,
   DEFAULT_SERVER_SETTINGS,
   type ServerSettingsPatch,
   type UsagePacingGateMode,
@@ -13,6 +14,7 @@ import {
 import { useState } from "react";
 
 import { Button } from "../../ui/button";
+import { Checkbox } from "../../ui/checkbox";
 import { Input } from "../../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
 import { Switch } from "../../ui/switch";
@@ -24,6 +26,9 @@ import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings
 import { BoundedNumberField, ForkRow, useSelectedProviders } from "./ForkRow";
 import {
   USAGE_PACING_GATE_OPTIONS,
+  USAGE_PACING_WINDOW_KINDS,
+  USAGE_PACING_WINDOW_LABELS,
+  burnFirstWindowsAfterToggle,
   formatLowerEffort,
   knownEffortLevels,
   parseLowerEffort,
@@ -276,6 +281,35 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
                     />
                     No usage limits (an API key)
                   </label>
+                  {row.settings.burnFirst ? (
+                    <div
+                      role="group"
+                      aria-label={`Windows ${row.label} spends first`}
+                      className="flex basis-full flex-wrap items-center gap-x-4 gap-y-1"
+                    >
+                      <span>Windows spent first:</span>
+                      {USAGE_PACING_WINDOW_KINDS.map((kind) => (
+                        <label key={kind} className="flex items-center gap-1.5">
+                          <Checkbox
+                            checked={burnFirstWindowKinds(row.settings).includes(kind)}
+                            aria-label={`Spend ${row.label} first on ${USAGE_PACING_WINDOW_LABELS[kind]} windows`}
+                            onCheckedChange={(checked) =>
+                              updateSettings(
+                                patch(row.instanceId, {
+                                  burnFirstWindows: burnFirstWindowsAfterToggle(
+                                    row.settings,
+                                    kind,
+                                    checked === true,
+                                  ),
+                                }),
+                              )
+                            }
+                          />
+                          {USAGE_PACING_WINDOW_LABELS[kind]}
+                        </label>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </ForkRow>

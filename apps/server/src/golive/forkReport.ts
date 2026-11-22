@@ -21,11 +21,11 @@ import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
 import { migrationManifest, skippedV2Migrations } from "../persistence/Migrations.ts";
 import { reconciledV2PreviewHistory } from "../persistence/reconcileV2PreviewMigration.ts";
 import {
-  decodeSettingsFileText,
+  decodePersistedSettings,
   parseSettingsFileText,
   settingsFileLegacyKeysUnreadable,
 } from "../serverSettings.ts";
-import { readSettingsFile } from "../fork/settingsFileRead.ts";
+import { decodeSettingsFileSilently, readSettingsFile } from "../fork/settingsFileRead.ts";
 import { type ManagedSettings, unmanagedSettings } from "../policy/managedSettings.ts";
 import { isProcessAlive } from "../serverRuntimeState.ts";
 
@@ -459,7 +459,10 @@ function readSettings(
       : raw !== undefined && raw.trim() === ""
         ? "empty"
         : "present";
-  const decoded = raw === undefined ? undefined : decodeSettingsFileText(raw, managed.withDefaults);
+  const decoded =
+    raw === undefined
+      ? undefined
+      : decodeSettingsFileSilently(raw, managed.withDefaults, decodePersistedSettings);
   let parseWarning: string | null = null;
   if (readError !== null) {
     parseWarning = `settings.json could not be read: ${readError}`;

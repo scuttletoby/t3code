@@ -171,8 +171,12 @@ is listed with **Remove**).
 
 Without the list, `burnFirst` spends every window first (as before the list existed). A name that is
 not a window kind is ignored on load (that window keeps its pace; a warning is logged) and refused by
-a save. Only `settings.json` sets the list so far; `__fork-report` shows the kinds each account spends
-first under `usagePacingBurnFirstWindows`.
+a save. In the app, an account with **Spend first** on shows one box per window kind; its summary
+names the kinds it spends first. `__fork-report` shows them under `usagePacingBurnFirstWindows`.
+
+A key an entry does not know (a typo such as `burnFirstWindow`) is ignored on load with a warning
+that names it; with `burnFirst` on and the list lost that way, every window burns first. The next
+settings save writes the entry back as it was read: unknown keys and names are gone from the file.
 
 ### `server.usagePacingGate`
 
