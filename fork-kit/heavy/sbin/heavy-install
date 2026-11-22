@@ -12,8 +12,9 @@ release into /usr/local/libexec/heavy/versions/<sha>/ (with MANIFEST.sha256), ch
 writes /etc/heavy/config.json and links /usr/local/bin/heavy, /usr/local/bin/t3-capacity and
 /usr/local/sbin/heavy-install to it. An old /usr/local/bin/heavy that is a plain file (a copy from before this kit) is
 kept in /usr/local/libexec/heavy/replaced/ and put back by uninstall. A plain /usr/local/bin/t3-capacity (a host's
-own copy, which its own scripts may read) is left alone, with a note, unless --replace-t3-capacity is given: then it
-is kept in /usr/local/libexec/heavy/replaced-capacity/, linked, and put back by uninstall. With a --memory-*,
+own copy, which its own scripts may read) or a link someone else made there is left alone, with a note, unless
+--replace-t3-capacity is given: then a plain copy is kept in /usr/local/libexec/heavy-kept/ (outside the folders
+every uninstall deletes, an older installer's too), linked, and put back by uninstall. With a --memory-*,
 --swap-max or --cpu-weight option it also writes the slice unit /etc/systemd/user/<slice> (every user's manager reads
 it after `systemctl --user daemon-reload`; a user's own ~/.config/systemd/user/<slice> wins over it). With
 --sweep-timer it also writes the user units heavy-sweep.service and heavy-sweep.timer to /etc/systemd/user/ (each
@@ -34,13 +35,14 @@ REPLACED = LIBEXEC + '/replaced'
 WRAPPER = '/usr/local/bin/heavy'
 INSTALLER = '/usr/local/sbin/heavy-install'
 CAPACITY = '/usr/local/bin/t3-capacity'
-# a plain old copy of t3-capacity has its own folder: an installer from before it restores the newest file of
-# REPLACED as /usr/local/bin/heavy on uninstall, so a t3-capacity there could come back as heavy
-REPLACED_CAPACITY = LIBEXEC + '/replaced-capacity'
+# a plain old copy of t3-capacity has its own folder, outside LIBEXEC and ETC: an installer from before it restores
+# the newest file of REPLACED as /usr/local/bin/heavy on uninstall (so a t3-capacity there could come back as heavy),
+# and its uninstall deletes LIBEXEC and ETC whole (so a copy kept anywhere in them would be lost)
+KEPT_CAPACITY = '/usr/local/libexec/heavy-kept'
 UNIT_DIR = '/etc/systemd/user'
 LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-install',
          CAPACITY: CURRENT + '/bin/t3-capacity'}
-KEPT = {WRAPPER: (REPLACED, 'heavy'), CAPACITY: (REPLACED_CAPACITY, 't3-capacity')}   # where a plain old file goes
+KEPT = {WRAPPER: (REPLACED, 'heavy'), CAPACITY: (KEPT_CAPACITY, 't3-capacity')}   # where a plain old file goes
 
 SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'lib/heavy_queue.py',
                 'lib/heavy_measure.py', 'common/machine_file.py', 'systemd/heavy-sweep.service',
@@ -257,7 +259,7 @@ def check_options(a):
     return limits
 
 
-def check_old_state():
+def check_old_state(replace_capacity=False):
     """Refuse, before writing anything, what the installer must not overwrite."""
     for path, target in LINKS.items():
         real = p(path)
@@ -265,9 +267,11 @@ def check_old_state():
             continue
         if path in KEPT and os.path.isfile(real) and not os.path.islink(real):
             continue   # a plain old copy: kept in its KEPT folder, put back by uninstall
+        if path == CAPACITY and os.path.islink(real) and not replace_capacity:
+            continue   # a host's own link: left alone, with a note (there is no file of ours to keep for it)
         raise Refused(f'{path} exists and is not the kit\'s link (a link elsewhere, or a folder): '
                       f'remove it by hand and run again')
-    for path in (ETC, LIBEXEC, VERSIONS, REPLACED, REPLACED_CAPACITY):
+    for path in (ETC, LIBEXEC, VERSIONS, REPLACED, KEPT_CAPACITY):
         real = p(path)
         if os.path.lexists(real) and (os.path.islink(real) or not os.path.isdir(real)):
             raise Refused(f'{path} exists and is not a folder: remove it by hand and run again')
@@ -329,7 +333,7 @@ def install(a, stop_after=None):
     if os.geteuid() != ROOT_UID:
         raise Refused('run this as root')
     limits = check_options(a)
-    check_old_state()
+    check_old_state(a.replace_t3_capacity)
     old = read_config()
     units_left = any(ours_unit(u) for u in sweep_unit_paths())
     if a.sweep_timer is not None:
@@ -389,8 +393,13 @@ def install(a, stop_after=None):
     done('switch')
     for path, target in LINKS.items():
         if path == CAPACITY and os.path.lexists(p(path)) and not ours(path, target) and not a.replace_t3_capacity:
-            say(f'note: {path} is a plain file this kit did not write: left as it is (its readings can differ from '
-                f'the kit\'s; --replace-t3-capacity keeps it in {REPLACED_CAPACITY}/ and links the kit\'s)')
+            if os.path.islink(p(path)):
+                say(f'note: {path} is a link this kit did not make (to {os.readlink(p(path))}): left as it is (its '
+                    f'readings can differ from the kit\'s; remove it and run again with --replace-t3-capacity to '
+                    f'link the kit\'s)')
+            else:
+                say(f'note: {path} is a plain file this kit did not write: left as it is (its readings can differ '
+                    f'from the kit\'s; --replace-t3-capacity keeps it in {KEPT_CAPACITY}/ and links the kit\'s)')
             continue
         keep_old(path)
         switch_link(path, target)
@@ -415,7 +424,9 @@ def install(a, stop_after=None):
                + ''.join('\t'.join(r) + '\n' for r in rows))
     done('record')
     say(f'installed release {a.sha}: slice {cfg["slice"]}, grace {cfg["grace_seconds"]:g}s'
-        + (', sweep timer units written' if sweep_timer else ''))
+        + (', sweep timer units written' if sweep_timer else '')
+        + ('' if ours(CAPACITY, LINKS[CAPACITY]) else
+           f'; WARNING: {CAPACITY} is still the host\'s own, not the kit\'s (--replace-t3-capacity switches it)'))
     for path, kind, want in rows:
         say(f'  {path}  {kind}  {want}')
     return 0
@@ -440,6 +451,12 @@ def uninstall():
             shutil.copy2(backups[-1], tmp)
             os.replace(tmp, p(path))
             say(f'put the old {path} back')
+        if folder == KEPT_CAPACITY and backups:   # outside LIBEXEC: removed only once its copy is back in place
+            if os.path.isfile(p(path)) and not os.path.islink(p(path)) \
+                    and sha256_file(p(path)) == sha256_file(backups[-1]):
+                shutil.rmtree(p(folder), ignore_errors=True)
+            else:
+                say(f'note: {path} is not the kept copy, so {folder}/ is left in place')
     for path in sweep_unit_paths():
         if ours_unit(path):
             os.unlink(p(path))

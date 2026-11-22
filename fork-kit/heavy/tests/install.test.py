@@ -5,6 +5,8 @@ No root, no systemd, no network.
 """
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, unittest
 
+OLDER_RELEASE = 'ci/v22'   # a released installer from before the t3-capacity link (its uninstall is run below)
+
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CAPACITY = os.path.join(os.path.dirname(os.path.dirname(KIT)), 'packages', 'shared', 'src', 'capacity')
 SHA1, SHA2 = 'a' * 40, 'b' * 40
@@ -13,8 +15,7 @@ OLD_CAPACITY = b'#!/bin/sh\necho "available=9999MB swapfree=9999MB load=0/4cores
 CAPACITY_LINK = '/usr/local/libexec/heavy/current/bin/t3-capacity'
 
 
-def load():
-    path = os.path.join(KIT, 'sbin', 'heavy-install')
+def load(path=os.path.join(KIT, 'sbin', 'heavy-install')):
     loader = importlib.machinery.SourceFileLoader('heavy_install', path)
     spec = importlib.util.spec_from_loader('heavy_install', loader)
     mod = importlib.util.module_from_spec(spec)
@@ -38,11 +39,11 @@ class Install(unittest.TestCase):
     def path(self, p):
         return self.root + p
 
-    def run_main(self, *argv, stop_after=None):
+    def run_main(self, *argv, stop_after=None, m=None):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
-                code = self.m.main(list(argv), stop_after=stop_after)
+                code = (m or self.m).main(list(argv), **({} if m else {'stop_after': stop_after}))
             except SystemExit as e:
                 code = str(e)
         return code, out.getvalue(), err.getvalue()
@@ -157,7 +158,7 @@ class Install(unittest.TestCase):
         self.assertEqual(self.install(sha=SHA2)[0], 0)               # an upgrade: the same link, the new release
         self.assertEqual(self.resolve('/usr/local/bin/t3-capacity'),
                          self.path(f'/usr/local/libexec/heavy/versions/{SHA2}/bin/t3-capacity'))
-        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy/replaced-capacity')))
+        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy-kept')))
         self.assertEqual(self.run_main('uninstall')[0], 0)
         self.assertFalse(os.path.lexists(link))
 
@@ -167,9 +168,13 @@ class Install(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn('note: /usr/local/bin/t3-capacity is a plain file this kit did not write: left as it is', out)
         self.assertIn('--replace-t3-capacity', out)
+        closing = [line for line in out.splitlines() if line.startswith('heavy-install: installed release ')]
+        self.assertEqual(len(closing), 1, out)
+        self.assertIn("WARNING: /usr/local/bin/t3-capacity is still the host's own, not the kit's "
+                      '(--replace-t3-capacity switches it)', closing[0])
         self.run_old_capacity()
         self.assertTrue(os.path.islink(self.path('/usr/local/bin/heavy')))
-        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy/replaced-capacity')))
+        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy-kept')))
         with open(self.path('/etc/heavy/installed.tsv')) as f:
             self.assertNotIn('/usr/local/bin/t3-capacity', f.read())
         self.assertEqual(self.run_main('self-check')[0], 0)
@@ -185,9 +190,10 @@ class Install(unittest.TestCase):
         code, out, err = self.install('--replace-t3-capacity')
         self.assertEqual(code, 0, err)
         self.assertIn('the old /usr/local/bin/t3-capacity (sha256 ', out)
-        self.assertIn('is kept as /usr/local/libexec/heavy/replaced-capacity/t3-capacity.', out)
+        self.assertIn('is kept as /usr/local/libexec/heavy-kept/t3-capacity.', out)
+        self.assertNotIn('WARNING', out)                              # the closing line: the kit's now
         self.assertEqual(os.readlink(self.path('/usr/local/bin/t3-capacity')), CAPACITY_LINK)
-        kept = self.path('/usr/local/libexec/heavy/replaced-capacity')
+        kept = self.path('/usr/local/libexec/heavy-kept')
         self.assertEqual(len(os.listdir(kept)), 1)
         with open(os.path.join(kept, os.listdir(kept)[0]), 'rb') as f:
             self.assertEqual(f.read(), OLD_CAPACITY)
@@ -205,7 +211,65 @@ class Install(unittest.TestCase):
         self.assertEqual(os.stat(self.path('/usr/local/bin/t3-capacity')).st_mode & 0o777, 0o755)
         with open(self.path('/usr/local/bin/heavy'), 'rb') as f:
             self.assertEqual(f.read(), OLD_WRAPPER)
+        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy-kept')))   # its copy is back
         self.assertEqual(self.run_main('uninstall')[0], 0)            # again: nothing left, still fine
+
+    def test_kept_t3_capacity_is_outside_every_folder_an_uninstall_deletes(self):
+        # every released uninstall (ci/v6 to ci/v22) deletes LIBEXEC and ETC whole, and unlinks only heavy and
+        # heavy-install; it does not know the t3-capacity link or the kept copy
+        for gone in (self.m.LIBEXEC, self.m.ETC):
+            self.assertFalse((self.m.KEPT_CAPACITY + '/').startswith(gone + '/'), gone)
+        self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
+        self.assertEqual(self.install('--replace-t3-capacity')[0], 0)
+        for path in ('/usr/local/bin/heavy', '/usr/local/sbin/heavy-install'):
+            os.unlink(self.path(path))
+        for path in (self.m.LIBEXEC, self.m.ETC):
+            shutil.rmtree(self.path(path))
+        self.assert_older_uninstall_left_the_kept_copy_then_restore()
+
+    def assert_older_uninstall_left_the_kept_copy_then_restore(self):
+        link = self.path('/usr/local/bin/t3-capacity')
+        self.assertEqual(os.readlink(link), CAPACITY_LINK)            # broken: an older uninstall does not know it
+        self.assertFalse(os.path.lexists(self.path(CAPACITY_LINK)))   # (its target, inside the fake root)
+        kept = self.path('/usr/local/libexec/heavy-kept')
+        self.assertEqual(len(os.listdir(kept)), 1)
+        with open(os.path.join(kept, os.listdir(kept)[0]), 'rb') as f:
+            self.assertEqual(f.read(), OLD_CAPACITY)
+        code, out, err = self.run_main('uninstall')                   # this release's uninstall puts it back
+        self.assertEqual(code, 0, err)
+        self.assertIn('put the old /usr/local/bin/t3-capacity back', out)
+        self.run_old_capacity()
+        self.assertFalse(os.path.exists(kept))
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.run_old_capacity()
+
+    def test_older_installers_install_and_uninstall_keep_the_hosts_t3_capacity(self):
+        repo = os.path.dirname(os.path.dirname(KIT))
+        r = subprocess.run(['git', '-C', repo, 'rev-parse', '--verify', '-q', OLDER_RELEASE + '^{commit}'],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            self.skipTest(f'{OLDER_RELEASE} is not in this checkout (a shallow clone without tags); '
+                          f'test_kept_t3_capacity_is_outside_every_folder_an_uninstall_deletes covers its deletes')
+        older = os.path.join(self.root, 'older-release')
+        os.mkdir(older)
+        tree = subprocess.run(['git', '-C', repo, 'archive', OLDER_RELEASE, 'fork-kit', 'packages/shared/src/capacity'],
+                              capture_output=True, timeout=120, check=True).stdout
+        subprocess.run(['tar', '-x', '-C', older], input=tree, check=True, timeout=120)
+        m_old = load(os.path.join(older, 'fork-kit', 'heavy', 'sbin', 'heavy-install'))
+        m_old.PREFIX, m_old.ROOT_UID = self.root, os.geteuid()
+        self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
+        self.assertEqual(self.install('--replace-t3-capacity')[0], 0)
+        # the rollback: the older installer installs its own release over this state, then uninstalls
+        code, _, err = self.run_main('install', '--source', os.path.join(older, 'fork-kit', 'heavy'), '--sha', SHA2,
+                                     m=m_old)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.resolve('/usr/local/bin/t3-capacity'),
+                         self.path(f'/usr/local/libexec/heavy/versions/{SHA2}/bin/t3-capacity'))
+        code, _, err = self.run_main('uninstall', m=m_old)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy')))
+        self.assertFalse(os.path.exists(self.path('/etc/heavy')))
+        self.assert_older_uninstall_left_the_kept_copy_then_restore()
 
     def test_t3_capacity_swap_fails_old_command_still_works_then_run_again(self):
         self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
@@ -226,16 +290,38 @@ class Install(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertNotIn('is kept as', out)                           # kept already by the run that stopped
         self.assertEqual(os.readlink(self.path('/usr/local/bin/t3-capacity')), CAPACITY_LINK)
-        self.assertEqual(len(os.listdir(self.path('/usr/local/libexec/heavy/replaced-capacity'))), 1)
+        self.assertEqual(len(os.listdir(self.path('/usr/local/libexec/heavy-kept'))), 1)
         self.assertEqual(self.run_main('self-check')[0], 0)
 
+    def test_foreign_t3_capacity_link_is_left_alone_without_the_option(self):
+        link = self.path('/usr/local/bin/t3-capacity')
+        os.symlink('/opt/other/t3-capacity', link)
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertIn('note: /usr/local/bin/t3-capacity is a link this kit did not make (to /opt/other/t3-capacity): '
+                      'left as it is', out)
+        self.assertIn("WARNING: /usr/local/bin/t3-capacity is still the host's own", out)
+        self.assertEqual(os.readlink(link), '/opt/other/t3-capacity')
+        self.assertTrue(os.path.islink(self.path('/usr/local/bin/heavy')))
+        with open(self.path('/etc/heavy/installed.tsv')) as f:
+            self.assertNotIn('/usr/local/bin/t3-capacity', f.read())
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        before = self.snapshot()
+        self.assertEqual(self.install()[0], 0)                       # again: still left alone, nothing changes
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertEqual(os.readlink(link), '/opt/other/t3-capacity')
+        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy-kept')))
+
     def test_foreign_t3_capacity_link_or_folder_is_refused_before_anything_is_written(self):
-        for make in (lambda p: os.symlink('/opt/other/t3-capacity', p), os.mkdir):
-            with self.subTest(make=make):
+        # with the option a link elsewhere is refused (nothing to keep); a folder is refused with or without it
+        for make, extra in ((lambda p: os.symlink('/opt/other/t3-capacity', p), ('--replace-t3-capacity',)),
+                            (os.mkdir, ()), (os.mkdir, ('--replace-t3-capacity',))):
+            with self.subTest(make=make, extra=extra):
                 shutil.rmtree(self.root)
                 os.makedirs(self.path('/usr/local/bin'))
                 make(self.path('/usr/local/bin/t3-capacity'))
-                code, _, err = self.install()
+                code, _, err = self.install(*extra)
                 self.assertEqual(code, 1)
                 self.assertIn('/usr/local/bin/t3-capacity exists and is not the kit\'s link', err)
                 self.assertEqual(sorted(os.listdir(self.path('/usr/local/bin'))), ['t3-capacity'])
@@ -303,7 +389,7 @@ class Install(unittest.TestCase):
                 self.assertTrue(os.path.isfile(self.path('/etc/systemd/user/heavy-sweep.timer')))
                 self.assertEqual(self.run_main('self-check')[0], 0)
                 self.assertEqual(len(os.listdir(self.path('/usr/local/libexec/heavy/replaced'))), 1)
-                self.assertEqual(len(os.listdir(self.path('/usr/local/libexec/heavy/replaced-capacity'))), 1)
+                self.assertEqual(len(os.listdir(self.path('/usr/local/libexec/heavy-kept'))), 1)
                 self.assertEqual(os.readlink(self.path('/usr/local/bin/t3-capacity')), CAPACITY_LINK)
 
     def test_half_copied_version_is_made_again(self):
