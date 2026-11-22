@@ -307,6 +307,8 @@ def verdict(body, override_prefix, head=None):
         return ['override']
     if review.lens_problem(post):
         return ['reads nothing']
+    if review.not_lens_report(post):   # looks like a report, but without the lens marker it is none (issue #865)
+        return ['not a lens', 'no lens marker']
     header = lens.lens_header(body)
     if not header:
         return ['not a lens']

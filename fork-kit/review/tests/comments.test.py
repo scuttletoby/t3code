@@ -23,7 +23,7 @@ SHA = '0123456789abcdef0123456789abcdef01234567'
 OTHER = '89abcdef0123456789abcdef0123456789abcdef'
 CLEAN = f'lens: code · reviewer: a · read at: {SHA}\nstate: a second run does nothing\nblocker: none\nmajor: none\n'
 WORDS = ('lens', 'round', 'read', 'short sha', 'clean', 'blocker', 'major', 'no findings section', 'state',
-         'no state', 'reads nothing', 'not a lens', 'override')
+         'no state', 'reads nothing', 'not a lens', 'no lens marker', 'override')
 
 
 def doc():
@@ -166,7 +166,13 @@ class Check(unittest.TestCase):
         self.assertEqual(self.verdict(f'tool ready --head {SHA[:7]}: read the fix'), 'not a lens')
 
     def test_a_looking_comment_reads_nothing(self):
-        self.assertEqual(self.verdict('safe to merge, I think'), 'reads nothing')
+        self.assertEqual(self.verdict(f'Here it is.\nread at: {SHA}'), 'reads nothing')
+
+    def test_a_look_alike_without_the_lens_marker_is_no_lens(self):   # issue #865: named, never blocking
+        for body in ('safe to merge, I think', '## Lens A\nblocker: none\nmajor: none', 'covered: a\nchecks: b'):
+            with self.subTest(body=body):
+                self.assertEqual(self.verdict(body), 'not a lens, no lens marker')
+                self.assertEqual(self.m.check(body, 'tool ready --head', SHA), (1, 'not a lens, no lens marker'))
 
 
 class Cli(unittest.TestCase):
@@ -235,6 +241,8 @@ MUTATIONS = {
                                (Doc, 'test_every_example_reads_as_it_says')),
     'the gate flags a looking comment': ('if review.lens_problem(post):', 'if False:',
                                          (Check, 'test_a_looking_comment_reads_nothing')),
+    'a look-alike without the marker is named': ('if review.not_lens_report(post):', 'if False:',
+                                                 (Check, 'test_a_look_alike_without_the_lens_marker_is_no_lens')),
     'every example is compared': ('if got != said:', 'if False:', (Doc, 'test_a_broken_example_fails')),
     'the head is lowercased': ("sha != head.lower()", 'sha != head',
                                (Check, 'test_the_head_is_matched_whatever_its_case')),

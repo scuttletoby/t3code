@@ -385,15 +385,31 @@ class Rules(unittest.TestCase):
                 self.assertTrue(self.verdict([self.p.lens('correctness', A), self.p.lens('x', B, login=login)])[0])
 
     def test_an_old_format_report_reads_nothing(self):   # old state: reports from before the fixed grammar
-        for body in (f'## Correctness {LENS}\nsafe to merge: yes', f'Review (correctness) read at: {A}',
-                     f'```\n{LENS}: correctness · read at: {A}\n```', 'covered: all\nchecks: ran the tests'):
-            with self.subTest(body=body):
+        for body in (f'## Correctness {LENS}\nread at: {A}', f'Review (correctness) read at: {A}',
+                     f'```\n{LENS}: correctness · read at: {A}\n```', f'covered: all\n{LENS}: correctness'):
+            with self.subTest(body=body):   # each carries the lens marker: a lens report, broken, so it blocks
                 ok, _, rows = self.verdict([self.p.lens('correctness', A), self.p.post(body)])
                 self.assertFalse(ok)
                 self.assertIn(lens.NO_HEADER, ' '.join(name for name, _, _ in rows))
 
+    def test_a_look_alike_without_the_lens_marker_passes_and_is_named(self):   # issue #865
+        for body in (f'## Correctness {LENS}\nsafe to merge: yes', 'covered: all\nchecks: ran the tests',
+                     f'## {LENS.title()} A\nblocker: none\nmajor: none'):
+            with self.subTest(body=body):
+                ok, why, rows = self.verdict([self.p.lens('correctness', A), self.p.post(body)])
+                self.assertTrue(ok, why)
+                self.assertEqual([(name.split(' (')[0], good) for name, good, _ in rows],
+                                 [('correctness', True), (lens.NOT_LENS, True)])
+                self.assertIn(lens.NO_MARKER, rows[1][2])
+                ok, why, rows = self.verdict([self.p.post(body)])   # alone: no lens comments, still named
+                self.assertTrue(ok, why)
+                self.assertEqual([(name.split(' (')[0], good) for name, good, _ in rows], [(lens.NOT_LENS, True)])
+                ok, why, rows = self.verdict([self.p.post(body)], required='correctness')   # fail closed
+                self.assertFalse(ok)
+                self.assertIn('carry no lens marker', why)
+
     def test_a_deleted_comment_counts_no_more(self):   # deleted: GitHub no longer lists it
-        look_alike = self.p.post('safe to merge')
+        look_alike = self.p.post(f'read at: {A[:7]}')
         good = self.p.lens('correctness', A)
         self.assertFalse(self.verdict([look_alike, good])[0])
         self.assertTrue(self.verdict([good])[0])
@@ -2185,7 +2201,7 @@ class Runs(unittest.TestCase):
         for node, says in ((self.inline_lens(self.read[:7]), 'reads nothing'),
                            (self.inline_lens(self.read, includesCreatedEdit=True), 'edited after posting'),
                            (self.inline_lens(self.read, isMinimized=True), 'hidden'),
-                           (inline_node('safe to merge'), 'reads nothing')):
+                           (inline_node(f'read at: {self.read}'), 'reads nothing')):
             with self.subTest(node=node['body'][:30], says=says):
                 code, out = run_cli(self.path, fake_gh((0, bare), flags=[flags_page(inline=[node])]))
                 self.assertEqual(code, 1, out)
@@ -2241,6 +2257,13 @@ class Runs(unittest.TestCase):
         code, out = run_cli(self.path, fake_gh((0, bare), flags=pages[:1]))   # page 2 fails every time
         self.assertEqual(code, 1, out)
         self.assertIn('could not read the pull request', out)
+
+    def test_a_near_miss_passes_and_the_summary_names_it(self):   # issue #865
+        answer = json.dumps(pr([self.p.lens('correctness', self.read), self.p.post('## Lens A\nmajor: none')],
+                               head=self.read))
+        code, out = run_cli(self.path, fake_gh((0, answer)), env=self.env)
+        self.assertEqual(code, 0, out)
+        self.assertRegex(self.read_file('summary.md'), rf'\| {lens.NOT_LENS} \([^|]*\) \| ok \| no lens marker')
 
     def test_pass_and_fail_reach_the_exit_code_summary_and_output(self):
         code, out = run_cli(self.path, fake_gh((0, self.good)), env=self.env)

@@ -214,7 +214,11 @@ labels or changed paths, say) and pass it in.
 
 The log and the job summary list each lens with `ok` or `fail` and a short
 reason (the sha it read, an override, edited, hidden, a short sha, required
-but missing).
+but missing). A comment that looks like a lens report but carries no lens
+marker (the pr-queue README, "Lens comments") is no lens report: it gets a row
+`not a lens report (<where>)`, `ok`, with the reason, and never fails the
+check; a required lens it was meant to be still fails as missing, and the
+reason says how many such comments there are.
 
 | Exit | Meaning                                                                          |
 | ---- | -------------------------------------------------------------------------------- |

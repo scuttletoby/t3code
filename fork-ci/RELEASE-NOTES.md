@@ -13,6 +13,20 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: only a comment with the lens marker is a lens report (#865)
+
+A comment counts as a lens report only when it carries the lens marker: a line that starts with the lens field
+(`lens:`, `lens=`, `lens —`, `lens –`), names a read (`read at` and a hex sha), or has a lens field with a hex sha after
+it (Markdown stripped, in code blocks and quotes too). A lens report that is not exactly one valid read still blocks, as
+before. A comment that only looks like one without the marker (a `## Lens A` heading, `safe to merge`, `covered:` and
+`checks:` lines) no longer blocks: the run log and the head check's summary name it as `not a lens report` with the
+reason. Comments with the marker read exactly as before. T3's copy (`apps/server/src/fork/reviewRules`) and the review
+kit's `check` read the same rule from the shared vectors.
+
+**Upgrade:** a lens report written without the marker now counts for nothing, so a lens that posts one has not
+reported: list required lenses (`required-lenses`, or a `review` block in `enforce`) so a missing read still fails the
+head check, and have lenses run the kit's `check` before posting.
+
 ### pr-queue: what counts as a `state:` line is gate code (#797)
 
 `review_judge.has_state_line` holds the rule for a lens report's `state:` line (an answer after the colon, outside code

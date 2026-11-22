@@ -3798,12 +3798,21 @@ class InlineReviewComments(Base):
     def test_an_inline_lens_look_alike_blocks_like_any_other(self):
         fence = '`' * 3
         for body in (f'{fence}\n{LENS}: correctness · reviewer: x · read at: {self.c}\n{fence}',
-                     'this one is safe to merge', f'{LENS}: correctness · reviewer: x · read at: {self.c[:7]}'):
+                     f'this one is safe to merge, read at {self.c}',
+                     f'{LENS}: correctness · reviewer: x · read at: {self.c[:7]}'):
             with self.subTest(body=body):
                 f = self.fake(inline=[inline_node(body)])
                 code, out = self.update(f)
                 self.assertOff(f, code, 'unclear')
                 self.assertFalse(f.updated)
+
+    def test_an_inline_look_alike_without_the_lens_marker_holds_nothing(self):   # issue #865
+        for n, body in enumerate(('this one is safe to merge', '## Lens A\nmajor: none'), 2):
+            with self.subTest(body=body):   # each named once in the run log (a Review logs each post once)
+                f = self.fake(inline=[self.lens(self.c), inline_node(body, n=n)])
+                code, out = self.update(f)
+                self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+                self.assertIn(lens.NOT_LENS, out)
 
     def test_an_edited_or_hidden_inline_lens_reads_nothing(self):
         for change, why in (({'edited': True}, lens.EDITED), ({'hidden': True}, lens.HIDDEN)):

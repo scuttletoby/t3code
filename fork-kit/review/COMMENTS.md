@@ -1,8 +1,10 @@
 # Lens comments: the format the gate reads
 
 A lens posts its report as one pull request comment. The merge gate (`fork-ci/actions/pr-queue`) reads that comment
-with fixed rules and fails closed: a comment that looks like a report but is not one valid read blocks the head. This
-page shows the format with examples. The rules themselves are the gate's code and its README (sections
+with fixed rules. A comment that carries the lens marker (below) is a lens report, and the gate fails closed on it: one
+that is not exactly one valid read blocks the head. A comment without the marker is no lens report however much it
+looks like one: it never reads and never blocks, and the gate's summary names it `not a lens report` with the reason.
+This page shows the format with examples. The rules themselves are the gate's code and its README (sections
 [Lens comments](../../fork-ci/actions/pr-queue/README.md#lens-comments) and
 [Review rules](../../fork-ci/actions/pr-queue/README.md#review-rules)); the gate's test vectors
 ([review.vectors.json](../../fork-ci/actions/pr-queue/review.vectors.json)) pin how it judges paths and lens counts.
@@ -13,6 +15,20 @@ of your own before posting it: `python3 -I fork-kit/review/lib/review_kit.py che
 comment.md` (`--settings` when the project's kit settings are not at `.github/review-kit.json`).
 
 The examples use the override prefix `tool ready --head`. A project's prefix is `override.prefix` in its queue config.
+
+## The lens marker
+
+A comment carries the lens marker when one of its lines, read with Markdown stripped (emphasis, links, tags, quote,
+list and heading marks), in a code block or quote too:
+
+- starts with the lens field: `lens:` (also `lens=`, `lens —`, `lens –`), or
+- names a read: `read at` and a hex sha (`read at: 0123abc`, `read-at 0123abc`), or
+- has a lens field followed by a hex sha anywhere in the line (`the security lens — fixed in 0123abc`).
+
+A real report has it on its first line, the header. The marker decides only whether a comment is a lens report; the
+rest of this page decides whether that report is one valid read. A heading such as `## Lens A`, `safe to merge`, or
+`covered:` and `checks:` lines are no marker: such a comment is `not a lens`, `no lens marker`, and a lens whose report
+reads that way has posted nothing the gate counts (a required lens then still has no read).
 
 ## The shape
 
@@ -60,7 +76,8 @@ Each example says, on the line before it, what the gate reads, as words:
 | `blocker`, `major`    | an open blocker or major: the gate holds the head until a new read on a fixed head, or a person                    |
 | `no findings section` | no blocker and major labels: with `findings` on, the gate does not take the read                                   |
 | `state`, `no state`   | a `state:` line with an answer, or none                                                                            |
-| `reads nothing`       | looks like a lens report but is not one valid read: the gate counts it as a blocking problem                       |
+| `reads nothing`       | carries the lens marker but is not one valid read: the gate counts it as a blocking problem                        |
+| `no lens marker`      | looks like a lens report but carries no lens marker: no lens report, never a read or a block, named in the summary |
 | `not a lens`          | not a lens report at all (a plain comment, or one that opts out with `not a lens:`): ignored                       |
 | `override`            | an override comment for that sha (counts only from the configured author association, never edited and not hidden) |
 
@@ -208,6 +225,9 @@ major: none
 
 ## Comments that read nothing or are no report
 
+A comment with the lens marker that is not one valid read blocks the head (`reads nothing`). One without the marker
+is no report, however much it looks like one (`no lens marker`).
+
 No findings section: only a major label, no blocker label. The gate sees no section and does not take the read.
 
 The gate reads: `lens code, read, no findings section, no state`
@@ -228,7 +248,7 @@ blocker: none
 major: none
 ```
 
-The header is not the first line. The comment looks like a report, so it is a blocking problem.
+The header is not the first line. The comment carries the lens marker, so it is a blocking problem.
 
 The gate reads: `reads nothing`
 
@@ -252,13 +272,35 @@ blocker: none
 major: none
 ```
 
-A report with no header, only report fields.
+A lens heading that names a read: `read at` and a sha are the marker, so this is a broken report, and it blocks.
 
 The gate reads: `reads nothing`
 
 ```text
+## Lens code
+read at: 0123456789abcdef0123456789abcdef01234567
+blocker: none
+major: none
+```
+
+A report with no header, only report fields: no marker, so no lens report. It does not block, and it counts for
+nothing: the lens has not reported.
+
+The gate reads: `not a lens, no lens marker`
+
+```text
 covered: src/queue.ts
 checks: ran the tests
+blocker: none
+major: none
+```
+
+A lens-like heading with no marker: no lens report.
+
+The gate reads: `not a lens, no lens marker`
+
+```text
+## Lens A
 blocker: none
 major: none
 ```

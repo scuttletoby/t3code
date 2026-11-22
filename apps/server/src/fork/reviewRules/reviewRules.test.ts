@@ -11,10 +11,14 @@ import {
   EMBEDDED,
   HIDDEN,
   NO_HEADER,
+  NO_MARKER,
+  hasMarker,
   lensHeader,
   lensKey,
   lensProblem,
   lensScan,
+  looksProblem,
+  notLensReport,
 } from "./lensComment.ts";
 import { ReviewPlanError, globMatches, planReview, type ReviewBlock } from "./plan.ts";
 import { repr, splitlines } from "./pyText.ts";
@@ -47,7 +51,7 @@ const FIELDS: Record<string, ReadonlyArray<string> | null> = {
   globs: null,
   cases: ["name", "config", "changes", "weight", "lenses", "hits", "protected"],
   findings: ["name", "group", "body", "findings", "section"],
-  scans: ["name", "posts", "history", "entries"],
+  scans: ["name", "posts", "history", "entries", "not_lens"],
   rounds: [
     "name",
     "config",
@@ -150,7 +154,11 @@ describe("the shared vectors", () => {
   it("every scan", () => {
     assert.isAtLeast(V.scans.length, 31);
     for (const s of V.scans)
-      assert.deepStrictEqual(scan(s), { history: s.history, entries: s.entries }, s.name);
+      assert.deepStrictEqual(
+        scan(s),
+        { history: s.history, entries: s.entries, notLens: s.not_lens ?? [] },
+        s.name,
+      );
   });
 
   it("every round", () => {
@@ -208,7 +216,7 @@ describe("rounds meet old, repeated, edited, deleted and empty state", () => {
     );
   });
   it("a pull request with no lens comments is round 0 and passes", () => {
-    assert.deepStrictEqual(lensScan([]), { history: [], entries: {} });
+    assert.deepStrictEqual(lensScan([]), { history: [], entries: {}, notLens: [] });
     const r = replayRound(
       named("rounds", "a pull request with no lens comments is round 0 and passes"),
     );
@@ -244,6 +252,33 @@ describe("rounds meet old, repeated, edited, deleted and empty state", () => {
     );
     assert.lengthOf(Object.keys(reposted.entries), 2);
     assert.include(Object.keys(reposted.entries)[0], EMBEDDED);
+  });
+  it("a look-alike without the lens marker is no lens report; one with it still blocks (#865)", () => {
+    const near = scan(
+      named("scans", "a lens heading with no lens marker is no lens report (issue 865)"),
+    );
+    assert.deepStrictEqual([near.history, near.entries], [[], {}]);
+    assert.lengthOf(near.notLens, 1);
+    assert.include(near.notLens[0]![1], NO_MARKER);
+    const read = scan(
+      named("scans", "a lens heading that names a read carries the marker and reads nothing"),
+    );
+    assert.isTrue(Object.keys(read.entries)[0]!.startsWith(NO_HEADER));
+    assert.deepStrictEqual(read.notLens, []);
+    const beside = scan(
+      named("scans", "a near miss beside a report of the same lens and head leaves the read"),
+    );
+    assert.deepStrictEqual(beside.entries, { code: ["a".repeat(40), null] });
+    for (const body of [
+      "## Lens A\nmajor: none",
+      "lgtm, safe to merge",
+      "Here.\nread at: 1234567",
+    ]) {
+      const looks = looksProblem(body);
+      assert.isNotNull(looks, body);
+      assert.strictEqual(lensProblem(body), hasMarker(body) ? looks : null, body);
+      assert.strictEqual(notLensReport(body) !== null, !hasMarker(body), body);
+    }
   });
   it("an override comment never reads as a lens report, with the repository's prefix only", () => {
     const body = named("scans", "an override comment that looks like a report is never one")

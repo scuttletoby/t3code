@@ -375,10 +375,10 @@ class Rounds(unittest.TestCase):
 SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds'}
 FIELDS = {'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
           'findings': {'name', 'group', 'body', 'findings', 'section'},
-          'scans': {'name', 'posts', 'history', 'entries'},
+          'scans': {'name', 'posts', 'history', 'entries', 'not_lens'},
           'rounds': {'name', 'config', 'history', 'reports', 'decided', 'changes', 'override_authors', 'findings',
                      'expect'}}
-SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',))
+SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',), log=lambda *_: None)
 
 
 def scan(posts):
@@ -386,8 +386,8 @@ def scan(posts):
                  'createdAt': f'2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z',
                  'includesCreatedEdit': p.get('edited', False), 'isMinimized': p.get('hidden', False)}
                 for i, p in enumerate(posts)]
-    found, history = SCAN.lens_scan({'comments': comments, 'reviews': []})
-    return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}
+    found, history, notes = SCAN.scan_posts({'comments': comments, 'reviews': []})
+    return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}, [list(n) for n in notes]
 
 
 def replay_round(v):
@@ -413,7 +413,7 @@ class SharedVectors(unittest.TestCase):
         self.assertGreaterEqual(len(VECTORS['scans']), 31)
         for v in VECTORS['scans']:
             with self.subTest(v['name']):
-                self.assertEqual(scan(v['posts']), (v['history'], v['entries']))
+                self.assertEqual(scan(v['posts']), (v['history'], v['entries'], v.get('not_lens', [])))
 
     def test_every_round(self):
         self.assertGreaterEqual(len(VECTORS['rounds']), 28)

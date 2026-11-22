@@ -1,5 +1,5 @@
 {
-  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a post that only looks like a report is a `comment without a first-line lens header` entry that reads nothing). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
+  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a lens report, one with the lens marker, that is not one valid read is a `comment without a first-line lens header` entry that reads nothing; `not_lens`, when there is one: [where, why] of each post that looks like a report but has no lens marker, so is no lens report, as lens.Review.not_lens_reports names them). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
   "config_path": ".github/pr-queue.json",
   "override_prefix": "override for head",
   "globs": [
@@ -1836,49 +1836,52 @@
       "entries": {}
     },
     {
-      "name": "headerless covered and checks fields read nothing",
+      "name": "headerless covered and checks fields are no lens report: no marker",
       "posts": [
         {
           "body": "Review done.\ncovered: the gate\nchecks: tests"
         }
       ],
       "history": [],
-      "entries": {
-        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with 'Review done.')": [
-          null,
-          null
+      "entries": {},
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:00Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with 'Review done.'"
         ]
-      }
+      ]
     },
     {
-      "name": "safe to merge in prose reads nothing, its start cut at 60 characters",
+      "name": "safe to merge in prose is no lens report, its start cut at 60 characters",
       "posts": [
         {
           "body": "🎉 Looked through every changed file again today and I think this one is safe to merge."
         }
       ],
       "history": [],
-      "entries": {
-        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with '🎉 Looked through every changed file again today and I think ')": [
-          null,
-          null
+      "entries": {},
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:00Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '🎉 Looked through every changed file again today and I think '"
         ]
-      }
+      ]
     },
     {
-      "name": "a heading naming a lens near the top reads nothing",
+      "name": "a heading naming a lens near the top is no lens report: no marker",
       "posts": [
         {
           "body": "## Code lens\nAll fine."
         }
       ],
       "history": [],
-      "entries": {
-        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with '## Code lens')": [
-          null,
-          null
+      "entries": {},
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:00Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Code lens'"
         ]
-      }
+      ]
     },
     {
       "name": "an override comment that looks like a report is never one",
@@ -1935,6 +1938,177 @@
       "history": [],
       "entries": {
         "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, its first line reads as a different lens header, or as one and as none, depending on how its HTML tags and links are read; starts with 'lens: [a [b](c) · reviewer: x · read at: aaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a lens heading with no lens marker is no lens report (issue 865)",
+      "posts": [
+        {
+          "body": "## Lens A\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [],
+      "entries": {},
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:00Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Lens A'"
+        ]
+      ]
+    },
+    {
+      "name": "a lens heading that names a read carries the marker and reads nothing",
+      "posts": [
+        {
+          "body": "## Lens A\nread at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with '## Lens A')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a read without a lens field carries the marker and reads nothing",
+      "posts": [
+        {
+          "body": "reviewer: lens-a · read at: 1234567\nmajor: none"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with 'reviewer: lens-a · read at: 1234567')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a near miss beside a report of the same lens and head leaves the read",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Code lens\nsafe to merge: yes\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      },
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:01Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Code lens'"
+        ]
+      ]
+    },
+    {
+      "name": "an edited or hidden near miss is still no lens report",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Code lens\nmajor: none",
+          "edited": true
+        },
+        {
+          "body": "covered: a\nchecks: b",
+          "hidden": true
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      },
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:01Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Code lens'"
+        ],
+        [
+          "by someone at 2026-01-01T00:00:02Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with 'covered: a'"
+        ]
+      ]
+    },
+    {
+      "name": "a report edited to drop its marker counts as deleted",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Code lens\nmajor: x is cut",
+          "edited": true
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      },
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:01Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Code lens'"
+        ]
+      ]
+    },
+    {
+      "name": "a report edited with its marker kept reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none",
+          "edited": true
+        }
+      ],
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+      ],
+      "entries": {
+        "code": [null, "edited after posting: post a new comment instead"]
+      }
+    },
+    {
+      "name": "two reports of one lens at one head: the newer is the entry, both are history",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: x is cut"
+        }
+      ],
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      ],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a not-a-lens note with an unquoted read still reads nothing: the read is the marker",
+      "posts": [
+        {
+          "body": "not a lens: round 2\nlens correctness, read at 1234567"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, says on its first line that it is no lens report, but holds a hex read-at sha outside a `>` quote, starts with 'not a lens: round 2')": [
           null,
           null
         ]

@@ -213,8 +213,10 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False, rules_name_l
     reviewed, read, why = review.reviewed_head(pr)
     missing = [name for key, name in required.items() if key not in reads]
     found = ', '.join(sorted(reads)) or 'none'
+    # comments that look like a lens report but carry no lens marker: no report, so they pass; named, never silent
+    notes = [(f'{lens.NOT_LENS} ({where})', True, why) for where, why in review.not_lens_reports(pr)]
     if not reads and not required:
-        return True, 'no lens comments and no required lens: nothing to compare', []
+        return True, 'no lens comments and no required lens: nothing to compare', notes
     ok, how = same_change(checkout, head, read) if reviewed and read else (False, None)
     rows = [(name, False, f'required: no lens comment of a counted author has this name (lenses found: {found})')
             for name in missing]
@@ -226,10 +228,14 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False, rules_name_l
         else:
             text = f'{"override " if override else "read "}{sha[:12]}: {how}'
         rows.append(((f'{key} (required)' if key in required else key), bool(sha and read and ok), text))
+    rows += notes
     if missing:
         where = ' or the review rules of the config' if rules_name_lenses else ''
+        near = (f'; {len(notes)} comment(s) look like a lens report but carry no lens marker, so they are not one '
+                f'(rows "{lens.NOT_LENS}")') if notes else ''
         return False, (f'required lens without a read: {", ".join(missing)}. No counted lens comment has that name: '
-                       f'check it in required-lenses (one name per line){where}; lenses found: {found}'), rows
+                       f'check it in required-lenses (one name per line){where}; lenses found: {found}'
+                       f'{near}'), rows
     if not read:
         return False, why, rows
     return ok, how, rows
