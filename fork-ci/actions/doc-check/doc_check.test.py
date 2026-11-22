@@ -251,6 +251,31 @@ class Links(Repo):
         self.assertIn('DOC  docs/a.md:9: broken link missing.md', out)
         self.assertIn('1 problem(s)', out)   # not the inline code, the query or the fenced one
 
+    def test_a_fence_opens_only_with_0_to_3_spaces_of_indent(self):
+        # CommonMark: indented 4 or more (a tab is 4), or with a backtick after a backtick fence, it is no fence, so
+        # the links after it are still checked; inside a list item the indent counts from the item's content.
+        for text in ['Shown:\n\n    ```\n\n[gone](nope.md)\n', '\t~~~\n[gone](nope.md)\n',
+                     '- item\n\n        ```\n[gone](nope.md)\n', '```x```\n[gone](nope.md)\n']:
+            with self.subTest(text=text):
+                self.write({'docs/a.md': text})
+                code, out = self.run_check('--files', 'docs/a.md')
+                self.assertEqual(code, 1, out)
+                self.assertIn('broken link nope.md: no such file', out)
+        text = '1. step\n\n   ```\n   [in](nope.md)\n   ```\n2. next\n\n   ~~~\n   [in](nope.md)\n[after](nope.md)\n'
+        self.write({'docs/a.md': text})   # a fence in a list item ends with the item
+        code, out = self.run_check('--files', 'docs/a.md')
+        self.assertIn('DOC  docs/a.md:10: broken link nope.md', out)
+        self.assertIn('1 problem(s)', out)
+
+    def test_a_link_that_is_no_path_is_a_broken_link_not_a_traceback(self):
+        self.commit({'docs/a.md': '[nul](x%00.md)\n', 'docs/b.md': 'b\n'})
+        base = self.branch({'docs/b.md': None})   # the removed-link scan reads the untouched a.md
+        code, out = self.run_check('--base', base)
+        self.assertEqual(code, 0, out)            # an old broken link is not this change
+        code, out = self.run_check('--files', 'docs/a.md')
+        self.assertEqual(code, 1, out)
+        self.assertIn('DOC  docs/a.md:1: broken link x%00.md: not a path (ValueError)', out)
+
 
 class Removed(Repo):
     """#908: a change that deletes or renames a doc another file links to fails, though it did not touch that file."""
@@ -270,6 +295,40 @@ class Removed(Repo):
 
     def test_an_old_broken_link_in_an_untouched_file_is_not_this_change(self):
         self.commit({'docs/old.md': '[gone](never.md)\n', 'docs/b.md': 'b\n'})
+        base = self.branch({'docs/b.md': None})
+        code, out = self.run_check('--base', base)
+        self.assertEqual(code, 0, out)
+
+    def untouched_symlink_loses_its_target(self, how):
+        """Base: docs/AGENTS.md and CLAUDE.md -> docs/AGENTS.md; the change touches only the target."""
+        self.commit({'docs/AGENTS.md': 'rules\n'})
+        os.symlink('docs/AGENTS.md', 'CLAUDE.md')
+        self.commit({})
+        self.git('checkout', '-q', '-b', 'change')
+        how()
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'change')
+        code, out = self.run_check('--base', 'main')
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r'DOC  CLAUDE.md: a symlink that points [a-z ]+: make it a file: '
+                              r'this change removed docs/AGENTS.md')
+
+    def test_the_target_of_an_untouched_symlink_deleted(self):
+        self.untouched_symlink_loses_its_target(lambda: os.remove('docs/AGENTS.md'))
+
+    def test_the_target_of_an_untouched_symlink_renamed(self):
+        self.untouched_symlink_loses_its_target(lambda: os.rename('docs/AGENTS.md', 'docs/RULES.md'))
+
+    def test_the_folder_of_an_untouched_symlinks_target_turned_into_a_symlink_out(self):
+        away = os.path.join(self.tmp.name, 'away')
+        def how():
+            os.rename('docs', away)
+            os.symlink(away, 'docs')
+        self.untouched_symlink_loses_its_target(how)
+
+    def test_a_symlink_already_dangling_on_the_base_is_not_this_change(self):
+        os.symlink('missing.md', 'CLAUDE.md')
+        self.commit({'docs/b.md': 'b\n'})
         base = self.branch({'docs/b.md': None})
         code, out = self.run_check('--base', base)
         self.assertEqual(code, 0, out)
@@ -299,6 +358,51 @@ class FailClosed(Repo):
         self.assertEqual(code, 1, out)
         self.assertIn('DOC  AGENTS.md: a symlink that points outside the repository', out)
         self.assertIn('DOC  CLAUDE.md: a symlink that points to no file', out)
+
+    def test_a_symlink_into_git_fails(self):
+        self.git('checkout', '-q', '-b', 'change')
+        os.symlink('.git/config', 'AGENTS.md')
+        self.commit({})
+        code, out = self.run_check('--base', 'main')
+        self.assertEqual(code, 1, out)
+        self.assertIn('DOC  AGENTS.md: a symlink that points into .git', out)
+        self.assertNotIn('core', out)
+
+    def test_a_symlink_warning_says_when_this_change_moved_it_past(self):
+        self.commit({'docs/a.md': lines(30), 'docs/b.md': lines(38), 'CLAUDE.md': 'x\n'})
+        self.git('checkout', '-q', '-b', 'change')
+        os.remove('CLAUDE.md')
+        os.symlink('docs/b.md', 'CLAUDE.md')
+        self.commit({})
+        code, out = self.run_check('--base', 'main')
+        self.assertEqual(code, 0, out)
+        self.assertIn('WARN CLAUDE.md: 38 lines', out)
+        self.assertIn('this change moved it past 90%', out)
+        self.git('checkout', '-q', 'main')
+        self.git('merge', '-q', '--ff-only', 'change')
+        self.git('checkout', '-q', '-b', 'change2')
+        os.remove('CLAUDE.md')
+        os.symlink('docs/a.md', 'CLAUDE.md')
+        self.commit({'docs/a.md': lines(38)})   # already past 90% on the base (through its old target)
+        code, out = self.run_check('--base', 'main')
+        self.assertEqual(code, 0, out)
+        self.assertIn('WARN CLAUDE.md: 38 lines', out)
+        self.assertNotIn('moved it past', out)
+
+    def test_all_reports_a_symlink_to_an_over_budget_file_once(self):
+        target = lines(300) + 'Updated: 2026-01-01\n[gone](nope.md)\n'
+        self.commit({'skills/one/SKILL.md': target, 'AGENTS.md': lines(60)})
+        os.makedirs('vendor/one')
+        os.symlink('../../skills/one/SKILL.md', 'vendor/one/SKILL.md')
+        os.symlink('AGENTS.md', 'CLAUDE.md')
+        self.commit({})
+        code, out = self.run_check('--all')
+        self.assertEqual(code, 1, out)
+        self.assertEqual(out.count('302 lines'), 1, out)
+        self.assertEqual(out.count('dated "Updated" banner'), 1, out)
+        self.assertEqual(out.count('broken link nope.md'), 1, out)
+        self.assertNotIn('vendor/one', out)
+        self.assertIn('DOC  CLAUDE.md: 60 lines / 660 B, budget 40 lines', out)   # its own, smaller budget
 
     def test_a_byte_that_is_not_utf8_fails_and_the_size_is_still_checked(self):
         base = self.branch({'a.md': 'ok\n'})

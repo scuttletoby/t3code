@@ -7,11 +7,12 @@ action fails a pull request that:
 - puts an instruction file over its **size budget** (lines or bytes; above `warn_at` of a budget it only warns, and
   says when this change moved the file past it);
 - writes **history** into an instruction file (a changelog block, an "is live on" claim, a dated "Updated" banner);
-- has a **broken relative link** in a Markdown file it adds or changes (code fences and inline code skipped; `/x` is
-  from the repository root, as GitHub reads it; a link that leaves the repository is broken), or deletes or renames a
+- has a **broken relative link** in a Markdown file it adds or changes (code fences, opened as CommonMark does, and inline code
+  skipped; `/x` is from the repository root, as GitHub reads it; a link that leaves the repository is broken), or deletes or renames a
   file that another Markdown file still links to;
-- has a checked file that is **not UTF-8** or cannot be read, or is a **symlink** out of the repository or to no
-  file (a symlink is checked as the file it points to; sizes are the bytes on disk, CRLF included);
+- has a checked file that is **not UTF-8** or cannot be read, or is a **symlink** out of the repository, into
+  `.git` or to no file (a symlink is checked as the file it points to and reported once when its target is checked
+  too; sizes are the bytes on disk, CRLF included), or deletes, renames or moves away the file a symlink points to;
 - **adds** a file whose name looks like a dated report, handoff or review (those go in the pull request or an issue).
 
 The general rules this enforces, and the rest of the agent rules, are in

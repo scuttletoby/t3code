@@ -273,7 +273,7 @@ test("the list ignores comments and blank lines and reads `run by` and weights",
     () => readList("a.test.py unittest ~12s\n"),
     /"; a Python test's line then ends in its format: "unittest" or "ok lines"\)$/,
   );
-  // One line per test: a second line for a file is refused, whatever it says (#789).
+  // One line per test: a second line for a file is refused, whatever it says.
   for (const twice of [
     "a.test.sh\nb.test.sh\na.test.sh\n",
     "a.test.py unittest\na.test.py ok lines\n",
@@ -287,7 +287,7 @@ test("the list ignores comments and blank lines and reads `run by` and weights",
 });
 
 // A Python test the runner never runs (upstream's, which a plain step runs) leaves no record, so the runner never reads
-// its format word: its word is checked here against its source instead (#789).
+// its format word: its word is checked here against its source instead.
 test("a listed Python test the runner does not judge says the format its source has", () => {
   const root = path.resolve(__dirname, "../..");
   const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
