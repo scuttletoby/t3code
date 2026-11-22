@@ -61,6 +61,8 @@ interface World {
   host: "ok" | "hang" | "throw";
   /** No agent scopes of their own (Linux without systemd, macOS, Windows). */
   noScopes?: boolean;
+  /** The next this many scope lookups crash (a defect, not a failure). */
+  scopeDies?: number;
 }
 
 /** 16 GB, 12 GB available, swap unused, no pressure: everything fits once the level is calm. */
@@ -117,10 +119,15 @@ const scopesOf = (world: World): AgentScopeShape => ({
     ? {}
     : {
         ownScope: (threadId: string) =>
-          Effect.sync(() => {
-            const unit = world.threads.find((thread) => thread.id === threadId)?.unit;
-            return unit === undefined ? undefined : { unit, slice: SLICE };
-          }),
+          (world.scopeDies ?? 0) > 0
+            ? Effect.suspend(() => {
+                world.scopeDies = (world.scopeDies ?? 0) - 1;
+                return Effect.die(new Error("a crash in a reading"));
+              })
+            : Effect.sync(() => {
+                const unit = world.threads.find((thread) => thread.id === threadId)?.unit;
+                return unit === undefined ? undefined : { unit, slice: SLICE };
+              }),
       }),
 });
 
@@ -1487,6 +1494,29 @@ describe("SlotGate enforce mode (the default)", () => {
     }),
   );
 
+  it.effect("a reading of the timer that crashes does not end the timer", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000);
+      world.threads = TWO_RUNNING;
+      // The timer's first reading (at the start) crashes; the next ones still come every 30 s,
+      // so the calm wait starts at 30 s and the level lifts at 90 s without any ask.
+      world.scopeDies = 1;
+      const first = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          yield* TestClock.adjust(Duration.seconds(91));
+          const reads = world.hostReads;
+          const answer = yield* ask(LIGHT_KIND);
+          return { answer, reads };
+        }),
+      );
+      assert.strictEqual(world.scopeDies, 0, "the crash happened");
+      assert.isAbove(first.reads, 0, "the timer read the machine after the crash");
+      assert.strictEqual(first.answer.type, "allow");
+    }),
+  );
+
   it.effect(
     "readings that fail: the floor starts with none running, then the fixed 10 by count",
     () =>
@@ -1697,15 +1727,19 @@ describe("SlotGate enforce mode (the default)", () => {
             // A kill elsewhere (a build box at its own cap): the fallback, no raise.
             world.files.set("/proc/vmstat", "oom_kill 2\n");
             const otherKill = yield* cost;
-            // Ten calm minutes (the timer's readings): the fallback lifts, one raise comes off.
+            // Ten calm minutes (the timer's readings): the fallback lifts and keeps the raise, so
+            // a kill again soon after is not met at the lower cost.
+            yield* TestClock.adjust(Duration.minutes(11));
+            const lifted = yield* cost;
+            // Ten calm minutes more: one raise comes off.
             yield* TestClock.adjust(Duration.minutes(11));
             const calm = yield* cost;
-            return { before, agentKill, otherKill, calm, shown: yield* status };
+            return { before, agentKill, otherKill, lifted, calm, shown: yield* status };
           }),
         );
         assert.deepStrictEqual(
-          [costs.before, costs.agentKill, costs.otherKill, costs.calm],
-          [768, 960, 960, 768],
+          [costs.before, costs.agentKill, costs.otherKill, costs.lifted, costs.calm],
+          [768, 960, 960, 960, 768],
         );
         assert.deepInclude(costs.shown, { fallback: false });
       }),

@@ -751,6 +751,7 @@ const make = Effect.gen(function* () {
           state,
           previous: step.previous,
           settledBefore: step.settledBefore,
+          strictBefore: step.strictBefore,
           nowMs,
         });
         const counted = running.length + starting.length;
@@ -1492,7 +1493,8 @@ const make = Effect.gen(function* () {
   /**
    * `enforce`: a reading every `ENFORCE_SAMPLE_INTERVAL`, asks or not, so a calm machine lifts the
    * start's "elevated" and the fallback, and a kill or filling swap is seen between asks. Under the
-   * semaphore, as the decisions' readings are; a failed one only waits for the next.
+   * semaphore, as the decisions' readings are; a failed or crashed one is logged and only waits for
+   * the next.
    */
   const sample = Effect.gen(function* () {
     const settings = yield* readSettings;
@@ -1500,7 +1502,13 @@ const make = Effect.gen(function* () {
     const running = yield* readRunning;
     const nowMs = yield* Clock.currentTimeMillis;
     yield* readAndStep(running?.running.map((agent) => agent.threadId) ?? [], nowMs);
-  }).pipe(semaphore.withPermits(1), Effect.ignore);
+  }).pipe(
+    semaphore.withPermits(1),
+    // A failure or a crash (a defect) of one reading only waits for the next: the timer never ends.
+    Effect.catchCause((cause) =>
+      Effect.logWarning("agent slots: the 30 s capacity reading failed", { cause }),
+    ),
+  );
   yield* sample.pipe(Effect.repeat(Schedule.spaced(ENFORCE_SAMPLE_INTERVAL)), Effect.forkScoped);
 
   return SlotGate.of({
