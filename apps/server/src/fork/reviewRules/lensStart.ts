@@ -11,6 +11,7 @@ import { type EffectiveReviewRules, type ReviewRunner, reviewLensRunner } from "
 
 import {
   NO_HEADER,
+  REPOST,
   lensEntries,
   lensKey,
   namesALens,
@@ -397,7 +398,7 @@ function readPull(
     return { refused: `no plan: ${error.reason}; no lens is started rather than too few` };
   }
   const reads = gateReads(pull.posts, overridePrefix);
-  const { history } = lensEntries(pull.posts, overridePrefix, isOverride);
+  const { history, notLens } = lensEntries(pull.posts, overridePrefix, isOverride);
   const rounds = startRounds(block, history, head, pull.changeOf);
   // The lenses this base can start, by key: the config's, then the input's names (built-in prompt).
   const approachKey = lensKey(block.rounds.approach_lens);
@@ -413,7 +414,13 @@ function readPull(
       });
     }
   }
-  const notes: string[] = [];
+  // A look-alike with no lens marker and no open finding: the gate ignores it, so the lens that posted it has not
+  // reported. Said, so an agent does not take its post for a read.
+  const notes: string[] = notLens.map(
+    ([where, why]) =>
+      `#${pull.number}: the comment ${where} looks like a lens report, but the gate ignores it and counts no read ` +
+      `from it (${why}); if it was meant as a report: ${REPOST}`,
+  );
   const inputOnly: string[] = [];
   for (const [key, name] of named) {
     if (known.has(key)) continue;

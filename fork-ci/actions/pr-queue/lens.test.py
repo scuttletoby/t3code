@@ -14,6 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import config  # noqa: E402
 import lens  # noqa: E402
+import review_judge  # noqa: E402
 
 CORPUS = os.path.join(HERE, 'testdata', 'lens-corpus.jsonl')
 SOURCE = lens.Review(('coderabbitai', 'github-actions', 'copilot'), 'proj ready --head', 'OWNER', ('OWNER',))
@@ -67,7 +68,7 @@ class Corpus(unittest.TestCase):
                'override_sha': SOURCE.override_sha, 'lens_header': lens.lens_header, 'no_lens_text': lens.no_lens_text,
                'latest_checks': lens.latest_checks, 'check_state': lens.check_state, 'lens_key': lens.lens_key}
         self.assertEqual({c['fn'] for c in cases}, set(fns) | {'full_sha'})
-        wrong, changed, opt_out = [], 0, 0
+        wrong, changed, opt_out, no_marker, held = [], 0, 0, [], []
         for c in (c for c in cases if c['fn'] in fns):
             got = json.loads(json.dumps(fns[c['fn']](*c['args'])))
             if got == c['out']:
@@ -78,21 +79,40 @@ class Corpus(unittest.TestCase):
             if cause and got[:2] == [True, None] and any(w in got[2] for w in CHANGED):
                 changed += 1
                 continue
+            if c['fn'] == 'reviewed_head' and got == [False, None, 'no lens comments'] \
+                    and all(not lens.has_marker(p.get('body') or '') or SOURCE.override_sha(p) for p in posts):
+                no_marker.append(c['args'])   # issue #865: its only look-alike is no lens report, as if never posted
+                continue
             if c['fn'] == 'lens_problem' and c['out'] is None and (got or '').startswith(lens.OPT_OUT_READ):
                 opt_out += 1   # issue #77: a hex `read at` below `not a lens:` blocks now
+                continue
+            body = c['args'][0].get('body') or '' if c['fn'] == 'lens_problem' else ''
+            if c['fn'] == 'lens_problem' and got is None and not lens.has_marker(body) \
+                    and SOURCE.looks_problem(*c['args']) == c['out']:
+                no_marker.append(body)   # issue #865: no lens marker, no lens report (named, never blocking)
+                continue
+            if c['fn'] == 'lens_problem' and SOURCE.report_problem(*c['args'])[1] == lens.HELD \
+                    and got.endswith(f'; it looks like one: {c["out"]}'):
+                held.append(body)   # issue #865: no lens marker but an open finding: it blocks as before, with the fix
                 continue
             wrong.append(f'{c["fn"]}{json.dumps(c["args"])[:160]}: got {got!r}, source {c["out"]!r}')
         self.assertEqual(wrong, [], f'{len(wrong)} of {len(cases)} differ; first: {wrong[:3]}')
         self.assertEqual(changed, 54, 'answers changed on purpose (a short read or an edited lens comment)')
         self.assertEqual(opt_out, 2, 'answers changed on purpose (a hex read at below not a lens:, issue #77)')
+        self.assertEqual(len(no_marker), 6 + 3, 'answers changed on purpose (no lens marker, issue #865)')
+        self.assertEqual(len(held), 1, 'old state: a report with an open finding and no marker blocks as before')
+        self.assertIn('finding: major', held[0])
+        # a lens heading, `safe to merge`, report fields: never a `lens:` line or a read
+        for body in (b for b in no_marker if isinstance(b, str)):
+            self.assertNotRegex(body, r'(?im)^\W*lens\s*:|read[\s-]*at\b\W*[0-9a-f]{7}')
 
 
 class Gaps(unittest.TestCase):
     """Rules the corpus does not pin (a mutation of each passed it)."""
     def test_a_lens_heading_counts_only_in_the_first_five_plain_lines(self):
         top = ['Summary', 'one', 'two', 'three']
-        self.assertIsNotNone(SOURCE.lens_problem(post('\n'.join(top + ['## Lens correctness', 'text']))))
-        self.assertIsNone(SOURCE.lens_problem(post('\n'.join(top + ['four', '## Lens correctness', 'text']))))
+        self.assertIsNotNone(SOURCE.looks_problem(post('\n'.join(top + ['## Lens correctness', 'text']))))
+        self.assertIsNone(SOURCE.looks_problem(post('\n'.join(top + ['four', '## Lens correctness', 'text']))))
 
     def test_a_hex_word_without_a_digit_is_no_sha(self):
         self.assertIsNone(SOURCE.lens_problem(post('Notes\n```\nlens: effaced\n```')))
@@ -118,16 +138,17 @@ class Gaps(unittest.TestCase):
         self.assertEqual(lens.plain_lines('a\n````\n```\nb\n````\nc'), ['a', 'c'])
         self.assertEqual(lens.plain_lines('a\n```\nb'), ['a'])   # unclosed: to the end
         # the rendered `safe to merge` line below the inner fence is plain text, and blocks
-        self.assertIsNotNone(SOURCE.lens_problem(post('Notes\n```\nx\n```py\ny\n```\nsafe to merge: no\n```')))
+        self.assertIsNotNone(SOURCE.looks_problem(post('Notes\n```\nx\n```py\ny\n```\nsafe to merge: no\n```')))
 
 
 class NotALens(unittest.TestCase):
     """Issue #77: below a `not a lens:` first line, a lens read written another way (no colon after `lens`, another
-    field spelling) blocks too; only a `>` quote keeps such a line from counting."""
+    field spelling) looks like a report too; only a `>` quote keeps such a line from counting. What a comment looks
+    like is looks_problem; it blocks only with the lens marker (issue #865, class Marker)."""
     HEX = '7838aaec7c3cb4b6deaafa3d8cd701dd6f737f9a'
 
     def problem(self, body):
-        return SOURCE.lens_problem(post(body))
+        return SOURCE.looks_problem(post(body))
 
     def test_a_lens_line_without_the_colon_below_the_opt_out_blocks(self):
         for read in (self.HEX, self.HEX[:10], 'abc1234'):
@@ -238,6 +259,219 @@ class NotALens(unittest.TestCase):
     def test_the_way_out_names_the_quote_and_never_reads_as_a_report(self):
         self.assertIn('`>`', lens.NO_HEADER_WAY_OUT)
         self.assertEqual(lens.no_lens_text(lens.NO_HEADER_WAY_OUT, keep_markdown=True), lens.NO_HEADER_WAY_OUT)
+
+
+class Marker(unittest.TestCase):
+    """Issue #865: a comment is a lens report only when it carries the lens marker (lens.has_marker: a line starting
+    `lens:`, a lens field naming a sha, or `read at <hex>`). One that only looks like a report without it is no lens
+    report: it neither reads nor blocks, and not_lens_reports names it (the head check's summary), unless it holds an
+    open finding (a blocker or major that is not none, or NOT SAFE): then it blocks, as a NO_HEADER entry whose reason
+    names the missing marker and the fix (report_problem kind HELD). A lens report that is not one valid read still
+    blocks."""
+    READ = f'lens: correctness · reviewer: x · read at: {SHA_B}\nstate: fine\nblocker: none\nmajor: none'
+    NEAR = ('## Lens A\nblocker: none\nmajor: none', '## Lens correctness\nsafe to merge: yes', 'lgtm, safe to merge',
+            'covered: a.py\nchecks: ran the tests', 'The merge-path lens: nothing found',
+            '## Lens A, round 2\nblocker: none\nmajor: none\nminor: a typo',
+            '## Lens A, round 2\n\ncovered: x\nchecks: y\n\nThe old code was not safe to run twice.',   # no "to merge"
+            '## Lens A, round 2\n\ncovered: x\n\n```\nNot safe to merge: an example\n```')                # in a fence
+    HELD = ('## Lens correctness, round 2\nblocker: a re-run loses data\nmajor: none',
+            '**Lens correctness** (round 2)\nverdict: not safe to merge',
+            'NOT SAFE to merge (code lens, round 2)\nmore below',
+            'Code lens, round 2\nsafe to merge: no\nmajor: the retry drops a row', '## Lens A\nmajor: x is cut',
+            'covered: a.py\nchecks: ran them\nfinding: blocker a.py:3 loses data',
+            # round 2: NOT SAFE on the line under the heading (the title line), or in a sentence further down
+            '## Lens correctness, round 2\n\n**NOT SAFE to merge**\n\ncovered: x\nchecks: y',
+            '## Merge-path review\n\nNOT SAFE TO MERGE\n\ncovered: x\nchecks: y',
+            '## Lens merge-path, round 2\n\nNot safe to merge: the gate passes an unread head.',
+            '## Lens correctness, round 2\n\ncovered: x\nchecks: y\n\nNot safe to merge: the gate passes an unread head.')
+    BROKEN = (f'Here is my review.\n{READ}',                                   # the header not on the first line
+              f'{READ}\nlens: state · reviewer: x · read at: {SHA_B}',         # two lenses in one comment
+              'lens: <name> · reviewer: x · read at: <sha>\nmajor: none',     # a placeholder name: names no lens
+              f'## Lens A\nread at: {SHA_B}\nmajor: none',                     # a lens heading that names a read
+              f'reviewer: lens-a · read at: {SHA_B[:7]}',                       # a read, short sha, no lens field
+              f'Report — lens: code at {NotALens.HEX[:10]}',                    # a lens field naming a sha mid-line
+              f'```\n{READ}\n```')                                             # in a code block
+
+    def setUp(self):
+        self.lines = []
+        self.r = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',), log=self.lines.append)
+
+    def test_a_near_miss_is_no_lens_report_and_is_named(self):
+        for body in self.NEAR:
+            with self.subTest(body=body):
+                self.assertFalse(lens.has_marker(body))
+                self.assertIsNotNone(self.r.looks_problem(post(body)), 'it looks like a report')
+                self.assertIsNone(self.r.lens_problem(post(body)), 'but blocks nothing')
+                self.assertIn(lens.NO_MARKER, self.r.not_lens_report(post(body)))
+                self.assertEqual(self.r.reviewed_head(pr(post(body))), (False, None, 'no lens comments'))
+                p = pr(post(self.READ), post(body, url='https://github.test/c2', when='2026-01-02T00:00:00Z'))
+                self.assertEqual(self.r.reviewed_head(p), (True, SHA_B, 'every lens read it'))
+                self.assertEqual([w for w, _ in self.r.not_lens_reports(p)], ['https://github.test/c2'])
+                self.assertEqual(self.r.lens_scan(p)[1], [('correctness', SHA_B)], 'no round either')
+
+    def test_a_lens_report_with_a_broken_body_still_blocks(self):   # fail closed: never a pass
+        for body in self.BROKEN:
+            with self.subTest(body=body):
+                self.assertTrue(lens.has_marker(body))
+                self.assertIsNotNone(self.r.lens_problem(post(body)))
+                self.assertIsNone(self.r.not_lens_report(post(body)))
+                p = pr(post(self.READ), post(body, when='2026-01-02T00:00:00Z'))
+                self.assertEqual(self.r.reviewed_head(p)[:2], (True, None))
+                self.assertEqual(self.r.not_lens_reports(p), [])
+
+    def test_a_valid_report_and_a_plain_comment_read_as_before(self):   # old comments on open PRs: same answers
+        self.assertIsNone(self.r.lens_problem(post(self.READ)))
+        self.assertIsNone(self.r.not_lens_report(post(self.READ)))
+        self.assertIsNone(self.r.not_lens_report(post('Thanks, merging after CI.')))
+        self.assertEqual(self.r.reviewed_head(pr(post(self.READ))), (True, SHA_B, 'every lens read it'))
+        opt_out = f'not a lens: round 2\n> read at {SHA_B}'
+        self.assertEqual((self.r.lens_problem(post(opt_out)), self.r.not_lens_report(post(opt_out))), (None, None))
+
+    def test_every_problem_with_the_marker_is_the_old_answer(self):   # the marker only ever drops a block
+        for body in self.NEAR + self.HELD + self.BROKEN + (self.READ, 'Thanks', f'not a lens: x\nread at: {SHA_B}'):
+            with self.subTest(body=body):
+                looks, now = self.r.looks_problem(post(body)), self.r.lens_problem(post(body))
+                if lens.has_marker(body):
+                    self.assertEqual(now, looks)
+                elif looks and review_judge.findings(body, unmarked=True):   # an open finding without the marker blocks
+                    self.assertTrue(now.startswith(lens.NO_MARKER) and now.endswith(f'; it looks like one: {looks}'))
+                else:
+                    self.assertIsNone(now)
+                self.assertEqual(self.r.not_lens_report(post(body)) is not None, looks is not None and now is None)
+
+    def test_an_unmarked_report_with_an_open_finding_blocks_and_names_the_fix(self):   # issue #865 round 1
+        for body in self.HELD:
+            with self.subTest(body=body):
+                self.assertFalse(lens.has_marker(body))
+                why = self.r.lens_problem(post(body))
+                self.assertTrue(why.startswith(lens.NO_MARKER), why)
+                self.assertIn(lens.REPOST, why)
+                self.assertEqual(self.r.report_problem(post(body))[1], lens.HELD)
+                self.assertIsNone(self.r.not_lens_report(post(body)))
+                alone = pr(post(body, url='https://github.test/c2'))
+                self.assertEqual(self.r.reviewed_head(alone)[:2], (True, None), 'no required lens: still held')
+                self.assertEqual([w for w, _ in self.r.unmarked_held(alone)], ['https://github.test/c2'])
+                for older, newer in ((post(self.READ), post(body, when='2026-01-02T00:00:00Z')),
+                                     (post(body), post(self.READ, when='2026-01-02T00:00:00Z'))):
+                    p = pr(older, newer)   # newest wins never lets an older clean read through, and a newer one
+                    reviewed, sha, why = self.r.reviewed_head(p)   # does not clear it (keyed by the comment)
+                    self.assertEqual((reviewed, sha), (True, None))
+                    self.assertIn(lens.NO_MARKER, why)
+                    self.assertEqual(self.r.reviewed_head(p), (reviewed, sha, why), 'run again: the same answer')
+                    self.assertEqual(self.r.not_lens_reports(p), [])
+                    self.assertEqual(self.r.lens_scan(p)[1], [('correctness', SHA_B)], 'no round of its own')
+                self.assertEqual(self.lines, [], 'a blocking entry is in the verdict, not only in the log')
+
+    def test_not_safe_under_the_heading_or_in_a_sentence_holds(self):   # issue #865 round 2: main blocked these
+        for body in self.HELD[-4:]:
+            with self.subTest(body=body):
+                self.assertEqual(review_judge.findings(body), [], 'read as a marked report, no finding: the old hole')
+                self.assertEqual(review_judge.findings(body, unmarked=True)[0][0], 'blocker')
+                self.assertEqual(self.r.report_problem(post(body))[1], lens.HELD)
+                p = pr(post(self.READ), post(body, url='https://github.test/c2', when='2026-01-02T00:00:00Z'))
+                self.assertEqual(self.r.reviewed_head(p)[:2], (True, None), 'an older clean read never wins')
+                self.assertEqual(self.r.reviewed_head(p), self.r.reviewed_head(p), 'run again: the same answer')
+        self.assertEqual(review_judge.findings(self.NEAR[-2], unmarked=True), [], 'not safe to run twice: no verdict')
+        self.assertEqual(review_judge.findings(self.NEAR[-1], unmarked=True), [], 'in a code block: an example')
+
+    def test_a_held_comment_edited_to_hold_no_open_finding_stops_holding(self):   # the same as deleting it
+        for body in (self.HELD[0], self.HELD[-1]):
+            with self.subTest(body=body):
+                edited = (body.replace('a re-run loses data', 'none') if 'blocker:' in body
+                          else body.replace('Not safe to merge', 'Safe to merge'))
+                p = pr(post(self.READ), post(edited, url='https://github.test/c2', when='2026-01-02T00:00:00Z',
+                                             includesCreatedEdit=True))
+                self.assertEqual(self.r.reviewed_head(p), (True, SHA_B, 'every lens read it'))
+                self.assertEqual([w for w, _ in self.r.not_lens_reports(p)], ['https://github.test/c2'])
+
+    def test_the_queue_posts_a_held_reason_readable_and_lens_free(self):   # round 2: it read "lens-  · reviewer:"
+        for text in (lens.REPOST_PLAIN, lens.HELD_WAY_OUT):
+            self.assertEqual(lens.no_lens_text(text, keep_markdown=True), text)
+        for body in (self.HELD[0], self.HELD[-1]):
+            with self.subTest(body=body):
+                why = self.r.lens_problem(post(body))
+                self.assertIn(lens.REPOST, why)
+                out = lens.no_lens_text(' '.join(why.split()))
+                self.assertIn(lens.REPOST_PLAIN, out)
+                self.assertNotIn('lens-  ·', out)
+                self.assertIn(lens.HELD_WAY_OUT.replace('`', ''), out, 'the way out stays readable')
+                self.assertNotIn('not a lens-', out)
+                self.assertTrue(lens._lens_free(out), out)
+                self.assertIsNone(self.r.looks_problem(post(out)), 'the queue comment never looks like a report')
+
+    def test_an_unmarked_report_with_an_open_finding_posted_twice_holds_twice(self):
+        p = pr(post(self.READ), post(self.HELD[0], url='https://github.test/c2', when='2026-01-02T00:00:00Z'),
+               post(self.HELD[0], url='https://github.test/c3', when='2026-01-03T00:00:00Z'))
+        self.assertEqual([w for w, _ in self.r.unmarked_held(p)], ['https://github.test/c2', 'https://github.test/c3'])
+        self.assertEqual(sum(k.startswith(lens.NO_HEADER) for k in self.r.lens_scan(p)[0]), 2)
+
+    def test_the_ways_out_of_an_unmarked_report_with_an_open_finding(self):
+        held = self.HELD[0]
+        gone = pr(post(self.READ))   # deleted: GitHub no longer lists it
+        self.assertEqual(self.r.reviewed_head(gone), (True, SHA_B, 'every lens read it'))
+        opted = post(f'not a lens: round 2 notes\n{held}', when='2026-01-02T00:00:00Z', includesCreatedEdit=True)
+        self.assertEqual(self.r.reviewed_head(pr(post(self.READ), opted)), (True, SHA_B, 'every lens read it'))
+        marked = post(f'lens: correctness · reviewer: x · read at: {SHA_B}\n{held}', when='2026-01-02T00:00:00Z',
+                      includesCreatedEdit=True)   # the marker edited in: an edited report reads nothing, post anew
+        reviewed, sha, why = self.r.reviewed_head(pr(post(self.READ), marked))
+        self.assertEqual((reviewed, sha), (True, None))
+        self.assertIn(lens.EDITED, why)
+        for flags in ({'includesCreatedEdit': True}, {'isMinimized': True}):   # edited or hidden: still holds
+            with self.subTest(flags=flags):
+                p = pr(post(self.READ), post(held, when='2026-01-02T00:00:00Z', **flags))
+                self.assertEqual(self.r.reviewed_head(p)[:2], (True, None))
+
+    def test_the_marker_is_read_both_ways_and_in_any_markdown(self):
+        for body in ('**Lens:** a', '## lens: a', '- lens: a', '> lens: a', '    lens: a', f'| read at | {SHA_B} |',
+                     f'read at: `{SHA_B[:7]}`', f'lens<a title="<">: x · read at<a title="<">: {SHA_B}',
+                     'Lens — a', 'lens= a'):
+            with self.subTest(body=body):
+                self.assertTrue(lens.has_marker(body))
+        for body in ('lensing: a', 'the lens: a', 'read at: the old head', 'lenses: a', 'not a lens: a', 'LENS = x'):
+            with self.subTest(body=body):
+                self.assertFalse(lens.has_marker(body))
+
+    def test_edited_and_hidden_near_misses_stay_no_report(self):
+        for flags in ({'includesCreatedEdit': True}, {'isMinimized': True}, {'includesCreatedEdit': ...}):
+            with self.subTest(flags=flags):
+                p = pr(post(self.READ), post(self.NEAR[0], when='2026-01-02T00:00:00Z', **flags))
+                self.assertEqual(self.r.reviewed_head(p), (True, SHA_B, 'every lens read it'))
+                self.assertEqual(len(self.r.not_lens_reports(p)), 1)
+
+    def test_a_report_edited_to_drop_its_marker_is_as_if_deleted(self):   # GitHub keeps no old text: only now counts
+        dropped = post(self.NEAR[0].replace('Lens A', 'Lens correctness'), when='2026-01-02T00:00:00Z',
+                       includesCreatedEdit=True)
+        self.assertEqual(self.r.reviewed_head(pr(post(self.READ), dropped)), (True, SHA_B, 'every lens read it'))
+        dropped = post(self.HELD[0], when='2026-01-02T00:00:00Z', includesCreatedEdit=True)   # but an open finding
+        self.assertEqual(self.r.reviewed_head(pr(post(self.READ), dropped))[:2], (True, None))
+        kept = post(self.READ.replace(SHA_B, SHA_A), when='2026-01-02T00:00:00Z', includesCreatedEdit=True)
+        reviewed, sha, why = self.r.reviewed_head(pr(post(self.READ), kept))
+        self.assertEqual((reviewed, sha), (True, None), 'an edited report with its marker still reads nothing')
+        self.assertIn(lens.EDITED, why)
+
+    def test_two_comments_for_one_lens_and_head(self):
+        later = post(self.READ.replace('major: none', 'major: x is cut'), when='2026-01-02T00:00:00Z')
+        found, history = self.r.lens_scan(pr(post(self.READ), later))
+        self.assertEqual(list(found), ['correctness'])
+        self.assertIs(found['correctness'][3], later, 'the newer report is the one judged')
+        self.assertEqual(history, [('correctness', SHA_B)] * 2)
+        near = post(f'## Lens correctness\nmajor: none\nsafe to merge: yes', when='2026-01-02T00:00:00Z')
+        found, history = self.r.lens_scan(pr(post(self.READ), near))
+        self.assertIs(found['correctness'][3]['body'], self.READ, 'a near miss never replaces the report')
+        self.assertEqual(history, [('correctness', SHA_B)])
+
+    def test_a_near_miss_is_logged_once_and_quotes_only_its_start(self):
+        p = pr(post(self.NEAR[0], url='https://github.test/c1'))
+        self.r.reviewed_head(p)
+        self.r.reviewed_head(p)
+        self.assertEqual(len(self.lines), 1, self.lines)
+        self.assertTrue(self.lines[0].startswith(f'{lens.NOT_LENS} (https://github.test/c1): {lens.NO_MARKER}'))
+
+    def test_a_strangers_near_miss_is_still_only_logged_as_ignored(self):
+        p = pr(stranger(self.NEAR[0], url='https://github.test/s1'))
+        self.assertEqual(self.r.not_lens_reports(p), [])
+        self.assertEqual(len(self.lines), 1)
+        self.assertIn('ignored a lens-looking post https://github.test/s1', self.lines[0])
 
 
 class Markdown(unittest.TestCase):
@@ -383,7 +617,8 @@ class WhoCounts(unittest.TestCase):
         for junk in ('lgtm, safe to merge', 'looks fine, read at: deadbee1', f'read at: {SHA_A[:7]}',
                      f'lens: correctness · reviewer: x · read at: {SHA_A[:7]}', f'lens: other · read at: {SHA_B}'):
             self.assertEqual(self.head(self.OWN, stranger(junk)), (True, SHA_A, 'every lens read it'), junk)
-        self.assertIsNotNone(self.R.lens_problem(post('lgtm, safe to merge')), 'the same text from the owner blocks')
+        self.assertIsNotNone(self.R.looks_problem(post('lgtm, safe to merge')), 'the same text from the owner looks')
+        self.assertIsNotNone(self.R.lens_problem(post(f'Hi\nlens: other · read at: {SHA_B}')), 'this one blocks')
 
     def test_a_hidden_lens_comment_reads_nothing_until_that_lens_posts_again(self):
         # hidden (minimized) is how old review rounds are tidied away, so hiding must never make a reviewed PR look
@@ -397,7 +632,7 @@ class WhoCounts(unittest.TestCase):
         self.assertEqual(self.head(self.OWN, dict(newer, isMinimized=True))[:2], (True, None),
                          'a hidden newest read does not bring the older read back')
         self.assertEqual(self.head(hidden, newer), (True, SHA_B, 'every lens read it'), 'a new comment of the lens counts')
-        for junk in ('lgtm, safe to merge', f'lens: correctness · read at {SHA_B[:7]}'):   # hidden look-alikes block too
+        for junk in (f'Review\nlens: x · read at: {SHA_B}', f'lens: correctness · read at {SHA_B[:7]}'):   # hidden too
             self.assertEqual(self.head(post(junk, isMinimized=True))[:2], (True, None), junk)
 
     def test_hidden_posts_that_never_counted_stay_ignored(self):
@@ -611,7 +846,7 @@ class Reviews(unittest.TestCase):
 
     def test_a_counted_authors_look_alike_review_blocks(self):
         own = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z')
-        reviewed, sha, why = self.head([own], [self.review('lgtm, safe to merge')])
+        reviewed, sha, why = self.head([own], [self.review(f'Review\nlens: design · read at: {SHA_A}')])
         self.assertEqual((reviewed, sha), (True, None))
         self.assertIn(lens.NO_HEADER, why)
 
@@ -649,7 +884,7 @@ class InlineComments(unittest.TestCase):
 
     def test_a_counted_authors_inline_look_alike_blocks(self):
         own = post(self.READ_B)
-        for body in ('lgtm, safe to merge', f'lens: design · read at: {SHA_B[:7]}'):
+        for body in (f'Review\nlens: design · read at: {SHA_B}', f'lens: design · read at: {SHA_B[:7]}'):
             reviewed, sha, why = self.head([own], [self.inline(body)])
             self.assertEqual((reviewed, sha), (True, None), body)
 

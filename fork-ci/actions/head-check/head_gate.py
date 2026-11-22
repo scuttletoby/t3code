@@ -711,7 +711,7 @@ def verdict_text(ok, reason, results, head, base):
         lines += [f'#### #{n}: {"pass" if good else "fail"}', '', head_check.cell(why), '']
         if rows:
             lines += ['| lens | | reason |', '| --- | --- | --- |']
-            lines += [f'| {head_check.cell(name)} | {"ok" if g else "fail"} | {head_check.cell(text)} |'
+            lines += [f'| {head_check.cell(name)} | {head_check.mark(g)} | {head_check.cell(text)} |'
                       for name, g, text in rows]
             lines.append('')
     text = '\n'.join(lines)
