@@ -20,7 +20,7 @@ M = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(M)
 
 JAR, POM = b'jar bytes', b'<project/>'
-V = 'org/example/engine/1.0'
+V = 'org/example/core/1.0'
 DAY = 86400
 
 
@@ -69,10 +69,10 @@ class Base(unittest.TestCase):
         M.stage(self.lock_file, out or self.out, gh, cache=self.cache, say=self.lines.append)
 
     def rows(self):
-        return [{'path': f'{V}/engine-1.0.jar', 'sha256': sha(JAR)}, {'path': f'{V}/engine-1.0.pom', 'sha256': sha(POM)}]
+        return [{'path': f'{V}/core-1.0.jar', 'sha256': sha(JAR)}, {'path': f'{V}/core-1.0.pom', 'sha256': sha(POM)}]
 
     def remote(self):
-        return FakeGitHub({f'{sha(JAR)}-engine-1.0.jar': JAR, f'{sha(POM)}-engine-1.0.pom': POM})
+        return FakeGitHub({f'{sha(JAR)}-core-1.0.jar': JAR, f'{sha(POM)}-core-1.0.pom': POM})
 
     def staged(self, out=None):
         out = out or self.out
@@ -83,8 +83,8 @@ class Stage(Base):
     def test_a_fresh_runner_gets_exactly_the_locked_files(self):
         self.lock(self.rows())
         self.stage(self.remote())
-        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
-        with open(os.path.join(self.out, V, 'engine-1.0.jar'), 'rb') as f:
+        self.assertEqual(self.staged(), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
+        with open(os.path.join(self.out, V, 'core-1.0.jar'), 'rb') as f:
             self.assertEqual(f.read(), JAR)
 
     def test_a_second_run_takes_the_cache_and_still_asks_github(self):
@@ -94,22 +94,22 @@ class Stage(Base):
         gh = self.remote()
         self.stage(gh)
         self.assertEqual(gh.downloads, [])
-        gone = self.remote(); del gone.files[f'{sha(POM)}-engine-1.0.pom']
+        gone = self.remote(); del gone.files[f'{sha(POM)}-core-1.0.pom']
         shutil.rmtree(self.out)   # a warm cache never hides an asset that is gone: the fresh runner would be red
-        with self.assertRaisesRegex(M.Refused, 'engine-1.0.pom: the release jars has no asset'):
+        with self.assertRaisesRegex(M.Refused, 'core-1.0.pom: the release jars has no asset'):
             self.stage(gone)
 
     def test_a_missing_asset_is_red_by_name_and_nothing_is_staged(self):
         self.lock(self.rows())
-        gh = self.remote(); del gh.files[f'{sha(JAR)}-engine-1.0.jar']
-        with self.assertRaisesRegex(M.Refused, r'engine-1\.0\.jar: the release jars has no asset'):
+        gh = self.remote(); del gh.files[f'{sha(JAR)}-core-1.0.jar']
+        with self.assertRaisesRegex(M.Refused, r'core-1\.0\.jar: the release jars has no asset'):
             self.stage(gh)
         self.assertFalse(os.path.exists(self.out))
 
     def test_other_bytes_under_the_asset_name_are_red_and_never_cached(self):
         self.lock(self.rows())
         gh = self.remote()
-        gh.files[f'{sha(JAR)}-engine-1.0.jar'] = b'an older jar'
+        gh.files[f'{sha(JAR)}-core-1.0.jar'] = b'an older jar'
         real = gh.assets
         gh.assets = lambda tag: {n: {k: v for k, v in a.items() if k != 'digest'} for n, a in real(tag).items()}
         with self.assertRaisesRegex(M.Refused, 'the download has sha256'):
@@ -133,7 +133,7 @@ class Stage(Base):
             f.write(b'cut off')
         gh = self.remote()
         self.stage(gh)
-        self.assertEqual(sorted(gh.downloads), sorted([f'{sha(JAR)}-engine-1.0.jar', f'{sha(POM)}-engine-1.0.pom']))
+        self.assertEqual(sorted(gh.downloads), sorted([f'{sha(JAR)}-core-1.0.jar', f'{sha(POM)}-core-1.0.pom']))
         self.assertTrue(any(line.startswith('WARN:') and sha(JAR) in line for line in self.lines))
         with open(os.path.join(self.cache, sha(JAR)), 'rb') as f:
             self.assertEqual(f.read(), JAR)
@@ -141,7 +141,7 @@ class Stage(Base):
     def test_a_folder_with_files_is_refused(self):
         self.lock(self.rows())
         os.makedirs(os.path.join(self.out, V))
-        open(os.path.join(self.out, V, 'engine-0.9.jar'), 'w').close()
+        open(os.path.join(self.out, V, 'core-0.9.jar'), 'w').close()
         with self.assertRaisesRegex(M.Refused, 'is not empty'):
             self.stage(self.remote())
 
@@ -175,7 +175,7 @@ class Stage(Base):
             t.join()
         self.assertEqual(errors, [])
         for i in range(4):
-            self.assertEqual(self.staged(os.path.join(self.root, f'out{i}')), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+            self.assertEqual(self.staged(os.path.join(self.root, f'out{i}')), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
         self.assertEqual(sorted(os.listdir(self.cache)), sorted([sha(JAR), sha(POM)]))
 
 
@@ -184,8 +184,8 @@ class PublishBase(Base):
         super().setUp()
         folder = os.path.join(self.m2, *V.split('/'))
         os.makedirs(folder)
-        for name, data in (('engine-1.0.jar', JAR), ('engine-1.0.pom', POM), ('engine-1.0-sources.jar', b's'),
-                           ('engine-1.0-javadoc.jar', b'j'), ('_remote.repositories', b'r')):
+        for name, data in (('core-1.0.jar', JAR), ('core-1.0.pom', POM), ('core-1.0-sources.jar', b's'),
+                           ('core-1.0-javadoc.jar', b'j'), ('_remote.repositories', b'r')):
             with open(os.path.join(folder, name), 'wb') as f:
                 f.write(data)
         self.uploaded, self.release, self.calls = [], {}, []
@@ -231,7 +231,7 @@ class PublishBase(Base):
     def assets_of(self, tag):
         return self.release if tag == 'jars' else self.others[tag]
 
-    def publish(self, run=None, coords=('org.example:engine:1.0',), **kw):
+    def publish(self, run=None, coords=('org.example:core:1.0',), **kw):
         M.publish(self.lock_file, list(coords), 'example/repo', m2=self.m2, run=run or self.gh, say=self.lines.append, **kw)
 
     def paths(self):
@@ -244,7 +244,7 @@ class Publish(PublishBase):
         self.lock([])
         self.exists = False
         self.publish()
-        self.assertEqual(sorted(self.uploaded), sorted([f'{sha(JAR)}-engine-1.0.jar', f'{sha(POM)}-engine-1.0.pom']))
+        self.assertEqual(sorted(self.uploaded), sorted([f'{sha(JAR)}-core-1.0.jar', f'{sha(POM)}-core-1.0.pom']))
         self.assertEqual(self.paths(), [(r['path'], r['sha256']) for r in self.rows()])
         self.uploaded.clear()
         self.publish()
@@ -268,7 +268,7 @@ class Publish(PublishBase):
         self.assertEqual(len(self.release), 2)
 
     def test_other_bytes_under_a_locked_path_are_refused_and_the_lock_stays(self):
-        self.lock([{'path': f'{V}/engine-1.0.jar', 'sha256': sha(b'the first build')}])
+        self.lock([{'path': f'{V}/core-1.0.jar', 'sha256': sha(b'the first build')}])
         with self.assertRaisesRegex(M.Refused, 'never reused'):
             self.publish()
         self.assertEqual(self.uploaded, [])
@@ -277,18 +277,18 @@ class Publish(PublishBase):
     def test_a_version_not_in_m2_is_refused(self):
         self.lock([])
         with self.assertRaisesRegex(M.Refused, 'has no jar and pom'):
-            self.publish(coords=['org.example:engine:2.0'])
+            self.publish(coords=['org.example:core:2.0'])
 
     def test_a_path_the_lock_could_not_read_is_refused_before_any_upload(self):
         # source #1257 r1: Maven's 1.0+b1 was uploaded and written, then the lock refused itself (every stage red)
         self.lock([])
-        folder = os.path.join(self.m2, 'org', 'example', 'engine', '1.0+b1')
+        folder = os.path.join(self.m2, 'org', 'example', 'core', '1.0+b1')
         os.makedirs(folder)
-        for name in ('engine-1.0+b1.jar', 'engine-1.0+b1.pom'):
+        for name in ('core-1.0+b1.jar', 'core-1.0+b1.pom'):
             with open(os.path.join(folder, name), 'wb') as f:
                 f.write(name.encode())
-        with self.assertRaisesRegex(M.Refused, r"bad path 'org/example/engine/1\.0\+b1/engine-1\.0\+b1\.jar'"):
-            self.publish(coords=['org.example:engine:1.0+b1'])
+        with self.assertRaisesRegex(M.Refused, r"bad path 'org/example/core/1\.0\+b1/core-1\.0\+b1\.jar'"):
+            self.publish(coords=['org.example:core:1.0+b1'])
         self.assertEqual(self.uploaded, [])
         self.assertEqual(self.read_lock()['files'], [])
         M.read_lock(self.lock_file)   # the lock is still readable: every other stage stays green
@@ -326,7 +326,7 @@ class Issue1324KilledDownloads(Base):
             self.stage(self.remote())
         finally:
             M.sha256 = real
-        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+        self.assertEqual(self.staged(), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
 
     def test_a_stage_that_fails_half_way_leaves_no_out_and_the_rerun_is_green(self):
         self.lock(self.rows())
@@ -338,7 +338,7 @@ class Issue1324KilledDownloads(Base):
         self.assertFalse(os.path.exists(self.out))
         self.assertEqual([n for n in os.listdir(self.root) if '.part-' in n], [])   # the half-built folder went too
         self.stage(self.remote())
-        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+        self.assertEqual(self.staged(), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
 
 
 class Issue1330CachePrune(Base):
@@ -347,17 +347,17 @@ class Issue1330CachePrune(Base):
         self.lock(self.rows())
         os.makedirs(self.cache)
         long_ago, recent = time.time() - 40 * DAY, time.time() - DAY
-        files = {sha(b'old engine'): long_ago, sha(b'branch engine'): recent, sha(JAR): long_ago, 'notes.txt': long_ago}
+        files = {sha(b'old core'): long_ago, sha(b'branch core'): recent, sha(JAR): long_ago, 'notes.txt': long_ago}
         for name, t in files.items():
             with open(os.path.join(self.cache, name), 'wb') as f:
                 f.write(JAR if name == sha(JAR) else b'x')
             os.utime(os.path.join(self.cache, name), (t, t))
         gh = self.remote()
         self.stage(gh)
-        self.assertNotIn(f'{sha(JAR)}-engine-1.0.jar', gh.downloads)   # 40 days old but used: kept, not fetched again
+        self.assertNotIn(f'{sha(JAR)}-core-1.0.jar', gh.downloads)   # 40 days old but used: kept, not fetched again
         left = set(os.listdir(self.cache))
-        self.assertNotIn(sha(b'old engine'), left)          # no lock row, unused for 40 days
-        self.assertIn(sha(b'branch engine'), left)          # another branch's lock may still use it
+        self.assertNotIn(sha(b'old core'), left)          # no lock row, unused for 40 days
+        self.assertIn(sha(b'branch core'), left)          # another branch's lock may still use it
         self.assertIn('notes.txt', left)                     # never removes a file it did not write
         self.assertGreater(os.stat(os.path.join(self.cache, sha(JAR))).st_mtime, recent)   # used: its age restarts
         self.assertTrue(any('notes.txt' in line for line in self.lines))
@@ -385,17 +385,17 @@ class Issue1326ReleaseGrowth(PublishBase):
         gh.releases['jars-2'] = {}
         self.stage(gh)
         self.assertEqual(gh.listed, ['jars'])
-        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+        self.assertEqual(self.staged(), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
 
     def test_prune_lock_keeps_only_the_named_versions(self):
-        other = 'org/example/engine/0.9'
-        self.lock(self.rows() + [{'path': f'{other}/engine-0.9.jar', 'sha256': sha(b'0.9')}])
-        M.prune_lock(self.lock_file, ['org.example:engine:1.0'], say=self.lines.append)
+        other = 'org/example/core/0.9'
+        self.lock(self.rows() + [{'path': f'{other}/core-0.9.jar', 'sha256': sha(b'0.9')}])
+        M.prune_lock(self.lock_file, ['org.example:core:1.0'], say=self.lines.append)
         self.assertEqual(self.paths(), [(r['path'], r['sha256']) for r in self.rows()])
-        M.prune_lock(self.lock_file, ['org.example:engine:1.0'], say=self.lines.append)   # a rerun changes nothing
+        M.prune_lock(self.lock_file, ['org.example:core:1.0'], say=self.lines.append)   # a rerun changes nothing
         self.assertEqual(len(self.read_lock()['files']), 2)
-        with self.assertRaisesRegex(M.Refused, 'org.example:engine:3.0.*no rows'):   # a typo never empties the lock
-            M.prune_lock(self.lock_file, ['org.example:engine:1.0', 'org.example:engine:3.0'], say=self.lines.append)
+        with self.assertRaisesRegex(M.Refused, 'org.example:core:3.0.*no rows'):   # a typo never empties the lock
+            M.prune_lock(self.lock_file, ['org.example:core:1.0', 'org.example:core:3.0'], say=self.lines.append)
         self.assertEqual(len(self.read_lock()['files']), 2)
 
 
@@ -405,31 +405,31 @@ class Issue1329ReleaseMistakes(PublishBase):
     def test_check_names_every_missing_or_unfinished_asset_without_downloading(self):
         self.lock(self.rows())
         gh = self.remote()
-        del gh.files[f'{sha(POM)}-engine-1.0.pom']
+        del gh.files[f'{sha(POM)}-core-1.0.pom']
         real = gh.assets
         gh.assets = lambda tag: {n: dict(a, state='starter') for n, a in real(tag).items()}
         with self.assertRaises(M.Refused) as e:
             M.check(self.lock_file, gh, say=self.lines.append)
-        self.assertIn('engine-1.0.pom: the release jars has no asset', str(e.exception))
-        self.assertIn('engine-1.0.jar: the upload of', str(e.exception))
+        self.assertIn('core-1.0.pom: the release jars has no asset', str(e.exception))
+        self.assertIn('core-1.0.jar: the upload of', str(e.exception))
         self.assertEqual(gh.downloads, [])
         M.check(self.lock_file, self.remote(), say=self.lines.append)
 
     def test_publish_puts_back_a_deleted_asset_of_a_locked_version(self):
         self.lock([])
         self.publish()
-        del self.release[f'{sha(JAR)}-engine-1.0.jar']
+        del self.release[f'{sha(JAR)}-core-1.0.jar']
         self.uploaded.clear()
         self.publish()
-        self.assertEqual(self.uploaded, [f'{sha(JAR)}-engine-1.0.jar'])
+        self.assertEqual(self.uploaded, [f'{sha(JAR)}-core-1.0.jar'])
         self.stage(FakeGitHub(self.release))
 
     def test_an_unfinished_upload_is_replaced(self):
         self.lock([])
-        self.release = {f'{sha(JAR)}-engine-1.0.jar': b'cut'}
-        self.states = {f'{sha(JAR)}-engine-1.0.jar': 'starter'}
+        self.release = {f'{sha(JAR)}-core-1.0.jar': b'cut'}
+        self.states = {f'{sha(JAR)}-core-1.0.jar': 'starter'}
         self.publish()
-        self.assertEqual(self.release[f'{sha(JAR)}-engine-1.0.jar'], JAR)
+        self.assertEqual(self.release[f'{sha(JAR)}-core-1.0.jar'], JAR)
 
     def test_every_error_stage_and_check_print_has_a_troubleshooting_row(self):
         with open(os.path.join(HERE, 'README.md')) as f:
@@ -529,10 +529,10 @@ class LensPublishAfterRollover(PublishBase):
         self.lock([])
         self.publish()
         self.move_to('jars-2')
-        del self.release[f'{sha(JAR)}-engine-1.0.jar']
+        del self.release[f'{sha(JAR)}-core-1.0.jar']
         self.uploaded.clear()
         self.publish()
-        self.assertEqual(self.uploaded, [f'{sha(JAR)}-engine-1.0.jar'])   # back into the row's own release
+        self.assertEqual(self.uploaded, [f'{sha(JAR)}-core-1.0.jar'])   # back into the row's own release
         self.assertEqual(self.created, [])                                  # no empty jars-2 for it
         self.assertEqual({r['release'] for r in self.read_lock()['files']}, {'jars'})
         self.stage(FakeGitHub(self.release))
@@ -544,15 +544,15 @@ class LensPublishAfterRollover(PublishBase):
         self.uploaded.clear()
         self.publish()
         self.assertEqual((self.uploaded, self.created), ([], []))
-        folder = os.path.join(self.m2, 'org', 'example', 'engine', '1.1')
+        folder = os.path.join(self.m2, 'org', 'example', 'core', '1.1')
         os.makedirs(folder)
-        for name in ('engine-1.1.jar', 'engine-1.1.pom'):
+        for name in ('core-1.1.jar', 'core-1.1.pom'):
             with open(os.path.join(folder, name), 'wb') as f:
                 f.write(name.encode())
-        self.publish(coords=['org.example:engine:1.0', 'org.example:engine:1.1'])
+        self.publish(coords=['org.example:core:1.0', 'org.example:core:1.1'])
         self.assertEqual(self.created, ['jars-2'])
         self.assertEqual(sorted(self.uploaded),
-                         sorted(f'jars-2/{sha(n.encode())}-{n}' for n in ('engine-1.1.jar', 'engine-1.1.pom')))
+                         sorted(f'jars-2/{sha(n.encode())}-{n}' for n in ('core-1.1.jar', 'core-1.1.pom')))
         self.assertEqual({r['path'].split('/')[3]: r['release'] for r in self.read_lock()['files']},
                          {'1.0': 'jars', '1.1': 'jars-2'})
 
@@ -560,7 +560,7 @@ class LensPublishAfterRollover(PublishBase):
 class LensSameVersionTwice(PublishBase):
     """Lens S1+S2 (minor): one version named twice wrote every row twice, and the lock then refused itself."""
     def test_one_version_named_twice_or_spelled_two_ways_writes_each_row_once(self):
-        for coords in (['org.example:engine:1.0'] * 2, ['org.example:engine:1.0', 'org/example:engine:1.0']):
+        for coords in (['org.example:core:1.0'] * 2, ['org.example:core:1.0', 'org/example:core:1.0']):
             with self.subTest(coords=coords):
                 self.lock([])
                 self.release.clear()
@@ -579,10 +579,10 @@ class LensLegacyLockRollover(PublishBase):
     def setUp(self):
         super().setUp()
         self.lock(self.rows())   # no "release" in any row
-        self.release = {f'{sha(JAR)}-engine-1.0.jar': JAR, f'{sha(POM)}-engine-1.0.pom': POM}
-        folder = os.path.join(self.m2, 'org', 'example', 'engine', '1.1')
+        self.release = {f'{sha(JAR)}-core-1.0.jar': JAR, f'{sha(POM)}-core-1.0.pom': POM}
+        folder = os.path.join(self.m2, 'org', 'example', 'core', '1.1')
         os.makedirs(folder)
-        for name in ('engine-1.1.jar', 'engine-1.1.pom'):
+        for name in ('core-1.1.jar', 'core-1.1.pom'):
             with open(os.path.join(folder, name), 'wb') as f:
                 f.write(name.encode())
 
@@ -599,10 +599,10 @@ class LensLegacyLockRollover(PublishBase):
     def test_a_move_before_every_row_names_its_release_is_refused_before_any_upload(self):
         self.move_to('jars-2')
         before = self.lock_bytes()
-        for coords in (['org.example:engine:1.1'], ['org.example:engine:1.0'], ['org.example:engine:1.0'] * 2):
+        for coords in (['org.example:core:1.1'], ['org.example:core:1.0'], ['org.example:core:1.0'] * 2):
             with self.subTest(coords=coords):   # the new version, the repair of an old one, and a rerun of it
-                with self.assertRaisesRegex(M.Refused, r'(?s)no "release" of their own.*engine-1\.0\.jar.*'
-                                            r'engine-1\.0\.pom.*Nothing was uploaded'):
+                with self.assertRaisesRegex(M.Refused, r'(?s)no "release" of their own.*core-1\.0\.jar.*'
+                                            r'core-1\.0\.pom.*Nothing was uploaded'):
                     self.publish(coords=coords)
                 self.assertEqual((self.uploaded, self.created), ([], []))
                 self.assertEqual(self.lock_bytes(), before)
@@ -610,17 +610,17 @@ class LensLegacyLockRollover(PublishBase):
         self.move_to('jars')   # undone by hand: stage still finds every old file
         gh = FakeGitHub(self.release)
         self.stage(gh)
-        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+        self.assertEqual(self.staged(), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
 
     def test_the_readme_rollover_writes_every_rows_release_first_and_a_rerun_changes_nothing(self):
         self.publish()   # step 1: publish a version the lock already has; it uploads nothing, only writes the releases
         self.assertEqual((self.uploaded, self.created), ([], []))
         self.assertEqual({r['release'] for r in self.read_lock()['files']}, {'jars'})
         self.move_to('jars-2')   # step 2
-        self.publish(coords=['org.example:engine:1.1'])   # step 3
+        self.publish(coords=['org.example:core:1.1'])   # step 3
         self.assertEqual(self.created, ['jars-2'])
         self.assertEqual(sorted(self.uploaded),
-                         sorted(f'jars-2/{sha(n.encode())}-{n}' for n in ('engine-1.1.jar', 'engine-1.1.pom')))
+                         sorted(f'jars-2/{sha(n.encode())}-{n}' for n in ('core-1.1.jar', 'core-1.1.pom')))
         self.assertEqual({r['path'].split('/')[3]: r['release'] for r in self.read_lock()['files']},
                          {'1.0': 'jars', '1.1': 'jars-2'})
         gh = FakeGitHub(self.release)
@@ -628,14 +628,14 @@ class LensLegacyLockRollover(PublishBase):
         self.stage(gh)
         self.assertEqual(len(self.staged()), 4)
         before, self.uploaded = self.lock_bytes(), []
-        self.publish(coords=['org.example:engine:1.0', 'org.example:engine:1.1'])
+        self.publish(coords=['org.example:core:1.0', 'org.example:core:1.1'])
         self.assertEqual((self.uploaded, self.created, self.lock_bytes()), ([], ['jars-2'], before))
 
     def test_a_deleted_asset_of_a_row_that_names_no_release_is_never_guessed(self):
         """The lock's release may have moved, so publish cannot tell 'deleted here' from 'lives in an older release'."""
-        del self.release[f'{sha(JAR)}-engine-1.0.jar']
+        del self.release[f'{sha(JAR)}-core-1.0.jar']
         before = self.lock_bytes()
-        with self.assertRaisesRegex(M.Refused, r'no "release" of their own.*engine-1\.0\.jar'):
+        with self.assertRaisesRegex(M.Refused, r'no "release" of their own.*core-1\.0\.jar'):
             self.publish()
         self.assertEqual((self.uploaded, self.lock_bytes()), ([], before))
         lock = self.read_lock()   # the README's repair: write the tag that held it, then publish
@@ -644,7 +644,7 @@ class LensLegacyLockRollover(PublishBase):
         with open(self.lock_file, 'w') as f:
             json.dump(lock, f)
         self.publish()
-        self.assertEqual(self.uploaded, [f'{sha(JAR)}-engine-1.0.jar'])
+        self.assertEqual(self.uploaded, [f'{sha(JAR)}-core-1.0.jar'])
         self.stage(FakeGitHub(self.release))
 
 
@@ -655,7 +655,7 @@ class LensUnwritableCache(Base):
         open(os.path.join(self.root, 'a-file'), 'w').close()
         self.cache = os.path.join(self.root, 'a-file', 'cache')
         self.stage(self.remote())
-        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+        self.assertEqual(self.staged(), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
         self.assertTrue(any(line.startswith('WARN:') and 'cache' in line for line in self.lines), self.lines)
 
     def test_a_full_disk_on_a_cache_write_only_warns(self):
@@ -665,7 +665,7 @@ class LensUnwritableCache(Base):
             raise OSError(errno.ENOSPC, 'No space left on device')
         with mock.patch.object(M, 'write_atomic', full):
             self.stage(self.remote())
-        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+        self.assertEqual(self.staged(), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
         self.assertTrue(any(line.startswith('WARN:') and 'No space' in line for line in self.lines), self.lines)
 
     def test_a_cache_file_that_cannot_be_read_only_warns(self):
@@ -676,7 +676,7 @@ class LensUnwritableCache(Base):
         gh = self.remote()
         with mock.patch.object(M, 'cached', unreadable):
             self.stage(gh)
-        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+        self.assertEqual(self.staged(), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
         self.assertEqual(len(gh.downloads), 2)
         self.assertTrue(any(line.startswith('WARN:') and 'cannot be read' in line for line in self.lines), self.lines)
 
@@ -692,7 +692,7 @@ class LensUnwritableCache(Base):
         self.addCleanup(os.chmod, self.cache, 0o755)
         gh = self.remote()
         self.stage(gh)
-        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+        self.assertEqual(self.staged(), [f'{V}/core-1.0.jar', f'{V}/core-1.0.pom'])
         self.assertEqual(len(gh.downloads), 2)
         self.assertTrue(any(line.startswith('WARN:') for line in self.lines), self.lines)
 
