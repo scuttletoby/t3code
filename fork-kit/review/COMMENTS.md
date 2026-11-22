@@ -100,6 +100,33 @@ state: an old config without the new key is read with the default
 findings: none
 ```
 
+A quick check of a nit-only fix (SKILL.md, "Order", step 7). The `nit-only:` line is for the orchestrator: on `yes` it
+still posts the override for the fix head, because the other lenses still name the old head. The gate reads the report
+as any other, and counts it as a round (a read of a new head).
+
+The gate reads: `lens quick-check, read, clean, state`
+
+```text
+lens: quick-check · reviewer: lens agent · read at: 0123456789abcdef0123456789abcdef01234567
+covered: the fix diff since round 1 (tests and message text only)
+nit-only: yes
+state: no write step changed
+blocker: none
+major: none
+```
+
+The state answer only in `checks:` (an older shape): the gate takes the read, but the kit's `check` refuses it (no state
+line). Write the answer on a `state:` line.
+
+The gate reads: `lens correctness, read, clean, no state`
+
+```text
+lens: correctness · reviewer: lens agent · read at: 0123456789abcdef0123456789abcdef01234567
+covered: src/queue.ts
+checks: a second run finds the entry and does nothing; an empty queue file is read as empty
+finding: minor src/queue.ts:12 the error text names the wrong flag
+```
+
 ## Reports that block
 
 A major finding. The head is held until this lens posts a new read on a fixed head (or a person decides).

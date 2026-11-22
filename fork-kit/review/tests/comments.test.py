@@ -5,7 +5,7 @@ copy of lib/review_kit.py and shows its test then fails.
 
   python3 -I -B fork-kit/review/tests/comments.test.py
 """
-import os, re, subprocess, sys, tempfile, shutil, types, unittest
+import inspect, json, os, re, subprocess, sys, tempfile, shutil, types, unittest
 
 sys.dont_write_bytecode = True   # the CI runner has no -B; keep the kit folder free of __pycache__
 
@@ -15,6 +15,9 @@ LIB = os.path.join(KIT, 'lib', 'review_kit.py')
 DOC = os.path.join(KIT, 'COMMENTS.md')
 sys.path.insert(0, os.path.join(KIT, 'lib'))
 import review_kit  # noqa: E402
+import review_config  # noqa: E402  (the gate's, on the path review_kit set)
+import review_glob  # noqa: E402  (the gate's too)
+review_judge = review_kit.review_judge
 
 SHA = '0123456789abcdef0123456789abcdef01234567'
 OTHER = '89abcdef0123456789abcdef0123456789abcdef'
@@ -232,6 +235,246 @@ MUTATIONS = {
     'the head is lowercased': ("sha != head.lower()", 'sha != head',
                                (Check, 'test_the_head_is_matched_whatever_its_case')),
 }
+
+
+TEMPLATE_DOCS = ('SKILL.md', os.path.join('eval', 'lens.md'), 'COMMENTS.md')
+FENCE_RE = re.compile(r'^(`{3,})[a-z]*\s*$')
+PLACEHOLDER_RE = re.compile(r'<([^<>\n]*)>')
+
+
+def kit_text(name):
+    with open(os.path.join(KIT, name), encoding='utf-8') as f:
+        return f.read()
+
+
+def recommended():
+    """review.recommended.json through the gate's own parser."""
+    with open(os.path.join(REPO, 'fork-ci', 'actions', 'pr-queue', 'review.recommended.json'), encoding='utf-8') as f:
+        return review_config.parse_review(json.load(f))
+
+
+PROTECTED_PROBES = ('.github/actions/x/action.yml', '.github/CODEOWNERS', '.github/dependabot.yml',
+                    '.github/pr-queue.example.json', '.github/scripts/x.cjs', '.github/workflows', '.github/workflow/x.yml',
+                    'github/workflows/x.yml', 'x/.github/workflows/ci.yml', '.gitattributes', '.gitignore', 'package.json',
+                    'Dockerfile', 'Makefile', 'scripts/release.sh', 'docs/review.md', 'fork-ci/actions/pr-queue/lens.py',
+                    'fork-kit/review/SKILL.md', 'fork-kit/review/eval/lens.md', 'review/x.md', 'lenses/new.md')
+
+
+def repo_paths():
+    """Every file git tracks in this repository (none when git cannot say, and the probes still run)."""
+    try:
+        out = subprocess.run(['git', '-C', REPO, 'ls-files', '-z'], capture_output=True, check=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [p for p in out.decode('utf-8', 'replace').split('\0') if p]
+
+
+def lens_pr(*posts):
+    """A pull request whose comments are `posts` ((body), oldest first) as the gate reads them: written by the owner,
+    never edited, not hidden."""
+    return {'comments': [{'body': body, 'createdAt': f'2026-01-01T00:00:{i:02d}Z', 'authorAssociation': 'OWNER',
+                          'includesCreatedEdit': False, 'author': {'login': 'someone'}}
+                         for i, body in enumerate(posts)]}
+
+
+def templates(text):
+    """Every fenced block whose first line is a lens header with a `<placeholder>`: the report shapes the docs tell a
+    lens to write (the checked examples of COMMENTS.md hold real shas, so they are not templates)."""
+    lines, out, i = text.splitlines(), [], 0
+    while i < len(lines):
+        m = FENCE_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        body, i = [], i + 1
+        while i < len(lines) and lines[i].strip() != m.group(1):
+            body.append(lines[i])
+            i += 1
+        i += 1
+        if body and re.match(r'lens\s*:', body[0], re.I) and PLACEHOLDER_RE.search(body[0]):
+            out.append('\n'.join(body))
+    return out
+
+
+def fill(template):
+    """A template as a lens would fill it on a clean read: a sha placeholder takes a full sha, a choice
+    (`<blocker|major|minor>`) its last, lightest option, anything else plain text."""
+    def one(m):
+        inner = m.group(1)
+        if 'sha' in inner:
+            return SHA
+        if '|' in inner:
+            return inner.split('|')[-1].strip()
+        return 'text'
+    return PLACEHOLDER_RE.sub(one, template)
+
+
+class SkillFormat(unittest.TestCase):
+    """The report shape the skill, the eval lens and COMMENTS.md tell a lens to write is a clean read with a state line
+    to the gate's own parser, and the skill's tiers and state question are the gate's and the kit's: the skill text and
+    the gate cannot drift apart again."""
+
+    def test_every_documented_report_shape_reads_clean_with_the_gates_parser(self):
+        for name in TEMPLATE_DOCS:
+            found = templates(kit_text(name))
+            with self.subTest(doc=name):
+                self.assertTrue(found, f'{name} no longer shows the report shape')
+            for t in found:
+                with self.subTest(doc=name, header=t.splitlines()[0]):
+                    words = review_kit.verdict(fill(t), 'tool ready --head', SHA)
+                    self.assertEqual(words[1:], ['read', 'clean', 'state'])
+                    self.assertEqual(review_kit.check(fill(t), 'tool ready --head', SHA)[0], 0)
+
+    def test_a_shape_without_its_state_or_findings_lines_fails(self):
+        t = templates(kit_text('SKILL.md'))[0]
+        no_state = '\n'.join(x for x in t.splitlines() if not x.startswith('state:'))
+        self.assertIn('no state', review_kit.verdict(fill(no_state), 'tool ready --head', SHA))
+        no_blocker = '\n'.join(x for x in t.splitlines() if not x.startswith('blocker:'))
+        self.assertIn('no findings section', review_kit.verdict(fill(no_blocker), 'tool ready --head', SHA))
+
+    def test_the_skill_carries_the_state_question_word_for_word(self):
+        for name in ('SKILL.md', os.path.join('eval', 'lens.md'), 'REVIEW.md'):
+            with self.subTest(doc=name):
+                self.assertIn(review_kit.STATE_QUESTION, ' '.join(kit_text(name).split()))
+
+    def test_the_skill_tiers_are_the_gates_weights_and_recommended_lens_counts(self):
+        import json
+        import review_config
+        gate = os.path.join(REPO, 'fork-ci', 'actions', 'pr-queue')
+        with open(os.path.join(gate, 'review.recommended.json'), encoding='utf-8') as f:
+            mins = json.load(f)['min_lenses']
+        rows = re.findall(r'^\| (\w+) +\|[^|]*\| ([^|]*)\|\s*$', kit_text('SKILL.md'), re.M)
+        tiers = {w: cell for w, cell in rows if w in review_config.WEIGHTS}
+        self.assertEqual(list(tiers), list(review_config.WEIGHTS))
+        for weight, cell in tiers.items():
+            with self.subTest(weight=weight):
+                self.assertEqual(int(re.search(r'\*\*(\d+)', cell).group(1)), mins[weight])
+
+    def test_the_skill_runner_text_is_the_kits_default(self):
+        """The tier table's `Opus 5.5 high` and §5's runner defaults are the kit's DEFAULTS, read, not copied."""
+        skill = ' '.join(kit_text('SKILL.md').split())
+        for key in ('runner', 'audit_runner'):
+            r = review_kit.DEFAULTS[key]
+            with self.subTest(setting=key):
+                self.assertIn(f"`{key}` (default `{r['model']}`, effort `{r['effort']}`)", skill)
+        r = review_kit.DEFAULTS['runner']
+        m = re.fullmatch(r'claude-([a-z]+)-(\d+)-(\d+)', r['model'])
+        self.assertTrue(m, f"the default runner {r['model']!r} has no display name rule here")
+        shown = f"{m.group(1).capitalize()} {m.group(2)}.{m.group(3)} {r['effort']}"
+        rows = re.findall(r'^\| (\w+) +\|[^|]*\| ([^|]*)\|\s*$', kit_text('SKILL.md'), re.M)
+        with_lenses = [(w, cell) for w, cell in rows if w in review_config.WEIGHTS and 'lens' in cell]
+        self.assertTrue(with_lenses)
+        for weight, cell in with_lenses:
+            with self.subTest(weight=weight):
+                self.assertIn(shown, cell)
+
+    def test_the_skill_names_the_gates_protected_paths(self):
+        """The skill's always-critical list is the gate's: the config, every lens prompt and the workflows glob, and
+        nothing else (a new kind of protected path in the gate fails here until the skill names it)."""
+        rv = recommended()
+        cfg = '.github/pr-queue.json'
+        self.assertEqual(review_judge.protected_paths(rv, cfg), {cfg, *(x.prompt for x in rv.lenses)})
+        used = set(re.findall(r'\b[A-Z][A-Z_]{2,}\b', inspect.getsource(review_judge.is_protected)))
+        self.assertEqual(used, {'WORKFLOWS'}, 'is_protected reads another list: name it in SKILL.md, "Always critical"')
+        # The gate's answer, not its source: on every file of this repository and on probe paths next to the listed
+        # ones, is_protected says exactly what the skill's list says. A new rule of any form (a constant, an inline
+        # prefix, a suffix) that makes one more path protected fails here until the skill names it.
+        exact = review_judge.protected_paths(rv, cfg)
+        skill_says = lambda p: p in exact or review_glob.matches(review_judge.WORKFLOWS, p)  # noqa: E731
+        for path in sorted(set(repo_paths()) | set(PROTECTED_PROBES) | exact):
+            with self.subTest(probe=path):
+                self.assertEqual(review_judge.is_protected(path, exact), skill_says(path),
+                                 'is_protected and SKILL.md "Always critical" disagree on this path')
+        skill = ' '.join(kit_text('SKILL.md').split())
+        line = re.search(r'\*\*Always critical\*\*.*?\.(?= |$)', skill)   # to the sentence's end
+        self.assertTrue(line, 'SKILL.md no longer lists the always-critical paths')
+        for words in ('the queue config file', 'every lens prompt file', f'`{review_judge.WORKFLOWS}`'):
+            with self.subTest(path=words):
+                self.assertIn(words, line.group(0))
+        # the gate really judges them critical, even under a light rule (`**/*.md` is light in the recommended rules)
+        for path in (cfg, rv.lenses[0].prompt, '.github/workflows/ci.yml'):
+            with self.subTest(judged=path):
+                self.assertEqual(review_judge.judge(rv, [('M', (path,))], cfg).weight, 'critical')
+        light = re.search(r'^\| light +\|([^|]*)\|', kit_text('SKILL.md'), re.M).group(1)
+        self.assertNotIn('config', light)
+
+    def test_the_skill_counts_rounds_as_the_gate(self):
+        """A quick check is a lens read of a new head: one more gate round, and from `rounds.approach_at` the approach
+        lens is required unless a listed person decided. The skill names the gate's own round keys and the recommended
+        approach_at as review_config parses it."""
+        rv = recommended()
+        skill = ' '.join(kit_text('SKILL.md').split())
+        for key in review_config.ROUND_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(f'`rounds.{key}`', skill)
+        said = re.search(r'`rounds\.approach_at` of the review block \((\d+) in review\.recommended\.json', skill)
+        self.assertTrue(said, 'SKILL.md no longer says the recommended rounds.approach_at')
+        self.assertEqual(int(said.group(1)), rv.rounds.approach_at)
+        for words in ('the gate counts it as a round', '`override_authors`',
+                      "An orchestrator's override never replaces the approach lens"):
+            with self.subTest(says=words):
+                self.assertIn(words, skill)
+        # the gate's own round count: rounds before the quick check, then the quick check on a new head
+        n = rv.rounds.approach_at
+        history = [('code' if i == 0 else f'code r{i + 1}', f'{i:040x}') for i in range(n - 1)]
+        before = review_judge.judge_rounds(rv, history, {})
+        self.assertEqual((before.round, before.approach), (n - 1, False))
+        history.append(('quick-check', f'{n:040x}'))
+        after = review_judge.judge_rounds(rv, history, {})
+        self.assertEqual((after.round, after.approach), (n, True))
+        self.assertFalse(review_judge.judge_rounds(rv, history, {}, decided=True).approach)
+
+    def test_the_skill_says_what_passes_a_fix_head_after_a_quick_check(self):
+        """The gate passes a head only when every lens's newest read names it, or a newer override covers them
+        (lens.Review.reviewed_head). The history: round 1 `code` at A, round 2 `code r2` at B, then a nit-only fix C
+        with a quick check: the quick check alone holds C, the override for C passes it, and the override alone adds
+        no round. The skill must say so: the quick check never replaces the override."""
+        rv = recommended()
+        a, b, c = (f'{n:040x}' for n in (0xa, 0xb, 0xc))
+        prefix = 'tool ready --head'
+        review = review_kit.reader(prefix)
+
+        def report(name, sha):
+            return f'lens: {name} · reviewer: a · read at: {sha}\nstate: nothing is stored\nblocker: none\nmajor: none\n'
+
+        override = f'{prefix} {c}: read the fix diff and its tests'
+        approach = rv.rounds.approach_lens
+        rounds = [report('code', a), report('code r2', b)]
+        cases = (
+            ('quick check alone', rounds + [report('quick-check', c)], None),
+            ('quick check and the approach lens', rounds + [report('quick-check', c), report(approach, c)], None),
+            ('quick check, approach lens, override', rounds + [report('quick-check', c), report(approach, c), override],
+             c),
+            ('override alone', rounds + [override], c),
+        )
+        for name, posts, passes in cases:
+            with self.subTest(history=name):
+                reviewed, sha, why = review.reviewed_head(lens_pr(*posts))
+                self.assertTrue(reviewed)
+                self.assertEqual(sha, passes, why)
+        with_quick = review_judge.judge_rounds(rv, [('code', a), ('code r2', b), ('quick-check', c)], {})
+        self.assertEqual((with_quick.round, with_quick.approach), (3, rv.rounds.approach_at <= 3))
+        alone = review_judge.judge_rounds(rv, [('code', a), ('code r2', b)], {})
+        self.assertEqual((alone.round, alone.approach), (2, rv.rounds.approach_at <= 2))
+        skill = ' '.join(kit_text('SKILL.md').split())
+        for words in ('the gate passes a head only when every lens\'s newest read names that head, or an override',
+                      'the fix head passes only when every lens reads it again (a new round) or the orchestrator posts '
+                      'the override for it (no new round)',
+                      '**it does not replace the override**',
+                      'On `nit-only: yes` the orchestrator still posts the override for the fix head',
+                      'The override alone, with no quick check, adds no round'):
+            with self.subTest(says=words):
+                self.assertIn(words, skill)
+        self.assertNotIn('skip the quick check', skill)
+        comments = ' '.join(kit_text('COMMENTS.md').split())
+        self.assertIn('on `yes` it still posts the override for the fix head', comments)
+
+    def test_the_skill_says_whichever_is_higher(self):
+        """review_round takes the higher of the change count and the round marker, never the sum."""
+        self.assertEqual(review_judge.review_round([('code', 'a' * 40), ('code r3', 'a' * 40)]), 3)
+        self.assertEqual(review_judge.review_round([('code', 'a' * 40), ('code', 'b' * 40), ('code r2', 'c' * 40)]), 3)
+        skill = ' '.join(kit_text('SKILL.md').split())
+        self.assertIn('the highest `r2`, `r3` marker in a lens name, whichever is higher', skill)
 
 
 class RedCheck(unittest.TestCase):
