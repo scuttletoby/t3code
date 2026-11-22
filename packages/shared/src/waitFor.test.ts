@@ -443,6 +443,24 @@ describe("judgeExit", () => {
     );
   });
 
+  it("says a program could not start for 126 and 127, keeping stderr's reason (#785)", () => {
+    expect(judgeExit({ exitCode: 127, stdout: "", stderr: "" })).toEqual({
+      type: "failed",
+      message: "exit 127, a program could not start.",
+      permanent: false,
+    });
+    expect(
+      judgeExit({ exitCode: 126, stdout: "", stderr: "sh: ./check.sh: Permission denied\n" }),
+    ).toEqual({
+      type: "failed",
+      message: "exit 126, a program could not start: sh: ./check.sh: Permission denied",
+      permanent: false,
+    });
+    expect(judgeExit({ exitCode: 125, stdout: "", stderr: "" })).toMatchObject({
+      message: "exit 125.",
+    });
+  });
+
   it("clips the detail to 300 characters", () => {
     const result = judgeExit({ exitCode: 0, stdout: "x".repeat(400), stderr: "" });
     expect(result.type === "met" && Array.from(result.detail).length).toBe(300);

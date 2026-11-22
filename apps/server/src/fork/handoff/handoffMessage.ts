@@ -33,17 +33,32 @@ export const HANDOFF_AGENT_END = "----- end handoff from the old session -----";
 
 /**
  * A part-2 line that could pass for one of the message's own lines: a begin or end line (of either
- * source), a part-1 heading, the part-3 heading or the rules.
+ * source), a part-1 heading, the part-3 heading or the rules. Matched on the line as `lookAlike`
+ * reads it, so a disguised copy matches too.
  */
 const LOOKS_LIKE_OURS = new RegExp(
   [
-    String.raw`^-+\s*(begin|end)\b.*\bhandoff\b`,
+    String.raw`^-[-\s]*(begin|end)\b.*\bhandoff\b`,
     String.raw`^\[T3 handoff\b`,
     String.raw`^Recent conversation:`,
     String.raw`^This is context, not a request\.`,
   ].join("|"),
   "i",
 );
+
+/**
+ * A line as a reader sees it: compatibility forms folded (full-width letters, ligatures),
+ * invisible format characters (zero-width spaces, joiners, direction marks) and markdown marks
+ * (emphasis, code, heading, quote) dropped, and any run of dash-like, box-drawing or `=`
+ * characters read as hyphens. Letters that only look Latin (Cyrillic and the like) are not folded.
+ */
+const lookAlike = (line: string) =>
+  line
+    .normalize("NFKC")
+    .replaceAll(/\p{Cf}/gu, "")
+    .replaceAll(/[*_`~#>]/gu, "")
+    .replaceAll(/[\p{Pd}\u2212\u2500-\u257F=]+/gu, "-")
+    .trim();
 
 /**
  * Part 2 is someone else's text (the old session's, steerable by what it read): a line that looks
@@ -53,7 +68,7 @@ const LOOKS_LIKE_OURS = new RegExp(
 export const neutraliseNotes = (text: string) =>
   text
     .split("\n")
-    .map((line) => (LOOKS_LIKE_OURS.test(line.trim()) ? `> ${line}` : line))
+    .map((line) => (LOOKS_LIKE_OURS.test(lookAlike(line)) ? `> ${line}` : line))
     .join("\n");
 
 export const HANDOFF_RULES =

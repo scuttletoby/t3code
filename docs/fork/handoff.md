@@ -150,7 +150,15 @@ The new session's first message has these parts:
      not start" (exit code 126 or 127, as `timeout` reports it on Linux).
    - Point `command` at a program outside the repository: one inside it (`./scripts/x`, or a
      script an interpreter is given) can be edited by an agent, and runs with the server's
-     environment.
+     environment. A save that sets a new command checks this
+     (`fork/handoff/handoffCommandSaveCheck.ts`): the program must be a full path on the server's
+     OS, to a file that exists, outside any git checkout (a folder above it, or above the file a
+     link points to, holds `.git`); a script handed to an interpreter must be a full path, to a
+     file that exists, outside any checkout too. A command already stored at the same place is not
+     checked again, so a file moved since, or a hand edit, blocks no other save; it then fails at
+     the handoff as "its program could not start". The environment is the server's whole one: the
+     runner it shares with wait checks (upstream's `processRunner.ts`) always adds to it, so a
+     shorter list would need an upstream change.
    - **`agent`:** once the settle is over, T3 sends the old session one normal turn, the write
      turn: the setting's `instructions` (empty: a built-in text), then "start your reply with this
      line, alone: `[T3 handoff notes]`" and the 32 KB cap. It runs on the old session as it is (no
@@ -181,11 +189,22 @@ The new session's first message has these parts:
        latest run: a late update of the source run (a child settling, say), or a restart while
        it runs, starts a new loop, and that loop carries the write turn on to its handoff, with the
        same ids. A write turn that did not stop even after T3's stop sends its handoff when it ends.
-     - **Quiet.** A write turn that completes is marked quiet as the handoff run is (same rule,
-       same `:loud` suffix when the settle saw the relay not show the person's finish), so its
-       finish does not alert when it ends with no handoff. One the person steered into alerts. A
-       write turn that fails alerts as upstream's failed run: upstream's alert for a failed run
-       is in a file the fork does not change.
+       A restart that cuts the write turn short ends it `cancelled`, and upstream continues it in a
+       new run (`restartContinuationOfRunId`, with upstream's own "continue" prompt; a
+       continuation that fails before it starts is continued again, up to 3 in a row). T3 takes
+       that chain of runs as the one write turn: the handoff waits for its last run, judges the
+       chain's replies in order without upstream's prompts, and sends with the same ids, once; no
+       second write turn starts (`handoffWriteChain` in `handoffFacts.ts`). Each run of the chain
+       gets the 4-minute timeout from its own request.
+     - **Quiet.** A write turn that completes, or fails, is marked quiet as the handoff run is
+       (same rule, same `:loud` suffix when the settle saw the relay not show the person's
+       finish), so its end does not alert: the handoff, or the fallback at the size backstop,
+       follows. One the person steered into alerts. Upstream's alerts for a failed run (the relay's
+       in `packages/shared/src/agentAwareness.ts`, the browser's in
+       `ThreadNotificationCoordinator.tsx`) honour the mark once their announced seam lines are
+       in (`.github/fork-seams.json`); until then a failed write turn still alerts there. Those
+       lines also quiet a failed run a person asked to stop, as a completed one already is. A
+       failed handoff run is not marked: its retry, or its alert, follows.
 
    **If the source fails** (for `command`: an exit code other than 0, a timeout, empty output,
    output over the cap, a program that cannot start, a project that cannot be read; for `agent`: a

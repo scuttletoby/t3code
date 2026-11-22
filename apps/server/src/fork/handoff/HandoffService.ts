@@ -53,10 +53,10 @@ import {
   HANDOFF_MESSAGE_PREFIX,
   HANDOFF_RETRY_SUFFIX,
   handoffThreadFacts,
+  handoffWriteChain,
   handoffWriteIds,
   latestStartedRun,
   parseHandoffMessageId,
-  parseHandoffWrite,
   parseHandoffWriteMessageId,
 } from "./handoffFacts.ts";
 import { handoffMessageText } from "./handoffMessage.ts";
@@ -78,6 +78,31 @@ export const HANDOFF_WRITE_TIMEOUT = Duration.millis(HANDOFF_IDLE_LEAD_MS.agent)
 /** After T3 asked it to stop, how long the wait goes on for the write turn to end. */
 export const HANDOFF_WRITE_STOP_WAIT = Duration.minutes(1);
 const WRITE_ENDED = new Set(["completed", "interrupted", "failed", "cancelled", "rolled_back"]);
+/**
+ * A write turn that ended this way may have a restart continuation: upstream cancels a run
+ * a restart cut short, and continues again a continuation that failed before its prompt.
+ */
+const CUT_SHORT = new Set(["cancelled", "failed"]);
+
+/**
+ * A write turn's chain (`handoffWriteChain`) as one turn's items, in order: the continuations'
+ * prompts are upstream's, not a message that joined the write turn, so they are left out.
+ */
+function chainItems(
+  chain: ReadonlyArray<OrchestrationV2Run>,
+  items: ReadonlyArray<OrchestrationV2TurnItem>,
+): ReadonlyArray<OrchestrationV2TurnItem> {
+  const position = new Map(chain.map((member, index) => [member.id as string, index]));
+  const prompts = new Set<string>(chain.slice(1).map((member) => member.userMessageId));
+  return items
+    .flatMap((item) => {
+      const at = item.runId === null ? undefined : position.get(item.runId);
+      if (at === undefined) return [];
+      return item.type === "user_message" && prompts.has(item.messageId) ? [] : [{ at, item }];
+    })
+    .toSorted((left, right) => left.at - right.at || left.item.ordinal - right.item.ordinal)
+    .map(({ item }, ordinal) => ({ ...item, ordinal }));
+}
 
 /**
  * The write turns' own items left out of part 3: the prompt and the notes are not conversation.
@@ -174,9 +199,10 @@ export const make = Effect.gen(function* () {
         threadId,
         // Built only with a slot: a refused handoff asks again every 5 s and reads nothing more.
         text: Effect.gen(function* () {
-          // The latest runs, write turns not counted; the write turns among them are read too.
+          // The latest runs, write turns (and their restart continuations) not counted; the write
+          // turns among them are read too.
           const isWrite = (other: OrchestrationV2Run) =>
-            parseHandoffWriteMessageId(threadId, other.userMessageId) !== null;
+            handoffWriteChain(threadId, other, read.records.runs) !== null;
           const newest = read.records.runs.toSorted((left, right) => right.ordinal - left.ordinal);
           const oldest = newest.filter((other) => !isWrite(other)).at(TRANSCRIPT_RUNS - 1);
           const recent = newest.filter(
@@ -261,6 +287,23 @@ export const make = Effect.gen(function* () {
     nowMs - DateTime.toEpochMillis(write.completedAt) <= Duration.toMillis(HANDOFF_WRITE_TIMEOUT);
 
   /**
+   * The source run of the write turn a restart continuation carries on, read from the thread's
+   * runs; null for any other run. Unread counts as another run: its own turn end decides.
+   */
+  const continuedWrite = (threadId: ThreadId, run: OrchestrationV2Run) =>
+    projections.getThreadRecords(threadId, ["runs"], {}).pipe(
+      Effect.map(({ runs }) => handoffWriteChain(threadId, run, runs)?.write.runId ?? null),
+      Effect.catchCauseIf(
+        (cause) => !Cause.hasInterruptsOnly(cause),
+        (cause) =>
+          Effect.logWarning("handoff: a restart continuation's runs unread", {
+            threadId,
+            cause: Cause.pretty(cause),
+          }).pipe(Effect.as(null)),
+      ),
+    );
+
+  /**
    * A write turn, from wherever it is, to its handoff: waits for its end, stops it at its timeout,
    * judges the reply and sends (fixed ids: at most once). Any loop that finds a write turn as the
    * latest run comes here. `reason`: the trigger that started it; else the size decides.
@@ -269,15 +312,21 @@ export const make = Effect.gen(function* () {
     function* (
       threadId: ThreadId,
       found: OrchestrationV2Run,
+      runs: ReadonlyArray<OrchestrationV2Run>,
       waiting: Waiting,
       reason?: "size" | "idle" | "asked",
     ) {
-      const parsed = parseHandoffWrite(threadId, found.userMessageId);
-      if (parsed === null) return;
+      // `found` is the write turn or its restart continuation: the chain is one write turn.
+      const origin = handoffWriteChain(threadId, found, runs);
+      if (origin === null) return;
+      const parsed = origin.write;
+      let chain = origin.chain;
       carrying.add(found.id);
       yield* leavePlace(waiting);
       let write = found;
-      const deadlineMs =
+      // Each run of the chain gets the timeout: a restart is not the write turn's slowness, and
+      // upstream stops continuing after 3 restarts in a row.
+      let deadlineMs =
         DateTime.toEpochMillis(write.requestedAt) + Duration.toMillis(HANDOFF_WRITE_TIMEOUT);
       const stopWaitMs = Duration.toMillis(HANDOFF_WRITE_STOP_WAIT);
       let stopAsked = false;
@@ -291,7 +340,26 @@ export const make = Effect.gen(function* () {
         const now = runs.find((candidate) => candidate.id === write.id);
         if (now === undefined) return;
         write = now;
-        if (WRITE_ENDED.has(write.status)) break;
+        if (WRITE_ENDED.has(write.status)) {
+          // A restart cut it short and upstream continued it: carry on with the continuation.
+          const next = CUT_SHORT.has(write.status)
+            ? (yield* projections.getThreadRecords(threadId, ["runs"], {})).runs.find(
+                (candidate) => candidate.restartContinuationOfRunId === write.id,
+              )
+            : undefined;
+          if (next === undefined) break;
+          yield* Effect.logInfo("handoff write turn continued after a restart", {
+            threadId,
+            runId: next.id,
+          });
+          carrying.add(next.id);
+          chain = [...chain.slice(0, -1), write, next];
+          write = next;
+          deadlineMs =
+            DateTime.toEpochMillis(write.requestedAt) + Duration.toMillis(HANDOFF_WRITE_TIMEOUT);
+          stopAsked = false;
+          continue;
+        }
         const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
         if (!stopAsked && nowMs >= deadlineMs) {
           stopAsked = true;
@@ -331,12 +399,14 @@ export const make = Effect.gen(function* () {
         );
       }
       const { turnItems } = yield* projections.getThreadRecords(threadId, ["turnItems"], {
-        turnItemRunIds: [write.id],
+        turnItemRunIds: chain.map((member) => member.id),
         turnItemTypes: ["user_message", "assistant_message", "run_interrupt_request"],
       });
+      // Judged as one turn: the write turn's prompt, its end, and the chain's items in order,
+      // without upstream's "Continue where you left off" prompts (no person's message).
       const agent = handoffAgentReply(
-        write,
-        turnItems.filter((item) => item.runId === write.id),
+        { status: write.status, userMessageId: chain[0]!.userMessageId },
+        chainItems(chain, turnItems),
       );
       // Read now: part 1 is T3's state at the send, not before the write turn.
       const read = yield* readThread(threadId);
@@ -391,7 +461,7 @@ export const make = Effect.gen(function* () {
         });
       }
     },
-    (effect, _threadId, found) =>
+    (effect, _threadId, found, _runs) =>
       // Decided (sent, judged or left): no longer in hand. A loop replaced mid-way keeps it, so the
       // loop that replaces it carries it on.
       effect.pipe(
@@ -414,7 +484,7 @@ export const make = Effect.gen(function* () {
     const last = runs
       .filter(
         (candidate) =>
-          parseHandoffWriteMessageId(threadId, candidate.userMessageId) !== null ||
+          handoffWriteChain(threadId, candidate, runs) !== null ||
           parseHandoffMessageId(threadId, candidate.userMessageId) !== null,
       )
       .reduce<OrchestrationV2Run | undefined>(
@@ -422,8 +492,7 @@ export const make = Effect.gen(function* () {
           newest === undefined || candidate.ordinal > newest.ordinal ? candidate : newest,
         undefined,
       );
-    if (last === undefined || parseHandoffWriteMessageId(threadId, last.userMessageId) === null)
-      return false;
+    if (last === undefined || handoffWriteChain(threadId, last, runs) === null) return false;
     if (last.status !== "interrupted") return false;
     const { turnItems } = yield* projections.getThreadRecords(threadId, ["turnItems"], {
       turnItemRunIds: [last.id],
@@ -477,11 +546,11 @@ export const make = Effect.gen(function* () {
         const latestRun = latestStartedRun(read.records.runs);
         if (
           latestRun !== undefined &&
-          parseHandoffWriteMessageId(threadId, latestRun.userMessageId) !== null
+          handoffWriteChain(threadId, latestRun, read.records.runs) !== null
         ) {
           yield* endSettle;
           if (!carriesOn(latestRun, DateTime.toEpochMillis(yield* DateTime.now))) return;
-          yield* finishWrite(threadId, latestRun, waiting);
+          yield* finishWrite(threadId, latestRun, read.records.runs, waiting);
           return;
         }
         const latest = handoffThreadFacts(read.records).lastRun;
@@ -617,7 +686,7 @@ export const make = Effect.gen(function* () {
               );
               if (write === undefined) return;
               yield* endSettle;
-              yield* finishWrite(threadId, write, waiting, decision.reason);
+              yield* finishWrite(threadId, write, runs, waiting, decision.reason);
               return;
             }
             // Dropped or queued behind a newer run: that run's turn end decides.
@@ -764,6 +833,13 @@ export const make = Effect.gen(function* () {
     yield* forkParked(
       Stream.runForEach(orchestrator.streamDomainEvents, (event) =>
         Effect.gen(function* () {
+          // A restart continuation's write turn, read before the wake below: a read after it would
+          // let the woken loop send and end first, and this event would then start a second loop
+          // for the same write turn.
+          const continued =
+            event.type === "run.updated" && event.payload.restartContinuationOfRunId !== undefined
+              ? yield* continuedWrite(event.threadId, event.payload)
+              : null;
           const wake = wakes.get(event.threadId);
           if (wake !== undefined) {
             wakes.delete(event.threadId);
@@ -788,8 +864,9 @@ export const make = Effect.gen(function* () {
           }
           // The write turn's update wakes its wait (above); it is no turn end of its own. With no
           // loop on the thread (a restart mid write turn, or a loop that gave up waiting for its
-          // stop) it starts one, which carries the write turn on (`carriesOn`).
-          const write = parseHandoffWriteMessageId(run.threadId, run.userMessageId);
+          // stop) it starts one, which carries the write turn on (`carriesOn`). Upstream's
+          // continuation of a write turn after a restart is that write turn.
+          const write = parseHandoffWriteMessageId(run.threadId, run.userMessageId) ?? continued;
           if (write !== null) {
             yield* FiberMap.run(
               timers,

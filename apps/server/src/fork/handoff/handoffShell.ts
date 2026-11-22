@@ -1,8 +1,8 @@
 /**
- * Fork: a completed quiet handoff run, or the `agent` source's write turn before it, shows in the
- * thread shell as upstream's stopped run (`latestRunStopRequested`), so the browser's notice and
- * the relay stay quiet through upstream's own gates. One rule, read in the shell's JavaScript path
- * and mirrored in its SQL path.
+ * Fork: a completed quiet handoff run, or the `agent` source's write turn before it (completed or
+ * failed), shows in the thread shell as upstream's stopped run (`latestRunStopRequested`), so the
+ * browser's notice and the relay stay quiet through upstream's own gates. One rule, read in the
+ * shell's JavaScript path and mirrored in its SQL path.
  */
 import type {
   OrchestrationV2ConversationMessage,
@@ -42,9 +42,19 @@ function quietCandidate(threadId: ThreadId, messageId: string): string | null {
 }
 
 /**
- * A completed first-send handoff run or write turn, not loud, sent by the server, with no message
- * of the person's, requested at least the relay's hold after the person's run finished. Anything
- * else (a retry, a steered write turn) alerts; a failed write turn is upstream's failed run.
+ * A run that may end quiet: a completed run, or a failed write turn. The handoff follows a
+ * failed write turn at once, with the reason, so the failure is not lost; a failed handoff run is
+ * not quiet, as no message follows it but its retry. Upstream gates a failed run's alert on the
+ * mark only once the awareness line `.github/fork-seams.json` announces is in.
+ */
+const endsQuiet = (threadId: ThreadId, run: Pick<OrchestrationV2Run, "status" | "userMessageId">) =>
+  run.status === "completed" ||
+  (run.status === "failed" && parseHandoffWrite(threadId, run.userMessageId) !== null);
+
+/**
+ * A completed first-send handoff run, or a completed or failed write turn, not loud, sent by the
+ * server, with no message of the person's, requested at least the relay's hold after the person's
+ * run finished. Anything else (a retry, a steered write turn, a failed handoff run) alerts.
  */
 export function isQuietHandoffRun(
   threadId: ThreadId,
@@ -52,7 +62,7 @@ export function isQuietHandoffRun(
   messages: ReadonlyArray<QuietMessage>,
   sourceRun: Pick<OrchestrationV2Run, "id" | "completedAt"> | undefined,
 ): boolean {
-  if (run.status !== "completed") return false;
+  if (!endsQuiet(threadId, run)) return false;
   const sourceRunId = quietCandidate(threadId, run.userMessageId);
   if (sourceRunId === null) return false;
   const prompt = messages.find((message) => message.id === run.userMessageId);
@@ -104,7 +114,7 @@ export const quietHandoffRunOrSql = (sql: SqlClient.SqlClient, alias: string) =>
     ELSE '' END)`;
   const endsWith = (suffix: string) => sql`substr(${rest}, ${-suffix.length}) = ${suffix}`;
   return sql`COALESCE((CASE
-    WHEN ${run}.status = 'completed'
+    WHEN (${run}.status = 'completed' OR (${run}.status = 'failed' AND ${startsWith(HANDOFF_WRITE_PREFIX)}))
       AND ${rest} <> ''
       AND NOT ${endsWith(HANDOFF_RETRY_SUFFIX)}
       AND NOT ${endsWith(HANDOFF_LOUD_SUFFIX)}

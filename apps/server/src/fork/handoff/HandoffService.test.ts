@@ -1753,6 +1753,78 @@ describe("HandoffService, agent source", () => {
     SHORT_TIMEOUT_MS,
   );
 
+  it.effect.each([
+    ["the new server sees only the continuation", false],
+    ["the server sees the cut-short write turn, then its continuation", true],
+  ] as const)(
+    "a restart continues the write turn in a new run (#837): %s; one handoff, no second write turn",
+    ([, seesWrite]) =>
+      Effect.gen(function* () {
+        const data = projection(usage.size);
+        // Upstream's restart: the write run ends cancelled, a continuation run carries on with
+        // its own prompt and writes the marked reply.
+        const write = run({
+          id: RunId.make("write-2"),
+          ordinal: 2,
+          userMessageId: MessageId.make(`handoff-write:${threadId}:${runId}`),
+          status: "cancelled",
+          requestedAt: at(),
+          startedAt: at(),
+          completedAt: at(),
+        });
+        const continuation = run({
+          id: RunId.make("continue-3"),
+          ordinal: 3,
+          userMessageId: MessageId.make(`message:restart-continuation:${write.id}`),
+          restartContinuationOfRunId: write.id,
+          status: "running",
+          requestedAt: at(),
+          startedAt: at(),
+          completedAt: null,
+        });
+        const state = {
+          data: {
+            ...data,
+            runs: [...data.runs, write, continuation],
+            turnItems: [
+              turnItem(write.id, 1, {
+                type: "user_message",
+                messageId: write.userMessageId,
+                text: "Write it.",
+              }),
+              turnItem(write.id, 3, { type: "assistant_message", text: "Looking at the" }),
+              turnItem(continuation.id, 1, {
+                type: "user_message",
+                messageId: continuation.userMessageId,
+                text: "Continue from where you left off.",
+              }),
+            ],
+          },
+          settings: on,
+        };
+        const { sent, emit, events } = yield* harness(state);
+        if (seesWrite) yield* Queue.offer(events, runUpdated(write));
+        yield* emit(runUpdated(continuation), "readThread", 1);
+        yield* TestClock.adjust(MINUTE_MS);
+        expect(sent).toEqual([]);
+        const done = { ...continuation, status: "completed" as const, completedAt: at() };
+        state.data = {
+          ...state.data,
+          runs: state.data.runs.map((one) => (one.id === done.id ? done : one)),
+          turnItems: [
+            ...state.data.turnItems,
+            turnItem(continuation.id, 3, { type: "assistant_message", text: WRITTEN }),
+          ],
+        };
+        yield* Queue.offer(events, runUpdated(done));
+        yield* emit(null, "finishWrite", 1);
+        expect(messages(sent).map((one) => one.messageId)).toEqual([handoffMessageId]);
+        expect(part2(sent)[0]).toContain("Goal: ship X.");
+        expect(writes(sent)).toEqual([]);
+      }),
+    SHORT_TIMEOUT_MS,
+  );
+
   it.effect(
     "after a restart, a write turn that ended long before sends nothing; no new write turn either",
     () =>

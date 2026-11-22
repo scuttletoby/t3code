@@ -296,6 +296,44 @@ describe("the thread shell of a completed quiet handoff run", () => {
   );
 
   it.effect(
+    "a failed quiet write turn reads as stopped (#836); loud, steered or a failed handoff run does not",
+    () =>
+      Effect.gen(function* () {
+        const write = MessageId.make(`handoff-write:${threadId}:${runId}`);
+        const writeWorld = (
+          id: MessageId,
+          status: OrchestrationV2Run["status"],
+          extra: ReadonlyArray<OrchestrationV2ConversationMessage> = [],
+        ): World => ({
+          runs: [run(), handoffRun({ userMessageId: id, status })],
+          messages: [userMessage, handoffMessage(id), ...extra],
+        });
+        /**
+         * Every shell read's mark, in a fresh store. The relay's phase is left out: upstream reads
+         * the mark for a failed run only once the awareness line the seam list announces is in.
+         */
+        const marks = (world: World) =>
+          Effect.gen(function* () {
+            yield* seed(world);
+            const { relayPhase: _relayPhase, latestRunId, ...read } = yield* readStop();
+            assert.equal(latestRunId, handoffRunId);
+            return [...new Set(Object.values(read))];
+          }).pipe(Effect.provide(storeLayer));
+        assert.deepStrictEqual(yield* marks(writeWorld(write, "failed")), [true]);
+        const loud = MessageId.make(`${write}${HANDOFF_LOUD_SUFFIX}`);
+        assert.deepStrictEqual(yield* marks(writeWorld(loud, "failed")), [false]);
+        const steer = message({ id: MessageId.make("message-steer"), runId: handoffRunId });
+        assert.deepStrictEqual(yield* marks(writeWorld(write, "failed", [steer])), [false]);
+        // A failed handoff run gets a retry, not a handoff after it: it alerts as before.
+        assert.deepStrictEqual(yield* marks(writeWorld(handoffMessageId, "failed")), [false]);
+        // An interrupted or cancelled write turn raises no failed alert upstream: left as it was.
+        for (const status of ["interrupted", "cancelled"] as const) {
+          assert.deepStrictEqual(yield* marks(writeWorld(write, status)), [false]);
+        }
+      }),
+  );
+
+  it.effect(
     "stopped half-way: a handoff run still running or failed, or its prompt not stored yet, alerts as before",
     () =>
       Effect.gen(function* () {
