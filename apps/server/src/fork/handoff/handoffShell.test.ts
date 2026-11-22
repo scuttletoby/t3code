@@ -271,6 +271,31 @@ describe("the thread shell of a completed quiet handoff run", () => {
   );
 
   it.effect(
+    "a write turn (the agent source) ending with no handoff is quiet too; loud or steered alerts",
+    () =>
+      Effect.gen(function* () {
+        const writeWorld = (
+          id: MessageId,
+          extra: ReadonlyArray<OrchestrationV2ConversationMessage> = [],
+        ) => ({
+          runs: [run(), handoffRun({ userMessageId: id })],
+          messages: [userMessage, handoffMessage(id), ...extra],
+        });
+        const write = MessageId.make(`handoff-write:${threadId}:${runId}`);
+        yield* caseOf(writeWorld(write), true);
+        yield* caseOf(writeWorld(MessageId.make(`${write}${HANDOFF_LOUD_SUFFIX}`)), false);
+        const steer = message({ id: MessageId.make("message-steer"), runId: handoffRunId });
+        yield* caseOf(writeWorld(write, [steer]), false);
+        // For another thread's run, or no run: not this thread's write turn.
+        yield* caseOf(
+          writeWorld(MessageId.make(`handoff-write:${threadId}-other:${runId}`)),
+          false,
+        );
+        yield* caseOf(writeWorld(MessageId.make(`handoff-write:${threadId}:`)), false);
+      }),
+  );
+
+  it.effect(
     "stopped half-way: a handoff run still running or failed, or its prompt not stored yet, alerts as before",
     () =>
       Effect.gen(function* () {
