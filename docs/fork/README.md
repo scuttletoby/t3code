@@ -759,19 +759,28 @@ file (light 384 MB, writer 768 MB), and an agent's kind comes from its task `rol
 `review` and `design` are light, anything else or no role is a writer). A role can be wrong: a
 running agent that uses more than a light cost counts as a writer, and so does one whose memory
 cannot be read, whatever its role (it is taken to use a light cost already, so it is never counted
-twice). The floors (2 agents, 1 job) always start, whatever the readings, unless real readings say
+twice). So where agent memory cannot be read, every agent counts as a writer (768 MB, of which 384
+are taken as in use): on macOS, Windows and Linux without systemd, and for Codex threads, which share
+one scope, that caps writers at about 2 to 4 on a small machine. It is the strict side, by design. The floors (2 agents, 1 job) always start, whatever the readings, unless real readings say
 "severe". The agent ceiling is 3 per core, at most 64, only on Linux with cgroup v2, agents in their
 own scopes and the kernel's OOM counter; anywhere else it stays at 10 agents and 4 jobs. After an
 OOM kill (`oom_kill` in `/proc/vmstat` rises) or with swap under 10% free and filling, the gate falls
-back to at most 10 agents and 4 jobs. A kill inside an agents' slice also raises each agent cost by
+back to at most 10 agents and 4 jobs. Swap is "filling" when its free MB fell by more than the rule's
+`swapFillingMb` since a reading at least 25 seconds old, so a burst of asks a second apart never hides
+slow filling. Only the kernel's own OOM kills count: a killer that runs as a program (earlyoom,
+systemd-oomd) moves no counter, so its kills trip nothing and raise nothing (the next readings still
+see the memory it freed). A kill inside an agents' slice also raises each agent cost by
 25% (a kill elsewhere, such as a build box at its own cap, does not; where the slices cannot be
-read, at most 2 raises). Ten minutes of calm, whole readings lift the fallback and take one raise
-off; each further calm spell takes off one more. The gate reads the machine every 30 seconds as
+read, at most 2 raises). Ten minutes of calm, whole readings lift the fallback and keep the raises (so
+kills about 11 minutes apart keep their raise); each further calm spell takes off one. The gate reads the machine every 30 seconds as
 well as at each ask. A restarted server starts in the fallback and at "elevated", which lifts
 after about a minute of calm readings (no stall, memory above the margin, swap not filling: swap
 that is full of old pages does not count). Readings that fail count as "elevated": the floors still
 start, and after 2 minutes without a whole reading agents are counted against the fixed 10 until one
-comes back. Settings that cannot be read give the fixed 10 too (with a warning), never no limit.
+comes back. A reading that fails, or one with a part that cannot be read (a box's pressure file),
+after the level was "ok" lifts again like a start (memory above the margin, not 150 % of it), so it
+never keeps the gate "elevated" for good. A reading of the 30-second timer that fails or crashes is
+logged and the timer goes on. Settings that cannot be read give the fixed 10 too (with a warning), never no limit.
 Typed limits (`maxPerMachine`, ...) still apply while `enabled`. Without `mode`, a
 switched-on gate is `"fixed"` (a file from an older build decides exactly as before) and a
 switched-off one is `"enforce"`; a mode this build does not know (from a newer build) is `"fixed"`.
