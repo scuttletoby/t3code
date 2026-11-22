@@ -7,7 +7,7 @@ actionsDisable.refuseScripts names one script (example_garden.py --fix); the run
 
 (a test runner handed the folder, not `python3 this-file` from an agent's shell: the guard reads the script files an
 agent runs, and this one is full of the patterns it refuses.)"""
-import datetime as dt, json, os, subprocess, sys, tempfile, unittest
+import datetime as dt, json, os, re, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -943,7 +943,8 @@ FILES = {
     'w.yml': 'w: workflow\n',
     'ok.yml': 'co: pr checkout\n',
     'rs_off.json': '{"name": "main", "enforcement": "disabled", "rules": []}\n',
-    'rs_on.json': '{"name": "main", "enforcement": "active", "rules": []}\n',
+    'rs_on.json': '{"name": "main", "enforcement": "active", "rules": [{"type": "required_status_checks",\n'
+                  ' "parameters": {"required_status_checks": [{"context": "ci"}]}}]}\n',
     'off.txt': 'disabled\n',
     'prot.json': '{"required_status_checks": {"strict": true, "contexts": ["ci"]}, "enforce_admins": true,\n'
                  ' "required_pull_request_reviews": null, "restrictions": null}\n',
@@ -2654,9 +2655,15 @@ class CacheTest(CacheCase):
                                          stderr=subprocess.PIPE, text=True, cwd=self.dir,
                                          env={'PATH': '/usr/bin:/bin', 'HOME': self.dir}))
                     for i in range(6) for c in (f'python3 m{i}.py', 'python3 evil.py')]
-            for c, p in runs:
-                out, err = p.communicate(ev(c), timeout=60)
-                self.assertEqual('"deny"' in out, c == 'python3 evil.py', (c, out, err))
+            try:
+                for c, p in runs:
+                    out, err = p.communicate(ev(c), timeout=60)
+                    self.assertEqual('"deny"' in out, c == 'python3 evil.py', (c, out, err))
+            finally:   # a timeout or a failed check leaves no hook running behind the test
+                for _, p in runs:
+                    if p.poll() is None:
+                        p.kill()
+                        p.communicate()
         c = self.cache()
         self.assertEqual(c['v'], 1)
         self.assertIn(self.evil, c['files'])
@@ -2786,6 +2793,254 @@ class SlowBackendTest(CacheCase):
                 self.assertEqual(first and first['permissionDecision'], verdict)
                 self.assertGreater(took1, 3.0)
                 self.assertLess(took2, 0.9)
+
+
+class Issue930Test(Case):
+    """The open findings of #930: each test is red without its fix."""
+    T = 'gh workflow disable 1'
+
+    def refused(self, *cmds, env=None):
+        for cmd in cmds:
+            with self.subTest(cmd=cmd[-70:]):
+                self.assertIsNotNone(self.decide(cmd, env), cmd[-70:])
+
+    def passes(self, *cmds, env=None):
+        for cmd in cmds:
+            with self.subTest(cmd=cmd[-70:]):
+                self.assertIsNone(self.decide(cmd, env), cmd[-70:])
+
+    def test_1_sed_e_glued_to_its_address_is_read(self):
+        T = self.T
+        self.write('a.txt', 'hello\n', 0o644)
+        self.write('notes.md', 'never run ' + T + ' here\n', 0o644)
+        self.write('run.sed', '1e ' + T + '\n', 0o644)
+        self.write('ok.sed', 's/a/b/g\n', 0o644)
+        self.refused(f"sed '1e{T}' a.txt", f"sed '$e{T}' a.txt", f"sed '/x/e{T}' a.txt", f"sed -n '1!e{T}' a.txt",
+                     f"sed -e p -e'1e{T}' a.txt", f"sed -ne'1e{T}' a.txt", f"sed --expression='2e{T}' a.txt",
+                     f"sed '1{{e{T}\n}}' a.txt", f"sed 'p;1e{T}' a.txt", f"sed -i.bak '1e{T}' a.txt",
+                     'sed -nf run.sed a.txt', 'sed -f run.sed a.txt', f"echo x | sed '1e{T}'",
+                     # the input names a guarded command and sed runs it as shell
+                     'sed e notes.md', "sed 's/^never run //e' notes.md", "sed -n '1e' notes.md",
+                     f"echo '{T}' | sed e", "sed 's/x/y/'$F notes.md")
+        self.passes("sed 's/a/b/g' a.txt", "sed -n '1,20p' a.txt", "sed ':a;N;$!ba;s/\\n/ /g' a.txt",
+                    "sed '1i\\\nhello' a.txt", "sed 'y/ab/cd/' a.txt", "sed -n '/^e/p' notes.md",
+                    "sed 's/run/walk/' notes.md", 'sed "s/a/$X/g" notes.md', "sed -i 's/hello/bye/' a.txt",
+                    'sed -f ok.sed notes.md', "sed '$a the end' notes.md", "sed '1d;$d' notes.md",
+                    "sed --sandbox 's/a/b/' notes.md", "sed -E 's/(e)x/\\1/' notes.md")
+
+    def path_env(self, *dirs):
+        return dict(self.env, PATH=':'.join([os.path.join(self.dir, d) for d in dirs] + ['/usr/bin', '/bin']))
+
+    def test_2_a_glob_write_target_that_can_be_a_run_name_counts(self):
+        T, D = self.T, self.dir
+        self.write('run.sh', T + '\n')
+        self.write('p.txt', 'bash run.sh\n', 0o644)
+        self.write('q.txt', T + '\n', 0o644)
+        self.write('a.txt', 'hello\n', 0o644)
+        self.write('.local/bin/ls', 'echo hi\n')
+        env = self.path_env('.local/bin')
+        with mock.patch.dict(os.environ, {'HOME': D}):   # ~ is the hook's own HOME
+            self.refused('tee ~/.local/bin/* <p.txt; ls', 'tee ~/.local/bin/?? <p.txt; ls',
+                         'tee ~/.local/bin/*? <p.txt; ls', 'cat p.txt > ~/.local/bin/*; ls',
+                         'cd ~/.local/bin; tee * <~/p.txt; ls', 'n=ls; tee ~/.local/bin/$n <p.txt; ls',
+                         f'cat p.txt > {D}/.local/bin/ls; ls', f'cat p.txt | tee {D}/.local/bin/ls; ls',
+                         f'echo bash run.sh | tee {D}/.local/bin/ls; ls',
+                         f'cat p.txt | grep bash > {D}/.local/bin/ls; ls', f'cp p.txt {D}/.local/bin/ls; ls',
+                         f'cp q.txt {D}/.local/bin/ls; ls', f'cat q.txt > {D}/.local/bin/ls; ls',
+                         f'ln -sf {D}/run.sh {D}/.local/bin/ls; ls', f'cat q.txt > {D}/.local/bin/*; ls',
+                         'tee * < p.txt; ls', env=env)
+            # lockout care: text with no guarded call, or nothing run under the name
+            self.passes('tee ~/.local/bin/* <a.txt; ls', 'ls ~/.local/bin/*', 'cat p.txt > "$OUT"; ls',
+                        'echo hi > out/*; ls', 'jq . data.json > "$out"; ls', f'cat p.txt > {D}/.local/bin/x; ls',
+                        'cat q.txt > out.txt; ls', f'cat a.txt > {D}/.local/bin/ls; ls',
+                        f'cp a.txt {D}/.local/bin/ls; ls', 'cp q.txt backup/; ls', 'cp q.txt q.bak && wc -l q.bak',
+                        'ls -la', 'cat q.txt | grep foo | wc -l', env=env)
+
+    def test_3_programs_that_rg_and_sort_run(self):
+        T = self.T
+        self.write('x.sh', '#!/bin/sh\n' + T + '\n')
+        self.write('ok.sh', '#!/bin/sh\ncat "$1"\n')
+        self.write('a.txt', 'hello\n', 0o644)
+        self.refused('rg --pre ./x.sh foo .', 'rg --pre=./x.sh foo .', 'rg --hostname-bin ./x.sh foo',
+                     'rg --hostname-bin=./x.sh foo', 'sort --compress-program ./x.sh a.txt',
+                     'sort --compress-program=./x.sh a.txt', 'sort --compress-prog=./x.sh a.txt',
+                     'sort --comp ./x.sh a.txt', 'sort -S 1M --co=./x.sh a.txt', f'rg --pre "{T}" foo')
+        self.passes('rg --pre ./ok.sh foo .', "rg --pre-glob '*.pdf' --pre ./ok.sh foo", "rg --pre-glob '*.x.sh' foo",
+                    'sort --compress-program=gzip a.txt', 'sort --check a.txt', 'rg -n hostname-bin docs',
+                    'rg -- --pre ./x.sh')
+
+    def test_4_a_text_script_on_path_under_a_data_name_is_read(self):
+        T, D = self.T, self.dir
+        self.write('tools/ls', T + '\n')
+        self.write('okt/ls', 'echo hi\n')
+        self.write('q.txt', T + '\n', 0o644)
+        self.write('a.txt', 'hello\n', 0o644)
+        self.write('bin2/cat', 'echo \x00bin\n')   # a compiled program: trusted, as before
+        self.write('bin2/head', T + '\n')
+        self.write('bin2/jq', 'echo jq\n')
+        env = self.path_env('.local/bin', 'bin2')
+        with mock.patch.dict(os.environ, {'HOME': D}):
+            self.refused(f'mv tools {D}/.local/bin', 'mv tools ~/.local/bin; ls', f'cp -r tools/. {D}/bin2',
+                         f'cp -t {D}/bin2 tools/ls', f'cp tools/* {D}/bin2', 'head -3 a.txt', 'head -3 a.txt | wc -l',
+                         'ls; head a.txt', env=env)
+            self.passes(f'mv okt {D}/.local/bin', 'cat a.txt', 'jq . x.json', 'ls -la', 'mv q.txt notes/',
+                        'cp q.txt q2.txt', f'cp okt/ls {D}/.local/bin/', env=env)
+        for cmd in ('head -3 a.txt', f'mv tools {D}/.local/bin'):   # not passed by the fast exit
+            self.assertTrue(self.g.quick_shadowed(cmd, D, env), cmd)
+
+    def test_5_6_run_positions_decide_not_file_names(self):
+        T = self.T
+        pad = ('#' * 100 + '\n') * 300   # past the (lowered) size the guard reads whole
+        self.write('f', pad + T + '\n', 0o644)
+        self.write('x.sh', '#!/bin/sh\n' + T + '\n', 0o000)
+        self.write('y', T + '\n', 0o000)
+        self.write('big.js', pad + 'console.log(1)\n', 0o644)
+        self.write('data.log', pad + 'hello\n')
+        with mock.patch.object(self.g, 'MAX_FILE', 10_000), mock.patch.object(self.g, 'HARD_FILE', 20_000):
+            self.refused('eval "$(cat f)"', 'source <(cat f)', '. <(cat f)', 'bash -c "$(cat f)"',
+                         'bash <<< "$(cat f)"', 'cat f | grep -v x | bash', 'cat f | sed 1d | sh',
+                         'python3 -W ignore < f', 'python3 -X dev < f', 'bash < f', 'cat f | bash',
+                         'source <(sudo cat x.sh)', 'eval "$(cat y)"', 'bash -c "$(cat y)"')
+            # (gzip -c big.js > b.gz stays refused: gzip is no tool the guard knows, so a .js file it is handed may
+            # be a script it runs; see "Known over-refusals")
+            self.passes('cat f | gzip > f.gz', 'cat big.js | gzip > b.gz', 'cp data.log out.log', 'grep -c hello f',
+                        'cat big.js | wc -l')
+
+    def test_5_the_stated_depth_is_the_depth(self):
+        """The docstring says from which depth a script call passes; one level less is still refused."""
+        n = int(re.search(r'script (\d+) or more levels deep', self.g.__doc__).group(1))
+        names = [f's{i}.sh' for i in range(n + 1)]
+
+        def chain(levels):
+            d = os.path.join(self.dir, f'c{levels}')
+            for i in range(levels - 1):
+                self.write(f'c{levels}/{names[i]}', f'bash ./{names[i + 1]}\n')
+            self.write(f'c{levels}/{names[levels - 1]}', self.T + '\n')
+            return self.g.decide(f'bash {names[0]}', d, self.env)
+
+        self.assertIsNotNone(chain(n - 1), f'{n - 1} levels')
+        self.assertIsNone(chain(n), f'{n} levels (the docstring says this passes)')
+
+    def test_7_a_guard_file_changed_after_the_start_gives_no_start_stat(self):
+        g, now = self.g, time.time()
+        new = [1, 2, 3, int(now * 1e9), int(now * 1e9)]
+        old = [1, 2, 3, int((now - 60) * 1e9), int((now - 60) * 1e9)]
+        with mock.patch.object(g, 'since_start', return_value=1.0):
+            with mock.patch.object(g, 'guard_sig', return_value=new):
+                self.assertIsNone(g.start_sig())
+            with mock.patch.object(g, 'guard_sig', return_value=old):
+                self.assertEqual(g.start_sig(), old)
+
+    def test_8_the_owner_marker_is_read_before_the_save(self):
+        g, calls = self.g, []
+        with mock.patch.object(g, 'owner_marker', side_effect=lambda why, *a, **k: calls.append('marker') or why), \
+                mock.patch.object(g, 'cache_save', side_effect=lambda ctx: calls.append('save')):
+            self.assertIsNotNone(g.decide(self.T + ' ' + MARK_CMD + ':123456', self.dir, self.env))
+        self.assertEqual(calls, ['marker', 'save'])
+
+    def test_9_the_deny_is_printed_before_the_save(self):
+        import contextlib, io
+        g, out, seen = self.g, io.StringIO(), []
+        ev = json.dumps({'tool_name': 'Bash', 'cwd': self.dir, 'tool_input': {'command': self.T}})
+        with mock.patch.object(sys, 'stdin', io.StringIO(ev)), mock.patch.dict(os.environ, {'HOME': self.dir}), \
+                mock.patch.object(g, 'cache_save', side_effect=lambda ctx: seen.append(out.getvalue())), \
+                contextlib.redirect_stdout(out):
+            g.main()
+        self.assertTrue(seen, 'no save')
+        self.assertIn('"deny"', seen[0])
+
+    def test_10_write_then_run_pairs(self):
+        """Generated: every writer x target spelling x runner x name, with a harmless file of that name on PATH."""
+        D, g = self.dir, self.g
+        self.write('run.sh', self.T + '\n')
+        self.write('p.txt', 'bash run.sh\n', 0o644)
+        names = ('ls', 'date', 'cat', 'wc')
+        cmds = []   # (command, PATH): one PATH folder per name, holding only that name
+        for n in names:
+            self.write(f'b_{n}/{n}', 'echo hi\n')
+            env = self.path_env(f'b_{n}')
+            for spell in (n, n[0] + '?' * (len(n) - 1), f'[{n[0]}]{n[1:]}', '*', n[0] + '*'):
+                t = f'{D}/b_{n}/{spell}'
+                # with the harmless cat on PATH, `cat p.txt` writes "hi", which is harmless: no cat writer there
+                writers = [f'tee {t} < p.txt', f'cp p.txt {t}', f'echo bash run.sh > {t}'] + \
+                    ([f'cat p.txt > {t}'] if n != 'cat' else [])
+                for write in writers:
+                    for run in (f'; {n}', f' && {n} -l', f'\n{n} x'):
+                        cmds.append((write + run, env))
+        for cmd, env in cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(g.decide(cmd, D, env))
+                self.assertFalse(g.quick_pass(cmd) and not g.quick_shadowed(cmd, D, env))
+        # the generator finds the bugs it is for: each mutant lets some through
+        with mock.patch.object(g, 'same_name', lambda a, b: a == b):
+            self.assertTrue(any(g.decide(c, D, e) is None for c, e in cmds), 'same_name mutant')
+        with mock.patch.object(g, 'quick_glob_names', lambda *a: False), \
+                mock.patch.object(g, 'quick_shadowed', lambda *a: False):
+            self.assertTrue(any(g.quick_pass(c) for c, _ in cmds), 'quick_glob_names mutant')
+
+    def test_11_noclobber_redirects_are_no_pipe(self):
+        for cmd in ('echo x >&| f', 'echo x >>| f', 'echo x >| f', 'echo x &>| f'):
+            self.assertIsNone(self.g.quick_words(cmd), cmd)
+
+    def test_13_writes_that_empty_protection_or_a_ruleset(self):
+        P = 'repos/o/r/branches/main/protection'
+        R = 'repos/o/r/rulesets/1'
+        U = 'https://api.github.com/'
+        rsc = '"required_status_checks": %s, "enforce_admins": true, "required_pull_request_reviews": null, ' \
+              '"restrictions": null'
+        for name, val in (('ok', '{"strict": true, "contexts": ["ci"]}'), ('none', 'null'),
+                          ('emp', '{"strict": true, "contexts": []}'), ('chk', '{"checks": [{"context": "ci"}]}')):
+            self.write(f'{name}.json', '{' + rsc % val + '}', 0o644)
+        self.write('bad.json', 'not json', 0o644)
+        self.write('rsc_empty.json', '{"strict": true, "contexts": [], "checks": []}', 0o644)
+        for name, text in (('rs_empty', '{"rules": []}'), ('rs_nochk', '{"rules": [{"type": "deletion"}]}'),
+                           ('rs_emptychk', '{"rules": [{"type": "required_status_checks", "parameters": '
+                                           '{"required_status_checks": []}}]}'),
+                           ('rs_ok', '{"rules": [{"type": "deletion"}, {"type": "required_status_checks", '
+                                     '"parameters": {"required_status_checks": [{"context": "ci"}]}}]}'),
+                           ('rs_name', '{"name": "main rules"}')):
+            self.write(f'{name}.json', text, 0o644)
+        UBP, URR = 'updateBranch' + 'ProtectionRule', 'updateRepository' + 'Ruleset'
+        q = "gh api graphql -f query='mutation%s { %s(input: {id: \"x\", %s}) { clientMutationId } }'"
+        self.refused(f'gh api -X PUT {P} --input none.json', f'gh api -X PUT {P} --input emp.json',
+                     f'gh api -X PUT {P} --input bad.json', f'gh api -X PUT {P} --input new.json',
+                     f'gh api -X PUT {P} -F required_status_checks=null -F enforce_admins=true',
+                     f"gh api -X PUT {P} -F 'required_status_checks[strict]=true' -F 'required_status_checks"
+                     "[contexts][]' -F enforce_admins=true", f'gh api -X PUT {P} -F enforce_admins=true',
+                     f"gh api --method PATCH {P}/required_status_checks -F 'contexts[]'",
+                     f'gh api -X PATCH {P}/required_status_checks --input rsc_empty.json',
+                     f"gh api -X PUT {P}/required_status_checks/contexts -F 'contexts[]'",
+                     f'gh api -X PUT {R} --input rs_empty.json', f'gh api -X PUT {R} --input rs_nochk.json',
+                     f'gh api -X PATCH {R} --input rs_emptychk.json', "gh api -X PUT orgs/o/rulesets/7 -F 'rules[]'",
+                     f"gh api -X PUT {R} -f 'rules[][type]=deletion'",
+                     f'gh api -X PUT "repos/o/r/branches/main/$P" --input ok.json',
+                     q % ('', UBP, 'requiresStatusChecks: false'), q % ('', UBP, 'requiredStatusCheckContexts: []'),
+                     q % ('($r: Boolean!)', UBP, 'requiresStatusChecks: $r') + ' -F r=false',
+                     q % ('($r: Boolean!)', UBP, 'requiresStatusChecks: $r'),
+                     q % ('', URR, 'rules: []'), q % ('', URR, 'rules: [{type: DELETION}]'),
+                     f"curl -q -X PUT -H 'Accept: application/json' {U}{P} -d @none.json",
+                     f"curl -q -X PUT {U}{P} -d '{{\"required_status_checks\": null}}'",
+                     f"curl -q -X PUT {U}{R} --json '{{\"rules\": []}}'", f'curl -q -X PUT {U}{P} -F x=y',
+                     f'wget --no-config --method=PUT --body-file=none.json {U}{P}',
+                     f'http PUT {U}{P} required_status_checks:=null')
+        self.passes(f'gh api -X PUT {P} --input ok.json', f'gh api -X PUT {P} --input chk.json',
+                    f"gh api -X PUT {P} -F 'required_status_checks[strict]=true' -f 'required_status_checks"
+                    "[contexts][]=ci' -F enforce_admins=true -F required_pull_request_reviews=null -F restrictions=null",
+                    f'gh api -X PATCH {P}/required_status_checks -F strict=true',
+                    f'gh api -X PATCH {P}/required_status_checks --input rs_empty.json',   # no checks named: kept
+                    f"gh api -X PATCH {P}/required_status_checks -f 'contexts[]=ci'",
+                    f"gh api -X POST {P}/required_status_checks/contexts -f 'contexts[]=lint'",
+                    f"gh api -X PUT {P}/required_status_checks/contexts -f 'contexts[]=ci' -f 'contexts[]=lint'",
+                    f'gh api -X POST {P}/enforce_admins', f'gh api -X PUT {R} --input rs_ok.json',
+                    f'gh api -X PUT {R} --input rs_name.json', f'gh api -X PUT {R} -f name=x -f enforcement=active',
+                    f'gh api {P}', 'gh api -X POST repos/o/r/rulesets --input rs_empty.json',
+                    q % ('', UBP, 'requiresStatusChecks: true, requiredStatusCheckContexts: ["ci"]'),
+                    q % ('($r: Boolean!)', UBP, 'requiresStatusChecks: $r') + ' -F r=true',
+                    q % ('', URR, 'name: "y"'),
+                    q % ('', URR, 'rules: [{type: REQUIRED_STATUS_CHECKS, parameters: {requiredStatusChecks: '
+                                  '{requiredStatusChecks: [{context: "ci"}]}}}]'),
+                    f'curl -q -X PUT {U}{P} -d @ok.json', f"curl -q -X PUT {U}{R} --json '{{\"name\": \"x\"}}'",
+                    f'curl -q -sS {U}{P}')
 
 
 if __name__ == '__main__':

@@ -405,6 +405,69 @@ class Install(fx.FakeHost):
                 shutil.rmtree(d)
                 self.assertEqual(self.run_main('uninstall')[0], 0)
 
+    # #931 item 4: the installer points found on an older guard installer, checked here
+    LEFTOVER = os.path.join(os.path.dirname(DROP_IN), '.agent-guards.json.k3x_9q2a.tmp')
+
+    def put(self, path, text):
+        """A file at host path `path` of the installed tree (self.make writes beside it, in the fake host)."""
+        os.makedirs(os.path.dirname(self.path(path)), exist_ok=True)
+        with open(self.path(path), 'w') as f:
+            f.write(text)
+        return self.path(path)
+
+    def leave_temp_copy(self):
+        """What a run killed between write_file's write and its rename leaves: a full copy of the drop-in."""
+        return self.put(self.LEFTOVER, wiring.drop_in_text())
+
+    def test_931_a_temp_copy_left_by_a_killed_run_is_removed_by_the_next_run(self):
+        self.assertEqual(self.install('--settings')[0], 0)
+        keep = self.put(os.path.join(os.path.dirname(DROP_IN), '.agent-guards.json.bak'), 'x')
+        conf_left = self.put(os.path.join(os.path.dirname(CONFIG), '.config.json.0abc_xyz.tmp'), '{')
+        self.leave_temp_copy()
+        code, _, err = self.install()   # nothing to write: the leftovers still go
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.lexists(self.path(self.LEFTOVER)))
+        self.assertFalse(os.path.lexists(conf_left))
+        self.assertTrue(os.path.exists(keep), 'a file with another name is not the kit\'s')
+        self.leave_temp_copy()
+        self.assertEqual(self.install('--no-settings')[0], 0)
+        self.assertFalse(os.path.lexists(self.path(self.LEFTOVER)))
+
+    def test_931_uninstall_is_not_refused_by_the_kits_own_temp_copy(self):
+        self.assertEqual(self.install('--settings')[0], 0)
+        self.leave_temp_copy()
+        code, out, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse(os.path.lexists(self.path(self.LEFTOVER)))
+        self.assertFalse(self.is_file('/usr/local/bin/actions-disable-guard'))
+
+    def test_931_keys_added_to_config_by_hand_are_kept(self):
+        self.assertEqual(self.install()[0], 0)
+        with open(self.path(CONFIG), 'w') as f:
+            json.dump({'version': 1, 'settings': False, 'note': 'set by hand', 'n': 100000}, f)
+        for extra in (('--settings',), (), ('--no-settings',)):
+            with self.subTest(extra):
+                code, _, err = self.install(*extra)
+                self.assertEqual(code, 0, err)
+                self.assertEqual((self.config()['note'], self.config()['n']), ('set by hand', 100000))
+        self.assertEqual(self.config()['settings'], False)
+        self.assertIsInstance(self.config()['settingsOff'], int)
+        self.assertEqual(self.install('--settings')[0], 0)
+        self.assertNotIn('settingsOff', self.config(), 'a key of the kit\'s own still goes when the kit drops it')
+
+    def test_931_a_config_with_nan_or_a_key_given_twice_is_refused(self):
+        self.assertEqual(self.install()[0], 0)
+        for text in ('{"version": 1, "settings": NaN}', '{"version": 1, "settings": Infinity}',
+                     '{"version": 1, "settings": true, "settings": false}'):
+            with self.subTest(text):
+                with open(self.path(CONFIG), 'w') as f:
+                    f.write(text)
+                code, _, err = self.install()
+                self.assertEqual(code, 1, err)
+                self.assertIn('cannot be read', err)
+                with open(self.path(CONFIG)) as f:
+                    self.assertEqual(f.read(), text, 'left as it was')
+
     def fresh(self):
         shutil.rmtree(self.root)
         os.makedirs(self.root)

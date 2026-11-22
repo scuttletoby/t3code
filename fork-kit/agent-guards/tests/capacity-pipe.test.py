@@ -54,6 +54,19 @@ REFUSED = [
     'stdbuf -oL t3-capacity 1 | tail',
     'stdbuf -o L t3-capacity 1 | tail',
     'time -p t3-capacity 2048 | tail -1 && x',
+    # #931: the keyword `time` before a group; a flag cluster whose value is glued on; env -S runs its value's words
+    'time { t3-capacity 2048; } | tail -1 && x',
+    'time -p { t3-capacity 2048; } | tail -1 && x',
+    '! time { t3-capacity 1; } | tail',
+    'sudo -uroot t3-capacity 1 | tail -1 && x',
+    'sudo -iuroot t3-capacity 1 | tail',
+    "env -S 't3-capacity 1' | tail",
+    "env -S't3-capacity 1' | tail",
+    "env -iS 't3-capacity 1' | tail",
+    "env --split-string='t3-capacity 1' | tail",
+    "env --split-string 'A=1 t3-capacity 1' | tail",
+    "env -S 'nice t3-capacity 1' | tail",
+    'env -S \'bash -c "t3-capacity 1 | tail"\'',
     'exec -a cap t3-capacity 1 | tail',
     # after && ; newline, in if / while / until / for / case, behind !
     'cd /x && t3-capacity 2048 | tail -1 && heavy x',
@@ -166,6 +179,13 @@ ALLOWED = [
     'nice -n t3-capacity x | tail',                          # the value of -n, not the command
     'function f { t3-capacity 2048 && x; }; f | tail',
     'time -p grep t3-capacity x | head',
+    # #931: these were refused: the value glued to -u was read as a flag cluster ending in -t (a value letter)
+    'sudo -uroot cat /usr/local/bin/t3-capacity | head',
+    'sudo -uroot diff /usr/local/bin/t3-capacity scripts/dev/t3-capacity | head',
+    'sudo -ugit install -m 755 scripts/dev/t3-capacity /usr/local/bin/ 2>&1 | tail -3',
+    'time { t3-capacity 2048 && x; } | tail -3',
+    "env -S 'cat t3-capacity' | tail",
+    'env -C t3-capacity ls | tail',                         # the value of -C (a folder), not the command
     'python3 -I scripts/dev/run_tests.py scripts/dev/tests/test_t3_capacity.py 2>&1 | tail -5',
     '# t3-capacity 2048 | tail -1\nls',
     'ls # t3-capacity 2048 | tail -1',
@@ -242,6 +262,8 @@ class Reads(unittest.TestCase):
         cases = {'t3-capacity 2048 | tail -1 && echo RAN': True, '(t3-capacity 2048) | tail -1 && echo RAN': True,
                  '{ t3-capacity 2048; } | tail -1 && echo RAN': True, 'x=$(t3-capacity 2048 | tail -1) && echo RAN': True,
                  "sh -c 't3-capacity 2048 | tail -1 && echo RAN'": True,
+                 "env -S 't3-capacity 2048' | tail -1 && echo RAN": True,
+                 "env -S 't3-capacity 2048' && echo RAN": False,
                  't3-capacity 2048 && echo RAN': False, 'x=$(t3-capacity 2048) && echo RAN': False,
                  '{ t3-capacity 2048 && echo RAN; } | tail -5': False, 't3-capacity 2048 > /dev/null && echo RAN': False}
         for cmd, hidden in cases.items():
@@ -249,6 +271,15 @@ class Reads(unittest.TestCase):
                 out = subprocess.run(['/bin/sh', '-c', cmd], env=env, capture_output=True, text=True, timeout=60).stdout
                 self.assertEqual('RAN' in out, hidden, out)
                 self.assertEqual(bool(G.piped(cmd)), hidden)
+        bash = shutil.which('bash')
+        if bash:   # the keyword `time` before a group is bash's (sh has no such keyword)
+            for cmd, hidden in {'time { t3-capacity 2048; } | tail -1 && echo RAN': True,
+                                'time -p { t3-capacity 2048; } 2>/dev/null | tail -1 && echo RAN': True,
+                                'time { t3-capacity 2048 && echo RAN; } 2>/dev/null | tail -5': False}.items():
+                with self.subTest(cmd):
+                    out = subprocess.run([bash, '-c', cmd], env=env, capture_output=True, text=True, timeout=60).stdout
+                    self.assertEqual('RAN' in out, hidden, out)
+                    self.assertEqual(bool(G.piped(cmd)), hidden)
 
     def test_deep_or_long_text_is_read_in_time_and_never_crashes(self):
         deep = '$(' * 3000 + 't3-capacity 1 | tail' + ')' * 3000

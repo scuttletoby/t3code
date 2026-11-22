@@ -17,7 +17,9 @@ How it reads a command (small on purpose; actions-disable-guard is the full shel
 attack, this is a mistake):
   - shell text as a shell reads it: quotes, backslashes, comments, redirections, `&& || ; & |` and newlines;
   - the check must be the command word (any path; after NAME=value, `!`, if/while/until/then/do/else, and the
-    wrappers sudo, env, command, exec, nohup, nice, ionice, timeout, stdbuf, setsid, time, builtin with their flags);
+    wrappers sudo, env, command, exec, nohup, nice, ionice, timeout, stdbuf, setsid, time, builtin with their flags,
+    read letter by letter so a glued value is a value (`sudo -uroot`, `sudo -iu someone`); `env -S 'TEXT'` and
+    `--split-string` run the words of TEXT, which are read as the command; the keyword `time [-p]` before a group);
   - commands inside `$(..)`, backticks, `<(..)`, and a `( .. )` or `{ ..; }` group whose LAST command is the check;
   - shell text handed on, read again by the same rules: `bash -c '..'` (sh, zsh, dash, ksh, su; also behind another
     word: `heavy bash -c`, `timeout 60 bash -lc`), `eval ..`, `ssh host '..'`, `watch '..'`, and a heredoc into a shell.
@@ -35,7 +37,7 @@ entry (`agent-guards hooks`) also exits 1 with a line on stderr when this file i
 would exit 2 and refuse every Bash call). A broken machine file section: the default command list, one line on
 stderr. Tests: fork-kit/agent-guards/tests/capacity-pipe.test.py
 """
-import json, os, re, sys
+import json, os, re, shlex, sys
 
 
 def _settings():
@@ -56,7 +58,7 @@ MAX_DEPTH = 40
 SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'su'}   # `<shell> .. -c TEXT`; a heredoc into one is commands
 TEXT_ARGS = {'ssh', 'watch'}                           # each argument that names the tool is shell text
 TOOLS = {'Bash', 'Monitor'}                            # the tools whose `command` is shell text
-WRAPPERS = {   # a command follows them; value: their one-letter flags whose value is the NEXT word (sudo -u someone)
+WRAPPERS = {   # a command follows them; value: their one-letter flags that take a value (glued or the next word)
     'sudo': 'ughpCDRTUrt', 'env': 'uCS', 'timeout': 'ks', 'nice': 'n', 'ionice': 'cnp', 'stdbuf': 'ioe', 'exec': 'a',
     'time': 'fo', 'command': '', 'builtin': '', 'nohup': '', 'setsid': ''}
 KEYWORDS = {'!', '{', 'if', 'then', 'elif', 'else', 'while', 'until', 'do'}   # a command follows them
@@ -65,7 +67,6 @@ HEADS = {'for', 'case', 'select'}              # open a group too; the rest of t
 CLOSERS = {'}', 'fi', 'done', 'esac'}
 ASSIGN = re.compile(r'[A-Za-z_]\w*\+?=')
 PLAIN = re.compile(r'-|\d+(\.\d+)?[smhd]?$')   # a wrapper's flag, or its number / duration (timeout 5m, nice 10)
-FLAGS = re.compile(r'-[A-Za-z]+$')             # -u, -iu: the last letter decides whether a value follows
 C_FLAG = re.compile(r'-[A-Za-z]*c[A-Za-z]*$')  # -c, -lc, -ec
 REDIR = re.compile(r'&>>|&>|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>')
 VAR = re.compile(r'\$(?:[A-Za-z_]\w*|[0-9@*#?$!-])')
@@ -91,34 +92,64 @@ def base(word):
     return word.rsplit('/', 1)[-1]
 
 
+def split_string(text):
+    """The words of `env -S TEXT`: env splits TEXT itself, with shell-like quotes (shlex), else at blanks."""
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
 def command_at(ws):
-    """Index of the command word of a simple command: behind NAME=value and wrappers. len(ws) when there is none."""
-    i = 0
+    """(words, index of the command word) of a simple command: behind NAME=value and wrappers; index len(words) when
+    there is none. words is ws, or ws with an `env -S TEXT` value split into the words env runs."""
+    i, splits = 0, 0
     while i < len(ws):
         if ASSIGN.match(ws[i]):
             i += 1
             continue
         if base(ws[i]) not in WRAPPERS:
-            return i
-        asks, values = base(ws[i]) == 'command', WRAPPERS[base(ws[i])]
+            return ws, i
+        name = base(ws[i])
+        asks, values = name == 'command', WRAPPERS[name]
         i += 1
         while i < len(ws) and (PLAIN.match(ws[i]) or ASSIGN.match(ws[i])):
-            if asks and ws[i] in ('-v', '-V'):
-                return len(ws)   # `command -v x` only looks x up
-            i += 2 if FLAGS.match(ws[i]) and ws[i][-1] in values else 1
-    return len(ws)
+            w = ws[i]
+            if asks and w in ('-v', '-V'):
+                return ws, len(ws)   # `command -v x` only looks x up
+            split = None   # env -S TEXT / --split-string TEXT: the words env runs are the words of TEXT
+            step = 1
+            if w.startswith('--'):   # a long flag with its value as the next word is not read (see "Not covered")
+                if name == 'env' and (w == '--split-string' or w.startswith('--split-string=')):
+                    split = ((w.partition('=')[2], ws[i + 1:]) if '=' in w else
+                             (ws[i + 1] if i + 1 < len(ws) else '', ws[i + 2:]))
+            elif len(w) > 1 and w[0] == '-':
+                for j, ch in enumerate(w[1:], 1):   # letters left to right: the first one that takes a value takes the
+                    if ch in values:                # rest of the word (-uroot, -n10), else the next word (-iu someone)
+                        glued = w[j + 1:]
+                        if name == 'env' and ch == 'S':
+                            split = (glued, ws[i + 1:]) if glued else (ws[i + 1] if i + 1 < len(ws) else '', ws[i + 2:])
+                        step = 1 if glued else 2
+                        break
+                    if not ch.isalpha():
+                        break
+            if split and splits < MAX_DEPTH:
+                ws, splits = ws[:i] + split_string(split[0]) + split[1], splits + 1
+                continue
+            i += step
+    return ws, len(ws)
 
 
 def handed_on(ws, depth):
     """Read the shell text a simple command hands on. True when a shell is among its words (its heredoc is commands)."""
+    ws, k = command_at(ws)   # first: env -S TEXT puts the words of TEXT in place
     shell = False
-    for k, w in enumerate(ws):
+    for n, w in enumerate(ws):
         if base(w) in SHELLS:
             shell = True
-        elif shell and C_FLAG.match(w) and k + 1 < len(ws):
-            read(ws[k + 1], depth=depth + 1)
+        elif shell and C_FLAG.match(w) and n + 1 < len(ws):
+            read(ws[n + 1], depth=depth + 1)
             break
-    k = command_at(ws)
     if k < len(ws):
         word, args = base(ws[k]), ws[k + 1:]
         if word == 'eval':
@@ -226,7 +257,15 @@ def read(s, i=0, closer='', depth=0):
     def end():
         nonlocal ws, doc, tool
         cmd, ws, mine, doc = ws, [], doc, {}
-        while cmd and (cmd[0] in KEYWORDS or cmd[0] == 'function'):
+        while cmd and (cmd[0] in KEYWORDS or cmd[0] in ('function', 'time')):
+            if cmd[0] == 'time':   # the keyword `time [-p] [--]` times what follows, also `{ ..; }` and `if ..`
+                j = 1
+                while j < len(cmd) and cmd[j] in ('-p', '--'):
+                    j += 1
+                if j == len(cmd) or cmd[j] not in KEYWORDS:
+                    break   # `time cmd`: a wrapper (command_at)
+                cmd = cmd[j:]
+                continue
             if cmd[0] in OPENERS:
                 groups.append(cmd[0])
             cmd = cmd[2:] if cmd[0] == 'function' else cmd[1:]   # `function NAME { ..`: the rest is a command
@@ -239,7 +278,7 @@ def read(s, i=0, closer='', depth=0):
             if groups and groups[-1] != '(':
                 groups.pop()   # tool stays: the group ends with what its last command was
         else:
-            k = command_at(cmd)
+            cmd, k = command_at(cmd)
             tool = base(cmd[k]) if k < len(cmd) and base(cmd[k]) in CHECKS else False
             mine['shell'] = handed_on(cmd, depth)
 
