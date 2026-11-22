@@ -24,6 +24,7 @@ import {
   ClaudeMcpProfileError,
   EVERY_MCP_SERVER,
   type FindThread,
+  __testing as ClaudeMcpProfileTesting,
   type LineageThread,
   checkClaudeSession,
   claudeMcpCallOutsideProfile,
@@ -232,6 +233,7 @@ describe("makeClaudeMcpProfiles", () => {
     () =>
       Effect.gen(function* () {
         T3ToolSets.__testing.clear();
+        ClaudeMcpProfileTesting.clearOpenedPlanKeys();
         const lean = (t3Tools: unknown) => ({
           mcpProfile: "lean",
           mcpProfiles: { lean: { servers: "all", t3Tools } },
@@ -279,6 +281,7 @@ describe("makeClaudeMcpProfiles", () => {
     () =>
       Effect.gen(function* () {
         T3ToolSets.__testing.clear();
+        ClaudeMcpProfileTesting.clearOpenedPlanKeys();
         const lean = { mcpProfile: "lean", mcpProfiles: { lean: { servers: "all", t3Tools: [] } } };
         const service = yield* ServerSettingsService.ServerSettingsService;
         const plan = yield* makeClaudeMcpProfiles.pipe(
@@ -288,7 +291,7 @@ describe("makeClaudeMcpProfiles", () => {
           }),
         );
         const before: T3ToolSets.T3ToolSet = { _tag: "Groups", name: "all", groups: "all" };
-        T3ToolSets.fixT3ToolSet("t", before);
+        T3ToolSets.fixT3ToolSet("t", before, T3ToolSets.nextT3ToolSetTurn());
         const planned = yield* plan(thread("t"), {});
         // Planned, not opened (a continuation, or background work blocks the replacement).
         assert.strictEqual(planned.name, "lean");
@@ -315,10 +318,106 @@ describe("makeClaudeMcpProfiles", () => {
       ),
   );
 
+  /** A planner over settings the test changes between turns, from no opened process. */
+  const planner = Effect.gen(function* () {
+    T3ToolSets.__testing.clear();
+    ClaudeMcpProfileTesting.clearOpenedPlanKeys();
+    const service = yield* ServerSettingsService.ServerSettingsService;
+    const settings: { current: object } = { current: {} };
+    const plan = yield* makeClaudeMcpProfiles.pipe(
+      Effect.provideService(ServerSettingsService.ServerSettingsService, {
+        ...service,
+        getSettings: Effect.suspend(() => Effect.succeed(fromFile(settings.current))),
+      }),
+    );
+    return { plan, settings };
+  });
+  const lean = (t3Tools: unknown) => ({
+    mcpProfile: "lean",
+    mcpProfiles: { lean: { servers: "all", t3Tools } },
+  });
+  const groupsOf = (threadId: string) => {
+    const set = T3ToolSets.t3ToolSetFor(threadId);
+    return set?._tag === "Groups" && set.groups !== "all" ? [...set.groups] : set?._tag;
+  };
+  const withSettings = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ServerSettingsService.ServerSettingsService.layerTest(),
+          ManagedPolicy.layerTest(),
+          Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
+        ).pipe(Layer.provideMerge(NodeServices.layer)),
+      ),
+    );
+
+  it.effect(
+    "never wider: a process opened with one plan meets a different, wider one (fork issue #986)",
+    () =>
+      withSettings(
+        Effect.gen(function* () {
+          const { plan, settings } = yield* planner;
+          const self = thread("t");
+          // Empty state (as after a restart): no process opened, so a plan fixes nothing yet.
+          settings.current = lean(["threads"]);
+          const first = yield* plan(self, {});
+          assert.isUndefined(T3ToolSets.t3ToolSetFor(self.id));
+          void first.options;
+          assert.deepStrictEqual(groupsOf(self.id), ["threads"]);
+          // A refused turn keeps the process, and only the ungrouped tools.
+          settings.current = { mcpProfile: "gone" };
+          assert.isTrue(isRefusal(yield* Effect.flip(plan(self, {}))));
+          assert.strictEqual(groupsOf(self.id), "Refused");
+          // The profile is widened: a different plan, and its process has not opened, so the
+          // thread keeps the refusal, never the wider set on the narrower process.
+          settings.current = lean(["threads", "orchestration"]);
+          yield* plan(self, {});
+          assert.strictEqual(groupsOf(self.id), "Refused");
+          // Runs again: the same plan as the process opened with gets that process's set back.
+          settings.current = lean(["threads"]);
+          yield* plan(self, {});
+          assert.deepStrictEqual(groupsOf(self.id), ["threads"]);
+        }),
+      ),
+  );
+
+  it.effect(
+    "the cap drops the thread whose process was used longest ago, not the first opened (#986)",
+    () =>
+      withSettings(
+        Effect.gen(function* () {
+          const { plan, settings } = yield* planner;
+          settings.current = lean(["threads"]);
+          const first = thread("first");
+          void (yield* plan(first, {})).options;
+          for (let index = 1; index < T3ToolSets.MAX_T3_TOOL_SETS; index += 1) {
+            ClaudeMcpProfileTesting.keepOpenedPlanKey(ThreadId.make(`other-${index}`), "other-key");
+          }
+          // The first thread's process is used again (the same plan, no new process).
+          yield* plan(first, {});
+          // One more thread opens a process: the cap drops the one used longest ago.
+          void (yield* plan(thread("last"), {})).options;
+          assert.isTrue(ClaudeMcpProfileTesting.hasOpenedPlanKey(first.id));
+          assert.isFalse(ClaudeMcpProfileTesting.hasOpenedPlanKey(ThreadId.make("other-1")));
+          // So a turn after a refused one still gets the first thread's set back.
+          settings.current = { mcpProfile: "gone" };
+          yield* Effect.flip(plan(first, {}));
+          assert.strictEqual(groupsOf(first.id), "Refused");
+          settings.current = lean(["threads"]);
+          yield* plan(first, {});
+          assert.deepStrictEqual(groupsOf(first.id), ["threads"]);
+        }),
+      ),
+  );
+
   it.effect("a profile that cannot be worked out fixes no T3 tool but the ungrouped ones", () =>
     Effect.gen(function* () {
       T3ToolSets.__testing.clear();
-      T3ToolSets.fixT3ToolSet("t", { _tag: "Groups", name: "all", groups: "all" });
+      T3ToolSets.fixT3ToolSet(
+        "t",
+        { _tag: "Groups", name: "all", groups: "all" },
+        T3ToolSets.nextT3ToolSetTurn(),
+      );
       // The thread names a profile that is gone: the turn refuses, and the old `all` set is gone.
       assert.include(
         (yield* plansFor([{ mcpProfile: "gone" }]))[0],
@@ -333,7 +432,11 @@ describe("makeClaudeMcpProfiles", () => {
     () =>
       Effect.gen(function* () {
         T3ToolSets.__testing.clear();
-        T3ToolSets.fixT3ToolSet("t", { _tag: "Groups", name: "all", groups: "all" });
+        T3ToolSets.fixT3ToolSet(
+          "t",
+          { _tag: "Groups", name: "all", groups: "all" },
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
         const reading = yield* Deferred.make<void>();
         const service = yield* ServerSettingsService.ServerSettingsService;
         const plan = yield* makeClaudeMcpProfiles.pipe(

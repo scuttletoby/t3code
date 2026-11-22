@@ -22,7 +22,13 @@ import {
   type McpProfileResolved,
   builtinToolsNoneRefusal,
 } from "./mcpProfile.ts";
-import { fixT3ToolSet, forgetT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
+import {
+  fixT3ToolSet,
+  forgetT3ToolSet,
+  nextT3ToolSetTurn,
+  refusedT3ToolSet,
+  t3ToolSetOf,
+} from "./mcpT3ToolSets.ts";
 import { CurrentTurnMcpProfile } from "./mcpTurnProfile.ts";
 
 type ProfileFor = Effect.Success<typeof makeThreadMcpProfiles>;
@@ -87,14 +93,16 @@ const checkTurnProfile = Effect.fn("McpProfileTurnCheck.check")(function* (
   instance: ProviderInstance,
   thread: LineageThread,
 ) {
+  // Drawn before the read: a later turn's set stands over this one's, whichever finishes first.
+  const turn = nextT3ToolSetTurn();
   const resolved = yield* profileFor(thread).pipe(
     Effect.tapError((refusal) =>
-      Effect.sync(() => fixT3ToolSet(thread.id, refusedT3ToolSet(refusal.reason))),
+      Effect.sync(() => fixT3ToolSet(thread.id, refusedT3ToolSet(refusal.reason), turn)),
     ),
     // Stopped half-way: no set stands, so the next request works it out again.
-    Effect.onInterrupt(() => Effect.sync(() => forgetT3ToolSet(thread.id))),
+    Effect.onInterrupt(() => Effect.sync(() => forgetT3ToolSet(thread.id, turn))),
   );
-  fixT3ToolSet(thread.id, t3ToolSetOf(resolved));
+  fixT3ToolSet(thread.id, t3ToolSetOf(resolved), turn);
   if (resolved.profile.builtinTools === MCP_BUILTIN_TOOLS_NONE) {
     return yield* new ClaudeMcpProfileError({
       reason: builtinToolsNoneRefusal(resolved.name, instance.driverKind),

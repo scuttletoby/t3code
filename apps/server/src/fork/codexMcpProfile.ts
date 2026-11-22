@@ -23,7 +23,13 @@ import {
   type McpProfileSet,
   builtinToolsNoneRefusal,
 } from "./mcpProfile.ts";
-import { fixT3ToolSet, holdT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
+import {
+  fixT3ToolSet,
+  holdT3ToolSet,
+  nextT3ToolSetTurn,
+  refusedT3ToolSet,
+  t3ToolSetOf,
+} from "./mcpT3ToolSets.ts";
 import { CurrentTurnMcpProfile } from "./mcpTurnProfile.ts";
 
 type Client = CodexClient.CodexAppServerClient["Service"];
@@ -360,19 +366,22 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
   });
 
   /**
-   * The thread's profile, with its T3 tool groups fixed when `fix` (a turn of the thread itself,
-   * not of a sub-agent, and not a goal set while a turn may run): fixed until the next turn, and
-   * only the tools every profile keeps when the profile cannot apply.
+   * The thread's profile, with its T3 tool groups fixed when `turn` is given (a turn of the thread
+   * itself, not of a sub-agent, and not a goal set while a turn may run): fixed until the next
+   * turn, and only the tools every profile keeps when the profile cannot apply. `turn` is drawn
+   * before the profile is read, so a check that finishes after a later turn's fixes nothing.
    */
-  const profileStep = (method: string, threadId: ThreadId, fix: boolean) =>
+  const profileStep = (method: string, threadId: ThreadId, turn: number | undefined) =>
     workedOut(threadId).pipe(
       Effect.tap((resolved) =>
-        fix ? Effect.sync(() => fixT3ToolSet(threadId, t3ToolSetOf(resolved))) : Effect.void,
+        turn === undefined
+          ? Effect.void
+          : Effect.sync(() => fixT3ToolSet(threadId, t3ToolSetOf(resolved), turn)),
       ),
       Effect.tapError((cause) =>
-        fix
-          ? Effect.sync(() => fixT3ToolSet(threadId, refusedT3ToolSet(cause.reason)))
-          : Effect.void,
+        turn === undefined
+          ? Effect.void
+          : Effect.sync(() => fixT3ToolSet(threadId, refusedT3ToolSet(cause.reason), turn)),
       ),
       Effect.mapError((cause) => refusal(method, cause)),
     );
@@ -442,7 +451,8 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
       if (!narrowed) return;
       return yield* notLoadedHere(method);
     }
-    const resolved = yield* profileStep(method, threadId, fix && !children.has(nativeId));
+    const turn = fix && !children.has(nativeId) ? nextT3ToolSetTurn() : undefined;
+    const resolved = yield* profileStep(method, threadId, turn);
     yield* serverStep(method, nativeId, resolved);
   });
 
@@ -564,19 +574,21 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
           Effect.asVoid,
         );
       }
-      const own = !children.has(nativeId);
+      // The turn's place among the thread's turns, in the order Codex reports them started.
+      const turn = children.has(nativeId) ? undefined : nextT3ToolSetTurn();
       // Held inside the check, which starts before this handler returns, and released however it
       // ends: a closed scope never starts it, so no hold is left. Only the profile step is held;
       // T3's tools carry the new set while the server step runs.
-      const held = own
-        ? Effect.acquireUseRelease(
-            Effect.flatMap(Clock.currentTimeMillis, (now) =>
-              Effect.sync(() => holdT3ToolSet(threadId, now)),
-            ),
-            () => profileStep("turn/started", threadId, own),
-            (release) => Effect.sync(release),
-          )
-        : profileStep("turn/started", threadId, own);
+      const held =
+        turn === undefined
+          ? profileStep("turn/started", threadId, undefined)
+          : Effect.acquireUseRelease(
+              Effect.flatMap(Clock.currentTimeMillis, (now) =>
+                Effect.sync(() => holdT3ToolSet(threadId, now, turn)),
+              ),
+              () => profileStep("turn/started", threadId, turn),
+              (release) => Effect.sync(release),
+            );
       return held.pipe(
         Effect.flatMap((resolved) => serverStep("turn/started", nativeId, resolved)),
         Effect.catch(stop(nativeId, turnId)),
