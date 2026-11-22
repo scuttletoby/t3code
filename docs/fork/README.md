@@ -68,6 +68,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`                        | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`server.threadRoles`](#serverthreadroles)                                   | `{"assistant":null,"orchestrators":{}}` | yes | [#138](https://github.com/scuttletoby/t3code/issues/138) |
 | [`server.assistant`](#serverassistant)                                       | `{"enabled":false}`                     | yes | [#879](https://github.com/scuttletoby/t3code/issues/879) |
+| [`server.stopFinishedChildren`](#serverstopfinishedchildren)                 | `{"enabled":false}`                     | yes | [#925](https://github.com/scuttletoby/t3code/issues/925) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                                 | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                                 | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                                 | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
@@ -77,7 +78,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                                 | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 | [`client.calmSidebarEnabled`](#clientcalmsidebarenabled)                     | `false`                                 | yes | [#139](https://github.com/scuttletoby/t3code/issues/139) |
 
-For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
+For `waitFor`, `agentSlots`, `playtest` and `stopFinishedChildren` only the `enabled` switch is pinned, and for `handoff`
 and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
 
 ## Each setting
@@ -1335,6 +1336,34 @@ thread already named the assistant stays as it is. Only the person can change it
 `threadRoles.assistant` names never gets more than the profile `assistant`, whatever its pick (a
 managed policy that owns `mcpThreadProfiles` can drop the pick). More in
 [assistant.md](assistant.md).
+
+### `server.stopFinishedChildren`
+
+Stops a finished delegated child's provider process (a Claude process holds about 150-300 MB) once
+its thread has been idle for `graceSeconds` (default 60), instead of keeping it until upstream's own
+idle release 30 minutes later. The stop is upstream's idle release, so the thread keeps its history
+and the next message to it (a follow-up from its parent, `t3_thread_send`, a person) starts a new
+process as any resumed thread does.
+
+- When: the child's task ends (`delegate_task` here) or the child's run ends, then `graceSeconds`
+  of quiet. A run that starts in that time cancels it; that run's end starts it again. Nothing
+  polls: a child found busy is checked again at its next run end, request change or background-work
+  change.
+- Never stopped: a thread with a run (also a queued or silent one), a pending question or approval,
+  background work, a task still open (its own, or one it delegated itself), or a `wait_for` wait
+  that would wake it (or a wait store that cannot be read). The last check runs in the same step as upstream's release, which also keeps a
+  session a turn just started on.
+- Only a child's own process: one provider process per thread (Claude, and others that run one per
+  thread). A shared process (Codex, OpenCode) serves other threads and is left to upstream. A
+  provider's own subagent (not `delegate_task`) shares its parent's process and is never touched.
+- A child a linked machine delegated here is stopped by this machine's setting when its run is over
+  (the process runs here); the parent's machine stops nothing there.
+- Timers live in memory. A restart ends every provider session anyway; after it, a child's next run
+  end arms again. A second stop of the same child finds nothing live and does nothing.
+
+Switch on: **Settings → Fork**, section Finished children, or in `settings.json`:
+`"stopFinishedChildren": { "enabled": true, "graceSeconds": 60 }`. Anything but `"enabled": true`
+reads as off, and a bad `graceSeconds` as 60; a save with a bad value is refused.
 
 ### `projectOverride.waitChecks`
 

@@ -537,12 +537,14 @@ class OverrideAuthors(unittest.TestCase):
 # --- the fork's own config (issue #730): in enforce, workflow, queue, lens and other CI files critical (#82) ---------
 ROOT = os.path.join(HERE, '..', '..', '..')
 FORK_CONFIG = '.github/fork-pr-queue.json'
-# The two .github files that are not workflow files or gate settings (#82): per-pull-request bookkeeping lists a CI
-# check compares with the tree (fork-seam-check.cjs: every fork line in an upstream file is announced; fork-ci-tests.cjs:
-# every test file is listed). Most fork pull requests add a line to one of them; as critical files they made the gate
-# lenses (merge-path, state) the only required ones on plain app changes, and no lens read the code (the dry run of
-# the switch, issue #82). Every other file under .github stays critical: a new one fails this test until it is sorted.
-NOT_GATE = ('.github/fork-seams.json', '.github/fork-ci-tests.txt')
+# The one .github file that is not a workflow file or gate setting (#82): a per-pull-request bookkeeping list a CI check
+# compares with the tree (fork-ci-tests.cjs: every test file is listed). Most fork pull requests add a line to it; as a
+# critical file alone it made the gate lenses (merge-path, state) the only required ones on plain app changes, and no
+# lens read the code (the dry run of the switch, issue #82). .github/fork-seams.json was such a list too, but it is
+# the upstream-seam guard's list (which fork lines upstream files may hold): #968 makes it critical, and an app change
+# with it needs the code lens and the gate lenses (one extra review, below). Every other file under .github stays
+# critical: a new one fails this test until it is sorted.
+NOT_GATE = ('.github/fork-ci-tests.txt',)
 # fork-kit folders that are gate settings (#82): review is the lens-format checker and the lens skill (what a lens
 # report must say to count), gh-apps keeps the gate App's key and mints its tokens (the gate-trust design). The
 # other kits run machines and agents, and the merge gate reads none of them.
@@ -579,7 +581,7 @@ class ForkConfig(unittest.TestCase):
                      '.github/fork-actions-policies.json', '.github/scripts/fork-contracts.test.py',
                      '.github/workflows/new.yml', '.github/new-folder/x.json', '.github/new.md', 'fork-ci/new.txt',
                      'fork-kit/review/lib/review_kit.py', 'fork-kit/gh-apps/libexec/x', 'fork-kit/review/SKILL.md',
-                     'docs/fork/gate-trust.md'):
+                     'docs/fork/gate-trust.md', '.github/fork-seams.json'):
             with self.subTest(path):
                 j = self.judge(path)
                 self.assertEqual((j.weight, j.lenses), ('critical', self.critical.lenses))
@@ -587,7 +589,7 @@ class ForkConfig(unittest.TestCase):
         j = self.judge('apps/server/src/x.ts')
         self.assertEqual((j.weight, j.lenses), ('normal', ('code',)))
 
-    def test_every_github_file_is_critical_but_the_two_bookkeeping_lists(self):   # a new one must be sorted
+    def test_every_github_file_is_critical_but_the_bookkeeping_list(self):   # a new one must be sorted
         top = sorted(os.listdir(os.path.join(ROOT, '.github')))
         self.assertTrue(set(NOT_GATE) <= {f'.github/{x}' for x in top}, 'a bookkeeping list moved: update NOT_GATE')
         for name in top:
@@ -630,11 +632,18 @@ class ForkConfig(unittest.TestCase):
                                   'OTHER_KITS with why')
                     self.assertEqual(weight, 'normal', f'{path} is in OTHER_KITS but judged {weight}')
 
-    def test_an_app_change_that_announces_a_seam_or_lists_a_test_needs_the_code_lens(self):   # the dry run's refusals
+    def test_an_app_change_that_lists_a_test_needs_the_code_lens(self):   # the dry run's refusals
         for extra in NOT_GATE:
             with self.subTest(extra):
                 j = rj.judge(self.review, [('M', ('apps/server/src/x.ts',)), ('M', (extra,))], FORK_CONFIG)
                 self.assertEqual((j.weight, j.lenses), ('normal', ('code',)))
+
+    def test_a_seam_list_change_needs_the_gate_lenses_and_with_code_the_code_lens(self):   # #968 item 1
+        seams = '.github/fork-seams.json'
+        j = self.judge(seams)   # an announcement alone (a list-only pull request)
+        self.assertEqual((j.weight, j.lenses, j.hits[0].rule), ('critical', ('merge-path', 'state'), self.critical.name))
+        j = rj.judge(self.review, [('M', ('apps/server/src/x.ts',)), ('M', (seams,))], FORK_CONFIG)
+        self.assertEqual((j.weight, j.lenses), ('critical', ('merge-path', 'state', 'code')))
 
     def test_an_app_change_plus_a_gate_file_needs_the_code_lens_and_the_gate_lenses(self):   # #82: one EXTRA review
         for gate in ('.github/workflows/ci.yml', '.github/SECURITY.md', 'fork-ci/actions/x.py',
