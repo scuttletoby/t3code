@@ -755,29 +755,29 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 
 ## Files on the host
 
-| Path                                            | What                                                                      |
-| ----------------------------------------------- | ------------------------------------------------------------------------- |
-| `/usr/local/bin/heavy`                          | link to `current/bin/heavy`                                               |
-| `/usr/local/sbin/heavy-install`                 | link to `current/sbin/heavy-install`                                      |
-| `/usr/local/bin/t3-capacity`                    | link to `current/bin/t3-capacity`                                         |
-| `/usr/local/libexec/heavy/versions/<sha>/`      | the code of one release, with `MANIFEST.sha256` (root 755)                |
-| `/usr/local/libexec/heavy/current`              | link to the release in use (switched in one step)                         |
-| `/usr/local/libexec/heavy/replaced/`            | a plain `/usr/local/bin/heavy` from before the kit, put back on uninstall |
-| `/usr/local/libexec/heavy-kept/`                | a plain `/usr/local/bin/t3-capacity` (a host's copy), put back likewise   |
-| `/etc/heavy/config.json`                        | slice name and grace time                                                 |
-| `/etc/heavy/installed.tsv`                      | every installed path with its link target or hash (`--self-check`)        |
-| `/etc/systemd/user/<slice>`                     | only with limit options: the slice unit                                   |
-| `/etc/systemd/user/heavy-sweep.{service,timer}` | only with `--sweep-timer`: the leftover sweep (each user enables it)      |
-| `/etc/fork-kit/machine.json`                    | written by the owner, never the kit: sweep and queue settings             |
-| `~/.local/state/heavy-sweep/`                   | each user's sweep log, last report and lock                               |
-| `/run/user/<uid>/heavy-queue/<slice>/`          | the memory queue: its lock and one ticket per queued job (tmpfs)          |
-| `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
-|                                                 | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
-| `/run/user/<uid>/heavy-facts-*.json`            | `heavy facts`' 5 s cache (tmpfs), one per version and settings            |
-| `/tmp/heavy-facts-<uid>/heavy-facts-*.json`     | the same, for a user without `/run/user/<uid>` (no user manager)          |
-| `~/.cache/heavy-facts-<host>/heavy-facts-*.json`| the same, when the temporary one is taken or cannot be written            |
-| `<that folder>/t3-capacity-hold.json`           | `t3-capacity`'s 20 s hold of a NOT OK                                     |
-| `~/.config/t3-capacity/reserve.d/*.conf`        | each user's reservations for `heavy facts` and its callers                |
+| Path                                             | What                                                                      |
+| ------------------------------------------------ | ------------------------------------------------------------------------- |
+| `/usr/local/bin/heavy`                           | link to `current/bin/heavy`                                               |
+| `/usr/local/sbin/heavy-install`                  | link to `current/sbin/heavy-install`                                      |
+| `/usr/local/bin/t3-capacity`                     | link to `current/bin/t3-capacity`                                         |
+| `/usr/local/libexec/heavy/versions/<sha>/`       | the code of one release, with `MANIFEST.sha256` (root 755)                |
+| `/usr/local/libexec/heavy/current`               | link to the release in use (switched in one step)                         |
+| `/usr/local/libexec/heavy/replaced/`             | a plain `/usr/local/bin/heavy` from before the kit, put back on uninstall |
+| `/usr/local/libexec/heavy-kept/`                 | a plain `/usr/local/bin/t3-capacity` (a host's copy), put back likewise   |
+| `/etc/heavy/config.json`                         | slice name and grace time                                                 |
+| `/etc/heavy/installed.tsv`                       | every installed path with its link target or hash (`--self-check`)        |
+| `/etc/systemd/user/<slice>`                      | only with limit options: the slice unit                                   |
+| `/etc/systemd/user/heavy-sweep.{service,timer}`  | only with `--sweep-timer`: the leftover sweep (each user enables it)      |
+| `/etc/fork-kit/machine.json`                     | written by the owner, never the kit: sweep and queue settings             |
+| `~/.local/state/heavy-sweep/`                    | each user's sweep log, last report and lock                               |
+| `/run/user/<uid>/heavy-queue/<slice>/`           | the memory queue: its lock and one ticket per queued job (tmpfs)          |
+| `~/.local/state/heavy/`                          | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
+|                                                  | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
+| `/run/user/<uid>/heavy-facts-*.json`             | `heavy facts`' 5 s cache (tmpfs), one per version and settings            |
+| `/tmp/heavy-facts-<uid>/heavy-facts-*.json`      | the same, for a user without `/run/user/<uid>` (no user manager)          |
+| `~/.cache/heavy-facts-<host>/heavy-facts-*.json` | the same, when the temporary one is taken or cannot be written            |
+| `<that folder>/t3-capacity-hold.json`            | `t3-capacity`'s 20 s hold of a NOT OK                                     |
+| `~/.config/t3-capacity/reserve.d/*.conf`         | each user's reservations for `heavy facts` and its callers                |
 
 ## Install (owner, as root)
 
