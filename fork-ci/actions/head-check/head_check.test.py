@@ -1329,18 +1329,20 @@ class PathRulesBare(PathRules):
             self.assertEqual(code, H.REFUSED, out)
             self.assertIn(f'the head {head[:12]} does not merge cleanly into the base {b1[:12]}', out)
 
-    def test_the_merge_follows_a_directory_rename_as_the_queue_does(self):   # #413 item 4: merge.directoryRenames
-        # pr_queue.holds merges with merge.directoryRenames=true, so the check does too: the base adds the config into a
-        # folder the head renamed, the merge moves it along, and the config's path is gone (git's default, conflict,
-        # would refuse it as a conflict instead).
+    def test_the_merge_keeps_a_file_in_a_renamed_folder_as_the_queue_does(self):   # #413 item 4, #1033
+        # The check merges as pr_queue.merge_tree does, with merge.directoryRenames=false, which is how GitHub's update
+        # branch merges (measured, #924): the base adds the config into a folder the head renamed, and the merge keeps
+        # it at its path, so the base's config is read and the check passes. With `true` the merge moved it along and
+        # the check refused "deletes"; git's default, conflict, would refuse it as a conflict.
         path = 'E/q.json'
         m = self.w.commit(base_files(**{**PROMPTS, 'E/a.txt': lines(40), 'E/b.txt': lines(40, ['b'], 3)}), [self.m0])
         base = self.w.commit(base_files(**{**PROMPTS, 'E/a.txt': lines(40), 'E/b.txt': lines(40, ['b'], 3),
                                            path: json.dumps(CFG_RAW)}), [m])
         head = self.w.commit(base_files(**{**PROMPTS, 'F/a.txt': lines(40), 'F/b.txt': lines(40, ['b'], 3)}), [m])
-        code, out = self.check(base, head, EVERY_LENS, config_path=path)
-        self.assertEqual(code, H.REFUSED, out)
-        self.assertIn(f'merged, this pull request deletes {path}', out)
+        for _ in range(2):   # runs again: the same pass
+            code, out = self.check(base, head, EVERY_LENS, config_path=path)
+            self.assertEqual(code, 0, out)
+            self.assertNotIn('deletes', out)
 
     def test_a_merge_tree_that_takes_too_long_is_refused(self):   # #413 item 5: a timeout refuses, never passes
         base = self.base('shadow')
