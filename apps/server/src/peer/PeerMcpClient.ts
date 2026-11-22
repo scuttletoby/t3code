@@ -18,6 +18,7 @@ import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
 
+import * as ForkLinkRevoke from "../fork/peerLinkRevoke.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 
@@ -92,12 +93,6 @@ const linkedEnvironmentsOffThere = new OrchestratorMcpFailure({
     "The linked environment has Linked environments turned off. Turn it on in its Settings → Labs.",
 });
 
-const revokedThere = new OrchestratorMcpFailure({
-  code: "capability_denied",
-  message:
-    "The linked environment no longer accepts this link. It may have been revoked there; link it again.",
-});
-
 const stoppedAnswering = new OrchestratorMcpFailure({
   code: "orchestration_error",
   message: "The linked environment stopped answering.",
@@ -151,10 +146,7 @@ const make = Effect.gen(function* () {
       },
     );
 
-  // The token is dead there, so the link is over here too: listing, linking and
-  // the link card then treat it as expired and ask for a new pairing code.
-  const revoked = (link: PeerLinks.ResolvedPeerLink["link"]) =>
-    Effect.andThen(links.recordRevoked(link), Effect.fail(revokedThere));
+  const revokes = ForkLinkRevoke.makeRefusals({ links, post, sessions, recordLinkExpiry });
 
   const openSession = Effect.fn("PeerMcpClient.openSession")(
     function* (
@@ -177,12 +169,15 @@ const make = Effect.gen(function* () {
         limitHeader,
       );
       const sessionId = initialized.headers["mcp-session-id"];
-      if (initialized.status === 401) return yield* revoked(link);
+      if (initialized.status === 401) return yield* revokes.reopen(link, url, token, limitHeader);
       if (initialized.status === 403) return yield* linkedEnvironmentsOffThere;
       if (initialized.status !== 200 || sessionId === undefined) {
         return yield* new OrchestratorMcpFailure({
-          code: "orchestration_error",
-          message: `The linked environment refused to start an MCP session (HTTP ${initialized.status}).`,
+          code: initialized.status === 401 ? "capability_denied" : "orchestration_error",
+          message:
+            initialized.status === 401
+              ? "The linked environment no longer accepts this link. It may have been revoked there; link it again."
+              : `The linked environment refused to start an MCP session (HTTP ${initialized.status}).`,
         });
       }
       yield* recordLinkExpiry(link, initialized.headers);
@@ -250,7 +245,15 @@ const make = Effect.gen(function* () {
         yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, renewed));
         response = yield* callOnce(renewed);
       }
-      if (response.status === 401) return yield* revoked(resolved.link);
+      const fresh = openSession(resolved, limitHeader);
+      if (response.status === 401) response = yield* revokes.retry(sessionKey, fresh, callOnce);
+      if (response.status === 401) {
+        return yield* new OrchestratorMcpFailure({
+          code: "capability_denied",
+          message:
+            "The linked environment no longer accepts this link. It may have been revoked there; link it again.",
+        });
+      }
       if (response.status === 403) return yield* linkedEnvironmentsOffThere;
       if (response.status !== 200) {
         return yield* new OrchestratorMcpFailure({

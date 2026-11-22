@@ -38,6 +38,7 @@ import * as HttpApiClient from "effect/http-api/HttpApiClient";
 import { isLocalLoopbackHost, isTailnetHost } from "@t3tools/shared/hostClassification";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as ForkLinkRevoke from "../fork/peerLinkRevoke.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -127,10 +128,7 @@ export class PeerLinks extends Context.Service<
       environmentId: EnvironmentId,
       outcome: { readonly error: string | null },
     ) => Effect.Effect<void>;
-    /**
-     * Ends `link` here once the peer turns its token away, as an expired link:
-     * only a new pairing code brings it back. A link made again since is kept.
-     */
+    /** Fork: ends `link` here once the peer turns it away (fork/peerLinkRevoke.ts). */
     readonly recordRevoked: (link: PeerLink) => Effect.Effect<void>;
     /** Records a later end the peer gives the link's session: using a link renews it there. */
     readonly recordExpiry: (
@@ -763,24 +761,12 @@ const make = Effect.gen(function* () {
       Effect.ignoreCause({ log: true }),
     );
 
-  const recordRevoked: PeerLinks["Service"]["recordRevoked"] = (link) =>
-    DateTime.now.pipe(
-      Effect.flatMap(
-        (now) => sql`
-          UPDATE peer_environment_links SET expires_at = ${DateTime.formatIso(now)}
-          WHERE environment_id = ${link.environmentId}
-            AND linked_at = ${DateTime.formatIso(link.linkedAt)}
-            AND expires_at > ${DateTime.formatIso(now)}
-        `,
-      ),
-      Effect.asVoid,
-      Effect.ignoreCause({ log: true }),
-    );
-
+  const revokes = ForkLinkRevoke.makeLinkRevokes(sql);
   const recordExpiry: PeerLinks["Service"]["recordExpiry"] = (environmentId, expiresAt) =>
     sql`
       UPDATE peer_environment_links SET expires_at = ${DateTime.formatIso(expiresAt)}
       WHERE environment_id = ${environmentId} AND expires_at < ${DateTime.formatIso(expiresAt)}
+      ${revokes.notEnded(environmentId)}
     `.pipe(Effect.asVoid, Effect.ignoreCause({ log: true }));
 
   return PeerLinks.of({
@@ -793,7 +779,7 @@ const make = Effect.gen(function* () {
     unlink,
     resolve,
     recordOutcome,
-    recordRevoked,
+    recordRevoked: revokes.record,
     recordExpiry,
   });
 });

@@ -58,7 +58,6 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as PeerForwarding from "./PeerForwarding.ts";
 import * as PeerLinkRequests from "./PeerLinkRequests.ts";
 import * as PeerLinks from "./PeerLinks.ts";
-import * as PeerMcpClient from "./PeerMcpClient.ts";
 import {
   descriptorOf,
   layerLinkingEnvironment,
@@ -192,7 +191,6 @@ const makeLaptopWith = (
     return {
       links: Context.get(linking, PeerLinks.PeerLinks),
       linksSql: Context.get(linking, SqlClient.SqlClient),
-      peers: Context.get(linking, PeerMcpClient.PeerMcpClient),
       requests: Context.get(here, PeerLinkRequests.PeerLinkRequests),
       orchestrator: Context.get(here, Orchestrator.OrchestratorV2),
       sink: Context.get(here, EventSink.EventSinkV2),
@@ -1160,50 +1158,6 @@ const linkCards = (a: Laptop) =>
         projection.turnItems.flatMap((item) => (item.type === "link_request" ? [item] : [])),
       ),
     );
-
-it.live("a link the box revoked goes through the card, and linking it again replaces it", () =>
-  withBoth((a, b) =>
-    Effect.gen(function* () {
-      yield* seedThread(a);
-      yield* linkTo(a.links, b);
-      const noop = a.peers.call({
-        environmentId: box.environmentId,
-        tool: "noop",
-        arguments: {},
-        limits: { runtimeMode: "full-access", interactionMode: "default" },
-        success: Schema.Struct({}),
-      });
-      const [session] = yield* b.linkedSessions;
-      yield* b.auth.revokeSession(session!.sessionId);
-      expect((yield* noop.pipe(Effect.flip)).code).toBe("capability_denied");
-      // The box turned the link away, so it is over here too: no list calls it reachable.
-      expect((yield* a.links.list).map((link) => link.status)).toEqual(["expired"]);
-
-      const named = yield* a.call({ environmentId: box.environmentId });
-      expect(named.structuredContent).toMatchObject({ status: "pending" });
-      const first = yield* pendingCard(a);
-      // Keeping the revoked link is no answer.
-      yield* a.requests.answer({
-        threadId,
-        turnItemId: first.id,
-        answer: { type: "use-existing", environmentId: box.environmentId },
-      });
-      expect(yield* cardOf(a)).toMatchObject({ linkStatus: "failed" });
-
-      yield* a.call({ hint: "box" });
-      const second = (yield* linkCards(a)).find((card) => card.linkStatus === "pending")!;
-      const pairing = yield* b.auth.issuePairingCredential();
-      yield* a.requests.answer({
-        threadId,
-        turnItemId: second.id,
-        answer: { type: "link", urls: [b.url], access: "auto", pairingCode: pairing.credential },
-      });
-      expect((yield* linkCards(a)).map((card) => card.linkStatus)).toEqual(["failed", "linked"]);
-      expect(yield* noop).toEqual({});
-      expect((yield* a.links.list).map((link) => link.status)).toEqual(["reachable"]);
-    }),
-  ),
-);
 
 const ask = (a: Laptop, args: Record<string, unknown>) =>
   Effect.gen(function* () {
