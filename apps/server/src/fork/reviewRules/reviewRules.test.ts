@@ -200,7 +200,7 @@ describe("the shared vectors", () => {
         continue;
       }
       refused++;
-      for (const read of [readFindings, lensProblem, lensHeader, lensKey, fold]) {
+      for (const read of [readFindings, lensProblem, lensHeader, lensKey, fold, hasMarker]) {
         assert.throws(() => read(v.body), PyTextError, undefined, `${v.name}: ${read.name}`);
         try {
           read(v.body);
