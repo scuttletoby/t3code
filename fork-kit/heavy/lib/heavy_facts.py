@@ -41,9 +41,10 @@ version and settings, so callers of one user with other settings (slice, queue, 
 kit version never read each other's file and each one's hold-down steps down on its own (#945) ($HEAVY_FACTS_CACHE
 names one file instead; --fresh reads again; a user without /run/user/<uid>, as one with no user manager, uses
 $TMPDIR or /tmp /heavy-facts-<uid>/, a folder only it can use; when that name is taken (someone else made it first)
-or there is no temporary folder it can write, ~/.cache/heavy-facts-<host>/ in a home only it can change and that no
-one else could swap; none of these is no cache, #951). The folder is opened once (O_DIRECTORY|O_NOFOLLOW) and every
-file is reached through that handle, so a folder swapped for a link after its check is never followed (#951). The
+or there is no temporary folder it can write, ~/.cache/heavy-facts-<host>-<machine id>/ in a home only it can change
+and that no one else could swap; none of these is no cache, #951). The folder is opened once
+(O_DIRECTORY|O_NOFOLLOW) and every file is reached through that handle, so a folder swapped for a link after its
+check is never followed (#951). The
 file is written whole through a rename; a cache that is old, from the future, broken, of another version, of other
 settings or not this user's own is read again. The pressure level (and the swap free its trend needs; a state
 without it waits one more read before it can step down) carries from one reading to the next (the rule's
@@ -71,6 +72,7 @@ CACHE_FILE_RE = re.compile(r'^heavy-facts(-v[0-9]{1,4}-[0-9a-f]{16})?\.json\Z') 
 CACHE_KEYS = {'v', 'key', 'atMs', 'tier', 'facts', 'boxPsi', 'reservations', 'learned', 'carry', 'notes', 'load1',
               'queue', 'pressure'}
 USERS = '/sys/fs/cgroup/user.slice'
+MOUNTS_LIMIT = 1 << 22                          # the mount table read for automounts (#996: longer is a note)
 RUN_USER = '/run/user'                          # the cache's folder: /run/user/<uid>
 TMP_ROOT = None                                 # without it: <TMP_ROOT>/heavy-facts-<uid> (None: temp_root())
 TMP_DIRS = ('/tmp',)                            # temp_root() after $TMPDIR
@@ -95,6 +97,15 @@ MACHINE_WHY = 'machine tier: no systemd user manager for this user, so it has no
 def _read(path, limit=1 << 16):
     with open(ROOT + path, 'rb') as f:
         return f.read(limit).decode('ascii', 'replace')
+
+
+def _read_names(path, limit):
+    """A file of path names (the mount table, /etc/passwd) as text, each byte kept as the file system names it
+    (os.fsdecode: a non-ASCII name matches the same name from anywhere else), and whether it is longer than limit
+    (#996 item 4)."""
+    with open(ROOT + path, 'rb') as f:
+        raw = f.read(limit + 1)
+    return os.fsdecode(raw[:limit]), len(raw) > limit
 
 
 def load1():
@@ -307,20 +318,26 @@ def login_range():
 
 
 def autofs_points():
-    """The automount trigger points (fstype autofs) of this machine's mount table, for on_autofs(); [] when it
-    cannot be read (then every home is read, as before #951)."""
+    """(the mount points and their fstype from this machine's mount table, for on_autofs(); a note or None). [] when
+    it cannot be read or is longer than MOUNTS_LIMIT (#996 item 4: a home whose mount line was cut off read as not
+    mounted; the note names it): then every home is read, as before #951. A point's octal escapes (\\040 for a space,
+    \\303\\274 for ü) are undone byte by byte and the bytes decoded as the file system names them, as the homes
+    from /etc/passwd are, so a non-ASCII home matches its own mount."""
     try:
-        text = _read('/proc/self/mountinfo', 1 << 22)
+        with open(ROOT + '/proc/self/mountinfo', 'rb') as f:
+            raw = f.read(MOUNTS_LIMIT + 1)
     except OSError:
-        return []
+        return [], None
+    if len(raw) > MOUNTS_LIMIT:
+        return [], f'the mount table is longer than {MOUNTS_LIMIT >> 20} MiB: every home is read (autofs ones too)'
     out = []
-    for line in text.splitlines():
-        left, sep, right = line.partition(' - ')
+    for line in raw.splitlines():
+        left, sep, right = line.partition(b' - ')
         f = left.split()
         if sep and len(f) >= 5:
-            point = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), f[4])
-            out.append((point, right.split()[0] if right.split() else ''))
-    return out
+            point = os.fsdecode(re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m.group(1), 8) & 0xff]), f[4]))
+            out.append((point, os.fsdecode(right.split()[0]) if right.split() else ''))
+    return out, None
 
 
 def on_autofs(home, mounts):
@@ -343,16 +360,22 @@ def other_reserve_dirs(uid):
     lo, hi = login_range()
     homes, blind = {}, []
     try:
-        for line in _read('/etc/passwd', 1 << 22).splitlines():
+        for line in _read_names('/etc/passwd', 1 << 22)[0].splitlines():
             f = line.split(':')
             if len(f) >= 7 and f[2].isdigit() and lo <= int(f[2]) <= hi and int(f[2]) != uid:
                 homes.setdefault(int(f[2]), (f[0], f[5]))
     except OSError:
         pass
+    notes = []
     try:
         names = os.listdir(ROOT + USERS)
-    except OSError:
-        names = []
+    except OSError as e:
+        # #996 item 6: sessions that cannot be known are not "no session": every home is read, as before #951
+        names, sessions = [], None
+        notes.append(f'{USERS} cannot be listed ({e.strerror or e}): sessions cannot be known, every home is read '
+                     f'(autofs ones too)')
+    else:
+        sessions = {int(m.group(1)) for m in map(USER_RE.match, names) if m}
     for name in sorted(names):
         m = USER_RE.match(name)
         u = int(m.group(1)) if m else None
@@ -363,18 +386,19 @@ def other_reserve_dirs(uid):
             homes[u] = (pw.pw_name, pw.pw_dir)
         except KeyError:
             blind.append(f'user {u} has a session but no home that can be found: its reservations cannot be read')
-    sessions = {int(m.group(1)) for m in map(USER_RE.match, names) if m}
-    mounts = autofs_points()
+    mounts, note = autofs_points() if sessions is not None else ([], None)
+    notes += [note] if note else []
     out, skipped = [], []
     for u, (n, h) in sorted(homes.items()):
         if not os.path.isabs(h) or h == '/':
             continue
-        if u not in sessions and mounts and on_autofs(os.path.normpath(h), mounts):
+        if mounts and u not in sessions and on_autofs(os.path.normpath(h), mounts):
             skipped.append(n)
             continue
         out.append((n, u, os.path.join(ROOT + h, '.config', 't3-capacity', 'reserve.d')))
-    notes = [f'reservations not read for {len(skipped)} people without a session whose home is not mounted (autofs): '
-             f'{", ".join(skipped[:5])}{" ..." if len(skipped) > 5 else ""}'] if skipped else []
+    if skipped:
+        notes.append(f'reservations not read for {len(skipped)} people without a session whose home is not mounted '
+                     f'(autofs): {", ".join(skipped[:5])}{" ..." if len(skipped) > 5 else ""}')
     return out, blind, notes
 
 
@@ -662,8 +686,11 @@ def own_caps(uid):
         if own is None:                             # cgroup v1 alone: the basic tier
             return []
     path = rd.cgroup_path(own)
-    if path is None:                                # the root (a namespace's): the shared reader's
+    if path is None and re.fullmatch(r'/+', own):   # the root (a namespace's): the shared reader's
         return []
+    if path is None:                                # #996 item 5: above the namespace's root (/..): unreadable, busy
+        return [{'path': own[:200], 'limitMb': None, 'roomMb': None,
+                 'why': 'cannot be used (it leaves the cgroup tree: outside this cgroup namespace)'}]
     caps, parts = [], path.split('/')[1:]
     for i in range(1, len(parts) + 1):
         rel = '/' + '/'.join(parts[:i])
@@ -1068,6 +1095,7 @@ def open_folder(name, shown, parent=None, make=False, private=True):
 def swappable(st, uid):
     """True when someone else could swap what is in a folder with this stat: not root's or this user's, or a group or
     others can write it and it is not sticky (in a sticky one only an entry's owner can rename or remove it)."""
+    # bin/heavy and lib/heavy_sweep.py others_can_swap hold the same rule: tests/facts.test.py OneRule checks they agree
     return st.st_uid not in (0, uid) or bool(st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX)
 
 
@@ -1112,13 +1140,29 @@ def open_home():
 
 
 def host_name():
-    """This machine's name for a cache folder in the home, which other machines may share (one cache per machine)."""
+    """This machine's host name, made safe for a folder name."""
     return re.sub(r'[^A-Za-z0-9_.-]', '_', os.uname().nodename)[:64] or 'host'
 
 
+def machine_tag():
+    """This machine for a cache folder in the home, which other machines may share (one cache per machine): the host
+    name and (#996 item 3: clones and cloud images keep one host name) the machine id, else the boot id; neither
+    (no /etc/machine-id, or "uninitialized" on a first boot, and no /proc): the host name alone."""
+    for path in ('/etc/machine-id', '/proc/sys/kernel/random/boot_id'):
+        try:
+            ident = _read(path, 128).strip().lower().replace('-', '')
+        except OSError:
+            continue
+        if re.fullmatch(r'[0-9a-f]{32}', ident):
+            return f'{host_name()}-{ident[:16]}'
+    return host_name()
+
+
 def home_cache():
-    """(Folder, None) or (None, why): ~/.cache/heavy-facts-<host>, a folder only this user can use in its home
-    (open_home), each folder made when missing. ~/.cache must be this user's and closed to writes by others."""
+    """(Folder, None) or (None, why): ~/.cache/heavy-facts-<machine_tag()>, a folder only this user can use in its
+    home (open_home), each folder made when missing. ~/.cache must be this user's and closed to writes by others. The
+    previous kit's ~/.cache/heavy-facts-<host> is never read (another machine of this home may still run that kit,
+    so it is not removed either)."""
     home, where = open_home()
     if home is None:
         return None, f'no home for it ({where})'
@@ -1132,8 +1176,8 @@ def home_cache():
         st = os.fstat(cache.fd)
         if st.st_uid != os.getuid() or st.st_mode & 0o022:
             return None, f'{cache.path} is not this user\'s, or others can write it'
-        return open_folder(f'heavy-facts-{host_name()}', cache.at(f'heavy-facts-{host_name()}'), parent=cache.fd,
-                           make=True)
+        name = f'heavy-facts-{machine_tag()}'
+        return open_folder(name, cache.at(name), parent=cache.fd, make=True)
     finally:
         cache.close()
 
