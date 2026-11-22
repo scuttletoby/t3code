@@ -1350,8 +1350,8 @@ process as any resumed thread does.
   polls: a child found busy is checked again at its next run end, request change or background-work
   change.
 - Never stopped: a thread with a run (also a queued or silent one), a pending question or approval,
-  background work, a task still open, or a `wait_for` wait that would wake it (or a wait store that
-  cannot be read). The last check runs in the same step as upstream's release, which also keeps a
+  background work, a task still open (its own, or one it delegated itself), or a `wait_for` wait
+  that would wake it (or a wait store that cannot be read). The last check runs in the same step as upstream's release, which also keeps a
   session a turn just started on.
 - Only a child's own process: one provider process per thread (Claude, and others that run one per
   thread). A shared process (Codex, OpenCode) serves other threads and is left to upstream. A

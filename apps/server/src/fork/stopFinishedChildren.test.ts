@@ -81,11 +81,15 @@ const makeWorld = (stopFinishedChildren: { enabled: boolean; graceSeconds?: numb
     [CHILD, idleShell(CHILD)],
   ]);
   const tasks: Array<OrchestrationV2Subagent> = [delegatedTask()];
+  /** Tasks the child itself delegated. */
+  const childTasks: Array<OrchestrationV2Subagent> = [];
   const runs: Array<Pick<OrchestrationV2Run, "status">> = [];
   const state = {
     sessions: [session(SESSION)],
     providerThreads: [providerThread(CHILD, SESSION)],
     openWaits: 0,
+    /** The wait store could not be read. */
+    storeError: false,
     backgroundWork: false,
     /** Run while upstream decides, as a turn start in that same step would. */
     beforeKeepIf: null as null | (() => void),
@@ -106,7 +110,7 @@ const makeWorld = (stopFinishedChildren: { enabled: boolean; graceSeconds?: numb
             thread: {},
             ...(fields.includes("runs") ? { runs: threadId === CHILD ? runs : [] } : {}),
             ...(fields.includes("subagents")
-              ? { subagents: threadId === PARENT ? tasks : [] }
+              ? { subagents: threadId === PARENT ? tasks : threadId === CHILD ? childTasks : [] }
               : {}),
             ...(fields.includes("providerSessions")
               ? { providerSessions: threadId === CHILD ? state.sessions : [] }
@@ -148,10 +152,11 @@ const makeWorld = (stopFinishedChildren: { enabled: boolean; graceSeconds?: numb
             enabled: true,
             checks: [],
             waits: Array.from({ length: state.openWaits }, () => ({}) as never),
+            ...(state.storeError ? { storeError: "unreadable" } : {}),
           }),
       }),
     );
-  return { shells, tasks, runs, state, live, releases, released, layer };
+  return { shells, tasks, childTasks, runs, state, live, releases, released, layer };
 };
 
 type World = ReturnType<typeof makeWorld>;
@@ -216,7 +221,25 @@ describe("StopFinishedChildren.check", () => {
               ),
             "busy",
           ],
+          [
+            "a task it delegated itself, still open",
+            (world) =>
+              world.childTasks.push(
+                delegatedTask({
+                  id: "grandchild-task",
+                  threadId: CHILD,
+                  childThreadId: ThreadId.make("grandchild"),
+                  status: "running",
+                }),
+              ),
+            "busy",
+          ],
           ["a wait", (world) => (world.state.openWaits = 1), "waiting"],
+          [
+            "a wait store that cannot be read",
+            (world) => (world.state.storeError = true),
+            "waiting",
+          ],
           ["background work", (world) => (world.state.backgroundWork = true), "busy"],
         ];
         for (const [name, set, expected] of cases) {
@@ -257,6 +280,31 @@ describe("StopFinishedChildren.check", () => {
       native.tasks.splice(0, 1, delegatedTask({ origin: "provider_native" }));
       expect(yield* (yield* service(native)).check(CHILD)).toEqual({ type: "notChild" });
       expect(native.releases).toEqual([]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("stops only a session the child's own provider thread names", () =>
+    Effect.gen(function* () {
+      const world = makeWorld({ enabled: true });
+      // The session is in the child's records, but only another thread's provider thread names it.
+      world.state.providerThreads = [providerThread(PARENT, SESSION)];
+      expect(yield* (yield* service(world)).check(CHILD)).toEqual({ type: "none" });
+      expect(world.releases).toEqual([]);
+      expect(world.live.has(SESSION)).toBe(true);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("stops a child whose own delegated tasks have all ended", () =>
+    Effect.gen(function* () {
+      const world = makeWorld({ enabled: true });
+      world.childTasks.push(
+        delegatedTask({
+          id: "grandchild-task",
+          threadId: CHILD,
+          childThreadId: ThreadId.make("grandchild"),
+        }),
+      );
+      expect(yield* (yield* service(world)).check(CHILD)).toEqual(stoppedOnce);
     }).pipe(Effect.scoped),
   );
 

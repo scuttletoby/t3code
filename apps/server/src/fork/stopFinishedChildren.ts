@@ -34,7 +34,7 @@ export type CheckOutcome =
   | { readonly type: "notChild" }
   | { readonly type: "gone" }
   | { readonly type: "unreadable" }
-  /** Working, a pending question or approval, background work, or a task still open. */
+  /** Working, a pending question or approval, background work, or an open task (or one it gave). */
   | { readonly type: "busy" }
   /** A `wait_for` wait that will wake it (or a wait store that cannot be read). */
   | { readonly type: "waiting" }
@@ -100,6 +100,11 @@ export const make = Effect.fn("StopFinishedChildren.make")(function* () {
       );
       if (tasks.length === 0) return "notChild" as const;
       if (tasks.some((task) => !isEndedTask(task))) return "busy" as const;
+    }
+    // A child that delegated a task of its own waits for that task's result.
+    const own = yield* threads.getThreadRecords(threadId, ["subagents"]);
+    if (own.subagents.some((task) => isDelegatedTask(task) && !isEndedTask(task))) {
+      return "busy" as const;
     }
     const open = yield* waits.list({ threadId, projectId: shell.projectId }).pipe(
       Effect.map((result) => result.storeError !== undefined || result.waits.length > 0),
