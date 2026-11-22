@@ -82,6 +82,11 @@ export interface OptionCase {
 
 const OPTION_FIX = "this option is not allowed while the model policy is on";
 const MODEL_FIX = "Pick the model in the model field";
+/** An option that picks an agent or a mode: refused even where the model list describes it. */
+const AGENT_WHY = (id: string) =>
+  `the option ${id} picks an agent or a mode, which brings its own prompt, tools and settings (an agent can carry its own model) that the policy cannot see`;
+const AGENT_FIX =
+  "an option that picks an agent or a mode is not allowed while the model policy is on";
 const unreadable = (id: string, model: string) =>
   `the option ${id} is not described for ${model} in this machine's model list and is not an effort id the policy reads`;
 
@@ -101,8 +106,8 @@ export const OPTION_CASES: ReadonlyArray<OptionCase> = [
     model: ACP_OPTION_MODEL,
     allowed: { id: "thought_level", value: "high" },
     extra: { id: "_t3/session-mode", value: "max" },
-    why: unreadable("_t3/session-mode", ACP_OPTION_MODEL),
-    fix: OPTION_FIX,
+    why: AGENT_WHY("_t3/session-mode"),
+    fix: AGENT_FIX,
   },
   {
     name: "Grok: the agent's native thought_level beside reasoningEffort",

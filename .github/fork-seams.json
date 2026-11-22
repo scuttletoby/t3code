@@ -589,15 +589,11 @@
     },
     "apps/server/src/provider/Drivers/ClaudeSkills.ts": {
       "why": "#978 (model policy): the hook that checks Claude's Skill tool reads a skill's frontmatter with the skill list's own parser, so the repair of an unquoted \": \" in a value (which Claude Code accepts) is one source. parseSkillFrontmatter is exported, and its parsed result also carries the whole frontmatter record (fork/claudeAgentModelPolicy.ts reads context, model and effort from it). Tested in apps/server/src/fork/claudeAgentModelPolicy.test.ts.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-22",
-        "added": [
-          "readonly record: Record<string, unknown>; // Fork: for the model policy's skill check",
-          "record, // Fork: the model policy reads context, model and effort from it",
-          "export { parseSkillFrontmatter }; // Fork: one frontmatter read for skills and the model policy"
-        ]
-      }
+      "added": [
+        "readonly record: Record<string, unknown>; // Fork: for the model policy's skill check",
+        "record, // Fork: the model policy reads context, model and effort from it",
+        "export { parseSkillFrontmatter }; // Fork: one frontmatter read for skills and the model policy"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
