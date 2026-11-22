@@ -3,6 +3,9 @@
  * string indexing differ from Python's, and the gate is Python, so patterns here are spelled as Python reads them.
  */
 import { characterEntities } from "character-entities";
+import * as Schema from "effect/Schema";
+
+import { PY_ASSIGNED, PY_UNICODE } from "./pyUnicode.ts";
 
 /** Python's whitespace (str.isspace, re `\s`), as the body of a character class. */
 export const WS =
@@ -13,6 +16,62 @@ const W = "[\\p{L}\\p{N}_]";
 export const ALNUM = "[\\p{L}\\p{N}]";
 /** Python re `\b`. */
 export const B = `(?:(?<=${W})(?!${W})|(?<!${W})(?=${W}))`;
+
+const PY_CLASS = PY_ASSIGNED.split(" ")
+  .map((range) =>
+    range
+      .split("-")
+      .map((h) => `\\u{${h}}`)
+      .join("-"),
+  )
+  .join("");
+const PY_UNASSIGNED = new RegExp(`[^${PY_CLASS}]`, "gu");
+const IS_PY_UNASSIGNED = new RegExp(`^[^${PY_CLASS}]$`, "u");
+const UNASSIGNED = /\p{Cn}/gu;
+const IS_UNASSIGNED = /^\p{Cn}$/u;
+/** U+0000 to U+0377 are assigned in every Unicode version since 1.1. */
+const PAST_SAFE = /[\u0378-\u{10ffff}]/u;
+
+/** Text one of the rules cannot read as Python does: Python's Unicode and this runtime's assign a code point of it differently. */
+export class PyTextError extends Schema.TaggedError<PyTextError>()("PyTextError", {
+  codePoints: Schema.Array(Schema.String),
+}) {
+  override get message(): string {
+    return (
+      `the text holds ${this.codePoints.join(", ")}, which the gate's Python (Unicode ${PY_UNICODE}) and this ` +
+      "runtime assign differently, so the two would read it differently"
+    );
+  }
+}
+
+/**
+ * Throws PyTextError when the text holds a code point that Python's Unicode (PY_UNICODE) and this runtime's do not
+ * both assign or both leave unassigned. Such a code point reads differently in `\w`, digits, NFKC and case (`Ᲊ`,
+ * new in Unicode 16, just before `major:` is a finding in the gate and none here), so the text is refused, never read
+ * a second way. Unicode keeps an assigned character's normalization and case pairs stable, so the rest reads alike.
+ */
+export function pyUnicodeCheck(text: string): void {
+  if (!PAST_SAFE.test(text)) return;
+  const drift = new Set<number>();
+  for (const [ch] of text.matchAll(PY_UNASSIGNED))
+    if (!IS_UNASSIGNED.test(ch)) drift.add(ch.codePointAt(0)!);
+  for (const [ch] of text.matchAll(UNASSIGNED))
+    if (!IS_PY_UNASSIGNED.test(ch)) drift.add(ch.codePointAt(0)!);
+  if (drift.size === 0) return;
+  throw new PyTextError({
+    codePoints: [...drift]
+      .toSorted((a, b) => a - b)
+      .map((u) => `U+${u.toString(16).toUpperCase().padStart(4, "0")}`),
+  });
+}
+
+/** Python's sorted() on strings: by code point, not by UTF-16 unit. */
+export function byCodePoint(a: string, b: string): number {
+  const x = Array.from(a, (c) => c.codePointAt(0)!);
+  const y = Array.from(b, (c) => c.codePointAt(0)!);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i]! - y[i]!;
+  return x.length - y.length;
+}
 
 /**
  * A Python pattern source for re.I: Python's case-insensitive `i` also matches `İ` and `ı`, JavaScript's does not

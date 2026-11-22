@@ -200,9 +200,11 @@ class Findings(unittest.TestCase):
                 self.assertEqual(section, v['section'])
 
     def test_each_rule_keeps_its_vectors(self):   # a vector dropped from the file is a rule no longer shown
-        sizes = {g: len(group(g)) for g in ('finding', 'clean', 'section', 'one-kind', 'one-label', 'mention')}
+        sizes = {g: len(group(g)) for g in ('finding', 'clean', 'section', 'one-kind', 'one-label', 'mention', 'named',
+                                            'python-text')}
         self.assertEqual(sizes, {'finding': 58, 'clean': 37, 'section': 9, 'one-kind': 9, 'one-label': 4,
-                                 'mention': 8})
+                                 'mention': 8, 'named': 8, 'python-text': 10})
+        self.assertEqual(sum(sizes.values()), len(FINDINGS))
 
     def test_each_real_finding_format_counts(self):
         for v in group('finding'):
@@ -226,25 +228,6 @@ class Findings(unittest.TestCase):
                 r = rounds([('code', H1)], {'code': v['body']})
                 self.assertEqual(len(r.problems), 1)
                 self.assertIn('lens code: its newest report has no findings section', r.problems[0])
-
-    def test_a_long_run_of_spaces_takes_linear_time(self):   # #740 round 2: 81-91 s for one 65,000-character line
-        n = 200_000
-        for line in ('major' + ' ' * n + 'x', 'blocker: none' + ' ' * n + 'x', '| a | b |\n' + ' ' * n + 'x',
-                     '| a | b |\n|' + ' ' * n + 'x', '| a | b |\n|-' + ' ' * n + 'x',
-                     'not' + ' ' * n + 'safe', 'finding:' + ' ' * n + 'x', 'major: none' + ' \t' * (n // 2) + 'x'):
-            with self.subTest(line[:12]):
-                start = time.monotonic()
-                rj.read_findings(HEAD + line)
-                self.assertLess(time.monotonic() - start, 2)
-
-    def test_a_wide_table_row_takes_linear_time(self):   # the old per-cell read: 13 s at 4,000 cells, minutes at 65,536 chars
-        for text in ('| ' + 'major | ' * 8_000, '| ' + 'major | ' * 4_000 + 'x | ' * 4_000,
-                     '| ' + 'major | ' * 3_000 + '\n|' + '---|' * 3_000 + '\n| ' + 'x | ' * 3_000,
-                     '| major |' + ' |' * 30_000 + ' x |', '|' + '---|' * 16_000 + 'x'):
-            with self.subTest(text[:12]):   # each about one full-size comment (65,536 characters): 0.2-0.5 s here
-                start = time.monotonic()
-                rj.read_findings(HEAD + text)
-                self.assertLess(time.monotonic() - start, 2)
 
     def test_a_table_does_not_go_on_past_a_fence(self):   # a fence ends the table, as GitHub renders it
         table = '| blocker | major |\n|---|---|\n| none | none |\n'
@@ -359,8 +342,11 @@ class Rounds(unittest.TestCase):
 
 # Every section of review.vectors.json, replayed whole: the TypeScript side (apps/server/src/reviewRules) runs the same
 # sections, and each side fails on a section or a vector field it does not run, so neither can skip one quietly.
-SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds'}
-FIELDS = {'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
+SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds',
+            'linear', 'py_unicode', 'unicode'}
+FIELDS = {'linear': {'name', 'fn', 'parts', 'expect', 'ms'},
+          'unicode': {'name', 'body', 'findings', 'section', 'unassigned'},
+          'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
           'findings': {'name', 'group', 'body', 'findings', 'section'},
           'scans': {'name', 'posts', 'history', 'entries'},
           'rounds': {'name', 'config', 'history', 'reports', 'decided', 'changes', 'override_authors', 'findings',
@@ -369,11 +355,22 @@ SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',))
 
 
 def scan(posts):
-    comments = [{'body': p['body'], 'author': {'login': 'someone'}, 'authorAssociation': 'OWNER',
-                 'createdAt': f'2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z',
-                 'includesCreatedEdit': p.get('edited', False), 'isMinimized': p.get('hidden', False)}
-                for i, p in enumerate(posts)]
-    found, history = SCAN.lens_scan({'comments': comments, 'reviews': []})
+    """The vector's posts as a pull request: each by `someone`, one second apart unless it names its `when`; a comment by
+    default, else a `review` (its flags read unless `flags` is false) or an `inline` review comment."""
+    pr = {'comments': [], 'reviews': [], lens.REVIEW_FLAGS: {}, lens.REVIEW_COMMENTS: []}
+    for i, p in enumerate(posts):
+        when = p.get('when', f'2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z')
+        post = {'body': p['body'], 'author': {'login': 'someone'}, 'authorAssociation': 'OWNER'}
+        flags = {'includesCreatedEdit': p.get('edited', False), 'isMinimized': p.get('hidden', False)}
+        kind = p.get('kind', 'comment')
+        if kind == 'review':
+            pr['reviews'].append({**post, 'id': f'R{i}', 'submittedAt': when,
+                                  'includesCreatedEdit': False, 'isMinimized': False})   # gh's defaults, never read
+            if p.get('flags', True):
+                pr[lens.REVIEW_FLAGS][f'R{i}'] = flags
+        else:
+            pr['comments' if kind == 'comment' else lens.REVIEW_COMMENTS].append({**post, 'createdAt': when, **flags})
+    found, history = SCAN.lens_scan(pr)
     return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}
 
 
@@ -395,6 +392,43 @@ class SharedVectors(unittest.TestCase):
             self.assertEqual(len(names), len(set(names)), f'{section}: two vectors share a name')
             for v in VECTORS[section]:
                 self.assertLessEqual(set(v), fields, f'{section}: {v["name"]}')
+
+    def test_every_linear_vector_in_its_time(self):   # #740 round 2: 81-91 s for one 65,000-character line before
+        for v in VECTORS['linear']:   # each its own bound: a slow but not hanging path would pass a test timeout
+            with self.subTest(v['name']):
+                body = ''.join(text * times for text, times in v['parts'])
+                start = time.monotonic()
+                if v['fn'] == 'read_findings':
+                    said, section = rj.read_findings(body)
+                    got = [[list(f) for f in said], section]
+                else:
+                    self.assertEqual(v['fn'], 'lens_problem')
+                    got = SCAN.lens_problem({'body': body})
+                self.assertLess(time.monotonic() - start, v['ms'] / 1000)
+                self.assertEqual(got, v['expect'])
+
+    def test_the_unicode_table_is_this_pythons(self):   # T3 refuses text whose code points its Unicode assigns otherwise
+        import unicodedata
+        u = VECTORS['py_unicode']
+        self.assertEqual(u['version'], unicodedata.unidata_version,
+                         'a new Python reads a new Unicode: regenerate py_unicode and T3\'s pyUnicode.ts together')
+        ranges, start = [], None
+        for cp in range(0x110000):
+            assigned = unicodedata.category(chr(cp)) != 'Cn'
+            if assigned and start is None:
+                start = cp
+            if not assigned and start is not None:
+                ranges.append((start, cp - 1))
+                start = None
+        if start is not None:
+            ranges.append((start, 0x10ffff))
+        self.assertEqual(u['assigned'], ' '.join(f'{a:x}' if a == b else f'{a:x}-{b:x}' for a, b in ranges))
+        for v in VECTORS['unicode']:
+            with self.subTest(v['name']):
+                said, section = rj.read_findings(v['body'])
+                self.assertEqual(([list(f) for f in said], section), (v['findings'], v['section']))
+                self.assertEqual(v['unassigned'],
+                                 sorted({f'U+{ord(c):04X}' for c in v['body'] if unicodedata.category(c) == 'Cn'}))
 
     def test_every_scan(self):   # same comment twice, edited, hidden, old forms, no comment at all
         self.assertGreaterEqual(len(VECTORS['scans']), 31)

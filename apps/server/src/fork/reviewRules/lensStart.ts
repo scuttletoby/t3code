@@ -9,16 +9,28 @@ import * as Schema from "effect/Schema";
 
 import { type EffectiveReviewRules, type ReviewRunner, reviewLensRunner } from "@t3tools/contracts";
 
-import { NO_HEADER, lensKey, lensScan, namesALens, type LensPost } from "./lensComment.ts";
+import {
+  NO_HEADER,
+  lensEntries,
+  lensKey,
+  namesALens,
+  olderThan,
+  type LensPost,
+  type PostAt,
+} from "./lensComment.ts";
 import { ReviewPlanError, planReview, type ReviewBlock, type ReviewPlan } from "./plan.ts";
+import { PyTextError } from "./pyText.ts";
 import { judgeRounds, type Rounds } from "./rounds.ts";
 
 const isPlanError = Schema.is(ReviewPlanError);
+const isPyTextError = Schema.is(PyTextError);
 
 type OnRules = Extract<EffectiveReviewRules, { readonly preset: "recommended" }>;
 
 /** The most pull requests one call reads. */
 export const LENS_START_MAX_PRS = 10;
+/** The most children one lens gets on the same heads: after this many ended without the read, a person looks. */
+export const LENS_START_MAX_ATTEMPTS = 3;
 /** The longest request id `delegate_task` takes. */
 const REQUEST_ID_MAX = 256;
 const SHA = /^[0-9a-f]{40}$/u;
@@ -63,6 +75,12 @@ export interface LensStartPost extends LensPost {
    * it in the gate (lens_reads), a person's or not.
    */
   readonly override?: string;
+  /**
+   * The login of an override comment's author. An override by a login in the base's `review.override_authors` that
+   * vouches for this head (`sameChange`) is a person's: it clears the findings of every older entry (head_check
+   * review_rounds); any other override covers an entry's read but clears nothing. Absent: no person's override.
+   */
+  readonly author?: string;
 }
 
 /** One pull request as the caller read it from GitHub, its head first. */
@@ -79,8 +97,17 @@ export interface LensStartPullRequest {
   readonly posts: ReadonlyArray<LensStartPost>;
   /** A person's override for this head is newer than every lens comment (the gate's `decided`). */
   readonly decided?: boolean;
-  /** What the pull request itself changes at a commit, so a read before a clean base merge still read the head. */
+  /**
+   * For round counting only: what the pull request itself changes at a commit (head_check.own_change), so a read of
+   * the same change is no new round. Never used for "this lens read the head": an amended or rebased commit has the
+   * same change but is not the commit read, and the gate fails it.
+   */
   readonly changeOf?: (sha: string) => string;
+  /**
+   * The gate's own check that a lens read of `read` reads this head (head_check.same_change): the head is `read`, or
+   * `read` merged with the base and nothing else (pr_queue.holds). Absent: only the head itself counts.
+   */
+  readonly sameChange?: (read: string) => boolean;
 }
 
 /** What the gate reads at one base branch's tip. */
@@ -93,7 +120,10 @@ export interface LensStartBase {
   readonly requiredLenses: ReadonlyArray<string> | null;
 }
 
-/** A lens child started earlier for this repo (T3b reads them by their `lens/` request ids). */
+/**
+ * A lens child started earlier for this repo. A request id cannot be read back (a long one is a digest), so the caller
+ * stores each child's lens key and pull requests when it starts it (`earlierChild`) and passes every one in again.
+ */
 export interface LensStartEarlierChild {
   readonly requestId: string;
   readonly key: string;
@@ -187,37 +217,41 @@ export function gateReads(
   posts: ReadonlyArray<LensStartPost>,
   overridePrefix?: string,
 ): Map<string, GateRead> {
-  const entries = new Map<string, { at: number; sha: string | null; name: string | null }>();
-  let newest: { at: number; sha: string } | null = null;
-  posts.forEach((post, i) => {
-    if (post.override !== undefined) {
-      if (SHA.test(post.override)) newest = { at: i, sha: post.override };
-      return;
-    }
-    const one = lensScan([{ ...post, where: post.where ?? `post ${i + 1}` }], overridePrefix);
-    const name = one.history[0]?.[0] ?? null;
-    for (const [key, [sha]] of Object.entries(one.entries)) {
-      entries.set(key, { at: i, sha, name: key.startsWith(NO_HEADER) ? null : name });
-    }
-  });
-  const over = newest as { at: number; sha: string } | null;
+  const { entries } = lensEntries(posts, overridePrefix, isOverride);
+  const over = newestOverride(posts);
   const reads = new Map<string, GateRead>();
   for (const [key, { at, sha, name }] of entries) {
-    if (over !== null && at < over.at) reads.set(key, { sha: over.sha, name });
+    if (over !== null && olderThan(at, over.at)) reads.set(key, { sha: over.sha, name });
     else reads.set(key, { sha: sha !== null && SHA.test(sha) ? sha : null, name });
   }
   return reads;
 }
 
+const isOverride = (post: LensStartPost) => post.override !== undefined;
+
+/** The newest override with a full sha (lens_reads: max over [when, index]), and its post; null: none. */
+function newestOverride(
+  posts: ReadonlyArray<LensStartPost>,
+  only: (post: LensStartPost) => boolean = () => true,
+): { at: PostAt; sha: string } | null {
+  let newest: { at: PostAt; sha: string } | null = null;
+  posts.forEach((post, i) => {
+    if (post.override === undefined || !SHA.test(post.override) || !only(post)) return;
+    const at: PostAt = [post.when, i];
+    if (newest === null || !olderThan(at, newest.at)) newest = { at, sha: post.override };
+  });
+  return newest;
+}
+
 /**
  * The lens part of the gate's verdict (head_check.verdict): every required key has an entry, every entry reads one
- * full sha, and that sha is the head or the same change.
+ * full sha, and that sha is the head or holds its change (head_check.same_change, never the own-change hash).
  */
 function gateReadsPass(
   reads: ReadonlyMap<string, GateRead>,
   required: Iterable<string>,
   head: string,
-  changeOf: (sha: string) => string = (sha) => sha,
+  sameChange: (read: string) => boolean = () => false,
 ): boolean {
   const keys = [...required];
   if (reads.size === 0) return keys.length === 0;
@@ -225,7 +259,36 @@ function gateReadsPass(
   const shas = new Set([...reads.values()].map((r) => r.sha));
   if (shas.size !== 1) return false;
   const [sha] = shas;
-  return sha !== null && sha !== undefined && (sha === head || changeOf(sha) === changeOf(head));
+  return sha !== null && sha !== undefined && (sha === head || sameChange(sha));
+}
+
+/**
+ * The lens keys whose newest entry the gate judges UNREAD in enforce (head_check.review_rounds): it reads no full sha
+ * of its own and an override newer than it covers it, but no person's override for this head is newer. The gate fails
+ * such a head until that lens posts again (or a person overrides), however the reads look.
+ */
+export function unreadKeys(
+  posts: ReadonlyArray<LensStartPost>,
+  review: ReviewBlock,
+  head: string,
+  sameChange: (read: string) => boolean = () => false,
+  overridePrefix?: string,
+): Set<string> {
+  const people = new Set((review.override_authors ?? []).map((a) => a.toLowerCase()));
+  const newest = newestOverride(posts);
+  const person = newestOverride(
+    posts,
+    (post) =>
+      people.has((post.author ?? "").toLowerCase()) &&
+      (post.override === head || sameChange(post.override!)),
+  );
+  const unread = new Set<string>();
+  for (const [key, { at, sha }] of lensEntries(posts, overridePrefix, isOverride).entries) {
+    if ((person !== null && olderThan(at, person.at)) || key.startsWith(NO_HEADER)) continue;
+    if (!(sha !== null && SHA.test(sha)) && newest !== null && olderThan(at, newest.at))
+      unread.add(key);
+  }
+  return unread;
 }
 
 /** One lens a base knows how to start: its name, and its prompt (a config path, or a built-in one). */
@@ -295,7 +358,9 @@ function readPull(
     return {
       refused:
         "the gate's required-lenses input names no lens and the config has no `review` block in mode " +
-        "enforce, so the gate fails every head: a person names the lenses in the caller workflow or the config",
+        "enforce, so the gate requires no lens here (it fails a head only when the lens comments there do not " +
+        "all read it); lens_start starts only lenses the gate requires, so none: a person names the lenses in " +
+        "the caller workflow or the config",
     };
   }
   const block = review ?? FALLBACK_REVIEW;
@@ -310,10 +375,7 @@ function readPull(
     return { refused: `no plan: ${error.reason}; no lens is started rather than too few` };
   }
   const reads = gateReads(pull.posts, overridePrefix);
-  const { history } = lensScan(
-    pull.posts.flatMap((p) => (p.override === undefined ? [p] : [])),
-    overridePrefix,
-  );
+  const { history } = lensEntries(pull.posts, overridePrefix, isOverride);
   const rounds = startRounds(block, history, head, pull.changeOf);
   // The lenses this base can start, by key: the config's, then the input's names (built-in prompt).
   const approachKey = lensKey(block.rounds.approach_lens);
@@ -372,9 +434,28 @@ function readPull(
     };
   }
   if (rounds.approach) add(block.rounds.approach_lens);
-  const changeOf = pull.changeOf ?? ((sha: string) => sha);
-  const passes = gateReadsPass(reads, required.keys(), head, changeOf);
+  const sameChange = pull.sameChange ?? (() => false);
+  // In enforce the gate fails a lens whose newest report reads nothing and only an override no person's covers.
+  const unread =
+    enforce && block.findings
+      ? unreadKeys(pull.posts, block, head, sameChange, overridePrefix)
+      : new Set<string>();
+  const passes = unread.size === 0 && gateReadsPass(reads, required.keys(), head, sameChange);
   if (rounds.round > block.rounds.max) {
+    // The gate judges rounds only in enforce. Elsewhere T3 holds its own cap, and a head the gate already passes
+    // (its own required lenses: the input) needs no person: nothing more starts.
+    if (!enforce && gateReadsPass(reads, named.keys(), head, sameChange)) {
+      return {
+        read: { number: pull.number, head, round: rounds.round },
+        need: [],
+        done: [...named.values()],
+        earlier: new Map(),
+        notes: [
+          `#${pull.number}: a read of this head would be review round ${rounds.round}, past T3's cap of ` +
+            `${block.rounds.max}; the gate already passes it and judges no rounds here, so nothing starts`,
+        ],
+      };
+    }
     return {
       refused:
         `a read of this head would be review round ${rounds.round}, past the cap of ${block.rounds.max} ` +
@@ -389,13 +470,18 @@ function readPull(
     // Something starts at the head, so every entry that does not name the head itself starts again too.
     const stuck: string[] = [];
     for (const [key, name] of required) {
-      if (reads.get(key)?.sha === head) done.push(name);
+      if (reads.get(key)?.sha === head && !unread.has(key)) done.push(name);
       else need.push({ key, ...(known.get(key) ?? { ...NO_ENTRY, name }) });
     }
     for (const [key, read] of reads) {
-      if (required.has(key) || read.sha === head) continue;
+      if (required.has(key) || (read.sha === head && !unread.has(key))) continue;
       const lens = known.get(key);
-      const said = read.sha === null ? "reads nothing" : `read ${read.sha}`;
+      const said =
+        read.sha === null
+          ? "reads nothing"
+          : unread.has(key)
+            ? "reads nothing (only an override that is no person's covers it)"
+            : `read ${read.sha}`;
       if (lens !== undefined) {
         need.push({ key, ...lens });
         notes.push(
@@ -417,6 +503,16 @@ function readPull(
           "the gate needs every lens comment to name one head, and lens_start cannot start every lens " +
           `that does not: ${stuck.map((s) => `${s} a person writes a newer override comment for this head`).join("; ")}`,
       };
+    }
+  }
+  if (review?.mode === "shadow") {
+    const extra = need.filter((lens) => !named.has(lens.key)).map((lens) => lens.name);
+    if (extra.length > 0) {
+      notes.push(
+        `#${pull.number}: in shadow the gate requires only its required-lenses input; lens_start also starts ` +
+          `${extra.join(", ")} of the path rules on purpose (the trial shadow is for); each costs a child slot ` +
+          "and its runner's usage, Fable usage for a lens that runs on Fable",
+      );
     }
   }
   const earlier = new Map<string, string[]>();
@@ -591,7 +687,15 @@ export function planLensStart(input: LensStartInput): LensStartPlan {
       });
       continue;
     }
-    const got = readPull(rules, base, input.overridePrefix, pull);
+    let got: PullNeed;
+    try {
+      got = readPull(rules, base, input.overridePrefix, pull);
+    } catch (error) {
+      if (!isPyTextError(error)) throw error;
+      got = {
+        refused: `its lens comments or config cannot be read as the gate reads them: ${error.message}`,
+      };
+    }
     if ("refused" in got) {
       refused.push({ pr: number, reason: got.refused });
       continue;
@@ -631,16 +735,27 @@ export function planLensStart(input: LensStartInput): LensStartPlan {
     }
   }
   const ended = new Set(children.filter((c) => !c.running).map((c) => c.requestId));
-  const starts = [...groups.values()].map(({ key, lens, text, runner, reads }): LensStartChild => {
+  const starts: LensStartChild[] = [];
+  for (const { key, lens, text, runner, reads } of groups.values()) {
     const prs = reads.map(({ number, head, round }) => ({ number, head, round }));
     const which = prs.map((r) => `#${r.number}`).join(" ");
     const replaces: string[] = [];
     let attempt = 1;
-    for (;;) {
+    while (attempt <= LENS_START_MAX_ATTEMPTS) {
       const id = lensRequestId(input.repo, key, prs, attempt);
       if (!ended.has(id)) break;
       replaces.push(id);
       attempt++;
+    }
+    if (attempt > LENS_START_MAX_ATTEMPTS) {
+      refused.push({
+        pr: prs.length === 1 ? prs[0]!.number : null,
+        reason:
+          `lens ${lens.name} for ${which} is not started: ${LENS_START_MAX_ATTEMPTS} children ended without ` +
+          `the read (the last: ${replaces.at(-1)}); a person looks at why before it starts again, and a new ` +
+          "head starts it afresh",
+      });
+      continue;
     }
     if (attempt > 1) {
       notes.push(
@@ -648,7 +763,7 @@ export function planLensStart(input: LensStartInput): LensStartPlan {
           `starts again as attempt ${attempt}`,
       );
     }
-    return {
+    starts.push({
       requestId: lensRequestId(input.repo, key, prs, attempt),
       attempt,
       replaces,
@@ -658,14 +773,28 @@ export function planLensStart(input: LensStartInput): LensStartPlan {
       title: `lens ${lens.name} ${which}`,
       prompt: lensPrompt(rules, input.repo, lens.name, text, reads),
       prs,
-    };
-  });
+    });
+  }
   return {
     starts,
     running: [...running.values()].map(({ requestId, key, prs }) => ({ requestId, key, prs })),
     refused,
     alreadyRead,
     notes,
+  };
+}
+
+/**
+ * What the caller stores for a child it starts, to pass in again as `LensStartInput.children`: its id, lens key and
+ * the pull requests it reads (the id alone cannot be read back: a long one is a digest). `running`: false once the
+ * child ended.
+ */
+export function earlierChild(child: LensStartChild, running: boolean): LensStartEarlierChild {
+  return {
+    requestId: child.requestId,
+    key: child.key,
+    prs: child.prs.map(({ number, head }) => ({ number, head })),
+    running,
   };
 }
 

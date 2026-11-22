@@ -6,15 +6,20 @@ import * as NodeFS from "node:fs";
 import { effectiveReviewRules } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 
-import { lensKey, lensScan } from "./lensComment.ts";
+import { NO_HEADER, lensKey, lensScan } from "./lensComment.ts";
+import { byCodePoint } from "./pyText.ts";
+import { vectorPosts, type VectorPost } from "./vectors.testkit.ts";
 import {
   FALLBACK_REVIEW,
+  LENS_START_MAX_ATTEMPTS,
   LENS_START_MAX_PRS,
   confirmLensStart,
+  earlierChild,
   gateReads,
   lensRequestId,
   planLensStart,
   startRounds,
+  unreadKeys,
   type LensStartBase,
   type LensStartInput,
   type LensStartPlan,
@@ -48,6 +53,8 @@ const report = (lens: string, sha: string): LensStartPost => ({
   body: `lens: ${lens} · reviewer: x · read at: ${sha}\nstate: fine\nblocker: none\nmajor: none`,
   edited: false,
   hidden: false,
+  where: `report ${lens} ${sha}`,
+  when: "",
 });
 /** Every lens prompt of a config, read at the base. */
 const promptsOf = (review: ReviewBlock) =>
@@ -57,6 +64,8 @@ const override = (sha: string): LensStartPost => ({
   body: `${V.override_prefix} ${sha}: a person looked`,
   edited: false,
   hidden: false,
+  where: `override ${sha}`,
+  when: "",
   override: sha,
 });
 
@@ -100,10 +109,9 @@ function input(
 }
 
 /**
- * The gate's lens verdict, written from its own code, not from lensStart.ts: head_check.decide's required lenses (the
- * input; in enforce also the path lenses, as the shared case vector names them, and the approach lens from its
- * round), lens.Review.lens_reads (each lens's newest entry; a newer override covers it) and head_check.verdict (every
- * required key read, every entry one full sha, the head or the same change).
+ * The gate's lens verdict, written from its own code (not lensStart.ts): head_check.decide's required lenses,
+ * lens_reads (newest entry by [when, index]; a newer override covers it), head_check.verdict (one full sha: the head or
+ * `sameChange`) and, in enforce, review_rounds' UNREAD. `changeOf` (the own diff) counts rounds only.
  */
 function gatePasses(
   review: ReviewBlock,
@@ -112,21 +120,35 @@ function gatePasses(
   posts: ReadonlyArray<LensStartPost>,
   head: string,
   changeOf: (sha: string) => string = (sha) => sha,
+  sameChange: (read: string) => boolean = () => false,
 ): boolean {
-  const lensPosts = posts.flatMap((p, i) => (p.override === undefined ? [{ p, i }] : []));
-  const newest = posts.findLastIndex((p) => p.override !== undefined);
+  // Each post's age as a rank: the posts sorted by their time, ties by list place (lens_posts' [when, index]).
+  const rank: number[] = [];
+  posts
+    .map((p, i) => ({ p, i }))
+    .toSorted((x, y) => byCodePoint(x.p.when, y.p.when) || x.i - y.i)
+    .forEach(({ i }, r) => (rank[i] = r));
+  const byAge = posts.map((p, i) => ({ p, i: rank[i]! })).toSorted((x, y) => x.i - y.i);
+  const lensPosts = byAge.filter(({ p }) => p.override === undefined);
+  const newest = byAge.findLast(({ p }) => p.override !== undefined)?.i ?? -1;
+  const people = (review.override_authors ?? []).map((a) => a.toLowerCase());
+  const person =
+    byAge.findLast(
+      ({ p }) =>
+        p.override !== undefined &&
+        people.includes((p.author ?? "").toLowerCase()) &&
+        (p.override === head || sameChange(p.override)),
+    )?.i ?? -1;
   const entries: Record<string, { at: number; sha: string | null }> = {};
   for (const { p, i } of lensPosts) {
-    for (const [key, [sha]] of Object.entries(
-      lensScan([{ ...p, where: `post ${i + 1}` }], V.override_prefix).entries,
-    )) {
+    for (const [key, [sha]] of Object.entries(lensScan([p], V.override_prefix).entries)) {
       entries[key] = { at: i, sha };
     }
   }
   const reads = Object.entries(entries).map(([key, { at, sha }]) => [
     key,
     newest >= 0 && at < newest
-      ? posts[newest]!.override!
+      ? byAge[newest]!.p.override!
       : sha && /^[0-9a-f]{40}$/u.test(sha)
         ? sha
         : null,
@@ -135,20 +157,30 @@ function gatePasses(
   if (review.mode === "enforce") {
     pathLenses.forEach((name) => required.add(lensKey(name)));
     const history = lensScan(
-      lensPosts.map(({ p }) => p),
+      posts.filter((p) => p.override === undefined),
       V.override_prefix,
     ).history;
     if (judgeRounds(review, history, {}, false, changeOf).approach)
       required.add(lensKey(review.rounds.approach_lens));
+    const unread = Object.entries(entries).some(
+      ([key, { at, sha }]) =>
+        review.findings &&
+        at > person &&
+        !key.startsWith(NO_HEADER) &&
+        !(sha && /^[0-9a-f]{40}$/u.test(sha)) &&
+        at < newest,
+    );
+    if (unread) return false;
   }
   if (reads.length === 0) return required.size === 0;
   if ([...required].some((key) => !(key in entries))) return false;
   const shas = new Set(reads.map(([, sha]) => sha));
   const [sha] = shas;
-  return (
-    shas.size === 1 && typeof sha === "string" && (sha === head || changeOf(sha) === changeOf(head))
-  );
+  return shas.size === 1 && typeof sha === "string" && (sha === head || sameChange(sha as string));
 }
+
+/** A time after every vector post's: the reads a carried-out plan adds come last. */
+const LATER = "2026-12-31T00:00:00Z";
 
 const lensesOf = (plan: ReturnType<typeof planLensStart>) => plan.starts.map((s) => s.lens);
 
@@ -208,19 +240,10 @@ describe("lens_start on the shared vectors", () => {
   it("every shared vector state: after the plan is carried out the gate passes, or a person must act", () => {
     // States: each scan's posts, each round's history as reports, and mixed heads the vectors do not hold.
     const states: Array<[string, LensStartPost[]]> = [
-      ...V.scans.map(
-        (v: {
-          name: string;
-          posts: Array<{ body: string; edited?: boolean; hidden?: boolean }>;
-        }) => [
-          `scan ${v.name}`,
-          v.posts.map((p) => ({
-            body: p.body,
-            edited: p.edited ?? false,
-            hidden: p.hidden ?? false,
-          })),
-        ],
-      ),
+      ...V.scans.map((v: { name: string; posts: VectorPost[] }) => [
+        `scan ${v.name}`,
+        vectorPosts(v.posts),
+      ]),
       ...V.rounds.map((r: { name: string; history: Array<[string, string | null]> }) => [
         `round ${r.name}`,
         r.history.flatMap(([name, sha]) => (sha ? [report(name, sha)] : [])),
@@ -230,14 +253,25 @@ describe("lens_start on the shared vectors", () => {
       ["an override covers an older read", [report("code", B), override(A)]],
       [
         "an override covers a comment that reads nothing",
-        [
-          { body: `Review done.\n${report("code", B).body}`, edited: false, hidden: false },
-          override(A),
-        ],
+        [{ ...report("code", B), body: `Review done.\n${report("code", B).body}` }, override(A)],
       ],
       ["a read newer than an override", [override(A), report("code", B)]],
+      // The gate (enforce) cannot read the findings of an edited report that only a non-person override covers.
+      [
+        "an override covers an edited report",
+        [{ ...report("code", A), edited: true }, override(A)],
+      ],
+      ["an override covers a short read", [report("code", A.slice(0, 7)), override(A)]],
     ];
-    const sameChange = () => "one change";
+    // How a read relates to the head: the commit itself only; the same own diff but another commit (an amended
+    // message, a rebase, a force-push: the gate fails it); the same diff and the head merges it with the base.
+    const ways: Array<
+      [string, ((sha: string) => string) | undefined, ((sha: string) => boolean) | undefined]
+    > = [
+      ["own", undefined, undefined],
+      ["amended", () => "one change", undefined],
+      ["merged", () => "one change", () => true],
+    ];
     let plans = 0;
     let carried = 0;
     let mixed = 0;
@@ -248,8 +282,8 @@ describe("lens_start on the shared vectors", () => {
       for (const required of enforce ? [[], ["code"]] : [["code"], ["code", "data-1"]]) {
         for (const [name, posts] of states) {
           for (const head of [A, F]) {
-            for (const changeOf of [undefined, sameChange]) {
-              const at = `${c.name} / ${name} / ${required.join(",")} / ${head.slice(0, 1)} / ${changeOf ? "same" : "own"}`;
+            for (const [way, changeOf, sameChange] of ways) {
+              const at = `${c.name} / ${name} / ${required.join(",")} / ${head.slice(0, 1)} / ${way}`;
               const one = (list: LensStartPost[]) =>
                 planLensStart(
                   input({
@@ -261,6 +295,7 @@ describe("lens_start on the shared vectors", () => {
                         posts: list,
                         changes: c.changes,
                         ...(changeOf ? { changeOf } : {}),
+                        ...(sameChange ? { sameChange } : {}),
                       }),
                     ],
                   }),
@@ -276,7 +311,9 @@ describe("lens_start on the shared vectors", () => {
               }
               const after = [
                 ...posts,
-                ...plan.starts.flatMap((s) => s.prs.map((r) => report(s.lens, r.head))),
+                ...plan.starts.flatMap((s) =>
+                  s.prs.map((r) => ({ ...report(s.lens, r.head), when: LATER })),
+                ),
               ];
               if (plan.starts.length > 0) carried++;
               if (
@@ -284,7 +321,10 @@ describe("lens_start on the shared vectors", () => {
                 1
               )
                 mixed++;
-              assert.isTrue(gatePasses(review, required, c.lenses, after, head, changeOf), at);
+              assert.isTrue(
+                gatePasses(review, required, c.lenses, after, head, changeOf, sameChange),
+                at,
+              );
               // Runs again: the carried-out plan starts nothing more.
               assert.deepStrictEqual(one(after).starts, [], `${at}: again`);
             }
@@ -292,7 +332,7 @@ describe("lens_start on the shared vectors", () => {
         }
       }
     }
-    assert.isAtLeast(plans, V.cases.length * (V.scans.length + V.rounds.length) * 8);
+    assert.isAtLeast(plans, V.cases.length * (V.scans.length + V.rounds.length) * 12);
     assert.isAtLeast(carried, 1000);
     assert.isAtLeast(mixed, 100);
     assert.isAtLeast(refusedByPerson, 100);
@@ -346,6 +386,70 @@ describe("lens_start answers the state question", () => {
     );
   });
 
+  it("the newest post by time counts, not the last one listed (the gate lists reviews after comments)", () => {
+    const t = (second: number) => `2026-01-01T00:00:0${second}Z`;
+    const plan = (posts: LensStartPost[]) =>
+      lensesOf(planLensStart(input({ pullList: [pull(1, { posts })] })));
+    // The comment reading the head is newer than the review listed after it.
+    assert.deepStrictEqual(
+      plan([
+        { ...report("code", A), when: t(9) },
+        { ...report("code", B), when: t(1) },
+      ]),
+      [],
+    );
+    assert.deepStrictEqual(
+      plan([
+        { ...report("code", A), when: t(1) },
+        { ...report("code", B), when: t(9) },
+      ]),
+      ["code"],
+    );
+    // An override listed last but older than the read covers nothing.
+    const late = [
+      { ...report("code", B), when: t(9) },
+      { ...override(A), when: t(5) },
+    ];
+    assert.strictEqual(gateReads(late, V.override_prefix).get("code")?.sha, B);
+    assert.deepStrictEqual(plan(late), ["code"]);
+    // Nor does it make a newer short read UNREAD in enforce.
+    const short = [
+      { ...report("code", A.slice(0, 7)), when: t(5) },
+      { ...override(B), when: t(1) },
+    ];
+    assert.deepStrictEqual([...unreadKeys(short, { ...basic, findings: true }, A)], []);
+    assert.deepStrictEqual(
+      [...unreadKeys(short.toReversed(), { ...basic, findings: true }, A)],
+      [],
+    );
+    assert.deepStrictEqual(
+      [...unreadKeys([short[0]!, { ...short[1]!, when: t(9) }], { ...basic, findings: true }, A)],
+      ["code"],
+    );
+  });
+
+  it("a comment the gate's Unicode reads otherwise refuses that pull request only", () => {
+    // U+1C89 is unassigned in the gate's Python (Unicode 15.0) and a letter in this runtime's.
+    const drift = { ...report("code", B), body: `${report("code", B).body}\n\u1c89major: x` };
+    const plan = planLensStart(
+      input({
+        pullList: [pull(1, { posts: [drift] }), pull(2)],
+      }),
+    );
+    assert.deepStrictEqual(plan.refused, [
+      {
+        pr: 1,
+        reason:
+          "its lens comments or config cannot be read as the gate reads them: the text holds U+1C89, which the " +
+          "gate's Python (Unicode 15.0.0) and this runtime assign differently, so the two would read it differently",
+      },
+    ]);
+    assert.deepStrictEqual(
+      plan.starts.map((s) => [s.lens, s.prs.map((p) => p.number)]),
+      [["code", [2]]],
+    );
+  });
+
   it("a short read-at sha never counts as reading the head, even of the same change", () => {
     const short = report("code", A.slice(0, 7));
     const plan = planLensStart(
@@ -365,14 +469,43 @@ describe("lens_start answers the state question", () => {
     );
   });
 
-  it("a read before a clean base merge still read the head when the change is the same", () => {
+  it("a read before a clean base merge still read the head: the gate's same-change check says so", () => {
     const plan = planLensStart(
       input({
-        pullList: [pull(1, { head: B, posts: [report("code", A)], changeOf: () => "same" })],
+        pullList: [
+          pull(1, {
+            head: B,
+            posts: [report("code", A)],
+            changeOf: () => "same",
+            sameChange: (read) => read === A,
+          }),
+        ],
       }),
     );
     assert.deepStrictEqual(lensesOf(plan), []);
     assert.deepStrictEqual(plan.alreadyRead, [{ pr: 1, lens: "code" }]);
+  });
+
+  it("the same diff in other commits (an amend, a rebase, a force-push) is not read: every lens starts again", () => {
+    // The own diff matches, so it is no new round, but the gate fails a head that is not the read commit merged
+    // with the base: lens_start must start the lens, never count it as read.
+    for (const over of [{}, { sameChange: () => false }]) {
+      const plan = planLensStart(
+        input({
+          pullList: [
+            pull(1, {
+              head: B,
+              posts: [report("code", A)],
+              changeOf: () => "same",
+              ...over,
+            }),
+          ],
+        }),
+      );
+      assert.deepStrictEqual(lensesOf(plan), ["code"]);
+      assert.deepStrictEqual(plan.alreadyRead, []);
+      assert.deepStrictEqual(plan.starts[0]!.prs, [{ number: 1, head: B, round: 1 }]);
+    }
   });
 
   it("the head moved since the plan: the child is refused, call again plans the new head", () => {
@@ -387,7 +520,16 @@ describe("lens_start answers the state question", () => {
     );
     assert.deepStrictEqual(moved.starts, []);
     assert.include(moved.refused.find((r) => r.pr === 1)!.reason, `moved from ${A} to ${C}`);
-    assert.isTrue(moved.refused.some((r) => r.pr === null && r.reason.includes("#1 #2")));
+    assert.deepStrictEqual(
+      moved.refused.filter((r) => r.pr === null),
+      [
+        {
+          pr: null,
+          reason:
+            "lens code for #1 #2 is not started: a pull request of its batch moved; call lens_start again",
+        },
+      ],
+    );
     const kept = confirmLensStart(
       plan,
       new Map([
@@ -580,7 +722,7 @@ describe("lens_start's plan, prompt and refusals", () => {
       ],
       [
         { prs: Array.from({ length: LENS_START_MAX_PRS + 1 }, (_, i) => ({ number: i + 1 })) },
-        `at most ${LENS_START_MAX_PRS}`,
+        `at most ${LENS_START_MAX_PRS} pull requests per call, not ${LENS_START_MAX_PRS + 1}`,
       ],
     ] as const) {
       const plan = planLensStart({ ...input({}), ...over });
@@ -592,6 +734,14 @@ describe("lens_start's plan, prompt and refusals", () => {
       assert.include(plan.refused[0]!.reason, words);
     }
     assert.lengthOf(planLensStart({ ...input({}), prs: [{ number: 1 }, { number: 1 }] }).starts, 1);
+    // Exactly the cap is one call.
+    const ten = Array.from({ length: LENS_START_MAX_PRS }, (_, i) => pull(i + 1));
+    const full = planLensStart(input({ pullList: ten }));
+    assert.deepStrictEqual(full.refused, []);
+    assert.deepStrictEqual(
+      full.starts.flatMap((s) => s.prs.map((r) => r.number)),
+      ten.map((p) => p.number),
+    );
     assert.include(
       planLensStart(input({ pullList: [pull(1, { head: "abc" })] })).refused[0]!.reason,
       "not a full sha",
@@ -666,11 +816,20 @@ describe("lens_start's plan, prompt and refusals", () => {
       ).refused[0]!.reason,
       "past the cap of 4",
     );
-    // Old or empty state: no block and no input fails every head at the gate; a person must name the lenses.
+    // Old or empty state: no block and no input, the gate requires no lens; lens_start starts none and says why.
     for (const required of [[], ["", "  "]]) {
       const none = planLensStart(input({ review: null, required }));
       assert.deepStrictEqual(none.starts, []);
-      assert.include(none.refused[0]!.reason, "a person names the lenses");
+      assert.deepStrictEqual(none.refused, [
+        {
+          pr: 1,
+          reason:
+            "the gate's required-lenses input names no lens and the config has no `review` block in mode " +
+            "enforce, so the gate requires no lens here (it fails a head only when the lens comments there do " +
+            "not all read it); lens_start starts only lenses the gate requires, so none: a person names the " +
+            "lenses in the caller workflow or the config",
+        },
+      ]);
     }
   });
 
@@ -804,11 +963,7 @@ describe("lens_start plans what the gate reads (fix round A+B)", () => {
   });
 
   it("an entry lens_start cannot start again: refused, and a person is told the way out", () => {
-    const noHeader = {
-      body: `Looks fine.\n${report("code", A).body}`,
-      edited: false,
-      hidden: false,
-    };
+    const noHeader = { ...report("code", A), body: `Looks fine.\n${report("code", A).body}` };
     const stuck = planLensStart(input({ pullList: [pull(1, { posts: [noHeader] })] }));
     assert.deepStrictEqual(stuck.starts, []);
     assert.include(stuck.refused[0]!.reason, "a comment that reads nothing");
@@ -910,6 +1065,19 @@ describe("lens_start plans what the gate reads (fix round A+B)", () => {
       input({ children: earlier(false, child!.requestId, second.starts[0]!.requestId) }),
     );
     assert.strictEqual(third.starts[0]!.attempt, 3);
+    // Stops half-way again and again: after the cap of attempts a person looks, nothing restarts forever.
+    const ids = [child!.requestId, second.starts[0]!.requestId, third.starts[0]!.requestId];
+    assert.strictEqual(LENS_START_MAX_ATTEMPTS, 3);
+    const capped = planLensStart(input({ children: earlier(false, ...ids) }));
+    assert.deepStrictEqual(capped.starts, []);
+    assert.deepStrictEqual(capped.refused, [
+      {
+        pr: 1,
+        reason:
+          "lens code for #1 is not started: 3 children ended without the read (the last: " +
+          `${ids[2]}); a person looks at why before it starts again, and a new head starts it afresh`,
+      },
+    ]);
     // A second call while the child still runs: that child, never a duplicate.
     const busy = planLensStart(input({ children: earlier(true, child!.requestId) }));
     assert.deepStrictEqual(busy.starts, []);
@@ -933,6 +1101,135 @@ describe("lens_start plans what the gate reads (fix round A+B)", () => {
       input({ pullList: [pull(1, { head: B })], children: earlier(true, child!.requestId) }),
     );
     assert.deepStrictEqual(lensesOf(moved), ["code"]);
+  });
+
+  it("the caller stores each child's lens and pull requests: a hashed long id is still found again", () => {
+    const long = `code-${"x".repeat(240)}`;
+    const first = planLensStart(input({ review: null, required: [long] }));
+    const [child] = first.starts;
+    assert.match(child!.requestId, /^lens\/[0-9a-f]{64}$/u);
+    assert.deepStrictEqual(earlierChild(child!, true), {
+      requestId: child!.requestId,
+      key: lensKey(long),
+      prs: [{ number: 1, head: A }],
+      running: true,
+    });
+    const busy = planLensStart(
+      input({ review: null, required: [long], children: [earlierChild(child!, true)] }),
+    );
+    assert.deepStrictEqual(busy.starts, []);
+    assert.lengthOf(busy.running, 1);
+    const again = planLensStart(
+      input({ review: null, required: [long], children: [earlierChild(child!, false)] }),
+    );
+    assert.strictEqual(again.starts[0]!.attempt, 2);
+    assert.deepStrictEqual(again.starts[0]!.replaces, [child!.requestId]);
+  });
+
+  it("past the round cap a head the gate already passes needs no person, unless the gate judges rounds", () => {
+    // Round 5 by its marker, and every lens already read this head.
+    const posts = [report("code r5", A)];
+    const fallback = planLensStart(
+      input({ review: null, required: ["code"], pullList: [pull(1, { posts })] }),
+    );
+    assert.deepStrictEqual(fallback.refused, []);
+    assert.deepStrictEqual(fallback.starts, []);
+    assert.deepStrictEqual(fallback.alreadyRead, [{ pr: 1, lens: "code" }]);
+    assert.deepStrictEqual(fallback.notes, [
+      "#1: a read of this head would be review round 5, past T3's cap of 4; the gate already passes it and " +
+        "judges no rounds here, so nothing starts",
+    ]);
+    const shadow = planLensStart(
+      input({
+        review: configs["two-critical"]!,
+        required: ["code"],
+        pullList: [pull(1, { posts })],
+      }),
+    );
+    assert.deepStrictEqual(shadow.refused, []);
+    assert.deepStrictEqual(shadow.starts, []);
+    // In enforce the gate fails the head past the cap: a person decides.
+    const enforce = planLensStart(input({ pullList: [pull(1, { posts })] }));
+    assert.deepStrictEqual(enforce.starts, []);
+    assert.include(enforce.refused[0]!.reason, "review round 5, past the cap of 4");
+    // Past the cap and not yet passing: refused everywhere.
+    const fresh = planLensStart(
+      input({ review: null, required: ["code"], pullList: [pull(1, { head: B, posts })] }),
+    );
+    assert.include(fresh.refused[0]!.reason, "past the cap of 4");
+  });
+
+  it("enforce: a report that reads nothing and only a non-person override covers is read again", () => {
+    const edited = { ...report("code", A), edited: true };
+    for (const posts of [
+      [edited, override(A)],
+      [report("code", A.slice(0, 7)), override(A)],
+    ]) {
+      const plan = planLensStart(input({ pullList: [pull(1, { posts })] }));
+      assert.deepStrictEqual(plan.refused, []);
+      assert.deepStrictEqual(lensesOf(plan), ["code"]);
+      assert.deepStrictEqual(plan.alreadyRead, []);
+      // Shadow judges no findings: the override's read stands there.
+      const shadow = planLensStart(
+        input({
+          review: configs["two-critical"]!,
+          required: ["code"],
+          pullList: [pull(1, { posts })],
+        }),
+      );
+      assert.deepStrictEqual(shadow.starts, []);
+    }
+    // A person's override for this head clears it: nothing starts.
+    const people = { ...basic, override_authors: ["Someone"] };
+    const person = planLensStart(
+      input({
+        review: people,
+        pullList: [pull(1, { posts: [edited, { ...override(A), author: "someone" }] })],
+      }),
+    );
+    assert.deepStrictEqual(person.starts, []);
+    assert.deepStrictEqual(person.alreadyRead, [{ pr: 1, lens: "code" }]);
+    // A listed login's override for another change clears nothing.
+    const other = planLensStart(
+      input({
+        review: people,
+        pullList: [
+          pull(1, {
+            head: B,
+            posts: [
+              { ...report("code", B), edited: true },
+              { ...override(B), author: "someone" },
+              override(B),
+            ],
+          }),
+        ],
+      }),
+    );
+    assert.deepStrictEqual(lensesOf(other), []);
+  });
+
+  it("shadow says it starts the path lenses the gate does not require, on purpose", () => {
+    const plan = planLensStart(
+      input({
+        review: configs["two-critical"]!,
+        required: ["code"],
+        pullList: [
+          pull(1, {
+            changes: V.cases.find(
+              (c: { config: string; lenses: string[] }) =>
+                c.config === "two-critical" && c.lenses.some((l) => l !== "code"),
+            )!.changes,
+          }),
+        ],
+      }),
+    );
+    const extra = lensesOf(plan).filter((l) => l !== "code");
+    assert.isAbove(extra.length, 0);
+    assert.deepStrictEqual(plan.notes, [
+      `#1: in shadow the gate requires only its required-lenses input; lens_start also starts ${extra.join(", ")} ` +
+        "of the path rules on purpose (the trial shadow is for); each costs a child slot and its runner's usage, " +
+        "Fable usage for a lens that runs on Fable",
+    ]);
   });
 
   it("heads and repo in any case: one pull request, one id", () => {
