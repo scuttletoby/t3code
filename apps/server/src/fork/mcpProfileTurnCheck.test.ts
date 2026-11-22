@@ -1,8 +1,8 @@
 /**
- * Fork: a turn on a provider that cannot apply MCP profiles (all but Claude and Codex) refuses when its
- * thread's profile is narrower than `all`. The check wraps upstream's provider instance
- * registry as server.ts wires it, over upstream's settings test service and a real thread store
- * (SQLite in memory), so each route a thread takes to such a provider meets it at turn start.
+ * Fork: every turn but Claude's fixes its thread's T3 tool groups; outside Claude and Codex a turn
+ * whose profile leaves out an outside server also refuses. The check wraps upstream's provider
+ * instance registry as server.ts wires it, over upstream's settings test service and a real
+ * thread store (SQLite in memory), so each route a thread takes meets it at turn start.
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -40,6 +40,13 @@ import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.
 import * as ServerSettingsService from "../serverSettings.ts";
 import * as ForkLayers from "./forkLayers.ts";
 import { MCP_PROFILE_DRIVERS } from "./mcpProfile.ts";
+import * as T3ToolSets from "./mcpT3ToolSets.ts";
+
+/** The groups the thread's set holds now, or its tag when it is not a list. */
+const groupsOf = (threadId: string) => {
+  const set = T3ToolSets.t3ToolSetFor(threadId);
+  return set?._tag === "Groups" && set.groups !== "all" ? [...set.groups] : set?._tag;
+};
 
 const CLAUDE = ProviderInstanceId.make("claudeAgent");
 const CODEX = ProviderInstanceId.make("codex");
@@ -242,9 +249,9 @@ const withCheck = <A, E>(
 };
 
 const CUT =
-  /MCP profile \("all", cut down to its parent thread's\) is narrower than "all", and opencode/;
+  /MCP profile \("all", cut down to its parent thread's\) leaves out some outside MCP servers, and opencode/;
 const REFUSED =
-  /MCP profile "t3-only" is narrower than "all", and opencode \(provider instance opencode-work\) does not apply MCP profiles/;
+  /MCP profile "t3-only" leaves out some outside MCP servers, and opencode \(provider instance opencode-work\) does not apply a profile's outside servers/;
 
 describe("mcpProfileTurnCheck", () => {
   it("checks every driver but those that apply profiles", () => {
@@ -271,11 +278,12 @@ describe("mcpProfileTurnCheck", () => {
     withCheck({ mcpProfile: "t3-only" }, [], ({ calls, raw, start }) =>
       Effect.gen(function* () {
         const own = appThread("switched");
-        // Claude and Codex apply the profile themselves: their instances are upstream's, untouched.
+        // Claude applies the whole profile itself: its instance is upstream's, untouched. Codex
+        // applies the outside servers itself: its turns only get their T3 tool groups fixed here.
         const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
         assert.strictEqual(yield* registry.getInstance(CLAUDE), raw[0]);
         assert.strictEqual(yield* start(own, CLAUDE), "ok");
-        assert.strictEqual(yield* registry.getInstance(CODEX), raw[1]);
+        assert.notStrictEqual(yield* registry.getInstance(CODEX), raw[1]);
         assert.strictEqual(yield* start(own, CODEX), "ok");
         // The same thread, switched to a provider that does not apply profiles.
         assert.match(yield* start(own, OPENCODE), REFUSED);
@@ -306,24 +314,127 @@ describe("mcpProfileTurnCheck", () => {
     ),
   );
 
-  it.effect("every outside server but fewer T3 tools is narrower than all: it refuses", () =>
+  it.effect(
+    "every outside server but fewer T3 tools runs on every provider, its groups fixed",
+    () =>
+      withCheck(
+        {
+          mcpProfiles: { "servers-only": { servers: "all", t3Tools: ["threads"] } },
+          mcpProfile: "servers-only",
+        } as Mcp,
+        [],
+        ({ calls, start }) =>
+          Effect.gen(function* () {
+            T3ToolSets.__testing.clear();
+            const own = appThread("own");
+            assert.strictEqual(yield* start(own, OPENCODE), "ok");
+            assert.deepStrictEqual(groupsOf(own.id), ["threads"]);
+            assert.strictEqual(yield* start(own, CODEX), "ok");
+            assert.strictEqual(yield* start(own, CLAUDE), "ok");
+            assert.deepStrictEqual(calls, [
+              "start:opencode-work:own",
+              "start:codex:own",
+              "start:claudeAgent:own",
+            ]);
+          }),
+      ),
+  );
+
+  it.effect(
+    "Codex (in MCP_PROFILE_DRIVERS): a narrowed t3Tools gets exactly that set, and outside servers are left to Codex",
+    () =>
+      withCheck(
+        {
+          mcpProfiles: { lean: { servers: [], t3Tools: ["threads", "waits"] } },
+          mcpProfile: "lean",
+        } as Mcp,
+        [],
+        ({ calls, start }) =>
+          Effect.gen(function* () {
+            T3ToolSets.__testing.clear();
+            const own = appThread("own");
+            // Every outside server left out: OpenCode cannot apply that, Codex does it itself.
+            assert.match(yield* start(own, OPENCODE), /"lean" leaves out some outside MCP servers/);
+            T3ToolSets.__testing.clear();
+            for (const how of ["start", "resume", "compact"] as const) {
+              T3ToolSets.fixT3ToolSet(own.id, { _tag: "Groups", name: "all", groups: "all" });
+              assert.strictEqual(yield* start(own, CODEX, how), "ok");
+              assert.deepStrictEqual(groupsOf(own.id), ["threads", "waits"]);
+            }
+            assert.deepStrictEqual(calls, [
+              "start:codex:own",
+              "resume:codex:own",
+              "compact:codex:own",
+            ]);
+          }),
+      ),
+  );
+
+  it.effect(
+    "Claude is unchanged: its turns are upstream's, its set fixed where its query opens",
+    () =>
+      withCheck(
+        {
+          mcpProfiles: { lean: { servers: [], t3Tools: ["threads"] } },
+          mcpProfile: "lean",
+        } as Mcp,
+        [],
+        ({ calls, start }) =>
+          Effect.gen(function* () {
+            T3ToolSets.__testing.clear();
+            const own = appThread("own");
+            assert.strictEqual(yield* start(own, CLAUDE), "ok");
+            // Not fixed here: claudeMcpProfile.ts fixes it as the query opens.
+            assert.isUndefined(T3ToolSets.t3ToolSetFor(own.id));
+            assert.deepStrictEqual(calls, ["start:claudeAgent:own"]);
+          }),
+      ),
+  );
+
+  it.effect("a profile change applies from the next turn: the running one keeps its set", () =>
     withCheck(
       {
-        mcpProfiles: { "servers-only": { servers: "all", t3Tools: ["threads"] } },
-        mcpProfile: "servers-only",
+        mcpProfiles: { lean: { servers: "all", t3Tools: ["threads"] } },
+        mcpProfile: "lean",
       } as Mcp,
       [],
-      ({ calls, start }) =>
+      ({ start }) =>
         Effect.gen(function* () {
+          T3ToolSets.__testing.clear();
           const own = appThread("own");
-          assert.include(
-            yield* start(own, OPENCODE),
-            'MCP profile "servers-only" is narrower than "all", and opencode',
-          );
-          assert.strictEqual(yield* start(own, CLAUDE), "ok");
-          assert.deepStrictEqual(calls, ["start:claudeAgent:own"]);
+          for (const id of [CODEX, OPENCODE]) {
+            assert.strictEqual(yield* start(own, id), "ok");
+            const settings = yield* ServerSettingsService.ServerSettingsService;
+            yield* settings.updateSettings({
+              mcpProfiles: { lean: { servers: "all", t3Tools: ["threads", "orchestration"] } },
+            } as never);
+            // No turn started since: the set stays what the running turn started with.
+            assert.deepStrictEqual(groupsOf(own.id), ["threads"]);
+            assert.strictEqual(yield* start(own, id, "resume"), "ok");
+            assert.deepStrictEqual(groupsOf(own.id), ["threads", "orchestration"]);
+            yield* settings.updateSettings({
+              mcpProfiles: { lean: { servers: "all", t3Tools: ["threads"] } },
+            } as never);
+            assert.strictEqual(yield* start(own, id), "ok");
+          }
         }),
     ),
+  );
+
+  it.effect(
+    "a profile that is gone refuses the turn on Codex and OpenCode and keeps only the ungrouped",
+    () =>
+      withCheck({ mcpProfile: "gone" }, [], ({ calls, start }) =>
+        Effect.gen(function* () {
+          const own = appThread("own");
+          for (const id of [CODEX, OPENCODE]) {
+            T3ToolSets.fixT3ToolSet(own.id, { _tag: "Groups", name: "all", groups: "all" });
+            assert.include(yield* start(own, id, "compact"), 'MCP profile "gone" is not set up');
+            assert.strictEqual(T3ToolSets.t3ToolSetFor(own.id)?._tag, "Refused");
+          }
+          assert.deepStrictEqual(calls, []);
+        }),
+      ),
   );
 
   it.effect("a thread made by t3_thread_launch in a narrowed project refuses on OpenCode", () =>
@@ -466,10 +577,13 @@ describe("mcpProfileTurnCheck", () => {
         ({ calls, start }) =>
           Effect.gen(function* () {
             const own = appThread("own");
+            T3ToolSets.fixT3ToolSet(own.id, { _tag: "Groups", name: "all", groups: "all" });
             const fiber = yield* Effect.forkChild(start(own, OPENCODE));
             yield* Deferred.await(reading);
             yield* Fiber.interrupt(fiber);
             assert.deepStrictEqual(calls, []);
+            // No set stands for a turn that never started: the next request works it out again.
+            assert.isUndefined(T3ToolSets.t3ToolSetFor(own.id));
             // The next turn reads again and starts.
             assert.strictEqual(yield* start(own, OPENCODE), "ok");
             assert.deepStrictEqual(calls, ["start:opencode-work:own"]);

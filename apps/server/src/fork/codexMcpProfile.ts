@@ -1,7 +1,8 @@
 /**
- * Fork: MCP profiles on Codex (design part 5). Each thread T3 loads on the shared app-server gets
- * `mcp_servers.<name>.enabled = false` in its own config for every server Codex's config/read lists
- * that its profile leaves out; each turn first checks the thread's live servers, and refuses.
+ * Fork: MCP profiles on Codex (design part 5). Each thread on the shared app-server gets
+ * `mcp_servers.<name>.enabled = false` for every listed server its profile leaves out; each turn
+ * checks the thread's live servers, refuses on a mismatch, and fixes its T3 tool groups (cut on
+ * T3's MCP server, mcpT3ToolFilter.ts), also on a turn Codex starts itself.
  */
 import { MCP_PROFILE_ALL, ThreadId } from "@t3tools/contracts";
 import type * as CodexClient from "effect-codex-app-server/client";
@@ -13,7 +14,8 @@ import * as Schema from "effect/Schema";
 import type { CodexAppServerClientFactoryShape } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { AGENT_THREAD_ENV } from "../preview/PortScanner.ts";
 import { ClaudeMcpProfileError, makeThreadMcpProfilesById } from "./claudeMcpProfile.ts";
-import { isEveryMcpTool, type McpProfileResolved, type McpProfileSet } from "./mcpProfile.ts";
+import type { McpProfileResolved, McpProfileSet } from "./mcpProfile.ts";
+import { fixT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
 
 type Client = CodexClient.CodexAppServerClient["Service"];
 type Send = (
@@ -66,18 +68,14 @@ export function codexConfiguredMcpServers(config: unknown): ReadonlyArray<string
 /**
  * The per-thread config that turns off every configured server the profile does not keep (and
  * Codex's connectors server, see {@link CODEX_APPS_MCP_SERVER}), or the refusal. T3's own servers
- * stay; a kept name that is not configured keeps nothing (design §9).
+ * stay; a kept name that is not configured keeps nothing (design §9). `t3Tools` adds no config:
+ * T3's own server hides and refuses the tools it leaves out.
  */
 export function codexMcpProfileConfig(
   name: string,
   profile: McpProfileSet,
   configured: ReadonlyArray<string>,
 ): Readonly<Record<string, false>> | ClaudeMcpProfileError {
-  if (profile.t3Tools !== "all") {
-    return new ClaudeMcpProfileError({
-      reason: `MCP profile "${name}" limits T3's own tools, which this version cannot apply yet, so this thread cannot start: set its t3Tools to "all", or ${FIX}.`,
-    });
-  }
   const kept = profile.servers;
   if (kept === "all") return {};
   const off = configured.filter(
@@ -151,7 +149,7 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
    * start of such a thread is refused too, once, so a passing hiccup cannot cost the history.
    */
   const refusedResumes = new Map<ThreadId, string>();
-  /** Set once a thread here got a profile narrower than `all`. */
+  /** Set once a thread here got a profile that leaves out an outside server. */
   let narrowed = false;
   const read = (method: string, params: unknown) =>
     (client.raw.request as unknown as Send)(method, params).pipe(
@@ -247,7 +245,7 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
   ) {
     const resolved = yield* profileOf(method, threadId);
     let off: Readonly<Record<string, false>> = {};
-    if (!isEveryMcpTool(resolved.profile)) {
+    if (resolved.profile.servers !== "all") {
       const cwd = yield* workspaceOf(method, request);
       const configured = yield* read("config/read", {
         ...(cwd === undefined ? {} : { cwd }),
@@ -280,11 +278,17 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
         }),
       );
     }
-    const resolved = yield* profileOf(method, threadId);
+    // The turn's T3 tool groups, also for a turn Codex started itself (`turn/started`): fixed
+    // until the next turn, and only the tools every profile keeps when the profile cannot apply.
+    const resolved = yield* profileFor(threadId).pipe(
+      Effect.tapError((cause) =>
+        Effect.sync(() => fixT3ToolSet(threadId, refusedT3ToolSet(cause.reason))),
+      ),
+      Effect.mapError((cause) => refusal(method, cause)),
+    );
+    fixT3ToolSet(threadId, t3ToolSetOf(resolved));
     // A thread loaded narrower than its profile is now stays narrower until Codex reloads it.
-    if (isEveryMcpTool(resolved.profile)) return;
-    const planned = codexMcpProfileConfig(resolved.name, resolved.profile, []);
-    if (isRefusal(planned)) return yield* refusal(method, planned);
+    if (resolved.profile.servers === "all") return;
     const statuses: Array<{ readonly name: string; readonly runtimeStatus?: string | null }> = [];
     let cursor: string | undefined;
     for (let page = 0; ; page++) {
