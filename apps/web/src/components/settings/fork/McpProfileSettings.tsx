@@ -228,6 +228,15 @@ function ProfileEditor({
         onChange={(next) => setDraft({ ...draft, t3Tools: next })}
       />
       <p className="text-xs text-muted-foreground">{MCP_ALWAYS_KEPT_NOTE}</p>
+      <label className="flex items-center gap-2 text-xs">
+        <Checkbox
+          checked={draft.noBuiltinTools === true}
+          aria-label="No built-in tools"
+          onCheckedChange={(checked) => setDraft({ ...draft, noBuiltinTools: checked === true })}
+        />
+        No built-in tools (no shell, files or web; MCP tools only). Claude only: a thread on another
+        provider is refused.
+      </label>
       {notes.map((note) => (
         <p key={note} className="text-xs text-muted-foreground">
           {note}

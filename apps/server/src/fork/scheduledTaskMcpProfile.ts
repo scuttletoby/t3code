@@ -31,6 +31,7 @@ import {
   carryMcpProfile,
   isEveryMcpTool,
   isWithinMcpProfile,
+  mcpProfileWiderParts,
   type McpProfileCarried,
   type McpProfileResolved,
   readCarried,
@@ -188,7 +189,7 @@ export const boundToWiderRefusal = Effect.fnUntraced(function* (input: {
   const what =
     theirs === null
       ? `thread ${boundTo}, whose MCP profile cannot be worked out`
-      : `thread ${boundTo}, whose MCP profile ${named(theirs.name)} keeps MCP servers or T3 tools ${named(own.name)} does not`;
+      : `thread ${boundTo}, whose MCP profile ${named(theirs.name)} keeps ${mcpProfileWiderParts(theirs.profile, own.profile)} ${named(own.name)} does not`;
   return `This thread's MCP profile is ${named(own.name)}, and this task runs in ${what}, so its prompt and where it runs cannot be changed from here (reading it, pausing it or changing its schedule can). Ask the owner to change it, or delete_scheduled_task removes it.`;
 });
 
@@ -405,7 +406,7 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
         if (!isWithinMcpProfile(theirs.profile, own.profile)) {
           return yield* refuse(
             task,
-            `This thread's MCP profile is ${named(own.name)}, and a thread this task's runs start in its project would get ${named(theirs.name)}, which keeps MCP servers or T3 tools ${named(own.name)} does not, so the task was not saved. Bind the task to this thread (bindToCurrentThread: true), schedule it in a project whose MCP profile is within ${named(own.name)}, use delegate_task, or ask the owner to schedule it.`,
+            `This thread's MCP profile is ${named(own.name)}, and a thread this task's runs start in its project would get ${named(theirs.name)}, which keeps ${mcpProfileWiderParts(theirs.profile, own.profile)} ${named(own.name)} does not, so the task was not saved. Bind the task to this thread (bindToCurrentThread: true), schedule it in a project whose MCP profile is within ${named(own.name)}, use delegate_task, or ask the owner to schedule it.`,
           );
         }
       }
@@ -465,7 +466,7 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
       return `Not run: the MCP profile of the thread this run would start cannot be worked out. ${theirs.failure.reason}${afterSave(task, "once that is fixed")}`;
     }
     if (isWithinMcpProfile(theirs.success.profile, recorded)) return null;
-    return `Not run: this task was saved by a thread whose MCP profile is ${named(recorded.name)}, and the thread this run would start in its project gets ${named(theirs.success.name)}, which keeps MCP servers or T3 tools ${named(recorded.name)} does not. Bind the task to a thread, move it to a project whose MCP profile is within ${named(recorded.name)}, or save it in the T3 app to run it as the owner's.${afterSave(task)}`;
+    return `Not run: this task was saved by a thread whose MCP profile is ${named(recorded.name)}, and the thread this run would start in its project gets ${named(theirs.success.name)}, which keeps ${mcpProfileWiderParts(theirs.success.profile, recorded)} ${named(recorded.name)} does not. Bind the task to a thread, move it to a project whose MCP profile is within ${named(recorded.name)}, or save it in the T3 app to run it as the owner's.${afterSave(task)}`;
   });
 
   return { saving, runRefusal };
