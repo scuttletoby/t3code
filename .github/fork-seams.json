@@ -723,6 +723,7 @@
     "packages/contracts/src/handoff.ts",
     "packages/contracts/src/mcpProfile*",
     "packages/contracts/src/modelPolicy*",
+    "packages/contracts/src/placement*",
     "packages/contracts/src/playtest*",
     "packages/contracts/src/reviewRules*",
     "packages/contracts/src/threadRoles*",
