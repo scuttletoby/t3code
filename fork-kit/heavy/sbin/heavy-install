@@ -71,6 +71,12 @@ def source_file(source, rel):
     return os.path.join(source, rel)
 
 
+def missing_sources(source):
+    """The SOURCE_FILES that SOURCE lacks (each looked up as copy_tool reads it); [] when it has them all.
+    .github/scripts/fork-ci-release.test.py runs it on the files a release commit holds."""
+    return [rel for rel in SOURCE_FILES if not os.path.isfile(source_file(source, rel))]
+
+
 def say(msg):
     print(f'heavy-install: {msg}', flush=True)
 
@@ -200,6 +206,18 @@ def copy_tool(source, sha):
     return dest
 
 
+def self_test(dest):
+    """The copied version folder DEST is whole and its commands start from it; [] when they do."""
+    problems = tree_problems(dest)
+    for args in (['--help'], ['sweep', '--help'], ['queue', '--help'], ['capacity', '--help'],
+                 ['facts', '--help']):
+        r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, 'bin', 'heavy'), *args],
+                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        if r.returncode != 0 or 'heavy' not in r.stdout:
+            problems.append(f'bin/heavy {" ".join(args)} failed: {(r.stderr or r.stdout).strip()[:200]}')
+    return problems
+
+
 def read_config():
     try:
         with open(p(CONFIG), encoding='utf-8') as f:
@@ -223,9 +241,9 @@ def slice_unit_text(name, limits):
 def check_options(a):
     if not SHA_RE.match(a.sha or ''):
         raise Refused('--sha must be the full 40-character release commit')
-    for rel in SOURCE_FILES:
-        if not os.path.isfile(source_file(a.source or '', rel)):
-            raise Refused(f'--source {a.source}: {rel} is missing (point it at the fork-kit/heavy folder)')
+    missing = missing_sources(a.source or '')
+    if missing:
+        raise Refused(f'--source {a.source}: {missing[0]} is missing (point it at the fork-kit/heavy folder)')
     if a.slice is not None and not SLICE_RE.match(a.slice):
         raise Refused(f'bad --slice {a.slice!r} (a unit name ending in .slice)')
     if a.grace is not None:
@@ -341,13 +359,7 @@ def install(a, stop_after=None):
     done('folders')
     dest = copy_tool(os.path.realpath(a.source), a.sha)
     done('copy')
-    problems = tree_problems(dest)
-    for args in (['--help'], ['sweep', '--help'], ['queue', '--help'], ['capacity', '--help'],
-                 ['facts', '--help']):
-        r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, 'bin', 'heavy'), *args],
-                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
-        if r.returncode != 0 or 'heavy' not in r.stdout:
-            problems.append(f'bin/heavy {" ".join(args)} failed: {(r.stderr or r.stdout).strip()[:200]}')
+    problems = self_test(dest)
     if problems:
         raise Refused('the new copy failed its self-test (the version in use is unchanged):\n  ' + '\n  '.join(problems))
     done('self-test')

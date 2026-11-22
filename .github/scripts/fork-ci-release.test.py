@@ -8,12 +8,15 @@ Needs git, node and PyYAML. Reaches no network and no GitHub. Each check prints 
 exits 1. Each row of the failure table (first release, re-run, half states, main moving, a push
 refused half-way) is one block below.
 """
+import atexit
 import contextlib
 import importlib.util
 import io
 import json
 import os
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,6 +42,7 @@ def check(name, ok, detail=""):
 
 
 work = pathlib.Path(tempfile.mkdtemp(prefix="fork-ci-release-test-"))
+atexit.register(shutil.rmtree, work, ignore_errors=True)   # its release copies are tens of MB per run
 gitconfig = work / "gitconfig"
 gitconfig.write_text("[user]\n\tname = Test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n"
                      "[protocol \"file\"]\n\tallow = always\n")
@@ -406,50 +410,80 @@ check("real tree: fork-ci-release.yml itself is not released (it starts on sched
 # passes them and fails every real install (heavy-install refused "capacity/capacity-rule.json is missing" on every
 # release after the capacity rule moved to packages/shared/src/capacity). Here the release's files are written to a
 # folder exactly as release_entries picks them, and each kit's installer, loaded from that folder, runs its own
-# file check on it: the same list and the same path rules install uses. A new kit with an installer needs a row.
+# file check (missing_sources, or kit_install's) on the --source its bootstrap passes; heavy also copies itself and
+# runs its self-test, and desk stages the release and runs its self-test (both under a throwaway PREFIX), so a
+# copied script that loads a file the release lacks fails here too. Every fork-kit folder needs a row in KITS or
+# NO_INSTALLER, and each row must match what the kit's bootstrap runs.
 KIT_CHECK = r"""
-import importlib.machinery, importlib.util, json, os, sys
-top, kit, how = sys.argv[1:4]
+import importlib.machinery, importlib.util, json, os, sys, tempfile
+top, kit, how, installer, source = sys.argv[1:6]
 src = os.path.join(top, 'fork-kit', kit)
+source = top if source == 'top' else src
 def load(rel, name):
     loader = importlib.machinery.SourceFileLoader(name, os.path.join(src, rel))
     mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
     loader.exec_module(mod)
     return mod
-installer = sys.argv[4] if len(sys.argv) > 4 else ''
+failed = []
 if how == 'kit_install':        # agent-guards, cleaner, golive, schedule-kick: check_options' file part
     m = load(installer, 'kit_installer')
     inst, missing = m.INSTALLER, []
     for rel in inst.source_files():
         try:
-            inst.read_source(os.path.realpath(src), rel)
+            inst.read_source(os.path.realpath(source), rel)
         except m.kit_install.Refused as e:
             missing.append(f'{rel}: {e}')
     if not missing:
-        inst.check_same_installer(os.path.realpath(src))
-elif how == 'source_file':      # heavy (check_options), model-guard (install): SOURCE_FILES through source_file
-    m = load(installer, 'kit_installer')
-    missing = [rel for rel in m.SOURCE_FILES if not os.path.isfile(m.source_file(src, rel))]
-elif how == 'gh-apps':          # copy_tool: SOURCE_FILES under the kit folder
+        inst.check_same_installer(os.path.realpath(source))
+elif how == 'gh-apps':          # copy_tool's check
     sys.path.insert(0, os.path.join(src, 'lib'))
     from ghapps import install
-    missing = [rel for rel in install.SOURCE_FILES if not os.path.isfile(os.path.join(src, rel))]
-elif how == 'desk':             # install: missing_sources of the release's top folder
-    missing = load(installer, 'kit_installer').missing_sources(top)
-elif how == 'pc-agents':        # setup: CODE sources under the release's top folder
-    missing = [s for s in load(installer, 'kit_installer').k.CODE if not os.path.isfile(os.path.join(top, s))]
-print(json.dumps(missing))
+    missing = install.missing_sources(source)
+else:                           # heavy (check_options), model-guard (install), desk (install), pc-agents (setup)
+    m = load(installer, 'kit_installer')
+    missing = m.missing_sources(source)
+if how in ('heavy', 'desk') and not missing:
+    m.PREFIX, m.ROOT_UID = tempfile.mkdtemp(prefix=f'prefix-{kit}-', dir=os.getcwd()), os.geteuid()
+    if how == 'heavy':          # install's copy and self-test steps
+        os.makedirs(m.p(m.VERSIONS))
+        failed = m.self_test(m.copy_tool(os.path.realpath(source), '0' * 40))
+    else:                       # install's stage step (its self-test), for the release config's first pool
+        # The staged scripts run with os.getppid() == 1, so fork-fleet.py's gate (which refuses here) never finds the
+        # Runner.Worker of the CI job running this test, and never kills it.
+        shim = os.path.join(m.PREFIX, 'no-parent.py')
+        with open(shim, 'w') as f:
+            f.write("import os, runpy, sys\nos.getppid = lambda: 1\nargs = sys.argv[1:]\n"
+                    "while args[0] in ('-I', '-B'):\n    args.pop(0)\nsys.argv = args\n"
+                    "runpy.run_path(args[0], run_name='__main__')\n")
+        m.CMD['python3'] = [sys.executable, '-I', '-B', shim]
+        os.makedirs(m.p(m.OPT))
+        with open(os.path.join(source, '.github/fork-fleet.json')) as f:
+            pool = ([x.get('name') for x in json.load(f).get('pools') or [] if isinstance(x, dict)] or [''])[0]
+        try:
+            m.stage(source, '0' * 40, None, pool)
+        except m.Refused as e:
+            failed = [str(e)]
+print(json.dumps({'missing': missing, 'failed': failed}))
 """
-# kit -> (how its installer checks its files, the installer as the bootstrap runs it)
-KITS = {"agent-guards": ("kit_install", "sbin/agent-guards-install"),
-        "cleaner": ("kit_install", "sbin/fork-cleaner-install"),
-        "golive": ("kit_install", "sbin/t3-golive-install"),
-        "schedule-kick": ("kit_install", "sbin/schedule-kick-install"),
-        "heavy": ("source_file", "sbin/heavy-install"),
-        "model-guard": ("source_file", "sbin/model-guard-install"),
-        "gh-apps": ("gh-apps", "sbin/gh-apps-install"),
-        "desk": ("desk", "sbin/desk-install"),
-        "pc-agents": ("pc-agents", "sbin/pc-agents")}
+# kit -> (how its installer checks its files, the installer as the bootstrap runs it, the --source the bootstrap
+# passes: the kit's folder or the release's top folder)
+KITS = {"agent-guards": ("kit_install", "sbin/agent-guards-install", "kit"),
+        "cleaner": ("kit_install", "sbin/fork-cleaner-install", "kit"),
+        "golive": ("kit_install", "sbin/t3-golive-install", "kit"),
+        "schedule-kick": ("kit_install", "sbin/schedule-kick-install", "kit"),
+        "heavy": ("heavy", "sbin/heavy-install", "kit"),
+        "model-guard": ("own", "sbin/model-guard-install", "kit"),
+        "gh-apps": ("gh-apps", "sbin/gh-apps-install", "kit"),
+        "desk": ("desk", "sbin/desk-install", "top"),
+        "pc-agents": ("own", "sbin/pc-agents", "top")}
+# fork-kit folders that install nothing on a host
+NO_INSTALLER = {"common": "the code and the bootstrap the kits share", "review": "a skill an agent reads"}
+# What each kind of failure asks for
+CAUSES = {"path": "add the path(s) to .github/fork-ci-release.json paths",
+          "self-test": "the installer's own self-test failed on the release: a file a copied script loads is not in "
+                       "the release (add it to .github/fork-ci-release.json paths) or the kit is broken",
+          "row": "add or fix the kit's row in KITS or NO_INSTALLER of .github/scripts/fork-ci-release.test.py",
+          "ran": "the check did not run: fix the installer, or the kit's row in KITS"}
 
 
 def write_release(repo, entries, dest):
@@ -468,27 +502,89 @@ def write_release(repo, entries, dest):
         os.chmod(p, 0o755 if mode == "100755" else 0o644)
 
 
+def bootstrap_runs(top, kit):
+    """(the installer's path in the release, "kit" or "top" for its --source) as the kit's bootstrap runs it: its own
+    bootstrap.sh, else its arm in the shared fork-kit/common/bootstrap.sh; None when no bootstrap names the kit."""
+    own = top / "fork-kit" / kit / "bootstrap.sh"
+    shared = top / "fork-kit/common/bootstrap.sh"
+    if not own.is_file() and not shared.is_file():
+        return None
+    text = (own if own.is_file() else shared).read_text()
+    names = {"top": ""}
+    if not own.is_file():
+        arm = re.search(rf"^\s*{re.escape(kit)}\) installer='([^']+)'", text, re.M)
+        if not arm:
+            return None
+        names.update(kit=kit, installer=arm.group(1))
+
+    def expand(s):
+        return re.sub(r"\$\{?(\w+)\}?", lambda m: names.get(m.group(1), m.group(0)), s).strip("/")
+
+    for name, value in re.findall(r'^(\w+)="(\$top[^"]*)"$', text, re.M):
+        names[name] = "/" + expand(value)
+    run, source = re.search(r'python3 -I -B "([^"]+)"', text), re.search(r'--source "([^"]+)"', text)
+    if not run or not source:
+        return None
+    where = expand(source.group(1))
+    return expand(run.group(1)), {"": "top", f"fork-kit/{kit}": "kit"}.get(where, where)
+
+
 def kit_release_problems(top):
-    """{kit: [what its installer misses in the release at TOP]}, plus kits with an installer and no row."""
+    """{kit: [(cause, text)]} for the release at TOP: what each kit's installer misses or fails on, and kit folders
+    with no row or a row that does not match the bootstrap. cause is a key of CAUSES."""
     problems = {}
     for kit_dir in sorted((top / "fork-kit").iterdir()) if (top / "fork-kit").is_dir() else []:
-        if (kit_dir / "sbin").is_dir() and kit_dir.name not in KITS:
-            problems[kit_dir.name] = ["has an installer (sbin/) but no row in KITS of fork-ci-release.test.py"]
-    for kit, (how, installer) in KITS.items():
-        if not (top / "fork-kit" / kit / installer).is_file():
-            problems[kit] = [f"fork-kit/{kit}/{installer} is not in the release"]
+        if not kit_dir.is_dir():
             continue
-        r = subprocess.run([sys.executable, "-I", "-B", "-c", KIT_CHECK, str(top), kit, how, installer],
+        if kit_dir.name not in KITS and kit_dir.name not in NO_INSTALLER:
+            problems[kit_dir.name] = [("row", "a fork-kit folder with no row in KITS or NO_INSTALLER")]
+        elif kit_dir.name in NO_INSTALLER and ((kit_dir / "sbin").is_dir() or (
+                kit_dir.name != "common" and (kit_dir / "bootstrap.sh").is_file())):
+            problems[kit_dir.name] = [("row", "listed in NO_INSTALLER but has an installer (sbin/ or bootstrap.sh)")]
+    for kit, (how, installer, source) in KITS.items():
+        found = []
+        if not (top / "fork-kit" / kit / installer).is_file():
+            problems[kit] = [("path", f"fork-kit/{kit}/{installer} is not in the release")]
+            continue
+        runs = bootstrap_runs(top, kit)
+        if runs != (f"fork-kit/{kit}/{installer}", source):
+            found.append(("row", f"its bootstrap runs {runs[0]} --source {runs[1] or 'top'}, the row says "
+                                 f"fork-kit/{kit}/{installer} --source {source}" if runs else
+                          "no bootstrap runs its installer with --source"))
+        r = subprocess.run([sys.executable, "-I", "-B", "-c", KIT_CHECK, str(top), kit, how, installer, source],
                            capture_output=True, text=True, cwd=work)
         try:
-            missing = json.loads(r.stdout) if r.returncode == 0 else None
-        except ValueError:
-            missing = None
-        if missing is None:
-            problems[kit] = [f"its file check failed to run: {(r.stderr or r.stdout).strip()[-400:]}"]
-        elif missing:
-            problems[kit] = missing
+            got = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 else None
+        except (ValueError, IndexError):
+            got = None
+        if got is None:
+            found.append(("ran", f"its file check failed to run: {(r.stderr or r.stdout).strip()[-400:]}"))
+        else:
+            found += [("path", m) for m in got["missing"]] + [("self-test", f) for f in got["failed"]]
+        if found:
+            problems[kit] = found
     return problems
+
+
+def kit_failure_text(found):
+    """One kit's problems, each kind of cause followed once by what it asks for."""
+    causes = list(dict.fromkeys(c for c, _ in found))
+    return " | ".join("; ".join(t for c, t in found if c == cause)[:1500] + f" ({CAUSES[cause]})" for cause in causes)
+
+
+def mutated_release(name, change):
+    """A copy of the release at rel_top, changed by CHANGE(folder)."""
+    dest = work / name
+    shutil.copytree(rel_top, dest, symlinks=True)
+    change(dest)
+    return dest
+
+
+def edit(path, old, new):
+    text = path.read_text()
+    if old not in text:
+        raise RuntimeError(f"{path}: {old!r} not found (the mutation needs updating)")
+    path.write_text(text.replace(old, new, 1))
 
 
 if real_ok:
@@ -497,7 +593,7 @@ if real_ok:
     kit_problems = kit_release_problems(rel_top)
     for kit in sorted(set(KITS) | set(kit_problems)):
         check(f"release holds what the {kit} kit's installer reads", kit not in kit_problems,
-              "; ".join(kit_problems.get(kit, []))[:1500] + " (add the path(s) to .github/fork-ci-release.json paths)")
+              kit_failure_text(kit_problems.get(kit, [])))
 else:
     check("release holds what each kit's installer reads (the release tree above was refused)", False, why)
 # The check itself: a kit whose file is not in the release fails (heavy without its capacity files, as on ci/v21).
@@ -505,8 +601,49 @@ if real_ok:
     mutated = work / "release-without-capacity"
     write_release(root, [e for e in entries if not e[2].startswith("packages/shared/src/capacity/")], mutated)
     caught = kit_release_problems(mutated).get("heavy", [])
-    check("release check: a release without packages/shared/src/capacity fails the heavy kit",
-          any("capacity/capacity-rule.json" in m for m in caught), str(caught))
+    check("release check: a release without packages/shared/src/capacity fails the heavy kit, asking for the path",
+          ("path", "capacity/capacity-rule.json") in caught and CAUSES["path"] in kit_failure_text(caught), str(caught))
+
+    # Each installer's own missing_sources is what runs (not a copy of it in this test).
+    DRIFT = "\n\ndef missing_sources(source):\n    return ['drift-sentinel']\n"
+    OWN = {"heavy": "sbin/heavy-install", "model-guard": "sbin/model-guard-install", "desk": "sbin/desk-install",
+           "pc-agents": "sbin/pc-agents", "gh-apps": "lib/ghapps/install.py"}
+
+    def drift(top):
+        for kit, rel_path in OWN.items():
+            with open(top / "fork-kit" / kit / rel_path, "a") as f:
+                f.write(DRIFT)
+        (top / "fork-kit/newkit").mkdir()
+        (top / "fork-kit/newkit/bootstrap.sh").write_text("#!/bin/sh\n")
+        edit(top / "fork-kit/model-guard/bootstrap.sh", '--source "$kit"', '--source "$top"')
+
+    caught = kit_release_problems(mutated_release("release-drift", drift))
+    for kit in OWN:
+        check(f"release check: the {kit} row runs the installer's own missing_sources",
+              ("path", "drift-sentinel") in caught.get(kit, []), str(caught.get(kit)))
+    check("release check: a kit folder with only a bootstrap.sh and no row fails, asking for a row (not a path)",
+          [c for c, _ in caught.get("newkit", [])] == ["row"] and CAUSES["row"] in kit_failure_text(caught["newkit"])
+          and CAUSES["path"] not in kit_failure_text(caught["newkit"]), str(caught.get("newkit")))
+    check("release check: a bootstrap that passes another --source than its row fails, asking for the row",
+          any(c == "row" and "--source top" in t for c, t in caught.get("model-guard", [])),
+          str(caught.get("model-guard")))
+
+    # The installers' copy, staging and self-test run on the release, and a check that cannot run says so.
+    def loads_more(top):
+        extra = "import os\nopen(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'not-in-release.txt'))\n"
+        edit(top / "fork-kit/heavy/bin/heavy", '"""heavy:', extra + '"""heavy:')
+        agent = top / ".github/scripts/fork-fleet-desk-agent.py"
+        agent.write_text(extra + agent.read_text())
+        (top / "fork-kit/agent-guards/sbin/agent-guards-install").write_text("this is not python\n")
+
+    caught = kit_release_problems(mutated_release("release-loads-more", loads_more))
+    for kit, says in (("heavy", "bin/heavy --help failed"), ("desk", "fork-fleet-desk-agent.py --help fails")):
+        check(f"release check: a copied {kit} script that loads a file the release lacks fails the {kit} self-test",
+              any(c == "self-test" and says in t for c, t in caught.get(kit, []))
+              and CAUSES["self-test"] in kit_failure_text(caught[kit]), str(caught.get(kit))[:1500])
+    check("release check: an installer that cannot run fails as 'did not run', not as a missing path",
+          [c for c, _ in caught.get("agent-guards", [])] == ["ran"]
+          and CAUSES["path"] not in kit_failure_text(caught["agent-guards"]), str(caught.get("agent-guards")))
 
 for bad in ("/abs", "a/../b", "dir/", ""):
     t = work / f"cfg-{abs(hash(bad))}.json"
