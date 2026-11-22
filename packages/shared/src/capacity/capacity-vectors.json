@@ -2442,6 +2442,262 @@
       "nowMs": 1000000,
       "ask": { "kind": "agent-light" },
       "expect": { "level": "elevated", "calmSinceMs": null }
+    },
+    {
+      "name": "#800: a job owes its declared size when that is more than its kind's cost",
+      "why": "Margin 1209, available 10600. The test job declared 4000 MB (heavy's reservation for it) and uses 100: it owes 4000 - 100 = 3900, not 768 - 100 = 668. Free 10600 - 1209 - 3900 = 5491.",
+      "facts": "host-12gb-idle",
+      "patch": { "pieces": [{ "kind": "job-test", "demandMb": 100, "declaredMb": 4000 }] },
+      "ask": { "kind": "agent-light" },
+      "expect": { "admit": true, "reason": "fits", "owedMb": 3900, "freeMb": 5491, "costMb": 384 }
+    },
+    {
+      "name": "#800: a declared size below the kind's cost changes nothing",
+      "why": "A build that declared 1000 MB still owes its kind's 2048 (a floor, never a cap). Free 10600 - 1209 - 2048 = 7343.",
+      "facts": "host-12gb-idle",
+      "patch": { "pieces": [{ "kind": "job-build", "demandMb": 0, "declaredMb": 1000 }] },
+      "ask": { "kind": "agent-light" },
+      "expect": { "owedMb": 2048, "freeMb": 7343 }
+    },
+    {
+      "name": "#800: an impossible declared size is no floor",
+      "why": "Declared true, 0 and 1048576 (above maxTotalMb) are not sizes: each build owes its kind's 2048. Owed 6144, free 10600 - 1209 - 6144 = 3247.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "pieces": [
+          { "kind": "job-build", "demandMb": 0, "declaredMb": true },
+          { "kind": "job-build", "demandMb": 0, "declaredMb": 0 },
+          { "kind": "job-build", "demandMb": 0, "declaredMb": 1048576 }
+        ]
+      },
+      "ask": { "kind": "agent-light" },
+      "expect": { "owedMb": 6144, "freeMb": 3247 }
+    },
+    {
+      "name": "#800: a learned cost above the declared size wins",
+      "why": "The build kind learned 6000 MB; the piece declared 3000: the cost is the larger, 6000. Free 10600 - 1209 - 6000 = 3391.",
+      "facts": "host-12gb-idle",
+      "learned": { "job-build": { "mb": 6000 } },
+      "patch": { "pieces": [{ "kind": "job-build", "demandMb": 0, "declaredMb": 3000 }] },
+      "ask": { "kind": "agent-light" },
+      "expect": { "owedMb": 6000, "freeMb": 3391 }
+    },
+    {
+      "name": "#800: an ask's declared size is its cost, past the learned bound too",
+      "why": "An unknown job (job-default, 3072) that declares 13000 MB costs 13000, above 400% of 3072 (12288): a declared size is not a learned one and is not clamped. 13000 > free 9391: not fits; the job floor (none running) admits it only above the severe line: 10600 - 13000 < 0, so budget.",
+      "facts": "host-12gb-idle",
+      "ask": { "kind": "job-foo", "declaredMb": 13000 },
+      "expect": { "admit": false, "reason": "budget", "costMb": 13000, "freeMb": 9391 }
+    },
+    {
+      "name": "#800: a fill step's declared size is owed by each admitted piece",
+      "why": "Free 9391. Test jobs that declare 3000 MB each (their kind costs 768): one, two and three fit (owed 9000 <= 9391 after the third, cores 3 x 170 = 510 <= 1080); a fourth would need 3000 with 391 free: budget.",
+      "facts": "host-12gb-idle",
+      "fill": [{ "kind": "job-test", "count": 4, "declaredMb": 3000 }],
+      "expect": { "admitted": [3], "stoppedBy": ["budget"] }
+    },
+    {
+      "name": "#800 both ways: the minimum margin on a host under 10 GB",
+      "why": "Total 8000: 10% is 800 MB, under margin.minMb 1024, so the margin is 1024 (swap and per-piece caps: no widening).",
+      "facts": "host-12gb-idle",
+      "patch": { "totalMb": 8000, "availableMb": 6000 },
+      "ask": { "kind": "agent-light" },
+      "expect": { "marginMb": 1024 }
+    },
+    {
+      "name": "#800 both ways: a total of exactly minTotalMb is read",
+      "why": "Total 1024 is not below readingBounds.minTotalMb (1024): readable. Margin max(1024, 102.4) = 1024.",
+      "facts": "host-12gb-idle",
+      "patch": { "totalMb": 1024, "availableMb": 1000 },
+      "ask": { "kind": "agent-light" },
+      "expect": { "marginMb": 1024 }
+    },
+    {
+      "name": "#800 both ways: a total one under minTotalMb is unreadable",
+      "why": "Total 1023 is below readingBounds.minTotalMb (1024): unreadable, no margin.",
+      "facts": "host-12gb-idle",
+      "patch": { "totalMb": 1023, "availableMb": 1000 },
+      "ask": { "kind": "agent-light" },
+      "expect": { "reason": "unreadable", "marginMb": null }
+    },
+    {
+      "name": "#800 both ways: exactly maxCpuCores cores are read",
+      "why": "1024 cores is not above readingBounds.maxCpuCores (1024): readable, margin 1209.",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 1024 },
+      "ask": { "kind": "agent-light" },
+      "expect": { "marginMb": 1209 }
+    },
+    {
+      "name": "#800 both ways: one core over maxCpuCores is unreadable",
+      "why": "1025 cores is above readingBounds.maxCpuCores (1024): unreadable.",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 1025 },
+      "ask": { "kind": "agent-light" },
+      "expect": { "reason": "unreadable", "marginMb": null }
+    },
+    {
+      "name": "#800 both ways: a test job costs its start",
+      "why": "No learned cost: a job-test costs its startMb, 768.",
+      "facts": "host-12gb-idle",
+      "ask": { "kind": "job-test" },
+      "expect": { "costMb": 768 }
+    },
+    {
+      "name": "#800 both ways: two builds exactly fill the job cores",
+      "why": "5.56 cores: 556 centi-cores, 90% is 500 (floor of 500.4). Two builds need 2 x 250 = 500 <= 500; a third 750: cores. Memory holds three (6144 <= 9391).",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 5.56 },
+      "fill": [{ "kind": "job-build", "count": 3 }],
+      "expect": { "admitted": [2], "stoppedBy": ["cores"] }
+    },
+    {
+      "name": "#800 both ways: two builds one centi-core over the job cores",
+      "why": "5.55 cores: 555 centi-cores, 90% is 499 (floor of 499.5). The second build makes 500 > 499: cores (the floor of 1 job is met by the first).",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 5.55 },
+      "fill": [{ "kind": "job-build", "count": 3 }],
+      "expect": { "admitted": [1], "stoppedBy": ["cores"] }
+    },
+    {
+      "name": "#800 both ways: two test jobs exactly fill the job cores",
+      "why": "3.78 cores: 378 centi-cores, 90% is 340 (floor of 340.2). Two test jobs need 2 x 170 = 340 <= 340; a third 510: cores.",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 3.78 },
+      "fill": [{ "kind": "job-test", "count": 3 }],
+      "expect": { "admitted": [2], "stoppedBy": ["cores"] }
+    },
+    {
+      "name": "#800 both ways: two test jobs one centi-core over the job cores",
+      "why": "3.77 cores: 377 centi-cores, 90% is 339 (floor of 339.3). The second test job makes 340 > 339: cores.",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 3.77 },
+      "fill": [{ "kind": "job-test", "count": 3 }],
+      "expect": { "admitted": [1], "stoppedBy": ["cores"] }
+    },
+    {
+      "name": "#800 both ways: a job-typecheck one centi-core over the job cores",
+      "why": "3.1 cores: 310 centi-cores, 90% is 279. A build runs (250); a job-typecheck (30) makes 280 > 279: cores. Memory fits (the build owes 2048 of 9391).",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 3.1, "pieces": [{ "kind": "job-build", "demandMb": 0 }] },
+      "ask": { "kind": "job-typecheck" },
+      "expect": { "admit": false, "reason": "cores" }
+    },
+    {
+      "name": "#800 both ways: a job-server one centi-core over the job cores",
+      "why": "3.88 cores: 388 centi-cores, 90% is 349. A build runs (250); a job-server (100) makes 350 > 349: cores. Memory fits (the build owes 2048 of 9391).",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 3.88, "pieces": [{ "kind": "job-build", "demandMb": 0 }] },
+      "ask": { "kind": "job-server" },
+      "expect": { "admit": false, "reason": "cores" }
+    },
+    {
+      "name": "#800 both ways: a job-default one centi-core over the job cores",
+      "why": "5.55 cores: 555 centi-cores, 90% is 499. A build runs (250); a job-default (250) makes 500 > 499: cores. Memory fits (the build owes 2048 of 9391).",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 5.55, "pieces": [{ "kind": "job-build", "demandMb": 0 }] },
+      "ask": { "kind": "job-default" },
+      "expect": { "admit": false, "reason": "cores" }
+    },
+    {
+      "name": "#800 both ways: some PSI at exactly the elevated line",
+      "why": "PSI some avg10 10 is at pressure.elevated.psiSomeAvg10Pct (10): elevated (no previous state: the raw level).",
+      "facts": "host-12gb-idle",
+      "patch": { "psi": { "someAvg10Pct": 10, "fullAvg10Pct": 0 } },
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "elevated" }
+    },
+    {
+      "name": "#800 both ways: full PSI just under the elevated line",
+      "why": "PSI full avg10 1.5 is under pressure.elevated.psiFullAvg10Pct (2): ok (not calm, but no previous state: the raw level).",
+      "facts": "host-12gb-idle",
+      "patch": { "psi": { "someAvg10Pct": 0, "fullAvg10Pct": 1.5 } },
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "ok" }
+    },
+    {
+      "name": "#800 both ways: available exactly at the margin",
+      "why": "Available 1209 is not below 100% of the margin 1209 (pressure.elevated.availableBelowMarginPercent): ok, raw level.",
+      "facts": "host-12gb-idle",
+      "patch": { "availableMb": 1209 },
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "ok" }
+    },
+    {
+      "name": "#800 both ways: filling swap exactly at the elevated share",
+      "why": "Swap 600 of 4000 MB free is 15%, not under pressure.elevated.swapFreeBelowPercent (15); it fell 100 MB (filling): still ok.",
+      "facts": "host-12gb-idle",
+      "patch": { "swap": { "totalMb": 4000, "freeMb": 600 } },
+      "previous": { "level": "ok", "calmSinceMs": null, "swapFreeMb": 700 },
+      "nowMs": 1000000,
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "ok" }
+    },
+    {
+      "name": "#800 both ways: full PSI just under the severe line",
+      "why": "PSI full avg10 9.5 is under pressure.severe.psiFullAvg10Pct (10) and over the elevated line (2): elevated.",
+      "facts": "host-12gb-idle",
+      "patch": { "psi": { "someAvg10Pct": 0, "fullAvg10Pct": 9.5 } },
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "elevated" }
+    },
+    {
+      "name": "#800 both ways: available exactly at the severe line",
+      "why": "Total 12000: margin 1200. Available 600 is 50% of it, not under pressure.severe.availableBelowMarginPercent (50): elevated, not severe.",
+      "facts": "host-12gb-idle",
+      "patch": { "totalMb": 12000, "availableMb": 600 },
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "elevated" }
+    },
+    {
+      "name": "#800 both ways: some PSI at the calm line keeps elevated",
+      "why": "Elevated, calm since 0, now 1000 s: some avg10 5 is not under pressure.calm.psiSomeAvg10Pct (5), so not calm: elevated, the wait ends.",
+      "facts": "host-12gb-idle",
+      "patch": { "psi": { "someAvg10Pct": 5, "fullAvg10Pct": 0 } },
+      "previous": { "level": "elevated", "calmSinceMs": 0, "swapFreeMb": 4096 },
+      "nowMs": 1000000,
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "elevated", "calmSinceMs": null }
+    },
+    {
+      "name": "#800 both ways: some PSI just under the calm line steps down",
+      "why": "Elevated, calm since 0, now 1000 s (past elevatedClearSeconds 60): some avg10 4.5 is under the calm 5, swap not filling (4096 to 4096): ok.",
+      "facts": "host-12gb-idle",
+      "patch": { "psi": { "someAvg10Pct": 4.5, "fullAvg10Pct": 0 } },
+      "previous": { "level": "elevated", "calmSinceMs": 0, "swapFreeMb": 4096 },
+      "nowMs": 1000000,
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "ok" }
+    },
+    {
+      "name": "#800 both ways: full PSI at the calm line keeps elevated",
+      "why": "Elevated, calm since 0: full avg10 1 is not under pressure.calm.psiFullAvg10Pct (1): not calm, elevated (and under the elevated line 2).",
+      "facts": "host-12gb-idle",
+      "patch": { "psi": { "someAvg10Pct": 0, "fullAvg10Pct": 1 } },
+      "previous": { "level": "elevated", "calmSinceMs": 0, "swapFreeMb": 4096 },
+      "nowMs": 1000000,
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "elevated", "calmSinceMs": null }
+    },
+    {
+      "name": "#800 both ways: available exactly at the calm share steps down",
+      "why": "Total 12000: margin 1200; available 1800 is 150% of it, at pressure.calm.availableAtLeastMarginPercent (150): calm, so after 1000 s it steps down to ok.",
+      "facts": "host-12gb-idle",
+      "patch": { "totalMb": 12000, "availableMb": 1800 },
+      "previous": { "level": "elevated", "calmSinceMs": 0, "swapFreeMb": 4096 },
+      "nowMs": 1000000,
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "ok" }
+    },
+    {
+      "name": "#800 both ways: swap that fell one MB more than swapFillingMb is filling",
+      "why": "Swap 100 of 4000 free (2.5%, under 15%) fell from 165: by 65 MB, more than pressure.swapFillingMb (64): filling, elevated.",
+      "facts": "host-12gb-idle",
+      "patch": { "swap": { "totalMb": 4000, "freeMb": 100 } },
+      "previous": { "level": "ok", "calmSinceMs": null, "swapFreeMb": 165 },
+      "nowMs": 1000000,
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "elevated" }
     }
   ]
 }

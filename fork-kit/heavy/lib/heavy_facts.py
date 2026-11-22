@@ -54,7 +54,7 @@ import datetime, errno, fcntl, fnmatch, hashlib, json, math, os, pwd, re, signal
 CACHE_SECONDS, CARRY_SECONDS, ANSWER_SECONDS, STALE_TMP_SECONDS = 5, 300, 5, 60
 EXIT_FREE, EXIT_BUSY, EXIT_ERROR = 0, 75, 1
 CACHE_VERSION = 3                               # 3: reservations carry owedMb (#923)
-AGENT_SCOPE_RE = re.compile(r'^t3code-[A-Za-z0-9_.:-]+\.scope\Z')
+AGENT_SCOPE_RE = re.compile(r'^t3code-[A-Za-z0-9_.:\\-]+\.scope\Z')
 SCOPE_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\.scope\Z')
 TICKET_RE = re.compile(r'^t-[0-9]{1,15}-[0-9]{1,10}\.json\Z')
 KIND_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,59}\Z')
@@ -68,7 +68,16 @@ USERS = '/sys/fs/cgroup/user.slice'
 RUN_USER = '/run/user'                          # the cache's folder: /run/user/<uid>
 TMP_ROOT = None                                 # without it: <TMP_ROOT>/heavy-facts-<uid> (None: temp_root())
 TMP_DIRS = ('/tmp',)                            # temp_root() after $TMPDIR
-ROOT = os.environ.get('HEAVY_FACTS_ROOT', '')     # tests: /proc and /sys are read under this folder
+
+
+def test_env(name):
+    """A test-only setting (#800): read only while HEAVY_TESTING=1 is set too, so one that leaks into an agent's or a
+    service's environment (HEAVY_FACTS_ROOT, AGENT_SLOTS_ALIVE, T3_CAPACITY_HEAVY, AGENT_SLOTS_HEAVY) changes
+    nothing a real caller sees."""
+    return os.environ.get(name) if os.environ.get('HEAVY_TESTING') == '1' else None
+
+
+ROOT = test_env('HEAVY_FACTS_ROOT') or ''       # tests: /proc and /sys are read under this folder
 BASIC_WHY = 'basic tier: no cgroup v2, or neither a systemd user manager for this user nor user.slice, so agents and ' \
             'other users\' work cannot be counted: never free here'
 MACHINE_WHY = 'machine tier: no systemd user manager for this user, so it has no agents or heavy jobs of its own; ' \
@@ -100,19 +109,26 @@ def slice_path(name):
 
 
 def agent_scopes(manager):
-    """(T3's agent scope folders, the outermost app-t3code slice folder or None) under the user manager's cgroup."""
-    scopes, box = [], None
+    """(T3's agent scope folders, the outermost app-t3code slice folder or None, notes) under the user manager's
+    cgroup. Every scope right below an `app-t3code*` slice is an agent, whatever its name (an escaped label, `\x2d`,
+    too); a `t3code-*.scope` anywhere else below the manager (T3 run under a slice of another name) counts as one too,
+    with a note, so a scope outside the usual place is never left out (#800)."""
+    scopes, box, notes = [], None, []
     for dirpath, dirs, _files in os.walk(ROOT + manager):
         rel = dirpath[len(ROOT):]
         name = os.path.basename(rel)
+        parent = os.path.basename(os.path.dirname(rel))
         if name.startswith('app-t3code') and name.endswith('.slice') and (box is None or len(rel) < len(box)):
             box = rel
-        if AGENT_SCOPE_RE.match(name) and '/app-t3code' in rel[len(manager):]:
+        if name.endswith('.scope') and rel != manager and (
+                parent.startswith('app-t3code') and parent.endswith('.slice') or AGENT_SCOPE_RE.match(name)):
             scopes.append(rel)
+            if not (parent.startswith('app-t3code') and parent.endswith('.slice')):
+                notes.append(f'agent scope {name[:80]} is not below an app-t3code slice: counted as an agent')
             dirs[:] = []
         else:
             dirs[:] = [d for d in dirs if d.endswith(('.slice', '.scope', '.service'))]
-    return sorted(scopes), box
+    return sorted(scopes), box, notes
 
 
 def tickets(queue_dir):
@@ -466,15 +482,15 @@ def scope_demand(host, folder):
 
 def other_users(rule, host, uid, heavy_rel, owners, base):
     """The other users' heavy jobs and T3 agent scopes, from their user managers' cgroups (readable by every user):
-    (pieces, jobs, agents, notes). A folder that exists but cannot be listed is a note and 'blind'. owners gets
+    (pieces, jobs, agents, blind, notes). A folder that exists but cannot be listed is a note and 'blind'. owners gets
     {pid: base + the piece's index} for their processes (count_in_reservations)."""
-    pieces, jobs, agents, blind = [], 0, 0, []
+    pieces, jobs, agents, blind, notes = [], 0, 0, [], []
     try:
         names = sorted(os.listdir(ROOT + USERS))
     except FileNotFoundError:
-        return pieces, jobs, agents, blind
+        return pieces, jobs, agents, blind, notes
     except OSError as e:
-        return pieces, jobs, agents, [f'{USERS} cannot be listed ({e.strerror})']
+        return pieces, jobs, agents, [f'{USERS} cannot be listed ({e.strerror})'], notes
     for name in names:
         m = USER_RE.match(name)
         if not m or int(m.group(1)) == uid:
@@ -494,13 +510,15 @@ def other_users(rule, host, uid, heavy_rel, owners, base):
                 owners.update(dict.fromkeys(scope_pids(f'{box}/{n}'), base + len(pieces)))
                 pieces.append({'kind': rule['unknownKinds']['job'], 'demandMb': demand})
                 jobs += 1
-        for s in agent_scopes(manager)[0]:
+        found, _box, more = agent_scopes(manager)
+        notes += [f'user {m.group(1)}: {n}' for n in more]
+        for s in found:
             demand = scope_demand(host, s)
             if demand is not False:
                 owners.update(dict.fromkeys(scope_pids(s), base + len(pieces)))
                 pieces.append({'kind': rule['unknownKinds']['other'], 'demandMb': demand})
                 agents += 1
-    return pieces, jobs, agents, blind
+    return pieces, jobs, agents, blind, notes
 
 
 def read_machine(rule, where, carry, now):
@@ -533,7 +551,8 @@ def read_machine(rule, where, carry, now):
     own_jobs = running
     agents, agent_box = 0, None
     if mine:
-        scopes, agent_box = agent_scopes(manager)
+        scopes, agent_box, more = agent_scopes(manager)
+        notes += more
         for s in scopes:
             demand = scope_demand(host, s)
             if demand is not False:
@@ -541,7 +560,8 @@ def read_machine(rule, where, carry, now):
                 pieces.append({'kind': rule['unknownKinds']['other'], 'demandMb': demand})   # no kind label: a writer
                 agents += 1
     if full:
-        more, jobs, other_agents, blind = other_users(rule, host, uid, heavy_rel, owners, len(pieces))
+        more, jobs, other_agents, blind, more_notes = other_users(rule, host, uid, heavy_rel, owners, len(pieces))
+        notes += more_notes
         pieces += more
         running, agents = running + jobs, agents + other_agents
         if jobs or other_agents:

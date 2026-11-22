@@ -57,6 +57,7 @@ hq = load_module('heavy_queue', os.path.join(KIT, 'lib', 'heavy_queue.py'))
 cr = hf.cr
 RULE = cr.shipped_rule()
 WRITER = RULE['unknownKinds']['other']          # what an unlabelled agent scope counts as
+BUILD_MB = RULE['kinds']['job-build']['startMb']    # a build ticket that reserved just its kind's cost
 
 
 class Machine:
@@ -118,7 +119,8 @@ class Machine:
         self.write(f'/proc/{pid}/status', f'Name:\tx\nRssAnon:\t{rss_mb * 1024} kB\nRssShmem:\t0 kB\n')
 
     def env(self, **more):
-        return dict(os.environ, HEAVY_FACTS_ROOT=self.root, HEAVY_FACTS_CACHE=self.cache, HEAVY_QUEUE_ROOT=self.queue,
+        return dict(os.environ, HEAVY_TESTING='1', HEAVY_FACTS_ROOT=self.root, HEAVY_FACTS_CACHE=self.cache,
+                    HEAVY_QUEUE_ROOT=self.queue,
                     HEAVY_CONFIG=os.path.join(self.tmp, 'no-config.json'), HOME=self.home,
                     T3_CAPACITY_RESERVE_DIR=self.reserve, **more)
 
@@ -185,11 +187,26 @@ class Ledger(Case):
         self.assertLess(d['fits'][WRITER], idle['fits'][WRITER])
         self.assertLess(d['memory']['freeMb'], idle['memory']['freeMb'])
 
+    def test_agent_scopes_with_an_escaped_label_or_outside_the_agents_slice_count(self):
+        # #800: an escaped label (systemd's \x2d) or T3 under a slice of another name never gives 0 agents
+        self.m.write(AGENTS + '/t3code-my\\x2dthread-0a1b2c3d.scope/memory.stat', f'anon {100 * MB}\nshmem 0\n')
+        self.m.write(AGENTS + '/run-u1.scope/memory.stat', f'anon {100 * MB}\nshmem 0\n')   # any scope in it
+        self.m.write(MANAGER + '/app.slice/my-t3.slice/t3code-b-0a1b2c3d.scope/memory.stat',
+                     f'anon {100 * MB}\nshmem 0\n')
+        self.m.write(MANAGER + '/app.slice/app-t3code.slice/other.service/x.scope/memory.stat', 'anon 1\n')  # no
+        for box in (MANAGER + '/app.slice/app-t3code.slice', AGENTS):
+            self.m.write(box + '/memory.pressure', CALM)
+        d = self.facts('--kind', WRITER, '--fresh')[1]
+        self.assertEqual(d['queue']['agents'], 3)
+        self.assertEqual(d['memory']['owedMb'], 3 * (self.cost(WRITER) - 100))
+        self.assertTrue(any('t3code-b-0a1b2c3d.scope is not below an app-t3code slice' in n for n in d['notes']),
+                        d['notes'])
+
     def test_heavy_jobs_live_waiting_stale_and_garbled(self):
         build = 'job-build' if 'job-build' in RULE['kinds'] else RULE['unknownKinds']['job']
-        self.m.job('build', 3072, demand_mb=1000)                       # live, admitted
-        self.m.job('build', 3072, state='waiting')                      # counted as waiting only
-        self.m.job('build', 3072, hold=False)                           # its heavy is gone: not counted, not removed
+        self.m.job('build', BUILD_MB, demand_mb=1000)                       # live, admitted
+        self.m.job('build', BUILD_MB, state='waiting')                      # counted as waiting only
+        self.m.job('build', BUILD_MB, hold=False)                           # its heavy is gone: not counted, not removed
         code, d = self.facts('--kind', build)
         self.assertEqual(d['queue'], {'running': 1, 'waiting': 1, 'agents': 0})
         self.assertEqual(d['memory']['owedMb'], self.cost(build) - 1000)
@@ -306,7 +323,7 @@ class Ledger(Case):
         self.m.write(MANAGER + '/heavy.slice/memory.pressure', 'nonsense\n')
         os.unlink(self.m.cache)                     # (else the elevated reading carries: calm must last first)
         self.assertEqual(self.facts('--mb', '64')[1]['level'], 'ok', 'no job of its own: the box passes nothing')
-        self.m.job('build', 3072, demand_mb=100)
+        self.m.job('build', BUILD_MB, demand_mb=100)
         self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['level'], 'elevated')
         os.unlink(self.m.root + MANAGER + '/heavy.slice/memory.pressure')     # a box without its PSI file
         os.unlink(self.m.cache)
@@ -408,7 +425,7 @@ class Reservations(Case):
         self.assertEqual((d['memory']['holdMb'], d['memory']['owedMb']),
                          (1536 - 300 - owed, owed + self.cost(WRITER) - 100))
         build = 'job-build' if 'job-build' in RULE['kinds'] else RULE['unknownKinds']['job']
-        self.m.job('build', 3072, demand_mb=200)    # a heavy job started in the folder: never held twice either
+        self.m.job('build', BUILD_MB, demand_mb=200)    # a heavy job started in the folder: never held twice either
         self.m.write(f'{MANAGER}/heavy.slice/run-j1.scope/sub/cgroup.procs', '4003\n')
         self.m.process(4003, other, 200)
         d = self.facts('--mb', '64', '--fresh')[1]
@@ -430,7 +447,7 @@ class Reservations(Case):
         self.m.agent('w', 400, pids=(4001, 4002))
         self.m.process(4001, a + '/src', 300)
         self.m.process(4002, b + '/y/z', 100)
-        self.m.job('build', 3072, demand_mb=200)
+        self.m.job('build', BUILD_MB, demand_mb=200)
         self.m.write(f'{MANAGER}/heavy.slice/run-j1.scope/cgroup.procs', '4003\n4004\n')
         self.m.process(4003, a, 150)
         self.m.process(4004, b, 50)
@@ -753,7 +770,7 @@ class State(Case):
         build = 'job-build'
         if build not in RULE['kinds']:
             self.skipTest('no job-build kind in the rule')
-        self.m.job('build', 3072, demand_mb=0)
+        self.m.job('build', BUILD_MB, demand_mb=0)
         start = self.facts('--fresh')[1]['memory']['owedMb']
         self.assertEqual(start, self.cost(build))
         state = os.path.join(self.m.home, '.local', 'state', 'heavy')
@@ -1039,6 +1056,42 @@ class AgentSlots(Case):
         self.assertEqual((p.returncode, p.stdout), (0, ''))
 
 
+class TestOnlySettings(Case):
+    """#800: the test-only settings change nothing unless HEAVY_TESTING=1 is set too, so one that leaks into a real
+    caller's environment never fakes its machine or its answer."""
+
+    def test_the_fake_machine_needs_the_test_flag(self):
+        env = dict(self.m.env())
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_module('heavy_facts_flag', FACTS).ROOT, self.m.root)
+        del env['HEAVY_TESTING']
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_module('heavy_facts_noflag', FACTS).ROOT, '')
+            self.assertIsNone(hf.test_env('HEAVY_FACTS_ROOT'))
+        with mock.patch.dict(os.environ, dict(env, HEAVY_TESTING='yes'), clear=True):
+            self.assertIsNone(hf.test_env('HEAVY_FACTS_ROOT'), 'only "1" turns it on')
+
+    def test_the_callers_fake_heavy_and_process_count_need_the_test_flag(self):
+        marker = os.path.join(self.tmp, 'fake-ran')
+        fake = fake_heavy(self.tmp, f'touch {marker}; echo garbled; exit 0')
+        env = {k: v for k, v in self.m.env(T3_CAPACITY_HEAVY=fake, AGENT_SLOTS_HEAVY=fake, AGENT_SLOTS_ALIVE='x',
+                                           PWD=self.work).items() if k != 'HEAVY_TESTING'}
+        conf = os.path.join(self.tmp, 'c.json')
+        sessions = os.path.join(self.tmp, 's.txt')
+        with open(sessions, 'w') as f:
+            f.write('ORCH\n')
+        with open(conf, 'w') as f:
+            json.dump({'sessions_file': sessions, 'queue': os.path.join(self.tmp, 'none.md')}, f)
+        p = subprocess.run([T3CAP, '64'], capture_output=True, text=True, timeout=30, env=env, cwd=self.work)
+        self.assertNotIn('garbled', p.stdout + p.stderr)
+        p = subprocess.run([SLOTS], input=json.dumps({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ORCH'}),
+                           capture_output=True, text=True, timeout=30, env=dict(env, AGENT_SLOTS_CONFIG=conf),
+                           cwd=self.work)
+        self.assertEqual(p.returncode, 0)
+        self.assertIn('Agent slots:', p.stdout, 'AGENT_SLOTS_ALIVE=x is not read, so it cannot break the count')
+        self.assertFalse(os.path.exists(marker), 'neither caller ran the fake heavy without HEAVY_TESTING=1')
+
+
 class Kinds(Case):
     """Every heavy ticket is a job: a kind the rule does not know (tsc, gradle, a project's own) is the rule's
     unknownKinds.job, never an agent."""
@@ -1050,7 +1103,7 @@ class Kinds(Case):
     def test_unknown_kinds_at_the_job_ceiling_leave_no_job_free(self):
         ceiling = RULE['ceilings']['job']
         for _ in range(ceiling):
-            self.m.job('tsc', 3072, demand_mb=10)
+            self.m.job('tsc', 64, demand_mb=10)
         code, d = self.facts('--kind', 'build')
         self.assertEqual((code, d['free'], d['kind']), (75, False, 'job-build'))
         self.assertIn('ceiling', d['reason'])
@@ -1065,16 +1118,26 @@ class Kinds(Case):
             with self.subTest(kind=kind):
                 for name in os.listdir(os.path.join(self.m.queue, 'heavy.slice')):
                     os.unlink(os.path.join(self.m.queue, 'heavy.slice', name))
-                self.m.job(kind, 3072, demand_mb=10)
+                self.m.job(kind, 64, demand_mb=10)
                 code, d = self.facts('--kind', kind, '--fresh')
                 self.assertEqual((code, d['kind'], d['queue']['running']), (0, self.JOB, 1))
                 self.assertEqual(d['memory']['owedMb'], self.cost(self.JOB) - 10)
 
     def test_a_known_job_kind_keeps_its_own_cost(self):
-        self.m.job('test', 3072, demand_mb=10)
-        self.m.job('job-typecheck', 3072, demand_mb=10)
+        self.m.job('test', 64, demand_mb=10)
+        self.m.job('job-typecheck', self.cost('job-typecheck'), demand_mb=10)
         d = self.facts('--kind', 'build')[1]
         self.assertEqual(d['memory']['owedMb'], self.cost('job-test') + self.cost('job-typecheck') - 20)
+
+    def test_a_job_owes_heavy_s_reservation_when_that_is_more_than_its_kind_s_cost(self):
+        # #800: heavy reserved 5000 MB for this test job (its --mb, or the kind's learned peak): the job owes that,
+        # not job-test's start cost; so does a job of a kind the rule does not know
+        self.m.job('test', 5000, demand_mb=10)
+        self.m.job('tsc', self.cost(self.JOB) + 1000, demand_mb=10)
+        d = self.facts('--kind', 'build')[1]
+        self.assertEqual(d['memory']['owedMb'], 5000 - 10 + self.cost(self.JOB) + 1000 - 10)
+        code, d = self.facts('--kind', 'test', '--mb', '6000', '--fresh')
+        self.assertEqual(d['memory']['costMb'], 6000, 'an ask that declares more costs that much')
 
 
 class OtherUsers(Case):
@@ -1085,12 +1148,14 @@ class OtherUsers(Case):
         self.m.write(OTHER + '/heavy.slice/run-x1.scope/memory.stat', f'anon {10 * MB}\nshmem 0\n')
         self.m.write(OTHER + '/heavy.slice/memory.pressure', CALM)
         self.m.write(OTHER + '/app.slice/app-t3code.slice/t3code-z-1.scope/memory.stat', f'anon {10 * MB}\nshmem 0\n')
+        # #800: any scope right below an app-t3code slice is an agent, whatever its name
         self.m.write(OTHER + '/app.slice/app-t3code.slice/other.scope/memory.stat', 'anon 0\nshmem 0\n')
         os.makedirs(self.m.root + OTHER + '/heavy.slice/run-gone.scope')          # ended: no memory.stat
         code, d = self.facts('--kind', 'build', '--fresh')
-        self.assertEqual(d['queue'], {'running': 1, 'waiting': 0, 'agents': 1})
-        self.assertEqual(d['memory']['owedMb'], self.cost(RULE['unknownKinds']['job']) - 10 + self.cost(WRITER) - 10)
-        self.assertTrue(any(n.startswith('other users: 1 heavy job(s), 1 agent(s)') for n in d['notes']))
+        self.assertEqual(d['queue'], {'running': 1, 'waiting': 0, 'agents': 2})
+        self.assertEqual(d['memory']['owedMb'],
+                         self.cost(RULE['unknownKinds']['job']) - 10 + self.cost(WRITER) - 10 + self.cost(WRITER))
+        self.assertTrue(any(n.startswith('other users: 1 heavy job(s), 2 agent(s)') for n in d['notes']))
         self.assertLess(d['fits']['job-build'], idle['fits']['job-build'])
         for i in range(2, RULE['ceilings']['job'] + 1):
             self.m.write(OTHER + f'/heavy.slice/run-x{i}.scope/memory.stat', 'anon 0\nshmem 0\n')
@@ -1180,7 +1245,7 @@ class Container(Case):
                 os.unlink(self.m.root + path)
 
     def test_a_cut_short_memory_stat_owes_in_full(self):
-        self.m.job('build', 3072, demand_mb=1000)
+        self.m.job('build', BUILD_MB, demand_mb=1000)
         self.assertEqual(self.facts('--kind', 'build')[1]['memory']['owedMb'], self.cost('job-build') - 1000)
         self.m.write(f'{MANAGER}/heavy.slice/run-j1.scope/memory.stat', f'anon {1000 * MB}\nfi')
         self.assertEqual(self.facts('--kind', 'build', '--fresh')[1]['memory']['owedMb'], self.cost('job-build'))

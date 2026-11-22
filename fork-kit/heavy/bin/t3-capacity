@@ -20,8 +20,18 @@ not a terminal also says on stderr that a pipe would hide the exit status.
 import os, sys
 
 
-def kit_file(rel):
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), rel)
+KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def facts_module():
+    """lib/heavy_facts.py of this kit, imported from the kit's own lib folder (root's once installed); it loads the
+    rest with its own loader, the one copy (#800). Called inside the caller's try: a kit that cannot load is no
+    answer, never a traceback."""
+    lib = os.path.join(KIT, 'lib')
+    if sys.path[:1] != [lib]:
+        sys.path.insert(0, lib)
+    import heavy_facts
+    return heavy_facts
 
 
 def main(argv):
@@ -41,8 +51,8 @@ def main(argv):
             return usage()
     need = 3072 if need is None and kind is None else need
     try:
-        hf = load(kit_file('lib/heavy_facts.py'))
-        verdict, why, d = hf.ask(os.environ.get('T3_CAPACITY_HEAVY') or kit_file('bin/heavy'), kind, need)
+        hf = facts_module()
+        verdict, why, d = hf.ask(hf.test_env('T3_CAPACITY_HEAVY') or os.path.join(KIT, 'bin', 'heavy'), kind, need)
     except Exception as e:      # the caller itself cannot run: never OK
         verdict, why, d = 'unavailable', f'{e.__class__.__name__}: {e}', None
     if d is None:
@@ -87,14 +97,6 @@ def owed(r):
 def usage():
     print('usage: t3-capacity [--kind KIND] [MB]', file=sys.stderr)
     return 2
-
-
-def load(path):
-    import importlib.machinery, importlib.util
-    loader = importlib.machinery.SourceFileLoader('heavy_facts', path)
-    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader('heavy_facts', loader))
-    loader.exec_module(mod)
-    return mod
 
 
 if __name__ == '__main__':
