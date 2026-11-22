@@ -107,9 +107,10 @@ OK_CONCLUSIONS = ('SUCCESS', 'SKIPPED', 'NEUTRAL')
 STRANGER_SCAN = 4096   # characters of a post that does not count read to decide whether to log it
 # A report whose lens marker or header shows only once the text is folded as GitHub renders it (Review.lookalike_problem,
 # review_judge.fold: look-alike Cyrillic or Greek letters, zero-width and other format characters, HTML references,
-# backslash escapes): a broken report, never a read and never silent (issue #1005).
+# backslash escapes): a broken report, never a read and never silent (issue #1005). Keyed by its comment, so a new
+# comment alone does not clear it: its reason gives the held reasons' way out too.
 LOOKALIKE = ('reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash '
-             'escapes read as GitHub shows them (post a NEW comment in plain letters)')
+             f'escapes read as GitHub shows them (post a NEW comment in plain letters, and {HELD_WAY_OUT})')
 
 # The Unicode version every rule here, the shared vectors and T3's port (pyText.ts) were checked against: the vectors'
 # py_unicode table lists the code points it assigns. On a Python with another Unicode, text with a code point the two
@@ -173,9 +174,14 @@ def unicode_check(text):
 
 
 def fold_text(text):
-    """review_judge.fold: the text as GitHub renders it, for the findings rules and the look-alike check."""
+    """review_judge.fold, line by line: the text as GitHub renders it, for the lens marker, the look-alike check and the
+    queue's own text (settled). A line end an HTML reference writes (`&#10;`, `&#13;`, `&#x2028;`) reads as a space,
+    as GitHub shows it (a space in prose; in inline code it is not decoded at all), never as a new line: a valid report
+    that quotes one before header-like text in inline code is no look-alike (T3: lensComment.foldText)."""
     import review_judge   # noqa: PLC0415 - review_judge imports this module
-    return review_judge.fold(text)
+    parts = LINE_END_RE.split(text or '')
+    parts[::2] = [LINE_END_RE.sub(' ', review_judge.fold(part)) for part in parts[::2]]
+    return ''.join(parts)
 
 
 # The reader reads one line of a comment many times (both ways, per rule; the findings rules again): each pure step
@@ -731,10 +737,16 @@ class Review:
             where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
             if not self.counts(post):   # the author first: a stranger's text is only ever read in part, for the log
                 head = {**post, 'body': (post.get('body') or '')[:STRANGER_SCAN]}
-                if where not in self.logged and (self.looks_problem(head) or lens_header(head['body'])):
+                if where in self.logged:
+                    continue
+                try:
+                    what = 'a lens-looking post' if self.looks_problem(head) or lens_header(head['body']) else None
+                except UnicodeDrift as e:   # only logged: a post that does not count never reads or blocks
+                    what = f'a post this Python reads otherwise ({", ".join(e.code_points)})'
+                if what:
                     self.logged.add(where)
                     association = post.get('authorAssociation')
-                    self.log(f'ignored a lens-looking post {where}: '
+                    self.log(f'ignored {what} {where}: '
                              f'{"author association " + association if association else "no author association"} '
                              f'is not one of lens_author_associations ({", ".join(self.lens_associations)})')
                 continue

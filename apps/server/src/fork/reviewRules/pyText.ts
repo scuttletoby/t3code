@@ -41,7 +41,9 @@ export function memo(
  * again (5.5 s for one line). Lines end where Python's str.splitlines ends them.
  */
 const NFKC_CAP = 4096;
-const LINE_END = /(\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029])/u;
+/** str.splitlines' line ends: LINE_END splits keeping them, LINE_ENDS finds each. */
+export const LINE_END = /(\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029])/u;
+export const LINE_ENDS = /\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/gu;
 export function nfkc(text: string): string {
   if (text.length <= NFKC_CAP) return text.normalize("NFKC"); // no more code points than UTF-16 units
   return text

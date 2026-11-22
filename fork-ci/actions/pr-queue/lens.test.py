@@ -539,7 +539,8 @@ class FullWidth(unittest.TestCase):
 
     def test_text_the_queue_posts_never_reads_as_a_lens_form(self):   # no_lens_text folds what the reader folds
         for text in ('lens： x', f'read at： {SHA_B[:12]}', f'ｒｅａｄ ａｔ {SHA_B[:12]}', 'ｓａｆｅ ｔｏ ｍｅｒｇｅ',
-                     'lens﹦ x', f'`lens： x · read at： {SHA_B}`'):
+                     'lens﹦ x', f'`lens： x · read at： {SHA_B}`', 'l\u0435ns: x',
+                     f'`l\u0435ns: x \u00b7 read at: {SHA_B}`'):
             for keep in (False, True):
                 with self.subTest(text=text, keep=keep):
                     out = lens.no_lens_text(text, keep_markdown=keep)
@@ -1024,9 +1025,36 @@ class UnicodeVersion(unittest.TestCase):
             self.assertEqual(lens.lens_header(body), ('code', SHA_A))
             self.assertEqual(review_judge.read_findings(body)[0], [('major', 'major: \u00e9 \U0001f600')])
 
-    def test_the_same_unicode_reads_any_text(self):
-        with mock.patch.multiple(lens, _ASSIGNED=([], [])):   # the table is never read
+    def test_the_same_unicode_reads_any_text(self):   # whatever Unicode the runner's own Python has
+        with mock.patch.multiple(lens, UNIDATA=lens.PY_UNICODE, _ASSIGNED=([], [])):   # the table is never read
             self.assertEqual(lens.lens_header('lens: c\u0435de \u00b7 read at: ' + SHA_A), ('c\u0435de', SHA_A))
+
+    def test_a_table_of_another_unicode_is_refused(self):   # the table must be the one PY_UNICODE names
+        table = {'py_unicode': {'version': '14.0.0', 'assigned': '0000-10FFFF'}}
+        with mock.patch.multiple(lens, UNIDATA='99.0.0', _ASSIGNED=None), \
+                mock.patch.object(lens.json, 'load', return_value=table):
+            with self.assertRaises(lens.UnicodeDrift) as e:
+                lens.py_assigned()
+            self.assertEqual(e.exception.code_points, ['the table holds Unicode 14.0.0'])
+            self.assertIsNone(lens._ASSIGNED, 'nothing kept: every read refuses again')
+
+    def test_a_post_whose_author_does_not_count_is_only_logged_on_another_unicode(self):   # never refused
+        lines = []
+        review = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',), log=lines.append)
+        own = post(f'lens: correctness \u00b7 reviewer: x \u00b7 read at: {SHA_A}\nblocker: none\nmajor: none')
+        for body in ('thanks, l\u0435ns looks fine', f'l\u0435ns: correctness \u00b7 read at: {SHA_B}\nblocker: x'):
+            with self.subTest(body=body), self.other_unicode({0x435}):
+                lines.clear(), review.logged.clear()
+                drive_by = stranger(body, url='https://github.test/pr/7#c9')
+                self.assertEqual(review.reviewed_head(pr(own, drive_by)), (True, SHA_A, 'every lens read it'))
+                self.assertEqual(review.reviewed_head(pr(own, drive_by)), (True, SHA_A, 'every lens read it'))
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn('ignored a post this Python reads otherwise (U+0435) https://github.test/pr/7#c9',
+                              lines[0])
+                self.assertIn('lens_author_associations (OWNER)', lines[0])
+            with self.subTest(body=body, counted=True), self.other_unicode({0x435}), \
+                    self.assertRaises(lens.UnicodeDrift):   # the same text from a counted author is refused
+                review.reviewed_head(pr(own, post(body, when='2026-01-02T00:00:00Z')))
 
 
 class Config(unittest.TestCase):

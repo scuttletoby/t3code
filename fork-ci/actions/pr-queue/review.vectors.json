@@ -2703,7 +2703,7 @@
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
       "entries": {
         "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
-        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters), starts with 'l\\u200bens: code · reviewer: x · read\\u200b at: bbbbbbbbbbbbbbbbbbbbbb')": [
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'l\\u200bens: code · reviewer: x · read\\u200b at: bbbbbbbbbbbbbbbbbbbbbb')": [
           null,
           null
         ]
@@ -2722,7 +2722,7 @@
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
       "entries": {
         "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
-        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters), starts with 'lеns: code · reviewer: x · rеad at: bbbbbbbbbbbbbbbbbbbbbbbb')": [
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'lеns: code · reviewer: x · rеad at: bbbbbbbbbbbbbbbbbbbbbbbb')": [
           null,
           null
         ]
@@ -2741,7 +2741,7 @@
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
       "entries": {
         "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
-        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters), starts with 'LΕNS: code · reviewer: x · READ ΑT: bbbbbbbbbbbbbbbbbbbbbbbb')": [
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'LΕNS: code · reviewer: x · READ ΑT: bbbbbbbbbbbbbbbbbbbbbbbb')": [
           null,
           null
         ]
@@ -2760,7 +2760,7 @@
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
       "entries": {
         "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
-        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters), starts with 'lеns: code · reviewer: x')": [
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'lеns: code · reviewer: x')": [
           null,
           null
         ]
@@ -2779,7 +2779,7 @@
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
       "entries": {
         "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
-        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters), starts with 'lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbb\\u200bbbb')": [
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with 'lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbb\\u200bbbb')": [
           null,
           null
         ]
@@ -2794,7 +2794,62 @@
       ],
       "history": [],
       "entries": {
-        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters), starts with '&#108;ens: code · reviewer: x · read&#32;at: bbbbbbbbbbbbbbb')": [
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash escapes read as GitHub shows them (post a NEW comment in plain letters, and delete the old one or edit it to start with `not a lens` and a colon), starts with '&#108;ens: code · reviewer: x · read&#32;at: bbbbbbbbbbbbbbb')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a valid report that quotes an HTML line feed before a header in inline code reads its head (#1005)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\nminor: the header `x&#10;lens: code · reviewer: y · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb` was split in two"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a valid report that quotes an HTML line separator before a header in inline code reads its head (#1005)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\nminor: `x&#x2028;lens: code · reviewer: y · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb` was split in two"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a lens heading without the marker that quotes an HTML carriage return before a lens field is no lens report (#1005)",
+      "posts": [
+        {
+          "body": "## Lens code\nblocker: none\nmajor: none\nminor: the text `x&#13;lens: code` was split in two"
+        }
+      ],
+      "history": [],
+      "entries": {},
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:00Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Lens code'"
+        ]
+      ]
+    },
+    {
+      "name": "a lens heading over a header written with zero-width spaces carries the marker and blocks (#1005)",
+      "posts": [
+        {
+          "body": "## Lens code\nl\u200bens: code · reviewer: x · read\u200b at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with '## Lens code')": [
           null,
           null
         ]
