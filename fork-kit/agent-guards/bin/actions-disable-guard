@@ -4382,11 +4382,14 @@ def inert(variants, ctx):
     return True
 
 
+CREATORS = {'touch', 'mkdir', 'truncate', 'mkfifo', 'mknod', 'fallocate'}   # words that create the files they name
+
+
 def text_writes(runs, env, ctx):
     """(the files the commands of a text may write or replace, whether one of them may write any file). Named:
-    > file, tee, cp/mv/ln, dd of=, sed w and -i, sort -o, awk print > (file_writes). Any file: every word that is no
-    data word (a program, an unpacker, install, rsync, perl -i, a script), a hidden command word, xargs, eval,
-    find -exec, sed e, awk system()."""
+    > file, tee, cp/mv/ln, dd of=, sed w and -i, sort -o, awk print > (file_writes), touch/mkdir. Any file: every
+    word that is no data word (a program, an unpacker, install, rsync, perl -i, a script), a hidden command word,
+    xargs, eval, find -exec, sed e, awk system()."""
     out, any_ = [], False
     for cmd, variants in runs:
         out += [t for op, w in cmd['redirs'] if op.startswith(('>', '&>', '<>')) for t in redir_texts(op, w, env)
@@ -4398,6 +4401,8 @@ def text_writes(runs, env, ctx):
                 continue
             word, args = os.path.basename(toks[h]), toks[h + 1:]
             out += file_writes(toks, h, ctx)[0]
+            if word in CREATORS:   # touch json.py, mkdir json: a new file or folder there (python3 -m json.tool)
+                out += [a for a in args if not a.startswith('-')]
             if word == 'sed' and any(re.match(r'-[^-efl]*i', a) or a.startswith('--in') for a in args):
                 out += sed_args(args)[2]
             if hidden(toks[h]) or via & {'xargs', 'eval'}:
@@ -4710,7 +4715,10 @@ def decide_text(text, ctx, scan_raw=True):
                     return r
         for body in fed:
             kind = 'shell' if loop else doc_kind(variants[0], how, loose, body)
-            tok = kind == 'code' and named(body)
+            # python3 - < f, node < f, perl < f: a refuse-script line in code an interpreter runs (also a script it
+            # gets as data unless it is an allow-listed data reader: ends_text), as for a shell
+            tok = kind == 'code' and (named(body) or REFUSE_SCRIPTS and (
+                stdin_runs(variants[0], how, loose) or how or not ends_text(variants, c)) and refuse_script_named(body))
             if tok:
                 return unproven(tok, 'in inline code (a heredoc into an interpreter, or a script in another '
                                      'language that the same command writes and runs): the guard reads shell text '

@@ -3618,6 +3618,34 @@ class Pr1041Round1Test(Case):
                     'xargs gh pr view < ids.txt', "find . -name '*.py' | xargs grep x", 'cat ids.txt | xargs -n1 echo',
                     env=env)
 
+    def test_8_an_interpreter_that_runs_a_file_on_stdin(self):
+        """r1b: python/node/perl/ruby whose script comes from stdin through `<` (no pipe), a here-string or a
+        heredoc fed from a file: a refuse-script line in that file is refused, as for a shell. A script file that
+        reads the file as data (an allow-listed data reader) still passes."""
+        env = self.files()
+        self.refused('python3 - < qpy.txt', 'python3 /dev/./stdin < qpy.txt', 'python3 < qpy.txt',
+                     'python3 -u < qpy.txt', 'python3 /proc/self/fd/0 < qpy.txt', 'python3 -W ignore - < qpy.txt',
+                     'node < qpy.txt', 'node - < qpy.txt', 'node /dev/stdin < qpy.txt', 'perl < q.txt', 'ruby < q.txt',
+                     'sudo python3 < qpy.txt', 'env python3 < qpy.txt', 'python3 - <<< "$(< qpy.txt)"',
+                     'python3 - <<EOF\n$(cat qpy.txt)\nEOF', env=env)
+        self.passes('python3 tools/check.py < msg.md', 'python3 tools/check.py < q.txt', 'python3 - < notes.md',
+                    'python3 -m json.tool < msg.md', 'node x.js < msg.md', 'python3 - <<< "print(1)"',
+                    "python3 - <<'EOF'\nprint(1)\nEOF", 'cat < q.txt', 'grep fix < q.txt', env=env)
+
+    def test_9_a_json_module_created_in_the_same_command(self):
+        """r1b: `python3 -m json.tool` loads a json.py or json/ from the folder first: one created by the same
+        command (touch, mkdir, as well as a write) makes it no data reader."""
+        env = self.files()
+        self.refused('touch json.py; cat q.txt | python3 -m json.tool', 'touch -- json.py; cat q.txt | python3 -m json.tool',
+                     'mkdir json; cat q.txt | python3 -m json.tool',
+                     'mkdir -p json && touch json/__init__.py; cat q.txt | python3 -m json.tool',
+                     'echo x > json.py; cat q.txt | python3 -m json.tool', env=env)
+        self.write('json.py', '', 0o644)
+        self.refused('cat q.txt | python3 -m json.tool', env=env)
+        os.remove(os.path.join(self.dir, 'json.py'))
+        self.passes('touch out.txt; cat msg.md | python3 -m json.tool', 'mkdir -p out; python3 tools/check.py < msg.md',
+                    'cat msg.md | python3 -m json.tool', env=env)
+
     def test_7_the_new_checks_answer_the_same_twice(self):
         """State question: the new checks read files each time and keep no text in the cache, so a second run (the
         cache warm) answers the same as the first; an empty command passes."""
