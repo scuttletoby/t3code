@@ -62,7 +62,8 @@ function clearsAtMs(window: WindowPace, pace: InstancePace, nowMs: number): numb
         : resetMs - (RESERVE_RELEASE_MS * room) / pace.reservePercent;
   }
   const even = window.pacePercent;
-  if (!pace.burnFirst && even !== null && used - even > PACE_BAND_POINTS) {
+  const burnsFirst = pace.burnFirstWindows.includes(window.kind);
+  if (!burnsFirst && even !== null && used - even > PACE_BAND_POINTS) {
     // The window's length, from how much of it has passed.
     const lengthMs = even >= 100 ? 0 : (resetMs - nowMs) / (1 - even / 100);
     clearsAt = Math.max(clearsAt, resetMs - lengthMs * (1 - (used - PACE_BAND_POINTS) / 100));
