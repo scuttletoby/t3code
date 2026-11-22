@@ -126,7 +126,7 @@ def load_settings(root, path=None):
         problems.append('queue_config must be the repo-relative path of the queue config')
     if not (isinstance(s['lens_rounds'], int) and not isinstance(s['lens_rounds'], bool) and 1 <= s['lens_rounds'] <= 20):
         problems.append('lens_rounds must be a whole number 1-20')
-    if s['minors'] not in MINORS:
+    if not isinstance(s['minors'], str) or s['minors'] not in MINORS:
         problems.append(f'minors must be one of {", ".join(MINORS)}')
     if not isinstance(s['state_question'], str) or not 20 <= len(s['state_question'].strip()) <= 600:
         problems.append('state_question must be text of 20-600 characters (it cannot be emptied)')

@@ -61,7 +61,7 @@ function handSetFieldLabels(value: ReviewRules | null | undefined): ReadonlyArra
 
 const MINORS_LABELS: Readonly<Record<ReviewMinors, string>> = {
   "same-round": "Fixed in the pull request or dropped",
-  issue: "Filed as follow-up issues",
+  issue: "Filed as one follow-up issue",
   free: "No rule",
 };
 

@@ -381,15 +381,17 @@ class States(Project):
         self.assertIn("unknown key 'runers'", self.plain(self.plan(changes(('M', 'a')))))
 
     def test_wrong_settings_values_are_all_named(self):
-        self.put('.github/review-kit.json', {'version': 1, 'runner': {'model': 'm', 'effort': 'max'},
-                                             'audit_runner': 'fable', 'lens_rounds': 0, 'minors': 'later',
-                                             'state_question': ' ', 'queue_config': '',
-                                             'lens_runners': {'x': {'model': 'm', 'effort': 'low'}}})
-        err = self.plain(self.plan(changes(('M', 'a'))))
-        for part in ("runner has effort 'max'", 'audit_runner must be', 'lens_rounds must be', 'minors must be one of',
-                     'state_question must be', 'queue_config must be', "lens_runners.x has effort 'low'"):
-            with self.subTest(part=part):
-                self.assertIn(part, err)
+        for minors in ('later', None, ['issue'], {'issue': True}):
+            self.put('.github/review-kit.json', {'version': 1, 'runner': {'model': 'm', 'effort': 'max'},
+                                                 'audit_runner': 'fable', 'lens_rounds': 0, 'minors': minors,
+                                                 'state_question': ' ', 'queue_config': '',
+                                                 'lens_runners': {'x': {'model': 'm', 'effort': 'low'}}})
+            err = self.plain(self.plan(changes(('M', 'a'))))
+            for part in ("runner has effort 'max'", 'audit_runner must be', 'lens_rounds must be',
+                         'minors must be one of', 'state_question must be', 'queue_config must be',
+                         "lens_runners.x has effort 'low'"):
+                with self.subTest(minors=minors, part=part):
+                    self.assertIn(part, err)
 
     def test_settings_that_are_no_object_or_no_json(self):
         for text in ('[1]', '{', 'true'):

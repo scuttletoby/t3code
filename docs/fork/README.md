@@ -318,11 +318,11 @@ the machine's half. Nothing reads it yet: the review runner comes in a later pul
 fork's defaults: Claude (`claudeAgent`) with `claude-opus-5-5` at `high` effort, the `approach`
 lens on `claude-fable-5-2` at `high`, the state question "What happens when this runs again, stops
 half-way, or meets existing, old or empty state?", small findings fixed in the pull request or
-dropped (`minors: "same-round"`, the review kit's default), the config at `.github/pr-queue.json` and reports of at most 60000
-characters. A field written out wins over the preset's (`lensRunners` per lens); a field written
-out while `preset` is `off` does nothing. A fork update may change the preset's values; write the
-fields out to keep them fixed. Efforts an agent may not use are the model policy's, not this
-setting's.
+dropped (`minors: "same-round"`, the review kit's default), the config at `.github/pr-queue.json`
+and reports of at most 60000 characters. A field written out wins over the preset's (`lensRunners`
+per lens); a field written out while `preset` is `off` does nothing. A fork update may change the
+preset's values; write the fields out to keep them fixed. Efforts an agent may not use are the model
+policy's, not this setting's.
 
 Fields: `runner` and each `lensRunners` entry are `{driver, model, effort}` (a driver kind, not a
 provider instance), and a lens name is not a built-in object key such as `constructor`;
