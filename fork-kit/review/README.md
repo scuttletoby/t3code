@@ -17,8 +17,15 @@ checkout of the fork.
 
 The kit holds no project facts: which paths are critical and which lenses they need are the project's `review` block
 (read by the gate), and who runs a lens is the project's kit settings. The kit imports the gate's own parser
-(`config.py`, `lens.py`, `review_judge.py`), so it cannot read a comment or a path differently from the gate; it needs
-the fork's `fork-ci/` folder beside it.
+(`config.py`, `lens.py`, `review_judge.py`, `head_check.py`), so it cannot read a comment or a path differently from
+the gate; it needs the fork's `fork-ci/` folder beside it.
+
+## Which fork version
+
+The kit imports the gate's code from the fork checkout it runs in, not from the release the project's gate pins. A
+newer checkout can read comments, paths or the config differently from the pinned gate (a new rule, a new config
+key). So run the kit from a checkout at the pinned release: `git -C <fork checkout> checkout <the project's ci/vN
+tag>` (the gate's pin is in the project's workflow, gate README "Use it"), and move it when the pin moves.
 
 Tests (no network, no host changes):
 

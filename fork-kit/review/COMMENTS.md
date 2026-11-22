@@ -34,8 +34,9 @@ minor: <a small thing>; <another>
 - **Verdict line (optional):** `verdict: safe to merge` or `verdict: not safe to merge`. A `verdict:` line, or the
   first line under the header, that says NOT SAFE is a blocker whatever the labels say.
 - **State line:** `state:` and the lens's answer to the state question ("What happens when this runs again, stops
-  half-way, or meets existing, old or empty state?"). The gate parses the config's `state_line` setting but does not
-  enforce it yet; the kit's `check` does, and so does every lens prompt the kit writes.
+  half-way, or meets existing, old or empty state?"). What counts as one is the gate's rule
+  (`review_judge.has_state_line`); the gate parses the config's `state_line` setting but does not enforce it yet; the
+  kit's `check` does, and so does every lens prompt the kit writes.
 - **Round markers:** a re-read after a fix may add `r2`, `r3` to the lens name (`lens: data-1 r2`). The gate counts
   rounds from the different changes lenses read and from these markers, whichever is higher; the marker is not part of
   the lens's name (`data-1 r2` is lens `data-1`).
@@ -48,19 +49,19 @@ minor: <a small thing>; <another>
 
 Each example says, on the line before it, what the gate reads, as words:
 
-| Words                 | Meaning                                                                                         |
-| --------------------- | ----------------------------------------------------------------------------------------------- |
-| `lens <key>`          | a lens header naming this lens (`lens_key`: lowercased, a trailing round marker dropped)        |
-| `round <n>`           | the header carries round marker `r<n>`                                                          |
-| `read`                | the header names a full sha: this is a read of that head                                        |
-| `short sha`, `no sha` | the header's sha is short or missing: no read                                                   |
-| `clean`               | a findings section with no blocker and no major                                                 |
-| `blocker`, `major`    | an open blocker or major: the gate holds the head until a new read on a fixed head, or a person |
-| `no findings section` | no blocker and major labels: with `findings` on, the gate does not take the read                |
-| `state`, `no state`   | a `state:` line with an answer, or none                                                         |
-| `reads nothing`       | looks like a lens report but is not one valid read: the gate counts it as a blocking problem    |
-| `not a lens`          | not a lens report at all (a plain comment, or one that opts out with `not a lens:`): ignored    |
-| `override`            | an override comment for that sha (counts only from the configured author association)           |
+| Words                 | Meaning                                                                                                            |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `lens <key>`          | a lens header naming this lens (`lens_key`: lowercased, a trailing round marker dropped)                           |
+| `round <n>`           | the header carries round marker `r<n>`                                                                             |
+| `read`                | the header names a full sha: this is a read of that head                                                           |
+| `short sha`, `no sha` | the header's sha is short or missing: no read                                                                      |
+| `clean`               | a findings section with no blocker and no major                                                                    |
+| `blocker`, `major`    | an open blocker or major: the gate holds the head until a new read on a fixed head, or a person                    |
+| `no findings section` | no blocker and major labels: with `findings` on, the gate does not take the read                                   |
+| `state`, `no state`   | a `state:` line with an answer, or none                                                                            |
+| `reads nothing`       | looks like a lens report but is not one valid read: the gate counts it as a blocking problem                       |
+| `not a lens`          | not a lens report at all (a plain comment, or one that opts out with `not a lens:`): ignored                       |
+| `override`            | an override comment for that sha (counts only from the configured author association, never edited and not hidden) |
 
 ## Good reports
 
