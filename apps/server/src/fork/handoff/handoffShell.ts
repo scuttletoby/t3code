@@ -1,8 +1,8 @@
 /**
- * Fork: a completed quiet handoff run, or the `agent` source's write turn before it, shows in the
- * thread shell as upstream's stopped run (`latestRunStopRequested`), so the browser's notice and
- * the relay stay quiet through upstream's own gates. One rule, read in the shell's JavaScript path
- * and mirrored in its SQL path.
+ * Fork: a completed quiet handoff run, or the `agent` source's write turn before it (completed or
+ * failed), shows in the thread shell as upstream's stopped run (`latestRunStopRequested`), so the
+ * browser's notice and the relay stay quiet through upstream's own gates. One rule, read in the
+ * shell's JavaScript path and mirrored in its SQL path.
  */
 import type {
   OrchestrationV2ConversationMessage,
@@ -14,6 +14,7 @@ import * as DateTime from "effect/DateTime";
 import type * as SqlClient from "effect/sql/SqlClient";
 
 import {
+  HANDOFF_FALLBACK_SUFFIX,
   HANDOFF_LOUD_SUFFIX,
   HANDOFF_MESSAGE_PREFIX,
   HANDOFF_RETRY_SUFFIX,
@@ -42,9 +43,19 @@ function quietCandidate(threadId: ThreadId, messageId: string): string | null {
 }
 
 /**
- * A completed first-send handoff run or write turn, not loud, sent by the server, with no message
- * of the person's, requested at least the relay's hold after the person's run finished. Anything
- * else (a retry, a steered write turn) alerts; a failed write turn is upstream's failed run.
+ * A run that may end quiet: a completed run, or a failed write turn marked `:fallback`, as the
+ * fallback follows it with the reason. Unmarked (idle trigger) or a failed handoff run: nothing
+ * follows, so it alerts. Upstream reads the mark for a failed run once its announced seam is in.
+ */
+const endsQuiet = (threadId: ThreadId, run: Pick<OrchestrationV2Run, "status" | "userMessageId">) =>
+  run.status === "completed" ||
+  (run.status === "failed" && parseHandoffWrite(threadId, run.userMessageId)?.fallback === true);
+
+/**
+ * A completed first-send handoff run, a completed write turn or a failed one the fallback follows,
+ * not loud, sent by the server, with no message of the person's, requested at least the relay's
+ * hold after the person's run finished. Anything else (a retry, a steered write turn, a failed
+ * write turn at the idle trigger, a failed handoff run) alerts.
  */
 export function isQuietHandoffRun(
   threadId: ThreadId,
@@ -52,7 +63,7 @@ export function isQuietHandoffRun(
   messages: ReadonlyArray<QuietMessage>,
   sourceRun: Pick<OrchestrationV2Run, "id" | "completedAt"> | undefined,
 ): boolean {
-  if (run.status !== "completed") return false;
+  if (!endsQuiet(threadId, run)) return false;
   const sourceRunId = quietCandidate(threadId, run.userMessageId);
   if (sourceRunId === null) return false;
   const prompt = messages.find((message) => message.id === run.userMessageId);
@@ -103,8 +114,11 @@ export const quietHandoffRunOrSql = (sql: SqlClient.SqlClient, alias: string) =>
       THEN substr(${messageId}, length(${prefixOf(HANDOFF_WRITE_PREFIX)}) + 1)
     ELSE '' END)`;
   const endsWith = (suffix: string) => sql`substr(${rest}, ${-suffix.length}) = ${suffix}`;
+  // The source run's id: `rest` without a write turn's `:fallback` (a loud id never reads quiet).
+  const source = sql`(CASE WHEN ${startsWith(HANDOFF_WRITE_PREFIX)} AND ${endsWith(HANDOFF_FALLBACK_SUFFIX)}
+    THEN substr(${rest}, 1, length(${rest}) - ${HANDOFF_FALLBACK_SUFFIX.length}) ELSE ${rest} END)`;
   return sql`COALESCE((CASE
-    WHEN ${run}.status = 'completed'
+    WHEN (${run}.status = 'completed' OR (${run}.status = 'failed' AND ${startsWith(HANDOFF_WRITE_PREFIX)} AND ${endsWith(HANDOFF_FALLBACK_SUFFIX)}))
       AND ${rest} <> ''
       AND NOT ${endsWith(HANDOFF_RETRY_SUFFIX)}
       AND NOT ${endsWith(HANDOFF_LOUD_SUFFIX)}
@@ -119,7 +133,7 @@ export const quietHandoffRunOrSql = (sql: SqlClient.SqlClient, alias: string) =>
         AND json_extract(steer.payload_json, '$.createdBy') = 'user'
     ) AND EXISTS (
       SELECT 1 FROM orchestration_v2_projection_runs source
-      WHERE source.thread_id = ${run}.thread_id AND source.run_id = ${rest}
+      WHERE source.thread_id = ${run}.thread_id AND source.run_id = ${source}
         AND source.completed_at IS NOT NULL
         AND CAST(round(
           (julianday(${run}.requested_at) - julianday(source.completed_at)) * 86400000

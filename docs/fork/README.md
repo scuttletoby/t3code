@@ -1158,7 +1158,12 @@ existed have no `source` and read as `none`, so they start no write turns until 
 smallest idle thread handed off before its cache expires, and `modelSelection` the new session's
 model (not set: the thread's current one). A save with a bad value, a field T3 does not know (a
 typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
-server log), never as `handoff`.
+server log), never as `handoff`. The server also refuses a save that sets a new `command` (here or
+in a project's `handoff`) whose program is not a full path to a file on the server, or lies inside a
+git checkout an agent could edit; the script it hands a known interpreter, a module by name, a
+program `env` finds on the `PATH`, and runners such as `make` or `npm` are refused too. It guards
+against mistakes, not attacks: [handoff.md](handoff.md) lists what it does not catch. A command
+already stored is not checked again. The command gets a short list of the server's environment.
 
 In the app: **Settings → Fork**, section Handoff: the mode, each thread's own mode (added by thread
 id, shown with its title where this client knows the thread), and under Advanced the sizes, who
