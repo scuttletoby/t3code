@@ -87,10 +87,10 @@ const WRITE_ENDED = new Set(["completed", "interrupted", "failed", "cancelled", 
 const CUT_SHORT = new Set(["cancelled", "failed"]);
 /**
  * Upstream's outbox row that starts a run's restart continuation (`Orchestrator.ts`
- * `retryContinuationStart`, `ProviderRuntimeRecoveryService.ts`): written with the cancel at a
- * restart, or after a continuation failed before its prompt, due after upstream's own delay.
+ * `retryContinuationStart`, `ProviderRuntimeRecoveryService.ts`). Upstream does not export the id:
+ * `handoffContinuationRow.test.ts` checks it against upstream's restart writer.
  */
-const continuationEffectId = (runId: string) => `effect:restart-continuation:${runId}`;
+export const continuationEffectId = (runId: string) => `effect:restart-continuation:${runId}`;
 /**
  * A continuation that failed before its prompt gets upstream's retry row just after its failure
  * (no thread event marks it): read again this often until it is there.
@@ -320,7 +320,7 @@ export const make = Effect.gen(function* () {
   /**
    * What follows a write turn (or continuation) a restart cut short: its continuation (`next`), one
    * upstream still owes (`owed`: its outbox row is not settled yet, or upstream retries a
-   * continuation that failed before its prompt and has not written that row yet; due at `dueMs`),
+   * continuation that failed before its prompt and has not written that row yet, due at `dueMs`),
    * or none. The row is read before the runs, so a row that settles between the reads shows its run.
    */
   const continuationOf = Effect.fn("HandoffService.continuationOf")(function* (
@@ -414,10 +414,13 @@ export const make = Effect.gen(function* () {
             : ({ kind: "none" } as const);
           if (after.kind === "none") break;
           if (after.kind === "owed") {
-            // Upstream still starts it (at once, or after its retry delay): judging the chain
-            // now would send the fallback without the notes the continuation may write.
+            // Upstream still starts it: judging now would drop the continuation's notes. A
+            // written row is waited for until it settles, however late a busy effect worker
+            // runs it; a retry whose row is not written yet (it is, right after the failure) is
+            // given up a minute past its due time.
             const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-            const giveUpMs = after.dueMs + stopWaitMs;
+            const giveUpMs =
+              after.effectId === undefined ? after.dueMs + stopWaitMs : Number.POSITIVE_INFINITY;
             if (nowMs >= giveUpMs) {
               yield* Effect.logWarning(
                 "handoff: upstream's restart continuation did not start; the write turn is judged as it is",
@@ -436,21 +439,22 @@ export const make = Effect.gen(function* () {
                 },
               );
             }
-            yield* Effect.raceFirst(
-              Deferred.await(wake),
-              after.effectId === undefined
-                ? Effect.never
-                : outbox.awaitSettled(after.effectId).pipe(Effect.catch(() => Effect.never)),
-            ).pipe(
-              Effect.timeoutOrElse({
-                duration: Duration.millis(
-                  after.effectId === undefined
-                    ? Math.min(Duration.toMillis(CONTINUATION_RECHECK), giveUpMs - nowMs)
-                    : giveUpMs - nowMs,
-                ),
-                orElse: () => Effect.void,
-              }),
-            );
+            yield* after.effectId === undefined
+              ? Deferred.await(wake).pipe(
+                  Effect.timeoutOrElse({
+                    duration: Duration.millis(
+                      Math.min(Duration.toMillis(CONTINUATION_RECHECK), giveUpMs - nowMs),
+                    ),
+                    orElse: () => Effect.void,
+                  }),
+                )
+              : Effect.raceFirst(
+                  Deferred.await(wake),
+                  // A failed wait reads the row again shortly.
+                  outbox
+                    .awaitSettled(after.effectId)
+                    .pipe(Effect.catch(() => Effect.sleep(CONTINUATION_RECHECK))),
+                );
             continue;
           }
           const next = after.next;

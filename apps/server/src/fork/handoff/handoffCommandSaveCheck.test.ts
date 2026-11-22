@@ -66,7 +66,9 @@ const layout = Effect.gen(function* () {
     "repo/tool/__main__.py",
     "tree/notes",
     // Stand-ins for the programs, by name: the check reads names and the disk, it runs nothing.
-    ...["python3.12", "sh", "node", "env", "make", "npm"].map((name) => `outside/bin/${name}`),
+    ...["python3.12", "sh", "node", "env", "make", "npm", "bun", "deno"].map(
+      (name) => `outside/bin/${name}`,
+    ),
   ]) {
     yield* fs.writeFileString(at(file), "#!/bin/sh\n");
   }
@@ -196,6 +198,28 @@ describe("handoff command save check (#785)", () => {
         yield* problemOf(withCommand([env!, "-i", "A=1", at("outside/run"), "--quiet"])),
         undefined,
       );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("refuses bun and deno, which read their config from the project folder (#973)", () =>
+    Effect.gen(function* () {
+      const at = yield* layout;
+      const [bun, deno, env] = ["bun", "deno", "env"].map((name) => at(`outside/bin/${name}`));
+      // bunfig.toml's `preload` and deno.json's import map run project code before the script,
+      // however safe the script itself is.
+      for (const command of [
+        [bun!, at("outside/handoff")],
+        [bun!, "run", at("outside/handoff")],
+        [deno!, "run", at("outside/handoff")],
+        [deno!, at("outside/handoff")],
+        [env!, "-i", deno!, "run", at("outside/handoff")],
+      ]) {
+        assert.include(
+          yield* problemOf(withCommand(command)),
+          "reads its config (bunfig.toml, deno.json and the like) from the project folder",
+          command.join(" "),
+        );
+      }
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
