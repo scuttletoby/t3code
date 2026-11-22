@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  burnFirstWindowsAfterToggle,
   formatLowerEffort,
   knownEffortLevels,
   parseLowerEffort,
@@ -68,6 +69,35 @@ describe("usagePacingAccountRows", () => {
     expect(summary({ usagePacing: { a: { reservePercent: 15, noLimits: true } } })).toBe(
       "No usage limits",
     );
+    // The window list decides what "spent first" covers.
+    const listed = (burnFirstWindows: unknown) =>
+      summary({ usagePacing: { a: { burnFirst: true, burnFirstWindows } } });
+    expect(listed(["session", "weekly", "monthly", "other"])).toBe("No reserve, spent first");
+    expect(listed(["monthly", "weekly"])).toBe("No reserve, weekly and monthly spent first");
+    expect(listed(["weekly"])).toBe("No reserve, weekly spent first");
+    expect(listed([])).toBe("No reserve, no window spent first");
+    // An unreadable list reads as empty: nothing burns first, and the summary says so.
+    expect(listed("weekly")).toBe("No reserve, no window spent first");
+    // Without burnFirst the list does nothing.
+    expect(summary({ usagePacing: { a: { burnFirstWindows: ["weekly"] } } })).toBe("No reserve");
+  });
+
+  it("toggles one window kind in the burn-first list, in the usual order (#975)", () => {
+    const entry = (file: object) => Object.values(fromFile(file).usagePacing)[0]!;
+    // No list yet: every kind burns first, so unticking one lists the other three.
+    expect(
+      burnFirstWindowsAfterToggle(
+        entry({ usagePacing: { a: { burnFirst: true } } }),
+        "session",
+        false,
+      ),
+    ).toEqual(["weekly", "monthly", "other"]);
+    const weekly = entry({ usagePacing: { a: { burnFirst: true, burnFirstWindows: ["weekly"] } } });
+    expect(burnFirstWindowsAfterToggle(weekly, "monthly", true)).toEqual(["weekly", "monthly"]);
+    expect(burnFirstWindowsAfterToggle(weekly, "session", true)).toEqual(["session", "weekly"]);
+    expect(burnFirstWindowsAfterToggle(weekly, "weekly", false)).toEqual([]);
+    // Ticking one already listed changes nothing (a double click saves the same list).
+    expect(burnFirstWindowsAfterToggle(weekly, "weekly", true)).toEqual(["weekly"]);
   });
 });
 

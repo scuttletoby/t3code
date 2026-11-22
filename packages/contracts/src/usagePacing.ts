@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { ProviderInstanceId } from "./providerInstance.ts";
 import { ServerProviderUsageWindow } from "./providerUsageLimits.ts";
 
 const UsagePacingReservePercent = Schema.Number.check(
@@ -44,7 +45,7 @@ const UsagePacingBurnFirstWindowsFromSettingsFile = Schema.Unknown.pipe(
         const dropped = Array.isArray(raw) ? listed.filter((name) => !isWindowKind(name)) : [raw];
         if (dropped.length > 0) {
           yield* Effect.logWarning(
-            "settings: usagePacing burnFirstWindows entries that are not window kinds are ignored; those windows keep their even pace",
+            "settings: usagePacing burnFirstWindows entries that are not window kinds are ignored; those windows keep their even pace, and the next settings save writes the cleaned list back to the file",
             { dropped, kinds: USAGE_PACING_WINDOW_KINDS },
           );
         }
@@ -73,6 +74,45 @@ export const UsagePacingInstanceSettings = Schema.Struct({
   noLimits: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type UsagePacingInstanceSettings = typeof UsagePacingInstanceSettings.Type;
+
+const USAGE_PACING_INSTANCE_KEYS: ReadonlyArray<string> = Object.keys(
+  UsagePacingInstanceSettings.fields,
+);
+
+const isPlainRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * Fork: `usagePacing` as the settings file holds it, by provider instance id. A key an entry does
+ * not know (a typo such as `burnFirstWindow`) is dropped like any unknown settings key, but with a
+ * warning naming it: with `burnFirst` on, the dropped list means every window burns first.
+ */
+export const UsagePacingFromSettingsFile = Schema.Unknown.pipe(
+  Schema.decodeTo(
+    Schema.Unknown,
+    SchemaTransformation.transformEffect({
+      decode: Effect.fn("UsagePacingFromSettingsFile.decode")(function* (raw: unknown) {
+        const unknownKeys: Record<string, ReadonlyArray<string>> = {};
+        for (const [instanceId, entry] of Object.entries(isPlainRecord(raw) ? raw : {})) {
+          if (!isPlainRecord(entry)) continue;
+          const keys = Object.keys(entry).filter(
+            (key) => !USAGE_PACING_INSTANCE_KEYS.includes(key),
+          );
+          if (keys.length > 0) unknownKeys[instanceId] = keys;
+        }
+        if (Object.keys(unknownKeys).length > 0) {
+          yield* Effect.logWarning(
+            "settings: usagePacing keys that are not pacing settings are ignored, and the next settings save removes them from the file",
+            { unknownKeys, keys: USAGE_PACING_INSTANCE_KEYS },
+          );
+        }
+        return raw;
+      }),
+      encode: Effect.succeed,
+    }),
+  ),
+  Schema.decodeTo(Schema.Record(ProviderInstanceId, UsagePacingInstanceSettings)),
+);
 
 export const DEFAULT_USAGE_PACING_INSTANCE_SETTINGS: UsagePacingInstanceSettings = {
   reservePercent: 0,
