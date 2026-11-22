@@ -25,6 +25,17 @@
         "added": ["...ForkSettings.ForkClientSettingsPatchFields,"]
       }
     },
+    "apps/web/src/routes/_chat.issues.tsx": {
+      "why": "The Issues page swaps to the fork's owner-question page (Waiting on you, components/fork/ownerQuestions) while the fork setting ownerQuestionsPage is on (fork issue 828). One import and one spread after upstream's component line, so upstream's page files never change; announced with the page, added with the setting.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import { ForkIssuesRoute } from \"../components/fork/ownerQuestions/ForkIssuesRoute\"; // Fork (owner questions)",
+          "...ForkIssuesRoute, // Fork (owner questions): the fork page while ownerQuestionsPage is on"
+        ]
+      }
+    },
     "packages/client-runtime/package.json": {
       "why": "The calm sidebar's shared logic (fork file src/state/threadRoles.ts) is exported for the web and phone lists with one line; it is announced for the sidebar PR that first imports it. One line, since the four-line form's closing brace is a line upstream already has.",
       "added": [],
@@ -712,6 +723,7 @@
     "scripts/lib/release-repository.ts",
     "scripts/release-repository.test.ts",
     "apps/web/src/routes/_chat.settings.fork.tsx",
+    "apps/web/src/routes/_chat.owner-questions.tsx",
     "apps/web/src/components/settings/ReviewRulesSettings*",
     "apps/web/src/components/settings/reviewRulesSettings*",
     "!scripts/scenarios/fork-title-regenerates-from-inherited-history.e2e.ts",
