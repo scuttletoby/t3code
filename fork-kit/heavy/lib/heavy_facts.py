@@ -19,9 +19,10 @@ other users' heavy jobs and agent scopes read from their user managers' cgroups 
 Full tier: cgroup v2 and this user's systemd user manager. Machine tier: cgroup v2 and user.slice, but no user
 manager of this user's (a CI runner's user: no lingering, no login session): it has no agent or heavy job scopes of
 its own, every user's are counted as above, and so are every person's reservations (other_reserve_dirs: their
-~/.config/t3-capacity/reserve.d; one that cannot be read makes it basic), so it gets the same answer as a caller with
-a user manager (a note and the reason say "machine-wide numbers"). Basic tier (no cgroup v2, or neither a user manager nor user.slice):
-agents and other users' work cannot be counted, so the answer is never free (a note says why). A signal that is
+~/.config/t3-capacity/reserve.d; one that cannot be read, or not within HOME_SECONDS, #998, makes it basic), so it
+gets the same answer as a caller with a user manager (a note and the reason say "machine-wide numbers"). Basic tier
+(no cgroup v2, or neither a user manager nor user.slice): agents and other users' work cannot be counted, so the
+answer is never free (a note says why). A signal that is
 there but unreadable is "elevated": then only the rule's floors admit, never the budget; facts that cannot be read
 admit nothing.
 
@@ -42,7 +43,8 @@ kit version never read each other's file and each one's hold-down steps down on 
 names one file instead; --fresh reads again; a user without /run/user/<uid>, as one with no user manager, uses
 $TMPDIR or /tmp /heavy-facts-<uid>/, a folder only it can use; when that name is taken (someone else made it first)
 or there is no temporary folder it can write, ~/.cache/heavy-facts-<host>-<machine id>/ in a home only it can change
-and that no one else could swap; none of these is no cache, #951). The folder is opened once
+and that no one else could swap (no machine id: -boot-<boot id>, removed a day after its last write, #998); none of
+these is no cache, #951). The folder is opened once
 (O_DIRECTORY|O_NOFOLLOW) and every file is reached through that handle, so a folder swapped for a link after its
 check is never followed (#951). The
 file is written whole through a rename; a cache that is old, from the future, broken, of another version, of other
@@ -56,7 +58,7 @@ job costs: heavy's peaks (lib/heavy_queue.py reservation(); missing or broken: s
 heavy's own reservation for it when that is more (its ticket's mb is the piece's declared size, a floor of its cost
 in the rule, #800).
 """
-import datetime, errno, fcntl, fnmatch, hashlib, json, math, os, pwd, re, signal, stat, subprocess, sys, time
+import datetime, errno, fcntl, fnmatch, hashlib, json, math, os, pwd, re, select, signal, stat, subprocess, sys, time
 
 CACHE_SECONDS, CARRY_SECONDS, ANSWER_SECONDS, STALE_TMP_SECONDS = 5, 300, 5, 60
 EXIT_FREE, EXIT_BUSY, EXIT_ERROR = 0, 75, 1
@@ -402,6 +404,87 @@ def other_reserve_dirs(uid):
     return out, blind, notes
 
 
+HOME_SECONDS = 1                                # #998 item 4: one home's reserve.d (a hung network home gives up)
+HOMES_SECONDS = 2.5                             # all of them, well inside ANSWER_SECONDS
+
+
+def read_homes(dirs, now, size):
+    """#998 item 4: reservation_files() of every (name, uid, folder) in dirs, in order, each within HOME_SECONDS and
+    all within HOMES_SECONDS, so one hung network or autofs home never stalls `heavy facts`. They are read in a child
+    process (a read stuck in the kernel cannot be stopped in this one) that holds none of this process's files (its
+    output pipes, any lock), so a child that never ends keeps nothing open; one that does not answer in time is
+    killed and a new one reads the homes after its home. A home not read in time is 'blind', as one that cannot be
+    read is. Without a child (fork refused): read here, as before #998, with a note."""
+    out, i, deadline = [], 0, time.monotonic() + HOMES_SECONDS
+    while i < len(dirs):
+        r = w = None
+        try:
+            r, w = os.pipe()
+            pid = os.fork()
+        except OSError as e:
+            for fd in (r, w):
+                if fd is not None:
+                    os.close(fd)
+            rest = [reservation_files(folder, now, (name, u), size) for name, u, folder in dirs[i:]]
+            rest[0][1].insert(0, f'homes read without a time limit (no child process: {e.strerror or e})')
+            return out + rest
+        if pid == 0:                                # the child: never returns
+            try:
+                os.close(r)
+                null = os.open(os.devnull, os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(null, fd)
+                os.closerange(3, w)
+                os.closerange(w + 1, 1 << 16)
+                for name, u, folder in dirs[i:]:
+                    line = json.dumps(reservation_files(folder, now, (name, u), size)).encode() + b'\n'
+                    while line:
+                        line = line[os.write(w, line):]
+            finally:
+                os._exit(0)
+        os.close(w)
+        buf, got, gone = b'', [], False
+        poll = select.poll()
+        poll.register(r, select.POLLIN)
+        try:
+            while i + len(got) < len(dirs) and not gone:
+                wait = min(HOME_SECONDS, deadline - time.monotonic())
+                if wait <= 0 or not poll.poll(wait * 1000):
+                    break                           # this home hung: the child is given up
+                chunk = os.read(r, 1 << 16)
+                gone = not chunk
+                buf += chunk
+                *lines, buf = buf.split(b'\n')
+                got += [json.loads(line) for line in lines]
+        finally:
+            os.close(r)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            for _ in range(20):                     # reaped when it ends soon; one stuck in the kernel is left
+                try:
+                    if os.waitpid(pid, os.WNOHANG)[0]:
+                        break
+                except ChildProcessError:
+                    break
+                time.sleep(0.01)
+        out += [tuple(x) for x in got]
+        i += len(got)
+        if i < len(dirs):                           # the home it was reading did not answer (in time)
+            name = dirs[i][0]
+            late = not gone and time.monotonic() >= deadline
+            why = ('its reader stopped' if gone else
+                   f'not read within {HOMES_SECONDS if late else HOME_SECONDS:g} s: a hung network home?')
+            out.append(([], [], [f'reservations of user {name} cannot be read ({why}): never free here']))
+            i += 1
+            if late:                                # no time left: the rest are not read either
+                out += [([], [], [f'reservations of user {n} cannot be read (not read within {HOMES_SECONDS:g} s): '
+                                  f'never free here']) for n, _, _ in dirs[i:]]
+                break
+    return out
+
+
 def best(res, uid, cwd):
     """The one reservation a process of `uid` working in `cwd` counts toward: the deepest folder of that user's that
     holds cwd, the first by name when two hold it as deep (#945: never two, so nothing is taken off twice)."""
@@ -665,6 +748,9 @@ def _small_text(path):
         os.close(fd)
 
 
+OUTSIDE_WHY = 'cannot be used (it leaves the cgroup tree: outside this cgroup namespace)'
+
+
 def own_caps(uid):
     """#951: the memory caps of the cgroups the caller's work starts under, below the cgroup root (the shared
     reader caps the root itself): with this user's manager (the full tier: heavy jobs and agents start below it) the
@@ -689,8 +775,7 @@ def own_caps(uid):
     if path is None and re.fullmatch(r'/+', own):   # the root (a namespace's): the shared reader's
         return []
     if path is None:                                # #996 item 5: above the namespace's root (/..): unreadable, busy
-        return [{'path': own[:200], 'limitMb': None, 'roomMb': None,
-                 'why': 'cannot be used (it leaves the cgroup tree: outside this cgroup namespace)'}]
+        return [{'path': own[:200], 'limitMb': None, 'roomMb': None, 'why': OUTSIDE_WHY}]
     caps, parts = [], path.split('/')[1:]
     for i in range(1, len(parts) + 1):
         rel = '/' + '/'.join(parts[:i])
@@ -836,8 +921,7 @@ def read_machine(rule, where, carry, now):
         # was not read at all: a person who wants it seen makes ~/.config/t3-capacity/reserve.d readable to others.
         dirs, blind, more = other_reserve_dirs(uid)
         notes += more
-        for name, u, folder in dirs:
-            more_res, more, cannot = reservation_files(folder, now, (name, u), size)
+        for more_res, more, cannot in read_homes(dirs, now, size):
             res += more_res
             notes += more
             blind += cannot
@@ -1144,25 +1228,67 @@ def host_name():
     return re.sub(r'[^A-Za-z0-9_.-]', '_', os.uname().nodename)[:64] or 'host'
 
 
+MACHINE_IDS = (('/etc/machine-id', ''), ('/var/lib/dbus/machine-id', ''), ('/proc/sys/kernel/random/boot_id', 'boot-'))
+STALE_BOOT_SECONDS = 86400                      # #998 item 3: a boot folder not written for this long is removed
+
+
 def machine_tag():
     """This machine for a cache folder in the home, which other machines may share (one cache per machine): the host
-    name and (#996 item 3: clones and cloud images keep one host name) the machine id, else the boot id; neither
-    (no /etc/machine-id, or "uninitialized" on a first boot, and no /proc): the host name alone."""
-    for path in ('/etc/machine-id', '/proc/sys/kernel/random/boot_id'):
+    name and (#996 item 3: clones and cloud images keep one host name) the machine id (systemd's, else D-Bus's),
+    else `boot-` and the boot id (a new one each boot: drop_stale_boot_folders removes the old ones, #998 item 3);
+    none (no machine id, or "uninitialized" on a first boot, and no /proc): the host name alone."""
+    for path, mark in MACHINE_IDS:
         try:
             ident = _read(path, 128).strip().lower().replace('-', '')
         except OSError:
             continue
         if re.fullmatch(r'[0-9a-f]{32}', ident):
-            return f'{host_name()}-{ident[:16]}'
+            return f'{host_name()}-{mark}{ident[:16]}'
     return host_name()
+
+
+def drop_stale_boot_folders(cache, keep):
+    """#998 item 3: remove this kit's boot-id folders of this host name in the open ~/.cache (cache) other than
+    `keep` whose files were not written for STALE_BOOT_SECONDS (the newest file's time; an empty folder's own time):
+    each boot without a machine id made one, and nothing read them again. Only a folder of plain files is removed;
+    anything else (the previous kit's host-only folder, a machine-id folder, another host name's, a link, a folder
+    with a folder in it, one that cannot be read) is left as it is. Best effort, never an error: a later call
+    finishes what one stopped half-way (the files left keep their old times)."""
+    prefix = f'heavy-facts-{host_name()}-boot-'
+    try:
+        names = [n for n in os.listdir(cache.fd)
+                 if n.startswith(prefix) and n != keep and re.fullmatch(r'[0-9a-f]{16}', n[len(prefix):])]
+    except OSError:
+        return
+    limit = time.time() - STALE_BOOT_SECONDS
+    for name in names:
+        try:
+            fd = os.open(name, O_FOLDER, dir_fd=cache.fd)
+        except OSError:
+            continue                                # a link, a file, gone, closed: not touched
+        try:
+            st = os.fstat(fd)
+            if st.st_uid != os.getuid():
+                continue
+            files = [(n, os.stat(n, dir_fd=fd, follow_symlinks=False)) for n in os.listdir(fd)]
+            if any(not stat.S_ISREG(f.st_mode) for _, f in files):
+                continue
+            if max([f.st_mtime for _, f in files] or [st.st_mtime]) >= limit:
+                continue                            # written lately: a machine with this host name may use it
+            for n, _ in files:
+                os.unlink(n, dir_fd=fd)
+            os.rmdir(name, dir_fd=cache.fd)
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
 
 
 def home_cache():
     """(Folder, None) or (None, why): ~/.cache/heavy-facts-<machine_tag()>, a folder only this user can use in its
     home (open_home), each folder made when missing. ~/.cache must be this user's and closed to writes by others. The
     previous kit's ~/.cache/heavy-facts-<host> is never read (another machine of this home may still run that kit,
-    so it is not removed either)."""
+    so it is not removed either); this kit's stale boot-id folders are (drop_stale_boot_folders)."""
     home, where = open_home()
     if home is None:
         return None, f'no home for it ({where})'
@@ -1177,6 +1303,7 @@ def home_cache():
         if st.st_uid != os.getuid() or st.st_mode & 0o022:
             return None, f'{cache.path} is not this user\'s, or others can write it'
         name = f'heavy-facts-{machine_tag()}'
+        drop_stale_boot_folders(cache, name)
         return open_folder(name, cache.at(name), parent=cache.fd, make=True)
     finally:
         cache.close()
@@ -1473,7 +1600,8 @@ def ready(hq, slice_name=None):
     not shipped with the kit, a machine file whose heavy section is broken, a basic tier machine: #981). heavy asks
     this before it waits for capacity, so a kit or machine that can never answer free refuses at once instead of
     waiting --wait (7200 s) for nothing. slice_name: heavy's slice, whose folder in this user's manager must be
-    listable when it is there (read_machine's other structural cause of the basic tier). The basic tier from
+    listable when it is there (read_machine's other structural cause of the basic tier). A caller outside its cgroup
+    namespace (own_caps: OUTSIDE_WHY, #998 item 2) is refused too: its own caps can never be read. The basic tier from
     reservations or sessions that cannot be read is not refused here: a person can fix those while a job waits."""
     try:
         cr.shipped_rule()
@@ -1487,6 +1615,11 @@ def ready(hq, slice_name=None):
     if tier == 'basic':
         what = 'no cgroup v2' if cgroup != 'v2' else 'neither a systemd user manager for this user nor user.slice'
         return f'basic tier ({what}): heavy facts is never free on this machine'
+    # #998 item 2: a caller outside its cgroup namespace (`0::/..`, the machine tier) is busy for every kind, and
+    # no wait changes where it runs
+    outside = [c['path'] for c in own_caps(uid) if c['why'] == OUTSIDE_WHY]
+    if outside:
+        return f'this cgroup ({outside[0]}) {OUTSIDE_WHY}: heavy facts is never free here'
     if tier == 'full' and slice_name:
         box = f'{USERS}/user-{uid}.slice/user@{uid}.service/{slice_path(slice_name)}'
         try:

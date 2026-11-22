@@ -289,7 +289,8 @@ class Heavy(unittest.TestCase):
     def isolated(self, env):
         """#996: env keeps every folder heavy writes in (STATE_SETTINGS) inside this test's folder, and HOME is one
         only this user can write (else heavy's state notes fall back to the password database's home): a test never
-        writes the tester's real home, history or queue. Every run of heavy goes through here (heavy(), start())."""
+        writes the tester's real home, history or queue. Every run of heavy goes through here (heavy(), start(); #998:
+        Hygiene's unguarded() finds one that does not)."""
         for key in STATE_SETTINGS:
             value = env.get(key) or ''
             self.assertTrue(os.path.isabs(value) and os.path.commonpath([self.dir, os.path.realpath(value)]) ==
@@ -438,7 +439,7 @@ class Heavy(unittest.TestCase):
         self.addCleanup(err.close)
         go = os.path.join(self.dir, 'go')
         p = subprocess.Popen([HEAVY, 'sh', '-c', f'echo up; while [ ! -e {go} ]; do sleep 0.05; done'],
-                             stdout=subprocess.PIPE, stderr=err, text=True, env=self.env, cwd=self.dir,
+                             stdout=subprocess.PIPE, stderr=err, text=True, env=self.isolated(self.env), cwd=self.dir,
                              start_new_session=True)
         self.addCleanup(lambda: p.poll() is None and p.kill())
         self.assertEqual(read_line(p), 'up\n')
@@ -603,7 +604,8 @@ class Heavy(unittest.TestCase):
                              ('kill -INT $$', 130), ('kill -KILL $$', 137), ('kill -SEGV $$', 139)):
             with self.subTest(script=script):
                 r = subprocess.run(['sh', '-c', '"$0" sh -c "$1"; echo "status=$?"', HEAVY, script],
-                                   capture_output=True, text=True, timeout=60, env=self.env, cwd=self.dir)
+                                   capture_output=True, text=True, timeout=60, env=self.isolated(self.env),
+                                   cwd=self.dir)
                 self.assertIn(f'status={want}', r.stdout, r.stderr)
                 self.assertEqual(self.heavy_lines(r.stderr), [])
 
@@ -807,7 +809,7 @@ class Heavy(unittest.TestCase):
     def test_timeout_signal_to_heavy_and_its_group_counts_once(self):
         # timeout(1) sends the signal to heavy, then to its whole process group: one event, not a second signal
         r = subprocess.run(['timeout', '-s', 'INT', '1', HEAVY, self.counter(3)], capture_output=True, text=True,
-                           timeout=60, env=dict(self.env, HEAVY_GRACE='10'), cwd=self.dir)
+                           timeout=60, env=self.isolated(dict(self.env, HEAVY_GRACE='10')), cwd=self.dir)
         self.assertEqual((r.returncode, r.stdout), (124, 'ready\nint=1 usr1=0\n'), r.stderr)
         self.assertEqual(self.heavy_lines(r.stderr), [])
 
@@ -1605,6 +1607,26 @@ def untimed(source, name):
     return found
 
 
+RUNS = ('run', 'Popen', 'call', 'check_call', 'check_output')
+
+
+def unguarded(source, name):
+    """#998 item 1: the runs of heavy in source that do not go through Heavy.isolated (a subprocess call that names
+    HEAVY in its arguments without env=self.isolated(...)): such a run could reach the tester's real home, history or
+    queue once a later change gives it a --kind or --measure job."""
+    import ast
+    found = []
+    for n in ast.walk(ast.parse(source)):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in RUNS):
+            continue
+        if not any(isinstance(x, ast.Name) and x.id == 'HEAVY' for a in n.args for x in ast.walk(a)):
+            continue
+        env = next((k.value for k in n.keywords if k.arg == 'env'), None)
+        if not (isinstance(env, ast.Call) and isinstance(env.func, ast.Attribute) and env.func.attr == 'isolated'):
+            found.append(f'{name}:{n.lineno} {n.func.attr}() runs heavy without env=self.isolated(...)')
+    return found
+
+
 class Hygiene(unittest.TestCase):
     """#744 item 7: a test of heavy that waits for a process without a time limit hangs (once 19 minutes) where it
     should fail."""
@@ -1617,6 +1639,25 @@ class Hygiene(unittest.TestCase):
             with open(os.path.join(here, name), encoding='utf-8') as f:
                 found += untimed(f.read(), name)
         self.assertEqual(found, [])
+
+    def test_every_run_of_heavy_goes_through_the_isolation_guard(self):
+        # #998 item 1: isolated() promised every run of heavy, but three ran with the bare env
+        with open(os.path.abspath(__file__), encoding='utf-8') as f:
+            self.assertEqual(unguarded(f.read(), 'heavy.test.py'), [])
+
+    def test_the_guard_check_finds_each_unguarded_run(self):
+        cases = {
+            "subprocess.run([HEAVY, 'x'], env=self.env)": 1, "subprocess.run([HEAVY, 'x'])": 1,
+            "subprocess.Popen([HEAVY, 'x'], env=dict(self.env))": 1,
+            "subprocess.run(['sh', '-c', 'x', HEAVY], env=self.env)": 1,
+            "subprocess.run(['timeout', '1', HEAVY], env=dict(self.env, A='1'))": 1,
+            "subprocess.run([HEAVY, 'x'], env=self.isolated(self.env))": 0,
+            "subprocess.Popen([wrapper or HEAVY], env=self.isolated(env or self.env))": 0,
+            "subprocess.run(['systemctl', '--user'], env=self.env)": 0,
+        }
+        for text, want in cases.items():
+            with self.subTest(code=text):
+                self.assertEqual(len(unguarded(text, 'x.py')), want, unguarded(text, 'x.py'))
 
     def test_the_check_finds_each_listed_form(self):
         # #761 item 3, #767 item 2: each of these hangs on a silent process; each timed form passes. The check
