@@ -357,9 +357,40 @@ def freed(cfg):
 
 # --- the line -----------------------------------------------------------------------------------------------------
 def disk(cfg):
-    """(used, size, device) of the filesystem the home folder is on: the disk "everything else" is measured on."""
+    """(used, size, device, free) of the filesystem the home folder is on: the disk "everything else" is measured on;
+    free is what this user may still write (root's reserve left out)."""
     vfs = os.statvfs(cfg.home)
-    return (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize, vfs.f_blocks * vfs.f_frsize, os.stat(cfg.home).st_dev
+    return ((vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize, vfs.f_blocks * vfs.f_frsize, os.stat(cfg.home).st_dev,
+            vfs.f_bavail * vfs.f_frsize)
+
+
+LARGEST = 5     # folders the LOW DISK warning names
+
+
+def low_disk(cfg, free, home_dev, points):
+    """The warning at the end of the line when the home folder's disk has less than cleaner.report.warnFreeGB free
+    (#982): the LARGEST folders directly in the home folder, largest first, measured as the classes are (no link
+    followed, no other disk or mount point entered, a hard-linked file once). Only then is the home walked. A folder
+    it cannot read in full says "at least"."""
+    head = f'LOW DISK: {gb(free)} free, under {cfg.warn_free_gb} GB'
+    try:
+        names = sorted(os.listdir(cfg.home))
+    except OSError as ex:
+        return f'{head}: the home folder {cfg.home} could not be read ({ex.strerror})'
+    sizer, found = Sizer(points), []
+    for name in names:
+        path = os.path.join(cfg.home, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue                    # gone, or not to be seen: nothing to name
+        if not stat.S_ISDIR(st.st_mode) or st.st_dev != home_dev or path in sizer.mount_points:
+            continue
+        size, _, problems = sizer.size(path)
+        found.append((size, name, bool(problems)))
+    found.sort(key=lambda f: (-f[0], f[1]))
+    parts = [f'{name} {"at least " if partial else ""}{rules.human(size)}' for size, name, partial in found[:LARGEST]]
+    return f'{head}: largest folders in {cfg.home}: ' + (', '.join(parts) or 'none')
 
 
 def _problems(problems):
@@ -440,9 +471,9 @@ def _report(cfg, say, docker, host, disk_of, mounts, locked, out=None, mark=True
     sizer = Sizer(points)
     classes = [measure(cfg, sizer, name, source, docker) for name, source in CLASSES]
     try:
-        used, size, home_dev = disk_of(cfg)
+        used, size, home_dev, free = disk_of(cfg)
     except OSError as ex:
-        used = size = home_dev = None
+        used = size = home_dev = free = None
         disk_problem = f'{cfg.home}: {ex.strerror}'
     else:
         disk_problem = None
@@ -488,6 +519,8 @@ def _report(cfg, say, docker, host, disk_of, mounts, locked, out=None, mark=True
         tail += f'; {got.skipped} log line' + ('' if got.skipped == 1 else 's') + ' not understood, skipped'
     if mount_problem is not None:
         tail += f'; the mount list could not be read ({mount_problem}): a bind mount may be counted twice'
+    if free is not None and free < cfg.warn_free_gb * GB:
+        tail += '; ' + low_disk(cfg, free, home_dev, points)
     line = f'disk on {host or socket.gethostname()}: ' + ', '.join(parts) + '; ' + tail
     if out is not None:
         try:

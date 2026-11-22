@@ -45,8 +45,9 @@ systemd unit files, the pull request lists and Docker's list.
 
 **When GitHub is asked.** The pull request lists of a repository are read once for the plan, and again before
 every worktree or clone delete of that repository (never for a temp entry or a volume). Each read is two `gh pr
-list` calls (merged and open, `--limit 1000`); gh fetches 100 rows per GraphQL page, so one read costs
-ceil(merged/100) + ceil(open/100) GraphQL requests, at least 2 and at most 20. A run that deletes N worktrees
+list` calls (`--state closed`, which lists the merged ones and the ones closed without a merge, and `--state open`,
+each `--limit 1000`); gh fetches 100 rows per GraphQL page, so one read costs ceil(closed/100) + ceil(open/100)
+GraphQL requests, at least 2 and at most 20. A run that deletes N worktrees
 and clones of one repository makes N + 1 reads. With [`mergedBranches`](#merged-branches) on, each clone's branches
 take one read for the plan and one before each branch delete. Each item's last check also runs `git ls-remote`
 against GitHub (git, not the API).
@@ -130,6 +131,18 @@ not be read) (180.2 GB of 250.0 GB used); freed since the last report at 2026-01
 ```
 
 (one line; wrapped here). It deletes nothing.
+
+**Low disk (#982).** When the home folder's disk has less than `report.warnFreeGB` free (60 GB unless the machine
+file says otherwise; free is what the user may still write), the line ends with a warning and the five largest
+folders directly in the home folder, measured as the classes are (a folder it cannot read in full says `at least`):
+
+```
+...; LOW DISK: 41.3 GB free, under 60 GB: largest folders in /home/u: work 80.1 GB, .cache 12.3 GB, .claude 6.0 GB,
+.local 2.2 GB, projects 1.0 GB
+```
+
+Only then is the home folder walked for it. The warning changes no exit code. The daily report of a host (the
+project's own gardener, say) carries the line as it is.
 
 - **The classes** are `CLASSES` in `config.py`, the one list, and each name says what it measures. A rule's class
   is what that rule looks at: `worktrees` (the worktrees and clones of the listed repositories), `temp` (the temp
@@ -235,9 +248,9 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | `no commit`                    | its branch has no commit: deleted under the worktree, or never had one                                                                      |
 | `open PR`                      | an open pull request has its branch                                                                                                         |
 | `base branch`                  | it is GitHub's default branch (`git ls-remote --symref`), or a pull request merges into its branch                                          |
-| `no merged PR`                 | no merged pull request **from this repository** (not a fork) has its branch                                                                 |
-| `commits not in the merged PR` | HEAD is not the head of a merged pull request of that branch, nor inside one                                                                |
-| `merged under 24 h ago`        | the pull request merged less than `mergedHours` ago (24 or more)                                                                            |
+| `no merged PR`                 | no merged pull request, and none closed without a merge, **from this repository** (not a fork) has its branch                               |
+| `commits not in the merged PR` | HEAD is not the head of a merged (or closed: `... closed PR`) pull request of that branch, nor inside one                                   |
+| `merged under 24 h ago`        | the pull request merged (or closed: `closed under 24 h ago`) less than `mergedHours` ago (24 or more)                                       |
 | `branch not listed`            | `branches` is set and the branch matches none of its patterns                                                                               |
 | `used under 24 h ago`          | in the last `usedHours` (24 or more): a file in it, its HEAD reflog, `HEAD`, `index`, `ORIG_HEAD`, `FETCH_HEAD` or `COMMIT_EDITMSG` changed |
 | `uncommitted or untracked`     | `git status` shows anything                                                                                                                 |
@@ -257,6 +270,13 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | `could not read`               | git or GitHub gave no full answer; an unreadable merge time or folder; a moved worktree                                                     |
 | `orphaned worktree`            | its `.git` file names a git folder that is gone (main repository removed): kept, but no error (exit 0)                                      |
 | `unknown parent`               | tmp: its git folder is not there but may be elsewhere (see [`tmp`](#tmp)): kept, but no error (exit 0)                                      |
+
+A pull request closed without a merge finishes its branch's worktree as a merged one does (#982): GitHub keeps
+its head (`refs/pull/<n>/head`), and the branch stays in the clone, so the same checks show nothing is only there.
+A full clone still goes only when GitHub has every commit in it, and a closed pull request's head counts as on
+GitHub: when its branch was deleted there, the clone's branch lives on GitHub only in `refs/pull/<n>/head`, and the
+clone is removed. The [merged branches](#merged-branches) step
+takes merged pull requests only.
 
 A worktree is removed with `git worktree remove`, never with `--force`: git itself refuses when a file changed
 after the last check. The local branch and its reflog stay in the clone, so a commit that was amended or reset
@@ -797,7 +817,7 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
 | `worktrees.repos[].regenerable`          | none                                      | plain names of ignored build folders, on top of `node_modules`, `__pycache__` and `.pytest_cache`    |
 | `worktrees.repos[].branches`             | all                                       | branch patterns (shell style, case as written; `*` crosses `/`): only these branches are taken       |
 | `worktrees.repos[].mergedBranches`       | false                                     | also deletes merged local branches the patterns name (see Merged branches); needs `branches`         |
-| `worktrees.mergedHours`                  | 24                                        | hours after the merge (24 or more)                                                                   |
+| `worktrees.mergedHours`                  | 24                                        | hours after the merge or close (24 or more)                                                          |
 | `worktrees.usedHours`                    | 24                                        | hours since the worktree or clone was last used (24 or more)                                         |
 | `docker.enabled`                         | false                                     | turns the rule on                                                                                    |
 | `docker.days`                            | 7                                         | age of an unused anonymous volume (7 or more)                                                        |
@@ -817,6 +837,7 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
 | `daily.outDir`                           | `~/.local/state/fork-cleaner/daily`       | where `daily` writes its files                                                                       |
 | `daily.keepDays`                         | 30                                        | days `daily` keeps its dated files (1 or more)                                                       |
 | `daily.compare[]`                        | none                                      | the old tools' dry runs: `name`, `command` (absolute program, no shell), `pattern` (one group)       |
+| `report.warnFreeGB`                      | 60                                        | the report warns below this many GB free on the home folder's disk (0: never); see The report        |
 
 An empty section (`"cleaner": {}`) is valid and does nothing. An unknown key, a wrong type, a number below its
 floor, a root folder that is `/`, the home folder or a folder above it: the command names the file and the key,
