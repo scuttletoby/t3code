@@ -30,7 +30,7 @@ describe("withFieldsFrom", () => {
       idleTokens: environment.idleTokens,
     });
     const source = withFieldsFrom(project, environment, ["source", "command"]);
-    expect(source).toEqual({ ...project, source: "agent", command: undefined });
+    expect(source).toEqual({ ...project, source: "none", command: undefined });
     expect(source).not.toHaveProperty("command");
   });
 
