@@ -171,8 +171,12 @@ is listed with **Remove**).
 
 Without the list, `burnFirst` spends every window first (as before the list existed). A name that is
 not a window kind is ignored on load (that window keeps its pace; a warning is logged) and refused by
-a save. Only `settings.json` sets the list so far; `__fork-report` shows the kinds each account spends
-first under `usagePacingBurnFirstWindows`.
+a save. In the app, an account with **Spend first** on shows one box per window kind; its summary
+names the kinds it spends first. `__fork-report` shows them under `usagePacingBurnFirstWindows`.
+
+A key an entry does not know (a typo such as `burnFirstWindow`) is ignored on load with a warning
+that names it; with `burnFirst` on and the list lost that way, every window burns first. The next
+settings save writes the entry back as it was read: unknown keys and names are gone from the file.
 
 ### `server.usagePacingGate`
 
@@ -283,8 +287,8 @@ Only the person can change it; agents cannot. A save that is on without all four
 push step's name (or names one `claim`, `renew` or `release`), names a program by anything but its
 full path on the server's OS, or has a field this build does not know is refused. A hand-edited
 value that is not valid, or has a field this build does not know (a newer build's limit, a typo),
-reads as off (with a warning in the server log), and the next save of any setting writes the default
-in its place. So after moving back to an older build, copy the playtest value first: the older
+reads as off (with a warning in the server log that names what is wrong, such as the unknown
+field), and the next save of any setting writes the default in its place. So after moving back to an older build, copy the playtest value first: the older
 build's next save replaces a newer build's value. Other fields: how often a claim is renewed (`renewMinutes`), when an idle
 session ends (`idleMinutes`) and the longest session (`maxHours`).
 
@@ -524,7 +528,11 @@ wiring). Fields, each with its default:
   for `labels`; a line that is not one label is skipped, at most 64); any other exit, a program that
   cannot start, or no answer within 5 seconds means not available, with the reason. The machine
   that runs it checks the path again on its own OS first and runs it with no arguments; on Windows
-  only an `.exe` runs, since a `.cmd`, `.bat` or script needs a shell. The runner is in the fork
+  only an `.exe` runs, since a `.cmd`, `.bat` or script needs a shell, and that holds for the file
+  the server's lookup would start, not only the text. A Windows server whose PATHEXT has no `.EXE`
+  refuses every `factsCommand`: its lookup would try `facts.exe` plus each PATHEXT ending, so a
+  `facts.exe.CMD` planted after the check could run through a shell. A failed run's reason is the
+  first line of its error output, else of its output. The runner is in the fork
   (`apps/server/src/fork/factsCommand.ts`); placement row P4 wires it into the facts read.
 - `never`: `[]`. Label groups that must not meet on one machine, such as
   `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
@@ -1450,7 +1458,8 @@ the account at launch (the gate does). The fields are part of the tool's result,
 list an agent loads, so the tool context budget is unchanged.
 
 When placement reads a linked machine's answer (`factsFromAnswer` in the same file), it decodes it
-with these schemas: neither field is "no facts", as above; an answer they refuse is "facts not
+with these schemas: no answer (the machine did not answer) or neither field is "no facts", as
+above; an answer they refuse is "facts not
 valid", and the machine is refused, even when it is named. This machine with no CPU and memory
 sample (no sampler, or one that cannot measure CPU) is still a place for work when every other
 rule passes, ranked last; a linked machine without them is not. Its weight still counts (`manual`
