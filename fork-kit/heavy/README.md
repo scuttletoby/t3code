@@ -59,9 +59,10 @@ heavy asks Docker only after a run that labelled a container (`heavy docker-labe
 `/run/user` is full or a sandbox has a `/run/user` of its own, in `~/.local/state/heavy/labelled/`, which heavy
 reads too; the home is `$HOME`, else the password database's, and only one this user owns and no one else can
 write (not `/`), so heavy run as root with a user's `HOME` (`sudo -E heavy ...`) or `HOME=/tmp` uses root's own home
-and never makes a root-owned folder in the user's; `~/.local` must be a real folder (not a link) of the user's;
-an older heavy run as root with your `HOME` may have left a root-owned `~/.local/state` (heavy then skips it):
-`sudo chown -R "$USER:" ~/.local/state` gives it back;
+and never makes a root-owned folder in the user's; `~/.local` must be a real folder (not a link, even to a folder
+of the user's: kept fail-closed) of the user's that no one else can write; an older heavy run as root with your
+`HOME` may have left a root-owned `~/.local` or `~/.local/state` (heavy then skips it):
+`sudo chown "$USER:" ~/.local && sudo chown -R "$USER:" ~/.local/state` gives them back;
 heavy tells `docker-label` which folders it reads in `HEAVY_MARKS`; without either folder heavy asks after every
 run), so a run with no containers costs no `docker ps`. No Docker, or none this user can reach (a
 rootless Docker through `docker context use` counts as reachable): nothing to do, nothing said. Docker down: one
@@ -543,9 +544,12 @@ after another, up to the group's ceiling), the memory budget, the queue and note
 - **--kind K:** does the rule admit one piece of K (`agent-writer`, `job-build`, or heavy's own `build`). **--mb
   MB** alone: do MB fit the free budget at level "ok"; with --kind, the piece declares MB.
 - **T3 down or not installed:** no agent scopes, still an answer from the kernel.
-- **Tiers:** full with cgroup v2 and a systemd user manager. Without them (Basic) agents and other users' work
-  cannot be counted, so the answer is never free and every `fits` is 0 (a note says why). An other user's folder
-  that exists but cannot be listed is Basic too.
+- **Tiers:** full with cgroup v2 and a systemd user manager. Machine with cgroup v2 and `user.slice` but no user
+  manager of the caller's (a CI runner's user without lingering or a login session): it has no agents or heavy
+  jobs of its own, every user's are counted as usual, so it gets the answer a caller with a user manager gets
+  (`tier: "machine"`, a note, and the reason says "machine-wide numbers"). Without cgroup v2, or without both a user
+  manager and `user.slice` (Basic), agents and other users' work cannot be counted, so the answer is never free and
+  every `fits` is 0 (a note says why). An other user's folder that exists but cannot be listed is Basic too.
 - **Unreadable signals** (PSI, a box with a live piece but without its `memory.pressure`, or with no folder at
   all) give "elevated", never "ok"; a missing MemAvailable or a container limit that cannot be read gives busy for
   every kind. A box with no live piece of its own passes no box pressure (as the server's observer). A piece whose
@@ -554,9 +558,11 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   `<MB> <absolute folder> [until=YYYY-MM-DD]`. The folder matches itself and what is below it, with or without a
   trailing `/`, never a sibling sharing its first letters (`/x/app` is not `/x/app-x`); its real path (links
   resolved) matches too. A reservation holds back its MB less what this user's processes working in that folder
-  already use; a caller working inside the folder (its real working folder) is not held back by its own
-  reservation. Ended, broken or unreadable lines hold nothing and give a note. Limit: another user's reservations
-  are not seen.
+  already use, and less what this user's agents and heavy jobs with a process working there still owe the rule
+  (their cost less their demand, `owedMb`): that room is already held as their debt, so it is counted once (one
+  idle 300 MB agent under a 1536 MB reservation holds 1536 MB in all, not 1536 + 768 - 300). A caller working
+  inside the folder (its real working folder) is not held back by its own reservation. Ended, broken or unreadable
+  lines hold nothing and give a note. Limit: another user's reservations are not seen.
 - **Holds (machine file):** a cgroup outside the user managers, such as a CI runners' slice, is not in the ledger.
   `heavy.capacity.holds` names such cgroups; one that uses more than `inUseFromMb` (anon + shmem + swap) keeps its
   budget (its `memory.max`, or `budgetMb` when it has none) less the RAM it uses (anon + shmem: `memory.max` limits
@@ -565,14 +571,16 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   with a note. Its use cannot be read: the whole budget is held, with a note. A reservation file named like a hold
   (`<label>.conf`) gives a note; both hold.
 - **Cache:** `/run/user/<uid>/heavy-facts.json` (or `$HEAVY_FACTS_CACHE`), 0600, read again after 5 s (`--fresh`:
-  now). Pressure levels carry from it (at most 5 minutes old) so calm must last before a level drops. Without a
-  cache folder nothing carries, so every call starts "elevated" (only the rule's floors admit; never straight to
-  "ok").
+  now). A user without `/run/user/<uid>` (no user manager) uses `heavy-facts-<uid>/` in the temporary folder
+  (`$TMPDIR`, else `/tmp`), made 0700; one that is a link, another user's or open to others is no cache (a note).
+  Pressure levels carry from it (at most 5 minutes old) so calm must last before a level drops. Without a cache
+  folder nothing carries, so every call starts "elevated" (only the rule's floors admit; never straight to "ok").
 
 Two thin callers come with it:
 
 - `bin/t3-capacity [--kind KIND] [MB]`: the older host check's output (first line `available=..MB swapfree=..MB
-  load=..`, available less the rule's whole reservation hold, last line `OK` or `NOT OK: why`, exit 0 or 1), now
+  load=..`, available less the rule's whole reservation hold, `reserved=` what admitted jobs and agents may still
+  grow into (so `available - reserved` counts each once), last line `OK` or `NOT OK: why`, exit 0 or 1), now
   from `heavy facts`. MB defaults to 3072. The installer links `/usr/local/bin/t3-capacity` to it, so the command
   has one source, the release in use (a host's own plain copy there only with `--replace-t3-capacity`: Install,
   below); `heavy --self-check` warns when the `t3-capacity` found on PATH is another copy (its readings can differ:
@@ -586,12 +594,15 @@ either caller.
 
 ### Facts run again, stop half-way, or meet old or empty state
 
+- **No user manager** (no `/run/user/<uid>`): Machine tier, and the cache in the temporary folder, so the level
+  carries and can reach "ok" as with one.
 - **Runs again:** within 5 s the cache answers; two callers in the same second both answer and leave one valid
   cache (each writes its own temporary file and renames it).
 - **Stops half-way:** a temporary cache file is left; the next run removes ones older than a minute.
 - **Old, empty, broken or foreign cache** (another owner, group or other access, a link, a time in the future, an
-  unknown key or version, or written with other settings: slice, queue or reservations folder): read again from
-  the kernel. A cache that cannot be written gives a note.
+  unknown key or version (an older kit's cache, without each reservation's `owedMb`, is version 2), or written with
+  other settings: slice, queue or reservations folder): read again from the kernel. A cache that cannot be written
+  gives a note.
 - **Cost file** (`peaks.json`) missing, empty or broken: the rule's start costs, with the queue's note.
 - **Reservation file cut short** (its writer stopped half-way): its whole lines hold, the cut line is a note.
   A reservation whose processes are all gone still holds all its MB (the room is kept for them), until its
@@ -664,6 +675,7 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
 |                                                 | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
 | `/run/user/<uid>/heavy-facts.json`              | `heavy facts`' 5 s cache (tmpfs)                                          |
+| `/tmp/heavy-facts-<uid>/heavy-facts.json`       | the same, for a user without `/run/user/<uid>` (no user manager)          |
 | `~/.config/t3-capacity/reserve.d/*.conf`        | each user's reservations for `heavy facts` and its callers                |
 
 ## Install (owner, as root)

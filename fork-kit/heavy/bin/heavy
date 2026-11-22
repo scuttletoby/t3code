@@ -389,8 +389,8 @@ def docker_context():
 def own_folder(base, make_base=False):
     """<base>/heavy/labelled, made if missing: '' unless it, its parent and base are folders this user owns and
     only this user can write. make_base: base (~/.local/state) and its parent (~/.local) are made too, one at a
-    time, and the parent must be a real folder (no symlink) this user owns, so a planted ~/.local link never
-    leads heavy to make folders elsewhere."""
+    time, and the parent must be a real folder (no symlink) this user owns that no one else can write, so a planted
+    ~/.local link never leads heavy to make folders elsewhere, and no one else can swap state for a link (#771)."""
     uid = os.getuid()
     path = os.path.join(base, 'heavy', 'labelled')
     try:
@@ -401,7 +401,7 @@ def own_folder(base, make_base=False):
             except FileExistsError:
                 pass
             st = os.lstat(parent)
-            if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
                 return ''
         for folder in (base, os.path.dirname(path), path):
             if folder != base or make_base:
@@ -442,12 +442,12 @@ def state_base():
     for home in homes:
         if not home or not os.path.isabs(home):
             continue
+        home = os.path.realpath(home)   # resolved once: a HOME link swapped after this check changes nothing (#771)
         try:
-            st = os.stat(home)
+            st = os.lstat(home)
         except OSError:
             continue
-        if (stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022
-                and os.path.realpath(home) != '/'):
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022 and home != '/':
             return os.path.join(home, '.local', 'state')
     return ''
 

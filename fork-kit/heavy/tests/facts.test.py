@@ -90,9 +90,10 @@ class Machine:
         with open(full, 'w') as f:
             f.write(text)
 
-    def agent(self, name, demand_mb):
+    def agent(self, name, demand_mb, pids=()):
         folder = f'{AGENTS}/t3code-{name}-0a1b2c3d.scope'
         self.write(folder + '/memory.stat', f'anon {demand_mb * MB}\nfile 999999999\nshmem 0\n')
+        self.write(folder + '/cgroup.procs', ''.join(f'{p}\n' for p in pids))
         for box in (MANAGER + '/app.slice/app-t3code.slice', AGENTS):   # every v2 cgroup has one (PSI on)
             self.write(box + '/memory.pressure', CALM)
 
@@ -215,10 +216,36 @@ class Ledger(Case):
             code, d = self.facts(*args)
             self.assertEqual((code, d['free'], set(d['fits'].values())), (75, False, {0}), args)
             self.assertIn('basic tier', d['reason'])
-        self.m.write('/sys/fs/cgroup/cgroup.controllers', 'memory\n')      # cgroup v2 but no user manager
-        shutil.rmtree(self.m.root + MANAGER)
+        self.m.write('/sys/fs/cgroup/cgroup.controllers', 'memory\n')      # cgroup v2, no user manager, no user.slice
+        shutil.rmtree(self.m.root + '/sys/fs/cgroup/user.slice')           # (a cgroup namespace, say)
         code, d = self.facts('--kind', WRITER, '--fresh')
         self.assertEqual((code, d['tier'], set(d['fits'].values())), (75, 'basic', {0}))
+
+    def test_no_user_manager_gets_the_machine_wide_answer(self):
+        # #844: a CI runner's user (no lingering, no login session) has no user manager; every other user's agents
+        # and heavy jobs are still read from user.slice, so it gets the answer a caller with a manager gets
+        self.m.write(OTHER + '/heavy.slice/run-x1.scope/memory.stat', f'anon {10 * MB}\nshmem 0\n')
+        self.m.write(OTHER + '/heavy.slice/memory.pressure', CALM)
+        self.m.write(OTHER + '/app.slice/app-t3code.slice/t3code-z-1.scope/memory.stat', f'anon {10 * MB}\nshmem 0\n')
+        answers = {}
+        for tier in ('full', 'machine'):
+            if tier == 'machine':
+                shutil.rmtree(self.m.root + MANAGER)
+            answers[tier] = [self.facts(*args, '--fresh') for args in (('--kind', WRITER), ('--mb', '1024'))]
+        for (code, d), (full_code, full) in zip(answers['machine'], answers['full']):
+            self.assertEqual((code, d['free'], d['tier'], d['level']), (0, True, 'machine', 'ok'), d.get('reason'))
+            self.assertEqual((full_code, full['tier']), (0, 'full'))
+            for key in ('memory', 'queue', 'fits'):
+                self.assertEqual(d[key], full[key], key)
+            self.assertEqual(d['queue'], {'running': 1, 'waiting': 0, 'agents': 1})
+            self.assertIn(hf.MACHINE_WHY, d['notes'])
+            self.assertNotIn(hf.BASIC_WHY, d['notes'])
+        code, d = self.facts('--mb', '99999', '--fresh')
+        self.assertEqual((code, d['tier']), (75, 'machine'))
+        self.assertIn('machine-wide numbers', d['reason'])
+        self.m.write(OTHER + '/app.slice/app-t3code.slice/t3code-z-2.scope/memory.stat', 'anon 0\nshmem 0\n')
+        d = self.facts('--kind', WRITER, '--fresh')[1]
+        self.assertEqual(d['queue']['agents'], 2, 'still counts every user\'s agents')
 
     def test_an_unreadable_signal_is_elevated_never_ok(self):
         self.m.write('/proc/pressure/memory', 'some garbage\nfull avg10=x\n')
@@ -308,6 +335,35 @@ class Reservations(Case):
         d = self.facts('--mb', '64')[1]
         self.assertEqual(d['memory']['holdMb'], 1000)
         self.assertEqual([n.split(' ')[1] for n in d['notes']], ['half.conf:2'])
+
+    def test_an_agent_or_job_working_in_the_folder_is_counted_once(self):
+        # #923: one idle 300 MB agent under a 1536 MB reservation holds 1536 MB in all (its use and its debt to the
+        # rule together), not its debt on top of the reservation's 1536 - 300
+        other = os.path.join(self.tmp, 'other')
+        with open(os.path.join(self.m.reserve, 'game.conf'), 'w') as f:
+            f.write(f'1536 {other}/\n')
+        self.m.process(4001, other + '/sub', 300)
+        self.m.agent('a', 300, pids=(4001,))
+        code, d = self.facts('--mb', '64')
+        owed = self.cost(WRITER) - 300
+        self.assertLessEqual(self.cost(WRITER), 1536, 'the example needs a writer that fits the reservation')
+        self.assertEqual(d['memory']['owedMb'], owed)
+        self.assertEqual(d['memory']['holdMb'], 1536 - 300 - owed)
+        self.assertEqual(d['memory']['owedMb'] + d['memory']['holdMb'] + 300, 1536)
+        self.assertEqual([(r['useMb'], r['owedMb']) for r in d['reservations']], [(300, owed)])
+        self.m.agent('b', 100, pids=(4002,))         # an agent working elsewhere: its debt is its own
+        self.m.process(4002, os.path.join(self.tmp, 'elsewhere'), 100)
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual((d['memory']['holdMb'], d['memory']['owedMb']),
+                         (1536 - 300 - owed, owed + self.cost(WRITER) - 100))
+        build = 'job-build' if 'job-build' in RULE['kinds'] else RULE['unknownKinds']['job']
+        self.m.job('build', 3072, demand_mb=200)    # a heavy job started in the folder: never held twice either
+        self.m.write(f'{MANAGER}/heavy.slice/run-j1.scope/sub/cgroup.procs', '4003\n')
+        self.m.process(4003, other, 200)
+        d = self.facts('--mb', '64', '--fresh')[1]
+        job_owed = self.cost(build) - 200
+        self.assertEqual(d['memory']['holdMb'], max(0, 1536 - 500 - owed - job_owed))
+        self.assertEqual(d['reservations'][0]['owedMb'], owed + job_owed)
 
     def test_a_reservation_whose_processes_are_gone_still_holds_it_all(self):
         other = os.path.join(self.tmp, 'other')
@@ -595,14 +651,57 @@ class State(Case):
         self.assertEqual(hf.read_cache(self.m.cache, data['atMs'], 'another key'), (None, None))
 
     def test_without_a_cache_folder_the_level_never_drops_straight_to_ok(self):
-        with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')):
+        tmp_root = os.path.join(self.tmp, 'tmp')
+        os.makedirs(os.path.join(tmp_root, f'heavy-facts-{UID}'), mode=0o700)
+        os.chmod(os.path.join(tmp_root, f'heavy-facts-{UID}'), 0o777)    # planted first, open to others: no cache
+        with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')), \
+                mock.patch.object(hf, 'TMP_ROOT', tmp_root):
             for i in range(3):                      # a calm machine, called again and again: every call starts over
                 code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(minutes=i * 10),
                                      env={'HEAVY_FACTS_CACHE': ''})
                 self.assertEqual((code, d['level']), (75, 'elevated'), i)
             code, d = self.facts('--kind', WRITER, env={'HEAVY_FACTS_CACHE': ''})
             self.assertEqual((code, d['level']), (0, 'elevated'), 'the floor still admits')
+            self.assertTrue(any(n.startswith('no cache: ') for n in d['notes']), d['notes'])
         self.assertFalse(os.path.exists(self.m.cache))
+        self.assertEqual(os.listdir(os.path.join(tmp_root, f'heavy-facts-{UID}')), [])
+
+    def test_without_run_user_the_cache_is_a_private_temporary_folder(self):
+        # #844: a user with no user manager has no /run/user/<uid>; without a cache every call would start
+        # "elevated" and a --mb ask would never be OK. A folder only it can use in the temporary folder keeps it
+        tmp_root = os.path.join(self.tmp, 'tmp')
+        os.makedirs(tmp_root)
+        folder = os.path.join(tmp_root, f'heavy-facts-{UID}')
+        with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')), \
+                mock.patch.object(hf, 'TMP_ROOT', tmp_root):
+            code, d = self.facts('--mb', '64', env={'HEAVY_FACTS_CACHE': ''})
+            self.assertEqual((code, d['level']), (0, 'ok'), 'as with /run/user: a calm machine is free')
+            self.m.write('/proc/meminfo', self.m.meminfo(16384, 6000))
+            again = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=4), env={'HEAVY_FACTS_CACHE': ''})
+            self.assertEqual(again[1]['memory'], d['memory'], 'a second call within 5 s is answered from the cache')
+            self.assertEqual(os.lstat(folder).st_mode & 0o777, 0o700)
+            self.assertEqual(os.listdir(folder), ['heavy-facts.json'])
+            for planted in ('link', 'file', 'open'):     # a folder that is not one only this user can use: no cache
+                with self.subTest(planted=planted):
+                    shutil.rmtree(folder)
+                    if planted == 'link':
+                        os.makedirs(os.path.join(self.tmp, 'elsewhere'), mode=0o700, exist_ok=True)
+                        os.symlink(os.path.join(self.tmp, 'elsewhere'), folder)
+                    elif planted == 'file':
+                        open(folder, 'w').close()
+                    else:
+                        os.mkdir(folder)
+                        os.chmod(folder, 0o755)
+                    code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=30),
+                                         env={'HEAVY_FACTS_CACHE': ''})
+                    self.assertEqual((code, d['level']), (75, 'elevated'))
+                    self.assertTrue(any(n.startswith('no cache: ') for n in d['notes']), d['notes'])
+                    self.assertEqual(os.listdir(os.path.join(self.tmp, 'elsewhere')) if planted == 'link' else [], [])
+                    if planted == 'open':
+                        os.rmdir(folder)
+                    else:
+                        os.unlink(folder)
+                    os.mkdir(folder, 0o700)
 
 
 def fake_heavy(tmp, body):
@@ -646,6 +745,23 @@ class T3Capacity(Case):
         code, out, _ = self.cli([T3CAP, '64'], cwd=other)
         self.assertEqual(out.splitlines()[1], 'reservations: game:own')
         self.assertIn('available=12288MB', out.splitlines()[0])
+
+    def test_reserved_and_available_count_each_once(self):
+        # #923: available= already has the reservations' hold taken off; reserved= is only what agents and jobs may
+        # still grow into, so available - reserved counts each once. The agent working in the reserved folder owes
+        # its debt there, so the reservation holds the rest
+        other = os.path.join(self.tmp, 'other')
+        with open(os.path.join(self.m.reserve, 'game.conf'), 'w') as f:
+            f.write(f'1536 {other}/\n')
+        self.m.process(4001, other, 300)
+        self.m.agent('a', 300, pids=(4001,))
+        owed = self.cost(WRITER) - 300
+        code, out, _ = self.cli([T3CAP, '64'])
+        first, second = out.splitlines()[:2]
+        self.assertRegex(first, self.FIRST)
+        self.assertIn(f' reserved={owed}MB ', first)
+        self.assertIn(f'available={12288 - (1536 - 300 - owed)}MB ', first)
+        self.assertEqual(second, f'reservations: game:1536MB(using 300,holding {1536 - 300 - owed},owed {owed})')
 
     def test_available_counts_every_reservation_even_those_trimmed_from_the_answer(self):
         with open(os.path.join(self.m.reserve, 'many.conf'), 'w') as f:
@@ -915,6 +1031,30 @@ class RedCheck(Case):
             mod = self.broken(line, '            pass\n')
             self.assertGreater(self.failing(Holds, name, mod), 0, line)
             self.assertEqual(self.failing(Holds, name, hf), 0, name)
+
+    def test_without_the_923_and_844_fixes_their_tests_fail(self):
+        for line, instead, cls, name in (
+                ("        r['owedMb'] = sum(debt(rule, learned, pieces[i], m['totalMb']) for i in "
+                 "sorted(r.pop('pieces')))\n", "        r['owedMb'] = 0 * len(r.pop('pieces'))\n", Reservations,
+                 'test_an_agent_or_job_working_in_the_folder_is_counted_once'),
+                ("    res = [{'mb': r['mb'], 'useMb': r['useMb'] + r['owedMb']}",
+                 "    res = [{'mb': r['mb'], 'useMb': r['useMb']}", Reservations,
+                 'test_an_agent_or_job_working_in_the_folder_is_counted_once'),
+                ("    tier = 'full' if mine else 'machine' if v2 and os.path.isdir(ROOT + USERS) else 'basic'\n",
+                 "    tier = 'full' if mine else 'basic'\n", Ledger,
+                 'test_no_user_manager_gets_the_machine_wide_answer'),
+                ("    basic = readings['tier'] not in ('full', 'machine')\n",
+                 "    basic = readings['tier'] != 'full'\n", Ledger,
+                 'test_no_user_manager_gets_the_machine_wide_answer'),
+                ("        return None, f'no cache: {folder} is not a folder only this user can use: every call starts "
+                 "\"elevated\"'\n", "        pass\n", State,
+                 'test_without_run_user_the_cache_is_a_private_temporary_folder'),
+                ("    if os.path.isdir(run):\n        return run + '/heavy-facts.json', None\n",
+                 "    return (run + '/heavy-facts.json', None) if os.path.isdir(run) else (None, 'no cache')\n", State,
+                 'test_without_run_user_the_cache_is_a_private_temporary_folder')):
+            with self.subTest(line=line[:60]):
+                self.assertGreater(self.failing(cls, name, self.broken(line, instead)), 0, line)
+                self.assertEqual(self.failing(cls, name, hf), 0, name)
 
     def test_without_each_913_fix_its_hold_test_fails(self):
         for line, instead, name in (

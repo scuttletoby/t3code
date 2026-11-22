@@ -15,30 +15,37 @@ capacityReadings.ts). Pieces: heavy's admitted jobs (its live queue tickets; eve
 kind for its name or else unknownKinds.job; demand from the job's scope) and T3's agent scopes (`t3code-*.scope`
 under an `app-t3code*` slice; a scope has no kind label, so it counts as unknownKinds.other: a writer), plus the
 other users' heavy jobs and agent scopes read from their user managers' cgroups (unknownKinds.job and writers).
-Full tier: cgroup v2 and this user's systemd user manager. Basic tier (either missing): agents and other users'
-work cannot be counted, so the answer is never free (a note says why). A signal that is there but unreadable is
-"elevated": then only the rule's floors admit, never the budget; facts that cannot be read admit nothing.
+Full tier: cgroup v2 and this user's systemd user manager. Machine tier: cgroup v2 and user.slice, but no user
+manager of this user's (a CI runner's user: no lingering, no login session): it has no agent or heavy job scopes of
+its own, every user's are counted as above, so it gets the same answer as a caller with a user manager (a note and
+the reason say "machine-wide numbers"). Basic tier (no cgroup v2, or neither a user manager nor user.slice):
+agents and other users' work cannot be counted, so the answer is never free (a note says why). A signal that is
+there but unreadable is "elevated": then only the rule's floors admit, never the budget; facts that cannot be read
+admit nothing.
 
 Reservations: lines `<MB> <folder> [until=YYYY-MM-DD]` in *.conf files of $T3_CAPACITY_RESERVE_DIR, else
 ~/.config/t3-capacity/reserve.d. A folder matches itself and what is below it, never a sibling that shares its
 first letters (`/x/app` is not `/x/app-x`); its real path (links resolved) matches too. Each holds MB less what
-this user's processes working in the folder use (RssAnon + RssShmem + VmSwap); it does not hold back a caller whose
-working folder is in it; past its until date, or broken, it holds nothing (a note says so).
+this user's processes working in the folder use (RssAnon + RssShmem + VmSwap), and less what this user's agents and
+heavy jobs with a process working in it still owe the rule (their cost less their demand: that room is held as
+their debt already, so it is counted once, #923); it does not hold back a caller whose working folder is in it;
+past its until date, or broken, it holds nothing (a note says so).
 
-Readings are kept 5 seconds in /run/user/<uid>/heavy-facts.json ($HEAVY_FACTS_CACHE; --fresh reads again), written
-whole through a rename; a cache that is old, from the future, broken, of another version, of other settings (slice,
-queue, reservations folder) or not this user's own is read again. The pressure level (and the swap free its trend
-needs; a state without it waits one more read before it can step down) carries from one reading to the
-next (the rule's hysteresis) while the last one is at most 5 minutes old; without a cache folder nothing can carry,
-so the level starts "elevated" on every call (it never drops straight to ok). Learned job costs: heavy's peaks
-(lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost, not heavy's own
-reservation for it (heavy's queue holds that one back itself).
+Readings are kept 5 seconds in /run/user/<uid>/heavy-facts.json ($HEAVY_FACTS_CACHE; --fresh reads again; a user
+without /run/user/<uid>, as one with no user manager, uses <temporary folder>/heavy-facts-<uid>/, a folder only it
+can use: one that is not is no cache), written whole through a rename; a cache that is old, from the future, broken,
+of another version, of other settings (slice, queue, reservations folder) or not this user's own is read again. The
+pressure level (and the swap free its trend needs; a state without it waits one more read before it can step down)
+carries from one reading to the next (the rule's hysteresis) while the last one is at most 5 minutes old; without a
+cache folder nothing can carry, so the level starts "elevated" on every call (it never drops straight to ok). Learned
+job costs: heavy's peaks (lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost,
+not heavy's own reservation for it (heavy's queue holds that one back itself).
 """
-import datetime, errno, fcntl, fnmatch, json, math, os, pwd, re, signal, stat, subprocess, sys, time
+import datetime, errno, fcntl, fnmatch, json, math, os, pwd, re, signal, stat, subprocess, sys, tempfile, time
 
 CACHE_SECONDS, CARRY_SECONDS, ANSWER_SECONDS, STALE_TMP_SECONDS = 5, 300, 5, 60
 EXIT_FREE, EXIT_BUSY, EXIT_ERROR = 0, 75, 1
-CACHE_VERSION = 2
+CACHE_VERSION = 3                               # 3: reservations carry owedMb (#923)
 AGENT_SCOPE_RE = re.compile(r'^t3code-[A-Za-z0-9_.:-]+\.scope\Z')
 SCOPE_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\.scope\Z')
 TICKET_RE = re.compile(r'^t-[0-9]{1,15}-[0-9]{1,10}\.json\Z')
@@ -50,9 +57,13 @@ CACHE_KEYS = {'v', 'key', 'atMs', 'tier', 'facts', 'boxPsi', 'reservations', 'le
               'queue', 'pressure'}
 USERS = '/sys/fs/cgroup/user.slice'
 RUN_USER = '/run/user'                          # the cache's folder: /run/user/<uid>
+TMP_ROOT = None                                 # without it: <TMP_ROOT>/heavy-facts-<uid> (None: the temporary folder)
 ROOT = os.environ.get('HEAVY_FACTS_ROOT', '')     # tests: /proc and /sys are read under this folder
-BASIC_WHY = 'basic tier: no cgroup v2 or no systemd user manager for this user, so agents and other users\' work ' \
-            'cannot be counted: never free here'
+BASIC_WHY = 'basic tier: no cgroup v2, or neither a systemd user manager for this user nor user.slice, so agents and ' \
+            'other users\' work cannot be counted: never free here'
+MACHINE_WHY = 'machine tier: no systemd user manager for this user, so it has no agents or heavy jobs of its own; ' \
+              'judged on the machine-wide numbers (memory, swap, pressure, holds, reservations, every user\'s heavy ' \
+              'jobs and agents)'
 
 
 def _read(path, limit=1 << 16):
@@ -159,8 +170,10 @@ def under(cwd, prefixes):
     return any(c.startswith(p) for p in prefixes)
 
 
-def reservations(cfg_dir, today):
-    """([{name, prefixes, mb, useMb}], notes)."""
+def reservations(cfg_dir, today, owners=None):
+    """([{name, prefixes, mb, useMb, pieces}], notes). owners: {pid: piece index} of this user's counted pieces;
+    `pieces` is the set of those with a process working in the folder."""
+    owners = owners or {}
     out, notes = [], []
     try:
         files = sorted(f for f in os.listdir(cfg_dir) if f.endswith('.conf'))
@@ -187,7 +200,8 @@ def reservations(cfg_dir, today):
             except ValueError as e:
                 notes.append(f'reservation {f}:{n} ignored ({e})')
                 continue
-            out.append({'name': f[:-5], 'prefixes': folder_prefixes(words[1]), 'mb': int(words[0]), 'useMb': 0})
+            out.append({'name': f[:-5], 'prefixes': folder_prefixes(words[1]), 'mb': int(words[0]), 'useMb': 0,
+                        'pieces': set()})
     if out:
         for pid in os.listdir(ROOT + '/proc'):
             try:
@@ -201,6 +215,8 @@ def reservations(cfg_dir, today):
             for r in out:
                 if under(cwd, r['prefixes']):
                     r['useMb'] += kb / 1024
+                    if pid in owners:
+                        r['pieces'].add(owners[pid])
     return out, notes
 
 
@@ -284,7 +300,7 @@ def held_cgroups(host, holds, user):
             # so its use and limit cannot be known: it holds its whole budgetMb.
             notes.append(f'hold {h["label"]}: no memory controller (no memory.stat): holds its whole budget '
                          f'{h["budgetMb"]} MB')
-            out.append({'name': h['label'], 'prefixes': [], 'mb': h['budgetMb'], 'useMb': 0})
+            out.append({'name': h['label'], 'prefixes': [], 'mb': h['budgetMb'], 'useMb': 0, 'owedMb': 0})
             continue
         if use['demandMb'] is None:
             notes.append(f'hold {h["label"]}: its memory.stat cannot be read: holds its whole budget')
@@ -301,8 +317,28 @@ def held_cgroups(host, holds, user):
         # here (missing or unreadable swap: 0, as in the shared reader).
         swap = rd._mb_of(rd._one_number(rd._text_of(host, folder + '/memory.swap.current'))) or 0
         ram = None if use['demandMb'] is None else max(0, use['demandMb'] - swap)
-        out.append({'name': h['label'], 'prefixes': [], 'mb': mb, 'useMb': ram or 0})
+        out.append({'name': h['label'], 'prefixes': [], 'mb': mb, 'useMb': ram or 0, 'owedMb': 0})
     return out, notes
+
+
+def scope_pids(folder):
+    """The processes (pids as text) in a cgroup folder and the cgroups below it; none where it cannot be read."""
+    pids = set()
+    for dirpath, _dirs, _files in os.walk(ROOT + folder):
+        try:
+            with open(os.path.join(dirpath, 'cgroup.procs'), 'rb') as f:
+                pids.update(f.read(1 << 20).decode('ascii', 'replace').split())
+        except OSError:
+            pass
+    return pids
+
+
+def debt(rule, learned, piece, total_mb):
+    """What a piece still owes the rule: its cost less its demand (capacity_rule.decision's owed part for it)."""
+    cost = cr.cost_of(rule, cr.capacity_kind(rule, piece['kind']), learned, piece.get('declaredMb'))['mb']
+    d = piece['demandMb']
+    d = math.floor(d) if cr.is_num(d) and total_mb is not None and 0 <= d <= total_mb else 0
+    return max(0, cost - d)
 
 
 def scope_demand(host, folder):
@@ -354,10 +390,14 @@ def read_machine(rule, where, carry, now):
     host = rd.RealHost(ROOT)
     m = rd.read_machine(host)
     manager = f'{USERS}/user-{uid}.slice/user@{uid}.service'
-    full = m['cgroup'] == 'v2' and os.path.isdir(ROOT + manager)
+    v2 = m['cgroup'] == 'v2'
+    mine = v2 and os.path.isdir(ROOT + manager)     # this user's own agents and heavy jobs can be read
+    # #844: no user manager of its own (a CI runner's user): nothing of its own to count, everyone else's as usual
+    tier = 'full' if mine else 'machine' if v2 and os.path.isdir(ROOT + USERS) else 'basic'
+    full = tier != 'basic'
     heavy_rel = '/' + slice_path(where['slice'])
     heavy_box = manager + heavy_rel
-    pieces, running, waiting = [], 0, 0
+    pieces, running, waiting, owners = [], 0, 0, {}
     for t in tickets(where['queueDir']):
         if t['state'] == 'waiting':
             waiting += 1
@@ -365,47 +405,57 @@ def read_machine(rule, where, carry, now):
         running += 1
         scope = t.get('scope')
         demand = None
-        if full and isinstance(scope, str) and SCOPE_RE.match(scope):
+        if mine and isinstance(scope, str) and SCOPE_RE.match(scope):
             # an admitted job whose scope is not there (yet) owes its whole cost: it is never dropped
             demand = rd.read_piece_demand(host, 'v2', cg(heavy_box + '/' + scope)).get('demandMb')
+            owners.update(dict.fromkeys(scope_pids(heavy_box + '/' + scope), len(pieces)))
         pieces.append({'kind': ticket_kind(rule, t['kind']), 'demandMb': demand, 'declaredMb': t.get('mb')})
     own_jobs = running
     agents, agent_box = 0, None
-    if full:
+    if mine:
         scopes, agent_box = agent_scopes(manager)
         for s in scopes:
             demand = scope_demand(host, s)
             if demand is not False:
+                owners.update(dict.fromkeys(scope_pids(s), len(pieces)))
                 pieces.append({'kind': rule['unknownKinds']['other'], 'demandMb': demand})   # no kind label: a writer
                 agents += 1
+    if full:
         more, jobs, other_agents, blind = other_users(rule, host, uid, heavy_rel)
         pieces += more
         running, agents = running + jobs, agents + other_agents
         if jobs or other_agents:
             notes.append(f'other users: {jobs} heavy job(s), {other_agents} agent(s) (counted)')
         if blind:
-            full = False
+            full, tier = False, 'basic'
             notes += blind
-    res, more = reservations(where['reserveDir'], now.date())
+    learned_notes = []
+    learned = where['learned'](learned_notes)
+    res, more = reservations(where['reserveDir'], now.date(), owners)
     notes += more
+    for r in res:           # #923: a piece working in a reservation's folder owes its debt once, not there too
+        r['owedMb'] = sum(debt(rule, learned, pieces[i], m['totalMb']) for i in sorted(r.pop('pieces')))
     held, more = held_cgroups(host, where['holds'], where['user'])
     notes += [f'reservation {n}.conf has the name of a machine-file hold: both hold; rename the file'
               for n in sorted({r['name'] for r in res} & {h['label'] for h in where['holds']})]
     res += held
     notes += more
     notes += [f'{g["reading"]}: {g["instead"]}' for g in m['gaps']]
-    if not full:
+    if tier == 'basic':
         notes.append(BASIC_WHY)
+    elif tier == 'machine':
+        notes.append(MACHINE_WHY)
+    notes += learned_notes
     # A box with no live piece of its own passes no box pressure (as the server's observer); one that has some is
     # read by the shared reader: missing or broken is "unreadable".
-    box_psi = {'job': rd.read_box_psi(host, m, cg(heavy_box)) if full and own_jobs else None,
+    box_psi = {'job': rd.read_box_psi(host, m, cg(heavy_box)) if full and mine and own_jobs else None,
                'agent': rd.read_box_psi(host, m, cg(agent_box)) if full and agent_box and agents else None}
     return {'v': CACHE_VERSION, 'key': where['key'], 'atMs': int(now.timestamp() * 1000),
-            'tier': 'full' if full else 'basic',
+            'tier': tier,
             'facts': {'totalMb': m['totalMb'], 'availableMb': m['availableMb'], 'cpuCores': m['cpuCores'],
                       'pieceCaps': full, 'swap': m['swap'], 'psi': m['psi'], 'osLevel': m['osLevel'],
                       'pieces': pieces},
-            'boxPsi': box_psi, 'reservations': res, 'learned': where['learned'](notes), 'carry': carry,
+            'boxPsi': box_psi, 'reservations': res, 'learned': learned, 'carry': carry,
             'notes': notes, 'load1': load1(), 'queue': {'running': running, 'waiting': waiting, 'agents': agents}}
 
 
@@ -459,7 +509,7 @@ def own(r, cwds):
 
 def facts_for(readings, group, cwds):
     """The rule's facts for a piece of the group, as its caller sees them (its own reservations left out)."""
-    res = [{'mb': r['mb'], 'useMb': r['useMb']} for r in readings['reservations'] if not own(r, cwds)]
+    res = [{'mb': r['mb'], 'useMb': r['useMb'] + r['owedMb']} for r in readings['reservations'] if not own(r, cwds)]
     return dict(readings['facts'], boxPsi=readings['boxPsi'][group], reservations=res)
 
 
@@ -472,7 +522,7 @@ def answer(rule, readings, kind=None, need_mb=None, cwds=()):
     if need_mb is not None:
         ask['declaredMb'] = need_mb
     d = cr.decision(rule, facts_for(readings, group, cwds), ask, learned, carry.get(group), now_ms)
-    basic = readings['tier'] != 'full'
+    basic = readings['tier'] not in ('full', 'machine')
     free = not basic and (d['admit'] if kind else d['level'] == 'ok') and (
         need_mb is None or d['freeMb'] is not None and need_mb <= d['freeMb'])
     fits = {}
@@ -496,13 +546,14 @@ def answer(rule, readings, kind=None, need_mb=None, cwds=()):
                       'pressureFull10': facts['psi']['fullAvg10Pct'] if isinstance(facts['psi'], dict) else None},
            'queue': readings['queue'], 'cpu': {'cores': facts['cpuCores'], 'load1': readings['load1']},
            'reservations': [{'name': r['name'], 'mb': r['mb'], 'useMb': math.floor(r['useMb']),
-                             'own': own(r, cwds)} for r in readings['reservations']],
+                             'owedMb': r['owedMb'], 'own': own(r, cwds)} for r in readings['reservations']],
            'notes': list(readings['notes'])}
     if not free:
         why = 'basic tier' if basic and (d['admit'] if kind else d['level'] == 'ok') else \
             (d['reason'] if kind else f'{need_mb} MB')
         out['reason'] = (f'{kind}: {why}' if kind else why) + \
-            f' ({d["freeMb"]} MB free, {need_mb if need_mb is not None else d["costMb"]} MB needed, level {d["level"]})'
+            f' ({d["freeMb"]} MB free, {need_mb if need_mb is not None else d["costMb"]} MB needed, level ' \
+            f'{d["level"]}{", machine-wide numbers: no user manager" if readings["tier"] == "machine" else ""})'
     while len(json.dumps(out)) > 4000 and (out['notes'] or out['reservations']):
         (out['notes'] or out['reservations']).pop()
     return (EXIT_FREE if free else EXIT_BUSY), out
@@ -521,6 +572,26 @@ def options(argv):
     if not KIND_RE.match(opts.get('--kind', 'x')) or not re.match(r'^[0-9]{1,7}\Z', opts.get('--mb', '0')):
         return None
     return opts
+
+
+def cache_path(run):
+    """(the cache file, None) or (None, why there is none). /run/user/<uid> when it is there; else (#844: a user with
+    no user manager and no login session has none) a folder only this user can use in the temporary folder, made if
+    missing: one that is a link, another user's or open to others (planted first) is no cache, and so no carry."""
+    if os.path.isdir(run):
+        return run + '/heavy-facts.json', None
+    folder = os.path.join(TMP_ROOT or tempfile.gettempdir(), f'heavy-facts-{os.getuid()}')
+    try:
+        try:
+            os.mkdir(folder, 0o700)
+        except FileExistsError:
+            pass
+        st = os.lstat(folder)
+    except OSError as e:
+        return None, f'no cache: {folder} cannot be made ({e.strerror or e}): every call starts "elevated"'
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return None, f'no cache: {folder} is not a folder only this user can use: every call starts "elevated"'
+    return os.path.join(folder, 'heavy-facts.json'), None
 
 
 def facts_main(argv, slice_name, queue_root, hq, now=None):
@@ -561,7 +632,8 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
         where['user'] = user_name()
         where['key'] = '\n'.join((slice_name, where['queueDir'], where['reserveDir'], where['user'],
                                   json.dumps(where['holds'], sort_keys=True)))
-        cache = os.environ.get('HEAVY_FACTS_CACHE') or (run + '/heavy-facts.json' if os.path.isdir(run) else None)
+        cache, why = (os.environ['HEAVY_FACTS_CACHE'], None) if os.environ.get('HEAVY_FACTS_CACHE') else \
+            cache_path(run)
         now = now or datetime.datetime.now(datetime.timezone.utc)
         now_ms = int(now.timestamp() * 1000)
         # Without a cache folder nothing carries the pressure level from one call to the next: start every call
@@ -577,6 +649,8 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
                     write_cache(cache, readings)
                 except OSError as e:
                     readings['notes'].append(f'cache not written ({e.strerror or e})')
+            elif why:
+                readings['notes'].append(why)
         code, out = answer(rule, readings, opts.get('--kind'), int(opts['--mb']) if '--mb' in opts else None,
                            (os.getcwd(),))
     except Exception as e:      # a reading this code did not expect: no answer, never "free"

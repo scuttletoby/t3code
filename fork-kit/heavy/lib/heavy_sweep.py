@@ -938,13 +938,16 @@ class Sweep:
         started since is newer than its note could be old. A note heavy has not read yet (its scope ended a moment
         before this sweep began) costs at most a container that this sweep or the next removes instead of heavy.
         Only in a folder heavy would use (bin/heavy own_folder): labelled/, heavy/ and the base each a real folder
-        (no symlink) of this user's that no one else can write. Returns how many were removed."""
+        (no symlink) of this user's that no one else can write, and for the second (state) folder the base's parent
+        too (parent_ok). Returns how many were removed."""
         listed_at, known = getattr(self, 'known_scopes', (None, None))
         if known is None:
             return 0
         before = listed_at - cfg['minAgeSeconds']
         removed = 0
-        for folder in self.note_folders():
+        for i, folder in enumerate(self.note_folders()):
+            if i == 1 and not parent_ok(os.path.dirname(os.path.dirname(folder))):
+                continue
             try:
                 # the folder, heavy/ and the base: each a real folder of this user's only it can write (own_folder)
                 if any(not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid or st.st_mode & 0o022
@@ -1246,12 +1249,12 @@ def state_base():
     for home in homes:
         if not home or not os.path.isabs(home):
             continue
+        home = os.path.realpath(home)   # resolved once: a HOME link swapped after this check changes nothing (#771)
         try:
-            st = os.stat(home)
+            st = os.lstat(home)
         except OSError:
             continue
-        if (stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022
-                and os.path.realpath(home) != '/'):
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022 and home != '/':
             return os.path.join(home, '.local', 'state')
     return ''
 
@@ -1261,12 +1264,25 @@ def note_bases():
     return os.path.join(RUNTIME_ROOT, str(os.getuid())), state_base()
 
 
-def note_in(base, scope):
+def parent_ok(base):
+    """bin/heavy own_folder's rule for the state base's parent (~/.local): a real folder (no symlink) this user owns
+    that no one else can write (#771). Not for the /run/user base, whose parent is root's."""
+    try:
+        st = os.lstat(os.path.dirname(base))
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022
+
+
+def note_in(base, scope, state=False):
     """Note the scope in <base>/heavy/labelled (bin/heavy own_folder, the same rule): (folder, '') or ('', why not).
     heavy/ and heavy/labelled are made if missing (heavy has made its own already: one made here is never heavy's),
-    but never base itself: unlike heavy, docker-label never makes ~/.local/state."""
+    but never base itself: unlike heavy, docker-label never makes ~/.local/state. state: base is the state base, so
+    its parent must pass parent_ok too."""
     if not base:
         return '', 'no home folder this user owns'
+    if state and not parent_ok(base):
+        return '', f'{os.path.dirname(base)} is not a folder only this user can write'
     uid = os.getuid()
     folder = os.path.join(base, 'heavy', 'labelled')
     try:
@@ -1298,8 +1314,8 @@ def note_label(value, marks=None):
     marks = os.environ.get('HEAVY_MARKS') if marks is None else marks
     reads = set(filter(None, (marks or '').split(',')))
     whys = []
-    for base in note_bases():
-        folder, why = note_in(base, scope)
+    for i, base in enumerate(note_bases()):
+        folder, why = note_in(base, scope, state=i == 1)
         if folder and marks:
             try:
                 st = os.stat(folder)
