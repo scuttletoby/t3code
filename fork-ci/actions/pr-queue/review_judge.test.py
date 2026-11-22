@@ -5,7 +5,7 @@ The shared vectors (review.vectors.json: `cases`, `findings`, `scans`, `rounds`)
 rest here: reading git's name-status output, and that a rule set the parser
 would refuse, or a diff line nobody knows, never judges.
 """
-import dataclasses, json, os, sys, time, unittest
+import dataclasses, json, os, re, sys, time, types, unittest, unittest.mock
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 
@@ -15,6 +15,8 @@ import config  # noqa: E402
 import lens  # noqa: E402
 import review_config as rc  # noqa: E402
 import review_judge as rj  # noqa: E402
+sys.path.insert(0, os.path.join(HERE, '..', 'head-check'))
+import head_check  # noqa: E402  (the `reads` vectors: lens_reads, review_rounds and verdict, as the gate runs them)
 
 with open(os.path.join(HERE, 'review.vectors.json'), encoding='utf-8') as _f:
     VECTORS = json.load(_f)
@@ -343,9 +345,10 @@ class Rounds(unittest.TestCase):
 # Every section of review.vectors.json, replayed whole: the TypeScript side (apps/server/src/reviewRules) runs the same
 # sections, and each side fails on a section or a vector field it does not run, so neither can skip one quietly.
 SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds',
-            'linear', 'py_unicode', 'unicode'}
+            'reads', 'linear', 'py_unicode', 'unicode'}
 FIELDS = {'linear': {'name', 'fn', 'parts', 'expect', 'ms'},
-          'unicode': {'name', 'body', 'findings', 'section', 'unassigned'},
+          'unicode': {'name', 'body', 'findings', 'section', 'unassigned', 'refused'},
+          'reads': {'name', 'posts', 'head', 'same', 'override_authors', 'required', 'expect'},
           'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
           'findings': {'name', 'group', 'body', 'findings', 'section'},
           'scans': {'name', 'posts', 'history', 'entries'},
@@ -354,13 +357,14 @@ FIELDS = {'linear': {'name', 'fn', 'parts', 'expect', 'ms'},
 SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',))
 
 
-def scan(posts):
-    """The vector's posts as a pull request: each by `someone`, one second apart unless it names its `when`; a comment by
-    default, else a `review` (its flags read unless `flags` is false) or an `inline` review comment."""
+def vector_pr(posts):
+    """The vector's posts as a pull request: each by its `author` (else `someone`), one second apart unless it names its
+    `when`; a comment by default, else a `review` (its flags read unless `flags` is false) or an `inline` review
+    comment."""
     pr = {'comments': [], 'reviews': [], lens.REVIEW_FLAGS: {}, lens.REVIEW_COMMENTS: []}
     for i, p in enumerate(posts):
         when = p.get('when', f'2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z')
-        post = {'body': p['body'], 'author': {'login': 'someone'}, 'authorAssociation': 'OWNER'}
+        post = {'body': p['body'], 'author': {'login': p.get('author', 'someone')}, 'authorAssociation': 'OWNER'}
         flags = {'includesCreatedEdit': p.get('edited', False), 'isMinimized': p.get('hidden', False)}
         kind = p.get('kind', 'comment')
         if kind == 'review':
@@ -370,7 +374,11 @@ def scan(posts):
                 pr[lens.REVIEW_FLAGS][f'R{i}'] = flags
         else:
             pr['comments' if kind == 'comment' else lens.REVIEW_COMMENTS].append({**post, 'createdAt': when, **flags})
-    found, history = SCAN.lens_scan(pr)
+    return pr
+
+
+def scan(posts):
+    found, history = SCAN.lens_scan(vector_pr(posts))
     return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}
 
 
@@ -382,6 +390,49 @@ def replay_round(v):
                         v.get('decided', False), (lambda s: changes.get(s, s)) if changes else None)
     return {'round': r.round, 'approach': r.approach, 'over_cap': r.over_cap,
             'findings': [list(f) for f in r.findings], 'problems': list(r.problems), 'text': r.text(review)}
+
+
+class _MergeCommit:
+    """A checkout of GitHub's merge commit of `head` that knows no history (own_change: each read its own change)."""
+    holder = 'the checkout merges'
+
+    def __init__(self, head):
+        self.parents = ('0' * 40, head)
+
+    def merge_parents(self):
+        return self.parents
+
+    def git(self, *a):
+        return types.SimpleNamespace(returncode=1, stdout='', stderr='no history here')
+
+    def has(self, sha):
+        return True
+
+    fetch = has
+
+
+AGAIN_RE = re.compile(r'lens (.+?): its newest report (?:reads nothing|has no findings section)')
+
+
+def replay_reads(v):
+    """What the gate reads of the lens posts at `head`, under the `basic` rules in enforce with findings judged:
+    lens.Review.lens_reads (each key's sha), the keys review_rounds fails until that lens posts again (UNREAD, or a
+    report with no findings section), and whether head_check.verdict and the rounds pass. `same`: the reads that are
+    the head's change merged with the base (head_check.same_change)."""
+    head = v['head']
+    pr = {**vector_pr(v['posts']), 'isDraft': False, 'headRefOid': head}
+    rules = dataclasses.replace(CONFIGS['basic'], mode='enforce', findings=True,
+                                override_authors=tuple(v['override_authors']))
+    checkout = _MergeCommit(head)
+    same = lambda _checkout, h, read: (read == h or read in v['same'], 'the same change')   # noqa: E731
+    with unittest.mock.patch.object(head_check, 'same_change', same):
+        reads = {k: sha for k, (sha, _, _) in SCAN.lens_reads(pr).items()}
+        rounds, why = head_check.review_rounds(rules, SCAN, pr, checkout, VECTORS['override_prefix'])
+        ok, _, _ = head_check.verdict(pr, SCAN, checkout, {lens.lens_key(n): n for n in v['required']})
+    if rounds is None:
+        raise AssertionError(why)
+    again = sorted(m.group(1) for p in rounds.problems for m in [AGAIN_RE.match(p)] if m)
+    return {'reads': reads, 'again': again, 'passes': ok and not rounds.problems}
 
 
 class SharedVectors(unittest.TestCase):
@@ -429,12 +480,21 @@ class SharedVectors(unittest.TestCase):
                 self.assertEqual(([list(f) for f in said], section), (v['findings'], v['section']))
                 self.assertEqual(v['unassigned'],
                                  sorted({f'U+{ord(c):04X}' for c in v['body'] if unicodedata.category(c) == 'Cn'}))
+                # What T3 refuses on a runtime that assigns them (a letter, number, mark, format or space there): a
+                # subset; the rest (a new symbol) reads alike here and there.
+                self.assertLessEqual(set(v['refused']), set(v['unassigned']))
 
     def test_every_scan(self):   # same comment twice, edited, hidden, old forms, no comment at all
         self.assertGreaterEqual(len(VECTORS['scans']), 31)
         for v in VECTORS['scans']:
             with self.subTest(v['name']):
                 self.assertEqual(scan(v['posts']), (v['history'], v['entries']))
+
+    def test_every_reads_vector(self):   # lens_start's copy of lens_reads, review_rounds' UNREAD and verdict
+        self.assertGreaterEqual(len(VECTORS['reads']), 10)
+        for v in VECTORS['reads']:
+            with self.subTest(v['name']):
+                self.assertEqual(replay_reads(v), v['expect'])
 
     def test_every_round(self):
         self.assertGreaterEqual(len(VECTORS['rounds']), 28)

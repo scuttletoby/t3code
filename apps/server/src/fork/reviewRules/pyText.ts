@@ -29,32 +29,50 @@ const PY_UNASSIGNED = new RegExp(`[^${PY_CLASS}]`, "gu");
 const IS_PY_UNASSIGNED = new RegExp(`^[^${PY_CLASS}]$`, "u");
 const UNASSIGNED = /\p{Cn}/gu;
 const IS_UNASSIGNED = /^\p{Cn}$/u;
-/** U+0000 to U+0377 are assigned in every Unicode version since 1.1. */
-const PAST_SAFE = /[\u0378-\u{10ffff}]/u;
+/** U+0000 to U+036F have been assigned since Unicode 1.1 (U+0370 to U+0377 since 5.1): no drift below them. */
+const PAST_SAFE = /[\u0370-\u{10ffff}]/u;
+/**
+ * What a rule reads of a code point: a letter or number (`\w`, digits), a mark (it can join the one before it in
+ * NFKC), a format character (`repr`, the findings' invisible-character rule) or a space.
+ */
+const READ_CLASS = /^[\p{L}\p{N}\p{M}\p{Cf}\p{Z}]$/u;
+
+/**
+ * A code point this runtime assigns and the gate's Python does not reads the same on both sides only when no rule reads
+ * it: Python reads every unassigned code point as no letter, number, mark, format character or space, with no case or
+ * NFKC mapping, and `repr` escapes it (pyText's `repr` does too). A new symbol, such as an emoji, reads alike.
+ */
+const readsOtherwise = (ch: string): boolean =>
+  READ_CLASS.test(ch) ||
+  ch.normalize("NFKC") !== ch ||
+  ch.toLowerCase() !== ch ||
+  ch.toUpperCase() !== ch;
 
 /** Text one of the rules cannot read as Python does: Python's Unicode and this runtime's assign a code point of it differently. */
 export class PyTextError extends Schema.TaggedError<PyTextError>()("PyTextError", {
   codePoints: Schema.Array(Schema.String),
+  /** The post that holds them (LensPost.where), when the text is a post's. */
+  where: Schema.optional(Schema.String),
 }) {
   override get message(): string {
     return (
-      `the text holds ${this.codePoints.join(", ")}, which the gate's Python (Unicode ${PY_UNICODE}) and this ` +
-      "runtime assign differently, so the two would read it differently"
+      `${this.where === undefined ? "the text" : `the post ${this.where}`} holds ${this.codePoints.join(", ")}, ` +
+      `which the gate's Python (Unicode ${PY_UNICODE}) and this runtime assign differently, so the two would read ` +
+      "it differently"
     );
   }
 }
 
 /**
- * Throws PyTextError when the text holds a code point that Python's Unicode (PY_UNICODE) and this runtime's do not
- * both assign or both leave unassigned. Such a code point reads differently in `\w`, digits, NFKC and case (`Ᲊ`,
- * new in Unicode 16, just before `major:` is a finding in the gate and none here), so the text is refused, never read
- * a second way. Unicode keeps an assigned character's normalization and case pairs stable, so the rest reads alike.
+ * Throws PyTextError when the text holds a code point only one of Python's Unicode (PY_UNICODE) and this runtime's
+ * assigns, and a rule reads it (readsOtherwise; always when only Python assigns it): `Ᲊ` (Unicode 16) before `major:`
+ * is a finding in the gate and none here. Code points both assign read alike, except upper case, which no rule reads.
  */
 export function pyUnicodeCheck(text: string): void {
   if (!PAST_SAFE.test(text)) return;
   const drift = new Set<number>();
   for (const [ch] of text.matchAll(PY_UNASSIGNED))
-    if (!IS_UNASSIGNED.test(ch)) drift.add(ch.codePointAt(0)!);
+    if (!IS_UNASSIGNED.test(ch) && readsOtherwise(ch)) drift.add(ch.codePointAt(0)!);
   for (const [ch] of text.matchAll(UNASSIGNED))
     if (!IS_PY_UNASSIGNED.test(ch)) drift.add(ch.codePointAt(0)!);
   if (drift.size === 0) return;
@@ -139,7 +157,7 @@ export function digitValue(ch: string): number {
   return n % 10;
 }
 
-/** repr(text) of a Python str. */
+/** repr(text) of a Python str: what the gate's Python leaves unassigned is not printable there, so it is escaped. */
 export function repr(text: string): string {
   const quote = text.includes("'") && !text.includes('"') ? '"' : "'";
   let out = "";
@@ -148,7 +166,10 @@ export function repr(text: string): string {
     if (ch === "\\" || ch === quote) out += "\\" + ch;
     else if (ch === "\t" || ch === "\n" || ch === "\r")
       out += { "\t": "\\t", "\n": "\\n", "\r": "\\r" }[ch];
-    else if (ch !== " " && /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Z}]/u.test(ch)) {
+    else if (
+      ch !== " " &&
+      (/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Z}]/u.test(ch) || IS_PY_UNASSIGNED.test(ch))
+    ) {
       const [p, w] = cp < 0x100 ? ["\\x", 2] : cp < 0x10000 ? ["\\u", 4] : ["\\U", 8];
       out += p + cp.toString(16).padStart(w as number, "0");
     } else out += ch;

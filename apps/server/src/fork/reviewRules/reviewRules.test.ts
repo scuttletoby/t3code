@@ -50,7 +50,9 @@ const FIELDS: Record<string, ReadonlyArray<string> | null> = {
   scans: ["name", "posts", "history", "entries"],
   linear: ["name", "fn", "parts", "expect", "ms"],
   py_unicode: null,
-  unicode: ["name", "body", "findings", "section", "unassigned"],
+  unicode: ["name", "body", "findings", "section", "unassigned", "refused"],
+  // Run by lensStart.test.ts: lens_start's copy of lens_reads, review_rounds and verdict.
+  reads: ["name", "posts", "head", "same", "override_authors", "required", "expect"],
   rounds: [
     "name",
     "config",
@@ -178,8 +180,9 @@ describe("the shared vectors", () => {
     assert.isAtLeast(V.unicode.length, 3);
     let refused = 0;
     for (const v of V.unicode) {
-      // Unassigned in the gate's Unicode and assigned here: those read differently.
-      const drift = (v.unassigned as string[]).filter(
+      // Unassigned in the gate's Unicode and assigned here as a letter, number, mark, format character or space: those
+      // read differently. A new symbol (an emoji) reads alike.
+      const drift = (v.refused as string[]).filter(
         (u) => !/^\p{Cn}$/u.test(String.fromCodePoint(Number.parseInt(u.slice(2), 16))),
       );
       if (drift.length === 0) {

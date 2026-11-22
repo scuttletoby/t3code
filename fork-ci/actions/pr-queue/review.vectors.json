@@ -1,5 +1,5 @@
 {
-  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a post that only looks like a report is a `comment without a first-line lens header` entry that reads nothing). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
+  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a post that only looks like a report is a `comment without a first-line lens header` entry that reads nothing). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). `reads`: posts as in `scans` (each by its `author`, else `someone`; an override comment is `<override_prefix> <sha>: ...`), the `head`, the reads that are its change merged with the base (`same`) and `override_authors`, under the `basic` rules in enforce with findings judged: lens.Review.lens_reads (each lens key's sha), the keys head_check.review_rounds fails until that lens posts again (`again`: UNREAD, or a report with no findings section) and whether head_check.verdict with the `required` lenses and the rounds pass (`passes`); T3's lens_start reads the same (lensStart.ts), and its vectors hold no finding and stay under the round cap. `unicode`: `refused` is what T3 refuses on a runtime that assigns those code points (a letter, number, mark, format character or space there): a new symbol reads alike on both sides. Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
   "config_path": ".github/pr-queue.json",
   "override_prefix": "override for head",
   "globs": [
@@ -2898,6 +2898,361 @@
         ],
         "text": "round 0 of 4; lens ｂ reported a major that no later round cleared (issue #99): 'major: y'; fix it, and lens ｂ posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person); lens 😀 reported a major that no later round cleared (issue #99): 'major: x'; fix it, and lens 😀 posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
       }
+    },
+    {
+      "name": "a finding line with a symbol new after Unicode 15.0 is shown escaped",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: the 🫩 race"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [["code", "major", "major: the 🫩 race"]],
+        "problems": [
+          "lens code reported a major that no later round cleared (issue #99): 'major: the \\U0001fae9 race'; fix it, and lens code posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+        ],
+        "text": "round 1 of 4; lens code reported a major that no later round cleared (issue #99): 'major: the \\U0001fae9 race'; fix it, and lens code posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+      }
+    }
+  ],
+  "reads": [
+    {
+      "name": "a report of the head reads it",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "a newer override covers an older report, which is still judged",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nstate: fine\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "override for head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: a person looked"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "an edited report under an agent's override is UNREAD",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none",
+          "edited": true
+        },
+        {
+          "body": "override for head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: a person looked"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": ["code"],
+        "passes": false
+      }
+    },
+    {
+      "name": "a person's override for the head clears an UNREAD report",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none",
+          "edited": true
+        },
+        {
+          "body": "override for head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: a person looked",
+          "author": "owner-person"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": ["Owner-Person"],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "a person's override for another change clears nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nstate: fine\nblocker: none\nmajor: none",
+          "edited": true
+        },
+        {
+          "body": "override for head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: a person looked",
+          "author": "owner-person"
+        },
+        {
+          "body": "override for head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb: a person looked"
+        }
+      ],
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "same": [],
+      "override_authors": ["owner-person"],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "again": ["code"],
+        "passes": false
+      }
+    },
+    {
+      "name": "a person's override for the same change clears it",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nstate: fine\nblocker: none\nmajor: none",
+          "edited": true
+        },
+        {
+          "body": "override for head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: a person looked",
+          "author": "owner-person"
+        }
+      ],
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "same": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      "override_authors": ["owner-person"],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "the newest override by time covers, not the last one listed",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: cccccccccccccccccccccccccccccccccccccccc\nstate: fine\nblocker: none\nmajor: none",
+          "when": "2026-01-01T00:00:01Z"
+        },
+        {
+          "body": "override for head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: a person looked",
+          "when": "2026-01-01T00:00:05Z"
+        },
+        {
+          "body": "override for head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb: a person looked",
+          "when": "2026-01-01T00:00:03Z",
+          "kind": "review"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "an override older than the report covers nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nstate: fine\nblocker: none\nmajor: none",
+          "when": "2026-01-01T00:00:09Z"
+        },
+        {
+          "body": "override for head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: a person looked",
+          "when": "2026-01-01T00:00:05Z"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "a report of the head with no findings section fails until that lens posts again",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": ["code"],
+        "passes": false
+      }
+    },
+    {
+      "name": "two lenses that read different heads",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lens: data-1 · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nstate: fine\nblocker: none\nmajor: none"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "data-1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "a short sha reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": null
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "a read of the same change merged with the base passes",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        }
+      ],
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "same": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "a required lens with no post fails",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code", "data-1"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "an override with no lens post reads nothing",
+      "posts": [
+        {
+          "body": "override for head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: a person looked"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": [],
+      "expect": {
+        "reads": {},
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "a review whose flags were not read is UNREAD under an agent's override",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none",
+          "kind": "review",
+          "flags": false
+        },
+        {
+          "body": "override for head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: a person looked"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": ["code"],
+        "passes": false
+      }
     }
   ],
   "linear": [
@@ -3132,6 +3487,52 @@
       ],
       "expect": null,
       "ms": 2000
+    },
+    {
+      "name": "major, a long run of a non-ASCII letter, x",
+      "fn": "read_findings",
+      "parts": [
+        ["lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor", 1],
+        ["é", 200000],
+        ["x", 1]
+      ],
+      "expect": [[], false],
+      "ms": 2000
+    },
+    {
+      "name": "major: none, a long run of non-ASCII spaces, x",
+      "fn": "read_findings",
+      "parts": [
+        [
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none",
+          1
+        ],
+        ["　 ", 100000],
+        ["x", 1]
+      ],
+      "expect": [[["major", "major: none x"]], false],
+      "ms": 2000
+    },
+    {
+      "name": "a wide table row of majors in another script",
+      "fn": "read_findings",
+      "parts": [
+        ["lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| ", 1],
+        ["major ü | ", 6000]
+      ],
+      "expect": [[], false],
+      "ms": 2000
+    },
+    {
+      "name": "a long run of non-ASCII letters and emoji before a read at",
+      "fn": "lens_problem",
+      "parts": [
+        ["x\n", 1],
+        ["ÿ😀", 40000],
+        ["read at 1234567", 1]
+      ],
+      "expect": "starts with 'x'",
+      "ms": 2000
     }
   ],
   "py_unicode": {
@@ -3144,21 +3545,32 @@
       "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nᲉmajor: x",
       "findings": [["major", "major: x"]],
       "section": true,
-      "unassigned": ["U+1C89"]
+      "unassigned": ["U+1C89"],
+      "refused": ["U+1C89"]
     },
     {
       "name": "a code point unassigned in every version",
       "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: x 󠂀",
       "findings": [["major", "major: x 󠂀"]],
       "section": true,
-      "unassigned": ["U+E0080"]
+      "unassigned": ["U+E0080"],
+      "refused": []
     },
     {
       "name": "only code points Python assigns",
       "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: İx 😀",
       "findings": [["major", "major: İx 😀"]],
       "section": true,
-      "unassigned": []
+      "unassigned": [],
+      "refused": []
+    },
+    {
+      "name": "a symbol new in Unicode 16 (an emoji) reads alike",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none 🫩",
+      "findings": [],
+      "section": true,
+      "unassigned": ["U+1FAE9"],
+      "refused": []
     }
   ]
 }

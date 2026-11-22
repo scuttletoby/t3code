@@ -3,6 +3,8 @@
  * vectors and the gate's lens corpus. A comment that only looks like a report, or holds a second header, is a
  * NO_HEADER entry that reads nothing, as in the gate. The caller picks the posts that count, in the gate's order.
  */
+import * as Schema from "effect/Schema";
+
 import {
   ALNUM,
   B,
@@ -11,6 +13,7 @@ import {
   byCodePoint,
   cut,
   isBlank,
+  PyTextError,
   pyI,
   pyUnicodeCheck,
   repr,
@@ -20,6 +23,7 @@ import {
   stripChars,
 } from "./pyText.ts";
 
+const isPyTextError = Schema.is(PyTextError);
 const TAG_OPEN = /<\/?[A-Za-z]/gu;
 const TAG_NARROW = /<\/?[A-Za-z][^<>]*>/gu;
 const LINK_NARROW = /!?\[([^[\]]*)\]\([^()]*\)/gu;
@@ -303,6 +307,8 @@ export interface LensEntry {
   readonly why: string | null;
   /** The lens name of its newest header; null for a NO_HEADER entry. */
   readonly name: string | null;
+  /** The post's body: review_judge reads the newest report's findings from it. */
+  readonly body: string;
 }
 
 export interface LensScan {
@@ -314,7 +320,8 @@ export interface LensScan {
 
 /**
  * lens.Review.lens_scan with each entry's age: the newest post per lens key by [when, index], `index` the post's place
- * in `posts`. `skip` leaves a post out (an override) but keeps its index. History stays in list order.
+ * in `posts`. `skip` leaves a post out (an override) but keeps its index. History stays in list order. A post the
+ * rules cannot read as Python does throws PyTextError naming that post (`where`).
  */
 export function lensEntries(
   posts: ReadonlyArray<LensPost>,
@@ -326,21 +333,31 @@ export function lensEntries(
   posts.forEach((post, i) => {
     if (skip(post)) return;
     const at: PostAt = [post.when, i];
+    const { body } = post;
     const hidden = !post.unread && post.hidden;
-    const problem = lensProblem(post.body, overridePrefix);
+    let problem: string | null;
+    let header: [string, string | null] | null;
+    let key: string;
+    try {
+      problem = lensProblem(body, overridePrefix);
+      header = problem ? null : lensHeader(body);
+      key = header ? lensKey(header[0]) : "";
+    } catch (error) {
+      if (isPyTextError(error) && error.where === undefined)
+        throw new PyTextError({ codePoints: error.codePoints, where: post.where });
+      throw error;
+    }
     if (problem) {
-      const key = `${NO_HEADER} (${post.where}, ${problem}${hidden ? ", hidden" : ""})`;
-      entries.set(key, { at, sha: null, why: null, name: null });
+      key = `${NO_HEADER} (${post.where}, ${problem}${hidden ? ", hidden" : ""})`;
+      entries.set(key, { at, sha: null, why: null, name: null, body });
       return;
     }
-    const header = lensHeader(post.body);
     if (!header) return;
     history.push(header);
-    const key = lensKey(header[0]);
     const was = entries.get(key);
     if (was && olderThan(at, was.at)) return;
     const why = post.unread ? FLAGS_UNREAD : hidden ? HIDDEN : post.edited ? EDITED : null;
-    entries.set(key, { at, sha: why ? null : header[1], why, name: header[0] });
+    entries.set(key, { at, sha: why ? null : header[1], why, name: header[0], body });
   });
   return { history, entries };
 }
