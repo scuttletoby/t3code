@@ -400,6 +400,114 @@ check("real tree: this commit's release would hold plain files only and workflow
       real_ok and entries, why)
 check("real tree: fork-ci-release.yml itself is not released (it starts on schedule)",
       real_ok and not any(p.endswith("fork-ci-release.yml") for _, _, p in entries))
+# --- every kit installs from this commit's release ---------------------------------------------------
+# A kit's bootstrap downloads a release commit, which holds only the config's paths, and runs the kit's installer
+# on it; the kits' own tests run from a full checkout, so a file the installer reads from outside those paths
+# passes them and fails every real install (heavy-install refused "capacity/capacity-rule.json is missing" on every
+# release after the capacity rule moved to packages/shared/src/capacity). Here the release's files are written to a
+# folder exactly as release_entries picks them, and each kit's installer, loaded from that folder, runs its own
+# file check on it: the same list and the same path rules install uses. A new kit with an installer needs a row.
+KIT_CHECK = r"""
+import importlib.machinery, importlib.util, json, os, sys
+top, kit, how = sys.argv[1:4]
+src = os.path.join(top, 'fork-kit', kit)
+def load(rel, name):
+    loader = importlib.machinery.SourceFileLoader(name, os.path.join(src, rel))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(mod)
+    return mod
+installer = sys.argv[4] if len(sys.argv) > 4 else ''
+if how == 'kit_install':        # agent-guards, cleaner, golive, schedule-kick: check_options' file part
+    m = load(installer, 'kit_installer')
+    inst, missing = m.INSTALLER, []
+    for rel in inst.source_files():
+        try:
+            inst.read_source(os.path.realpath(src), rel)
+        except m.kit_install.Refused as e:
+            missing.append(f'{rel}: {e}')
+    if not missing:
+        inst.check_same_installer(os.path.realpath(src))
+elif how == 'source_file':      # heavy (check_options), model-guard (install): SOURCE_FILES through source_file
+    m = load(installer, 'kit_installer')
+    missing = [rel for rel in m.SOURCE_FILES if not os.path.isfile(m.source_file(src, rel))]
+elif how == 'gh-apps':          # copy_tool: SOURCE_FILES under the kit folder
+    sys.path.insert(0, os.path.join(src, 'lib'))
+    from ghapps import install
+    missing = [rel for rel in install.SOURCE_FILES if not os.path.isfile(os.path.join(src, rel))]
+elif how == 'desk':             # install: missing_sources of the release's top folder
+    missing = load(installer, 'kit_installer').missing_sources(top)
+elif how == 'pc-agents':        # setup: CODE sources under the release's top folder
+    missing = [s for s in load(installer, 'kit_installer').k.CODE if not os.path.isfile(os.path.join(top, s))]
+print(json.dumps(missing))
+"""
+# kit -> (how its installer checks its files, the installer as the bootstrap runs it)
+KITS = {"agent-guards": ("kit_install", "sbin/agent-guards-install"),
+        "cleaner": ("kit_install", "sbin/fork-cleaner-install"),
+        "golive": ("kit_install", "sbin/t3-golive-install"),
+        "schedule-kick": ("kit_install", "sbin/schedule-kick-install"),
+        "heavy": ("source_file", "sbin/heavy-install"),
+        "model-guard": ("source_file", "sbin/model-guard-install"),
+        "gh-apps": ("gh-apps", "sbin/gh-apps-install"),
+        "desk": ("desk", "sbin/desk-install"),
+        "pc-agents": ("pc-agents", "sbin/pc-agents")}
+
+
+def write_release(repo, entries, dest):
+    """The files of a release tree, as a downloaded release commit holds them (plain files, their modes)."""
+    batch = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch"], capture_output=True, check=True,
+                           input="".join(f"{oid}\n" for _, oid, _ in entries).encode()).stdout
+    at = 0
+    for mode, oid, path in entries:
+        header_end = batch.index(b"\n", at)
+        size = int(batch[at:header_end].split()[2])
+        data = batch[header_end + 1:header_end + 1 + size]
+        at = header_end + 2 + size
+        p = dest / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        os.chmod(p, 0o755 if mode == "100755" else 0o644)
+
+
+def kit_release_problems(top):
+    """{kit: [what its installer misses in the release at TOP]}, plus kits with an installer and no row."""
+    problems = {}
+    for kit_dir in sorted((top / "fork-kit").iterdir()) if (top / "fork-kit").is_dir() else []:
+        if (kit_dir / "sbin").is_dir() and kit_dir.name not in KITS:
+            problems[kit_dir.name] = ["has an installer (sbin/) but no row in KITS of fork-ci-release.test.py"]
+    for kit, (how, installer) in KITS.items():
+        if not (top / "fork-kit" / kit / installer).is_file():
+            problems[kit] = [f"fork-kit/{kit}/{installer} is not in the release"]
+            continue
+        r = subprocess.run([sys.executable, "-I", "-B", "-c", KIT_CHECK, str(top), kit, how, installer],
+                           capture_output=True, text=True, cwd=work)
+        try:
+            missing = json.loads(r.stdout) if r.returncode == 0 else None
+        except ValueError:
+            missing = None
+        if missing is None:
+            problems[kit] = [f"its file check failed to run: {(r.stderr or r.stdout).strip()[-400:]}"]
+        elif missing:
+            problems[kit] = missing
+    return problems
+
+
+if real_ok:
+    rel_top = work / "release-of-head"
+    write_release(root, entries, rel_top)
+    kit_problems = kit_release_problems(rel_top)
+    for kit in sorted(set(KITS) | set(kit_problems)):
+        check(f"release holds what the {kit} kit's installer reads", kit not in kit_problems,
+              "; ".join(kit_problems.get(kit, []))[:1500] + " (add the path(s) to .github/fork-ci-release.json paths)")
+else:
+    check("release holds what each kit's installer reads (the release tree above was refused)", False, why)
+# The check itself: a kit whose file is not in the release fails (heavy without its capacity files, as on ci/v21).
+if real_ok:
+    mutated = work / "release-without-capacity"
+    write_release(root, [e for e in entries if not e[2].startswith("packages/shared/src/capacity/")], mutated)
+    caught = kit_release_problems(mutated).get("heavy", [])
+    check("release check: a release without packages/shared/src/capacity fails the heavy kit",
+          any("capacity/capacity-rule.json" in m for m in caught), str(caught))
+
 for bad in ("/abs", "a/../b", "dir/", ""):
     t = work / f"cfg-{abs(hash(bad))}.json"
     t.write_text(json.dumps({**CFG, "paths": [bad]}))
