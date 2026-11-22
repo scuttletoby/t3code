@@ -79,7 +79,7 @@ describe("MCP profile resolver: old and empty state", () => {
     });
   });
 
-  it.each(["all", "t3-only"])(
+  it.each(["all", "t3-only", "assistant"])(
     "refuses %s when a hand edit put a profile of that name in the file",
     (name) => {
       const file = {
@@ -660,6 +660,19 @@ describe('builtinTools "none" (assistant)', () => {
     expect(carryMcpProfile(resolved(resolveMcpProfile(settings, [top("x")])))).not.toHaveProperty(
       "builtinTools",
     );
+  });
+
+  it("the built-in assistant: no servers or built-in tools, three groups; a child keeps it", () => {
+    const picked = fromFile({ mcpThreadProfiles: { a1: "assistant" } });
+    const own = resolved(resolveMcpProfile(picked, [top("a1")]));
+    expect([own.name, own.source]).toEqual(["assistant", "thread-pick"]);
+    expect(own.profile).toEqual({
+      servers: [],
+      t3Tools: ["orchestration", "threads", "projects"],
+      builtinTools: "none",
+    });
+    const sub = resolved(resolveMcpProfile(picked, [child("c1"), top("a1")]));
+    expect(sub.profile).toEqual(own.profile);
   });
 
   it.each([["some"], [false], [["Bash"]]])("refuses, never widens, builtinTools %j", (value) => {

@@ -8,6 +8,7 @@ import {
   MCP_BUILTIN_TOOLS_NONE,
   MCP_CARRIED_PROFILES_REFUSE,
   MCP_PROFILE_ALL,
+  MCP_PROFILE_ASSISTANT,
   MCP_PROFILE_T3_ONLY,
   MCP_SUBAGENT_INHERIT,
   MCP_T3_TOOL_GROUPS,
@@ -108,9 +109,15 @@ export type McpProfileResolution = McpProfileResolved | McpProfileCannotApply;
 /** Longer lineages are refused; real delegation chains are a few threads deep. */
 export const MCP_PROFILE_MAX_LINEAGE = 64;
 
-const BUILT_IN_PROFILES: Readonly<Record<string, McpProfileSet>> = {
+/** What each built-in profile gives; Settings lists them from here. */
+export const MCP_BUILT_IN_PROFILES: Readonly<Record<string, McpProfileSet>> = {
   [MCP_PROFILE_ALL]: { servers: "all", t3Tools: "all" },
   [MCP_PROFILE_T3_ONLY]: { servers: [], t3Tools: "all" },
+  [MCP_PROFILE_ASSISTANT]: {
+    servers: [],
+    t3Tools: ["orchestration", "threads", "projects"],
+    builtinTools: MCP_BUILTIN_TOOLS_NONE,
+  },
 };
 
 const KNOWN_GROUPS: ReadonlySet<string> = new Set(MCP_T3_TOOL_GROUPS);
@@ -181,7 +188,9 @@ type Lookup =
 /** A named profile: a built-in, or an entry of `mcpProfiles` checked now. */
 function lookUp(settings: McpProfileSettings, name: string): Lookup {
   const profiles: unknown = settings.mcpProfiles;
-  const builtIn = Object.hasOwn(BUILT_IN_PROFILES, name) ? BUILT_IN_PROFILES[name] : undefined;
+  const builtIn = Object.hasOwn(MCP_BUILT_IN_PROFILES, name)
+    ? MCP_BUILT_IN_PROFILES[name]
+    : undefined;
   if (builtIn !== undefined) {
     // A save never writes an entry under a built-in's name, so one is a hand edit. Which of the
     // two the owner meant is unknown, so neither is used.
