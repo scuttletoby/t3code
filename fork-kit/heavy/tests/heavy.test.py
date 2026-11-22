@@ -982,9 +982,17 @@ class Heavy(unittest.TestCase):
                  f'n=$(ls "/sys/fs/cgroup$cg" 2>/dev/null | grep -c "^heavy-{tag}-"); echo "$n" >> {log}; sleep 0.5')
         env = dict(self.env, HEAVY_CHECK_HEAVY=self.check_script('counting-check', True, count))
         cmd = self.script(tag, f'exec {self.sleeper}')
+        cg = '/sys/fs/cgroup' + subprocess.run(['systemctl', '--user', 'show', SLICE, '-p', 'ControlGroup', '--value'],
+                                               capture_output=True, text=True, timeout=30).stdout.strip()
+
+        def scopes():                               # not ours(): the fake check's own sh names this folder too
+            try:
+                return [n for n in os.listdir(cg) if n.startswith(f'heavy-{tag}-')]
+            except FileNotFoundError:
+                return []
         a, b = self.start('--wait', '60', cmd, env=env), self.start('--wait', '60', cmd, env=env)
         try:
-            wait_for(lambda: len(self.ours()) == 2, timeout=30, what='both commands')
+            wait_for(lambda: len(scopes()) == 2, timeout=30, what='both commands\' scopes')
             with open(log) as f:
                 seen = sorted(int(n) for n in f.read().split())
         finally:

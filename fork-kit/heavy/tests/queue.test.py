@@ -574,7 +574,7 @@ class QueueTests(unittest.TestCase):
                 'print("held", flush=True); time.sleep(300)')
         p = subprocess.Popen([sys.executable, '-I', '-c', code, path], stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait(timeout=60), p.stdout.close()))
-        self.assertEqual(p.stdout.readline(), 'held\n')
+        self.assertEqual(read_line(p), 'held\n')
         self.assertTrue(self.lock_taken())
         p.kill()
         p.wait(timeout=60)
