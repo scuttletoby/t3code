@@ -446,7 +446,7 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
   });
 
   /** T3's own turn: checked, then remembered so its `turn/started` is not checked again. */
-  const startTurn = Effect.fn("CodexMcpProfile.startTurn")(function* (send: Send, params: unknown) {
+  const turnStart = Effect.fn("CodexMcpProfile.turnStart")(function* (send: Send, params: unknown) {
     const nativeId = stringField(params, "threadId");
     yield* check("turn/start", nativeId, true);
     if (nativeId === undefined) return yield* send("turn/start", params);
@@ -508,7 +508,7 @@ export const withCodexMcpProfiles = Effect.fn("CodexMcpProfile.wrap")(function* 
       LOADS.has(method)
         ? load(send, method, params)
         : method === "turn/start"
-          ? startTurn(send, params)
+          ? turnStart(send, params)
           : setsGoal(method, params)
             ? // The goal's turn fixes the set as it starts; a turn may still be running now.
               check(method, stringField(params, "threadId"), false).pipe(
