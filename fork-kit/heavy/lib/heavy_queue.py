@@ -121,7 +121,7 @@ SETTINGS = {
     'admitCommand': (list, [], _argv),                      # the machine's own check: exit 0 = admit now
     'admitTimeoutSeconds': ((int, float), 20, _at_least(1, 300)),
 }
-SECTION = {'sweep': (dict, None, None), 'queue': (dict, None, None)}
+SECTION = {'sweep': (dict, None, None), 'queue': (dict, None, None), 'capacity': (dict, None, None)}  # heavy_facts.py
 
 
 class Refused(Exception):

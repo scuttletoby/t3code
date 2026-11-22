@@ -50,11 +50,28 @@ All of them are the queue's, imported from `../pr-queue`, never copied:
   summary only adds a row "the path rules would have said: ...". A change the
   rules cannot judge (no merge base, a failed diff) refuses, in either mode.
   Without the block, nothing of this runs.
+- **Findings and rounds** (`review_judge.judge_rounds`, the pr-queue README,
+  "Findings and rounds"): with a `review` block in `enforce`, a lens whose
+  newest report has a blocker or major finding (a `blocker:` or `major:` line,
+  a `### Blocking` or `### Major` heading with items, a table row ...) fails
+  the head until a later round of that lens clears it or a person's override
+  newer than the report covers it (`findings: true`); a report with no findings
+  section (a blocker label and a major label, `none` allowed) fails too. A person is a login in `override_authors`; none
+  listed (the default) means no override clears a finding or passes the cap
+  (issue #78). A round is a read of a different own change (`own_change`: a
+  head that only merges the base in is no new round); from round
+  `rounds.approach_at` the approach lens is required; a round past
+  `rounds.max` fails the head until a person's override for it, newer than
+  every lens comment, lets it through on its own. In `shadow` the summary only
+  adds a row "they would have said: ...". Comments that cannot be judged fail
+  the head, in either mode.
 
 It passes when:
 
 - every lens read the head, or a newer override vouches for it, and every
-  required lens (`required-lenses`) is among them;
+  required lens (`required-lenses`, and in `enforce` the path rules' and the
+  approach lens) is among them, with no open blocker or major and no round past
+  the cap (`enforce` only);
 - the pull request has no lens comments and no lens is required: there is
   nothing to compare (the queue then vouches only for the head it found);
 - it is a draft and `pass-drafts` is `true`.
@@ -320,6 +337,23 @@ Setup (the repository owner's steps; nothing here creates them):
    ([pr-queue](../pr-queue/README.md)), so the queue counts only that App's
    check runs. Release the code first, then bump the pins, then add the key:
    an older queue refuses a key it does not know.
+8. The live check, once, after the review trigger is in: post a review on one
+   open pull request and check that the gate ran for it. The caller's run on
+   `workflow_run` logs `review run: #N has the head …`, and the check run on
+   that head is new. The GitHub fields the lookup uses (the review run's head
+   branch, head repository and head sha, and the list filter
+   `head=owner:branch`) are tested only against fakes. If the run warns "the
+   review trigger's run does not name a head" (a pin at `ci/v20` or before logs
+   it as a plain line), or logs "no open pull request has the head" for a
+   review on an open pull request whose head did not move, they differ: reviews
+   then never run the gate again. After `ci/v20` that line also says how many
+   open pull requests GitHub listed on the branch: "no open pull request on
+   that branch" means the `head=owner:branch` filter differs; a count means the
+   head sha or head repository differs. Pick a pull request whose branch name
+   is plain (letters, digits, `-`, `_`, `/`) and whose fork still exists: other
+   names log that the gate does not look them up, and a deleted fork leaves no
+   head repository. Report it on the fork and use the fallback (an issue
+   comment or a dispatch, see "Run again after a review") until it is fixed.
 
 After a change to the caller, a new pin, or a change to the queue config or
 the lens rules on the default branch, dispatch the backfill again: it judges
@@ -423,7 +457,11 @@ head "not passed" unless it judged the head and the head passed.
     fails every try, and after a 5xx or a rate limit GraphQL (which has its
     own rate limit) does not name it either. Comment spam can spend the job
     token's hourly REST limit; while GraphQL still names the Environment the
-    gate posts failures instead. The gate job does not start, as the
+    gate posts failures instead. The guard job's token needs no extra
+    permission for that GraphQL read: with only the job's `contents`,
+    `pull-requests` and `actions` read (no `deployments`) it gets the
+    Environment's name, and `NOT_FOUND` for one that does not exist (checked
+    in a live run). The gate job does not start, as the
     Environment may not exist and naming it would create it. Fix: once GitHub
     answers again, post an issue comment on the pull request or dispatch the
     gate.
@@ -431,7 +469,14 @@ head "not passed" unless it judged the head and the head passed.
     pull request read and git's `refs/pull/N/head` both fail every try.
   - A review trigger's run whose pull request cannot be found: the list of
     open pull requests with its head fails every try (the guard job fails), or
-    no open pull request has its head (nothing to judge, the log says why).
+    no open pull request has its head (nothing to judge, the log says why and
+    how many GitHub listed on the branch). A run that names no head (its head
+    fields missing or not GitHub's form) judges nothing with a warning: most
+    likely GitHub's fields are not what the lookup expects (setup step 8); a
+    fork deleted while its pull request is open also leaves no head
+    repository. A head branch that git allows but the gate does not look up
+    (an invisible or joining character such as a zero-width space, or longer
+    than 255) judges nothing with a plain log line.
     More than one is no such case: the head is judged once, in the job for
     the lowest number.
   - The backfill cannot list the open pull requests after its tries, or finds

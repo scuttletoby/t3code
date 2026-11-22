@@ -1,0 +1,11 @@
+# schedule-kick kit: written by schedule-kick-install. Do not edit: run the installer again.
+[Unit]
+Description=schedule-kick tick every 5 minutes (fork-kit/schedule-kick)
+
+[Timer]
+OnStartupSec=1min
+OnCalendar=*:0/5
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

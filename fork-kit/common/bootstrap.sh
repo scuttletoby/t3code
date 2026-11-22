@@ -5,8 +5,10 @@
 #   sh fork-kit-bootstrap.sh --kit KIT --repo FORK_OWNER/FORK --sha RELEASE_SHA [kit options]
 #
 # KIT and its options (each kit's sbin/*-install says what they do):
+#   agent-guards  fork-kit/agent-guards/sbin/agent-guards-install  [--settings | --no-settings]
 #   cleaner   fork-kit/cleaner/sbin/fork-cleaner-install   [--timer | --no-timer]
 #   golive    fork-kit/golive/sbin/t3-golive-install       (none)
+#   schedule-kick  fork-kit/schedule-kick/sbin/schedule-kick-install  [--timer | --no-timer]
 #
 # It refuses a sha that is not a commit on the fork's protected release branch (ci-release), downloads exactly
 # that commit, prints the sha and the hash of what it downloaded, and runs the kit's installer (safe to run again).
@@ -28,13 +30,20 @@ while [ $# -gt 0 ]; do
     --sha) [ $# -ge 2 ] || die "--sha needs a value"; sha="$2"; shift 2 ;;
     --release-branch) [ $# -ge 2 ] || die "--release-branch needs a value"; branch="$2"; shift 2 ;;
     --timer|--no-timer) opt="$1"; shift ;;
+    --settings|--no-settings) opt="$1"; shift ;;
     *) die "unknown option $1 (see the top of this file)" ;;
   esac
 done
 case "$kit" in
+  agent-guards) installer='sbin/agent-guards-install' ;;
   cleaner) installer='sbin/fork-cleaner-install' ;;
   golive) installer='sbin/t3-golive-install'; [ -z "$opt" ] || die "$opt is not an option of --kit golive" ;;
-  *) die "--kit must be one of: cleaner golive" ;;
+  schedule-kick) installer='sbin/schedule-kick-install' ;;
+  *) die "--kit must be one of: agent-guards cleaner golive schedule-kick" ;;
+esac
+case "$kit:$opt" in
+  agent-guards:--timer|agent-guards:--no-timer|cleaner:--*settings|schedule-kick:--*settings)
+    die "$opt is not an option of --kit $kit" ;;
 esac
 printf '%s\n' "$repo" | grep -Eqx '[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}' || die "--repo must be OWNER/NAME"
 printf '%s\n' "$sha" | grep -Eqx '[0-9a-f]{40}' || die "--sha must be the full 40-character release commit"

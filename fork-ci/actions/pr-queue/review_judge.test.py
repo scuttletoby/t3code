@@ -1,16 +1,18 @@
 """Tests of review_judge.py (run: python3 fork-ci/actions/pr-queue/review_judge.test.py).
 
-Which lens reads a change needs by the `review` block's path rules. The shared vectors (review.vectors.json, `cases`)
-are the contract both sides test; the rest here: reading git's name-status output, and that a rule set the parser
+Which lens reads a change needs by the `review` block's path rules, the findings a lens report says, and the rounds.
+The shared vectors (review.vectors.json: `cases`, `findings`, `scans`, `rounds`) are the contract both sides test; the
+rest here: reading git's name-status output, and that a rule set the parser
 would refuse, or a diff line nobody knows, never judges.
 """
-import dataclasses, json, os, sys, unittest
+import dataclasses, json, os, sys, time, unittest
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import config  # noqa: E402
+import lens  # noqa: E402
 import review_config as rc  # noqa: E402
 import review_judge as rj  # noqa: E402
 
@@ -161,6 +163,303 @@ class Refusals(unittest.TestCase):
         for rules in (block['rules'][:2], block['rules'][1:]):
             with self.assertRaises(config.ConfigError):
                 rc.parse_review({**block, 'rules': rules})
+
+
+# --- findings and rounds (issues #99, #100): judge_rounds on lens comments ---------------------------------------
+H1, H2, H3, H4, H5 = (c * 40 for c in 'abcde')
+BASIC = CONFIGS['basic']   # findings true, rounds approach_at 3, max 4, approach lens `approach`, no override_authors
+PEOPLE = dataclasses.replace(BASIC, override_authors=('a-person',))
+HEAD = 'lens: code · reviewer: x · read at: ' + H1 + '\n'
+NONE = 'blocker: none\nmajor: none'   # the clean findings section the lens prompts ask for
+
+
+def rounds(history, reports, decided=False, review=BASIC, change_of=None):
+    """judge_rounds with each lens's newest entry a report that counts, unless given as (how, body)."""
+    reports = {k: v if isinstance(v, tuple) else (rj.REPORT, v) for k, v in reports.items()}
+    return rj.judge_rounds(review, list(history), reports, decided, change_of)
+
+
+# Findings as the fork's lens reports write them (pull requests #720-#739) and as reviews A and B of #740 showed they
+# can be written are shared vectors (review.vectors.json `findings`), so the TypeScript side reads the same lines;
+# `group` says which rule each shows. Review A and B of #740 round 2: `blocker: none` kept from the prompt, the major
+# written in a form not read as a label (`one-kind`): with one label kind only there is no findings section, so each
+# fails closed, never clean.
+FINDINGS = VECTORS['findings']
+
+
+def group(name):
+    return [v for v in FINDINGS if v['group'] == name]
+
+
+class Findings(unittest.TestCase):
+    def test_every_shared_findings_vector(self):
+        for v in FINDINGS:
+            with self.subTest(v['name']):
+                said, section = rj.read_findings(v['body'])
+                self.assertEqual([list(f) for f in said], v['findings'])
+                self.assertEqual(section, v['section'])
+
+    def test_each_rule_keeps_its_vectors(self):   # a vector dropped from the file is a rule no longer shown
+        sizes = {g: len(group(g)) for g in ('finding', 'clean', 'section', 'one-kind', 'one-label', 'mention')}
+        self.assertEqual(sizes, {'finding': 58, 'clean': 37, 'section': 9, 'one-kind': 9, 'one-label': 4,
+                                 'mention': 8})
+
+    def test_each_real_finding_format_counts(self):
+        for v in group('finding'):
+            with self.subTest(v['name']):
+                self.assertTrue(v['findings'] and v['findings'][0][0] in ('blocker', 'major'))
+
+    def test_each_clean_format_is_no_finding(self):
+        for v in group('clean'):
+            with self.subTest(v['name']):
+                self.assertEqual(v['findings'], [])
+                if v['body'].startswith(HEAD):
+                    self.assertEqual(rj.read_findings(HEAD + NONE + '\n\n' + v['body'][len(HEAD):]), ([], True))
+
+    def test_a_section_needs_a_blocker_and_a_major_label(self):   # #740 round 2, A major 1
+        for v in group('section'):
+            self.assertEqual((v['findings'], v['section']), ([], True), v['name'])
+        for v in group('one-label') + group('one-kind') + group('mention'):
+            self.assertEqual((v['findings'], v['section']), ([], False), v['name'])
+        for v in group('one-kind'):
+            with self.subTest(v['name']):
+                r = rounds([('code', H1)], {'code': v['body']})
+                self.assertEqual(len(r.problems), 1)
+                self.assertIn('lens code: its newest report has no findings section', r.problems[0])
+
+    def test_a_long_run_of_spaces_takes_linear_time(self):   # #740 round 2: 81-91 s for one 65,000-character line
+        n = 200_000
+        for line in ('major' + ' ' * n + 'x', 'blocker: none' + ' ' * n + 'x', '| a | b |\n' + ' ' * n + 'x',
+                     '| a | b |\n|' + ' ' * n + 'x', '| a | b |\n|-' + ' ' * n + 'x',
+                     'not' + ' ' * n + 'safe', 'finding:' + ' ' * n + 'x', 'major: none' + ' \t' * (n // 2) + 'x'):
+            with self.subTest(line[:12]):
+                start = time.monotonic()
+                rj.read_findings(HEAD + line)
+                self.assertLess(time.monotonic() - start, 2)
+
+    def test_a_wide_table_row_takes_linear_time(self):   # the old per-cell read: 13 s at 4,000 cells, minutes at 65,536 chars
+        for text in ('| ' + 'major | ' * 8_000, '| ' + 'major | ' * 4_000 + 'x | ' * 4_000,
+                     '| ' + 'major | ' * 3_000 + '\n|' + '---|' * 3_000 + '\n| ' + 'x | ' * 3_000,
+                     '| major |' + ' |' * 30_000 + ' x |', '|' + '---|' * 16_000 + 'x'):
+            with self.subTest(text[:12]):   # each about one full-size comment (65,536 characters): 0.2-0.5 s here
+                start = time.monotonic()
+                rj.read_findings(HEAD + text)
+                self.assertLess(time.monotonic() - start, 2)
+
+    def test_a_table_does_not_go_on_past_a_fence(self):   # a fence ends the table, as GitHub renders it
+        table = '| blocker | major |\n|---|---|\n| none | none |\n'
+        self.assertEqual(rj.read_findings(table + '```\ncode\n```\n| a | b |'), ([], True))
+        self.assertEqual(len(rj.findings(table + '| a | b |')), 1)   # without the fence: a row of the table
+
+    def test_fold(self):
+        self.assertEqual(rj.fold('\uff2da\u200bj\u043er'), 'Major')
+        self.assertEqual(rj.fold(None), '')
+
+
+class Rounds(unittest.TestCase):
+    def test_each_different_change_read_is_a_round(self):
+        self.assertEqual(rj.review_round([]), 0)
+        self.assertEqual(rj.review_round([('code', H1), ('data-1', H1)]), 1)
+        self.assertEqual(rj.review_round([('code', H1), ('code', H2), ('data-1', H2), ('code', H3)]), 3)
+        self.assertEqual(rj.review_round([('code', None)]), 0)
+
+    def test_a_short_sha_counts_too(self):   # it reads nothing for the head, but it was a read: a round
+        self.assertEqual(rj.review_round([('code', 'abcdef1'), ('code', H1)]), 2)
+
+    def test_reads_of_one_change_are_one_round(self):   # #100: a queue update merges the base in, no fix
+        change = {H1: 'x', H2: 'x', H3: 'y'}.get
+        self.assertEqual(rj.review_round([('code', H1), ('code', H2)], change), 1)
+        self.assertEqual(rj.review_round([('code', H1), ('code', H2), ('code', H3)], change), 2)
+        self.assertEqual(rj.review_round([('code', H1.upper()), ('code', H1)]), 1)
+
+    def test_a_round_marker_counts_when_it_is_higher(self):   # deleted old rounds: the marker still says it
+        self.assertEqual(rj.review_round([('code r3', H1)]), 3)
+        self.assertEqual(rj.review_round([('code **r4**', H1), ('data r2', H2)]), 4)   # emphasis stripped: counts
+        self.assertEqual(rj.review_round([('code `r5`', H1)]), 5)
+        self.assertEqual(rj.review_round([('code r1', H1), ('code r1', H2), ('code', H3)]), 3)
+        self.assertEqual(rj.round_marker('r2d2 lens'), 0)
+        self.assertEqual(rj.round_marker('r9'), 0)   # a name's first word is its name, never a marker
+        self.assertEqual(rj.round_marker('code r\uff13'), 3)   # folded
+
+    def test_no_lens_comment_yet_is_round_zero_and_passes(self):   # empty state
+        r = rounds([], {})
+        self.assertEqual((r.round, r.approach, r.over_cap, r.findings, r.problems), (0, False, False, (), ()))
+
+    def test_a_major_blocks_until_a_later_round_of_that_lens_clears_it(self):
+        r = rounds([('code', H1)], {'code': 'major: two writers race'})
+        self.assertEqual(r.findings, (('code', 'major', 'major: two writers race'),))
+        self.assertIn('lens code reported a major that no later round cleared', r.problems[0])
+        self.assertIn('lens code posts a new report on the fixed head', r.problems[0])
+        r = rounds([('code', H1), ('code r2', H2)], {'code': NONE})   # round 2 cleared it
+        self.assertEqual((r.round, r.problems), (2, ()))
+
+    def test_a_report_with_no_findings_section_fails_that_lens(self):   # #99: never passes as clean
+        r = rounds([('code', H1)], {'code': HEAD + 'Looks good to me.'})
+        self.assertEqual(len(r.problems), 1)
+        self.assertIn('lens code: its newest report has no findings section', r.problems[0])
+        self.assertIn('findings in inline review comments are not read', r.problems[0])
+        self.assertEqual(rounds([('code', H1)], {'code': HEAD}).problems, r.problems)   # empty body: the same
+        self.assertEqual(rounds([('code', H1)], {'code': HEAD + NONE}).problems, ())
+        self.assertEqual(rounds([('code', H1)], {'code': HEAD + 'major: none'}).problems, r.problems)   # one kind
+
+    def test_an_entry_that_reads_nothing_under_an_agents_override_cannot_be_judged(self):
+        r = rounds([('code', H1)], {'code': (rj.UNREAD, HEAD + 'major: none')})
+        self.assertIn('its findings cannot be read', r.problems[0])
+
+    def test_a_loose_comment_under_an_agents_override_is_judged_by_its_lines(self):   # no section needed
+        self.assertEqual(rounds([], {'x': (rj.LOOSE, 'fixed it')}).problems, ())
+        self.assertEqual(len(rounds([], {'x': (rj.LOOSE, 'major: still racy')}).findings), 1)
+
+    def test_a_cleared_or_unjudged_entry_is_not_judged_here(self):
+        for how in (rj.CLEARED, rj.NOT_JUDGED):   # a person's override; or it fails the head already
+            with self.subTest(how):
+                self.assertEqual(rounds([('code', H1)], {'code': (how, 'blocker: x')}).problems, ())
+
+    def test_findings_false_judges_no_finding(self):
+        r = rounds([('code', H1)], {'code': 'blocker: x'}, review=dataclasses.replace(BASIC, findings=False))
+        self.assertEqual(r.problems, ())
+        self.assertIn('findings are not judged', r.text(dataclasses.replace(BASIC, findings=False)))
+
+    def test_the_approach_lens_is_required_from_round_approach_at(self):
+        self.assertFalse(rounds([('code', H1), ('code', H2)], {'code': NONE}).approach)
+        r = rounds([('code', H1), ('code', H2), ('code', H3)], {'code': NONE})
+        self.assertTrue(r.approach)
+        self.assertIn('approach lens approach required from round 3', r.text(BASIC))
+        self.assertFalse(rounds([('code', H1), ('code', H2), ('code', H3)], {}, decided=True).approach)
+
+    def test_a_round_past_the_cap_stops_and_says_what_a_person_does(self):   # #100
+        four = [('code', h) for h in (H1, H2, H3, H4)]
+        self.assertEqual(rounds(four, {'code': NONE}).problems, ())   # round 4 of 4 may pass
+        r = rounds(four + [('code', H5)], {'code': NONE})
+        self.assertTrue(r.over_cap)
+        self.assertEqual(r.problems, (
+            'review round 5 is past the cap of 4 rounds (issue #100): no more rounds; a person decides: close the pull '
+            'request, or a person\'s override comment, but no one is listed in review.override_authors yet, so no '
+            'override is accepted (issue #78: until agents no longer post as the person\'s login, an override is not '
+            'proof of a person). A person\'s override alone is enough, also for a required approach lens that never '
+            'posted',))
+        r = rounds(four + [('code', H5)], {'code': NONE}, review=PEOPLE)
+        self.assertIn('an override comment `override for head <head sha>: <why>` for this head by a-person, newer '
+                      'than every lens comment', r.problems[0])
+        self.assertEqual(rounds([('code r5', H1)], {'code': NONE}).round, 5)
+
+    def test_a_persons_decision_passes_the_cap_and_waives_the_approach_lens(self):
+        five = [('code', h) for h in (H1, H2, H3, H4, H5)]
+        r = rounds(five, {'code': (rj.CLEARED, '')}, decided=True, review=PEOPLE)
+        self.assertEqual((r.over_cap, r.approach, r.problems), (False, False, ()))
+
+    def test_a_finding_at_the_last_round_says_no_more_rounds(self):
+        r = rounds([('code', h) for h in (H1, H2, H3, H4)], {'code': 'major: still racy'})
+        self.assertIn('this is round 4 of 4: no more rounds; a person decides', r.problems[0])
+
+    def test_the_same_comments_give_the_same_verdict(self):   # runs again: pure
+        args = ([('code', H1), ('code r2', H2)], {'code': 'major: x'})
+        self.assertEqual(rounds(*args), rounds(*args))
+
+
+# Every section of review.vectors.json, replayed whole: the TypeScript side (apps/server/src/reviewRules) runs the same
+# sections, and each side fails on a section or a vector field it does not run, so neither can skip one quietly.
+SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds'}
+FIELDS = {'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
+          'findings': {'name', 'group', 'body', 'findings', 'section'},
+          'scans': {'name', 'posts', 'history', 'entries'},
+          'rounds': {'name', 'config', 'history', 'reports', 'decided', 'changes', 'override_authors', 'findings',
+                     'expect'}}
+SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',))
+
+
+def scan(posts):
+    comments = [{'body': p['body'], 'author': {'login': 'someone'}, 'authorAssociation': 'OWNER',
+                 'createdAt': f'2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z',
+                 'includesCreatedEdit': p.get('edited', False), 'isMinimized': p.get('hidden', False)}
+                for i, p in enumerate(posts)]
+    found, history = SCAN.lens_scan({'comments': comments, 'reviews': []})
+    return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}
+
+
+def replay_round(v):
+    review = dataclasses.replace(CONFIGS[v['config']], override_authors=tuple(v.get('override_authors', ())),
+                                 findings=v.get('findings', True))
+    changes = v.get('changes')
+    r = rj.judge_rounds(review, [tuple(h) for h in v['history']], {k: tuple(e) for k, e in v['reports'].items()},
+                        v.get('decided', False), (lambda s: changes.get(s, s)) if changes else None)
+    return {'round': r.round, 'approach': r.approach, 'over_cap': r.over_cap,
+            'findings': [list(f) for f in r.findings], 'problems': list(r.problems), 'text': r.text(review)}
+
+
+class SharedVectors(unittest.TestCase):
+    def test_this_side_runs_every_section_and_field(self):
+        self.assertEqual(set(VECTORS), SECTIONS)
+        for section, fields in FIELDS.items():
+            names = [v['name'] for v in VECTORS[section]]
+            self.assertEqual(len(names), len(set(names)), f'{section}: two vectors share a name')
+            for v in VECTORS[section]:
+                self.assertLessEqual(set(v), fields, f'{section}: {v["name"]}')
+
+    def test_every_scan(self):   # same comment twice, edited, hidden, old forms, no comment at all
+        self.assertGreaterEqual(len(VECTORS['scans']), 31)
+        for v in VECTORS['scans']:
+            with self.subTest(v['name']):
+                self.assertEqual(scan(v['posts']), (v['history'], v['entries']))
+
+    def test_every_round(self):
+        self.assertGreaterEqual(len(VECTORS['rounds']), 28)
+        for v in VECTORS['rounds']:
+            with self.subTest(v['name']):
+                self.assertEqual(replay_round(v), v['expect'])
+
+
+class OverrideAuthors(unittest.TestCase):
+    def test_left_out_or_empty_is_no_person(self):   # #78: agents still post as the owner's login
+        self.assertEqual(BASIC.override_authors, ())
+        block = VECTORS['configs']['basic']
+        self.assertEqual(rc.parse_review({**block, 'override_authors': []}).override_authors, ())
+        self.assertEqual(rc.parse_review({**block, 'override_authors': ['a-person', 'B2']}).override_authors,
+                         ('a-person', 'B2'))
+
+    def test_a_wrong_list_is_refused(self):
+        block = VECTORS['configs']['basic']
+        for bad in ('a-person', [''], ['-x'], ['a b'], ['x', 'X'], [1], ['x'] * 21, [f'p{i}' for i in range(21)], None):
+            with self.subTest(bad), self.assertRaises(config.ConfigError) as e:
+                rc.parse_review({**block, 'override_authors': bad})
+            self.assertIn('override_authors', str(e.exception))
+        self.assertEqual(len(rc.parse_review({**block, 'override_authors': [f'p{i}' for i in range(20)]})
+                             .override_authors), 20)
+
+
+# --- the fork's own config (issue #730): in shadow, workflow, queue and lens files critical (#82) ----------------
+ROOT = os.path.join(HERE, '..', '..', '..')
+FORK_CONFIG = '.github/fork-pr-queue.json'
+
+
+class ForkConfig(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(ROOT, FORK_CONFIG), encoding='utf-8') as f:
+            self.cfg = config.parse(f.read(), FORK_CONFIG)
+        self.review = self.cfg.review
+
+    def test_it_parses_in_shadow_with_the_owners_numbers_and_no_person_yet(self):
+        r = self.review   # shadow first (README, Turning it on); no override author until #78
+        self.assertEqual((r.mode, r.findings, r.rounds.approach_at, r.rounds.max, r.warnings, r.override_authors),
+                         ('shadow', True, 3, 4, (), ()))
+        self.assertEqual(r.order, ())   # enforce would take it as it is
+        self.assertGreaterEqual(r.min_lenses.critical, r.min_lenses.normal + 1)   # #82: one extra review
+        for x in r.lenses:
+            with self.subTest(x.name):
+                self.assertTrue(os.path.isfile(os.path.join(ROOT, x.prompt)), x.prompt)
+
+    def test_workflow_queue_gate_config_and_lens_files_are_critical(self):   # #82
+        critical = next(x for x in self.review.rules if x.weight == 'critical')
+        for path in ('.github/workflows/fork-head-gate.yml', 'fork-ci/actions/pr-queue/review_judge.py',
+                     'fork-ci/actions/head-check/head_check.py', FORK_CONFIG, '.github/fork-lens-state.md',
+                     '.github/actions/setup-ci-deps/action.yml', '.github/fork-ci-release-rulesets.json'):
+            with self.subTest(path):
+                j = rj.judge(self.review, [('M', (path,))], FORK_CONFIG)
+                self.assertEqual((j.weight, j.lenses), ('critical', critical.lenses))
+                self.assertGreaterEqual(len(j.lenses), 2)
+        j = rj.judge(self.review, [('M', ('apps/server/src/x.ts',))], FORK_CONFIG)
+        self.assertEqual(j.weight, 'normal')
+        self.assertTrue(j.lenses)
 
 
 if __name__ == '__main__':

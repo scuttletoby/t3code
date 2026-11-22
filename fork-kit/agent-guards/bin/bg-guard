@@ -1,0 +1,171 @@
+#!/usr/bin/python3 -IB
+"""Claude Code Stop hook: don't let an agent end its turn while a Bash command it started in the background still runs.
+Part of fork-kit/agent-guards (README.md there: install, settings entry, the machine file's "agent-guards" section).
+
+Why: in some hosts (child threads, headless runs) the end of a background command never wakes the agent, so it
+stalls for hours (several agents did). This hook blocks such a stop once per try and tells the agent to wait in the
+foreground. At most maxBlocks blocks per session, so a deliberate leftover (a test server) never loops.
+
+General (any project, any Claude config dir). Settings, all optional (machine file, bgGuard):
+  skipSessionsFiles  files with one session id per line (# comments): sessions never blocked (e.g. orchestrators
+                     that are woken another way); default none
+  maxBlocks          blocks per session at most (default 3)
+  stateDir           the per-session block counts (default ~/.local/state/bg-guard); a count is read and raised
+                     under a lock, so two Stop hooks at once count two blocks
+Never fails a stop because of its own error (exit 0 on anything unexpected). A broken machine file section: the
+defaults, and one line on stderr. Tests: fork-kit/agent-guards/tests/bg-guard.test.py
+"""
+import fcntl, json, os, sys
+
+CLAUDE = 'claude'                                  # Claude Code's process name
+SNAPSHOT = 'shell-snapshots/snapshot-'             # in the command line of each of its Bash tool commands
+NAME = 'bg-guard'
+
+
+def _settings():
+    """(bgGuard settings, problem or None); a copy without the kit's lib keeps the defaults and says so."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        c, problem = config.load('bgGuard')
+        c['stateDir'] = config.expand(c['stateDir'])
+        c['skipSessionsFiles'] = [config.expand(f) for f in c['skipSessionsFiles']]
+        return c, problem
+    except BaseException as e:   # noqa: BLE001 - the guard works without its config
+        return ({'skipSessionsFiles': [], 'maxBlocks': 3, 'stateDir': os.path.expanduser('~/.local/state/bg-guard')},
+                f'cannot load the kit\'s config code ({type(e).__name__}: {e})')
+
+
+def cmdline(pid):
+    try:
+        return open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\0', b' ').decode(errors='replace').strip()
+    except OSError:
+        return ''
+
+
+def ppid(pid):
+    try:
+        return int(open(f'/proc/{pid}/stat').read().rsplit(')', 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def claude_pid(start):
+    pid = start
+    while pid > 1:
+        if os.path.basename(cmdline(pid).split(' ', 1)[0]) == CLAUDE:
+            return pid
+        pid = ppid(pid)
+    return 0
+
+
+def background_commands(root, mine):
+    """Bash tool commands still running under this claude process (children of it, not this hook's own chain)."""
+    out = []
+    for d in os.listdir('/proc'):
+        if not d.isdigit() or int(d) in mine or ppid(int(d)) != root:
+            continue
+        c = cmdline(int(d))
+        if SNAPSHOT in c:
+            i = c.rfind(" eval '")
+            out.append((c[i + 7:].split("' < /dev/null", 1)[0] if i >= 0 else c[-140:])[:140])
+    return out
+
+
+def skipped(c):
+    s = set()
+    for f in c['skipSessionsFiles']:
+        try:
+            with open(f) as fh:
+                s |= {l.strip() for l in fh if l.strip() and not l.startswith('#')}
+        except OSError:
+            pass
+    return s
+
+
+def count_block(c, sid):
+    """Raise the session's block count when it is below maxBlocks: True when this stop may be blocked. Under a lock
+    (two Stop hooks at once count two). A state folder that cannot be written blocks no stop (as before)."""
+    os.makedirs(c['stateDir'], exist_ok=True)
+    f = os.path.join(c['stateDir'], ''.join(ch for ch in sid if ch.isalnum() or ch == '-')[:64] + '.count')
+    fd = os.open(f, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            n = int(os.read(fd, 64).decode().strip() or 0)
+        except ValueError:
+            n = 0
+        if n >= int(c['maxBlocks']):
+            return False
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(n + 1).encode())
+        return True
+    finally:
+        os.close(fd)
+
+
+def decide(data, c, start_pid):
+    sid = data.get('session_id') or ''
+    if not sid or sid in skipped(c):
+        return None
+    root = claude_pid(start_pid)
+    if not root:
+        return None
+    mine, p = set(), os.getpid()
+    while p > 1:
+        mine.add(p)
+        p = ppid(p)
+    running = background_commands(root, mine)
+    if not running:
+        return None
+    if not count_block(c, sid):
+        return None
+    return {'decision': 'block', 'reason':
+            'You are ending your turn while a command you started in the background is still running: '
+            + ' | '.join(running[:3])
+            + '. Its completion will NOT wake you, so you would stall. Wait for it in the foreground now '
+              '(a loop that checks its output file every 60 s, with a long timeout), then continue your task. '
+              'If you really mean to leave it running (e.g. a test server) and something else will wake you, say so '
+              'and stop again.'}
+
+
+def _notice(problem, event, out):
+    """`out` with a config problem added where the agent and the owner see it (and one line on stderr)."""
+    if not problem:
+        return out
+    try:
+        from agent_guards import config
+        config.warn(NAME, problem)
+        return config.notice(NAME, problem, event, out)
+    except BaseException:   # noqa: BLE001 - no lib: say it plainly
+        text = f'{NAME}: {problem}; built-in defaults used. Tell the owner.'
+        try:
+            sys.stderr.write(text + '\n')
+        except Exception:  # noqa: BLE001
+            pass
+        return dict(out or {}, systemMessage=text)
+
+
+def main():
+    if sys.argv[1:]:
+        sys.stderr.write('usage: bg-guard (hook: Stop JSON on stdin)\n')
+        return 1
+    event, problem = None, None
+    try:
+        c, problem = _settings()
+        event = json.load(sys.stdin)
+        out = decide(event, c, os.getppid())
+    except Exception:  # never break a stop because of this guard
+        out = None
+    try:
+        out = _notice(problem, event, out)
+    except Exception:  # noqa: BLE001
+        pass
+    if out:
+        print(json.dumps(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

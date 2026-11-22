@@ -23,27 +23,67 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 | `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                              |
 | `heavy sweep [--dry-run]`    | one leftover sweep (below); the user timer runs it every 5 minutes                           |
 | `heavy sweep --json`         | looks only: what a sweep would stop or report, as JSON                                       |
+| `heavy leftovers`            | looks only: each leftover older than a limit, with its owner and age (below)                 |
 | `heavy docker-label`         | the owner label for a container a test starts (below)                                        |
 | `heavy --kind K <cmd>`       | waits in the memory queue until the job fits, then runs it (`--mb`, `--wait`: below)         |
 | `heavy queue [--json]`       | what the memory queue runs and holds, and the figures behind it                              |
 | `heavy waits [--days N]`     | minutes waited for memory per day (`--json` too)                                             |
+| `heavy --measure K <cmd>`    | runs it as usual and records its peak memory under the kind K (below)                        |
+| `heavy capacity ...`         | the front of the machine's capacity check: a kind becomes its measured MB (below)            |
 | `heavy -- <command>`         | runs a command named like one of the words above                                             |
 
 The command gets the same folder, environment, stdin, stdout, stderr and open files. heavy exits with the command's
 exit code, or dies of the same signal (a shell sees `128+N`), so scripts and `make` see what they saw before. The
 environment is exactly the caller's (Python's own locale change is not passed on), plus `HEAVY_SCOPE`, the name of
-the scope (a test can label what it starts with it). Signal settings are the caller's too: SIGPIPE and SIGXFSZ are
+the scope (a test can label what it starts with it), and `HEAVY_MARKS`, which folders heavy reads the notes of
+`heavy docker-label` from (as device:inode). Signal settings are the caller's too: SIGPIPE and SIGXFSZ are
 back to the default, so a writer into a closed pipe ends as before. Only `HEAVY_KEEP=1` makes a `heavy-keep-*`
 scope (a command named `keep` gets `heavy-keep_-<random>.scope`), so the leftover sweep can tell kept ones apart.
 
 **Signals.** When heavy gets INT, TERM, HUP or QUIT, the command gets it too: from the terminal (Ctrl-C reaches
-both) or from heavy (when someone sent it to heavy alone; a signal sent to the whole process group, as `timeout`
-or a shell's `kill %1` do, reaches the command once). heavy then waits up to the grace time (30 s by default, so a
+both) or from heavy (when someone sent it to heavy alone; a signal sent to the whole process group, as `timeout` or
+a shell's `kill %1` do, reaches the command once). heavy then waits up to the grace time (30 s by default, so a
 command that handles Ctrl-C, a REPL or a server saving its data, has time) for the command, and stops the whole
-scope (TERM, then KILL after the grace time again). A second signal stops it at once. A command that handles the
-signal and exits keeps its own exit code. USR1 and USR2 are passed on. If heavy is killed with
-`kill -9`, the command is killed with it (as before, when heavy and the command were one process); anything the
-command had started keeps running in its scope (the leftover sweep below is for that case).
+scope (TERM, then KILL after the grace time again) and removes its containers. A second signal stops it at once. A
+command that handles the signal and exits keeps its own exit code. USR1 and USR2 are passed on. If heavy is killed
+with `kill -9`, the command is killed with it (as before, when heavy and the command were one process), and heavy's
+**guard** stops the rest of the scope (below).
+
+**Everything it started.** When the command ends, and after a signal to heavy, heavy stops every process left in its
+scope: children, double-forked daemons (`setsid`, `nohup`, `( cmd & )`) and anything else in it, since they all stay
+in the scope's cgroup. Then it removes the Docker containers the command labelled as its own (`heavy docker-label`,
+below) with their anonymous volumes, and says so: `heavy: removed 1 leftover container (test-db)`. Only a container
+whose owner label names this user and this exact scope is touched; others, and containers without the label, never.
+heavy asks Docker only after a run that labelled a container (`heavy docker-label` leaves a note for the scope in
+`/run/user/<uid>/heavy/labelled/`, a folder only this user can write; when that note cannot reach heavy, because
+`/run/user` is full or a sandbox has a `/run/user` of its own, in `~/.local/state/heavy/labelled/`, which heavy
+reads too; the home is `$HOME`, else the password database's, and only one this user owns and no one else can
+write (not `/`), so heavy run as root with a user's `HOME` (`sudo -E heavy ...`) or `HOME=/tmp` uses root's own home
+and never makes a root-owned folder in the user's; `~/.local` must be a real folder (not a link) of the user's;
+an older heavy run as root with your `HOME` may have left a root-owned `~/.local/state` (heavy then skips it):
+`sudo chown -R "$USER:" ~/.local/state` gives it back;
+heavy tells `docker-label` which folders it reads in `HEAVY_MARKS`; without either folder heavy asks after every
+run), so a run with no containers costs no `docker ps`. No Docker, or none this user can reach (a
+rootless Docker through `docker context use` counts as reachable): nothing to do, nothing said. Docker down: one
+line (`could not remove the containers of ...`); the leftover sweep looks again. `HEAVY_KEEP=1` keeps the scope's
+containers with it, unless heavy was stopped by a signal. When systemd cannot stop the scope, heavy stops what is
+left itself: TERM only to a process still in the scope (checked through a pidfd, so a pid that ended and was reused
+by another process is never hit; without pidfds, before Linux 5.3 or Python 3.9, no TERM and no grace wait, only
+a 1 s look for processes that end anyway), then
+the kernel's `cgroup.kill` (it also kills a `sudo` or setuid process the command started in its scope, which a plain
+kill could not reach: the scope is the job's own). Without `cgroup.kill` (before Linux 5.14) the KILL goes through a
+pidfd too; what is still running then is named, and the leftover sweep looks again.
+
+**The guard.** heavy starts a small helper (named `scope-guard`) in a session of its own, outside the scope, that
+waits for heavy. It is not heavy's child (a double fork), so a kill of heavy's process tree (`pkill -9 -P`, a tool
+that walks children) misses it. The command refuses to start when heavy is already gone. heavy tells the guard
+"done" after its own clean-up, and ends only once the guard has ended. When heavy goes away without that (`kill -9`,
+a crash, an out-of-memory kill), the guard does heavy's clean-up: it stops the scope and removes its containers, and
+prints `heavy: heavy was killed: stopped 2 leftover processes (sleeper)`. It ignores the signals heavy handles (a
+terminal's Ctrl-C, a service stop's TERM) and a kill of heavy's process group, holds no file of heavy's but stderr
+(so a pipe after heavy ends once it is done), and is never in the scope it cleans. Not for `HEAVY_KEEP=1` (a kept
+scope outlives heavy on purpose) or a nested heavy (the outer one has a guard). Only a kill of the guard too
+(`kill -9` on both, by pid) leaves the scope; the leftover sweep finds it then.
 
 **Never uncapped.** heavy refuses (exit 1, the reason on stderr, the command not run) when the systemd user
 manager cannot be reached, when the slice has no unit file (systemd would make an empty one up on the fly, with no
@@ -61,7 +101,7 @@ when that fits; the others wait in order. Without `--kind` heavy runs at once, a
 their real use is in the slice's figures).
 
 - **What a job reserves:** `--mb` (the project's start value for the kind), else 3072 MB, raised by what the kind
-  has used. While a queued job runs, heavy samples its scope's memory every 3 s and once more when the command
+  has used. While a queued job runs, heavy samples its scope's memory every second and once more when the command
   ends; the highest sample of every run goes into the kind's history (`peaks.json`, last 20 runs), failed and
   OOM-killed runs too (they often peak highest). The reservation is the highest of those peaks x 1.15, rounded up
   to 128 MB, never below the start value, at most 4x it, and a learned value at most the budget minus `vmReserveMb`.
@@ -71,7 +111,7 @@ their real use is in the slice's figures).
   reservation can be below a real peak; the slice's `memory.high`/`memory.max` still catch a real overrun. A start
   value above the budget stays as set. Kinds and start values are project facts: they live in the project's config,
   which passes them as `--kind`/`--mb`.
-- **Sampling limits:** a spike shorter than 3 s can be missed, and a job that is killed for memory is seen at its
+- **Sampling limits:** a spike shorter than a second can be missed, and a job that is killed for memory is seen at its
   last sample, not at the moment it was killed. That is why the reservation keeps a margin and never drops under
   the start value: set the start value from a real peak, not a typical run.
 - **When it fits:** reservation <= budget - used - owed, and <= MemAvailable - `vmReserveMb` - owed, the slice is
@@ -164,8 +204,8 @@ refuses it.
 - **Two callers at the same instant:** taking a place and every admission happen under one `flock` on the queue's
   `lock` file, so two callers always get two places, in order.
 - **heavy itself is killed** (`kill -9`) after its job was admitted: the command inherits the ticket's lock, so the
-  job keeps its reservation until the processes it started are gone. (Those processes have one more open file than
-  before: the ticket.)
+  job keeps its reservation until the processes it started are gone, which heavy's guard sees to at once. (Those
+  processes have one more open file than before: the ticket; the guard holds none.)
 - **Stops half-way through a write:** `peaks.json` and `waits.log` are written to `<file>.<pid>.tmp` and renamed;
   a failed write removes its temporary file, and the next writer removes ones whose process is gone.
 - **The admit command's program is missing** (removed or not yet installed): settings still load, `heavy queue`
@@ -177,13 +217,145 @@ refuses it.
 - **One leaky run of a kind:** its peak counts (failed runs too), but the learned value is capped at the budget
   minus `vmReserveMb`, so the kind is still admitted while other jobs use the slice.
 
+## Measured need and the capacity front
+
+Before an agent starts a build, a test run or a server it asks the machine's capacity check whether there is room
+(`<check> 1536 && start`). The number it asks for was a guess per kind of job. `heavy --measure` writes down what
+each run really used, and `heavy capacity` turns a kind name into an amount from those runs. The rule is to fail
+toward asking for more: the amount never goes below the kind's floor (by default its old fixed number), and big
+runs, stopped ones included, always count.
+
+**Recording.** `heavy --measure <kind> <command>` (and `heavy --kind <kind> ...`, which queues; `--measure` there
+names another kind for the record) looks at the job's scope every second while it runs (every 0.2 s until the
+scope is seen). Each look reads `memory.current`, `memory.peak` (the kernel's high-water mark since the scope
+began) and `used` (what the queue counts: `memory.current` less file cache the kernel can drop, at least the anon
+memory, plus swap). The job's **need** is the highest, over all looks, of `used + (memory.peak - memory.current)`:
+what it holds that cannot be dropped, plus how far above its current size it ever was. When the command ends one
+line is appended to `~/.local/state/heavy/measured.jsonl` (the home folder comes from the password database, not
+`$HOME`; `HEAVY_STATE_DIR` names another absolute folder for `--measure`, for tests):
+
+```
+{"at":"2026-11-21T10:00:00Z","code":0,"end":"exited","kind":"node-tests","needMb":1180,"peakMb":1210,"seconds":84.2,"usedMb":930,"v":1}
+```
+
+`end` is `exited` (the command ended by itself) or `stopped` (heavy was signalled and stopped it); `code` is the
+command's exit code (negative: the signal it died of), so fast failures can be told apart later. A nested heavy and
+`HEAVY_KEEP=1` record nothing. A failed write is one `heavy:` line on stderr, never a failed job.
+
+**What the need can miss** (the margin is the only cover for these):
+
+- growth after the last look: the scope's files fail with `ENODEV` as soon as its last process ends, so up to one
+  second at the very end of a job;
+- a spike followed by growth of droppable file cache before the next look: the need subtracts the cache held at
+  that look, so it is short of the spike by the cache that grew after it (`memory.peak` counts anon memory and
+  file cache together; the kernel keeps no peak of anon memory alone);
+- on a kernel without `memory.peak` (before 5.19), any spike shorter than one second (the need is then `used`);
+- memory outside the scope: the agent that runs the command, and anything the command starts outside heavy.
+
+`"measure": "used"` uses the sampled `used` alone (misses every spike shorter than a second), `"measure": "peak"`
+the kernel's peak (never misses a spike while the scope lives, but counts file cache too, so an IO-heavy job's
+peak grows towards the slice limit).
+
+**The capacity front.** `heavy capacity --kinds FILE --check PROGRAM [--] [<kind> | <MB>] [args...]` runs the
+check `PROGRAM` (absolute path) with the caller's arguments, except that a first argument that is a kind becomes
+its amount in MB:
+
+- **none, an empty one, or a whole number:** the check gets the same arguments (an empty one stays empty, so a
+  check's own default still applies), and the kinds file is not even read;
+- **a kind of the kinds file:** its amount (below), then the other arguments;
+- **any other word:** nothing runs, exit 2 (a typo must not reach a check that would read it as 0).
+
+The amount of a kind:
+
+1. its runs: the last `recentRuns` (at most 1000) records of the kind, **stopped runs too** (a run that was stopped,
+   often for growing, needed at least what it had);
+2. the **highest** figure of those runs, plus `marginPercent`, rounded up to `roundMb` (the highest, not a
+   percentile: two big runs among 48 small ones are the ones the check must leave room for);
+3. never below the kind's **floor** `minMb` (default: its `fallbackMb`), and never below its `fallbackMb` while it
+   has fewer than `minRuns` runs (no runs: the `fallbackMb`);
+4. at most the kind's `maxMb` (default twice its `fallbackMb`), so one runaway run cannot block a kind for good.
+
+So by default a kind's amount only ever rises above its old fixed number; a project that trusts its measurements
+lowers a kind's floor on purpose (`"minMb": 2048`), and a few tiny or mis-tagged runs still cannot pull it below that.
+
+**Agent kinds.** When the ask starts an agent (a writer that will run `npm test`), the measured command is not
+everything that starts: the agent itself (a few hundred MB, outside heavy) is never in a scope. Mark such a kind
+`"agent": true`; its floor is then its `fallbackMb` and cannot be set lower (the kinds file is refused), because no
+run can show that the agent needs less. Its measured runs only raise it. A kind that nothing runs under heavy (a
+read-only reviewer) is `"measured": false`: it always gets its `fallbackMb`, and `--show` says so.
+
+The front reads the history of the user that runs it, or the folder `--state-dir DIR` names; it never reads
+`HEAVY_STATE_DIR`, so a test setting that leaks into an agent's shell cannot size real starts. The check runs with
+`HEAVY_CAPACITY_KIND` (the kind, or empty) and `HEAVY_CAPACITY_FRONT=1`; its stdout and exit code are heavy's. A
+check that calls the front again (`HEAVY_CAPACITY_FRONT=1` already set) is refused, exit 2.
+`heavy capacity --kinds FILE --show [--json] [<kind>...]` prints each kind's amount and how it was reached.
+
+**Two histories, two questions.** The queue's `peaks.json` (above) decides when a queued job starts inside
+heavy.slice; `measured.jsonl` decides what the capacity check is asked before an agent starts something. Neither
+reads the other, so the same kind name can have two figures: the queue's for its reservation, the front's for the
+check. Nothing picks one over the other.
+
+**The kinds file** is the project's, not the kit's: its own file, or the `"capacity"` object of a larger project
+config. Example ([capacity-kinds.example.json](capacity-kinds.example.json)):
+
+```json
+{
+  "version": 1,
+  "marginPercent": 20,
+  "minRuns": 5,
+  "recentRuns": 50,
+  "roundMb": 128,
+  "measure": "need",
+  "kinds": {
+    "review": { "fallbackMb": 1024, "agent": true, "measured": false },
+    "node-tests": { "fallbackMb": 1536, "agent": true },
+    "gradle-build": { "fallbackMb": 3072, "minMb": 2048, "maxMb": 6144 }
+  }
+}
+```
+
+Only `version` and `kinds` (each with `fallbackMb`) are required; the other values are the defaults shown. An
+unknown key, a wrong type or a value out of range refuses the file (exit 2 for a kind; a plain number still works).
+
+**Switching a machine to it** (owner): see the pull request that added this section for paste-ready steps. In
+short: install, write the kinds file, put a front script between the agents' capacity command and the check, and
+only then let agents ask by kind. **Going back is the other order:** first agents ask with numbers again, then the
+front goes. A check reached without the front gets a word: a `sh`/`dash` check aborts on it (fails closed, every
+start waits), a `bash` check reads it as 0 (fails open). A check should therefore refuse a first argument that is
+not a whole number itself, for example as its first line:
+
+```sh
+case "${1-}" in *[!0-9]*) echo "NOT OK: '$1' is not a number of MB (a kind needs the capacity front)" >&2; exit 2 ;; esac
+```
+
+### The history runs again, stops half-way, or meets old or empty state
+
+- **First run, no history:** every kind gets its `fallbackMb` until it has `minRuns` measured runs.
+- **Missing or unreadable history** (gone, a folder or a link in its place, no permission): missing is the first
+  run; unreadable is not trusted, and every kind gets its `fallbackMb`. Never 0.
+- **Corrupt history:** a line that is not a record of this version is skipped. More than one such line and more
+  than 1 in 10: the whole history is not trusted (fallback for every kind) until rotation drops the bad lines.
+- **Two writers at once:** each record is one `write` of one line to a file opened with `O_APPEND`, so lines of
+  jobs that end at the same instant never mix and none is lost.
+- **A writer cut off half-way** (a line with no newline): the next writer starts on a new line, so only the cut
+  line is lost.
+- **A job killed before it records** (heavy killed with -9): no line, and the history is as before; the guard
+  still stops the scope. A job stopped by a signal to heavy is recorded as `stopped` and counts.
+- **Runs again forever:** past 256 KiB the file is renamed to `measured.jsonl.1` (the older one goes), under a lock
+  nobody waits for, after checking the size again under the lock; at most two files, 512 KiB. A lock file that
+  cannot be opened does not stop the rotation (the history stays bounded); a rotation that fails is a note, the
+  record is kept. A reader reads at most the last MiB of each file.
+- **A read during a rotation:** the reader opens the current file, then the rotated one, then checks the current
+  name is still the file it opened; if a rotation came in between it reads again (at most 5 times, then the
+  history is not trusted: fallback), so it never sees one file twice or misses the older one.
+
 ## Leftover sweep
 
-heavy cleans up after its own command. Some things still escape: what a command left after heavy was killed with
-`kill -9`, test runs started without heavy, and Docker containers (the Docker daemon starts them, so they are never
-in heavy's scope). `heavy sweep` finds them. A user timer (`heavy-sweep.timer`, installed with `--sweep-timer`)
-runs it every 5 minutes for each user who enables it. It only ever looks at the processes and containers of the
-user it runs as.
+heavy cleans up after its own command, also when it is killed (its guard, above). Some things still escape: a scope
+whose heavy and guard were both killed, test runs started without heavy, and Docker containers without the owner
+label (the Docker daemon starts them, so they are never in heavy's scope). `heavy sweep` finds them. A user timer
+(`heavy-sweep.timer`, installed with `--sweep-timer`) runs it every 5 minutes for each user who enables it. It only
+ever looks at the processes and containers of the user it runs as.
 
 It finds:
 
@@ -224,6 +396,12 @@ It finds:
 Before every signal it checks that the pid still belongs to the same process (start time and user, through a
 pidfd), so a reused pid is never hit. It never touches itself or the processes that started it.
 
+It also removes the old notes of `heavy docker-label` (above) whose scope is gone, which heavy and its guard both
+killed with -9, or a kept scope that ended, leave behind (in `~/.local/state/heavy/labelled/` they would stay for
+good): only an empty file named like a heavy scope that systemd did not list when the sweep began, and that was
+already `minAgeSeconds` old then, in a folder heavy itself would use (`labelled/`, `heavy/` and the base each a
+real folder of the user's that no one else can write). A live run's note stays.
+
 Each sweep appends to `<report>/sweep.log` (rotated at 1 MiB) and writes a short `<report>/last-report.txt`.
 The report folder must be a folder of the sweep's user that no group or other user can write (not a link); else
 the sweep refuses. The log, the report and the journal show only a process's own command (above), with the
@@ -243,6 +421,25 @@ heavy sweep 2026-01-01T12:00:00Z, stopping: 2 processes stopped, 1 containers re
   removed: container 3f2a9c1b7d4e test-db (mariadb:11, 3h10m old, running); owner pid 3990 is gone
   report only: pid 5120 java (3h0m old, cpu 140%, unit app.service): java -jar server.jar; busy and long-lived; not test-shaped
 ```
+
+**Look only: `heavy leftovers`.** Names everything above that is older than a limit, each with its owner and
+age, and stops, removes and writes nothing (no log, no report, no lock), so a capacity check or a person can run it
+before a heavy job, as often as wanted:
+
+```
+$ heavy leftovers --older-than 1h
+heavy leftovers 2026-01-01T12:00:00Z: 2 older than 1h0m, look only, default rules (no heavy.sweep settings)
+  would stop heavy-pytest-0a1b2c3d.scope (3h0m old): its heavy is gone; 2 processes
+  report only: container 3f2a9c1b7d4e old-db (mariadb:11, 1d5h old, running); no owner label
+```
+
+`--older-than` takes seconds or `30m`, `2h`, `1d`; the default is `minAgeSeconds`. One limit for all: an idle
+leftover is named as soon as it is older than the limit (the sweep waits for `longLivedSeconds` before it counts
+an idle one). The owner is the unit a process runs in, the heavy scope itself, or a container's owner label (`no
+label` for one without). `would stop` and `would remove` say what a sweep with stopping on would do; the rest is
+only reported. It works without the `heavy.sweep` settings (the defaults, which have no `testPatterns`) and
+refuses a broken machine file like the sweep. `--json` gives `{"v": 1, "olderThanSeconds", "defaults", "items":
+[{"kind", "action", "owner", "ageSeconds", "why", ...}], "notes"}` (an empty scope has `"ageSeconds": null`).
 
 **Dry run first.** Until the owner sets `"stop": true`, a sweep stops and removes nothing and says what it would
 do (`would stop`, `would remove`). `heavy sweep --dry-run` does the same whatever the setting. Read a few reports,
@@ -283,13 +480,22 @@ docker run -d --label "$(heavy docker-label)" mariadb:11
 `heavy docker-label` prints `fork-kit.heavy.owner=<owner>`; `--value` prints only the value (for an API such as
 Testcontainers' `withLabel("fork-kit.heavy.owner", value)`). The owner is the heavy scope when the test runs
 under heavy (heavy passes the scope name to the command as `HEAVY_SCOPE`), else the calling process with its
-start time. A container whose label names another user is never touched.
+start time. The scope is the one `heavy docker-label` runs in (its own cgroup): a process that left heavy's scope
+(`systemd-run --scope` from inside the command) still has `HEAVY_SCOPE` but gets the process owner, since heavy
+would remove its container when the scope ends (or is refused under a shell, which exits at once: pass
+`--owner-pid`, below); `HEAVY_SCOPE` counts only when the cgroup cannot be read. A
+container whose label names another user is never touched. Under heavy, heavy itself removes
+the container when its command ends or heavy is killed (above); the sweep is for a label with an owner pid and for
+a scope whose heavy and guard are both gone.
 
 **Setup scripts outside heavy.** The owner must be the process that lives as long as the container is in use:
 the test, not a setup script, Makefile line or `npm` script that starts the container and exits (the sweep
 would then remove it under the running test). So outside heavy, `heavy docker-label` refuses (exit 1) when its
-caller is a shell or a script runner (`sh`, `bash`, `make`, `env`, `npm`, ...). A setup script names the test
-process with `--owner-pid PID` (`--pid` is the same), for example a script the test runs as its child:
+caller is a shell or a script runner (`sh`, `bash`, `make`, `env`, `npm`, ...), and prints nothing: `--label ""`
+then makes `docker run` fail, so no container starts without an owner (with `--value`, check the exit code: an
+empty label value is accepted by Docker, and the sweep only reports such a container, and only while it runs). A
+setup script names the test process with `--owner-pid PID` (`--pid` is the same), for example a script the test
+runs as its child:
 
 ```
 docker run -d --label "$(heavy docker-label --owner-pid "$PPID")" mariadb:11
@@ -307,6 +513,8 @@ the owner as gone).
 | a pid reused before the stop                                               | the start time differs: not signalled, reported as reused                     |
 | a container already gone                                                   | reported as already gone, not a problem                                       |
 | no Docker, or the daemon down                                              | a note in the report; processes are still swept                               |
+| `heavy leftovers` with no machine file, no section or no `sweep` key       | the defaults; it only looks                                                   |
+| `heavy leftovers` run again, or while a sweep runs                         | the same answer (no lock, no state of its own); never in the sweep's way      |
 | no machine file, a broken one, no section, an unknown key, a newer version | refused with the reason; nothing checked or stopped; exit 1                   |
 | the timer fires before the file exists                                     | the same refusal, every 5 minutes, until the owner writes it                  |
 | the systemd user manager unreachable                                       | refused; nothing stopped                                                      |
@@ -315,6 +523,102 @@ the owner as gone).
 | a detached heavy (`nohup heavy ...`) of any age, its scope live            | never stopped or reported                                                     |
 | an install stopped half-way, or a rollback to a release without the sweep  | the timer is written only after the new release is in use, and runs the       |
 |                                                                            | sweep of the release in use; a release without one skips it (below)           |
+
+## Facts: may one more piece of work start?
+
+`heavy facts [--kind KIND] [--mb MB] [--fresh]` answers with one free/v1 object (`fork-kit/common/FREE.md`): exit
+0 free, 75 busy, anything else not available. It runs the capacity rule (`packages/shared/src/capacity`, installed
+as `capacity/` next to the kit; `lib/capacity_rule.py` is the kit's evaluator of it and passes the same vectors as
+the TypeScript one) on a ledger read from the kernel. Memory, swap, PSI, cores and container limits (the cgroup
+root's `memory.max` and `cpu.max`) come from `lib/capacity_readings.py`, the port of the shared reader that runs the
+same `capacity-readings.json` cases. Pieces: heavy's live queue tickets (admitted jobs with their scope's demand;
+waiting ones are counted only; every ticket is a job: of the rule's kind for its name, `build` is `job-build`,
+else of a kind the rule does not know, `unknownKinds.job`, never an agent), T3's agent scopes (`t3code-*.scope`
+under an `app-t3code*.slice` of the user manager; no kind label yet, so each counts as a writer), and the same two
+of every other user, read from their user managers' cgroups (so a CI runner under its own user sees this user's
+work, and the other way round). Learned job costs come from the queue's `peaks.json`; a job owes its kind's cost,
+not heavy's own reservation for it. The object adds `fits` (how many more of each kind would start, one
+after another, up to the group's ceiling), the memory budget, the queue and notes.
+
+- **--kind K:** does the rule admit one piece of K (`agent-writer`, `job-build`, or heavy's own `build`). **--mb
+  MB** alone: do MB fit the free budget at level "ok"; with --kind, the piece declares MB.
+- **T3 down or not installed:** no agent scopes, still an answer from the kernel.
+- **Tiers:** full with cgroup v2 and a systemd user manager. Without them (Basic) agents and other users' work
+  cannot be counted, so the answer is never free and every `fits` is 0 (a note says why). An other user's folder
+  that exists but cannot be listed is Basic too.
+- **Unreadable signals** (PSI, a box with a live piece but without its `memory.pressure`, or with no folder at
+  all) give "elevated", never "ok"; a missing MemAvailable or a container limit that cannot be read gives busy for
+  every kind. A box with no live piece of its own passes no box pressure (as the server's observer). A piece whose
+  `memory.stat` is cut short or broken owes its whole cost.
+- **Reservations:** files `~/.config/t3-capacity/reserve.d/*.conf` (or `$T3_CAPACITY_RESERVE_DIR`), lines
+  `<MB> <absolute folder> [until=YYYY-MM-DD]`. The folder matches itself and what is below it, with or without a
+  trailing `/`, never a sibling sharing its first letters (`/x/app` is not `/x/app-x`); its real path (links
+  resolved) matches too. A reservation holds back its MB less what this user's processes working in that folder
+  already use; a caller working inside the folder (its real working folder) is not held back by its own
+  reservation. Ended, broken or unreadable lines hold nothing and give a note. Limit: another user's reservations
+  are not seen.
+- **Holds (machine file):** a cgroup outside the user managers, such as a CI runners' slice, is not in the ledger.
+  `heavy.capacity.holds` names such cgroups; one that uses more than `inUseFromMb` (anon + shmem + swap) keeps its
+  budget (its `memory.max`, or `budgetMb` when it has none) less the RAM it uses (anon + shmem: `memory.max` limits
+  RAM only, so swap is left out), as a reservation named by its `label`, for every user except its own (`users`).
+  Not there: nothing runs in it. There without a memory controller (no `memory.stat`): its whole `budgetMb` is held,
+  with a note. Its use cannot be read: the whole budget is held, with a note. A reservation file named like a hold
+  (`<label>.conf`) gives a note; both hold.
+- **Cache:** `/run/user/<uid>/heavy-facts.json` (or `$HEAVY_FACTS_CACHE`), 0600, read again after 5 s (`--fresh`:
+  now). Pressure levels carry from it (at most 5 minutes old) so calm must last before a level drops. Without a
+  cache folder nothing carries, so every call starts "elevated" (only the rule's floors admit; never straight to
+  "ok").
+
+Two thin callers come with it (not linked onto PATH: a host wires them in itself):
+
+- `bin/t3-capacity [--kind KIND] [MB]`: the older host check's output (first line `available=..MB swapfree=..MB
+  load=..`, available less the rule's whole reservation hold, last line `OK` or `NOT OK: why`, exit 0 or 1), now
+  from `heavy facts`. MB defaults to 3072.
+- `bin/agent-slots`: a Claude Code hook (UserPromptSubmit, Stop) for orchestrator sessions: free agent slots are
+  the smaller of the process limit and the machine's `fits` for its kind.
+
+A `heavy facts` that does not answer within 5 s (it is killed), fails or prints something else is never free for
+either caller.
+
+### Facts run again, stop half-way, or meet old or empty state
+
+- **Runs again:** within 5 s the cache answers; two callers in the same second both answer and leave one valid
+  cache (each writes its own temporary file and renames it).
+- **Stops half-way:** a temporary cache file is left; the next run removes ones older than a minute.
+- **Old, empty, broken or foreign cache** (another owner, group or other access, a link, a time in the future, an
+  unknown key or version, or written with other settings: slice, queue or reservations folder): read again from
+  the kernel. A cache that cannot be written gives a note.
+- **Cost file** (`peaks.json`) missing, empty or broken: the rule's start costs, with the queue's note.
+- **Reservation file cut short** (its writer stopped half-way): its whole lines hold, the cut line is a note.
+  A reservation whose processes are all gone still holds all its MB (the room is kept for them), until its
+  `until=` date or until the line is removed.
+- **Machine file** missing, or without `heavy` or `capacity`: no holds. Broken (not JSON, an unknown key, a wrong
+  value, a `user.slice` cgroup, a label twice, a cgroup in or the same as another hold's, more than 8 holds,
+  writable by others): `heavy facts` gives no answer, so
+  `t3-capacity` says `NOT OK` naming the key. A changed file is read again at once (the cache key holds it).
+
+### Settings: the machine file's `heavy.capacity`
+
+Optional, in `/etc/fork-kit/machine.json` (`fork-kit/common/README.md`):
+
+```json
+"heavy": {
+  "capacity": {
+    "holds": [{ "label": "ci-slice", "cgroup": "ci.slice/ci-runners.slice", "users": ["ci-*"] }]
+  }
+}
+```
+
+| Key in a hold | Default  | What                                                                             |
+| ------------- | -------- | -------------------------------------------------------------------------------- |
+| `label`       | required | the name in `reservations:` (lower-case letters, digits, `_ . -`; at most 40)    |
+| `cgroup`      | required | its folder below the cgroup root; never below `user.slice` (counted already)     |
+| `inUseFromMb` | 1024     | held only while it uses more than this                                           |
+| `budgetMb`    | 6144     | its budget when its `memory.max` is `max`, cannot be read or is not there        |
+| `users`       | `[]`     | user name patterns (`fnmatch`) whose own budget it is: never held back from them |
+
+At most 8 holds, none in another's cgroup (it would hold the same room twice). The sweep and the queue accept the
+`capacity` key and leave it to `heavy facts`.
 
 ## Settings
 
@@ -351,7 +655,10 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | `/etc/fork-kit/machine.json`                    | written by the owner, never the kit: sweep and queue settings             |
 | `~/.local/state/heavy-sweep/`                   | each user's sweep log, last report and lock                               |
 | `/run/user/<uid>/heavy-queue/<slice>/`          | the memory queue: its lock and one ticket per queued job (tmpfs)          |
-| `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`)        |
+| `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
+|                                                 | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
+| `/run/user/<uid>/heavy-facts.json`              | `heavy facts`' 5 s cache (tmpfs)                                          |
+| `~/.config/t3-capacity/reserve.d/*.conf`        | each user's reservations for `heavy facts` and its callers                |
 
 ## Install (owner, as root)
 
@@ -385,6 +692,8 @@ removes them again). Upgrade: the same line again. Remove:
   installer drops the setting from `config.json` but keeps the units; rolling forward again with the usual line
   (without `--sweep-timer`) keeps them and says so. If one of the two units there is not the kit's, that line
   refuses and names the file; remove it, or run with `--no-sweep-timer`.
+- **Rollback past `heavy.capacity`:** remove the `capacity` key from the machine file's `heavy` section first; a
+  release from before it refuses the whole section (as below).
 - **Rollback past the memory queue:** remove the `queue` key from the machine file's `heavy` section first. A
   release from before the queue does not know it: its sweep refuses the whole machine file and says which key. That
   release cannot be changed from here, so the order is the guard: key out, then the older release.
@@ -402,7 +711,15 @@ clock; real processes where the kernel matters (a waiter killed with -9, a crash
 instant). Its red check breaks each admission and clean-up rule and shows the test for it then fails.
 `heavy.test.py` runs queued jobs with the real systemd user manager in a private queue folder (`HEAVY_QUEUE_ROOT`,
 never the user's live queue): one that runs, one that fails and still leaves its peak, one whose heavy is killed
-with -9 (the reservation stays until its command ends) and one give-up (exit 76).
+with -9 (its guard stops the scope, and the reservation ends with it) and one give-up (exit 76).
+
+`python3 -I -B fork-kit/heavy/tests/measure.test.py`: the measured history and the capacity front in temporary
+folders (`HEAVY_STATE_DIR`, `--state-dir`), a fake scope folder and a fake check script, no systemd: first run,
+missing, unreadable and corrupt history, eight writers at once, a writer and a job killed with -9, rotation (its
+re-check, a lock that cannot be opened, a read in the middle of one), the amount rules (stopped runs, the highest
+of 50, floors, agent kinds), the kinds file and every refusal. `HEAVY_TEST_KIT=<older fork-kit/heavy>` runs it
+against an older kit (the red check). `heavy.test.py` records real runs (`--measure`, a queued `--kind`, nested,
+killed with -9) into a temporary `HEAVY_STATE_DIR`.
 
 `python3 -I -B fork-kit/heavy/tests/sweep.test.py`: the sweep on a fake host (a fake `/proc`, fake `systemctl`
 and `docker` from `tests/fake_tools.py`, a temporary machine file), no root and nothing real swept. Its red check
@@ -410,8 +727,26 @@ breaks each stop and report rule in a copy of the sweep and shows the test for t
 scope names through heavy's own `run()` (`HEAVY_KEEP=1` and a command named `keep`) and checks how the sweep
 treats them.
 
+`python3 -I -B fork-kit/heavy/tests/capacity_rule.test.py`: the kit's evaluator against every vector and format
+case, and its reader against every `capacity-readings.json` case, of `packages/shared/src/capacity` (the files the
+TypeScript tests read); each number of the rule, changed, turns a vector red. `python3 -I -B fork-kit/heavy/tests/facts.test.py`: `heavy facts`, `t3-capacity` and
+`agent-slots` on a fake `/proc` and `/sys` (`HEAVY_FACTS_ROOT`), a temporary queue, home and cache, and fake slow
+or failing `heavy` scripts. Its red checks take out of a copy of `lib/heavy_facts.py` the agent-scope count,
+unknown kinds as jobs and the folder's trailing `/`, and show the test for each then fails.
+
 `python3 -I -B fork-kit/heavy/tests/install.test.py` (the installer on a fake host in a temporary folder, no root)
 and `python3 -I -B fork-kit/heavy/tests/heavy.test.py` (the wrapper with the real systemd user manager and a slice
 with a memory limit, `HEAVY_TEST_SLICE`, default `heavy.slice`; it skips without one, and fails instead with
 `HEAVY_REAL_TESTS=1`, as in CI). `HEAVY_TEST_BIN=fork-kit/heavy/tests/old-heavy.sh` runs the wrapper tests against
-the one-line wrapper from before: every leftover test fails (the red check).
+the one-line wrapper from before: every leftover test fails (the red check). With `HEAVY_TEST_BIN` set to the
+`bin/heavy` of an older kit (`git archive <commit> fork-kit | tar -x -C <folder>`), the tests of what came later
+fail: a heavy killed with -9 (the guard stops a double-forked child and removes a container), a container a test
+started, a rerun of the same test after a kill (the same container name), the guard's name, a tree kill of heavy
+and its children (the guard is no child), a `kill -9` of heavy's process group (the guard's own session), the
+guard ignoring the signals heavy handles, a kept scope that gets no guard, a signal to heavy that removes the
+container of a command outliving it (after the grace time and at a second signal), a looser `docker ps` filter
+(heavy's own exact label check), Docker asked only after a run that labelled a container, a stop by hand that
+never signals a pid no longer in the scope, a heavy gone before its command starts, and a Docker context. Container tests use
+a fake `docker` (`HEAVY_DOCKER`, `tests/fake_tools.py`), never the machine's. Run `heavy.test.py` itself without
+heavy: inside a heavy scope the heavy under test would run nested, so it refuses there; every command it runs gets
+a heavy scope of its own.

@@ -4,6 +4,10 @@ the rest (fork-kit/heavy/README.md, "Leftover sweep").
   heavy sweep               one sweep: stop or report, write the log and the short report
   heavy sweep --dry-run     the same, but stop nothing (also the default until heavy.sweep.stop is true)
   heavy sweep --json        look only (no stop, no log, no lock): {"v": 1, "leftovers": [...], ...} on stdout
+  heavy leftovers [--older-than AGE] [--json]
+                            look only: what is left behind (processes, heavy scopes, containers) older than AGE
+                            (seconds, or 30m, 2h, 1d; default heavy.sweep.minAgeSeconds), each with its owner and
+                            age; stops nothing, writes nothing, and works without the heavy.sweep settings
   heavy docker-label        print the owner label for a container a test starts: fork-kit.heavy.owner=<owner>
   heavy docker-label --value [--owner-pid PID]   only the value; --owner-pid names the owner process
 
@@ -25,9 +29,11 @@ It finds, for the user it runs as:
 
 Settings: the "heavy" section of the machine file (fork-kit/common/README.md), key "sweep". No file, no
 section, an unknown key or a newer version: nothing is checked or stopped, the reason is printed, exit 1.
+`heavy leftovers` uses the defaults when the file or the section is not there (it only looks), and refuses a
+broken one like the sweep.
 """
 import contextlib, datetime, fcntl, fnmatch, importlib.machinery, importlib.util, json, os, re, shlex, signal, stat
-import subprocess, sys, tempfile, time
+import pwd, subprocess, sys, tempfile, time
 
 KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 LABEL = 'fork-kit.heavy.owner'
@@ -137,7 +143,9 @@ SPEC = {
     'testPatterns': (list, [], _regexes),
     'ignorePatterns': (list, list(DEFAULT_IGNORE), _regexes),
 }
-SECTION_SPEC = {'sweep': (dict, machine_file.REQUIRED, None), 'queue': (dict, None, None)}  # queue: heavy_queue.py
+SECTION_SPEC = {'sweep': (dict, machine_file.REQUIRED, None), 'queue': (dict, None, None),  # heavy_queue.py
+                'capacity': (dict, None, None)}                                               # heavy_facts.py
+LOOK_SPEC = dict(SECTION_SPEC, sweep=(dict, None, None))       # heavy leftovers: no sweep settings is the defaults
 
 
 class Refused(Exception):
@@ -415,6 +423,7 @@ class Sweep:
     owner_uid = 0               # who must own the machine file
     sample_seconds = 1.0
     stop_grace = 5.0
+    note_dirs = None            # the folders of docker-label's notes; None = the user's own (note_bases)
 
     def __init__(self):
         self.uid = os.getuid()
@@ -430,13 +439,17 @@ class Sweep:
 
     # ---------- settings ----------
 
-    def settings(self):
-        section = machine_file.read_section('heavy', self.machine_path, self.owner_uid)
+    def settings(self, optional=False):
+        """heavy.sweep with its defaults. optional (heavy leftovers): no file, no heavy section or no sweep key in
+        it is the defaults (cfg['defaults'] is True); a broken file is still refused."""
+        section = machine_file.read_section('heavy', self.machine_path, self.owner_uid, optional=optional)
         path = self.machine_path or machine_file.default_path()
-        machine_file.fields(section, SECTION_SPEC, f'{path}: heavy')
-        cfg = machine_file.fields(section['sweep'], SPEC, f'{path}: heavy.sweep')
+        section = machine_file.fields({} if section is None else section, LOOK_SPEC if optional else SECTION_SPEC,
+                                      f'{path}: heavy')
+        cfg = machine_file.fields(section['sweep'] or {}, SPEC, f'{path}: heavy.sweep')
         cfg['report'] = os.path.expanduser(cfg['report'])
         cfg['path'] = path
+        cfg['defaults'] = section['sweep'] is None
         return cfg
 
     # ---------- processes ----------
@@ -610,6 +623,10 @@ class Sweep:
     # ---------- docker ----------
 
     def docker_path(self):
+        if self.docker is None and os.environ.get('HEAVY_DOCKER'):     # tests: a fake docker (also bin/heavy's)
+            # only an absolute path, as bin/heavy: a relative one left in a shell would run ./<it> from any folder
+            path = os.environ['HEAVY_DOCKER']
+            self.docker = path if os.path.isabs(path) else ''
         if self.docker is not None:
             return self.docker if self.docker and os.access(self.docker, os.X_OK) else ''
         for folder in ('/usr/bin', '/bin', '/usr/local/bin'):
@@ -675,6 +692,7 @@ class Sweep:
     def find(self, cfg):
         """Everything the sweep would act on: (procs, plan). plan is a list of dicts with 'kind' (process, scope,
         empty-scope, container), 'action' (stop, report, remove) and the reason."""
+        listed_at = self._now()
         listed = self.heavy_scope_units()
         procs = self.sample()
         manager = next((p.pid for p in procs.values() if p.comm == 'systemd'
@@ -692,6 +710,7 @@ class Sweep:
         for p in procs.values():
             if is_heavy_scope(p.unit):
                 members.setdefault(p.unit, []).append(p)
+        self.known_scopes = (listed_at, set(listed) | set(members))     # for prune_notes
         info = self.units({p.unit for p in procs.values() if p.ppid in orphan_parents and not is_heavy_scope(p.unit)})
 
         children = {}
@@ -802,8 +821,8 @@ class Sweep:
             return None
         created = parse_created(c.get('Created'))
         age = self._now() - created if created is not None else 0
-        base = {'kind': 'container', 'id': cid, 'full_id': full, 'name': clip(name), 'image': clip(image), 'age': age, 'running': running,
-                'procs': []}
+        base = {'kind': 'container', 'id': cid, 'full_id': full, 'name': clip(name), 'image': clip(image), 'age': age,
+                'running': running, 'procs': [], 'owner': clip(labels[LABEL]) if LABEL in labels else 'no label'}
         if LABEL not in labels:
             if running and age >= cfg['minAgeSeconds']:
                 return dict(base, action='report', why='no owner label')
@@ -837,7 +856,8 @@ class Sweep:
         for item in plan:
             ps = item['procs']
             if item['kind'] in ('scope', 'empty-scope'):
-                head = f'{item["unit"]}: {item["why"]}' + (f'; {len(ps)} processes' if ps else '')
+                head = (f'{item["unit"]}' + (f' ({duration(max(p.age for p in ps))} old)' if ps else '')
+                        + f': {item["why"]}' + (f'; {len(ps)} processes' if ps else ''))
                 if item['action'] == 'report':
                     counts['reported'] += 1
                     lines.append(f'report only: {head}')
@@ -899,7 +919,51 @@ class Sweep:
                     counts['problems'] += 1
                 lines.append(f'{result}: {head}')
                 self.log(f'result container {item["id"]}: {result}')
+        if act:
+            pruned = self.prune_notes(cfg)
+            if pruned:
+                self.log(f'removed {pruned} old notes of docker-label for scopes that are gone')
         return plan, counts, lines
+
+    def note_folders(self):
+        if self.note_dirs is not None:
+            return self.note_dirs
+        return tuple(os.path.join(b, 'heavy', 'labelled') for b in note_bases() if b)
+
+    def prune_notes(self, cfg):
+        """Remove the notes `heavy docker-label` left for scopes that are gone: heavy and its guard both killed with
+        -9, or a kept scope that ended. In /run/user they go at logout; in ~/.local/state they would stay for good.
+        Only an empty file named like a heavy scope that systemd did not list (and that held no process) when this
+        sweep began, and that was already minAgeSeconds old then: a live run's scope is listed, and a scope
+        started since is newer than its note could be old. A note heavy has not read yet (its scope ended a moment
+        before this sweep began) costs at most a container that this sweep or the next removes instead of heavy.
+        Only in a folder heavy would use (bin/heavy own_folder): labelled/, heavy/ and the base each a real folder
+        (no symlink) of this user's that no one else can write. Returns how many were removed."""
+        listed_at, known = getattr(self, 'known_scopes', (None, None))
+        if known is None:
+            return 0
+        before = listed_at - cfg['minAgeSeconds']
+        removed = 0
+        for folder in self.note_folders():
+            try:
+                # the folder, heavy/ and the base: each a real folder of this user's only it can write (own_folder)
+                if any(not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid or st.st_mode & 0o022
+                       for st in map(os.lstat, (folder, os.path.dirname(folder),
+                                                os.path.dirname(os.path.dirname(folder))))):
+                    continue
+                names = os.listdir(folder)
+            except OSError:
+                continue
+            for name in names:
+                if not is_heavy_scope(name) or name in known:
+                    continue
+                path = os.path.join(folder, name)
+                with contextlib.suppress(OSError):
+                    st = os.lstat(path)
+                    if stat.S_ISREG(st.st_mode) and st.st_size == 0 and st.st_mtime < before:
+                        os.unlink(path)
+                        removed += 1
+        return removed
 
 
 def leftovers_json(plan):
@@ -1017,8 +1081,26 @@ def folder_problem(folder, uid):
     return None
 
 
+def item_owner(item):
+    """Who left it: the unit a process runs in, the heavy scope itself, or a container's owner label."""
+    if item['kind'] in ('scope', 'empty-scope'):
+        return item['unit']
+    if item['kind'] == 'container':
+        return item.get('owner') or 'no label'
+    return item['procs'][0].unit or '?'
+
+
+def item_age(item):
+    """Seconds: the oldest process in it, or the container's age; None for an empty scope (nothing to date it by)."""
+    if item['kind'] == 'container':
+        return item['age']
+    return max(p.age for p in item['procs']) if item['procs'] else None
+
+
 def item_json(item):
-    out = {'kind': item['kind'], 'action': item['action'], 'why': item['why']}
+    out = {'kind': item['kind'], 'action': item['action'], 'why': item['why'], 'owner': item_owner(item)}
+    age = item_age(item)
+    out['ageSeconds'] = None if age is None else round(age)
     if item['kind'] in ('scope', 'empty-scope'):
         out['unit'] = item['unit']
     if item['kind'] == 'container':
@@ -1029,11 +1111,63 @@ def item_json(item):
     return out
 
 
-def refuse(text, as_json, out, err):
+def refuse(text, as_json, out, err, verb='sweep'):
     if as_json:
         print(json.dumps({'v': 1, 'error': text}), file=out)
-    print(f'heavy sweep: {text}', file=err)
+    print(f'heavy {verb}: {text}', file=err)
     return 1
+
+
+def parse_age(text):
+    """Seconds from 90, 90s, 30m, 2h or 1d; None when it is not one of those."""
+    m = re.fullmatch(r'(\d{1,9})([smhd]?)', text or '')
+    return None if not m else int(m.group(1)) * {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[m.group(2)]
+
+
+def leftovers_main(argv, sweep=None, out=None, err=None):
+    """heavy leftovers: name what is left behind, older than a limit, with its owner and age. Stops nothing, writes
+    nothing (no log, no report, no lock), so a capacity check or a person can run it any time, as often as wanted."""
+    out, err = out or sys.stdout, err or sys.stderr
+    usage = 'usage: heavy leftovers [--older-than AGE] [--json]   (AGE: seconds, or 30m, 2h, 1d)'
+    as_json, limit, args = False, None, list(argv)
+    while args:
+        a = args.pop(0)
+        if a in ('-h', '--help'):
+            print(usage, file=out)
+            return 0
+        if a == '--json':
+            as_json = True
+        elif a == '--older-than' and args and parse_age(args[0]) is not None:
+            limit = parse_age(args.pop(0))
+        elif a.startswith('--older-than=') and parse_age(a.partition('=')[2]) is not None:
+            limit = parse_age(a.partition('=')[2])
+        else:
+            print(usage, file=err)
+            return 2
+    s = sweep or Sweep()
+    try:
+        cfg = s.settings(optional=True)
+    except MachineFileError as e:
+        return refuse(f'{e}; nothing checked', as_json, out, err, 'leftovers')
+    limit = cfg['minAgeSeconds'] if limit is None else limit
+    # one limit for everything: a leftover older than it is named whether it is busy or idle
+    cfg = dict(cfg, minAgeSeconds=limit, longLivedSeconds=limit)
+    stamp = datetime.datetime.fromtimestamp(s._now(), datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    s.log_file = None
+    try:
+        plan, _counts, lines = s.run(cfg, act=False)
+    except Refused as e:
+        return refuse(f'{e}; nothing checked', as_json, out, err, 'leftovers')
+    where = 'default rules (no heavy.sweep settings)' if cfg['defaults'] else f'rules from {cfg["path"]}'
+    if as_json:
+        print(json.dumps({'v': 1, 'at': stamp, 'olderThanSeconds': limit, 'defaults': cfg['defaults'],
+                          'items': [item_json(i) for i in plan], 'notes': s.notes}, sort_keys=True), file=out)
+        return 0
+    head = (f'heavy leftovers {stamp}: ' + (f'{len(plan)} older than {duration(limit)}' if plan
+                                              else f'none older than {duration(limit)}')
+            + f', look only, {where}')
+    out.write('\n'.join([head] + [f'  {line}' for line in lines] + [f'  note: {n}' for n in s.notes]) + '\n')
+    return 0
 
 
 SHORT_LIVED = SHELLS | {'make', 'gmake', 'env', 'xargs', 'timeout', 'nohup', 'nice', 'setsid', 'stdbuf', 'time',
@@ -1055,17 +1189,17 @@ def read_owner(pid, proc='/proc'):
 
 
 def owner_value(pid=None, proc='/proc'):
-    """The fork-kit.heavy.owner label value for a container: the heavy scope this runs in (HEAVY_SCOPE, which heavy
-    gives its command, or else the own cgroup), or a process with its start time, so a reused pid never counts as
-    the owner. The process is `pid` (--owner-pid), which must be the caller's own user's; without it, the caller's
-    parent, refused when that is a shell or a script runner (make, env, npm, ...): those usually exit while the
-    container is still in use (`docker run --label "$(heavy docker-label)"` in a setup script), and the sweep
-    would then remove the container under the running test."""
+    """The fork-kit.heavy.owner label value for a container: the heavy scope this runs in (its own cgroup; HEAVY_SCOPE,
+    which heavy gives its command, only when the cgroup cannot be read), or a process with its start time, so a
+    reused pid never counts as the owner. A process that left heavy's scope (systemd-run --scope from inside the
+    command) keeps HEAVY_SCOPE but is not in the scope: it gets the process owner, since heavy would otherwise
+    remove its container when the scope ends, while the process goes on. The process is `pid` (--owner-pid), which
+    must be the caller's own user's; without it, the caller's parent, refused when that is a shell or a script
+    runner (make, env, npm, ...): those usually exit while the container is still in use (`docker run --label
+    "$(heavy docker-label)"` in a setup script), and the sweep would then remove the container under the running
+    test."""
     uid = os.getuid()
     if pid is None:
-        scope = os.environ.get('HEAVY_SCOPE', '')
-        if is_heavy_scope(scope) and re.fullmatch(r'[A-Za-z0-9_.:-]+', scope):
-            return f'uid={uid},scope={scope}'
         try:
             with open(f'{proc}/self/cgroup', encoding='utf-8') as f:
                 leaf = unit_of(''.join(line[3:].strip() for line in f if line.startswith('0::')))
@@ -1073,18 +1207,115 @@ def owner_value(pid=None, proc='/proc'):
             leaf = ''
         if is_heavy_scope(leaf):
             return f'uid={uid},scope={leaf}'
+        scope = os.environ.get('HEAVY_SCOPE', '')
+        if not leaf and is_heavy_scope(scope) and re.fullmatch(r'[A-Za-z0-9_.:-]+', scope):
+            return f'uid={uid},scope={scope}'
         pid = os.getppid()
         owner_uid, start, comm = read_owner(pid, proc)
         if comm in SHORT_LIVED:
+            # nothing on stdout: `--label "$(heavy docker-label)"` is then an empty label, which docker run refuses,
+            # so no container starts that nobody owns
+            fix = 'run the test under heavy, or pass --owner-pid PID of the long-lived test process'
+            if is_heavy_scope(scope):
+                fix = (f'this process left heavy\'s scope {scope} (it runs in {leaf or "an unknown cgroup"}), so '
+                       f'heavy would remove the container under it: pass --owner-pid PID of the long-lived process '
+                       f'that uses the container')
             raise LabelRefused(f'the caller (pid {pid}, {comm}) is a shell or a script runner, which usually exits '
-                               f'before the container is done, and the sweep would then remove it. Run the test '
-                               f'under heavy, or pass --owner-pid PID of the long-lived test process')
+                               f'before the container is done, and the sweep would then remove it; {fix}')
     else:
         owner_uid, start, comm = read_owner(pid, proc)
     if owner_uid != uid:
         raise LabelRefused(f'pid {pid} belongs to uid {owner_uid}, not {uid}: the sweep sees only its own '
                            f"user's processes and would remove the container")
     return f'uid={uid},pid={pid},start={start}'
+
+
+RUNTIME_ROOT = '/run/user'
+STATE_ROOT = ''         # '' = ~/.local/state (bin/heavy STATE_ROOT)
+
+
+def state_base():
+    """<home>/.local/state for the second notes folder (bin/heavy state_base, the same rule), or '' for none: $HOME,
+    else the password database's home; only an absolute folder this user owns, that no group or other user can write,
+    and not /."""
+    if STATE_ROOT:
+        return STATE_ROOT
+    homes = [os.environ.get('HOME') or '']
+    with contextlib.suppress(KeyError):
+        homes.append(pwd.getpwuid(os.getuid()).pw_dir)
+    for home in homes:
+        if not home or not os.path.isabs(home):
+            continue
+        try:
+            st = os.stat(home)
+        except OSError:
+            continue
+        if (stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022
+                and os.path.realpath(home) != '/'):
+            return os.path.join(home, '.local', 'state')
+    return ''
+
+
+def note_bases():
+    """The bases of the notes folders, as heavy reads them: <RUNTIME_ROOT>/<uid>, then state_base() ('' for none)."""
+    return os.path.join(RUNTIME_ROOT, str(os.getuid())), state_base()
+
+
+def note_in(base, scope):
+    """Note the scope in <base>/heavy/labelled (bin/heavy own_folder, the same rule): (folder, '') or ('', why not).
+    heavy/ and heavy/labelled are made if missing (heavy has made its own already: one made here is never heavy's),
+    but never base itself: unlike heavy, docker-label never makes ~/.local/state."""
+    if not base:
+        return '', 'no home folder this user owns'
+    uid = os.getuid()
+    folder = os.path.join(base, 'heavy', 'labelled')
+    try:
+        for d in (base, os.path.dirname(folder), folder):
+            if d != base:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(d, 0o700)
+            st = os.lstat(d)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
+                return '', f'{d} is not a folder only this user can write'
+        os.close(os.open(os.path.join(folder, scope), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
+    except OSError as e:
+        return '', str(e)
+    return folder, ''
+
+
+def note_label(value, marks=None):
+    """For a scope owner: note the scope where heavy reads it (bin/heavy marks_dirs), so heavy asks Docker for the
+    scope's containers when it ends; a run that labelled none never asks. First <RUNTIME_ROOT>/<uid>/heavy/labelled;
+    when that note cannot reach heavy (not written: /run/user full or not allowed; or written into another folder
+    than heavy's, a sandbox's own /run/user, told by HEAVY_MARKS, device:inode of the folders heavy reads), then
+    ~/.local/state/heavy/labelled. '' or why it could not (heavy then leaves the container to the leftover sweep).
+    Without HEAVY_MARKS only the /run/user note is tried: a heavy with neither folder asks Docker after every run
+    anyway, and an older heavy (before HEAVY_MARKS) reads only that folder, so it asks Docker only when that note was
+    written; when it was not, the container is left to the leftover sweep."""
+    scope = value.partition(',scope=')[2]
+    if not scope:
+        return ''
+    marks = os.environ.get('HEAVY_MARKS') if marks is None else marks
+    reads = set(filter(None, (marks or '').split(',')))
+    whys = []
+    for base in note_bases():
+        folder, why = note_in(base, scope)
+        if folder and marks:
+            try:
+                st = os.stat(folder)
+                if f'{st.st_dev}:{st.st_ino}' not in reads:
+                    why = f'{folder} is not the folder heavy reads (another mount namespace?)'
+            except OSError as e:
+                why = str(e)
+            if why:     # a note heavy never reads: none at all
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(folder, scope))
+        if not why:
+            return ''
+        whys.append(why)
+        if not marks:   # heavy asks Docker anyway: no second folder needed
+            break
+    return '; '.join(whys)
 
 
 def label_main(argv, out=None, err=None):
@@ -1107,6 +1338,10 @@ def label_main(argv, out=None, err=None):
     except (OSError, ValueError, IndexError, StopIteration) as e:
         print(f'heavy docker-label: cannot read the owner process ({e})', file=err)
         return 1
+    problem = note_label(value)
+    if problem:
+        print(f'heavy docker-label: cannot note the scope for heavy ({problem}); the leftover sweep removes the '
+              f'container later', file=err)
     print(value if value_only else f'{LABEL}={value}', file=out)
     return 0
 
@@ -1116,8 +1351,11 @@ if __name__ == '__main__':
     verb, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ('', [])
     if verb == 'sweep':
         sys.exit(sweep_main(rest))
+    if verb == 'leftovers':
+        sys.exit(leftovers_main(rest))
     if verb == 'docker-label':
         sys.exit(label_main(rest))
-    print('usage: heavy_sweep.py sweep [--dry-run|--json] | docker-label [--value] [--owner-pid PID]',
+    print('usage: heavy_sweep.py sweep [--dry-run|--json] | leftovers [--older-than AGE] [--json] | '
+          'docker-label [--value] [--owner-pid PID]',
           file=sys.stderr)
     sys.exit(2)

@@ -28,6 +28,12 @@ MODES = ('shadow', 'enforce')
 WEIGHTS = ('critical', 'normal', 'light')   # heaviest first
 CATCH_ALL = '**'
 KEYS = ('version', 'mode', 'rules', 'lenses', 'min_lenses', 'rounds', 'findings', 'state_line')
+# Optional keys, with what leaving them out means. override_authors: the GitHub logins whose override comment counts as a
+# person's decision (a finding cleared, the round cap passed). Left out or empty: no override is a person's (issue #78:
+# while agents post as the owner's login, an override from it proves no person).
+OPTIONAL = ('override_authors',)
+LOGIN_RE = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}')
+MAX_OVERRIDE_AUTHORS = 20
 RULE_KEYS = ('name', 'weight', 'paths', 'lenses')
 ROUND_KEYS = ('approach_at', 'max', 'approach_lens')
 MAX_LENSES = 10
@@ -83,6 +89,7 @@ class ReviewRules:
     warnings: tuple = ()
     # The rule-order problems themselves, in either mode (enforce_order_problems): empty in a parsed enforce block.
     order: tuple = ()
+    override_authors: tuple = ()   # GitHub logins as written, each once (case-insensitive); empty: no person's override
 
     def lens(self, name):
         return next((x for x in self.lenses if x.name == name), None)
@@ -447,7 +454,8 @@ def parse_review(obj, where='review'):
         newer = _int(obj['version'], VERSION + 1, 2 ** 31)
         raise ConfigError(f'{where}: version {_show(obj["version"])} is not {VERSION}, the only version this release '
                           f'reads' + (': update the pinned release first' if newer else ''))
-    problems.extend(f'unknown key {k!r} (known: {", ".join(KEYS)})' for k in obj if k not in KEYS)
+    problems.extend(f'unknown key {k!r} (known: {", ".join(KEYS + OPTIONAL)})' for k in obj
+                    if k not in KEYS + OPTIONAL)
     problems.extend(f'{k} is missing' for k in KEYS if k not in obj)
     if 'mode' in obj and obj['mode'] not in MODES:
         problems.append(f'mode is {_show(obj["mode"])}: must be one of {", ".join(MODES)}')
@@ -461,6 +469,7 @@ def parse_review(obj, where='review'):
     mins = _min_lenses(obj['min_lenses'], problems) if 'min_lenses' in obj else None
     rules = _rules(obj['rules'], declared, mins, problems) if 'rules' in obj else ()
     rounds = _rounds(obj['rounds'], declared, problems) if 'rounds' in obj else None
+    authors = _override_authors(obj.get('override_authors', []), problems)
     # Rule order: refused in enforce (the rules decide), a warning in shadow (they only say what they would have said).
     order = _shadowed(rules)
     warnings = tuple(f'{w}; {SWITCH}' for w in order) if obj.get('mode') == 'shadow' else ()
@@ -469,4 +478,24 @@ def parse_review(obj, where='review'):
     if problems:
         raise ConfigError(f'{where}: ' + '; '.join(problems))
     return ReviewRules(obj['version'], obj['mode'], rules, tuple(Lens(n, p) for n, p in lenses.items()), mins,
-                       rounds, obj['findings'], obj['state_line'], warnings, tuple(order))
+                       rounds, obj['findings'], obj['state_line'], warnings, tuple(order), authors)
+
+
+def _override_authors(raw, problems):
+    """The override_authors list: GitHub logins, each once (case-insensitive), at most MAX_OVERRIDE_AUTHORS."""
+    if not isinstance(raw, list):
+        problems.append(f'override_authors is {_show(raw)}: must be a list of GitHub logins ([] = no override is a '
+                        f'person\'s)')
+        return ()
+    if len(raw) > MAX_OVERRIDE_AUTHORS:
+        problems.append(f'override_authors has {len(raw)} logins: at most {MAX_OVERRIDE_AUTHORS}')
+    seen, out = set(), []
+    for x in raw:
+        if not isinstance(x, str) or not LOGIN_RE.fullmatch(x):
+            problems.append(f'override_authors: {_show(x)} is not a GitHub login')
+        elif x.lower() in seen:
+            problems.append(f'override_authors: {x!r} is listed twice')
+        else:
+            seen.add(x.lower())
+            out.append(x)
+    return tuple(out)

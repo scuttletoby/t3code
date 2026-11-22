@@ -13,6 +13,48 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: review findings, rounds and `override_authors` (#740)
+
+With a `review` block, the gate also judges the review itself from the lens comments. With `findings: true`, a lens's
+newest report needs a findings section (`blocker:` and `major:` lines, or `findings: none`), and a blocker or major in
+it fails the head. A round is a lens read of a different own change (a queue update adds none): from
+`rounds.approach_at` the approach lens is required, and past `rounds.max` a person decides. The new optional key
+`review.override_authors` lists the logins whose override comment counts as a person's (empty or left out: none
+does). In `shadow` the check summary only adds a row "findings and rounds (shadow): they would have said: ...". Without
+a `review` block nothing changes. First in the release after `ci/v20`.
+
+**Upgrade:** `ci/v20` and older refuse a config with `override_authors`: move every pin first, then add the key
+(pr-queue README, "Turning it on: release, pin, then config"). A config already in `enforce` with `findings: true`:
+after the move, a required lens whose newest report has no findings section fails the head, so have the lens prompts
+write `blocker: none` and `major: none` first, or switch to `shadow` before the move. In both modes a head whose
+rounds cannot be judged (an error while reading the lens comments) now fails instead of passing on the old rule.
+
+### handoff-put and handoff-get: a file handed from one job to a later job of the same run (#247)
+
+- New actions [`handoff-put`](actions/handoff-put/README.md) and [`handoff-get`](actions/handoff-get/README.md). put
+  wraps a text file as `{format, name, sha, payload}` with the checkout's HEAD and uploads it as the artifact
+  `<name>-<sha>` (pinned `actions/upload-artifact`, three days' retention by default, a re-run attempt overwrites
+  it, a second producer of the same name in a first attempt is refused with `ok` `'false'`). get
+  downloads it from the same run only (pinned `actions/download-artifact`) and writes the payload only when the `sha`
+  inside is the checkout's HEAD. Neither fails its step for a missing, refused or forged hand-off: `ok` is `'false'`
+  and the consumer falls back to its old `runs-on`, which keeps the fork guard (README, "How the consumer picks its
+  runner"). A `path` whose folder is a symlink out of the workspace is refused.
+- git-clean's test now also counts an action that runs another action folder's script (handoff-get runs
+  handoff-put's `handoff.py`) as one that runs git.
+
+### pr-queue: `notify_command` runs once for each notice on an armed pull request it passes over (#129)
+
+- New optional config keys `notify_command` (an argv list) and `notify_timeout_seconds` (default 30). When set, the
+  queue runs the command right after it posted a notice on an armed pull request it passes over (a conflict, a red,
+  cancelled or missing required check), with repo, PR number, head, kind, reason and a link as arguments (README,
+  "Notify"). The posted comment is the record: a later run, a restart or another runner does not run it again for
+  the same head and reason.
+- A command that is missing, fails or runs too long is a warning in the run log and never changes what the run does
+  or its exit code. No token is passed in its environment, but it runs as the queue's user (README, "Notify").
+
+**Upgrade:** move the pin first, then add `notify_command` to the config: a queue of an older release refuses the
+unknown key and touches no pull request.
+
 ### git-clean: the wipe stays in the workspace while another process changes it (#428)
 
 - Going back up by `..` must land in the folder the wipe came from (device and inode): a folder moved out of the
@@ -241,6 +283,27 @@ then behind, and the update that brings it up to date is a new head, judged on t
   is itself a config that parses. A real symlink's text is a path and a submodule entry names a commit, so the check
   refuses the fix too ("not JSON"), and an owner has to push the fix by hand, as for any base config that does not
   parse.
+
+### head-check gate: reviews and inline review comments run the gate again (#375, #392, #379)
+
+A new example workflow, `review-trigger.example.yml` ("Head gate review trigger"), runs on reviews and inline review
+comments and does nothing but finish. The gate caller runs on `workflow_run` of it and judges the head of the open pull
+request whose head branch, head repository and head sha are the run's (the number comes from the API, never from the
+run). Two open pull requests on one head (one branch into two bases) are judged once, in the job for the lowest number.
+Before this, a review left the check showing the older answer until the next push or issue comment. First in `ci/v15`.
+After `ci/v20` (#379, #651), a review run whose head fields are missing or not GitHub's form judges nothing with a
+warning (before: a plain log line); a head branch git allows but the gate does not look up (an invisible or joining
+character, or longer than 255) keeps the plain line, and "no open pull request has the head" says how many GitHub listed
+on that branch.
+
+**Upgrade:** nothing breaks if you only move the pin: a caller without the new trigger never runs on `workflow_run`.
+To use it, in one pull request on the default branch, after the pin is at `ci/v15` or later: copy
+`review-trigger.example.yml` to `.github/workflows/` unchanged, and add the caller's `workflow_run` trigger, its `if`
+(with the event clause) and its `concurrency` from `gate-caller.example.yml`. The pin moves first or in that pull
+request: a caller with `workflow_run` pinned to an older release (`ci/v14` or before) is refused on that event (its
+guard job fails, nothing is posted). Then do the live check once ([head-check README](actions/head-check/README.md),
+setup step 8): post a review on one open pull request and check that the gate ran for it. The GitHub fields the lookup
+uses are tested only against fakes.
 
 ### pr-queue and head-check: stricter rule order in `review` (#378)
 

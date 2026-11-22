@@ -47,7 +47,8 @@ and no comment says so yet (STATE stays, the next run finishes it).
     PR_QUEUE_READ_TOKEN=... PR_QUEUE_WRITE_TOKEN=... \
     pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
 """
-import argparse, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, threading, time, urllib.parse, zlib
+import argparse, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat, subprocess, sys, tempfile, threading, \
+    time, urllib.parse, zlib
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -608,6 +609,85 @@ def sync_dir(path):
 def no_token_env():
     """This process's environment without any token: for a local git that needs no login."""
     return {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
+
+
+def notify_env():
+    """The environment notify_command runs with: the queue's, without any token (TOKEN_VARS, and every name with TOKEN
+    in it, such as the runner's ACTIONS_RUNTIME_TOKEN): the command is the project's, and the write token can merge."""
+    return {k: v for k, v in os.environ.items() if k not in TOKEN_VARS and 'TOKEN' not in k.upper()}
+
+
+def repo_page(link, page):
+    """Whether `link` (GitHub's text: a status targetUrl can be anything) is a page under `page`
+    (https://github.com/<repo>/, any case) and stays there in a browser: printable ASCII only (no space, control
+    character or NUL, which would also stop the command from starting), no backslash (browsers read it as /), and no
+    path segment that is . or .. once percent-decoded, nor an encoded / or \\ (%2f, %5c)."""
+    if not (isinstance(link, str) and re.fullmatch(r'[!-~]+', link) and link.lower().startswith(page.lower())):
+        return False
+    path = re.split(r'[?#]', link[len(page):], maxsplit=1)[0]
+    if '\\' in path or re.search(r'%(2f|5c)', path, re.I):
+        return False
+    return not any(urllib.parse.unquote(seg) in ('.', '..') for seg in path.split('/'))
+
+
+NOTIFY_OUTPUT = 4000   # characters of the command's output the run log shows
+NOTIFY_BUDGET = 300    # seconds all notify_command runs of one run may take together: the job stops at 20 minutes
+
+
+def notify_tree(root):
+    """The processes to stop with a notify_command (pid `root`, not yet waited for) that ran too long: its session,
+    which holds a child that made a process group of its own (coreutils timeout does), and every process still linked
+    to one of those by its parent, which holds a child that made a session of its own (setsid) while its parent runs.
+    Read from /proc; only `root` where there is none (stop_notify then kills root's process group as well). A child whose parent already ended (a daemon) is beyond it: the
+    runner's end-of-job cleanup stops that one (README.md, "Notify\")."""
+    procs = {}
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return {root}
+    for d in names:
+        if not d.isdigit():
+            continue
+        try:
+            with open(f'/proc/{d}/stat', 'rb') as f:
+                stat_line = f.read().decode('ascii', 'replace')
+            fields = stat_line[stat_line.rindex(')') + 2:].split()   # state ppid pgrp session ...
+            procs[int(d)] = (int(fields[1]), int(fields[3]))
+        except (OSError, ValueError, IndexError):   # it ended while read
+            continue
+    tree = {root} | {pid for pid, (_, sid) in procs.items() if sid == root}
+    while True:
+        more = {pid for pid, (ppid, _) in procs.items() if ppid in tree} - tree
+        if not more:
+            return tree
+        tree |= more
+
+
+def stop_notify(root):
+    """Kill notify_tree(root): stop each process first, then kill them all, so that none forks or moves away (a child
+    whose parent is killed first leaves the tree) between the read and the kill. Then root's process group goes too, in
+    one kill: without /proc that is all there is to find, and never less than the group. Safe: root leads its own session
+    (start_new_session), so its group is never the queue's, and its pid, not yet waited for, cannot be reused."""
+    stopped = set()
+    for _ in range(20):   # a process that forks on every stop cannot keep it going forever
+        new = notify_tree(root) - stopped
+        if not new:
+            break
+        for pid in new:
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:   # it ended, or is not the queue user's
+                pass
+        stopped |= new
+    for pid in stopped:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.killpg(root, signal.SIGKILL)
+    except OSError:   # the group has no process left
+        pass
 
 
 def git_env(env, remote=None):
@@ -1311,12 +1391,16 @@ class Queue:
                     'it, so that the current workflows run')
         return 'Nothing re-runs it by itself: re-run the CI run (Actions, "Re-run failed jobs") or push'
 
-    def tell(self, n, head, reason, way_out, still=None):
+    def tell(self, n, head, reason, way_out, still=None, kind='red', link=None):
         """An armed PR the queue skips says why on the PR, once per head and reason. No answer from GitHub: the next
         run tries again. Told means a comment of the queue's own login (viewerDidAuthor) that starts with the mark:
         anyone can post a copy of it on a public repository. `head` is the head the reason was found on (the list):
         after a push the reason is not known for the new head, and a mark for it would silence its real notice.
-        `still`: what the PR must still show when it is read for this (the list is older), else nothing is said."""
+        `still`: what the PR must still show when it is read for this (the list is older), else nothing is said.
+        Once the comment is posted, notify_command runs (notify) with `kind` and `link`: the comment is the record that
+        this head and reason were told, on GitHub, so a later run, a restart or another runner never runs it again.
+        So while a notify_command is set and this run's NOTIFY_BUDGET is spent, nothing is posted: the next run, with a
+        fresh budget, posts it and runs the command. No notice is lost, and none runs twice."""
         pr = self.view(n, gh=self.gh_write)   # viewerDidAuthor: the login that posts the queue's comments
         if not pr:
             print(f'#{n}: could not read it to say why it waits')
@@ -1331,17 +1415,107 @@ class Queue:
         if any(c.get('viewerDidAuthor') is True and (c.get('body') or '').startswith(told)
                for c in pr.get('comments') or []):
             return
+        if self.cfg.notify_command and self.notify_left() < 1:   # the comment would say it was told, and wake no one
+            print(f"#{n}: this run's notify commands used their {NOTIFY_BUDGET} s, so it does not post this notice "
+                  'yet: the next run tells it (and runs notify_command)')
+            return
         r = self.gh_write('pr', 'comment', str(n), '--repo', self.repo, '--body',
                           f'{told} so this armed PR waits and the queue passes over it. {way_out}')
         if r.returncode != 0:
             print(f'#{n}: could not comment: {r.stderr.strip()[:300]}')
+            return
+        self.notify(n, (pr.get('headRefOid') or '').lower(), kind, reason, link)
 
-    def tell_red(self, n, head, check, what='is red', fix='Fix the cause and push'):
+    def notify(self, n, head, kind, reason, link=None):
+        """Run the config's notify_command for a notice tell() just posted: argv + repo, PR, head, kind, reason, link
+        (README.md, "Notify"). Never part of the queue's result: a command that is missing, fails or runs longer than
+        notify_timeout_seconds (then it and its processes are killed: stop_notify) is a warning, and the run goes on.
+        All commands of a run share NOTIFY_BUDGET seconds; tell() posts no notice once that is spent, so the next run
+        posts and runs it. A command that fails, hangs or cannot start is not tried again: the posted comment says it
+        was told, and a later run must not wake anyone again."""
+        cmd = self.cfg.notify_command
+        if not cmd:
+            return
+        page = f'https://github.com/{self.repo}/'
+        if not repo_page(link, page):
+            link = f'{page}pull/{n}'
+        argv = [*cmd, self.repo, str(n), head, kind, reason, link]
+        left = self.notify_left()
+        if left < 1:   # tell() posts nothing then; a direct call still stays inside the budget
+            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) not run: this run\'s notify commands took '
+                  f'{NOTIFY_BUDGET} s together. The PR comment stands; nothing is tried again')
+            return
+        limit = min(self.cfg.notify_timeout_seconds, left)
+        sys.stdout.flush()
+        start, code, ran = time.monotonic(), None, False
+        try:
+            with tempfile.TemporaryFile() as out:   # a file, not a pipe: a helper it leaves running cannot hold the run
+                p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                     env=notify_env(), start_new_session=True)
+                ran = True
+                try:
+                    code = p.wait(timeout=limit)
+                except subprocess.TimeoutExpired:
+                    stop_notify(p.pid)
+                    p.wait()
+                    code = None
+                out.seek(0)
+                said = out.read(NOTIFY_OUTPUT + 1).decode('utf-8', 'replace')
+        except (OSError, ValueError) as e:   # cannot start, no temp file (a full disk), or its output cannot be read
+            what = 'ran, but its output could not be read' if ran else 'could not start'
+            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) {what}: {e}. The PR comment '
+                  'stands; nothing is tried again')
+            return
+        finally:
+            self.notify_spent = getattr(self, 'notify_spent', 0.0) + time.monotonic() - start
+        if said:
+            # Its output is not the queue's: no workflow command from it, neither ::cmd:: (the prefix: the runner
+            # reads it only at a line's start) nor the older ##[cmd] (read anywhere in a line), so the runner stops
+            # reading commands until a token the command cannot know.
+            # The resume line is printed whatever happens to the lines before it (an encoding error on a non-UTF-8
+            # stdout), or the runner would ignore every later ::warning:: of the step.
+            resume, shown = secrets.token_hex(16), None
+            print(f'::stop-commands::{resume}')
+            try:
+                for line in said[:NOTIFY_OUTPUT].splitlines():
+                    print(f'  notify| {line}')
+            except (OSError, ValueError) as e:
+                shown = e
+            finally:
+                print(f'::{resume}::')
+            if shown:
+                print(f'::warning::pr-queue: notify_command for #{n} ({kind}): its output could not all be shown: '
+                      f'{shown}')
+        if code is None:
+            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) ran longer than {limit:.3g} s and was '
+                  'stopped. The PR comment stands; nothing is tried again')
+        elif code != 0:
+            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) exited {code}. The PR comment stands; '
+                  'nothing is tried again')
+        else:
+            print(f'#{n}: notify_command ran for {kind} on {head[:12]}')
+
+    def notify_left(self):
+        """Seconds of NOTIFY_BUDGET this run's notify commands have not used yet (one Queue per run)."""
+        return NOTIFY_BUDGET - getattr(self, 'notify_spent', 0.0)
+
+    def tell_red(self, n, head, check, what='is red', fix='Fix the cause and push', kind='red', link=None):
         """tell() for a required check: once per head, check and reason."""
         also = '.'
         if check == self.cfg.head_check and what == 'is red':
             also = f', or if a new lens read or override covers this head: `{self.cfg.ready(n)}`.'
-        self.tell(n, head, f'required check {check} {what}', fix + also)
+        self.tell(n, head, f'required check {check} {what}', fix + also, kind=kind, link=link)
+
+    @staticmethod
+    def check_link(p, check):
+        """The page of the newest run of required check `check` on the listed PR `p` (its detailsUrl, or a status's
+        targetUrl), for notify; None when it has none (notify then links the PR)."""
+        runs = [c for c in lens.latest_checks(p.get('statusCheckRollup') or [])
+                if (c.get('name') or c.get('context')) == check]
+        if not runs:
+            return None
+        c = max(runs, key=lambda c: c.get('startedAt') or '9999')
+        return c.get('detailsUrl') or c.get('targetUrl')
 
     def tell_dirty(self, n, head, base):
         """tell() for an armed PR that conflicts with its base (merge state DIRTY): GitHub cannot merge it and the queue
@@ -1351,7 +1525,8 @@ class Queue:
         self.tell(n, head, f'merge conflict with {base}',
                   f'GitHub cannot merge it and the queue cannot update it: merge {base} into it, resolve the conflict '
                   f'and push (`{self.cfg.push_command}`).',
-                  still=lambda pr: pr.get('mergeStateStatus') == 'DIRTY' and bool(pr.get('autoMergeRequest')))
+                  still=lambda pr: pr.get('mergeStateStatus') == 'DIRTY' and bool(pr.get('autoMergeRequest')),
+                  kind='conflict')
 
     # --- red only because the base it was tested on was red (config update_when_base_was_red) -----------------------
     def tested_base(self, c):
@@ -1834,13 +2009,14 @@ class Queue:
                     if not dry:
                         self.tell_red(n, head, bad, f'failed as on {base}',
                                       f'{base} failed {bad} too, so this is not this PR\'s fault: the queue '
-                                      f'updates it by itself once {bad} is green on {base}')
+                                      f'updates it by itself once {bad} is green on {base}',
+                                      kind='base-red', link=self.check_link(p, bad))
                     continue
             elif bad:
                 print(f'skip #{n}: required check {bad} failed (its author fixes it)')
             if bad:
                 if not dry:
-                    self.tell_red(n, head, bad)
+                    self.tell_red(n, head, bad, link=self.check_link(p, bad))
                 continue
             if p.get('mergeStateStatus') != 'BEHIND':
                 if p.get('mergeStateStatus') == 'UNKNOWN' and may_wait:
@@ -1856,7 +2032,8 @@ class Queue:
                           'cannot merge, so it does not hold the queue')
                     if not dry:
                         self.tell_red(n, head, why[0], why[1],
-                                      self.stuck_fix(why[1], p.get('baseRefName') or 'its base'))
+                                      self.stuck_fix(why[1], p.get('baseRefName') or 'its base'),
+                                      kind='stuck', link=self.check_link(p, why[0]))
                     continue
                 print(f'#{n} is up to date and waiting for its checks: queue is moving')
                 return 0

@@ -6,6 +6,7 @@ No root, no systemd, no network.
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CAPACITY = os.path.join(os.path.dirname(os.path.dirname(KIT)), 'packages', 'shared', 'src', 'capacity')
 SHA1, SHA2 = 'a' * 40, 'b' * 40
 OLD_WRAPPER = b'#!/bin/sh\nexec systemd-run --user --scope --quiet --slice=heavy.slice --collect -- "$@"\n'
 
@@ -73,7 +74,7 @@ class Install(unittest.TestCase):
         self.assertEqual(self.run_main('self-check')[0], 0)
         # the installed wrapper runs from its version folder
         r = subprocess.run([sys.executable, '-I', '-B', self.path(f'/usr/local/libexec/heavy/versions/{SHA1}/bin/heavy'),
-                            '--help'], capture_output=True, text=True)
+                            '--help'], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0)
         self.assertIn('heavy <command>', r.stdout)
 
@@ -158,6 +159,7 @@ class Install(unittest.TestCase):
         shutil.copytree(KIT, src, ignore=shutil.ignore_patterns('__pycache__'))
         shutil.copytree(os.path.join(os.path.dirname(KIT), 'common'), os.path.join(self.root, 'common'),
                         ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(CAPACITY, os.path.join(src, 'capacity'))
         with open(os.path.join(src, 'bin', 'heavy'), 'w') as f:
             f.write('this is not python\n')
         code, _, err = self.install(sha=SHA2, source=src)
@@ -216,11 +218,21 @@ class Install(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(version, 'lib', 'heavy_sweep.py')))
         moved = os.path.join(self.root, 'elsewhere')   # nothing of the repository next to it
         shutil.copytree(version, moved)
-        for args in (['sweep', '--help'], ['docker-label', '--value']):
+        # docker-label with a process owner: a scope owner (this test run under heavy) would leave a note for the
+        # heavy running it in /run/user/<uid>/heavy/labelled, which an installed heavy from before the notes keeps
+        with open('/proc/self/cgroup') as f:
+            leaf = ''.join(line[3:].strip() for line in f if line.startswith('0::')).rpartition('/')[2]
+        home = os.path.join(self.root, 'home')          # never the tester's real home (#761 item 9)
+        os.mkdir(home, 0o700)
+        notes = [os.path.join(base, 'heavy', 'labelled', leaf) for base in
+                 (f'/run/user/{os.getuid()}', os.path.join(home, '.local', 'state'))] if leaf.endswith('.scope') else []
+        before = [n for n in notes if os.path.lexists(n)]
+        for args in (['sweep', '--help'], ['facts', '--help'], ['docker-label', '--value', '--owner-pid', str(os.getpid())]):
             r = subprocess.run([sys.executable, '-I', '-B', os.path.join(moved, 'bin', 'heavy'), *args],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, timeout=60, env=dict(os.environ, HOME=home))
             self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertRegex(r.stdout, r'^uid=\d+,(pid=\d+,start=\d+|scope=heavy-.+\.scope)\n$')
+        self.assertRegex(r.stdout, rf'^uid=\d+,pid={os.getpid()},start=\d+\n$')
+        self.assertEqual([n for n in notes if os.path.lexists(n)], before, 'the test left a note behind')
 
     def test_sweep_timer_units_written_kept_and_removed(self):
         units = [self.path('/etc/systemd/user/heavy-sweep.service'), self.path('/etc/systemd/user/heavy-sweep.timer')]

@@ -8,6 +8,7 @@ One test sends real signals, to a child process this test starts.
 """
 import contextlib, fcntl, importlib.machinery, importlib.util, io, json, os, re, shutil, signal, subprocess, sys
 import tempfile, time, types, unittest
+from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWEEP = os.path.join(KIT, 'lib', 'heavy_sweep.py')
@@ -151,6 +152,7 @@ class SweepTests(unittest.TestCase):
         self.stubborn = set()
         self.before_open = None
         self.after_send = None
+        self.note_dirs = tuple(os.path.join(self.root, d, 'heavy', 'labelled') for d in ('run', 'state'))
 
     def write_machine(self, data=None):
         data = data if data is not None else {'version': 1, 'heavy': {'sweep': self.cfg}}
@@ -171,6 +173,8 @@ class SweepTests(unittest.TestCase):
         s.systemctl, s.docker = self.shim('systemctl'), (self.shim('docker') if docker else '')
         s.uid, s.pid, s.clk, s.stop_grace = UID, SELF, CLK, 0.3
         s._now = lambda: NOW
+        # docker-label's notes: this test's folders, never the user's (the fake host's scopes are not the real ones)
+        s.note_dirs = self.note_dirs
         sampled = []
 
         def sleep(_seconds):
@@ -196,6 +200,52 @@ class SweepTests(unittest.TestCase):
                 self.after_send(fd, sig)
         s._pidfd_open, s._pidfd_send, s._close = pidfd_open, pidfd_send, lambda fd: None
         return s
+
+    def label_proc(self, cgroup):
+        """A fake /proc for owner_value: its own cgroup (None: no cgroup v2 line) and its parent, a python3."""
+        proc = os.path.join(self.root, 'label-proc')
+        shutil.rmtree(proc, ignore_errors=True)
+        os.makedirs(os.path.join(proc, 'self'))
+        with open(os.path.join(proc, 'self', 'cgroup'), 'w') as f:
+            f.write(f'0::{cgroup}\n' if cgroup is not None else '1:name=systemd:/\n')
+        parent = os.path.join(proc, str(os.getppid()))
+        os.makedirs(parent)
+        with open(os.path.join(parent, 'stat'), 'w') as f:
+            f.write(f'{os.getppid()} (python3) S 1 ' + ' '.join(['0'] * 17) + ' 4321 ' + ' '.join(['0'] * 20) + '\n')
+        with open(os.path.join(parent, 'status'), 'w') as f:
+            f.write(f'Name:\tpython3\nUid:\t{UID}\t{UID}\t{UID}\t{UID}\n')
+        return proc
+
+    def test_docker_label_names_the_scope_the_process_is_in(self):
+        # HEAVY_SCOPE is only inherited: a process that left heavy's scope (systemd-run --scope from inside the
+        # command) keeps it, yet heavy would remove its container while it still runs. Its own cgroup decides
+        old = os.environ.get('HEAVY_SCOPE')
+        self.addCleanup(lambda: os.environ.__setitem__('HEAVY_SCOPE', old) if old is not None
+                        else os.environ.pop('HEAVY_SCOPE', None))
+        os.environ['HEAVY_SCOPE'] = 'heavy-a-0a1b2c3d.scope'
+        value = self.mod.owner_value(proc=self.label_proc(f'{CG}/heavy.slice/heavy-b-0a1b2c3d.scope'))
+        self.assertEqual(value, f'uid={UID},scope=heavy-b-0a1b2c3d.scope')
+        value = self.mod.owner_value(proc=self.label_proc(f'{CG}/app.slice/run-r0a1b2c3d.scope'))
+        self.assertEqual(value, f'uid={UID},pid={os.getppid()},start=4321')
+        value = self.mod.owner_value(proc=self.label_proc(None))      # the cgroup cannot be told: HEAVY_SCOPE then
+        self.assertEqual(value, f'uid={UID},scope=heavy-a-0a1b2c3d.scope')
+
+    def test_heavy_docker_must_be_an_absolute_path(self):
+        # as bin/heavy: a relative HEAVY_DOCKER left in a shell would run ./<it> from whatever folder the sweep runs in
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(self.root)
+        with open('docker-here', 'w') as f:
+            f.write('#!/bin/sh\nexit 0\n')
+        os.chmod('docker-here', 0o755)
+        old = os.environ.get('HEAVY_DOCKER')
+        self.addCleanup(lambda: os.environ.__setitem__('HEAVY_DOCKER', old) if old is not None
+                        else os.environ.pop('HEAVY_DOCKER', None))
+        for value, want in (('docker-here', ''), (os.path.join(self.root, 'docker-here'),
+                                                  os.path.join(self.root, 'docker-here'))):
+            with self.subTest(value=value):
+                os.environ['HEAVY_DOCKER'] = value
+                self.assertEqual(self.mod.Sweep().docker_path(), want)
 
     def run_sweep(self, *argv, docker=True, sweep=None):
         out, err = io.StringIO(), io.StringIO()
@@ -720,6 +770,94 @@ class SweepTests(unittest.TestCase):
         self.nothing_stopped()
         self.assertNotIn('300', out.replace('3000', ''))
 
+    def notes(self, *names, age=700, folders=None):
+        """Empty notes of docker-label (made in both folders), age seconds old on the fake clock."""
+        for folder in folders or self.note_dirs:
+            os.makedirs(folder, 0o700, exist_ok=True)
+            for d in (folder, os.path.dirname(folder), os.path.dirname(os.path.dirname(folder))):
+                os.chmod(d, 0o700)                     # as heavy makes them (makedirs's parents follow the umask)
+            for name in names:
+                path = os.path.join(folder, name)
+                open(path, 'w').close()
+                os.utime(path, (NOW - age, NOW - age))
+
+    def left_notes(self):
+        return [sorted(os.listdir(d)) if os.path.isdir(d) else None for d in self.note_dirs]
+
+    def test_old_notes_of_gone_scopes_are_removed_and_no_other(self):
+        # #761 item 7: heavy and its guard both killed with -9 (or a kept scope that ended) leave docker-label's empty
+        # note; in ~/.local/state nothing else would ever remove it
+        live = 'heavy-pytest-0a1b2c3d.scope'
+        self.host.add(3000, SERVICE, 'python3', 'python3 heavy pytest', f'{CG}/app.slice/t3code.service', 3600)
+        self.host.add(3001, 3000, 'pytest', 'pytest -x', f'{CG}/{self.scope(live)}', 3600)
+        listed = 'heavy-keep-db-0a1b2c3d.scope'         # a kept scope systemd still lists, with no process
+        self.host.load()['units'][listed] = {'ActiveState': 'active'}
+        self.host.save()
+        self.notes('heavy-gone-0a1b2c3d.scope', 'heavy-keep-gone-0a1b2c3d.scope', live, listed)
+        self.notes('heavy-young-0a1b2c3d.scope', age=100)              # its scope may have just ended: next time
+        self.notes('notes.txt')                                       # not a note of heavy's
+        for d in self.note_dirs:
+            with open(os.path.join(d, 'heavy-full-0a1b2c3d.scope'), 'w') as f:
+                f.write('x')                                           # not empty: not docker-label's
+            os.utime(os.path.join(d, 'heavy-full-0a1b2c3d.scope'), (NOW - 700, NOW - 700))
+            os.symlink('/nowhere', os.path.join(d, 'heavy-link-0a1b2c3d.scope'))
+        kept = sorted(['heavy-young-0a1b2c3d.scope', 'notes.txt', 'heavy-full-0a1b2c3d.scope',
+                       'heavy-link-0a1b2c3d.scope', live, listed])
+        code, out, _ = self.run_sweep('--dry-run')                     # a dry run changes nothing
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.left_notes()[0]), len(kept) + 2)
+        code, out, _ = self.run_sweep()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.left_notes(), [kept, kept])
+        with open(os.path.join(self.report, 'sweep.log')) as f:
+            self.assertIn('removed 4 old notes of docker-label for scopes that are gone', f.read())
+        code, out, _ = self.run_sweep()                                # again: nothing more, no error
+        self.assertEqual((code, self.left_notes()), (0, [kept, kept]))
+
+    def test_notes_in_a_folder_others_can_write_or_a_missing_one_are_left(self):
+        # missing folders (no note ever written, a fresh machine): nothing to do, no error
+        self.assertEqual((self.run_sweep()[0], self.left_notes()), (0, [None, None]))
+        self.notes('heavy-gone-0a1b2c3d.scope')
+        os.chmod(self.note_dirs[0], 0o777)              # not a folder of heavy's (heavy and docker-label skip it too)
+        self.addCleanup(os.chmod, self.note_dirs[0], 0o700)
+        self.assertEqual(self.run_sweep()[0], 0)
+        self.assertEqual(self.left_notes(), [['heavy-gone-0a1b2c3d.scope'], []])
+
+    def test_notes_behind_a_linked_or_open_parent_folder_or_a_link_are_left(self):
+        # #767 item 3: the same folder rule as heavy's own (own_folder): labelled/, heavy/ and the base each a real
+        # folder of this user's that no one else can write. And a note that is a link is never followed (#764 nit)
+        elsewhere = os.path.join(self.root, 'elsewhere', 'heavy', 'labelled')
+        self.notes('heavy-gone-0a1b2c3d.scope', folders=(elsewhere,))
+        run_base, state_base = (os.path.dirname(os.path.dirname(d)) for d in self.note_dirs)
+        os.symlink(os.path.dirname(os.path.dirname(elsewhere)), run_base)            # the base a link
+        os.makedirs(state_base, 0o700)
+        os.symlink(os.path.dirname(elsewhere), os.path.join(state_base, 'heavy'))    # heavy/ a link
+        self.assertEqual(self.run_sweep()[0], 0)
+        self.assertEqual(os.listdir(elsewhere), ['heavy-gone-0a1b2c3d.scope'])
+        # real folders, but a base others can write: left too
+        os.remove(run_base)
+        os.remove(os.path.join(state_base, 'heavy'))
+        self.notes('heavy-gone-0a1b2c3d.scope')
+        os.chmod(run_base, 0o777)
+        self.addCleanup(os.chmod, run_base, 0o700)
+        # a note that links to an old empty file elsewhere: the link is not an empty file of docker-label's
+        target = os.path.join(self.root, 'old-empty')
+        open(target, 'w').close()
+        os.utime(target, (NOW - 700, NOW - 700))
+        os.symlink(target, os.path.join(self.note_dirs[1], 'heavy-link-0a1b2c3d.scope'))
+        self.assertEqual(self.run_sweep()[0], 0)
+        self.assertEqual(self.left_notes(), [['heavy-gone-0a1b2c3d.scope'], ['heavy-link-0a1b2c3d.scope']])
+        self.assertTrue(os.path.isfile(target))
+
+    def test_the_user_s_own_note_folders_by_default(self):
+        # the sweep the timer runs reads the folders heavy reads (bin/heavy marks_dirs): /run/user/<uid> and the
+        # state folder of a home this user owns
+        s = self.mod.Sweep()
+        with mock.patch.object(self.mod, 'RUNTIME_ROOT', os.path.join(self.root, 'run')), \
+                mock.patch.dict(os.environ, {'HOME': self.root}):
+            self.assertEqual(s.note_folders(), (os.path.join(self.root, 'run', str(UID), 'heavy', 'labelled'),
+                                                os.path.join(self.root, '.local', 'state', 'heavy', 'labelled')))
+
     def test_scope_whose_heavy_is_gone_is_stopped_as_a_whole(self):
         self.orphan(3002, 'node worker.js', unit=self.scope(), age=1200, cpu=0)      # not test-shaped, not busy
         self.host.add(3003, 3002, 'sleep', 'sleep 9', f'{CG}/{self.scope()}', 1200)
@@ -729,7 +867,7 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn(['systemctl', '--user', 'stop', '--', 'heavy-pytest-0a1b2c3d.scope'], self.host.calls('systemctl'))
         self.assertFalse(self.host.exists(3002) or self.host.exists(3003))
-        self.assertIn('stopped heavy-pytest-0a1b2c3d.scope: its heavy is gone; 2 processes', out)
+        self.assertIn('stopped heavy-pytest-0a1b2c3d.scope (20m old): its heavy is gone; 2 processes', out)
 
     def test_young_scope_whose_heavy_is_gone_waits(self):
         self.orphan(3002, 'node worker.js', unit=self.scope(), age=30)
@@ -822,7 +960,7 @@ class SweepTests(unittest.TestCase):
         self.host.save()
         code, out, _ = self.run_sweep()
         self.nothing_stopped()
-        self.assertIn(f'report only: {unit}: its heavy is gone, but it holds a session or multiplexer; 2 processes',
+        self.assertIn(f'report only: {unit} (3h0m old): its heavy is gone, but it holds a session or multiplexer; 2 processes',
                       out)
 
     def test_scope_holding_only_another_users_processes_is_reported_not_stopped(self):
@@ -998,6 +1136,147 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('not there', json.loads(out)['error'])
 
+    # ---------- heavy leftovers: look only, by owner and age ----------
+
+    def run_leftovers(self, *argv, docker=True):
+        out, err = io.StringIO(), io.StringIO()
+        code = self.mod.leftovers_main(list(argv), sweep=self.sweep(docker), out=out, err=err)
+        return code, out.getvalue(), err.getvalue()
+
+    def leftover_host(self):
+        self.orphan(2001, 'python3 -m pytest a', age=1200, cpu=0)          # idle, 20 minutes: not long-lived
+        self.orphan(2002, 'java -jar x.jar', age=3 * 3600, cpu=0, unit='app.slice/other.service')
+        self.orphan(2003, 'python3 -m pytest b', age=120, cpu=99)           # young: never named
+        self.host.add(2010, MANAGER, 'node', 'node a.test.js', f'{CG}/heavy.slice/heavy-node-0a1b2c3d.scope', 900)
+        self.host.container('a', 'db1', 7200, owner=f'uid={UID},scope=heavy-gone-0a1b2c3d.scope')
+        self.host.container('b', 'old-db', 29 * 3600)                       # running, no label: only ever named
+
+    def test_leftovers_without_the_sweep_settings_names_them_by_owner_and_age_and_stops_nothing(self):
+        # no machine file, or one with no heavy section, or one with only heavy.queue: the default rules
+        self.leftover_host()
+        for name, data in (('no file', None), ('no heavy', {'version': 1}),
+                           ('queue only', {'version': 1, 'heavy': {'queue': {}}})):
+            with self.subTest(case=name):
+                if data is None:
+                    os.unlink(self.machine)
+                else:
+                    self.write_machine(data)
+                code, out, err = self.run_leftovers()
+                self.assertEqual(code, 0, err)
+                head, *lines = out.splitlines()
+                self.assertRegex(head, r'^heavy leftovers \S+: 5 older than 10m, look only, default rules ')
+                text = '\n'.join(lines)
+                # idle for 20 minutes, which the sweep (long-lived: 2 hours) leaves alone: named here
+                self.assertIn('report only: pid 2001 python3 (20m old, cpu 0%, unit t3code.service)', text)
+                self.assertIn('pid 2002 java (3h0m old, cpu 0%, unit other.service)', text)
+                self.assertIn('would stop heavy-node-0a1b2c3d.scope (15m old): its heavy is gone', text)
+                self.assertIn('would remove: container aaaaaaaaaaaa db1 (mariadb:11, 2h0m old, running); '
+                              'owner heavy-gone-0a1b2c3d.scope is gone', text)
+                self.assertIn('report only: container bbbbbbbbbbbb old-db (mariadb:11, 1d5h old, running); '
+                              'no owner label', text)
+                self.assertNotIn('2003', text)
+                self.nothing_stopped()
+                self.assertFalse(os.path.exists(self.report))       # no log, no report, no lock
+                self.assertEqual(self.host.calls('systemctl', 'stop') + self.host.calls('docker', 'rm'), [])
+
+    def test_leftovers_older_than_a_limit(self):
+        self.leftover_host()
+        code, out, _ = self.run_leftovers('--older-than', '1h')
+        self.assertEqual(code, 0)
+        self.assertRegex(out.splitlines()[0], r': 3 older than 1h0m, look only, rules from ')
+        self.assertNotIn('pid 2001', out)
+        self.assertIn('pid 2002 java', out)
+        code, out, _ = self.run_leftovers('--older-than=60')
+        self.assertIn('pid 2003 python3', out)                  # 2 minutes old: older than one
+        code, out, _ = self.run_leftovers('--older-than', '30d')
+        self.assertRegex(out.splitlines()[0], r': none older than 30d0h, look only')
+        self.assertEqual(len(out.splitlines()), 1, out)
+        for bad in (['--older-than'], ['--older-than', '-5'], ['--older-than', '2w'], ['--stop'], ['x']):
+            with self.subTest(argv=bad):
+                code, _, err = self.run_leftovers(*bad)
+                self.assertEqual(code, 2)
+                self.assertIn('usage: heavy leftovers', err)
+        self.nothing_stopped()
+
+    def test_leftovers_json_gives_owner_and_age(self):
+        self.leftover_host()
+        code, out, _ = self.run_leftovers('--json', '--older-than', '10m')
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual((data['v'], data['olderThanSeconds'], data['defaults']), (1, 600, False))
+        got = {(i['kind'], i['owner'], i['ageSeconds'], i['action']) for i in data['items']}
+        self.assertEqual(got, {('process', 't3code.service', 1200, 'stop'),          # test-shaped
+                               ('process', 'other.service', 3 * 3600, 'report'),
+                               ('scope', 'heavy-node-0a1b2c3d.scope', 900, 'stop'),
+                               ('container', f'uid={UID},scope=heavy-gone-0a1b2c3d.scope', 7200, 'remove'),
+                               ('container', 'no label', 29 * 3600, 'report')})
+        self.nothing_stopped()
+
+    def test_leftovers_refuses_a_broken_machine_file(self):
+        self.leftover_host()
+        for name, data in (('broken', '{"version": 1,'), ('newer', {'version': 2}),
+                           ('unknown key', {'version': 1, 'heavy': {'sweep': {'stopp': True}}}),
+                           ('too young', {'version': 1, 'heavy': {'sweep': {'minAgeSeconds': 5}}})):
+            with self.subTest(case=name):
+                self.write_machine(data)
+                code, out, err = self.run_leftovers()
+                self.assertEqual(code, 1, err)
+                self.assertIn('heavy leftovers:', err)
+                self.assertIn('nothing checked', err)
+                self.assertEqual(out, '')
+                self.assertEqual(self.host.calls(), [])
+        self.write_machine()
+        os.chmod(self.machine, 0o666)
+        code, _, err = self.run_leftovers('--json')
+        self.assertEqual(code, 1)
+        self.assertIn('writable by group or others', err)
+
+    def test_leftovers_runs_again_with_the_same_answer_and_after_a_sweep_none_of_what_it_removed(self):
+        self.leftover_host()
+        first = self.run_leftovers()
+        second = self.run_leftovers()
+        strip = lambda r: (r[0], r[1].split(':', 1)[1])          # everything but the time stamp
+        self.assertEqual(strip(first), strip(second))
+        self.nothing_stopped()
+        code, _, _ = self.run_sweep()                           # the sweep stops the dead scope, removes db1
+        self.assertEqual(code, 0)
+        code, out, _ = self.run_leftovers()
+        self.assertNotIn('heavy-node-0a1b2c3d.scope', out)
+        self.assertNotIn(' db1 ', out)
+        self.assertIn('old-db', out)                            # never the sweep's to remove
+        self.assertTrue(self.host.exists(2001) and self.host.exists(2002))
+
+    def test_heavy_leftovers_from_the_wrapper_looks_only(self):
+        # through bin/heavy, on this machine's own processes: it looks, never stops, and needs no sweep settings
+        # (a machine with none uses the defaults); never the machine's Docker (HEAVY_DOCKER names no program)
+        env = dict(os.environ, HEAVY_DOCKER=os.path.join(self.root, 'no-docker'), HOME=self.root)
+        r = subprocess.run([HEAVY, 'leftovers', '--older-than', '30d', '--json'], capture_output=True, text=True,
+                           timeout=120, env=env)
+        if r.returncode == 1 and 'nothing checked' in r.stderr:
+            self.skipTest(f"this machine's machine file is refused: {r.stderr.strip()}")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual((data['v'], data['olderThanSeconds']), (1, 30 * 86400))
+        self.assertIn('docker: not installed; containers not checked', data['notes'])
+        self.assertFalse(os.path.exists(os.path.join(self.root, '.local')))     # no report folder, no log
+        r = subprocess.run([HEAVY, 'leftovers', '--older-than', 'soon'], capture_output=True, text=True, timeout=60,
+                           env=env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('usage: heavy leftovers', r.stderr)
+
+    def test_leftovers_with_docker_missing_or_down_still_names_the_processes(self):
+        self.leftover_host()
+        code, out, _ = self.run_leftovers(docker=False)
+        self.assertEqual(code, 0)
+        self.assertIn('pid 2001', out)
+        self.assertIn('note: docker: not installed; containers not checked', out)
+        self.host.load()['dockerDown'] = True
+        self.host.save()
+        code, out, _ = self.run_leftovers()
+        self.assertEqual(code, 0)
+        self.assertIn('pid 2002', out)
+        self.assertIn('Cannot connect to the Docker daemon', out)
+
     # ---------- containers ----------
 
     def test_container_whose_owner_pid_is_gone_is_removed(self):
@@ -1138,6 +1417,15 @@ class Label(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.proc, True)
         self.fake(os.getppid(), 'python3')
         self.cgroup('/user.slice/app.slice/t3code.service')
+        # under heavy, the real `heavy docker-label` below notes this test's scope for the heavy running it; an
+        # installed heavy from before the notes would leave it, so a note this test made goes again
+        with open('/proc/self/cgroup') as f:
+            leaf = REAL.unit_of(''.join(line[3:].strip() for line in f if line.startswith('0::')))
+        if REAL.is_heavy_scope(leaf):
+            for base in filter(None, REAL.note_bases()):
+                note = os.path.join(base, 'heavy', 'labelled', leaf)
+                if not os.path.lexists(note):
+                    self.addCleanup(lambda note=note: os.path.lexists(note) and os.unlink(note))
 
     def fake(self, pid, comm, uid=UID, start=4321):
         d = os.path.join(self.proc, str(pid))
@@ -1154,6 +1442,9 @@ class Label(unittest.TestCase):
 
     def test_owner_value_heavy_scope_first_then_the_parent_process(self):
         os.environ['HEAVY_SCOPE'] = 'heavy-pytest-0a1b2c3d.scope'
+        # in another unit's cgroup (it left heavy's scope): the variable is only inherited, the parent owns it
+        self.assertEqual(REAL.owner_value(proc=self.proc), f'uid={UID},pid={os.getppid()},start=4321')
+        self.cgroup('/')                # a cgroup namespace's root: the cgroup cannot be told, HEAVY_SCOPE then
         self.assertEqual(REAL.owner_value(proc=self.proc), f'uid={UID},scope=heavy-pytest-0a1b2c3d.scope')
         os.environ['HEAVY_SCOPE'] = 'not-a-heavy-scope; rm -rf'
         self.assertEqual(REAL.owner_value(proc=self.proc), f'uid={UID},pid={os.getppid()},start=4321')
@@ -1176,6 +1467,81 @@ class Label(unittest.TestCase):
         self.fake(4242, 'bash')                 # named on purpose: taken
         self.assertEqual(REAL.owner_value(pid=4242, proc=self.proc), f'uid={UID},pid=4242,start=4321')
 
+    def test_a_process_that_left_heavys_scope_under_a_shell_is_told_to_name_its_owner(self):
+        # systemd-run --scope sh -c 'docker run --label "$(heavy docker-label)" ...' from inside a heavy command: the
+        # shell exits at once, so it cannot own the container; the message says why (not "run it under heavy", it is)
+        os.environ['HEAVY_SCOPE'] = 'heavy-a-0a1b2c3d.scope'
+        self.fake(os.getppid(), 'sh')
+        self.cgroup('/user.slice/app.slice/run-r0a1b2c3d.scope')
+        with self.assertRaises(REAL.LabelRefused) as cm:
+            REAL.owner_value(proc=self.proc)
+        self.assertIn("left heavy's scope heavy-a-0a1b2c3d.scope (it runs in run-r0a1b2c3d.scope)", str(cm.exception))
+        self.assertIn('--owner-pid', str(cm.exception))
+        os.environ.pop('HEAVY_SCOPE')       # not under heavy at all: the plain advice
+        with self.assertRaises(REAL.LabelRefused) as cm:
+            REAL.owner_value(proc=self.proc)
+        self.assertIn('run the test under heavy', str(cm.exception))
+        # a refusal prints nothing on stdout: `--label "$(heavy docker-label)"` is then empty, and docker run refuses
+        # an empty label, so no container starts without an owner
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(REAL, 'owner_value', side_effect=REAL.LabelRefused('x')):
+            self.assertEqual(REAL.label_main([], out=out, err=err), 1)
+        self.assertEqual(out.getvalue(), '')
+
+    def notes(self):
+        """Temporary folders for the notes of note_label: (run folder, state folder) and their HEAVY_MARKS ids."""
+        root = tempfile.mkdtemp(prefix='heavy-notes-')
+        self.addCleanup(shutil.rmtree, root, True)
+        run_base = os.path.join(root, 'run', str(UID))
+        os.makedirs(run_base, 0o700)
+        for name, value in (('RUNTIME_ROOT', os.path.join(root, 'run')), ('STATE_ROOT', os.path.join(root, 'state'))):
+            patcher = mock.patch.object(REAL, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        run, state = (os.path.join(run_base, 'heavy', 'labelled'), os.path.join(root, 'state', 'heavy', 'labelled'))
+        for d in (run, state):
+            os.makedirs(d, 0o700)
+            for x in (d, os.path.dirname(d), os.path.dirname(os.path.dirname(d))):   # makedirs: umask's mode
+                os.chmod(x, 0o700)
+        ids = {d: f'{os.stat(d).st_dev}:{os.stat(d).st_ino}' for d in (run, state)}
+        return run, state, ids
+
+    def test_the_note_goes_where_heavy_reads_it(self):
+        # bin/heavy passes HEAVY_MARKS (device:inode of the folders it reads); a note in any other folder is never
+        # read, so heavy would skip Docker and leave the container to the sweep (#744 item 8)
+        unit = 'heavy-sh-0a1b2c3d.scope'
+        value = f'uid={UID},scope={unit}'
+        run, state, ids = self.notes()
+        both = f'{ids[run]},{ids[state]}'
+        self.assertEqual(REAL.note_label(value, both), '')                  # the usual case: /run/user
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([unit], []))
+        self.assertEqual(REAL.note_label(value, both), '')                  # runs again: the same one note
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([unit], []))
+        os.unlink(os.path.join(run, unit))
+        # the /run/user this process sees is not heavy's (a sandbox's own mount namespace): the state folder then
+        self.assertEqual(REAL.note_label(value, ids[state]), '')
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([], [unit]))
+        os.unlink(os.path.join(state, unit))
+        os.chmod(run, 0o777)                                               # /run/user unusable: the same
+        self.assertEqual(REAL.note_label(value, both), '')
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([], [unit]))
+        os.unlink(os.path.join(state, unit))
+        # heavy reads neither: no note anywhere, and why (docker-label warns; the sweep removes the container later)
+        os.chmod(run, 0o700)
+        problem = REAL.note_label(value, '1:1')
+        self.assertIn('not the folder heavy reads', problem)
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([], []))
+        # no HEAVY_MARKS (an older heavy, or one with no such folder: it asks Docker after every run): /run/user only
+        self.assertEqual(REAL.note_label(value, ''), '')
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([unit], []))
+        os.unlink(os.path.join(run, unit))
+        os.chmod(run, 0o777)
+        self.assertIn('not a folder only this user can write', REAL.note_label(value, ''))
+        self.assertEqual(os.listdir(state), [])
+        os.chmod(run, 0o700)
+        self.assertEqual(REAL.note_label(f'uid={UID},pid=1,start=2', both), '')   # a process owner: no note
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([], []))
+
     def test_another_users_owner_pid_is_refused(self):
         # the sweep sees only its own user's processes: it would count the owner as gone and remove the container
         self.fake(4242, 'python3', uid=UID + 1)
@@ -1194,16 +1560,21 @@ class Label(unittest.TestCase):
         env = dict(os.environ, HEAVY_SCOPE='')
         for flag in ('--owner-pid', '--pid'):
             r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', flag, str(os.getpid())],
-                               capture_output=True, text=True, env=env)
+                               capture_output=True, text=True, env=env, timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
             key, _, value = r.stdout.strip().partition('=')
             self.assertEqual(key, LABEL)
             owner = REAL.parse_owner(value)
             self.assertEqual((owner['uid'], owner['pid']), (UID, os.getpid()))
+        # HEAVY_SCOPE names a scope this test is not in: its own cgroup decides (its own heavy scope, else its parent)
         r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', '--value'], capture_output=True,
-                           text=True, env=dict(env, HEAVY_SCOPE='heavy-a-0a1b2c3d.scope'))
-        self.assertEqual(r.stdout, f'uid={UID},scope=heavy-a-0a1b2c3d.scope\n')
-        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', '--pid'], capture_output=True, text=True)
+                           text=True, env=dict(env, HEAVY_SCOPE='heavy-a-0a1b2c3d.scope'), timeout=60)
+        with open('/proc/self/cgroup') as f:
+            leaf = REAL.unit_of(''.join(line[3:].strip() for line in f if line.startswith('0::')))
+        self.assertEqual(r.stdout, f'uid={UID},scope={leaf}\n' if REAL.is_heavy_scope(leaf) else
+                         f'uid={UID},pid={os.getpid()},start={REAL.read_owner(os.getpid())[1]}\n', r.stderr)
+        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', '--pid'], capture_output=True, text=True,
+                           timeout=60)
         self.assertEqual(r.returncode, 2)
 
     def test_label_from_a_setup_script(self):
@@ -1212,10 +1583,11 @@ class Label(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != 'HEAVY_SCOPE'}
         cmd = f'"{sys.executable}" -I -B "{HEAVY}" docker-label --value'
         r = subprocess.run(['bash', '-c', f'v=$({cmd} --owner-pid "$PPID") && echo "$v"; true'],
-                           capture_output=True, text=True, env=env)
+                           capture_output=True, text=True, env=env, timeout=60)
         owner = REAL.parse_owner(r.stdout.strip())
         self.assertEqual(owner['pid'], os.getpid(), r.stderr)
-        r = subprocess.run(['bash', '-c', f'v=$({cmd}) && echo "$v"; true'], capture_output=True, text=True, env=env)
+        r = subprocess.run(['bash', '-c', f'v=$({cmd}) && echo "$v"; true'], capture_output=True, text=True, env=env,
+                           timeout=60)
         owner = REAL.parse_owner(r.stdout.strip())
         if owner is not None and 'scope' in owner:
             self.skipTest('runs inside a heavy scope: the scope is the owner')
@@ -1230,7 +1602,7 @@ class RealSignal(unittest.TestCase):
         s = REAL.Sweep()
         s.stop_grace = 2
         child = subprocess.Popen(['sleep', '60'])
-        self.addCleanup(lambda: (child.kill(), child.wait()))
+        self.addCleanup(lambda: (child.kill(), child.wait(timeout=60)))
         p = s.read_proc(child.pid)
         self.assertEqual(p.uid, UID)
         wrong = REAL.Proc(**{k: getattr(p, k) for k in p.__slots__})
@@ -1245,6 +1617,23 @@ class RealSignal(unittest.TestCase):
 
 # Each rule broken on purpose in a copy of lib/heavy_sweep.py: (text, broken text, the test that must then fail)
 MUTATIONS = {
+    "a live scope's note stays": ('if not is_heavy_scope(name) or name in known:', 'if not is_heavy_scope(name):',
+                                  'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
+    'a young note stays': ('and st.st_mtime < before:', ':',
+                           'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
+    'only an empty file': ('if stat.S_ISREG(st.st_mode) and st.st_size == 0 and', 'if',
+                           'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
+    'only a note-shaped name': ('if not is_heavy_scope(name) or name in known:', 'if name in known:',
+                                'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
+    'only a folder of heavy\'s': ('if any(not stat.S_ISDIR', 'if False and any(not stat.S_ISDIR',
+                                  'test_notes_in_a_folder_others_can_write_or_a_missing_one_are_left'),
+    'its parent folders too': ('(folder, os.path.dirname(folder),\n' + ' ' * 48
+                               + 'os.path.dirname(os.path.dirname(folder)))', '(folder,)',
+                               'test_notes_behind_a_linked_or_open_parent_folder_or_a_link_are_left'),
+    'a link is never followed': ('st = os.lstat(path)', 'st = os.stat(path)',
+                                 'test_notes_behind_a_linked_or_open_parent_folder_or_a_link_are_left'),
+    'notes only when the sweep acts': ('        if act:\n            pruned', '        if True:\n            pruned',
+                                       'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
     'owner gone (reparented)': ('if p.pid in mine or p.pid in (1, manager) or p.ppid not in orphan_parents:',
                                 'if p.pid in mine or p.pid in (1, manager):',
                                 'test_process_with_a_living_parent_is_left_alone'),
@@ -1298,6 +1687,21 @@ MUTATIONS = {
                            'test_container_is_removed_by_its_full_id_never_by_a_name_or_a_prefix'),
     'report folder checked': ('problem = folder_problem(folder, s.uid)', 'problem = None',
                               'test_report_folder_others_could_change_is_refused'),
+    'leftovers: no settings is the defaults': ("machine_file.read_section('heavy', self.machine_path, self.owner_uid, "
+                                               "optional=optional)",
+                                               "machine_file.read_section('heavy', self.machine_path, self.owner_uid)",
+                                               'test_leftovers_without_the_sweep_settings_names_them_by_owner_and_age_and_stops_nothing'),
+    'leftovers: one limit, busy or idle': ('cfg = dict(cfg, minAgeSeconds=limit, longLivedSeconds=limit)',
+                                           'cfg = dict(cfg, minAgeSeconds=limit)',
+                                           'test_leftovers_without_the_sweep_settings_names_them_by_owner_and_age_and_stops_nothing'),
+    'leftovers: look only': ('plan, _counts, lines = s.run(cfg, act=False)', 'plan, _counts, lines = s.run(cfg, act=True)',
+                             'test_leftovers_without_the_sweep_settings_names_them_by_owner_and_age_and_stops_nothing'),
+    'leftovers: a broken file refused': ("    except MachineFileError as e:\n"
+                                         "        return refuse(f'{e}; nothing checked', as_json, out, err, 'leftovers')",
+                                         "    except MachineFileError as e:\n"
+                                         "        cfg = dict(machine_file.fields({}, SPEC, 'x'), path='?', defaults=True)",
+                                         'test_leftovers_refuses_a_broken_machine_file'),
+    'leftovers: owner in json': ("'owner': item_owner(item)}", "}", 'test_leftovers_json_gives_owner_and_age'),
     'command line masked': ("cmd = redact(' '.join(own)) if own else", "cmd = ' '.join(own) if own else",
                             'test_short_secrets_inside_inline_code_never_reach_the_log_the_report_or_the_journal'),
     'only the own command shown': ("own = own_command(argv, shown=True) if not is_session(self) else argv[:1]",
@@ -1438,6 +1842,10 @@ MUTATIONS = {
         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     "python's --check-hash-based-pycs takes a word": ("'-Q', '--check-hash-based-pycs'}", "'-Q'}",
                                                       'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'docker-label: own cgroup first': ("if not leaf and is_heavy_scope(scope)", "if is_heavy_scope(scope)",
+                                       'test_docker_label_names_the_scope_the_process_is_in'),
+    'HEAVY_DOCKER absolute': ("self.docker = path if os.path.isabs(path) else ''", 'self.docker = path',
+                              'test_heavy_docker_must_be_an_absolute_path'),
     "node's long options take a word": ("'--env-file', '--env-file-if-exists', '--title',", "'--env-file-if-exists',",
                                         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
 }

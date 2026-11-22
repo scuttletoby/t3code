@@ -13,8 +13,10 @@ import install_fixture as fx  # noqa: E402
 
 SHA1, SHA2 = fx.SHA1, fx.SHA2
 KITS = {
+    'agent-guards': os.path.join(fx.FORK_KIT, 'agent-guards', 'sbin', 'agent-guards-install'),
     'cleaner': os.path.join(fx.FORK_KIT, 'cleaner', 'sbin', 'fork-cleaner-install'),
     'golive': os.path.join(fx.FORK_KIT, 'golive', 'sbin', 't3-golive-install'),
+    'schedule-kick': os.path.join(fx.FORK_KIT, 'schedule-kick', 'sbin', 'schedule-kick-install'),
 }
 
 
@@ -598,12 +600,20 @@ class Contract:
         self.assertFalse(os.path.exists(self.path(self.m.ETC)))
 
 
+class AgentGuards(Contract, fx.FakeHost):
+    KIT_DIR, INSTALLER = os.path.join(fx.FORK_KIT, 'agent-guards'), KITS['agent-guards']
+
+
 class Cleaner(Contract, fx.FakeHost):
     KIT_DIR, INSTALLER = os.path.join(fx.FORK_KIT, 'cleaner'), KITS['cleaner']
 
 
 class Golive(Contract, fx.FakeHost):
     KIT_DIR, INSTALLER = os.path.join(fx.FORK_KIT, 'golive'), KITS['golive']
+
+
+class ScheduleKick(Contract, fx.FakeHost):
+    KIT_DIR, INSTALLER = os.path.join(fx.FORK_KIT, 'schedule-kick'), KITS['schedule-kick']
 
 
 class Bootstrap(fx.FakeHost):
@@ -617,7 +627,7 @@ class Bootstrap(fx.FakeHost):
 
     def test_the_kit_is_one_it_knows(self):
         self.assertEqual(self.refused('--repo', 'a/b', '--sha', SHA1), 'fork-kit-bootstrap: --kit must be one of: '
-                         'cleaner golive')
+                         'agent-guards cleaner golive schedule-kick')
         self.assertIn('--kit must be one of', self.refused('--kit', '../heavy', '--repo', 'a/b', '--sha', SHA1))
         self.assertEqual(self.refused('--repo', 'a/b', '--sha', SHA1, '--kit'),
                          'fork-kit-bootstrap: --kit needs a value')
@@ -625,7 +635,7 @@ class Bootstrap(fx.FakeHost):
     def test_only_the_kit_options_are_passed_on(self):
         """Nothing reaches the installer unchecked: a second --source would install a folder the release check
         never saw."""
-        for kit in ('cleaner', 'golive'):
+        for kit in ('agent-guards', 'cleaner', 'golive', 'schedule-kick'):
             for extra in (['--source', '/elsewhere'], ['--x']):
                 with self.subTest(kit=kit, extra=extra):
                     err = self.refused('--kit', kit, '--repo', 'a/b', '--sha', SHA1, *extra)
@@ -637,8 +647,15 @@ class Bootstrap(fx.FakeHost):
         for timer in ('--timer', '--no-timer'):                  # an option of one kit only
             self.assertEqual(self.refused(timer, '--kit', 'golive', '--repo', 'a/b', '--sha', SHA1),
                              f'fork-kit-bootstrap: {timer} is not an option of --kit golive')
+        for kit, opt in (('agent-guards', '--timer'), ('agent-guards', '--no-timer'), ('cleaner', '--settings'),
+                         ('schedule-kick', '--no-settings'), ('golive', '--settings')):
+            with self.subTest(kit=kit, opt=opt):
+                self.assertEqual(self.refused('--kit', kit, opt, '--repo', 'a/b', '--sha', SHA1),
+                                 f'fork-kit-bootstrap: {opt} is not an option of --kit {kit}')
         if os.geteuid() != 0:                                    # as root it would go on to download
-            for args in (['--kit', 'cleaner', '--timer'], ['--no-timer', '--kit', 'cleaner'], ['--kit', 'golive']):
+            for args in (['--kit', 'cleaner', '--timer'], ['--no-timer', '--kit', 'cleaner'], ['--kit', 'golive'],
+                         ['--kit', 'schedule-kick', '--timer'], ['--kit', 'agent-guards', '--settings'],
+                         ['--no-settings', '--kit', 'agent-guards']):
                 with self.subTest(args=args):
                     self.assertIn('run this as root', self.refused('--repo', 'a/b', '--sha', SHA1, *args))
 
@@ -748,8 +765,14 @@ MUTATIONS = {
         'bootstrap', ' [ -z "$opt" ] || die "$opt is not an option of --kit golive" ;;', ' ;;',
         'test_only_the_kit_options_are_passed_on'),
     'bootstrap: an unknown kit is refused': (
-        'bootstrap', '  *) die "--kit must be one of: cleaner golive" ;;', '  *) installer=x ;;',
+        'bootstrap', '  *) die "--kit must be one of: agent-guards cleaner golive schedule-kick" ;;', '  *) installer=x ;;',
         'test_the_kit_is_one_it_knows'),
+    'bootstrap: --settings is kept, nothing after it passed on': (
+        'bootstrap', '    --settings|--no-settings) opt="$1"; shift ;;', '    --settings|--no-settings) break ;;',
+        'test_only_the_kit_options_are_passed_on'),
+    'bootstrap: each kit gets only its own options': (
+        'bootstrap', '    die "$opt is not an option of --kit $kit" ;;', '    ;;',
+        'test_only_the_kit_options_are_passed_on'),
 }
 
 
