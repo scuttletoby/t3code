@@ -16,6 +16,7 @@ rounds, what happens to minors, the state question) and requiring the `state:` l
 No state: every run reads the files again, so the same input gives the same output. A missing, empty, old or broken
 file gives a plain message and exit 2, never a traceback.
 """
+import glob
 import json
 import os
 import re
@@ -140,15 +141,43 @@ def commit_of(root, ref):
     return sha
 
 
+def _git_said(r):
+    return os.fsdecode(r.stderr or b'').strip()[:200] or f'exit {r.returncode}'
+
+
+def base_file(root, base, rel):
+    """The bytes of `rel` in the commit `base` (a full sha), or None only when its tree has no such entry. Any other
+    git failure (a missing tree or blob, a partial clone offline) is a Problem: the file is there, so judging as if it
+    were not would advise fewer lenses than the gate asks."""
+    path = head_check.repo_path(rel)
+    r = subprocess.run(['git', '-C', root, 'ls-tree', '-z', '--full-tree', base, '--', path], capture_output=True)
+    if r.returncode != 0:
+        raise Problem(f'git cannot read the tree of {base[:12]} in {root} to find {rel}: {_git_said(r)}')
+    if not r.stdout:
+        return None
+    r = subprocess.run(['git', '-C', root, 'show', f'{base}:{path}'], capture_output=True)
+    if r.returncode != 0:
+        raise Problem(f'{rel} is in {base[:12]} but git cannot read it: {_git_said(r)}; fetch the missing objects '
+                      f'(or run from a full clone) and plan again')
+    return r.stdout
+
+
+def other_settings(root):
+    """Files in `.github` named like kit settings under another name (the fork's `fork-review-kit.json`): the plan
+    names them when it found no settings and no queue config, as the likely missing --settings."""
+    found = glob.glob(os.path.join(glob.escape(os.path.join(root, '.github')), '*review-kit*.json'))
+    return sorted(os.path.relpath(f, root) for f in found if os.path.relpath(f, root) != SETTINGS)
+
+
 def load_queue_config(root, settings, base=None):
     """(gate Config or None, note). The config is read from the commit `base` (a full sha) with git when given (as the
     gate reads it, from the base tip, as bytes: one that is not UTF-8 is refused as the gate refuses it), else from the
     file. No file, or no `review` block (a config from before the review rules): None, and the note says how the plan
-    judges. Problem for an empty or invalid config: the gate would refuse it too."""
+    judges. Problem for an empty or invalid config (the gate would refuse it too), and for a base config git cannot
+    read (base_file)."""
     rel = settings['queue_config']
     if base:
-        r = subprocess.run(['git', '-C', root, 'show', f'{base}:{rel}'], capture_output=True)
-        text = r.stdout if r.returncode == 0 else None
+        text = base_file(root, base, rel)
     else:
         text = read_text(os.path.join(root, rel), 'the queue config')
     where = f'{rel} at {base}' if base else rel
@@ -168,7 +197,10 @@ def load_queue_config(root, settings, base=None):
 
 
 def git_dir(root):
-    r = subprocess.run(['git', '-C', root, 'rev-parse', '--absolute-git-dir'], capture_output=True)
+    """The repository's common git folder (a linked worktree's too): where its objects, `shallow` and `info/grafts`
+    are."""
+    r = subprocess.run(['git', '-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                       capture_output=True)
     if r.returncode != 0:
         raise Problem(f'{root} is not in a git repository: {r.stderr.decode("utf-8", "replace").strip()}')
     return os.fsdecode(r.stdout.rstrip(b'\n'))
@@ -176,11 +208,17 @@ def git_dir(root):
 
 def changes_from(root, base=None, changes=None):
     """[(status, paths)] as the gate reads them: with `base` (a full sha), the gate's own head_check.changed_paths from
-    `base` to HEAD (every merge base, git's safe flags and no global config: never fewer paths than the gate sees), else
-    a file of `git diff --name-status -z -M` output."""
+    `base` to HEAD (every merge base, git's safe flags and no global config), after the gate's own Checkout.problem()
+    (a repository whose grafts, shallow file, alternates or attributes change what git reads is refused, as the gate
+    refuses it): never fewer paths than the gate sees. Else a file of `git diff --name-status -z -M` output."""
     if base:
         head = commit_of(root, 'HEAD')
-        found, why = head_check.changed_paths(head_check.Checkout(git_dir(root), bare=(base, head)), base, head)
+        checkout = head_check.Checkout(git_dir(root), bare=(base, head))
+        why = checkout.problem()
+        if why:
+            raise Problem(f'the repository at {root} cannot be read as the gate reads it ({why}): its paths could differ '
+                          f'from the gate\'s; plan from a full clone without it, or give the changes with --changes')
+        found, why = head_check.changed_paths(checkout, base, head)
         if found is None:
             raise Problem(why)
         return found
@@ -395,6 +433,10 @@ def main(argv, out=sys.stdout):
     settings, note = load_settings(root, opts.get('--settings'))
     base = commit_of(root, opts['--base']) if '--base' in opts else None
     cfg, cfg_note = load_queue_config(root, settings, base)
+    others = other_settings(root) if cfg is None and note else []
+    if others:
+        cfg_note += (f'; {", ".join(others)} looks like kit settings under another name: if it is this project\'s, '
+                     f'pass --settings {others[0]}')
     if cmd == 'check':
         if not rest:
             raise Problem('check needs the comment: a file, or - for stdin')
