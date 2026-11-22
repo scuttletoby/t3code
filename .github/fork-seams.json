@@ -78,12 +78,12 @@
       ]
     },
     "apps/server/src/serverSettings.ts": {
-      "why": "Every settings write goes through upstream's patch and write paths here. The fork swaps in its patch (fork/serverSettingsPatch.ts, under upstream's name, so a project's MCP profile a client left out is kept) and calls its save check (fork/serverSettingsWriteCheck.ts) once in each write path. The load decodes the file after fork/settingsFileRead.ts (old auto-update names renamed, an unusable interval left out so it reads as its default). The lines from \"import { renameRetiredAutoUpdateKeys }\" on predate this list (#277): the load's decode of the file, which the fork report shares and which needs upstream's private decoders here, and the fallback when the file cannot be read. When the file fails to load, upstream runs on its defaults, whose model policy is off; the fork reads the policy from the file on its own and fails closed (enforce, nothing allowed) when the file does not parse, so a broken file never turns an enforced policy off (fork/modelPolicyFile.ts, #731). Each listed copy is one the fork adds over upstream; the run from upstream refuses a spare one (#311).",
+      "why": "Every settings write goes through upstream's patch and write paths here. The fork swaps in its patch (fork/serverSettingsPatch.ts, under upstream's name, so a project's MCP profile a client left out is kept) and calls its save check (fork/serverSettingsWriteCheck.ts) once in each write path. The load decodes the file in fork/settingsFileRead.ts (old auto-update names renamed, an unusable interval left out so it reads as its default), in the server's fiber so what a lenient field drops is logged to the server's logger (#975); upstream's private settings schema is decoded there through the one exported decodePersistedSettings, which the fork report and the Claude MCP profile reader also pass to the silent copy of that decode. The lines from \"import { renameRetiredAutoUpdateKeys }\" on predate this list (#277): the load's decode of the file, which the fork report shares and which needs upstream's private decoders here, and the fallback when the file cannot be read. When the file fails to load, upstream runs on its defaults, whose model policy is off; the fork reads the policy from the file on its own and fails closed (enforce, nothing allowed) when the file does not parse, so a broken file never turns an enforced policy off (fork/modelPolicyFile.ts, #731). Each listed copy is one the fork adds over upstream; the run from upstream refuses a spare one (#311).",
       "added": [
         "// Fork: upstream's patch keeping a project's MCP profile a client left out, and the save check.",
         "import { applyServerSettingsPatchKeepingForkProjectKeys as applyServerSettingsPatch } from \"./fork/serverSettingsPatch.ts\";",
         "import * as ForkSettingsWrite from \"./fork/serverSettingsWriteCheck.ts\";",
-        "import { prepareSettingsFile } from \"./fork/settingsFileRead.ts\"; // Fork: renames, bad intervals",
+        "import { decodeSettingsFile, prepareSettingsFile } from \"./fork/settingsFileRead.ts\"; // Fork: load",
         ": decodePersistedServerSettingsExit(withDefaults(prepareSettingsFile(parsed.value)));",
         "Effect.flatMap(ForkSettingsWrite.withCheck(update, \"test settings\")), // Fork: save check",
         "yield* ForkSettingsWrite.check(current, updated, settingsPath); // Fork: save check",
@@ -92,7 +92,7 @@
         "}",
         "/**",
         "* The load's decode of a settings file's text: parse, rename retired keys, fill policy defaults,",
-        "* decode. Pure, so the fork's read-only report (`__fork-report`) decodes exactly as a load does.",
+        "* decode. Synchronous: the load and `__fork-report` use fork/settingsFileRead.ts's Effect form.",
         "*/",
         "export function decodeSettingsFileText(",
         "raw: string,",
@@ -107,22 +107,14 @@
         "// The file before this write, parsed; only read when policy defaults need it. Fork: renamed as on",
         "// load, so a choice saved under an old name is kept like one under the new name.",
         "return Exit.isSuccess(parsed) ? renameRetiredAutoUpdateKeys(parsed.value) : undefined;",
-        "const decoded = decodeSettingsFileText(raw, managed.withDefaults);",
+        "const decoded = yield* decodeSettingsFile(raw, managed.withDefaults, decodePersistedSettings);",
+        "export const decodePersistedSettings = Schema.decodeUnknownEffect(PersistedServerSettings);",
         "// The file may hold an opt-out we can no longer read; never resume threads or update on a",
         "// guess, even when an admin policy defaults them on (a locked policy value still applies).",
         "automaticUpdates: false,",
         "import * as ForkPolicy from \"./fork/modelPolicyFile.ts\"; // Fork: model policy",
         "modelPolicy: yield* ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy"
-      ],
-      "announced": {
-        "since": "2026-11-22",
-        "added": [
-          "import { decodeSettingsFile, prepareSettingsFile } from \"./fork/settingsFileRead.ts\"; // Fork: load",
-          "* decode. Synchronous: the load and `__fork-report` use fork/settingsFileRead.ts's Effect form.",
-          "const decoded = yield* decodeSettingsFile(raw, managed.withDefaults, decodePersistedSettings);",
-          "export const decodePersistedSettings = Schema.decodeUnknownEffect(PersistedServerSettings);"
-        ]
-      }
+      ]
     },
     "packages/shared/src/AgentScope.ts": {
       "why": "The slot observer (apps/server/src/slots/SlotObserver.ts) reads an agent's memory from its own systemd scope; one optional method on upstream's interface asks for it.",
