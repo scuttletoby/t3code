@@ -252,7 +252,8 @@ describe("makeClaudeMcpProfiles", () => {
         for (const read of reads) {
           current = read;
           const overrides = {};
-          yield* plan(self, overrides);
+          // The adapter reads the options only as it opens the query's process.
+          void (yield* plan(self, overrides)).options;
           keys.push(planKeyFor(overrides));
           const set = T3ToolSets.t3ToolSetFor(self.id);
           sets.push(set?._tag === "Groups" && set.groups !== "all" ? [...set.groups] : set);
@@ -262,6 +263,41 @@ describe("makeClaudeMcpProfiles", () => {
         assert.isDefined(keys[0]);
         assert.strictEqual(keys[1], keys[0]);
         assert.notStrictEqual(keys[2], keys[1]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettingsService.ServerSettingsService.layerTest(),
+            ManagedPolicy.layerTest(),
+            Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
+          ).pipe(Layer.provideMerge(NodeServices.layer)),
+        ),
+      ),
+  );
+
+  it.effect(
+    "the set is fixed only once the plan opens a process: a turn that keeps the old one keeps its set",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        const lean = { mcpProfile: "lean", mcpProfiles: { lean: { servers: "all", t3Tools: [] } } };
+        const service = yield* ServerSettingsService.ServerSettingsService;
+        const plan = yield* makeClaudeMcpProfiles.pipe(
+          Effect.provideService(ServerSettingsService.ServerSettingsService, {
+            ...service,
+            getSettings: Effect.succeed(fromFile(lean)),
+          }),
+        );
+        const before: T3ToolSets.T3ToolSet = { _tag: "Groups", name: "all", groups: "all" };
+        T3ToolSets.fixT3ToolSet("t", before);
+        const planned = yield* plan(thread("t"), {});
+        // Planned, not opened (a continuation, or background work blocks the replacement).
+        assert.strictEqual(planned.name, "lean");
+        assert.deepStrictEqual(planned.servers, "all");
+        assert.strictEqual(T3ToolSets.t3ToolSetFor("t"), before);
+        // The new process opens: its options are read, and the new set applies from then.
+        assert.deepStrictEqual(planned.options, {});
+        const set = T3ToolSets.t3ToolSetFor("t");
+        assert.deepStrictEqual(set?._tag === "Groups" ? [...(set.groups as Set<string>)] : set, []);
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
@@ -287,7 +323,7 @@ describe("makeClaudeMcpProfiles", () => {
   );
 
   it.effect(
-    "stopped half-way: a query whose profile read is interrupted leaves no T3 tool set",
+    "stopped half-way: a query whose profile read is interrupted leaves the set as it was",
     () =>
       Effect.gen(function* () {
         T3ToolSets.__testing.clear();
@@ -303,8 +339,12 @@ describe("makeClaudeMcpProfiles", () => {
         const fiber = yield* Effect.forkChild(plan(thread("t"), {}));
         yield* Deferred.await(reading);
         yield* Fiber.interrupt(fiber);
-        // The next request works the set out again from the settings, rather than the old turn's.
-        assert.isUndefined(T3ToolSets.t3ToolSetFor("t"));
+        // No process opened: the last turn's set stands until one does.
+        assert.deepStrictEqual(T3ToolSets.t3ToolSetFor("t"), {
+          _tag: "Groups",
+          name: "all",
+          groups: "all",
+        });
       }).pipe(
         Effect.provide(
           Layer.mergeAll(

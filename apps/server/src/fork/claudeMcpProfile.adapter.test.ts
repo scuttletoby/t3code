@@ -9,6 +9,7 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   type ServerSettings,
+  ServerSettingsError,
   ThreadId,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -30,6 +31,7 @@ import { makeTurnInput } from "../orchestration-v2/Adapters/AcpAdapterV2.testkit
 import * as ClaudeAdapterV2 from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as ServerSettingsService from "../serverSettings.ts";
 import { type LineageThread, makeClaudeMcpProfiles } from "./claudeMcpProfile.ts";
+import * as T3ToolSets from "./mcpT3ToolSets.ts";
 
 const MODEL = {
   instanceId: ProviderInstanceId.make(ClaudeAdapterV2.CLAUDE_PROVIDER),
@@ -47,14 +49,18 @@ const NATIVE_THREAD = "native-thread-mcp-profile";
 
 /**
  * Runs Claude turns on one thread with these server settings, saving each of `saves` before the
- * next turn; records each open and the sessions' closes. Stops at the first refused turn.
+ * next turn; records each open, the sessions' closes and the thread's T3 tool set after each turn.
+ * Stops at the first refused turn, unless `pastRefusals`.
  */
 const runTurns = (
   settings: McpSettings,
   statuses: ReadonlyArray<{ readonly name: string; readonly status: "connected" }> | "unexpected",
-  saves: ReadonlyArray<McpSettings> = [],
-) =>
-  Effect.gen(function* () {
+  saves: ReadonlyArray<McpSettings | "unreadable"> = [],
+  pastRefusals = false,
+) => {
+  /** True for a turn whose settings read fails (`"unreadable"`): only that one. */
+  let unreadable = false;
+  return Effect.gen(function* () {
     const opened: Array<ClaudeAdapterV2.ClaudeAgentSdkQueryOptions> = [];
     const processes: Array<Queue.Queue<SDKMessage>> = [];
     let closed = 0;
@@ -123,8 +129,10 @@ const runTurns = (
     );
     const settingsService = yield* ServerSettingsService.ServerSettingsService;
     let refusal: string | undefined;
+    const sets: Array<T3ToolSets.T3ToolSet | undefined> = [];
     for (const [index, save] of [undefined, ...saves].entries()) {
-      if (save !== undefined) yield* settingsService.updateSettings(save);
+      unreadable = save === "unreadable";
+      if (save !== undefined && save !== "unreadable") yield* settingsService.updateSettings(save);
       const started = yield* runtime
         .startTurn(
           makeTurnInput({
@@ -138,8 +146,10 @@ const runTurns = (
           }),
         )
         .pipe(Effect.exit);
+      sets.push(T3ToolSets.t3ToolSetFor(threadId));
       if (started._tag === "Failure") {
-        refusal = makeProviderFailure({ cause: started.cause, class: "provider_error" }).message;
+        refusal ??= makeProviderFailure({ cause: started.cause, class: "provider_error" }).message;
+        if (pastRefusals) continue;
         break;
       }
       if (index === saves.length) break;
@@ -147,7 +157,7 @@ const runTurns = (
       yield* Queue.offer(processes.at(-1)!, resultFrame(index + 1));
       yield* Queue.take(terminals);
     }
-    return { opened, closed, refusal };
+    return { opened, closed, refusal, sets };
   }).pipe(
     Effect.scoped,
     Effect.provide(
@@ -156,10 +166,29 @@ const runTurns = (
         McpProviderSessions.layer,
         NodeServices.layer,
         NodeCrypto.layer,
-        ServerSettingsService.layerTest(settings),
+        Layer.effect(
+          ServerSettingsService.ServerSettingsService,
+          Effect.map(ServerSettingsService.ServerSettingsService, (service) =>
+            ServerSettingsService.ServerSettingsService.of({
+              ...service,
+              getSettings: Effect.suspend(() =>
+                unreadable
+                  ? Effect.fail(
+                      new ServerSettingsError({
+                        settingsPath: "settings.json",
+                        operation: "read-secret",
+                        cause: new Error("secret store unreadable"),
+                      }),
+                    )
+                  : service.getSettings,
+              ),
+            }),
+          ),
+        ).pipe(Layer.provideMerge(ServerSettingsService.layerTest(settings))),
       ),
     ),
   );
+};
 
 const resultFrame = (ordinal: number) =>
   ({
@@ -342,6 +371,31 @@ describe("ClaudeAdapterV2 MCP profile", () => {
       assert.isUndefined(same.refusal);
       assert.lengthOf(same.opened, 1);
     }),
+  );
+
+  it.effect(
+    "runs again after a refused turn: the next good turn on the same process gets its set back",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        const lean = { servers: "all", t3Tools: ["waits"] } as const;
+        // Turn 2's settings read fails once, so it is refused and the live process stays; turn 3
+        // reads them again: the same plan as the process opened with, so it reuses that process.
+        const { opened, refusal, sets } = yield* runTurns(
+          { mcpProfile: "lean", mcpProfiles: { lean } },
+          [],
+          ["unreadable", {}],
+          true,
+        );
+        assert.isDefined(refusal);
+        assert.lengthOf(opened, 1);
+        assert.deepStrictEqual(
+          sets.map((set) =>
+            set?._tag === "Groups" && set.groups !== "all" ? [...set.groups] : set?._tag,
+          ),
+          [["waits"], "Refused", ["waits"]],
+        );
+      }),
   );
 
   it.effect(
