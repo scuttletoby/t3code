@@ -405,10 +405,10 @@ const CurrentDirectDelivery = Context.Reference<DirectDelivery | undefined>(
 );
 
 /**
- * Places in the gate's line (`SlotGate.SlotPlace`): a scheduled run that waits keeps one per task,
- * at its due time; a webhook delivery one per delivery, at the time it was stored (direct: its
- * first ask). Each leaves when its run starts (the gate), when it is given up or its task deleted
- * (`waitForWebhookSlot`, and `leaveEndedPlaces` every 5 s), or refused for its profile (`admitRun`).
+ * Line places (`SlotGate.SlotPlace`): a waiting scheduled run's per task, at its due time; a webhook
+ * delivery's per delivery, from its first ask. Each leaves as its run starts, given up or deleted
+ * (`waitForWebhookSlot`, `leaveEndedPlaces` every 5 s), refused for its profile (`admitRun`), or as
+ * its worker removes its stored row after its run returned (`keepStored`).
  */
 const SCHEDULED_PLACE = "scheduled-run:";
 const DELIVERY_PLACE = "webhook-delivery:";
@@ -549,6 +549,32 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   const waitingDeliveries = new Set<string>();
 
   /**
+   * The place of the stored delivery its task's worker runs now (the first of its rows, in the
+   * worker's order); unreadable or none, its task's place.
+   */
+  const storedPlace = (taskId: string) =>
+    sql<{ delivery_id: string; due_at: number }>`
+      SELECT delivery_id, due_at FROM scheduled_task_webhook_pending
+      WHERE task_id = ${taskId} AND state IN ('dispatching', 'running', 'completed', 'failed')
+      ORDER BY due_at, rowid LIMIT 1
+    `.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Could not read a waiting webhook delivery's place in line", {
+          taskId,
+          cause,
+        }).pipe(Effect.as([])),
+      ),
+      Effect.map(([stored]) =>
+        stored === undefined
+          ? ({ key: `${DELIVERY_TASK_PLACE}${taskId}` } satisfies SlotGate.SlotPlace)
+          : ({
+              key: `${DELIVERY_PLACE}${stored.delivery_id}`,
+              sinceMs: Number(stored.due_at),
+            } satisfies SlotGate.SlotPlace),
+      ),
+    );
+
+  /**
    * The run's place in line: a run on its schedule at its due time, a webhook delivery at the
    * time it was stored. "Run now" asks once and has none. A stored delivery is the one its task's
    * worker runs now (one at a time per task, in the worker's order); unreadable, it is logged and
@@ -568,24 +594,7 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
     }
     const direct = yield* CurrentDirectDelivery;
     if (direct !== undefined) return { key: `${DELIVERY_PLACE}${direct.deliveryId}` };
-    const [stored] = yield* sql<{ delivery_id: string; due_at: number }>`
-      SELECT delivery_id, due_at FROM scheduled_task_webhook_pending
-      WHERE task_id = ${task.id} AND state IN ('dispatching', 'running', 'completed', 'failed')
-      ORDER BY due_at, rowid LIMIT 1
-    `.pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("Could not read a waiting webhook delivery's place in line", {
-          taskId: task.id,
-          cause,
-        }).pipe(Effect.as([])),
-      ),
-    );
-    return stored === undefined
-      ? ({ key: `${DELIVERY_TASK_PLACE}${task.id}` } satisfies SlotGate.SlotPlace)
-      : ({
-          key: `${DELIVERY_PLACE}${stored.delivery_id}`,
-          sinceMs: Number(stored.due_at),
-        } satisfies SlotGate.SlotPlace);
+    return yield* storedPlace(task.id);
   });
 
   const leave = (place: SlotGate.SlotPlace | undefined) =>
@@ -955,11 +964,18 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   });
 
   /**
-   * The stored-delivery worker, after a delivery's run returned: `true` when that run was not
-   * started because its task was saved while it waited, so the worker keeps the row and runs it
-   * again on the task as it is now, instead of removing it. Read once.
+   * The stored-delivery worker, after a delivery's run returned: `true` when its task was saved
+   * while it waited (the worker keeps the row, runs it again on the task as saved; read once). Else
+   * the worker removes the row: its place in line goes now, run, skipped or failed before it asked.
    */
-  const keepStored = (taskId: string) => Effect.sync(() => keep.delete(taskId));
+  const keepStored = (taskId: string) =>
+    Effect.suspend(() =>
+      keep.delete(taskId)
+        ? Effect.succeed(true)
+        : Option.isNone(gate)
+          ? Effect.succeed(false)
+          : storedPlace(taskId).pipe(Effect.flatMap(leave), Effect.as(false)),
+    );
 
   /** The task's run ended, any way: a slot its dispatch never ended is free again. */
   const ended = (taskId: string) => Effect.suspend(() => open.get(taskId)?.(null) ?? Effect.void);
