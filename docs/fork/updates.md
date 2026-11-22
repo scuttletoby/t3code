@@ -57,7 +57,10 @@ watches; it changes nothing on the machine, and `0` turns it off.
   an unknown or duplicate key, a `files` or `pending` key that is not a plain repository path, a
   `lost` entry not in the form below, a line in both `added` and `announced`, or none) is refused
   (a repeated `"//"` comment key is a duplicate too: give each comment its own `//name` key), since once merged it would stop every
-  later run. `pending` maps upstream files
+  later run. Every list the checker reads (main's, the merge-base's, fork-follow's head) is parsed
+  the same way: one with a duplicate key stops the run (exit 3), naming the commit and the key, as
+  JSON keeps only the last of two equal keys and the other entry would be shown but never apply.
+  `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it). So a pull request that moves fork lines out
   of a pending file lowers its ceiling in its own list, in the same change: its run refuses a
@@ -107,7 +110,11 @@ watches; it changes nothing on the machine, and `0` turns it off.
   (a ceiling is 1 or more, and a `lost` entry needs its file in `files` or `pending`) is moved to
   `files` with `"added": []` in that commit, which holds it tighter: no fork line may come back, and
   a pull request may lose none of its lines. The run's summary lists the lowered counts once the
-  plan has finished; a run stopped after the lowering pushes nothing. A pull request may change a pending file but not grow it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
+  plan has finished; a run stopped after the lowering pushes nothing. A pull request may change a pending file but not grow it. A
+  pull request that changes a pending file's text is counted from upstream in its run
+  (fork-checks), against main's ceiling and `lost` entry, even with its list unchanged: within the
+  counts its run cannot tell an upstream line from a fork line, so a change that swaps an upstream
+  line for a fork line keeps every count it can see. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
   guard, or re-indented) add no line, so they are counted too, two ways: `lines`, the upstream lines
   it does not keep in order and indentation, and `gone`, those whose text it no longer has at all,
   so deleting a line already counted as moved or re-indented raises `gone`. `lost` maps such
@@ -205,6 +212,11 @@ seam entry together is refused. It takes two pull requests, each green:
    announcement fails the tests: kept as it is, the lines are now in the file; copied into `added`
    too, the list is malformed. Review where the line goes, not only the list edit: any pull request
    may spend an announced line, not only the one meant to.
+
+A pull request that changes a file and whose list drops an announced line main's list has, in date
+(from a branch made before the announcement merged, say), is refused: keep it under `announced`,
+or move it to `added` in the change that adds it. Withdraw one on purpose with a list-only pull
+request; an expired one may go in any change.
 
 An announcement lasts 14 days. From upstream, fork-follow refuses one more than 14 days older than
 the head's commit date (or dated more than a day ahead of it): announce the lines again (set `since`

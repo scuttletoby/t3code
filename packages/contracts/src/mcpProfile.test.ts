@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { ProjectId } from "./baseSchemas.ts";
+import { mcpProfileWiderParts } from "./mcpProfileResolve.ts";
 import { ProjectSettingsOverrides, ServerSettings, ServerSettingsPatch } from "./settings.ts";
 
 const decodeFile = Schema.decodeUnknownSync(ServerSettings);
@@ -29,7 +30,7 @@ describe("MCP profile settings file", () => {
   it("loads a file whose profile this build cannot read, and keeps it on save", () => {
     // Written by a newer build: an unknown field, an unknown group, a missing field.
     const profiles = {
-      future: { servers: [], t3Tools: ["mail"], builtinTools: "none" },
+      future: { servers: [], t3Tools: ["mail"], hosts: ["a"] },
       half: { servers: ["docs"] },
       odd: "not a profile",
     };
@@ -121,6 +122,25 @@ describe("MCP profile settings patch", () => {
     }
   });
 
+  it('takes builtinTools "none" or "all"; a profile without it is as before', () => {
+    const patch = decodePatch({
+      mcpProfiles: {
+        bare: { servers: "all", t3Tools: "all", builtinTools: "none" },
+        full: { servers: "all", t3Tools: "all", builtinTools: "all" },
+      },
+    });
+    expect(patch.mcpProfiles?.bare).toEqual({
+      servers: "all",
+      t3Tools: "all",
+      builtinTools: "none",
+    });
+    expect(patch.mcpProfiles?.full).toEqual({
+      servers: "all",
+      t3Tools: "all",
+      builtinTools: "all",
+    });
+  });
+
   it("takes null under a built-in name, so a hand-edited entry with that name can be removed", () => {
     expect(decodePatch({ mcpProfiles: { all: null, "t3-only": null } }).mcpProfiles).toEqual({
       all: null,
@@ -135,6 +155,10 @@ describe("MCP profile settings patch", () => {
     ["the name `inherit`", { mcpProfiles: { inherit: { servers: [], t3Tools: [] } } }],
     ["a bad name", { mcpProfiles: { "Bad Name": { servers: [], t3Tools: [] } } }],
     ["an unknown field", { mcpProfiles: { lean: { servers: [], t3Tools: [], extra: 1 } } }],
+    [
+      "a bad builtinTools",
+      { mcpProfiles: { lean: { servers: [], t3Tools: [], builtinTools: "x" } } },
+    ],
     ["a missing field", { mcpProfiles: { lean: { servers: [] } } }],
     ["an unknown group", { mcpProfiles: { lean: { servers: [], t3Tools: ["mail"] } } }],
     ["a blank server", { mcpProfiles: { lean: { servers: [" "], t3Tools: [] } } }],
@@ -185,5 +209,21 @@ describe("mcpCarriedProfiles setting (#640)", () => {
     expect(decodePatch({ mcpCarriedProfiles: "refuse" }).mcpCarriedProfiles).toBe("refuse");
     expect(decodePatch({ mcpCarriedProfiles: "apply" }).mcpCarriedProfiles).toBe("apply");
     expect(() => decodePatch({ mcpCarriedProfiles: "ignore" })).toThrow();
+  });
+});
+
+describe("mcpProfileWiderParts", () => {
+  const all = { servers: "all", t3Tools: "all" } as const;
+  const bare = { ...all, builtinTools: "none" } as const;
+  it("names only what the wider profile really keeps, for a refusal", () => {
+    expect(mcpProfileWiderParts(all, all)).toBe("");
+    expect(mcpProfileWiderParts(bare, all)).toBe("");
+    expect(mcpProfileWiderParts(all, bare)).toBe("built-in tools");
+    expect(mcpProfileWiderParts(all, { servers: ["docs"], t3Tools: "all" })).toBe("MCP servers");
+    expect(mcpProfileWiderParts(all, { servers: "all", t3Tools: ["threads"] })).toBe("T3 tools");
+    expect(mcpProfileWiderParts(all, { servers: [], t3Tools: [] })).toBe("MCP servers or T3 tools");
+    expect(mcpProfileWiderParts(all, { servers: [], t3Tools: [], builtinTools: "none" })).toBe(
+      "MCP servers, T3 tools or built-in tools",
+    );
   });
 });

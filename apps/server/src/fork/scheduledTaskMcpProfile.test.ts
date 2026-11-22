@@ -461,7 +461,7 @@ it.effect("a narrowed thread cannot change what a task bound to a wider thread r
               Effect.flip,
             );
             expect(messageOf(refused)).toContain(
-              `this task runs in thread ${WIDE}, whose MCP profile "all" keeps MCP servers or T3 tools "docs" does not`,
+              `this task runs in thread ${WIDE}, whose MCP profile "all" keeps MCP servers "docs" does not`,
             );
           }
           // Reading it, renaming it, pausing it or changing its schedule stays allowed.
@@ -1105,6 +1105,114 @@ it.effect(
     ),
 );
 
+/** The waiting task's row, for a case that makes it unreadable and then puts it back. */
+const setScheduleJson = (json: string) =>
+  SqlClient.SqlClient.pipe(
+    Effect.flatMap(
+      (sql) =>
+        sql`UPDATE scheduled_tasks SET schedule_json = ${json} WHERE task_id = 'task:hook-wait'`,
+    ),
+    Effect.asVoid,
+  );
+
+/**
+ * How a stored delivery's worker run ends before it asks for a slot, the worker then removing its
+ * row: skipped (paused, trigger changed) or failed (its task cannot be read as it starts: a row
+ * already marked running skips the worker's own read, so the run's read is the one that fails).
+ */
+const STORED_EARLY_ENDS = [
+  {
+    name: "paused",
+    end: (service: ScheduledTasks.ScheduledTaskService["Service"], stored: ScheduledTask) =>
+      service.setEnabled({ id: stored.id, enabled: false } as never).pipe(Effect.asVoid),
+    repair: Effect.void,
+    error: "The task was paused before this delivery ran.",
+  },
+  {
+    name: "trigger changed",
+    end: (service: ScheduledTasks.ScheduledTaskService["Service"], stored: ScheduledTask) =>
+      service
+        .upsert({ ...stored, schedule: { type: "interval", everyMs: 3_600_000 } } as never)
+        .pipe(Effect.asVoid),
+    repair: Effect.void,
+    error: "The task's trigger changed before this delivery ran.",
+  },
+  {
+    name: "failed before its ask",
+    end: () =>
+      SqlClient.SqlClient.pipe(
+        Effect.flatMap(
+          (sql) =>
+            sql`UPDATE scheduled_task_webhook_pending SET state = 'running' WHERE task_id = 'task:hook-wait'`,
+        ),
+        Effect.andThen(setScheduleJson("not json")),
+      ),
+    repair: setScheduleJson(JSON.stringify({ type: "webhook" })),
+    error: "The run failed to start.",
+  },
+] as const;
+
+it.effect.each(STORED_EARLY_ENDS)(
+  "$name: a stored delivery its worker ends without a run leaves its place in line (#915)",
+  ({ end, repair, error }) =>
+    held(
+      Effect.gen(function* () {
+        const slots = slotWorld();
+        const world = newWorld(slots);
+        yield* withService(NARROWED, world, (service) =>
+          Effect.gen(function* () {
+            const hook = { schedule: { type: "webhook" } as const };
+            const { task: waiting } = yield* service.upsert(task("task:hook-wait", hook));
+            const { task: other } = yield* service.upsert(task("task:hook-other", hook));
+            const sql = yield* SqlClient.SqlClient;
+            // The slot is full: the delivery asks for it, is refused, and is stored with its place
+            // in line from that ask.
+            slots.running = [ThreadId.make("thread:busy")];
+            const stored = yield* service.triggerWebhook(webhookRequest(waiting));
+            if (stored._tag !== "accepted") return assert.fail(`not accepted: ${stored._tag}`);
+            yield* settleUntil(
+              sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-wait'`.pipe(
+                Effect.map((rows) => rows.length === 1),
+                Effect.orDie,
+              ),
+              "the delivery is stored",
+            );
+            // Before its worker takes it, it comes to an end there, and the slot frees.
+            yield* end(service, waiting);
+            slots.running = [];
+            yield* settleUntil(
+              sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-wait'`.pipe(
+                Effect.map((rows) => rows.length === 0),
+                Effect.orDie,
+              ),
+              "the worker removed the stored delivery",
+              world.workers.get("webhook-coalescing")!.pipe(Effect.andThen(settle)),
+            );
+            yield* repair;
+            const [ended] = yield* sql<{ outcome: string; error: string | null }>`
+              SELECT outcome, error FROM scheduled_task_webhook_deliveries
+              WHERE delivery_id = ${stored.deliveryId}
+            `;
+            expect(ended?.outcome).toBe("dispatch_failed");
+            expect(ended?.error).toContain(error);
+            expect(world.launched).toHaveLength(0);
+            // Its place left with its row: another task's delivery takes the free slot as it
+            // comes in, not stored behind a delivery that already ended.
+            const ran = yield* service.triggerWebhook(webhookRequest(other));
+            if (ran._tag !== "accepted") return assert.fail(`not accepted: ${ran._tag}`);
+            yield* settleUntil(
+              Effect.sync(() => world.launched.length === 1),
+              "the other task's delivery ran",
+            );
+            expect(
+              yield* sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-other'`,
+            ).toHaveLength(0);
+          }),
+        );
+      }),
+    ),
+);
+
 it.effect(
   "a webhook delivery saved while it waited runs once on the task as saved, checked on it (#719)",
   () => {
@@ -1720,7 +1828,7 @@ it.effect(
                 const last = yield* scheduleTask({ scheduledTaskId: "task:bound-wide", ...change });
                 expect(last.isFailure).toBe(true);
                 expect(last.result.message).toContain(
-                  `this task runs in thread ${WIDE}, whose MCP profile "all" keeps MCP servers or T3 tools "docs" does not`,
+                  `this task runs in thread ${WIDE}, whose MCP profile "all" keeps MCP servers "docs" does not`,
                 );
               }
               expect(reached).toHaveLength(0);

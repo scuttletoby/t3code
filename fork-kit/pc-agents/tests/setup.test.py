@@ -5,7 +5,7 @@ walls, and a distro that is not fresh is refused with nothing changed.
 
   python3 -I -B fork-kit/pc-agents/tests/setup.test.py
 """
-import json, os, re, shutil, signal, stat, subprocess, sys, time, unittest
+import json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -863,15 +863,24 @@ class AsAgent(Case):
 
 
 class Refused(Case):
-    def refused(self, why):
+    def refused(self, why, source=REPO):
         lock = ('/run', os.path.dirname(k.LOCK), k.LOCK)   # the lock setup holds: a tmpfs file, gone at boot
         before = {p: v for p, v in self.snapshot().items() if p not in lock}
-        code, out = self.setup_run()
+        code, out = self.call(cli.main, ['setup', '--source', source, '--sha', SHA1])
         self.assertEqual(code, 1, out)
         self.assertIn('refused, nothing changed', out)
         self.assertIn(why, out)
         self.assertEqual({p: v for p, v in self.snapshot().items() if p not in lock}, before)
         self.assertEqual(self.log(), [])
+
+    def test_a_source_without_a_code_file(self):   # refused before any write, not half-way through the copy
+        with tempfile.TemporaryDirectory() as top:
+            for src in list(k.CODE)[:-1]:
+                os.makedirs(os.path.dirname(os.path.join(top, src)), exist_ok=True)
+                shutil.copyfile(os.path.join(REPO, src), os.path.join(top, src))
+            self.assertEqual(cli.missing_sources(top), [list(k.CODE)[-1]])
+            self.refused(f'{list(k.CODE)[-1]} is missing', source=top)
+        self.assertEqual(cli.missing_sources(REPO), [])
 
     def test_a_distro_with_its_own_user(self):
         with open(self.path('/etc/passwd'), 'a') as f:
