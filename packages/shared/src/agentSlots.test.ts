@@ -7,6 +7,7 @@ import {
   countedStarting,
   DISPATCH_SAFETY_MS,
   effectiveSlotLimits,
+  ENFORCE_COUNT_LIMIT,
   limitsCount,
   liveReservations,
   liveStarting,
@@ -56,11 +57,36 @@ const refused = (decision: SlotDecision) => {
 };
 
 describe("effectiveSlotLimits", () => {
-  it("is null while off, even with limits set (the default file has it off)", () => {
-    expect(effectiveSlotLimits(DEFAULT_SERVER_SETTINGS.agentSlots)).toBeNull();
-    expect(
-      effectiveSlotLimits({ ...slots({ maxPerMachine: 2, minFreeMemoryMb: 100 }), enabled: false }),
-    ).toBeNull();
+  it("is null while off in fixed or observe mode, even with limits set", () => {
+    for (const mode of ["fixed", "observe"] as const) {
+      expect(
+        effectiveSlotLimits({
+          ...slots({ maxPerMachine: 2, minFreeMemoryMb: 100 }),
+          enabled: false,
+          mode,
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it("enforces by default: the rule decides, typed limits only while switched on", () => {
+    const byDefault = effectiveSlotLimits(DEFAULT_SERVER_SETTINGS.agentSlots);
+    expect(byDefault).toMatchObject({ machine: ENFORCE_COUNT_LIMIT, enforce: true });
+    const off = effectiveSlotLimits({
+      ...slots({ maxPerMachine: 2, maxPerAccount: { [MAIN]: 1 }, minFreeMemoryMb: 100 }),
+      enabled: false,
+    });
+    expect(off).toMatchObject({ machine: ENFORCE_COUNT_LIMIT, minFreeMemoryBytes: null });
+    expect(off?.account(MAIN)).toBeNull();
+    const on = effectiveSlotLimits({
+      ...slots({ maxPerMachine: 200, maxPerAccount: { [MAIN]: 1 } }),
+      mode: "enforce",
+    });
+    expect(on).toMatchObject({ machine: ENFORCE_COUNT_LIMIT, enforce: true });
+    expect(on?.account(MAIN)).toBe(1);
+    expect(effectiveSlotLimits({ ...slots({ maxPerMachine: 3 }), mode: "enforce" })?.machine).toBe(
+      3,
+    );
   });
 
   it("is null when on with nothing to limit", () => {
@@ -393,15 +419,17 @@ describe("slotRefusalText", () => {
 
 describe("agentSlotsMode", () => {
   it("maps old settings files exactly and reads an unknown mode as fixed", () => {
-    // Before `mode`: switched on = today's fixed limits; off = the rule only observes.
+    // Before `mode`: switched on = today's fixed limits; off = the rule decides (on by default).
     expect(agentSlotsMode({ enabled: true })).toBe("fixed");
-    expect(agentSlotsMode({ enabled: false })).toBe("observe");
+    expect(agentSlotsMode({ enabled: false })).toBe("enforce");
+    expect(agentSlotsMode({ enabled: false, mode: "observe" })).toBe("observe");
+    expect(agentSlotsMode({ enabled: true, mode: "enforce" })).toBe("enforce");
     expect(agentSlotsMode({ enabled: false, mode: "fixed" })).toBe("fixed");
     expect(agentSlotsMode({ enabled: true, mode: "observe" })).toBe("observe");
     // A newer build's mode never runs here, and never makes this build read more.
     expect(agentSlotsMode({ enabled: false, mode: "dynamic" })).toBe("fixed");
     expect(agentSlotsMode({ enabled: true, mode: "" })).toBe("fixed");
-    expect(agentSlotsMode(DEFAULT_SERVER_SETTINGS.agentSlots)).toBe("observe");
+    expect(agentSlotsMode(DEFAULT_SERVER_SETTINGS.agentSlots)).toBe("enforce");
   });
 });
 

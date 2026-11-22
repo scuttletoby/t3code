@@ -27,7 +27,8 @@ working folder is in it; past its until date, or broken, it holds nothing (a not
 
 Readings are kept 5 seconds in /run/user/<uid>/heavy-facts.json ($HEAVY_FACTS_CACHE; --fresh reads again), written
 whole through a rename; a cache that is old, from the future, broken, of another version, of other settings (slice,
-queue, reservations folder) or not this user's own is read again. The pressure level carries from one reading to the
+queue, reservations folder) or not this user's own is read again. The pressure level (and the swap free its trend
+needs; a state without it waits one more read before it can step down) carries from one reading to the
 next (the rule's hysteresis) while the last one is at most 5 minutes old; without a cache folder nothing can carry,
 so the level starts "elevated" on every call (it never drops straight to ok). Learned job costs: heavy's peaks
 (lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost, not heavy's own

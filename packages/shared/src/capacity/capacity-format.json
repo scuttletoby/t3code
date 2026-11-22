@@ -53,10 +53,10 @@
               "object": {
                 "psiSomeAvg10Pct": "@nonneg",
                 "psiFullAvg10Pct": "@nonneg",
-                "availableAtLeastMarginPercent": "uint",
-                "swapFreeAtLeastPercent": "uint"
+                "availableAtLeastMarginPercent": "uint"
               }
             },
+            "swapFillingMb": "uint",
             "elevatedClearSeconds": "uint",
             "severeClearSeconds": "uint"
           }
@@ -94,7 +94,9 @@
         "reservations?": "any"
       }
     },
-    "pressureState": { "object": { "level": "@level", "calmSinceMs": "number|null" } },
+    "pressureState": {
+      "object": { "level": "@level", "calmSinceMs": "number|null", "swapFreeMb?": "number|null" }
+    },
     "learned": { "map": { "object": { "mb": "any", "centiCores?": "any" } } },
     "vector": {
       "object": {

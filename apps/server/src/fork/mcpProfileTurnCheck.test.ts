@@ -1,5 +1,5 @@
 /**
- * Fork: a turn on a provider that cannot apply MCP profiles (all but Claude) refuses when its
+ * Fork: a turn on a provider that cannot apply MCP profiles (all but Claude and Codex) refuses when its
  * thread's profile is narrower than `all`. The check wraps upstream's provider instance
  * registry as server.ts wires it, over upstream's settings test service and a real thread store
  * (SQLite in memory), so each route a thread takes to such a provider meets it at turn start.
@@ -115,7 +115,7 @@ const appThread = (
   } = {},
 ): OrchestrationV2AppThread => {
   const threadId = ThreadId.make(id);
-  const base = turn(threadId, CODEX).appThread;
+  const base = turn(threadId, OPENCODE).appThread;
   return {
     ...base,
     projectId: PROJECT,
@@ -242,13 +242,13 @@ const withCheck = <A, E>(
 };
 
 const CUT =
-  /MCP profile \("all", cut down to its parent thread's\) is narrower than "all", and codex/;
+  /MCP profile \("all", cut down to its parent thread's\) is narrower than "all", and opencode/;
 const REFUSED =
-  /MCP profile "t3-only" is narrower than "all", and codex \(provider instance codex\) does not apply MCP profiles/;
+  /MCP profile "t3-only" is narrower than "all", and opencode \(provider instance opencode-work\) does not apply MCP profiles/;
 
 describe("mcpProfileTurnCheck", () => {
   it("checks every driver but those that apply profiles", () => {
-    assert.deepStrictEqual([...MCP_PROFILE_DRIVERS], ["claudeAgent"]);
+    assert.deepStrictEqual([...MCP_PROFILE_DRIVERS], ["claudeAgent", "codex"]);
   });
 
   it.effect("with no profile anywhere (old and empty state), every provider runs as before", () =>
@@ -256,12 +256,12 @@ describe("mcpProfileTurnCheck", () => {
       Effect.gen(function* () {
         const own = appThread("own");
         for (const id of [CLAUDE, CODEX, OPENCODE]) assert.strictEqual(yield* start(own, id), "ok");
-        assert.strictEqual(yield* start(own, CODEX, "resume"), "ok");
+        assert.strictEqual(yield* start(own, OPENCODE, "resume"), "ok");
         assert.deepStrictEqual(calls, [
           "start:claudeAgent:own",
           "start:codex:own",
           "start:opencode-work:own",
-          "resume:codex:own",
+          "resume:opencode-work:own",
         ]);
       }),
     ),
@@ -271,19 +271,22 @@ describe("mcpProfileTurnCheck", () => {
     withCheck({ mcpProfile: "t3-only" }, [], ({ calls, raw, start }) =>
       Effect.gen(function* () {
         const own = appThread("switched");
-        // Claude applies the profile itself: its instance is upstream's, untouched.
+        // Claude and Codex apply the profile themselves: their instances are upstream's, untouched.
         const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
         assert.strictEqual(yield* registry.getInstance(CLAUDE), raw[0]);
         assert.strictEqual(yield* start(own, CLAUDE), "ok");
-        // The same thread, switched to Codex or any other non-Claude provider.
-        assert.match(yield* start(own, CODEX), REFUSED);
-        assert.match(yield* start(own, CODEX, "resume"), REFUSED);
+        assert.strictEqual(yield* registry.getInstance(CODEX), raw[1]);
+        assert.strictEqual(yield* start(own, CODEX), "ok");
+        // The same thread, switched to a provider that does not apply profiles.
+        assert.match(yield* start(own, OPENCODE), REFUSED);
+        assert.match(yield* start(own, OPENCODE, "resume"), REFUSED);
         assert.include(yield* start(own, OPENCODE), "opencode (provider instance opencode-work)");
         // Some providers compact by running a `/compact` prompt: it is held back too.
-        assert.match(yield* start(own, CODEX, "compact"), REFUSED);
+        assert.match(yield* start(own, OPENCODE, "compact"), REFUSED);
         assert.strictEqual(yield* start(own, CLAUDE, "compact"), "ok");
         assert.deepStrictEqual(calls, [
           "start:claudeAgent:switched",
+          "start:codex:switched",
           "compact:claudeAgent:switched",
         ]);
       }),
@@ -293,9 +296,9 @@ describe("mcpProfileTurnCheck", () => {
   it.effect("the message says how to get the turn running", () =>
     withCheck({ mcpProfile: "t3-only" }, [], ({ start }) =>
       Effect.gen(function* () {
-        const message = yield* start(appThread("own"), CODEX);
+        const message = yield* start(appThread("own"), OPENCODE);
         assert.include(message, "so this turn was not started");
-        assert.include(message, 'Switch the thread to a Claude instance, or pick "all"');
+        assert.include(message, 'Switch the thread to a Claude or Codex instance, or pick "all"');
         // Retrying cannot help, so upstream's turn-start guidance is not what the user reads.
         assert.notInclude(message, "Retry");
         assert.notInclude(message, "server logs");
@@ -314,8 +317,8 @@ describe("mcpProfileTurnCheck", () => {
         Effect.gen(function* () {
           const own = appThread("own");
           assert.include(
-            yield* start(own, CODEX),
-            'MCP profile "servers-only" is narrower than "all", and codex',
+            yield* start(own, OPENCODE),
+            'MCP profile "servers-only" is narrower than "all", and opencode',
           );
           assert.strictEqual(yield* start(own, CLAUDE), "ok");
           assert.deepStrictEqual(calls, ["start:claudeAgent:own"]);
@@ -323,66 +326,66 @@ describe("mcpProfileTurnCheck", () => {
     ),
   );
 
-  it.effect("a thread made by t3_thread_launch in a narrowed project refuses on Codex", () =>
+  it.effect("a thread made by t3_thread_launch in a narrowed project refuses on OpenCode", () =>
     withCheck(
       { projectSettingsOverrides: { [PROJECT]: { mcpProfile: "t3-only" } } },
       [],
       ({ calls, start }) =>
         Effect.gen(function* () {
           const launched = appThread("launched", { creationSource: "mcp", delegatedFrom: null });
-          assert.match(yield* start(launched, CODEX), REFUSED);
+          assert.match(yield* start(launched, OPENCODE), REFUSED);
           assert.strictEqual(yield* start(launched, CLAUDE), "ok");
           assert.deepStrictEqual(calls, ["start:claudeAgent:launched"]);
         }),
     ),
   );
 
-  it.effect("a local delegation of a narrowed parent refuses on Codex; all's runs", () =>
+  it.effect("a local delegation of a narrowed parent refuses on OpenCode; all's runs", () =>
     Effect.gen(function* () {
       const parent = appThread("parent");
       const child = appThread("child", { parent: "parent" });
       const picks = { mcpThreadProfiles: { [parent.id]: "t3-only" } } as Mcp;
       yield* withCheck(picks, [parent], ({ calls, start }) =>
         Effect.gen(function* () {
-          assert.match(yield* start(child, CODEX), CUT);
+          assert.match(yield* start(child, OPENCODE), CUT);
           assert.deepStrictEqual(calls, []);
         }),
       );
-      // A sub-agent rule narrows only delegated children: the parent itself still runs on Codex.
+      // A sub-agent rule narrows only delegated children: the parent itself still runs on OpenCode.
       yield* withCheck({ mcpSubagentProfile: "t3-only" }, [parent], ({ start }) =>
         Effect.gen(function* () {
-          assert.match(yield* start(child, CODEX), REFUSED);
-          assert.strictEqual(yield* start(parent, CODEX), "ok");
+          assert.match(yield* start(child, OPENCODE), REFUSED);
+          assert.strictEqual(yield* start(parent, OPENCODE), "ok");
         }),
       );
       yield* withCheck({}, [parent], ({ start }) =>
         Effect.gen(function* () {
-          assert.strictEqual(yield* start(child, CODEX), "ok");
+          assert.strictEqual(yield* start(child, OPENCODE), "ok");
         }),
       );
     }),
   );
 
-  it.effect("a child whose parent the store does not have refuses on Codex", () =>
+  it.effect("a child whose parent the store does not have refuses on OpenCode", () =>
     withCheck({}, [], ({ calls, start }) =>
       Effect.gen(function* () {
         const orphan = appThread("orphan", { parent: "gone" });
-        assert.include(yield* start(orphan, CODEX), "parent thread cannot be read");
+        assert.include(yield* start(orphan, OPENCODE), "parent thread cannot be read");
         assert.deepStrictEqual(calls, []);
       }),
     ),
   );
 
-  it.effect("a task another machine delegated with a narrower profile refuses on Codex", () =>
+  it.effect("a task another machine delegated with a narrower profile refuses on OpenCode", () =>
     withCheck({}, [], ({ calls, start }) =>
       Effect.gen(function* () {
         const task = appThread("task", { delegatedFrom: delegatedFrom(T3_ONLY) });
-        assert.match(yield* start(task, CODEX), CUT);
+        assert.match(yield* start(task, OPENCODE), CUT);
         const all = appThread("task-all", {
           delegatedFrom: delegatedFrom({ name: "all", servers: "all", t3Tools: "all" }),
         });
-        assert.strictEqual(yield* start(all, CODEX), "ok");
-        assert.deepStrictEqual(calls, ["start:codex:task-all"]);
+        assert.strictEqual(yield* start(all, OPENCODE), "ok");
+        assert.deepStrictEqual(calls, ["start:opencode-work:task-all"]);
       }),
     ),
   );
@@ -392,12 +395,12 @@ describe("mcpProfileTurnCheck", () => {
       const task = appThread("old-task", { delegatedFrom: delegatedFrom() });
       yield* withCheck({ mcpSubagentProfile: "t3-only" }, [], ({ start }) =>
         Effect.gen(function* () {
-          assert.match(yield* start(task, CODEX), REFUSED);
+          assert.match(yield* start(task, OPENCODE), REFUSED);
         }),
       );
       yield* withCheck({}, [], ({ start }) =>
         Effect.gen(function* () {
-          assert.strictEqual(yield* start(task, CODEX), "ok");
+          assert.strictEqual(yield* start(task, OPENCODE), "ok");
         }),
       );
     }),
@@ -407,14 +410,14 @@ describe("mcpProfileTurnCheck", () => {
     withCheck({ mcpProfile: "t3-only" }, [], ({ calls, start }) =>
       Effect.gen(function* () {
         const own = appThread("own");
-        const first = yield* start(own, CODEX);
-        assert.strictEqual(yield* start(own, CODEX), first);
+        const first = yield* start(own, OPENCODE);
+        assert.strictEqual(yield* start(own, OPENCODE), first);
         const settings = yield* ServerSettingsService.ServerSettingsService;
         yield* settings.updateSettings({ mcpThreadProfiles: { [own.id]: "all" } } as never);
-        assert.strictEqual(yield* start(own, CODEX), "ok");
+        assert.strictEqual(yield* start(own, OPENCODE), "ok");
         yield* settings.updateSettings({ mcpThreadProfiles: { [own.id]: "t3-only" } } as never);
-        assert.match(yield* start(own, CODEX), REFUSED);
-        assert.deepStrictEqual(calls, ["start:codex:own"]);
+        assert.match(yield* start(own, OPENCODE), REFUSED);
+        assert.deepStrictEqual(calls, ["start:opencode-work:own"]);
       }),
     ),
   );
@@ -423,12 +426,12 @@ describe("mcpProfileTurnCheck", () => {
     withCheck({}, [], () =>
       Effect.gen(function* () {
         const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
-        const codex = yield* registry.getInstance(CODEX);
-        assert.strictEqual(yield* registry.getInstance(CODEX), codex);
+        const other = yield* registry.getInstance(OPENCODE);
+        assert.strictEqual(yield* registry.getInstance(OPENCODE), other);
         const listed = yield* registry.listInstances;
         assert.strictEqual(
-          listed.find((entry) => entry.instanceId === CODEX),
-          codex,
+          listed.find((entry) => entry.instanceId === OPENCODE),
+          other,
         );
         assert.isUndefined(yield* registry.getInstance(ProviderInstanceId.make("none")));
       }),
@@ -463,13 +466,13 @@ describe("mcpProfileTurnCheck", () => {
         ({ calls, start }) =>
           Effect.gen(function* () {
             const own = appThread("own");
-            const fiber = yield* Effect.forkChild(start(own, CODEX));
+            const fiber = yield* Effect.forkChild(start(own, OPENCODE));
             yield* Deferred.await(reading);
             yield* Fiber.interrupt(fiber);
             assert.deepStrictEqual(calls, []);
             // The next turn reads again and starts.
-            assert.strictEqual(yield* start(own, CODEX), "ok");
-            assert.deepStrictEqual(calls, ["start:codex:own"]);
+            assert.strictEqual(yield* start(own, OPENCODE), "ok");
+            assert.deepStrictEqual(calls, ["start:opencode-work:own"]);
           }),
         blocking,
       );
@@ -500,12 +503,12 @@ describe("mcpProfileTurnCheck", () => {
         ({ start }) =>
           Effect.gen(function* () {
             // No settings.json (missing state): the defaults, so this machine's own thread runs.
-            assert.strictEqual(yield* start(appThread("own"), CODEX), "ok");
+            assert.strictEqual(yield* start(appThread("own"), OPENCODE), "ok");
             // settings.json that cannot be read as a file: a carried narrower task is refused.
             const { settingsPath } = yield* ServerConfig.ServerConfig;
             yield* (yield* FileSystem.FileSystem).makeDirectory(settingsPath);
             const task = appThread("task", { delegatedFrom: delegatedFrom(T3_ONLY) });
-            assert.notStrictEqual(yield* start(task, CODEX), "ok");
+            assert.notStrictEqual(yield* start(task, OPENCODE), "ok");
           }),
         failing,
       );

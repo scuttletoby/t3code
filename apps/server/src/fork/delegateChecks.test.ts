@@ -382,7 +382,8 @@ describe("fork delegation checks: a child's own options", () => {
       Effect.gen(function* () {
         assert.deepStrictEqual(yield* seats, {
           created: agentTarget([effort]),
-          before: agentTarget([effort]),
+          // No role: the slot gate counts the task as a writer.
+          before: { ...agentTarget([effort]), agentKind: "agent-writer" },
           remote: { model: "big-pickle", options: [effort] },
         });
       }).pipe(Effect.provide(pacingOff(mode))),
@@ -401,11 +402,55 @@ describe("fork delegation checks: a child's own options", () => {
     }).pipe(Effect.provide(pacingOff("unreadable"))),
   );
 
+  it.effect(
+    "the task's role reaches the slot gate as its kind; no role or target is a writer",
+    () => {
+      const asked: Array<string | undefined> = [];
+      const gate = Layer.mock(SlotGate.SlotGate)({
+        acquire: (input) =>
+          Effect.sync(() => {
+            asked.push(input.kind);
+            return { type: "allow" as const, token: null };
+          }),
+        release: () => Effect.void,
+      });
+      return Effect.gen(function* () {
+        const checks = yield* DelegateChecks.make(host);
+        // The role is the caller's word (it may lie): the gate checks what the agent then uses.
+        for (const requested of [
+          { model: "big-pickle", options: [effort], role: "review" as const },
+          { role: "research" as const },
+          { model: "big-pickle", options: [effort], role: "implementation" as const },
+          { role: undefined },
+          undefined,
+        ]) {
+          const before = yield* checks.beforeWorkspace({
+            isRetry: false,
+            parent,
+            requested,
+            runtimeMode: undefined,
+            cwd: undefined,
+            target: given,
+          });
+          const hold = yield* checks.afterWorkspace({
+            isRetry: false,
+            callerThreadId,
+            target: before.target,
+          });
+          yield* hold.release;
+        }
+        // Literal names: the capacity rule's kinds (capacity-rule.json).
+        const [light, writer] = ["agent-light", "agent-writer"];
+        assert.deepStrictEqual(asked, [light, light, writer, writer, writer]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(pacingOff("off"), gate)));
+    },
+  );
+
   it.effect("with the model policy off, every path keeps upstream's inheritance", () =>
     Effect.gen(function* () {
       assert.deepStrictEqual(yield* seats, {
         created: given,
-        before: given,
+        before: { ...given, agentKind: "agent-writer" },
         remote: { model: "big-pickle", options: [effort] },
       });
     }).pipe(Effect.provide(pacingOff("off"))),

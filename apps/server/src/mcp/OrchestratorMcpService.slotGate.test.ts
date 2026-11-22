@@ -11,6 +11,7 @@ import {
   EnvironmentId,
   NodeId,
   type OrchestratorMcpTarget,
+  type OrchestratorMcpTaskRole,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   ProjectId,
@@ -199,7 +200,11 @@ const serverLayer = (
   world: World,
   settings: DeepPartial<ServerSettingsValue>,
   providers: ReadonlyArray<ServerProvider>,
-  options: { readonly withGate?: boolean } = {},
+  options: {
+    readonly withGate?: boolean;
+    /** A gate of the test's own in place of the real one. */
+    readonly gate?: Layer.Layer<SlotGate.SlotGate>;
+  } = {},
 ) => {
   const taskOf = (task: World["tasks"][number]) => ({
     id: task.id,
@@ -357,18 +362,25 @@ const serverLayer = (
     ServerSettings.layerTest(settings),
   );
   const withGate =
-    options.withGate === false
-      ? dependencies
-      : SlotGate.layerOver.pipe(Layer.provideMerge(dependencies));
+    options.gate !== undefined
+      ? Layer.merge(dependencies, options.gate)
+      : options.withGate === false
+        ? dependencies
+        : SlotGate.layerOver.pipe(Layer.provideMerge(dependencies));
   return OrchestratorMcpService.layer.pipe(Layer.provideMerge(withGate));
 };
 
-const delegate = (clientRequestId: string, target?: OrchestratorMcpTarget) =>
+const delegate = (
+  clientRequestId: string,
+  target?: OrchestratorMcpTarget,
+  role?: OrchestratorMcpTaskRole,
+) =>
   OrchestratorMcpService.OrchestratorMcpService.pipe(
     Effect.flatMap((service) =>
       service.delegateTask(scope, {
         task: "Review the change.",
         ...(target === undefined ? {} : { target }),
+        ...(role === undefined ? {} : { role }),
         mode: "async",
         clientRequestId,
       }),
@@ -534,6 +546,39 @@ describe("OrchestratorMcpService agent slot gate", () => {
           assert.deepStrictEqual(world.dispatched, [{ instanceId: MAIN }]);
           assert.strictEqual(world.snapshotReads, 2);
         }).pipe(Effect.provide(serverLayer(world, slots({ maxPerMachine: 2 }), roomy)));
+      }),
+  );
+
+  it.effect(
+    "the task's role reaches the slot gate as its capacity kind (fork line in upstream file)",
+    () =>
+      Effect.gen(function* () {
+        const cases: ReadonlyArray<{ role: OrchestratorMcpTaskRole | undefined; kind: string }> = [
+          { role: "review", kind: "agent-light" },
+          { role: "research", kind: "agent-light" },
+          { role: "implementation", kind: "agent-writer" },
+          { role: undefined, kind: "agent-writer" },
+        ];
+        for (const entry of cases) {
+          const world = newWorld();
+          const kinds: Array<string | undefined> = [];
+          const gate = Layer.mock(SlotGate.SlotGate)({
+            acquire: (input) =>
+              Effect.sync(() => {
+                kinds.push(input.kind);
+                return { type: "allow", token: null } as const;
+              }),
+            started: () => Effect.void,
+            release: () => Effect.void,
+          });
+          const result = yield* delegate(
+            `slot-role-${entry.role ?? "none"}`,
+            undefined,
+            entry.role,
+          ).pipe(Effect.provide(serverLayer(world, {}, roomy, { gate })));
+          assert.strictEqual(result._tag, "Success", entry.role);
+          assert.deepStrictEqual(kinds, [entry.kind], entry.role);
+        }
       }),
   );
 

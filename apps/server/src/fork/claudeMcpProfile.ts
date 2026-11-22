@@ -15,6 +15,7 @@ import {
   MCP_CARRIED_PROFILES_REFUSE,
   MCP_PROFILE_ALL,
   type OrchestrationV2AppThread,
+  ProjectId,
   type ServerSettings,
   type ThreadId,
   isDelegatedAppThread,
@@ -530,13 +531,8 @@ export const makeMcpProfileSettings = Effect.gen(function* () {
 
 type McpOverrides = { readonly mcpServers?: Readonly<Record<string, unknown>> | undefined };
 
-/**
- * One settings read, or a refusal, then threads' resolved profiles (or refusals) from it: two
- * threads compared against one file. Settings as {@link makeMcpProfileSettings} reads them; without
- * the settings service (tests), the default settings' (`all`, cut to a profile another machine
- * carried).
- */
-export const makeThreadMcpProfileReads = Effect.gen(function* () {
+/** {@link makeThreadMcpProfileReads}, and the store's thread reads it uses. */
+const makeLineageReads = Effect.gen(function* () {
   const settingsService = yield* Effect.serviceOption(ServerSettingsService.ServerSettingsService);
   const sql = yield* Effect.serviceOption(SqlClient.SqlClient);
   // The adapter built alone (upstream's adapter tests): default settings and no store, so nothing
@@ -562,11 +558,20 @@ export const makeThreadMcpProfileReads = Effect.gen(function* () {
       ? undefined
       : () => Effect.succeed(null);
   const readSettings = yield* makeMcpProfileSettings;
-  return Effect.map(
+  const reads = Effect.map(
     readSettings,
     (settings) => (thread: LineageThread) => mcpProfileForThread(settings, thread, findThread),
   );
+  return { reads, findThread };
 });
+
+/**
+ * One settings read, or a refusal, then threads' resolved profiles (or refusals) from it: two
+ * threads compared against one file. Settings as {@link makeMcpProfileSettings} reads them; without
+ * the settings service (tests), the default settings' (`all`, cut to a profile another machine
+ * carried).
+ */
+export const makeThreadMcpProfileReads = Effect.map(makeLineageReads, ({ reads }) => reads);
 
 /**
  * A thread's resolved profile, or a refusal, from the settings {@link makeMcpProfileSettings}
@@ -576,6 +581,32 @@ export const makeThreadMcpProfiles = Effect.gen(function* () {
   const reads = yield* makeThreadMcpProfileReads;
   return Effect.fn("ClaudeMcpProfile.profileFor")(function* (thread: LineageThread) {
     return yield* (yield* reads)(thread);
+  });
+});
+
+/**
+ * A thread's resolved profile, or a refusal, found by its id alone (a Codex thread request carries
+ * only the id). A thread the store cannot give refuses, as an unreadable parent does. With no store
+ * and no settings service (upstream's adapter tests) it is read as a root thread: `all`.
+ */
+export const makeThreadMcpProfilesById = Effect.gen(function* () {
+  const { reads, findThread } = yield* makeLineageReads;
+  return Effect.fn("ClaudeMcpProfile.profileForId")(function* (threadId: ThreadId) {
+    const read = yield* reads;
+    if (findThread === undefined) {
+      return yield* read({
+        id: threadId,
+        projectId: ProjectId.make("unknown-project"),
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      } as LineageThread);
+    }
+    const thread = yield* findThread(threadId);
+    if (thread === null) {
+      return yield* new ClaudeMcpProfileError({
+        reason: `T3 cannot read this thread from its store, so its MCP profile cannot be worked out and it cannot start: retry, or ${FIX}.`,
+      });
+    }
+    return yield* read(thread);
   });
 });
 

@@ -307,12 +307,15 @@ function pressureOf(
   marginMb: number,
   input: { readonly previous?: PressureState | null; readonly nowMs?: number },
 ): PressureState {
-  return nextPressure(
+  const next = nextPressure(
     rule.pressure,
-    rawLevel(rule.pressure, readings, marginMb),
+    rawLevel(rule.pressure, readings, marginMb, input.previous?.swapFreeMb),
     input.previous,
     input.nowMs,
   );
+  // The swap free of this read, for the next one's trend (`swapFillingMb`).
+  const swap = readings.swap;
+  return { ...next, swapFreeMb: typeof swap === "object" && swap !== null ? swap.freeMb : null };
 }
 
 /**
