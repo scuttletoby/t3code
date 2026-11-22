@@ -12,6 +12,7 @@ import {
   htmlUnescape,
   isBlank,
   pyI,
+  pyUnicodeCheck,
   splitlines,
   strip,
   stripChars,
@@ -60,6 +61,7 @@ const blocking = (kind: Kind): kind is FindingKind => kind !== "minor";
 
 /** The text as the findings rules read it. */
 export function fold(text: string | null | undefined): string {
+  pyUnicodeCheck(text ?? "");
   const t = htmlUnescape((text ?? "").normalize("NFKC"))
     .replace(/\\([!-/:-@[-`{-~])/gu, "$1")
     .replace(/\p{Cf}/gu, "");
@@ -186,6 +188,7 @@ function read(lines: ReadonlyArray<string>, narrow: boolean): Read {
  * or the title under it) or a `verdict:` line that says NOT SAFE is a blocker whatever the labels say.
  */
 export function readFindings(body: string): [Array<[FindingKind, string]>, boolean] {
+  pyUnicodeCheck(body);
   const lines = splitlines(body);
   const found = new Map<number, [FindingKind, string]>();
   const seen = new Set<Kind>();

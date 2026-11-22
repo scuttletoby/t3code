@@ -19,7 +19,7 @@ Pin a release commit by its full SHA, never a commit of main ([why](../../README
 - id: m2
   uses: scuttletoby/t3code/fork-ci/actions/gradle-cache@<release sha> # ci/vN
   with:
-    lock: engine/m2-lock.json # project fact
+    lock: core/m2-lock.json # project fact
     cache-dir: ~/.cache/my-ci-m2 # optional: keep an existing warm cache
 - run: ./gradlew --offline -Dmaven.repo.local="${{ steps.m2.outputs.maven-repo-local }}" build
 ```
@@ -41,7 +41,7 @@ Output `maven-repo-local`: the staged folder.
 {
   "release": "m2-jars",
   "files": [
-    { "path": "org/example/engine/1.0/engine-1.0.jar", "sha256": "<64 hex>", "release": "m2-jars" }
+    { "path": "org/example/core/1.0/core-1.0.jar", "sha256": "<64 hex>", "release": "m2-jars" }
   ]
 }
 ```
@@ -56,9 +56,9 @@ Run these on a machine whose `~/.m2` has the version, with `gh` logged in:
 
 ```bash
 S=fork-ci/actions/gradle-cache/gradle_cache.py   # from a checkout of the pinned commit
-python3 -I $S publish --lock engine/m2-lock.json --repo OWNER/REPO org.example:engine:1.1   # then commit the lock
-python3 -I $S check --lock engine/m2-lock.json --repo OWNER/REPO                           # needs GH_TOKEN
-python3 -I $S prune-lock --lock engine/m2-lock.json --keep org.example:engine:1.1 org.example:engine:1.0
+python3 -I $S publish --lock core/m2-lock.json --repo OWNER/REPO org.example:core:1.1   # then commit the lock
+python3 -I $S check --lock core/m2-lock.json --repo OWNER/REPO                           # needs GH_TOKEN
+python3 -I $S prune-lock --lock core/m2-lock.json --keep org.example:core:1.1 org.example:core:1.0
 ```
 
 - `publish` uploads the version's jar, pom, module and `maven-metadata-local.xml` (no sources or

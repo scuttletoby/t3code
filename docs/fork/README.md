@@ -67,6 +67,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.mcpCarriedProfiles`](#servermcpcarriedprofiles)                     | `"apply"`                               | yes | [#640](https://github.com/scuttletoby/t3code/issues/640) |
 | [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`                        | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`server.threadRoles`](#serverthreadroles)                                   | `{"assistant":null,"orchestrators":{}}` | yes | [#138](https://github.com/scuttletoby/t3code/issues/138) |
+| [`server.assistant`](#serverassistant)                                       | `{"enabled":false}`                     | yes | [#879](https://github.com/scuttletoby/t3code/issues/879) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                                 | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                                 | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                                 | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
@@ -155,6 +156,23 @@ Set in `settings.json`:
 The key is the provider instance id, for example `codex` or `codex_work`. In the app: **Settings →
 Fork**, section Usage pacing, one row per account by its name (an entry for an account that is gone
 is listed with **Remove**).
+
+`burnFirstWindows` limits `burnFirst` to some window kinds (`session`, `weekly`, `monthly`,
+`other`); the rest keep the even pace. An extra account that may spend its week fast but keeps its
+5-hour windows paced:
+
+```json
+{
+  "usagePacing": {
+    "<instance id>": { "burnFirst": true, "burnFirstWindows": ["weekly", "monthly"] }
+  }
+}
+```
+
+Without the list, `burnFirst` spends every window first (as before the list existed). A name that is
+not a window kind is ignored on load (that window keeps its pace; a warning is logged) and refused by
+a save. Only `settings.json` sets the list so far; `__fork-report` shows the kinds each account spends
+first under `usagePacingBurnFirstWindows`.
 
 ### `server.usagePacingGate`
 
@@ -262,11 +280,12 @@ In the app: **Settings → Fork**, section Playtest: the switch (it stays off un
 set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
 
 Only the person can change it; agents cannot. A save that is on without all four steps, repeats a
-push step's name (or names one `claim`, `renew` or `release`), or names a program by anything but
-its full path on the server's OS is refused. A hand-edited
-value that is not valid reads as off (with a warning in the server log), and the next save of any
-setting writes the default in its place; fields a newer build added are dropped the same way (as for
-`waitChecks`). Other fields: how often a claim is renewed (`renewMinutes`), when an idle
+push step's name (or names one `claim`, `renew` or `release`), names a program by anything but its
+full path on the server's OS, or has a field this build does not know is refused. A hand-edited
+value that is not valid, or has a field this build does not know (a newer build's limit, a typo),
+reads as off (with a warning in the server log), and the next save of any setting writes the default
+in its place. So after moving back to an older build, copy the playtest value first: the older
+build's next save replaces a newer build's value. Other fields: how often a claim is renewed (`renewMinutes`), when an idle
 session ends (`idleMinutes`) and the longest session (`maxHours`).
 
 ```json
@@ -770,8 +789,9 @@ Switch off in `settings.json`: `"headlessUsageRefreshInterval": 0`.
 ### `server.mcpProfiles`
 
 Named MCP profiles. A profile says which outside MCP servers (`servers`) and which groups of T3's
-own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Two profiles are built in: `all`
-(everything, today's behaviour) and `t3-only` (no outside servers, every T3 tool); a profile cannot
+own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Three profiles are built in: `all`
+(everything, today's behaviour), `t3-only` (no outside servers, every T3 tool) and `assistant` (see
+[assistant.md](assistant.md): no outside servers or built-in tools, three T3 tool groups); a profile cannot
 take their names, and one written in by hand makes that built-in refuse threads until it is removed
 (a save may send `null` under a built-in name to remove it) or renamed.
 
@@ -1029,7 +1049,7 @@ the owner set up so.
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
 ```
 
-In the app: **Settings → Fork**, section MCP profiles. It lists `all` and `t3-only` (read-only)
+In the app: **Settings → Fork**, section MCP profiles. It lists the built-ins (read-only)
 and each named profile, and adds, edits and deletes named ones: `servers` is all or a list of
 names (the editor offers the names other profiles use and takes any other; no list of the
 machine's servers reaches the app yet), `t3Tools` all or a list of groups, and a "No built-in tools" box sets `builtinTools: "none"`. `request_secret`,
@@ -1140,7 +1160,12 @@ existed have no `source` and read as `none`, so they start no write turns until 
 smallest idle thread handed off before its cache expires, and `modelSelection` the new session's
 model (not set: the thread's current one). A save with a bad value, a field T3 does not know (a
 typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
-server log), never as `handoff`.
+server log), never as `handoff`. The server also refuses a save that sets a new `command` (here or
+in a project's `handoff`) whose program is not a full path to a file on the server, or lies inside a
+git checkout an agent could edit; the script it hands a known interpreter, a module by name, a
+program `env` finds on the `PATH`, and runners such as `make` or `npm` are refused too. It guards
+against mistakes, not attacks: [handoff.md](handoff.md) lists what it does not catch. A command
+already stored is not checked again. The command gets a short list of the server's environment.
 
 In the app: **Settings → Fork**, section Handoff: the mode, each thread's own mode (added by thread
 id, shown with its title where this client knows the thread), and under Advanced the sizes, who
@@ -1182,6 +1207,18 @@ file after the next save of any setting, since the save writes the settings as r
   "threadRoles": { "assistant": "<thread id>", "orchestrators": { "<project id>": "<thread id>" } }
 }
 ```
+
+### `server.assistant`
+
+`enabled` offers **Make assistant** in **Settings → Fork**, section Assistant: it makes a thread in
+the Scratch project, picks the built-in MCP profile `assistant` for it and points
+`threadRoles.assistant` at it, in two saves from the person (the pick first, before the thread
+exists). Off (the default): no such button; a
+thread already named the assistant stays as it is. Only the person can change it. Anything but
+`{"enabled": true}` in the file reads as off; a save with a bad value is refused. The thread
+`threadRoles.assistant` names never gets more than the profile `assistant`, whatever its pick (a
+managed policy that owns `mcpThreadProfiles` can drop the pick). More in
+[assistant.md](assistant.md).
 
 ### `projectOverride.waitChecks`
 
@@ -1345,6 +1382,7 @@ switch.
 - [host-tools.md](host-tools.md): design for agents on a person's own computer (no code yet).
 - [playtest.md](playtest.md): the playtest adapter contract (steps, environment, exit codes).
 - [handoff.md](handoff.md): handoff instead of compaction (when, the quiet rule, the message).
+- [assistant.md](assistant.md): the assistant thread (setup, its profile, what it cannot do yet).
 - [run-records.md](run-records.md): one record per agent run (usage, time, labels) and the weekly
   summary.
 - [`.github/fork-fleet.md`](../../.github/fork-fleet.md): the fleet runners and `CI_RUNNERS`.

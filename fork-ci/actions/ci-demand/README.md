@@ -91,4 +91,5 @@ Two choices to keep in mind when comparing before and after:
 ## General vs project
 
 General: the command, its counting rules and its cache. Project: only the repository (an argument, or `ciDemand.repo`
-in the project's own config file) and where the caller keeps the cache.
+in the project's own config file) and where the caller keeps the cache. The examples here, as in
+[fleet-route](../fleet-route/README.md), call that file `.github/fleet.json`; the name is the project's choice.

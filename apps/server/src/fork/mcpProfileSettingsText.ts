@@ -14,10 +14,13 @@ import * as Schema from "effect/Schema";
 
 import { parseSettingsFileText } from "../serverSettings.ts";
 
-/** The settings keys MCP profiles read from the file, besides `mcpCarriedProfiles`. */
+/**
+ * The settings keys MCP profiles read from the file, besides `mcpCarriedProfiles`. `threadRoles`
+ * too: the assistant thread is held within the `assistant` profile, so its pointer counts.
+ */
 export type McpProfileFileKeys = Pick<
   ServerSettings,
-  "mcpProfiles" | "mcpProfile" | "mcpSubagentProfile" | "mcpThreadProfiles"
+  "mcpProfiles" | "mcpProfile" | "mcpSubagentProfile" | "mcpThreadProfiles" | "threadRoles"
 > & {
   /** Each project's two MCP profile keys, as written; a project left out has none. */
   readonly projectSettingsOverrides: Readonly<
@@ -49,6 +52,7 @@ const ServerKeys = Schema.Struct({
   mcpProfile: ForkServerSettingsFields.mcpProfile,
   mcpSubagentProfile: ForkServerSettingsFields.mcpSubagentProfile,
   mcpThreadProfiles: ForkServerSettingsFields.mcpThreadProfiles,
+  threadRoles: ForkServerSettingsFields.threadRoles,
 });
 const ProjectKeys = Schema.Struct({
   mcpProfile: ForkProjectOverrideFields.mcpProfile,
@@ -184,6 +188,7 @@ export function mcpProfileFileKeysOf(settings: ServerSettings): McpProfileFileKe
     mcpProfile: settings.mcpProfile,
     mcpSubagentProfile: settings.mcpSubagentProfile,
     mcpThreadProfiles: settings.mcpThreadProfiles,
+    threadRoles: settings.threadRoles,
     projectSettingsOverrides,
   };
 }
@@ -211,6 +216,7 @@ export function withMcpProfileFileKeys(
     mcpProfile: keys.mcpProfile,
     mcpSubagentProfile: keys.mcpSubagentProfile,
     mcpThreadProfiles: keys.mcpThreadProfiles,
+    threadRoles: keys.threadRoles,
     projectSettingsOverrides:
       projectSettingsOverrides as ServerSettings["projectSettingsOverrides"],
   };

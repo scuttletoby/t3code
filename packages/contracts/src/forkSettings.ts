@@ -35,7 +35,7 @@ import {
   PlacementSettingsFromSettingsFile,
   PlacementSettingsPatch,
 } from "./placement.ts";
-import { PlaytestSettings, PlaytestSettingsFromSettingsFile } from "./playtest.ts";
+import { PlaytestSettingsFromSettingsFile, PlaytestSettingsPatch } from "./playtest.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   ReviewRulesFromSettingsFile,
@@ -43,6 +43,7 @@ import {
   ReviewRulesProjectPatch,
 } from "./reviewRules.ts";
 import { ThreadRolesFromSettingsFile, ThreadRolesPatch } from "./threadRoles.ts";
+import { AssistantSettingsFromSettingsFile, AssistantSettingsPatch } from "./assistant.ts";
 import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   UsagePacingGateMode,
@@ -59,6 +60,7 @@ import {
   WaitForSettingsPatch,
 } from "./waitFor.ts";
 
+export * from "./assistant.ts";
 export * from "./forkFeatures.ts";
 export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
@@ -138,6 +140,8 @@ export const ForkServerSettingsFields = {
   ),
   /** Which thread is the assistant and each project's orchestrator; none. A bad entry drops alone. */
   threadRoles: ThreadRolesFromSettingsFile,
+  /** Offers "Make assistant"; off. A bad value reads as off. */
+  assistant: AssistantSettingsFromSettingsFile,
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -166,8 +170,8 @@ export const ForkServerSettingsPatchFields = {
   mcpThreadProfiles: Schema.optionalKey(McpThreadProfilesPatch),
   /** Strict: `apply` or `refuse`. */
   mcpCarriedProfiles: Schema.optionalKey(McpCarriedProfiles),
-  /** Strict: a save refuses a bad step, or `enabled` without all four steps. */
-  playtest: Schema.optionalKey(PlaytestSettings),
+  /** Strict: a save refuses a bad step, an unknown field, or `enabled` without all four steps. */
+  playtest: Schema.optionalKey(PlaytestSettingsPatch),
   /** Strict: a save refuses a bad value, an unknown field, or `source: command` without a command. */
   handoff: Schema.optionalKey(HandoffSettingsPatch),
   /** Strict: a save refuses a bad field, an unknown key, or a value without `preset`. */
@@ -183,6 +187,8 @@ export const ForkServerSettingsPatchFields = {
   placementNeeds: Schema.optionalKey(PlacementNeedsPatch),
   /** Strict ids; the server also refuses a pointer to a thread that cannot hold the role. */
   threadRoles: Schema.optionalKey(ThreadRolesPatch),
+  /** Strict: a save refuses a bad value or an unknown field. */
+  assistant: Schema.optionalKey(AssistantSettingsPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -234,6 +240,7 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   // One orchestrator per project entry, so two people setting different projects keep both; two
   // saves of the same project, the last one wins.
   threadRoles: { fields: { assistant: "replace", orchestrators: { replaceEntries: {} } } },
+  assistant: "merge-fields",
 };
 
 /**
@@ -330,10 +337,10 @@ export const ForkProjectOverridePatchFields = {
   mcpProfile: Schema.optionalKey(McpProjectProfileRefPatch),
   mcpSubagentProfile: Schema.optionalKey(McpProjectProfileRefPatch),
   /**
-   * A save refuses a bad step, or `enabled` without all four steps. Left out keeps the stored value;
-   * `null` clears it (the project then uses the server's).
+   * A save refuses a bad step, an unknown field, or `enabled` without all four steps. Left out keeps
+   * the stored value; `null` clears it (the project then uses the server's).
    */
-  playtest: Schema.optionalKey(Schema.NullOr(PlaytestSettings)),
+  playtest: Schema.optionalKey(Schema.NullOr(PlaytestSettingsPatch)),
   /** As `playtest`: left out keeps the stored value; `null` clears it. */
   handoff: Schema.optionalKey(Schema.NullOr(HandoffSettingsPatch)),
   /**
