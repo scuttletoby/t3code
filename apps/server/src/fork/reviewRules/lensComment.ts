@@ -6,7 +6,7 @@
  */
 import * as Schema from "effect/Schema";
 
-import { readFindings } from "./findings.ts";
+import { fold, readFindings } from "./findings.ts";
 
 import {
   ALNUM,
@@ -16,6 +16,10 @@ import {
   byCodePoint,
   cut,
   isBlank,
+  LINE_END,
+  LINE_ENDS,
+  memo,
+  nfkc,
   PyTextError,
   pyI,
   pyUnicodeCheck,
@@ -55,7 +59,10 @@ const LOOKS_RE = new RegExp(
   "iu",
 );
 const FIELD_LINE_RE = new RegExp(`^(?:covered|checks)${S}*:`, "iu");
-const LOOKS_HEADING_RE = new RegExp(`^ {0,3}#{1,6}[ \t][^\n]*${B}lens${B}`, "iu");
+// lens.looks_heading: the heading marks as GitHub reads them, on the raw line (a full-width `＃` is no heading, as
+// GitHub renders it as plain text), then the lens word in NFKC.
+const HEADING_START_RE = /^ {0,3}#{1,6}[ \t]/u;
+const LENS_WORD_RE = new RegExp(`${B}lens${B}`, "iu");
 const HEX_RE =
   /(?<![0-9a-z\u0130\u0131])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}(?![0-9a-z\u0130\u0131])/iu;
 const TOP_LINES = 5;
@@ -66,14 +73,22 @@ export const HIDDEN = "hidden: post a new comment instead";
 const FLAGS_UNREAD =
   "a review whose edit and hidden flags were not read from GitHub: re-run, or post a new comment";
 export const EMBEDDED = "holds a lens header line";
+/** The one way out of a held comment (lens.HELD_WAY_OUT): delete it or opt it out. */
+const HELD_WAY_OUT = "delete the old one or edit it to start with `not a lens` and a colon";
+/**
+ * lens.LOOKALIKE: a report whose header or marker shows only once folded as GitHub renders it (lookalikeProblem): a
+ * broken report, never a read and never silent. Keyed by its comment, so a new comment alone does not clear it: its
+ * reason gives the held reasons' way out too.
+ */
+const LOOKALIKE =
+  "reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash " +
+  `escapes read as GitHub shows them (post a NEW comment in plain letters, and ${HELD_WAY_OUT})`;
 export const NO_MARKER =
   "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha)";
 /** How a lens fixes a report without the marker (lens.REPOST): every reason that names a look-alike says it. */
 export const REPOST =
   "post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the " +
   "marker into an old comment does not count)";
-/** The one way out of a held comment (lens.HELD_WAY_OUT): delete it or opt it out. */
-const HELD_WAY_OUT = "delete the old one or edit it to start with `not a lens` and a colon";
 /**
  * reportProblem's kinds (lens.BROKEN, HELD, NOT_LENS): a lens report (with the marker) that is not one valid read; a
  * comment without the marker that holds an open finding (both block); one without either (no report, never blocks).
@@ -126,16 +141,16 @@ function cleanInline(text: string, narrow = false): string {
   return t.replace(/[*`]/gu, "").replaceAll("|", " ").replace(EDGE_UNDERSCORES, "");
 }
 
-/**
- * lens.nfkc: a compatibility form reads as the plain one it renders like (`：` U+FF1A as `:`, `ｌｅｎｓ` as `lens`), as
- * the findings rules fold it. Without it such a header was no header, no marker and no look-alike: it silently
- * counted for nothing.
- */
-const nfkc = (text: string): string => text.normalize("NFKC");
-
 /** One line in NFKC, cleaned, its leading quote, list, heading and fence markers gone (lens.norm_line). */
-export const normLine = (line: string, narrow = false): string =>
-  strip(cleanInline(nfkc(line), narrow).replace(LEADING_MARKERS, ""));
+export const normLine: (line: string, narrow?: boolean) => string = memo((line, narrow) =>
+  strip(cleanInline(nfkc(line), narrow).replace(LEADING_MARKERS, "")),
+);
+
+/** lens.looks_heading: a Markdown heading as GitHub renders one whose text holds the word lens, read in NFKC. */
+function looksHeading(line: string): boolean {
+  const m = HEADING_START_RE.exec(line);
+  return m !== null && LENS_WORD_RE.test(nfkc(line.slice(m[0].length)));
+}
 
 const opensPlain = (line: string) => !/^(?: {4}|\t| {0,3}(?:>|`{3}|~{3}))/u.test(line);
 
@@ -235,6 +250,25 @@ const markerLine = (line: string) =>
  * Only such a comment is a lens report (COMMENTS.md, "The lens marker").
  */
 export function hasMarker(body: string): boolean {
+  pyUnicodeCheck(body);
+  if (marked(body)) return true;
+  const folded = foldText(body);
+  return folded !== body && marked(folded);
+}
+
+/**
+ * lens.fold_text: fold, line by line. A line end an HTML reference writes (`&#10;`, `&#13;`, `&#x2028;`) reads as a
+ * space, as GitHub shows it, never as a new line.
+ */
+function foldText(body: string): string {
+  return body
+    .split(LINE_END)
+    .map((part, i) => (i % 2 === 1 ? part : fold(part).replace(LINE_ENDS, " ")))
+    .join("");
+}
+
+/** hasMarker on the text as written (lens._marked). */
+function marked(body: string): boolean {
   const lines = splitlines(body);
   return [false, true].some((narrow) => lines.some((line) => markerLine(normLine(line, narrow))));
 }
@@ -275,7 +309,7 @@ function readProblem(body: string, narrow: boolean): string | null {
   if (
     normed.some((line) => READ_AT_RE.test(line)) ||
     plain.some((line) => LOOKS_RE.test(norm(line))) ||
-    plain.slice(0, TOP_LINES).some((line) => LOOKS_HEADING_RE.test(nfkc(line)))
+    plain.slice(0, TOP_LINES).some(looksHeading)
   )
     return start;
   return null;
@@ -291,7 +325,10 @@ export function reportProblem(
   overridePrefix?: string,
 ): [why: string, kind: ReportKind] | null {
   const problem = looksProblem(body, overridePrefix);
-  if (!problem) return null;
+  if (!problem) {
+    const lookalike = lookalikeProblem(body, overridePrefix);
+    return lookalike ? [lookalike, "broken"] : null;
+  }
   if (hasMarker(body)) return [problem, "broken"];
   const found = readFindings(body, true)[0]; // no header: the title line and NOT SAFE prose count
   if (found.length > 0) {
@@ -303,6 +340,29 @@ export function reportProblem(
   }
   return [`${NO_MARKER}; it looks like one: ${problem}`, "notLens"];
 }
+
+/**
+ * lens.Review.lookalike_problem: why a comment that, as written, is one valid read or no report at all, is a report
+ * only once folded as GitHub renders it (fold), or null: the folded text has a first-line header and the text as
+ * written none, or none of the same sha, or the folded text carries the marker and looksProblem flags it. The folded
+ * text is read for this only: never for a read or a round.
+ */
+function lookalikeProblem(body: string, overridePrefix?: string): string | null {
+  const folded = foldText(body);
+  if (folded === body || isOverride(body, overridePrefix)) return null;
+  const same = [false, true].every((narrow) => {
+    const raw = lensHeader(body, narrow);
+    const read = lensHeader(folded, narrow);
+    return (raw === null) === (read === null) && (raw === null || raw[1] === read![1]);
+  });
+  if (same && !(marked(folded) && looksProblem(folded, overridePrefix))) return null;
+  return `${LOOKALIKE}, ${starts(splitlines(body).find((line) => !isBlank(line)) ?? "")}`;
+}
+
+const isOverride = (body: string, overridePrefix?: string): boolean =>
+  overridePrefix !== undefined &&
+  body.startsWith(`${overridePrefix} `) &&
+  /^[0-9a-f]{40}:/u.test(body.slice(overridePrefix.length + 1));
 
 /**
  * lens.Review.lens_problem: why a comment that looks like a lens report blocks (reportProblem kind broken or held), or
@@ -329,12 +389,7 @@ export function notLensReport(body: string, overridePrefix?: string): string | n
  */
 export function looksProblem(body: string, overridePrefix?: string): string | null {
   pyUnicodeCheck(body);
-  if (
-    overridePrefix !== undefined &&
-    body.startsWith(`${overridePrefix} `) &&
-    /^[0-9a-f]{40}:/u.test(body.slice(overridePrefix.length + 1))
-  )
-    return null;
+  if (isOverride(body, overridePrefix)) return null;
   const problem = readProblem(body, false) ?? readProblem(body, true);
   if (
     problem === null &&

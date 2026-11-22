@@ -7,6 +7,57 @@ import * as Schema from "effect/Schema";
 
 import { PY_ASSIGNED, PY_UNICODE } from "./pyUnicode.ts";
 
+/**
+ * lens.memo: fn(text, flag) remembered by (text, flag), up to MEMO_CHARS characters of text in and out, then emptied.
+ * The reader reads one line of a comment many times (both ways, per rule; the findings rules again): a 64 KB line that
+ * NFKC writes 18 times as long was normalised dozens of times.
+ */
+const MEMO_CHARS = 1 << 22;
+export function memo(
+  fn: (text: string, flag: boolean) => string,
+): (text: string, flag?: boolean) => string {
+  const maps = [new Map<string, string>(), new Map<string, string>()] as const;
+  let size = 0;
+  return (text, flag = false) => {
+    const map = maps[flag ? 1 : 0];
+    let got = map.get(text);
+    if (got === undefined) {
+      got = fn(text, flag);
+      size += text.length + got.length;
+      if (size > MEMO_CHARS) {
+        maps[0].clear();
+        maps[1].clear();
+        size = text.length + got.length;
+      }
+      map.set(text, got);
+    }
+    return got;
+  };
+}
+
+/**
+ * lens.nfkc: the text in NFKC, up to NFKC_CAP code points of each line, the rest of a longer line as written. NFKC
+ * writes some characters 18 times as long (U+FDFA): a 64 KB line of them grew to 1.2 M characters that every rule read
+ * again (5.5 s for one line). Lines end where Python's str.splitlines ends them.
+ */
+const NFKC_CAP = 4096;
+/** str.splitlines' line ends: LINE_END splits keeping them, LINE_ENDS finds each. */
+export const LINE_END = /(\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029])/u;
+export const LINE_ENDS = /\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/gu;
+export function nfkc(text: string): string {
+  if (text.length <= NFKC_CAP) return text.normalize("NFKC"); // no more code points than UTF-16 units
+  return text
+    .split(LINE_END)
+    .map((part, i) => {
+      if (i % 2 === 1) return part;
+      let end = 0;
+      for (let n = 0; n < NFKC_CAP && end < part.length; n++)
+        end += part.codePointAt(end)! > 0xffff ? 2 : 1;
+      return part.slice(0, end).normalize("NFKC") + part.slice(end);
+    })
+    .join("");
+}
+
 /** Python's whitespace (str.isspace, re `\s`), as the body of a character class. */
 export const WS =
   "\\t-\\r\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";

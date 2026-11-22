@@ -11,6 +11,8 @@ import {
   cut,
   htmlUnescape,
   isBlank,
+  memo,
+  nfkc,
   pyI,
   pyUnicodeCheck,
   splitlines,
@@ -64,14 +66,19 @@ const blocking = (kind: Kind): kind is FindingKind => kind !== "minor";
 /** The text as the findings rules read it. */
 export function fold(text: string | null | undefined): string {
   pyUnicodeCheck(text ?? "");
-  const t = htmlUnescape((text ?? "").normalize("NFKC"))
+  return folded(text ?? "");
+}
+
+/** fold, remembered (pyText.memo). */
+const folded = memo((text) => {
+  const t = htmlUnescape(nfkc(text))
     .replace(/\\([!-/:-@[-`{-~])/gu, "$1")
     .replace(/\p{Cf}/gu, "");
   return Array.from(t, (ch) => {
     const k = CONFUSABLE_FROM.indexOf(ch);
     return k < 0 ? ch : CONFUSABLE_TO[k]!;
   }).join("");
-}
+});
 
 function kindOf(m: RegExpExecArray | RegExpMatchArray): Kind {
   const word = (m.groups!.kw ?? m.groups!.kw2 ?? m.groups!.kw3)!

@@ -17,6 +17,9 @@ run log names each such lens-looking comment). Among the rest, fail closed throu
 report but is not exactly one valid read, or a lens comment edited after posting or hidden (minimized), counts as a
 lens that read nothing, so the queue never takes a reviewed PR for an unreviewed one. A hidden override counts nothing. A read is a full 40-hex sha: a shorter one could be matched by a commit pushed later.
 """
+import bisect
+import json
+import os
 import re
 import unicodedata
 
@@ -64,7 +67,8 @@ EMBEDDED = 'holds a lens header line'   # lens_problem: `not a lens:` cannot cle
 OPT_OUT_READ = 'says on its first line that it is no lens report, but holds a hex read-at sha outside a `>` quote'
 # What a lens report looks like (ONE rule on normalised lines): on a plain line (outside code blocks and quotes) a
 # `lens:`, a `read at:` or `read at <hex>`, `safe to merge`, or in its first TOP_LINES plain lines a Markdown heading
-# naming a lens (LOOKS_HEADING_RE: the raw line, NFKC; normalising drops `#`), or two `covered:`/`checks:` field lines;
+# naming a lens (looks_heading: the heading marks as GitHub reads them, on the raw line, then the lens word in NFKC;
+# normalising drops `#`; a full-width `＃` is no heading, issue #1005), or two `covered:`/`checks:` field lines;
 # on ANY line, fenced, indented or quoted too, a `read at` with a hex sha, a header line or a `lens:` field with any hex
 # sha (loose_header). Such a comment without a valid first-line header is a lens that read nothing when it carries the
 # lens marker (has_marker) or, without it, holds an open finding (Review.report_problem); else it is no lens report at
@@ -74,7 +78,8 @@ OPT_OUT_READ = 'says on its first line that it is no lens report, but holds a he
 LOOKS_RE = re.compile(r'\blens\s*:|\bread[\s-]*at\b\s*(?::|[0-9a-f]{7})|\bsafe\s+to\s+merge\b', re.I)
 NOT_A_LENS_RE = re.compile(r'not\s+a\s+lens\s*:', re.I)
 FIELD_LINE_RE = re.compile(r'(?:covered|checks)\s*:', re.I)
-LOOKS_HEADING_RE = re.compile(r' {0,3}#{1,6}[ \t].*\blens\b', re.I)
+HEADING_START_RE = re.compile(r' {0,3}#{1,6}[ \t]')
+LENS_WORD_RE = re.compile(r'\blens\b', re.I)
 TOP_LINES = 5
 # Any hex sha with a digit (7-40 hex, not part of a longer word): `abc1234`, never `defaced` or `facade1x`.
 HEX_RE = re.compile(r'(?<![0-9a-z])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}(?![0-9a-z])', re.I)
@@ -100,6 +105,108 @@ REPOST_PLAIN = ('post a NEW comment whose first line is the lens header as the f
 HELD_WAY_OUT = 'delete the old one or edit it to start with `not a lens` and a colon'
 OK_CONCLUSIONS = ('SUCCESS', 'SKIPPED', 'NEUTRAL')
 STRANGER_SCAN = 4096   # characters of a post that does not count read to decide whether to log it
+# A report whose lens marker or header shows only once the text is folded as GitHub renders it (Review.lookalike_problem,
+# review_judge.fold: look-alike Cyrillic or Greek letters, zero-width and other format characters, HTML references,
+# backslash escapes): a broken report, never a read and never silent (issue #1005). Keyed by its comment, so a new
+# comment alone does not clear it: its reason gives the held reasons' way out too.
+LOOKALIKE = ('reads as a lens report only with its look-alike letters, invisible characters, HTML references or backslash '
+             f'escapes read as GitHub shows them (post a NEW comment in plain letters, and {HELD_WAY_OUT})')
+
+# The Unicode version every rule here, the shared vectors and T3's port (pyText.ts) were checked against: the vectors'
+# py_unicode table lists the code points it assigns. On a Python with another Unicode, text with a code point the two
+# assign otherwise, that a rule reads, is refused (unicode_check), as T3 refuses it (pyUnicodeCheck; issue #1005).
+PY_UNICODE = '15.0.0'
+UNIDATA = unicodedata.unidata_version
+_ASSIGNED = None   # (starts, ends) of the table, read once, and only on a Python whose Unicode is not PY_UNICODE
+_PAST_SAFE = re.compile('[\u0370-\U0010ffff]')
+
+
+class UnicodeDrift(Exception):
+    """Text with code points this Python's Unicode and PY_UNICODE assign otherwise: the rules may read it otherwise than
+    T3 and the vectors do. Not a ValueError, so no caller's except clause takes it for bad input: the gate refuses."""
+
+    def __init__(self, code_points):
+        self.code_points = code_points
+        super().__init__(f'Unicode {UNIDATA} is not the rules\' {PY_UNICODE} and they read these code points '
+                         f'otherwise: {", ".join(code_points)} (regenerate py_unicode and pyUnicode.ts together)')
+
+
+def py_assigned():
+    """(starts, ends) of the code points PY_UNICODE assigns, from the shared vectors (py_unicode)."""
+    global _ASSIGNED
+    if _ASSIGNED is None:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'review.vectors.json'),
+                  encoding='utf-8') as f:
+            table = json.load(f)['py_unicode']
+        if table['version'] != PY_UNICODE:
+            raise UnicodeDrift([f'the table holds Unicode {table["version"]}'])
+        starts, ends = [], []
+        for part in table['assigned'].split():
+            a, _, b = part.partition('-')
+            starts.append(int(a, 16))
+            ends.append(int(b or a, 16))
+        _ASSIGNED = (starts, ends)
+    return _ASSIGNED
+
+
+def _reads_otherwise(ch):
+    """A rule reads the code point: a letter, number, mark, format character or space, or NFKC or case changes it."""
+    cat = unicodedata.category(ch)
+    return cat[0] in 'LNMZ' or cat == 'Cf' or nfkc(ch) != ch or ch.lower() != ch or ch.upper() != ch
+
+
+def unicode_check(text):
+    """Raise UnicodeDrift when this Python's Unicode is not PY_UNICODE and the text holds a code point only one of the
+    two assigns that a rule reads (always when only PY_UNICODE assigns it), as pyText.pyUnicodeCheck does: none on the
+    gate's own Python."""
+    if UNIDATA == PY_UNICODE or not _PAST_SAFE.search(text or ''):
+        return
+    starts, ends = py_assigned()
+    drift = set()
+    for ch in set(text):
+        cp = ord(ch)
+        i = bisect.bisect_right(starts, cp) - 1
+        listed, here = i >= 0 and cp <= ends[i], unicodedata.category(ch) != 'Cn'
+        if listed != here and (listed or _reads_otherwise(ch)):
+            drift.add(cp)
+    if drift:
+        raise UnicodeDrift([f'U+{cp:04X}' for cp in sorted(drift)])
+
+
+def fold_text(text):
+    """review_judge.fold, line by line: the text as GitHub renders it, for the lens marker, the look-alike check and the
+    queue's own text (settled). A line end an HTML reference writes (`&#10;`, `&#13;`, `&#x2028;`) reads as a space,
+    as GitHub shows it (a space in prose; in inline code it is not decoded at all), never as a new line: a valid report
+    that quotes one before header-like text in inline code is no look-alike (T3: lensComment.foldText)."""
+    import review_judge   # noqa: PLC0415 - review_judge imports this module
+    parts = LINE_END_RE.split(text or '')
+    parts[::2] = [LINE_END_RE.sub(' ', review_judge.fold(part)) for part in parts[::2]]
+    return ''.join(parts)
+
+
+# The reader reads one line of a comment many times (both ways, per rule; the findings rules again): each pure step
+# remembers its answers, up to MEMO_CHARS characters of text in and out, so a 64 KB line that NFKC writes 18 times as
+# long is normalised once per way, not dozens of times (issue #1005: 5.5 s for one such line).
+MEMO_CHARS = 1 << 22
+
+
+def memo(fn):
+    """fn(text, flag) remembered by (text, flag); the memory is emptied when it passes MEMO_CHARS."""
+    cache, size = {}, [0]
+
+    def remembered(text, flag=False):
+        key = (text, flag)
+        got = cache.get(key)
+        if got is None:
+            got = fn(text, flag)
+            size[0] += len(text) + len(got)
+            if size[0] > MEMO_CHARS:
+                cache.clear()
+                size[0] = len(text) + len(got)
+            cache[key] = got
+        return got
+    remembered.__doc__ = fn.__doc__
+    return remembered
 
 
 _TAG_OPEN = re.compile(r'</?[A-Za-z]')
@@ -162,13 +269,24 @@ def clean_inline(text, narrow=False):
     return re.sub(r'(?<![^\W_])_+|_+(?![^\W_])', '', text)
 
 
+# NFKC reads the first NFKC_CAP characters of each line, and the rest of a longer line as written: far longer than any
+# header, label or field, and NFKC writes some characters 18 times as long (U+FDFA), so a 64 KB line of them grew to
+# 1.2 M characters that every rule read again (issue #1005: 5.5 s for one line). The same cap in T3 (pyText.nfkc).
+NFKC_CAP = 4096
+LINE_END_RE = re.compile('(\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029])')   # str.splitlines' line ends
+
+
 def nfkc(text):
-    """The text in NFKC: a compatibility form reads as the plain one it renders like (`：` U+FF1A and `﹕` U+FE55 as
-    `:`, full-width letters and digits as ASCII). Without it a header written with one was neither a header, nor the
-    marker, nor a look-alike, so the comment silently counted for nothing (issue #989)."""
-    return unicodedata.normalize('NFKC', text)
+    """The text in NFKC (up to NFKC_CAP characters of each line): a compatibility form reads as the plain one it renders
+    like (`：` U+FF1A and `﹕` U+FE55 as `:`, full-width letters and digits as ASCII). Without it a header written with
+    one was neither a header, nor the marker, nor a look-alike, so the comment silently counted for nothing (#989)."""
+    if len(text) <= NFKC_CAP:
+        return unicodedata.normalize('NFKC', text)
+    return ''.join(part if i % 2 else unicodedata.normalize('NFKC', part[:NFKC_CAP]) + part[NFKC_CAP:]
+                   for i, part in enumerate(LINE_END_RE.split(text)))
 
 
+@memo
 def norm_line(line, narrow=False):
     """One line as lens_problem and lens_header read it: nfkc, clean_inline, then any leading quote markers, list
     markers (`-` `+` `•` `1.` `1)`, a task box `[x]`; `*` is gone already), heading marks and `~~~` fences stripped.
@@ -180,6 +298,13 @@ def norm_line(line, narrow=False):
 # answer as stripping `^\s*<marker>\s*` until nothing changes: after one, the next starts at a non-blank.
 LEADING_MARKERS_RE = re.compile(
     r'^\s*(?:(?:>|[-+•](?=\s|$)|\d{1,9}[.)](?=\s|$)|#{1,6}(?=\s|$)|~{3,}|\[[ xX]\](?=\s|$))\s*)*')
+
+
+def looks_heading(line):
+    """A Markdown heading (as GitHub renders one: an ASCII `#` to `######` and a space or tab, after at most 3 spaces, on
+    the raw line) whose text holds the word lens, read in NFKC (`## Ｌｅｎｓ code`)."""
+    m = HEADING_START_RE.match(line)
+    return bool(m and LENS_WORD_RE.search(nfkc(line[m.end():])))
 
 
 def opens_plain(line):
@@ -195,6 +320,7 @@ def lens_key(name):
     # The old loop (join the words, strip `*_\`` from both ends, drop one trailing ` <marker>`, until nothing changes)
     # copied the whole name per pass: minutes for a 64 KB name of 13 K markers. The same steps on a word list, where a
     # word stripped empty at an end stays as the blank in front of a marker until the next pass, as in the text.
+    unicode_check(name)
     words = name.lower().split()
     lo, hi = 0, len(words)
     while True:
@@ -225,6 +351,7 @@ def names_a_lens(name):
 def lens_header(body, narrow=False):
     """(name, sha or None) of a comment's lens header, or None. The header is the first non-blank line, if it opens
     plain and its normalised form is a `lens: <name> ...` line whose name names a lens."""
+    unicode_check(body)
     first = next((line for line in (body or '').splitlines() if line.strip()), '')
     if not opens_plain(first):
         return None
@@ -308,8 +435,16 @@ def has_marker(body):
     too, read either way (clean_inline narrow or not), is a marker_line. Only such a comment is a lens report: one
     that is not exactly one valid read blocks (lens_problem); without the marker, a comment is no lens report however
     much it looks like one (not_lens_reports), unless it holds an open finding (Review.report_problem). Every line lens_problem flags as a header line, a lens field with a
-    sha or a first-line `lens:` is a marker line, so every comment with such a problem carries the marker."""
-    lines = (body or '').splitlines()
+    sha or a first-line `lens:` is a marker line, so every comment with such a problem carries the marker. The text is
+    read as written and folded as GitHub renders it (fold_text): `lеns:` with a Cyrillic `е` carries it too (#1005)."""
+    body = body or ''
+    unicode_check(body)
+    return _marked(body) or ((folded := fold_text(body)) != body and _marked(folded))
+
+
+def _marked(body):
+    """has_marker on the text as written."""
+    lines = body.splitlines()
     return any(marker_line(norm_line(line, narrow)) for narrow in (False, True) for line in lines)
 
 
@@ -320,8 +455,9 @@ def no_lens_text(text, keep_markdown=False):
     queue's own advice (a command in backticks, a `<sha>` placeholder) stays as written when, read without its markdown
     either way (clean_inline narrow or not), it holds none of these; otherwise it is cleaned like any other text. A
     REPOST in the text (a held reason) is posted as REPOST_PLAIN, as written, when the whole stays free of them. The
-    text is NFKC first, as the reader folds it (norm_line): `lens：` is a lens field there too (issue #989)."""
-    text = nfkc(text)
+    text is folded first, as the reader folds it (settled): `lens：` and `lеns:` are lens fields there too (issues #989,
+    #1005)."""
+    text = settled(text)
     if REPOST in text:
         out = REPOST_PLAIN.join(no_lens_text(part, keep_markdown) for part in text.split(REPOST))
         if _lens_free(out):
@@ -333,6 +469,18 @@ def no_lens_text(text, keep_markdown=False):
     # pass would turn into a field on the second (issue #303). So the `<` `>` `[` `]` one pass left become blanks: with
     # none of them, another pass (either way) changes nothing.
     return _no_lens_forms(re.sub(r'[<>\[\]]', ' ', plain))
+
+
+def settled(text):
+    """The text folded (fold_text) until folding changes it no more, so the reader, folding it again, reads it as
+    written. Folding once can leave work for a second pass (`&amp;#108;` is `&#108;`, then `l`): after 4 passes, `&`
+    and `\\` become blanks, so nothing is decoded again, and the rest settles in at most 3 more."""
+    for i in range(8):
+        folded = fold_text(text)
+        if folded == text:
+            break
+        text = folded if i < 3 else re.sub(r'[&\\]', ' ', folded)
+    return text
 
 
 def _lens_free(text):
@@ -420,11 +568,13 @@ class Review:
         it does not but holds an open finding, a blocker or major line that is not none or a NOT SAFE verdict as
         review_judge.read_findings reads them (kind HELD: a real report with a broken header must not pass because an
         older read of that lens is clean). Without the marker and with no open finding it is no lens report (kind
-        NOT_LENS): named, never blocking."""
+        NOT_LENS): named, never blocking. A comment that is a report only once folded as GitHub renders it
+        (lookalike_problem) blocks as BROKEN: never a read, never silent (issue #1005)."""
         problem = self.looks_problem(post)
-        if not problem:
-            return None, None
         body = post.get('body') or ''
+        if not problem:
+            lookalike = self.lookalike_problem(body)
+            return (lookalike, BROKEN) if lookalike else (None, None)
         if has_marker(body):
             return problem, BROKEN
         import review_judge   # noqa: PLC0415 - review_judge imports this module
@@ -455,6 +605,7 @@ class Review:
         EMBEDDED). Read both ways (clean_inline narrow or not): flagged when either way flags it, or when the two read
         different headers."""
         body = post.get('body') or ''
+        unicode_check(body)
         if self.override_re.match(body):
             return None
         problem = self.read_problem(body) or self.read_problem(body, narrow=True)
@@ -463,6 +614,22 @@ class Review:
             return (f'its first line reads as a different lens header, or as one and as none, depending on how its HTML '
                     f'tags and links are read; starts with {first.strip()[:60]!r}')
         return problem
+
+    def lookalike_problem(self, body):
+        """Why a comment that, as written, is one valid read or no report at all, is a report only once folded as
+        GitHub renders it (fold_text), or None (issue #1005). It is one when the folded text has a first-line header
+        and the text as written has none, or none of the same sha (a zero-width space in `lens`, `lеns:` with a
+        Cyrillic `е`, `&#108;ens:`), or when the folded text carries the lens marker and looks_problem flags it (a hidden second
+        header). The folded text is read for this only: never for a read or a round."""
+        folded = fold_text(body)
+        if folded == body or self.override_re.match(body):
+            return None
+        heads = [(lens_header(body, narrow), lens_header(folded, narrow)) for narrow in (False, True)]
+        if all((raw is None) == (read is None) and (raw is None or raw[1] == read[1]) for raw, read in heads) \
+                and not (_marked(folded) and self.looks_problem({'body': folded})):
+            return None
+        first = next((line for line in body.splitlines() if line.strip()), '')
+        return f'{LOOKALIKE}, starts with {first.strip()[:60]!r}'
 
     def read_problem(self, body, narrow=False):
         """lens_problem's rules with one way of reading tags and links (clean_inline)."""
@@ -496,7 +663,7 @@ class Review:
         if sum(bool(FIELD_LINE_RE.match(norm(line))) for line in plain) >= 2:   # fields of a headerless report
             return start
         if any(READ_AT_RE.search(line) for line in normed) or any(LOOKS_RE.search(norm(line)) for line in plain) \
-                or any(LOOKS_HEADING_RE.match(nfkc(line)) for line in plain[:TOP_LINES]):
+                or any(looks_heading(line) for line in plain[:TOP_LINES]):
             return start
         return None
 
@@ -570,10 +737,16 @@ class Review:
             where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
             if not self.counts(post):   # the author first: a stranger's text is only ever read in part, for the log
                 head = {**post, 'body': (post.get('body') or '')[:STRANGER_SCAN]}
-                if where not in self.logged and (self.looks_problem(head) or lens_header(head['body'])):
+                if where in self.logged:
+                    continue
+                try:
+                    what = 'a lens-looking post' if self.looks_problem(head) or lens_header(head['body']) else None
+                except UnicodeDrift as e:   # only logged: a post that does not count never reads or blocks
+                    what = f'a post this Python reads otherwise ({", ".join(e.code_points)})'
+                if what:
                     self.logged.add(where)
                     association = post.get('authorAssociation')
-                    self.log(f'ignored a lens-looking post {where}: '
+                    self.log(f'ignored {what} {where}: '
                              f'{"author association " + association if association else "no author association"} '
                              f'is not one of lens_author_associations ({", ".join(self.lens_associations)})')
                 continue
