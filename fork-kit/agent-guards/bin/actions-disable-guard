@@ -125,18 +125,25 @@ every nested `claude -p` or `codex exec` of the session.) Fails closed: an inter
 look dangerous.
 
 Nested agents: a command that starts an agent session this machine's hooks do not reach is refused, since that
-session could do what this guard refuses: `claude --bare` / `--safe-mode`, `claude` with CLAUDE_CODE_SIMPLE set in
-the same command, and `codex` with anything but login/logout/help/completion/--version (codex runs no Claude Code
-hooks). A nested `claude -p` passes: managed hooks run there too, also with `--settings '{"disableAllHooks":
-true}'` (settings outside managed settings cannot turn managed hooks off). Not covered: other agent programs, and
-an agent started by a program the guard does not read (a Python script, a container).
+session could do what this guard refuses: `claude --bare` / `--safe-mode` (safe mode runs managed hooks, but not
+hooks a user wired by hand in user settings), `claude` with CLAUDE_CODE_SIMPLE set, and `codex` with anything but
+login/logout/help/completion/--version (codex runs no Claude Code hooks). claude and codex count by name, by
+their program path (.../claude/versions/<v>, @anthropic-ai/claude-code, @openai/codex), as a link to or a copy of
+the installed program, as a name the same command gives one (ln -s), through npx/bunx/pnpm dlx/npm exec/bun x and
+`node <their cli>`, behind `$(which claude)`, and as text in python -c, node -e, at, systemd-run .. (the same token
+reading as for gh). CLAUDE_CODE_SIMPLE counts in the command, through env -S, from a file the command sources, from
+BASH_ENV/--rcfile, and from the agents' user's shell start files (~/.bashrc ..; files those read are not followed).
+A nested `claude -p` passes: managed hooks run there too, also with `--settings '{"disableAllHooks": true}'`.
+This is a list, and a list of strings cannot be complete: it stops mistakes and casual misuse, not an agent set on
+getting round it (other agent programs, an MCP tool that starts one, words built at run time). The wall against
+that is the GitHub permissions of the token the agent holds (README, "What the guards are and are not").
 
 Facts from the machine file (fork-kit/agent-guards/README.md): actionsDisable.stateDir (cache and log of
 refusals, default ~/.local/state/actions-disable-guard) and actionsDisable.refuseScripts (default none). A missing
 machine file or section gives those defaults; a broken one too, with one line on stderr: the guard never weakens.
 Tests: fork-kit/agent-guards/tests/actions-disable.test.py
 """
-import fnmatch, itertools, json, os, re, signal, sys, time
+import fnmatch, itertools, json, os, re, shlex, signal, sys, time
 from stat import S_ISDIR, S_ISREG
 from urllib.parse import unquote
 
@@ -185,7 +192,7 @@ WRAPPERS = {'sudo', 'doas', 'env', 'command', 'exec', 'builtin', 'nohup', 'time'
             'stdbuf', 'xargs', 'setsid', 'unbuffer', 'chronic', 'flock', 'eval', 'source', '.', 'do', 'then',
             'else', 'elif', 'if', 'while', 'until', '{', '}', '!', 'watch', 'script', 'runuser', 'systemd-run',
             'coproc'} | SHELLS
-ARG_FLAGS = {'-u', '-g', '-n', '-k', '-s', '-I', '-P', '-L', '-d', '-E', '-C', '-p', '-o', '-e', '-i', '-l',
+ARG_FLAGS = {'-u', '-g', '-n', '-k', '-s', '-I', '-P', '-L', '-d', '-E', '-C', '-p', '-o', '-e', '-i', '-l', '-a',
              '--user', '--group', '--signal', '--kill-after', '--unit'}
 TEXT_ARGS = {'trap', 'ssh', 'su', 'parallel'}            # commands whose quoted arguments are shell text
 SETTERS = {'export', 'local', 'declare', 'typeset', 'readonly'}
@@ -2012,7 +2019,8 @@ def cache_save(ctx):
 # \uXXXX is four digits and no more (JSON, JS, Python, Go): in \u0070ermissions the `e` is the next letter
 ESCAPES = re.compile(r'\\+(?:u([0-9a-fA-F]{4})|u\{([0-9a-fA-F]{1,6})\}|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2}))'
                      r'|\\+([0-3][0-7]{2})|%([0-9a-fA-F]{2})')
-CUES = ('disable', 'permissions', 'protection', 'ruleset')
+AGENT_LABEL = 'an agent session without this machine\'s hooks (`claude --bare`, CLAUDE_CODE_SIMPLE, `codex exec`)'
+CUES = ('disable', 'permissions', 'protection', 'ruleset', 'bare', 'safe-mode', 'claude_code_simple', 'codex')
 # What may not be changed, as it looks after canon(): wherever one of these shows up, the command passes only when
 # the guard can prove it is harmless (a plain read, a known allowed form, or text that goes nowhere unread).
 TOKENS = [
@@ -2023,6 +2031,15 @@ TOKENS = [
     ('a ruleset', re.compile(r'(?<![\w-])rulesets/[^/\s?#]')),
     ('a GraphQL mutation on branch protection or a ruleset',
      re.compile(r'deletebranchprotectionrule|deleterepositoryruleset|updaterepositoryruleset')),
+    # an agent session this machine's hooks do not reach (lens B r2 major 1): the same text inside python -c,
+    # node -e, at, a script .. is refused as for gh. The program path counts too (.../claude/versions/2.1.3 --bare,
+    # @anthropic-ai/claude-code, @openai/codex); `codex app-server` and `codex mcp ...` are no session of their own.
+    (AGENT_LABEL,
+     re.compile(r'(?<![\w-])claude[^\s;|&]*(?:\s+[^\s;|&]+){0,8}?\s+--(?:bare|safe-mode)(?![\w-])'
+                r'|claude_code_simple'
+                r'|(?<![\w-])codex[^\s;|&,]*(?:\s+-[^\s;|&]*(?:\s+[^\s;|&-][^\s;|&]*)?){0,6}?\s+'
+                r'(?:exec|e|review|resume|fork|mcp-server)'
+                r'(?![\w-])')),
 ]
 # Command words that never run their arguments or their input as a command: shell keywords and builtins, and tools
 # that only read, print, compare or move text and files. Text that names a guarded token may go to these. (Not
@@ -2647,25 +2664,235 @@ def flag_values(toks, h):
 
 
 CODEX_SAFE = {'login', 'logout', 'help', 'completion', '--version', '-V', '--help', '-h'}
+# codex's options that take a value (codex --help): `codex -m o3 exec x` runs `exec`, not `o3`
+CODEX_VALUE = {'-c', '--config', '--enable', '--disable', '--remote', '--remote-auth-token-env', '-i', '--image',
+               '-m', '--model', '--local-provider', '-p', '--profile', '-s', '--sandbox', '-C', '--cd', '--add-dir',
+               '-a', '--ask-for-approval'}
+# claude words that start no session (a session started with CLAUDE_CODE_SIMPLE from a file is what matters)
+CLAUDE_TOOLS = {'mcp', 'config', 'update', 'doctor', 'install', 'auth', 'plugin', 'plugins', 'setup-token',
+                'migrate-installer', 'logs', 'purge', 'import', 'auto-mode', '--version', '-v', '--help', '-h'}
 NO_HOOKS_ENV = 'CLAUDE_CODE_SIMPLE'   # bare mode: Claude Code runs no hooks, managed ones neither
+# where the programs are installed: the native build's version folder, the npm packages
+AGENT_PATH = re.compile(r'/claude/versions/|@anthropic-ai/claude-code(?:/|$)|@openai/codex(?:-[\w-]+)?(?:/|$)', re.I)
+AGENT_PKGS = {'@anthropic-ai/claude-code': 'claude', '@openai/codex': 'codex', 'claude': 'claude', 'codex': 'codex'}
+PKG_RUNNERS = {'npx': (), 'bunx': (), 'pnpx': (), 'pnpm': ('dlx',), 'yarn': ('dlx',), 'npm': ('exec', 'x'),
+               'bun': ('x',)}
+# the shell start files of the agents' user: a `claude` session the Bash tool starts may get its variables from them
+START_FILES = ('.bashrc', '.bash_profile', '.bash_login', '.profile', '.zshrc', '.zshenv', '.zprofile', '.zlogin')
+KNOWN_WORDS = DATA | QUICK_WORDS | WRAPPERS | NET_CLIENTS | {'git', 'gh', 'ssh', 'make', 'npm', 'pnpm', 'yarn'}
+_AGENT_BINS = {}
+
+
+def agent_path_kind(path):
+    m = AGENT_PATH.search(path or '')
+    return None if not m else ('codex' if 'codex' in m.group(0).lower() else 'claude')
+
+
+def agent_copy(path, ctx):
+    """'claude'/'codex' when a file is a copy of the installed program (same size, same first 64 KB)."""
+    try:
+        size = os.path.getsize(path)
+        for kind in ('claude', 'codex'):
+            key = (kind, ctx['env'].get('PATH') or '')
+            if key not in _AGENT_BINS:
+                p = which(kind, ctx)
+                _AGENT_BINS[key] = os.path.realpath(p) if p else None
+            real = _AGENT_BINS[key]
+            if real and real != path and os.path.isfile(real) and os.path.getsize(real) == size:
+                with open(real, 'rb') as a, open(path, 'rb') as b:
+                    if a.read(65536) == b.read(65536):
+                        return kind
+    except OSError:
+        pass
+    return None
+
+
+def agent_kind(tok, ctx, script=False):
+    """'claude' or 'codex' when a word runs one of them: by name, by a name the same command gave it (ln -s ..),
+    by the path of its program (.../claude/versions/2.1.3, @openai/codex), by a link to it or by a copy of the
+    installed one; 'maybe' for a name the same command gave a program it cannot read; else None. script: the
+    word is a script an interpreter runs (`node cli.js`)."""
+    if not tok or hidden(tok):
+        return None
+    base = os.path.basename(tok).lower()
+    if base in ('claude', 'codex'):
+        return base
+    given = ctx.get('agents', {}).get(base)
+    if given:
+        return given
+    kind = agent_path_kind(tok)
+    if kind or (not script and '/' not in tok and (base in KNOWN_WORDS or INTERPRETERS.match(base))):
+        return kind
+    p = resolve_path(tok, ctx['cwd']) if script or '/' in tok else which(tok, ctx)
+    if not p or not os.path.isfile(p):
+        return None
+    real = os.path.realpath(p)
+    return agent_path_kind(real) or {'claude': 'claude', 'codex': 'codex'}.get(os.path.basename(real).lower()) \
+        or agent_copy(real, ctx)
+
+
+def agent_names(toks, ctx):
+    """The names a command gives a link to or a copy of claude or codex (`ln -s ~/.local/share/claude/versions/2.1.3
+    cc`: cc), as gh_names() does for gh. A source the guard cannot read gives 'maybe'."""
+    h, _ = head(toks)
+    if h is None or os.path.basename(toks[h]) not in ('ln', 'cp', 'mv', 'install', 'link', 'rsync'):
+        return {}
+    rest = [a for a in toks[h + 1:] if not a.startswith('-') or hidden(a)]
+    if len(rest) < 2 or hidden(rest[-1]):
+        return {}
+    kinds = [agent_kind(a, ctx) or ('maybe' if hidden(a) else None) for a in rest[:-1]]
+    kind = next((k for k in kinds if k and k != 'maybe'), None) or next((k for k in kinds if k), None)
+    name = os.path.basename(rest[-1].rstrip('/')).lower()
+    return {name: kind} if kind and name not in ('', '.', '..') else {}
+
+
+def package_agent(toks, h, ctx):
+    """(kind, the agent's own words) when the command word runs claude or codex through a package runner (npx,
+    bunx, pnpm dlx, npm exec ..) or an interpreter (`node .../@anthropic-ai/claude-code/cli.js`); else (None, [])."""
+    base, rest = os.path.basename(toks[h]).lower(), toks[h + 1:]
+    if INTERPRETERS.match(base):
+        i = next((i for i, a in enumerate(rest) if not a.startswith('-')), None)
+        kind = i is not None and agent_kind(rest[i], ctx, script=True)
+        return (kind, rest[i + 1:]) if kind else (None, [])
+    if base not in PKG_RUNNERS or (PKG_RUNNERS[base] and rest[:1] and rest[0] not in PKG_RUNNERS[base]) \
+            or (PKG_RUNNERS[base] and not rest):
+        return None, []
+    rest = rest[1:] if PKG_RUNNERS[base] else rest
+    pkgs, i = [], 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ('-p', '--package'):
+            pkgs.append(rest[i + 1] if i + 1 < len(rest) else '')
+            i += 2
+            continue
+        if a.startswith('--package='):
+            pkgs.append(a.partition('=')[2])
+        elif a in ('-c', '--call'):   # npm exec -c 'text': shell text, read by the shell reading
+            return None, []
+        elif a != '--' and not a.startswith('-'):
+            break
+        i += 1
+    word = rest[i] if i < len(rest) else ''
+    names = [re.sub(r'(?<=.)@[^/]*$', '', p.lower()) for p in pkgs + [word] if p]
+    kind = next((AGENT_PKGS[n] for n in names if n in AGENT_PKGS), None)
+    return (kind, rest[i + 1:]) if kind else (None, [])
+
+
+def start_files(ctx):
+    """Why a `claude` session may get CLAUDE_CODE_SIMPLE from a file the command or its shell reads (a sourced
+    file, BASH_ENV/ENV, --rcfile, the user's shell start files), as far as the guard can see; else None. Not
+    followed: files those files read in turn."""
+    for f in ctx.get('sourced', ()):
+        if hidden(f):
+            return 'the command reads a file the guard cannot name (`. "$F"`) that may set ' + NO_HOOKS_ENV
+        text = read_named(f, ctx)
+        if text is None:
+            return f'the command reads {f}, which the guard cannot read, and it may set {NO_HOOKS_ENV}'
+        if NO_HOOKS_ENV.lower() in text.lower():
+            return f'the command reads {f}, which names {NO_HOOKS_ENV}'
+    if re.search(r'(?<![\w$])(?:BASH_ENV|ENV)=', ctx.get('all') or ''):
+        return f'the command sets BASH_ENV or ENV: a file the shell reads first may set {NO_HOOKS_ENV}'
+    home = ctx['env'].get('HOME') or ''
+    for name in START_FILES if os.path.isabs(home) else ():
+        text = read_text(os.path.join(home, name))
+        if text and NO_HOOKS_ENV.lower() in text.lower():
+            return f'~/{name} names {NO_HOOKS_ENV}'
+    return None
 
 
 def nested_agent(toks, h, ctx):
     """Why this command word starts an agent session without this machine's hooks, or None."""
     if h is None:
         return None
-    word = os.path.basename(toks[h]).lower()
-    args = toks[h + 1:]
-    if word == 'claude':
+    tok, args = toks[h], toks[h + 1:]
+    kind = agent_kind(tok, ctx)
+    shown = os.path.basename(tok) if kind and kind != 'maybe' else kind or ''
+    if not kind:
+        kind, pargs = package_agent(toks, h, ctx)
+        if kind:
+            args, shown = pargs, f'{os.path.basename(tok)} ... {kind}'
+    if not kind and hidden(tok):
+        # `$(which claude) --bare`, `env $(cat vars) claude -p x`: the word is unknown, what follows may say more
+        j = next((j for j in range(h + 1, len(toks)) if agent_kind(toks[j], ctx) in ('claude', 'codex')), None)
+        if j is not None:
+            if agent_kind(toks[j], ctx) == 'claude' and claude_starts(toks[j + 1:]):
+                return (f'`{os.path.basename(toks[j])}` behind a word the guard cannot read (`env $(..)`, `$X`), '
+                        f'which may set {NO_HOOKS_ENV}, starts a session that may run without this machine\'s hooks')
+            return nested_agent(toks, j, ctx)
+        if re.search(r'(?<![\w-])codex(?![\w-])', ctx.get('raw') or '', re.I) and codex_sub(args) not in CODEX_SAFE:
+            return ('a program the guard cannot name, in a command that names codex (`$(which codex) exec`), may start '
+                    'an agent session that runs no Claude Code hooks')
+        kind, shown = 'maybe', 'a program the guard cannot name'
+    if kind in ('claude', 'maybe'):
         flags = [a for a in args if a in ('--bare', '--safe-mode') or a.startswith(('--bare=', '--safe-mode='))]
         if flags:
-            return f'`claude {flags[0]}` starts a session that runs without this machine\'s hooks'
+            return f'`{shown} {flags[0]}` starts a session that runs without this machine\'s hooks'
+    if kind == 'claude':
         if any(NO_HOOKS_ENV in t for t in toks[:h]) or NO_HOOKS_ENV in (ctx.get('all') or ''):
-            return f'`claude` with {NO_HOOKS_ENV} set starts a session that runs without this machine\'s hooks'
-    if word == 'codex':
-        sub = next((a for a in args if not a.startswith('-') or a in CODEX_SAFE), None)
+            return f'`{shown}` with {NO_HOOKS_ENV} set starts a session that runs without this machine\'s hooks'
+        why = claude_starts(args) and start_files(ctx)
+        if why:
+            return f'`{shown}` starts a session, and {why} (a session that runs without this machine\'s hooks)'
+    if kind == 'codex':
+        sub = codex_sub(args)
         if sub not in CODEX_SAFE:
-            return (f'`codex {sub}`' if sub else '`codex`') + ' starts an agent session that runs no Claude Code hooks'
+            return (f'`{shown} {sub}`' if sub else f'`{shown}`') + \
+                ' starts an agent session that runs no Claude Code hooks'
+    return None
+
+
+def sourced_files(toks):
+    """The files a command reads as shell text into the shell that runs what follows: `. f`, `source f`, and a
+    shell's --rcfile/--init-file."""
+    out = []
+    for i, t in enumerate(toks):
+        if t in ('.', 'source') and i + 1 < len(toks):
+            out.append(toks[i + 1])
+        elif t in ('--rcfile', '--init-file') and i + 1 < len(toks) and i and os.path.basename(toks[0]) in SHELLS:
+            out.append(toks[i + 1])
+    return out
+
+
+def env_split(toks):
+    """`env -S 'A=1 cmd x' y` / --split-string: the shell-like text env splits and runs, or None."""
+    h, _ = head(toks)
+    for i, t in enumerate(toks[:h if h is not None else len(toks)]):
+        if os.path.basename(t) != 'env':
+            continue
+        for j in range(i + 1, len(toks)):
+            a = toks[j]
+            if a in ('-S', '--split-string') and j + 1 < len(toks):
+                return ' '.join([toks[j + 1]] + [shlex.quote(x) for x in toks[j + 2:]])
+            if a.startswith('--split-string=') or (a.startswith('-S') and len(a) > 2):
+                v = a.partition('=')[2] if a.startswith('--') else a[2:]
+                return ' '.join([v] + [shlex.quote(x) for x in toks[j + 1:]])
+            if not a.startswith('-') and not is_assign(a):
+                break
+    return None
+
+
+def claude_starts(args):
+    """Whether claude with these words starts a session (not `claude --version`, `claude mcp list` ..)."""
+    return not any(a in CLAUDE_TOOLS for a in args[:1]) and not any(a in ('--version', '-v', '--help', '-h')
+                                                                    for a in args)
+
+
+def codex_sub(args):
+    """codex's subcommand: the first word that is no option and no option's value (`codex -m o3 exec x`: exec),
+    or a safe option (--version); None for the interactive session."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in CODEX_SAFE and a.startswith('-'):
+            return a
+        if a == '--':
+            return args[i + 1] if i + 1 < len(args) else None
+        if a in CODEX_VALUE:
+            i += 2
+            continue
+        if not a.startswith('-'):
+            return a
+        i += 1
     return None
 
 
@@ -2675,11 +2902,17 @@ def segment_reason(toks, ctx, loose):
     if why:
         return reason(why, 'Run the work in this session (or a nested `claude -p` without --bare), or ask the '
                            'owner.')
+    split = env_split(toks)
+    if split:   # env -S 'A=1 cmd x': read the text env runs as a command
+        r = decide_text(split, ctx)
+        if r:
+            return r
     flow = ctx['flow']
     for j in flag_values(toks, h):   # the other reading: the flag takes no value and the word starts the command
         base = os.path.basename(toks[j])
         if base in SHELLS or base in NET_CLIENTS or base in TEXT_ARGS or base in AWKS or INTERPRETERS.match(base) \
-                or is_gh(toks[j], ctx) or (not hidden(toks[j]) and cmd_files(toks[j], ctx, True)):
+                or is_gh(toks[j], ctx) or (not hidden(toks[j]) and cmd_files(toks[j], ctx, True)) \
+                or base in PKG_RUNNERS or agent_kind(toks[j], ctx):
             r = segment_reason(toks[:j - 1] + toks[j:], ctx, loose)
             if r:
                 return r
@@ -3043,6 +3276,12 @@ def decide_text(text, ctx, scan_raw=True):
             gh_set += [a for a in text_aliases(toks, stdin_of(cmd, env, c), c) if a not in gh_set]
     c['gh_set'] = gh_set
     c['ghs'] = set(ctx.get('ghs', ())).union(*(gh_names(toks) for _, variants in runs for toks in variants if toks))
+    c['agents'] = dict(ctx.get('agents', {}))
+    for _, variants in runs:
+        for toks in (t for t in variants if t):
+            c['agents'].update(agent_names(toks, c))
+    c['sourced'] = list(ctx.get('sourced', ())) + [f for _, variants in runs for toks in variants[:1] if toks
+                                                    for f in sourced_files(toks)]
     # Where each command's text goes on: into a file, into another command's words ($(..)), or down a pipe that
     # does not end in a word that only handles text.
     tgts = [[t for op, w in cmd['redirs'] if op.startswith('>') for t in redir_texts(op, w, env)

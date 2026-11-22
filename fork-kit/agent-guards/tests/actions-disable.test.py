@@ -2036,6 +2036,93 @@ class LensSecurityR2Test(Case):
         # the same call that keeps the ruleset on passes
         self.assertIsNone(self.decide(f"gh api graphql -f query='{mut}' -F e=ACTIVE"))
 
+    # lens B r2 major 1: a nested session without this machine's hooks, started in a form the first list missed
+    def agents(self):
+        """A stand-in install in the test folder: bin/claude, bin/codex on PATH, a native version folder."""
+        for rel, text in (('bin/claude', '#!/bin/sh\n# stand-in claude ' + 'c' * 200 + '\n'),
+                          ('bin/codex', '#!/bin/sh\n# stand-in codex ' + 'x' * 300 + '\n'),
+                          ('share/claude/versions/2.1.9', '#!/bin/sh\n# stand-in native build\n')):
+            self.write(rel, text, 0o755)
+        self.env = dict(self.env, PATH=os.path.join(self.dir, 'bin'))
+        return os.path.join(self.dir, 'share/claude/versions/2.1.9')
+
+    def assert_refused(self, cmds, part=None):
+        for cmd in cmds:
+            with self.subTest(cmd):
+                why = self.decide(cmd)
+                self.assertIsNotNone(why, cmd)
+                if part:
+                    self.assertIn(part, why)
+
+    def assert_passed(self, cmds):
+        for cmd in cmds:
+            with self.subTest(cmd):
+                self.assertIsNone(self.decide(cmd), cmd)
+
+    def test_r2_major1_the_real_program_path_a_link_or_a_copy_of_claude_or_codex_is_refused(self):
+        ver = self.agents()
+        os.symlink(ver, os.path.join(self.dir, 'cc'))
+        os.symlink(os.path.join(self.dir, 'bin/claude'), os.path.join(self.dir, 'c2'))
+        import shutil
+        shutil.copy(os.path.join(self.dir, 'bin/claude'), os.path.join(self.dir, 'mine'))
+        shutil.copy(os.path.join(self.dir, 'bin/codex'), os.path.join(self.dir, 'cx'))
+        self.assert_refused([f'{ver} --bare -p x', '~/share/claude/versions/2.1.9 --bare -p x',
+                             './cc --bare -p x', './c2 --safe-mode -p x', './mine --bare -p x',
+                             f'ln -s {ver} ./new && ./new --bare -p x', 'ln -s "$(which claude)" n2 && ./n2 --bare',
+                             '$(which claude) --bare -p x', '"$(command -v claude)" --bare -p x',
+                             '`which claude` --bare -p x', './cx exec x', './cx', '"$(which codex)" exec x'])
+        self.assert_passed(['./cc -p x', './mine --version', './cx login', 'git clone --bare https://example.com/x',
+                            'git init --bare x.git', f'ls -la {ver}'])
+
+    def test_r2_major1_npx_bunx_pnpm_dlx_and_node_of_the_packages_are_refused(self):
+        self.write('node_modules/@anthropic-ai/claude-code/cli.js', '// stand-in\n', 0o644)
+        self.assert_refused([
+            'npx @anthropic-ai/claude-code --bare -p x', 'npx -y @anthropic-ai/claude-code@latest --bare -p x',
+            'bunx @anthropic-ai/claude-code --bare -p x', 'pnpm dlx @anthropic-ai/claude-code --safe-mode -p x',
+            'pnpx @anthropic-ai/claude-code --bare', 'yarn dlx @anthropic-ai/claude-code --bare',
+            'npm exec -- @anthropic-ai/claude-code --bare -p x', 'npm x @anthropic-ai/claude-code --bare',
+            'bun x @anthropic-ai/claude-code --bare', 'node node_modules/@anthropic-ai/claude-code/cli.js --bare -p x',
+            'node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --bare -p x',
+            'npx @openai/codex exec x', 'npx -y @openai/codex exec x', 'npx -y @openai/codex', 'npx @openai/codex@0.9',
+            'pnpm dlx @openai/codex e x', 'npm exec --package=@openai/codex -- codex exec x',
+            'npm exec -p @openai/codex codex', 'bunx @openai/codex review'])
+        self.assert_passed(['npx @anthropic-ai/claude-code -p x', 'npx prettier --check .',
+                            'npm install -g @openai/codex', 'npm install -g @anthropic-ai/claude-code',
+                            'npx -y @openai/codex login', 'npm exec -- eslint .', 'pnpm dlx create-vite x'])
+
+    def test_r2_major1_the_wrappers_refused_for_gh_are_refused_for_a_hookless_session(self):
+        self.assert_refused([
+            'python3 -c \'import os; os.system("claude --bare -p x")\'',
+            'node -e \'require("child_process").execSync("claude --bare -p x")\'',
+            'perl -e \'system("claude --bare -p x")\'', 'python3 -c \'import os; os.system("codex exec x")\'',
+            'ruby -e \'system("codex -m o3 exec x")\'', 'at now <<< \'claude --bare -p x\'',
+            'echo "claude --bare -p x" | at now', 'systemd-run --user claude --bare -p x',
+            'systemd-run --user codex exec x', 'exec -a foo claude --bare -p x', 'exec -a foo codex exec x',
+            'CLAUDE_CODE_SIMPLE=1 python3 -c \'import os; os.system("claude -p x")\'',
+            'python3 -c \'import os; os.environ["CLAUDE_CODE_SIMPLE"] = "1"; os.system("claude -p x")\''])
+        self.assert_passed(['python3 -c \'print("claude")\'', 'echo "codex exec x"',
+                            'git commit -m "no claude --bare here"', 'grep -rn CLAUDE_CODE_SIMPLE .',
+                            'gh pr comment 1 --body "claude --bare is refused"', 'codex help exec'])
+
+    def test_r2_major1_claude_code_simple_from_a_file_or_env_split_string_is_refused(self):
+        self.write('e.env', 'CLAUDE_CODE_SIMPLE=1\n', 0o644)
+        self.write('ok.env', 'A=1\n', 0o644)
+        self.write('venv/bin/activate', 'export VIRTUAL_ENV=x\n', 0o644)
+        self.assert_refused([
+            '. ./e.env; claude -p x', 'source ./e.env && claude -p x', 'set -a; . ./e.env; set +a; claude -p x',
+            '. "$F"; claude -p x', '. ./missing.env; claude -p x', 'env $(cat e.env) claude -p x',
+            'env $(cat ok.env) claude -p x', 'env -S \'CLAUDE_CODE_SIMPLE=1 claude -p x\'',
+            'env -S"CLAUDE_CODE_SIMPLE=1 claude -p x"', 'env --split-string=\'CLAUDE_CODE_SIMPLE=1 claude -p x\'',
+            'BASH_ENV=./e.env bash -c \'claude -p x\'', 'bash --rcfile ./e.env -ic \'claude -p x\''])
+        self.assert_passed(['. ./ok.env; claude -p x', '. ./venv/bin/activate && python3 -V',
+                            'env -S \'A=1 claude -p x\'', 'source ./e.env && claude --version',
+                            'bash -lc \'claude -p x\'', 'bash -ic \'ls\''])
+        # the agents' user's own shell start files: a session the Bash tool or `bash -l` starts may read them
+        self.write('.bashrc', 'export CLAUDE_CODE_SIMPLE=1\n', 0o644)
+        self.assert_refused(['claude -p x', 'bash -lc \'claude -p x\'', 'bash -ic \'claude -p x\''],
+                            '.bashrc names CLAUDE_CODE_SIMPLE')
+        self.assert_passed(['claude --version', 'claude mcp list', 'bash -lc \'ls\''])
+
 
 class FastExitTest(Case):
     """#1752 fix point 1: plain commands pass before any file is read or the clock matters, and nothing the full
