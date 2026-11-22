@@ -5,8 +5,12 @@
  */
 import { HANDOFF_MIN_TOKENS, type HandoffMode, type HandoffSource } from "@t3tools/contracts";
 
-/** The agent writes its handoff in the warm cache, so it starts earlier than a command. */
+/**
+ * The agent writes its handoff in the warm cache, so it starts earlier than a command. `none` keeps
+ * the lead it had before the sources existed (the old default, `agent`).
+ */
 export const HANDOFF_IDLE_LEAD_MS: Readonly<Record<HandoffSource, number>> = {
+  none: 4 * 60_000,
   agent: 4 * 60_000,
   command: 2 * 60_000,
 };
