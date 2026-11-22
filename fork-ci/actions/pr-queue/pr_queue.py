@@ -156,6 +156,9 @@ NO_DETACH = ('-c', 'gc.autoDetach=false', '-c', 'maintenance.autoDetach=false')
 # are GitHub's own history, not an earlier job's object: that run does not download it all again. An older queue kept
 # it in the cache (`queue-fsck-known`), where whoever can write the cache could plant one: that file is never read.
 FSCK_KNOWN = '.fsck-known'
+# Beside STATE: an unreadable plan kept aside (STATE.bad, STATE.bad-<ns>: keep_bad), and which of those were told once
+# through notify_command (report_bad).
+BAD, TOLD_BAD = '.bad', '.told-bad'
 # CACHE + this: the merge check's own repository (Queue.holds_checked), made new for each check and deleted after it.
 MERGE_COPY = '.merge'
 # How long the merge check's object reader (Copy: one `git cat-file --batch`) may owe one answer, the line that names
@@ -597,6 +600,19 @@ def write_text(path, text):
     sync_dir(path)
 
 
+def read_own(path):
+    """The text of a record the queue wrote, or None: only a regular file of this user that no one else can write,
+    never a link (as STATE). Missing, unreadable or anyone else's: None."""
+    try:
+        with open(path, 'rb', opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW | os.O_NONBLOCK)) as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                return None
+            return f.read().decode('utf-8', 'replace')
+    except OSError:
+        return None
+
+
 def sync_dir(path):
     """The rename or removal of `path` itself on disk: a reboot must not bring back a dropped plan or lose a new one."""
     fd = os.open(os.path.dirname(path), os.O_RDONLY)
@@ -975,18 +991,17 @@ class Queue:
         if os.path.lexists(self.cache):
             problem = self.cache_problem()
             if not problem:
-                # A fetch killed half-way leaves a ref lock that fails every later fetch. Only the queue uses the cache,
-                # and only while it holds the lock: a lock file here is always a stale one.
-                for d, _, files in os.walk(os.path.join(self.cache, 'refs', 'queue')):
-                    for f in files:
-                        if f.endswith('.lock'):
-                            os.remove(os.path.join(d, f))
-                return True
+                return self.drop_stale_locks()
             print(f'{self.cache} {problem}: rebuilding it')
         parent, name = os.path.split(self.cache)
-        os.makedirs(parent, exist_ok=True)
-        remove_old(*(os.path.join(parent, f) for f in sorted(os.listdir(parent))   # CACHE.old-*, CACHE.new.old-*
-                     if f.startswith(name + '.') and '.old-' in f))
+        try:
+            os.makedirs(parent, exist_ok=True)
+            old = [os.path.join(parent, f) for f in sorted(os.listdir(parent))   # CACHE.old-*, CACHE.new.old-*
+                   if f.startswith(name + '.') and '.old-' in f]
+        except OSError as e:   # EACCES, EROFS, ENOSPC: nothing made, the next run tries again
+            print(f'could not make or list {parent}, the folder of {self.cache}: {e}')
+            return False
+        remove_old(*old)
         new = self.cache + '.new'
         if not (set_aside(self.cache) and set_aside(new)):   # a broken cache; one made half-way
             return False
@@ -1004,6 +1019,30 @@ class Queue:
             os.rename(new, self.cache)
         except OSError as e:   # something made the cache between the two steps: the next run sets it aside
             print(f'could not move the new repository to {self.cache}: {e}')
+            return False
+        return True
+
+    def drop_stale_locks(self):
+        """A fetch killed half-way leaves a ref lock that fails every later fetch. Only the queue uses the cache, and
+        only while it holds the lock: a lock file here is always a stale one. True when none is left; one that cannot
+        be deleted, or refs that cannot be listed, are said and return False (own_cache). No refs/queue yet (a cache
+        whose first fetch failed) has no lock: nothing to do."""
+        top = os.path.join(self.cache, 'refs', 'queue')
+
+        def stop(e):
+            if not (isinstance(e, FileNotFoundError) and e.filename == top):
+                raise e
+        path = None
+        try:
+            for d, _, files in os.walk(top, onerror=stop):
+                for f in files:
+                    if f.endswith('.lock'):
+                        path = os.path.join(d, f)
+                        os.remove(path)
+                        path = None
+        except OSError as e:
+            print(f'could not delete the stale ref lock {path}: {e}' if path else
+                  f'could not look for stale ref locks in {self.cache}: {e}')
             return False
         return True
 
@@ -1053,16 +1092,9 @@ class Queue:
 
     def known_broken(self):
         """What the cache's check said right after its download from scratch (self.known), or None. Only a record the
-        queue wrote counts: a regular file of this user that no one else can write, never a link (as STATE). Any
-        other is no record, so the cache is downloaded once more and the record written again."""
-        try:
-            with open(self.known, 'rb', opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW | os.O_NONBLOCK)) as f:
-                info = os.fstat(f.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
-                    return None
-                return f.read().decode('utf-8', 'replace')
-        except OSError:
-            return None
+        queue wrote counts (read_own). Any other is no record, so the cache is downloaded once more and the record
+        written again."""
+        return read_own(self.known)
 
     def keep_known(self, said):
         try:
@@ -1427,9 +1459,10 @@ class Queue:
         self.notify(n, (pr.get('headRefOid') or '').lower(), kind, reason, link)
 
     def notify(self, n, head, kind, reason, link=None):
-        """Run the config's notify_command for a notice tell() just posted: argv + repo, PR, head, kind, reason, link
-        (README.md, "Notify"). Never part of the queue's result: a command that is missing, fails or runs longer than
-        notify_timeout_seconds (then it and its processes are killed: stop_notify) is a warning, and the run goes on.
+        """Run the config's notify_command for a notice tell() just posted, or for an unreadable plan report_bad() just
+        recorded (n 0, head ''): argv + repo, PR, head, kind, reason, link (README.md, "Notify"). Never part of the
+        queue's result: a command that is missing, fails or runs longer than notify_timeout_seconds (then it and its
+        processes are killed: stop_notify) is a warning, and the run goes on.
         All commands of a run share NOTIFY_BUDGET seconds; tell() posts no notice once that is spent, so the next run
         posts and runs it. A command that fails, hangs or cannot start is not tried again: the posted comment says it
         was told, and a later run must not wake anyone again."""
@@ -1440,10 +1473,13 @@ class Queue:
         if not repo_page(link, page):
             link = f'{page}pull/{n}'
         argv = [*cmd, self.repo, str(n), head, kind, reason, link]
+        # A bad-plan notice has no PR and no PR comment: its record is STATE.told-bad (report_bad).
+        who, stands = (f'#{n}', 'The PR comment stands') if n else \
+            ('unreadable plans', f'{self.state + TOLD_BAD} says it was told')
         left = self.notify_left()
         if left < 1:   # tell() posts nothing then; a direct call still stays inside the budget
-            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) not run: this run\'s notify commands took '
-                  f'{NOTIFY_BUDGET} s together. The PR comment stands; nothing is tried again')
+            print(f'::warning::pr-queue: notify_command for {who} ({kind}) not run: this run\'s notify commands took '
+                  f'{NOTIFY_BUDGET} s together. {stands}; nothing is tried again')
             return
         limit = min(self.cfg.notify_timeout_seconds, left)
         sys.stdout.flush()
@@ -1463,8 +1499,8 @@ class Queue:
                 said = out.read(NOTIFY_OUTPUT + 1).decode('utf-8', 'replace')
         except (OSError, ValueError) as e:   # cannot start, no temp file (a full disk), or its output cannot be read
             what = 'ran, but its output could not be read' if ran else 'could not start'
-            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) {what}: {e}. The PR comment '
-                  'stands; nothing is tried again')
+            print(f'::warning::pr-queue: notify_command for {who} ({kind}) {what}: {e}. {stands}; nothing is '
+                  'tried again')
             return
         finally:
             self.notify_spent = getattr(self, 'notify_spent', 0.0) + time.monotonic() - start
@@ -1484,16 +1520,16 @@ class Queue:
             finally:
                 print(f'::{resume}::')
             if shown:
-                print(f'::warning::pr-queue: notify_command for #{n} ({kind}): its output could not all be shown: '
+                print(f'::warning::pr-queue: notify_command for {who} ({kind}): its output could not all be shown: '
                       f'{shown}')
         if code is None:
-            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) ran longer than {limit:.3g} s and was '
-                  'stopped. The PR comment stands; nothing is tried again')
+            print(f'::warning::pr-queue: notify_command for {who} ({kind}) ran longer than {limit:.3g} s and was '
+                  f'stopped. {stands}; nothing is tried again')
         elif code != 0:
-            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) exited {code}. The PR comment stands; '
-                  'nothing is tried again')
+            print(f'::warning::pr-queue: notify_command for {who} ({kind}) exited {code}. {stands}; nothing is tried '
+                  'again')
         else:
-            print(f'#{n}: notify_command ran for {kind} on {head[:12]}')
+            print(f'{who}: notify_command ran for {kind}' + (f' on {head[:12]}' if head else ''))
 
     def notify_left(self):
         """Seconds of NOTIFY_BUDGET this run's notify commands have not used yet (one Queue per run)."""
@@ -1847,14 +1883,111 @@ class Queue:
         return 1
 
     def recover(self):
+        """finish_plan(), then report_bad(): a plan this run kept as unreadable is named in this run already, and the
+        earlier ones are named even when finish_plan() fails (an error, not a kill: that runs nothing more)."""
+        try:
+            code = self.finish_plan()
+        except Exception:
+            self.report_bad()
+            raise
+        self.report_bad()
+        return code
+
+    def keep_bad(self):
+        """STATE moved aside as an unreadable plan, never over an earlier one (#934): STATE.bad, or STATE.bad-<ns>
+        when that name is taken (an older queue's or an earlier run's, kept until a person deletes it). A name
+        STATE.told-bad holds is taken too, even with no file left: report_bad() would take a new plan there for the one
+        it already told of. The name is made first as an empty file (O_EXCL: never one that is there), then STATE is
+        moved onto that file of its own, so no other file is overwritten; a hard link would not do (another user's
+        STATE: protected_hardlinks). A run killed between the two leaves STATE and that empty file, which later runs
+        name as one more kept plan. Only a run holding the lock moves one. The name it got."""
+        told, base = {os.path.basename(t) for t in self.told_bad()}, self.state + BAD
+        bad, ns = base, time.time_ns()
+        while True:
+            if os.path.basename(bad) not in told and not os.path.lexists(bad):
+                try:
+                    os.close(os.open(bad, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+                    break
+                except FileExistsError:   # made after the check
+                    pass
+            bad, ns = f'{base}-{ns}', ns + 1
+        try:
+            os.replace(self.state, bad)
+        except OSError:
+            try:
+                os.remove(bad)
+            except OSError:
+                pass
+            raise
+        sync_dir(bad)
+        return bad
+
+    def told_bad(self):
+        """The kept plans STATE.told-bad says were told (report_bad); [] for no record, or one the queue did not
+        write."""
+        try:
+            told = json.loads(read_own(self.state + TOLD_BAD) or '[]')
+        except ValueError:
+            return []
+        return [t for t in told if isinstance(t, str)] if isinstance(told, list) else []
+
+    def bad_plans(self):
+        """The unreadable plans kept beside STATE (keep_bad: STATE.bad first, then STATE.bad-<ns> oldest first), links
+        too, or None when the folder cannot be listed (said)."""
+        folder, name = os.path.split(self.state)
+        try:
+            names = os.listdir(folder)
+        except FileNotFoundError:
+            return []
+        except OSError as e:
+            print(f'::warning::pr-queue: could not list {folder} for unreadable plans of earlier runs: {e}')
+            return None
+        first = [name + BAD] if name + BAD in names else []
+        later = sorted((int(f[len(name + BAD) + 1:]), f) for f in names
+                       if re.fullmatch(re.escape(name + BAD) + r'-[0-9]+', f))
+        return [os.path.join(folder, f) for f in first + [f for _, f in later]]
+
+    def report_bad(self):
+        """Every unreadable plan kept beside STATE is named in every run's log as a ::warning:: (shown on the run's
+        page on GitHub), and told once per file through notify_command (kind bad-plan; README.md, "Notify"). The
+        record of which were told is STATE.told-bad (read_own), written before the command runs, as a PR notice's
+        comment is: a stop between the two tells no one, none is told twice. No such file left: the record goes, so a
+        later one with the same name is told again. A record that cannot be written tells no one yet: the next run
+        tries again, never every run."""
+        bads, record = self.bad_plans(), self.state + TOLD_BAD
+        if bads is None:
+            return
+        if not bads:
+            try:
+                os.remove(record)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f'could not delete {record}: {e}')
+            return
+        for bad in bads:
+            print(f'::warning::pr-queue: {bad} is an unreadable plan of an earlier run: a PR may still have auto-merge '
+                  'OFF. Look at the open PRs without auto-merge, then delete it')
+        if not self.cfg.notify_command:
+            return
+        told = self.told_bad()
+        new = [b for b in bads if b not in told]
+        if not new:
+            return
+        try:
+            write_text(record, json.dumps(bads))
+        except OSError as e:
+            print(f'::warning::pr-queue: could not write {record} ({e}): notify_command not run for {", ".join(new)} '
+                  'yet, the next run tries again')
+            return
+        self.notify(0, '', 'bad-plan', f'unreadable plan of an earlier run kept as {", ".join(new)}: a PR may still '
+                    'have auto-merge OFF', f'https://github.com/{self.repo}/pulls')
+
+    def finish_plan(self):
         """A run stopped after its disarm left STATE: re-arm the PR at a head that passes step 4's check against the
         review as it is now, or leave it OFF with the comment. A PR that is armed again, merged or closed needs nothing.
         0: done, STATE removed. Otherwise STATE stays and the caller ends the run: another PR's update would overwrite
         it."""
-        bad = self.state + '.bad'
-        if os.path.exists(bad):
-            print(f'WARNING: {bad} is an unreadable plan of an earlier run: a PR may still have auto-merge OFF. Look '
-                  'at the open PRs without auto-merge, then delete it')
         mine = True
         try:
             with open(self.state, 'rb', opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
@@ -1867,8 +2000,7 @@ class Queue:
             st = {}
         n = st.get('pr') if isinstance(st, dict) else None
         if not isinstance(n, int) or isinstance(n, bool):   # which PR it was is lost: never quietly
-            os.replace(self.state, bad)
-            sync_dir(bad)
+            bad = self.keep_bad()
             print(f'ERROR: {"unreadable" if mine else "untrusted (another user could write it)"} {self.state}, kept as '
                   f'{bad}: a PR may have auto-merge OFF and nothing says so')
             return 1
@@ -2045,9 +2177,9 @@ class Queue:
 
 def own_name(path):
     """`path` without what follows its last name (`/`, `/.`): the queue makes its other files by adding to the path
-    (CACHE.merge, CACHE.new, CACHE.old-*, STATE.lock, STATE.tmp, STATE.fsck-known), and after `CACHE/` those would be
-    inside the cache, where set_aside deletes what is in the way. Nothing else is changed: a `..` is the kernel's to
-    follow (it may come after a link)."""
+    (CACHE.merge, CACHE.new, CACHE.old-*, STATE.lock, STATE.tmp, STATE.fsck-known, STATE.bad*, STATE.told-bad), and
+    after `CACHE/` those would be inside the cache, where set_aside deletes what is in the way. Nothing else is
+    changed: a `..` is the kernel's to follow (it may come after a link)."""
     while True:
         head, tail = os.path.split(path)
         if tail not in ('', '.') or head == path:
