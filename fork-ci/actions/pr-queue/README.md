@@ -146,7 +146,7 @@ whole). Then (`review_judge.py`, `review_glob.py`):
   once. Each path gets its own rule's read: an app change plus one workflow
   file needs the app rule's lens and the critical lenses, never the critical
   lenses alone (owner decision,
-  [issue 82](https://github.com/scuttletoby/t3code/issues/82): one *extra*
+  [issue 82](https://github.com/scuttletoby/t3code/issues/82): one _extra_
   review). A protected path counts for its own rule too, so one under a
   normal catch-all also needs that rule's lens; put the protected paths in a
   critical rule of their own to keep them at the critical lenses;
