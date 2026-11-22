@@ -1,5 +1,5 @@
 /**
- * Fork: each turn start fixes the thread's T3 tool groups (mcpT3ToolFilter.ts) on every driver but
+ * Fork: each turn start fixes the thread's T3 tool groups (mcpT3ToolRule.ts) on every driver but
  * Claude. It refuses outside `MCP_PROFILE_DRIVERS` when the profile leaves out an outside server, and
  * on every wrapped driver for `builtinTools: "none"` or a profile that cannot be worked out.
  */
@@ -23,6 +23,7 @@ import {
   builtinToolsNoneRefusal,
 } from "./mcpProfile.ts";
 import { fixT3ToolSet, forgetT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
+import { CurrentTurnMcpProfile } from "./mcpTurnProfile.ts";
 
 type ProfileFor = Effect.Success<typeof makeThreadMcpProfiles>;
 /** What a turn start, and a resume, are given that the check reads. */
@@ -79,7 +80,7 @@ const refusalReason = (resolved: McpProfileResolved, instance: ProviderInstance)
  * Fixes the thread's T3 tool groups for this turn, then nothing when the driver applies outside
  * servers itself (Codex) or the profile keeps every one; otherwise the refusal. A profile that
  * cannot be worked out refuses with the resolver's reason, as it does on Claude, and keeps only the
- * tools every profile keeps.
+ * tools every profile keeps. Returns the profile, so the turn reads it once.
  */
 const checkTurnProfile = Effect.fn("McpProfileTurnCheck.check")(function* (
   profileFor: ProfileFor,
@@ -99,7 +100,9 @@ const checkTurnProfile = Effect.fn("McpProfileTurnCheck.check")(function* (
       reason: builtinToolsNoneRefusal(resolved.name, instance.driverKind),
     });
   }
-  if (appliesMcpProfiles(instance.driverKind) || resolved.profile.servers === "all") return;
+  if (appliesMcpProfiles(instance.driverKind) || resolved.profile.servers === "all") {
+    return resolved;
+  }
   return yield* new ClaudeMcpProfileError({ reason: refusalReason(resolved, instance) });
 });
 
@@ -123,7 +126,15 @@ const makeWrap = (profileFor: ProfileFor) => {
               cause,
             }),
         ),
-        Effect.andThen(run(input)),
+        // The driver's own checks (Codex's) read this profile rather than work it out again.
+        Effect.flatMap((resolved) =>
+          run(input).pipe(
+            Effect.provideService(CurrentTurnMcpProfile, {
+              threadId: input.appThread.id,
+              resolved,
+            }),
+          ),
+        ),
       );
   return (instance: ProviderInstance): ProviderInstance => {
     if (FIXES_OWN_T3_TOOL_SETS.has(instance.driverKind)) return instance;

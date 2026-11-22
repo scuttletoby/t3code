@@ -41,6 +41,7 @@ import * as ServerSettingsService from "../serverSettings.ts";
 import * as ForkLayers from "./forkLayers.ts";
 import { MCP_PROFILE_DRIVERS } from "./mcpProfile.ts";
 import * as T3ToolSets from "./mcpT3ToolSets.ts";
+import { CurrentTurnMcpProfile } from "./mcpTurnProfile.ts";
 
 /** The groups the thread's set holds now, or its tag when it is not a list. */
 const groupsOf = (threadId: string) => {
@@ -74,11 +75,20 @@ type Mcp = Partial<
 /** What each provider's session was asked to do, in order: `start:thread`, `resume:…`, `compact:…`. */
 type Calls = Array<string>;
 
+/** The profile each recorded call was given to read (`thread:name`), in order. */
+const turnProfiles: Array<string | undefined> = [];
+
 /** A provider instance whose sessions only record their calls; enough for the check. */
 const fakeInstance = (instanceId: ProviderInstanceId, calls: Calls): ProviderInstance => {
   const driver = DRIVERS[instanceId]!;
   const record = (kind: string) => (input: { readonly threadId: ThreadId }) =>
-    Effect.sync(() => void calls.push(`${kind}:${instanceId}:${input.threadId}`));
+    Effect.gen(function* () {
+      calls.push(`${kind}:${instanceId}:${input.threadId}`);
+      const current = yield* CurrentTurnMcpProfile;
+      turnProfiles.push(
+        current === undefined ? undefined : `${current.threadId}:${current.resolved.name}`,
+      );
+    });
   return {
     instanceId,
     driverKind: driver,
@@ -366,6 +376,8 @@ describe("mcpProfileTurnCheck", () => {
               "resume:codex:own",
               "compact:codex:own",
             ]);
+            // Codex's own checks read this profile, not work it out again.
+            assert.deepStrictEqual(turnProfiles.slice(-3), ["own:lean", "own:lean", "own:lean"]);
           }),
       ),
   );

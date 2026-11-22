@@ -29,6 +29,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 
 import { makeTurnInput } from "../orchestration-v2/Adapters/AcpAdapterV2.testkit.ts";
 import * as CodexAdapterV2 from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
@@ -38,8 +39,11 @@ import * as ServerConfig from "../config.ts";
 import * as PortScanner from "../preview/PortScanner.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettingsService from "../serverSettings.ts";
-import { ClaudeMcpProfileError } from "./claudeMcpProfile.ts";
+import { ClaudeMcpProfileError, threadNotInStore } from "./claudeMcpProfile.ts";
 import {
+  CODEX_ADOPT_WAIT_MS,
+  afterStoreLag,
+  codexCarriedT3McpServers,
   codexConfiguredMcpServers,
   codexMcpProfileConfig,
   codexMcpServersOutsideProfile,
@@ -49,6 +53,7 @@ import {
 } from "./codexMcpProfile.ts";
 import type { McpProfileResolved, McpProfileSet } from "./mcpProfile.ts";
 import * as T3ToolSets from "./mcpT3ToolSets.ts";
+import { CurrentTurnMcpProfile } from "./mcpTurnProfile.ts";
 
 /** The groups the thread's set holds now, or its tag when it is not a list. */
 const groupsOf = (threadId: string) => {
@@ -109,6 +114,8 @@ interface FakeThread {
   readonly cwd: string;
   config: Json;
   loaded: boolean;
+  /** The thread that spawned it, for a Codex sub-agent. */
+  readonly parent?: string;
 }
 
 /**
@@ -183,7 +190,19 @@ const makeFakeCodex = (
         const found = thread(params.threadId);
         return found === undefined
           ? Effect.fail(fail(method))
-          : Effect.succeed({ thread: { id: found.id, cwd: found.cwd } });
+          : Effect.succeed({
+              thread: {
+                id: found.id,
+                cwd: found.cwd,
+                ...(found.parent === undefined
+                  ? {}
+                  : {
+                      source: {
+                        subAgent: { thread_spawn: { parent_thread_id: found.parent, depth: 1 } },
+                      },
+                    }),
+              },
+            });
       }
       case "config/read": {
         const cwd = typeof params.cwd === "string" ? params.cwd : "";
@@ -251,12 +270,20 @@ const makeFakeCodex = (
     string,
     Array<(payload: unknown) => Effect.Effect<void, CodexError.CodexAppServerError>>
   >();
+  /** Server-request handlers (the last one added for a method, as the real client keeps them). */
+  const serverRequests = new Map<
+    string,
+    (payload: unknown) => Effect.Effect<unknown, CodexError.CodexAppServerError>
+  >();
   const client = {
     request,
     raw: { request, requests: undefined as never },
     notify: () => Effect.void,
     awaitTermination: Effect.never,
-    handleServerRequest: () => Effect.void,
+    handleServerRequest: (
+      method: string,
+      handler: (payload: unknown) => Effect.Effect<unknown, CodexError.CodexAppServerError>,
+    ) => Effect.sync(() => void serverRequests.set(method, handler)),
     handleServerNotification: (
       method: string,
       handler: (payload: unknown) => Effect.Effect<void, CodexError.CodexAppServerError>,
@@ -284,6 +311,8 @@ const makeFakeCodex = (
       Effect.forEach(handlers.get(method) ?? [], (handler) => handler(payload), {
         discard: true,
       }).pipe(Effect.orDie),
+    /** Codex asks the client (a server request): the handler's answer. */
+    ask: (method: string, payload: unknown) => serverRequests.get(method)!(payload),
     setPageSize: (size: number) => void (pageSize = size),
     setEndlessPages: () => void (endlessPages = true),
     /**
@@ -293,7 +322,7 @@ const makeFakeCodex = (
     spawnChild: (parent: string) => {
       const source = threads.get(parent)!;
       const id = `native-${++next}`;
-      threads.set(id, { id, cwd: source.cwd, config: { ...source.config }, loaded: true });
+      threads.set(id, { id, cwd: source.cwd, config: { ...source.config }, loaded: true, parent });
       return id;
     },
     /** Codex lets the thread go (idle): its next resume loads it with the config sent then. */
@@ -1173,6 +1202,237 @@ describe("withCodexMcpProfiles", () => {
   );
 });
 
+describe("follow-ups: holds, sub-agents, unknown threads, per-call checks (fork issues #814, #918)", () => {
+  it.effect("a turn Codex starts holds T3's requests until its set is fixed", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      const fake = makeFakeCodex({ servers: ["alpha"] });
+      const gate = yield* Deferred.make<void>();
+      let gated = false;
+      const profileFor: ProfileById = () =>
+        gated
+          ? Deferred.await(gate).pipe(Effect.as(resolved("lean", "all", ["waits"])))
+          : Effect.succeed(ALL);
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+      const id = (yield* start(client, "t")).thread.id;
+      gated = true;
+      yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+      // Held from the notification on, before the profile is read: no request sees the old set.
+      assert.isDefined(T3ToolSets.t3ToolSetHold("t"));
+      yield* Deferred.succeed(gate, undefined);
+      yield* TestClock.withLive(Effect.sleep("20 millis"));
+      assert.isUndefined(T3ToolSets.t3ToolSetHold("t"));
+      assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+    }),
+  );
+
+  it.effect("a sub-agent's turn, or a goal set active, checks but leaves the parent's set", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      const fake = makeFakeCodex({ servers: ["alpha"] });
+      const { profiles, profileFor } = makeProfiles({ t: resolved("a", "all", ["threads"]) });
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+      const id = (yield* start(client, "t")).thread.id;
+      yield* turn(client, id);
+      assert.deepStrictEqual(groupsOf("t"), ["threads"]);
+      const child = fake.spawnChild(id);
+      yield* fake.emit("item/completed", spawned(id, [child]));
+      // The parent's turn still runs with its set; a change reaches its next turn only.
+      profiles.set("t", resolved("a", "all", ["waits"]));
+      yield* fake.emit("turn/started", turnStarted(child, "child-1"));
+      yield* TestClock.withLive(Effect.sleep("20 millis"));
+      assert.deepStrictEqual(groupsOf("t"), ["threads"]);
+      assert.strictEqual(
+        yield* outcome(
+          client.request("thread/goal/set", { threadId: id, status: "active" } as never),
+        ),
+        "ok",
+      );
+      assert.deepStrictEqual(groupsOf("t"), ["threads"]);
+      // The goal's own turn, which Codex starts, fixes it.
+      yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+      yield* TestClock.withLive(Effect.sleep("20 millis"));
+      assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+    }),
+  );
+
+  it.effect(
+    "a turn on a Codex thread T3 has not seen: adopted when Codex names its parent, else stopped",
+    () =>
+      Effect.gen(function* () {
+        const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
+        const { profiles, profileFor } = makeProfiles({ t: resolved("a", ["alpha"]) });
+        const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+        const seen = yield* completions(client);
+        const id = (yield* start(client, "t")).thread.id;
+        // A sub-agent whose spawn item T3 has not seen yet: thread/read names its parent.
+        const child = fake.spawnChild(id);
+        profiles.set("t", resolved("a", ["alpha", "beta"]));
+        yield* fake.emit("turn/started", turnStarted(child, "child-1"));
+        yield* fake.reached("mcpServerStatus/list", 1);
+        assert.strictEqual(fake.sent("mcpServerStatus/list")[0]!.params.threadId, child);
+        assert.deepStrictEqual(fake.sent("turn/interrupt"), []);
+        // A thread Codex names no parent for, and T3 never sees spawned, is stopped after a wait.
+        const stray = (
+          (yield* fake.client.request("thread/start", {} as never)) as {
+            readonly thread: { readonly id: string };
+          }
+        ).thread.id;
+        const readsBefore = fake.sent("thread/read").length;
+        const waited = yield* Effect.forkChild(
+          Effect.gen(function* () {
+            yield* fake.emit("turn/started", turnStarted(stray, "stray-1"));
+            yield* fake.reached("turn/interrupt", 1);
+          }),
+        );
+        // Codex names no parent for it; then T3 waits for the spawn to show.
+        yield* fake.reached("thread/read", readsBefore + 1);
+        yield* drive(waited, CODEX_ADOPT_WAIT_MS);
+        assert.deepStrictEqual(fake.sent("turn/interrupt")[0]!.params, {
+          threadId: stray,
+          turnId: "stray-1",
+        });
+        yield* fake.emit("turn/completed", turnCompleted(stray, "stray-1"));
+        assert.include(
+          (seen.at(-1)!.error as { readonly message: string }).message,
+          "did not load this Codex thread",
+        );
+      }),
+  );
+
+  it.effect("T3's own turn reads the profile the turn check worked out, once per turn", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
+      let reads = 0;
+      const profileFor: ProfileById = () =>
+        Effect.sync(() => void (reads += 1)).pipe(Effect.as(resolved("a", ["alpha"])));
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+      const id = (yield* start(client, "t")).thread.id;
+      reads = 0;
+      const response = (yield* turn(client, id).pipe(
+        Effect.provideService(CurrentTurnMcpProfile, {
+          threadId: ThreadId.make("t"),
+          resolved: resolved("a", ["alpha"]),
+        }),
+      )) as { readonly turn: { readonly id: string } };
+      const listed = fake.sent("mcpServerStatus/list").length;
+      assert.isAbove(listed, 0);
+      // Codex reports T3's own turn started: it was checked before it was sent.
+      yield* fake.emit("turn/started", turnStarted(id, response.turn.id));
+      yield* TestClock.withLive(Effect.sleep("20 millis"));
+      assert.strictEqual(reads, 0);
+      assert.strictEqual(fake.sent("mcpServerStatus/list").length, listed);
+    }),
+  );
+
+  it.effect("MCP Apps calls and elicitations to a server outside the profile are refused", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
+      const client = yield* withCodexMcpProfiles(
+        fake.client,
+        makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
+      );
+      let asked = 0;
+      yield* client.handleServerRequest("mcpServer/elicitation/request", () =>
+        Effect.sync(() => void (asked += 1)).pipe(Effect.as({ action: "accept" as const })),
+      );
+      const id = (yield* start(client, "t")).thread.id;
+      const call = (server: string) =>
+        outcome(
+          client.request("mcpServer/tool/call", { threadId: id, server, tool: "x" } as never),
+        );
+      assert.include(yield* call("beta"), 'MCP server "beta" is not in this thread\'s MCP profile');
+      assert.include(
+        yield* outcome(
+          client.request("mcpServer/resource/read", {
+            threadId: id,
+            server: "beta",
+            uri: "ui://x",
+          } as never),
+        ),
+        "not in this thread's MCP profile",
+      );
+      assert.strictEqual(yield* call("alpha"), "ok");
+      assert.strictEqual(yield* call("t3-code"), "ok");
+      assert.deepStrictEqual(
+        fake.sent("mcpServer/tool/call").map((sent) => sent.params.server),
+        ["alpha", "t3-code"],
+      );
+      const elicit = (serverName: string) =>
+        fake.ask("mcpServer/elicitation/request", {
+          threadId: id,
+          serverName,
+          message: "ok?",
+          mode: "form",
+          requestedSchema: { type: "object", properties: {} },
+        });
+      assert.deepStrictEqual(yield* elicit("beta"), { action: "decline" });
+      assert.strictEqual(asked, 0);
+      assert.deepStrictEqual(yield* elicit("alpha"), { action: "accept" });
+      assert.strictEqual(asked, 1);
+    }),
+  );
+
+  it.effect("a server of the user's named like T3's is switched off unless T3 carries it", () =>
+    Effect.gen(function* () {
+      assert.deepStrictEqual([...codexCarriedT3McpServers(threadConfig("t"))].sort(), [
+        "t3-code",
+        "t3-code-direct",
+      ]);
+      const fake = makeFakeCodex({ servers: ["alpha", "t3-code"] });
+      const client = yield* withCodexMcpProfiles(
+        fake.client,
+        makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
+      );
+      // A load with no T3 server of its own (T3's MCP session was not set up).
+      const {
+        "mcp_servers.t3-code": _,
+        "mcp_servers.t3-code-direct": __,
+        ...bare
+      } = threadConfig("t");
+      const id = (
+        (yield* client.request("thread/start", { cwd: "/workspace", config: bare } as never)) as {
+          readonly thread: { readonly id: string };
+        }
+      ).thread.id;
+      assert.deepStrictEqual(offKeys(fake.threads.get(id)!.config), [
+        "mcp_servers.t3-code.enabled",
+      ]);
+      assert.strictEqual(yield* outcome(turn(client, id)), "ok");
+      // One T3 does carry stays on.
+      const own = (yield* start(client, "t")).thread.id;
+      assert.deepStrictEqual(offKeys(fake.threads.get(own)!.config), []);
+    }),
+  );
+
+  it.effect("a thread the store does not have yet is read again before it is refused", () =>
+    Effect.gen(function* () {
+      let reads = 0;
+      const lagging = afterStoreLag(() =>
+        Effect.suspend(() =>
+          ++reads < 3 ? Effect.fail(threadNotInStore()) : Effect.succeed(resolved("a", "all")),
+        ),
+      );
+      const found = yield* drive(yield* Effect.forkChild(lagging(ThreadId.make("t"))), 1_750);
+      assert.strictEqual(found.name, "a");
+      assert.strictEqual(reads, 3);
+      // Any other refusal stands at once.
+      reads = 0;
+      const refused = afterStoreLag(() =>
+        Effect.sync(() => void (reads += 1)).pipe(
+          Effect.andThen(Effect.fail(new ClaudeMcpProfileError({ reason: "gone" }))),
+        ),
+      );
+      assert.include(yield* outcome(refused(ThreadId.make("t"))), "gone");
+      assert.strictEqual(reads, 1);
+    }),
+  );
+});
+
+/** Moves test time on by `millis` (each sleep in turn wakes), then joins the fiber. */
+const drive = <A, E>(fiber: Fiber.Fiber<A, E>, millis: number) =>
+  TestClock.adjust(millis).pipe(Effect.andThen(Fiber.join(fiber)));
+
 describe("profiledClientFactory (settings and thread store)", () => {
   const NOW = DateTime.makeUnsafe("2026-11-21T00:00:00.000Z");
   const PROJECT = ProjectId.make("project");
@@ -1288,7 +1548,11 @@ describe("profiledClientFactory (settings and thread store)", () => {
         Effect.gen(function* () {
           const lost = yield* outcome(start(client, "lost"));
           assert.include(lost, '"gone"');
-          const unknown = yield* outcome(start(client, "not-stored"));
+          // Read again three times over 1.75 s (the store may lag a new thread), then refused.
+          const unknown = yield* drive(
+            yield* Effect.forkChild(outcome(start(client, "not-stored"))),
+            1_750,
+          );
           assert.include(unknown, "cannot read this thread from its store");
           assert.include(unknown, FIX);
           assert.deepStrictEqual(fake.sent("thread/start"), []);

@@ -96,7 +96,7 @@ import * as HtmlHandlers from "./toolkits/html/handlers.ts";
 import { MessageToolkit } from "./toolkits/message/tools.ts";
 import * as WaitsHandlers from "./toolkits/waits/handlers.ts";
 import { WaitsToolkit } from "./toolkits/waits/tools.ts";
-import * as McpT3ToolFilter from "../fork/mcpT3ToolFilter.ts";
+import * as McpT3ToolFilter from "../fork/mcpT3ToolRule.ts";
 import * as MessageHandlers from "./toolkits/message/handlers.ts";
 import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
 import { MCP_HTTP_PATH } from "../httpCors.ts";

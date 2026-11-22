@@ -1,6 +1,6 @@
 /**
  * Fork: a thread's MCP profile, applied to its Claude session. This applies the outside servers;
- * T3's own tools are filtered on the T3 MCP server for every provider (mcpT3ToolFilter.ts), with
+ * T3's own tools are filtered on the T3 MCP server for every provider (mcpT3ToolRule.ts), with
  * the groups fixed as each query opens. A profile that cannot be applied refuses the turn instead
  * of starting it with every tool: the owner chose refusing over warning.
  */
@@ -42,7 +42,7 @@ import {
   type McpProfileThread,
   resolveMcpProfile,
 } from "./mcpProfile.ts";
-import { fixT3ToolSet, forgetT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
+import { type T3ToolSet, fixT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
 import {
   type McpProfileFileKeys,
   mcpProfileFileKeysOf,
@@ -76,7 +76,7 @@ export interface ClaudeMcpProfilePlan {
     readonly disallowedTools?: Array<string>;
   };
   readonly servers: McpProfileSet["servers"];
-  /** T3's own tool groups; the T3 MCP server applies them (mcpT3ToolFilter.ts). */
+  /** T3's own tool groups; the T3 MCP server applies them (mcpT3ToolRule.ts). */
   readonly t3Tools: McpProfileSet["t3Tools"];
   readonly builtinTools?: McpProfileSet["builtinTools"];
 }
@@ -669,6 +669,14 @@ export const makeThreadMcpProfiles = Effect.gen(function* () {
   });
 });
 
+const NOT_IN_STORE = `T3 cannot read this thread from its store, so its MCP profile cannot be worked out and it cannot start: retry, or ${FIX}.`;
+
+/** {@link makeThreadMcpProfilesById}'s refusal of a thread the store did not give. */
+export const threadNotInStore = () => new ClaudeMcpProfileError({ reason: NOT_IN_STORE });
+/** True for {@link threadNotInStore}'s refusal. */
+export const isNotInStore = (error: ClaudeMcpProfileError): boolean =>
+  error.reason === NOT_IN_STORE;
+
 /**
  * A thread's resolved profile, or a refusal, found by its id alone (a Codex thread request carries
  * only the id). A thread the store cannot give refuses, as an unreadable parent does. With no store
@@ -686,14 +694,31 @@ export const makeThreadMcpProfilesById = Effect.gen(function* () {
       } as LineageThread);
     }
     const thread = yield* findThread(threadId);
-    if (thread === null) {
-      return yield* new ClaudeMcpProfileError({
-        reason: `T3 cannot read this thread from its store, so its MCP profile cannot be worked out and it cannot start: retry, or ${FIX}.`,
-      });
-    }
+    if (thread === null) return yield* threadNotInStore();
     return yield* read(thread);
   });
 });
+
+/**
+ * The plan with its T3 tool set fixed when its `options` are first read: ClaudeAdapterV2 reads
+ * them only to open a new process, after the old one closed. A turn that keeps the live process (a
+ * continuation, the same plan) or is refused before replacing it (background work still runs)
+ * leaves that process's set as its turn fixed it, so a running turn keeps its set.
+ */
+const fixedWhenOpened = (
+  plan: ClaudeMcpProfilePlan,
+  threadId: ThreadId,
+  set: T3ToolSet,
+): ClaudeMcpProfilePlan => {
+  const { options, ...rest } = plan;
+  return Object.defineProperty({ ...rest }, "options", {
+    enumerable: true,
+    get: () => {
+      fixT3ToolSet(threadId, set);
+      return options;
+    },
+  }) as ClaudeMcpProfilePlan;
+};
 
 /** The thread's Claude plan, or a refusal, from {@link makeThreadMcpProfiles}. */
 export const makeClaudeMcpProfiles = Effect.gen(function* () {
@@ -702,19 +727,20 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
     thread: LineageThread,
     overrides: McpOverrides,
   ) {
-    // The query opens for a turn: its T3 tool groups are fixed here until the next one opens, and
-    // a profile that cannot be worked out keeps only the tools every profile keeps.
+    // A profile that cannot apply refuses the turn and keeps only the tools every profile keeps,
+    // at once: narrowing never waits. A profile that applies is fixed as its process opens.
     const resolved: McpProfileResolved = yield* profileFor(thread).pipe(
       Effect.tapError((refusal) =>
         Effect.sync(() => fixT3ToolSet(thread.id, refusedT3ToolSet(refusal.reason))),
       ),
-      // Stopped half-way: no set stands, so the next request works it out again.
-      Effect.onInterrupt(() => Effect.sync(() => forgetT3ToolSet(thread.id))),
     );
-    fixT3ToolSet(thread.id, t3ToolSetOf(resolved));
     const t3ServerNames = Object.keys(overrides.mcpServers ?? {});
     const plan = claudeMcpProfilePlan(resolved.name, resolved.profile, t3ServerNames);
-    return isRefusal(plan) ? yield* plan : plan;
+    if (isRefusal(plan)) {
+      fixT3ToolSet(thread.id, refusedT3ToolSet(plan.reason));
+      return yield* plan;
+    }
+    return fixedWhenOpened(plan, thread.id, t3ToolSetOf(resolved));
   });
 
   return Effect.fn("ClaudeMcpProfile.plan")(function* (

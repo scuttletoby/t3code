@@ -801,11 +801,17 @@ Claude thread whose groups changed starts a fresh Claude process for its next tu
 Claude lists T3's tools again; that costs one prompt-cache miss. Another provider may keep the
 list it read before: a tool it still shows is refused when called, and one newly kept is there the
 next time it lists. The sets live in the server's memory, one per thread, not per credential (a
-credential reused after a change gets the thread's new set from its next turn): after a restart, or for a thread
+credential reused after a change gets the thread's new set from its next turn), at most 4096 of
+them: past that, the thread that went longest without a turn loses its set, and its next request
+works it out again from the settings as they are then, so a change made since applies to it within
+its running turn (never wider than the settings). After a restart, or for a thread
 whose session lists its tools before its first turn, the set is worked out from the settings at
 the first request. A thread whose profile cannot be worked out (a missing or broken profile, a
 parent that cannot be read, settings that cannot be read, a thread T3 cannot read because it was
-deleted) keeps only the tools every profile keeps and is told why, never `all`. A delegated child
+deleted) keeps only the tools every profile keeps and is told why, never `all`. Such a refusal
+worked out by a request (not by a turn) is reused for 5 seconds, so a list request reads the
+settings once, and is never kept as the thread's set: once the read works, the next request gets
+the real set. A delegated child
 is cut down to its parent's groups like its servers, so it never gets more. Clients from outside
 a thread (signed in with OAuth) have no profile.
 
@@ -908,7 +914,9 @@ for the thread's folder (Codex's `config.toml`, a project's `.codex/config.toml`
 by `-c mcp_servers…` in the Codex launch arguments) and gives that thread
 `mcp_servers.<name>.enabled = false` for each one the profile leaves out, and `features.apps = false`
 unless the profile names `codex_apps` (Codex's connectors server, which it adds with a ChatGPT
-sign-in and which that list never shows). T3's own servers stay. Other threads on the same
+sign-in and which that list never shows). T3's own servers stay: the `t3-code` and
+`t3-code-direct` entries T3 sends with the load. A server of the owner's own config that has one of
+those names but that T3 did not send is switched off like any other. Other threads on the same
 app-server keep their own sets. Codex's own sub-agents copy their parent's loaded config, these
 settings included. Before each turn (and before a goal is set running) T3 reads the thread's live
 servers from Codex and does not start the turn, saying why and how to go on (pick `all` for the
@@ -919,7 +927,8 @@ check when the profile was narrowed while Codex had the thread loaded (Codex rea
 config only as it loads it, so the change counts once it loads the thread again: after it has been
 idle a while, or after T3 restarts) and for a server a Codex plugin adds, which T3 cannot switch off
 this way. A turn is also refused when the profile is missing or broken, Codex's servers cannot be listed, a server's name cannot be written as a config key, the
-thread is not in T3's store, or (once any thread on that app-server has a narrower profile) Codex
+thread is not in T3's store (read 4 times over about 2 seconds first, as a thread T3 has just
+made can reach the store a moment after Codex asks for it), or (once any thread on that app-server has a narrower profile) Codex
 asks to load or run a thread T3 cannot match to one of its own. Codex answers the server list only
 once the thread's servers have started, and T3 waits up to 30 seconds for each read: a kept server
 slower to start than that refuses the turn, which can be sent again once it is up. When a resume is
@@ -929,7 +938,31 @@ which would lose its history: the turn fails, and sending it again resumes the t
 thread store at each load and turn, so a thread missing from the store refuses there too. A turn already running when the profile is narrowed keeps its servers
 until it ends. A Codex thread's T3 tool groups are cut on T3's own server, as on every provider
 (above); each Codex turn fixes them as it starts, also one Codex starts on its own (a goal's next
-turn, a sub-agent's turn, which uses its parent's T3 thread).
+turn). A sub-agent's turn, and a goal set while a turn may run, are checked but never fix the set:
+the sub-agent uses its parent's T3 thread, and must not change the set of the parent's running
+turn. While a goal's turn has its set fixed, T3's server holds that thread's requests (up to 10
+seconds, then refuses them with a "try again" reason), so the turn's first T3 tool call already
+gets the new set.
+
+Codex is checked at each call too, where it lets T3 see one
+([#814](https://github.com/scuttletoby/t3code/issues/814)). A request the app sends to one MCP
+server of a thread (`mcpServer/tool/call`, `mcpServer/resource/read`, for MCP Apps) is refused when
+the thread's profile leaves that server out, and an MCP server's elicitation (also Codex's
+approval of an MCP tool call, when its approval policy asks for one) is declined then, with a
+warning in the server log. `mcpServerStatus/list` is not refused: it only reads which servers are
+on. Once any thread on an app-server has a narrower profile, those requests on a Codex thread T3
+cannot match to one of its own are refused too. A Codex sub-agent T3 did not see spawned (for
+example one from before an app-server restart) is matched by asking Codex for its parent, at its
+resume and at its turn; a turn on a thread T3 still cannot match waits up to 5 seconds for the
+spawn to show, then is stopped like a refused turn.
+
+Edges of the Codex turn check. It runs as Codex reports the turn started, so a turn Codex starts on
+its own can run briefly (a model step, possibly a call to an outside MCP server when no approval
+is asked) before it is stopped; T3's own tools already get the turn's set. A turn that ends before
+its check does is not stopped: its goal is still paused, without a message. Requests to T3's server
+that come from no thread get every T3 tool, as above (a known limit, fork issue #918). A server a Codex plugin adds is not switched off: every turn is refused while it
+is on. Switching it off through the plugin's own config key is not done, as a key Codex does not
+accept can make it refuse to load the thread at all.
 
 Only Claude and Codex threads apply a profile's outside servers. A thread on any other provider
 would get every outside MCP server whatever its profile says (T3's own tool groups apply on every

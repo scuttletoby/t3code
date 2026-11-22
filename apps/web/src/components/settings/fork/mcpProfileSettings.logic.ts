@@ -41,6 +41,13 @@ export type McpProfilePanelSettings = Pick<
 /** T3 tools every profile keeps, whatever its `t3Tools` says. */
 export const MCP_ALWAYS_KEPT_NOTE = `${MCP_T3_UNGROUPED_TOOLS.map((tool) => `\`${tool}\``).join(", ")} always stay, whatever the profile says.`;
 
+/**
+ * Under the T3 tool groups: only requests from a thread are filtered. The
+ * agent-facing refusal text leaves this out on purpose, so it does not point a refused agent at it.
+ */
+export const MCP_NOT_A_SANDBOX_NOTE =
+  "Profiles are not a sandbox: only requests that come from a thread are filtered. A request with no thread (an OAuth client, the `t3 thread` CLI, a script run from a shell with the owner's access) gets every T3 tool.";
+
 export const MCP_PICK_APPLIES_NOTE = "A change applies from the next message.";
 
 export type McpProfileRow =
