@@ -20,7 +20,8 @@ then only reports what it would ask for. Start from the gate's
 - `min_lenses`: at least 2 for critical, 1 for normal, 0 for light.
 - `rounds`: the gate's own cap. Keep `max` at or above the kit's `lens_rounds` (the plan warns otherwise).
 - `findings: true`: the gate holds a head while a lens's newest read has an open blocker or major.
-- `state_line: true`: the gate parses it but does not enforce it yet; the kit's `check` does.
+- `state_line: true`: the gate parses it but does not enforce it yet; the kit's `check` does, with the gate's own
+  rule for what counts as a `state:` line (`review_judge.has_state_line`).
 
 Also set the queue config's `lens_format_doc` (a text the gate only quotes in its comments) to where agents read
 the format: the kit's [COMMENTS.md](COMMENTS.md) at the fork tag the project pins, or the project's adapter skill
@@ -28,7 +29,8 @@ if it links there.
 
 Check it: `python3 -I fork-kit/review/lib/review_kit.py plan --root . --changes <file>` with a
 `git diff --name-status -z -M` output, or `--base origin/main` on a branch. A config the gate refuses gives a plain
-message and exit 2.
+message and exit 2. Run the kit from a fork checkout at the release the project's gate pins (README.md, "Which fork
+version").
 
 ## 2. Lens prompt files
 
@@ -65,7 +67,16 @@ Optional: `.github/review-kit.json`. No file means the defaults. Every key is op
 | `state_question`    | _What happens when this runs again, stops half-way, or meets existing, old or empty state?_    |
 
 [review-kit.example.json](review-kit.example.json) shows one. An empty file, an unknown key or a wrong value is
-refused with a plain message naming every problem, so a typo never turns into a silent default.
+refused with a plain message naming every problem, so a typo never turns into a silent default. A project that keeps
+the file under another name gives it with `--settings <file>` to every `plan` and `check`; without it, a plan that
+finds no queue config names any `.github/*review-kit*.json` it sees as the likely missing `--settings`.
+
+**This file or T3's review rules setting:** T3 has a per-machine setting for the same runners (`server.reviewRules`
+and `projectOverride.reviewRules`, docs/fork/README.md). Nothing in T3 reads it yet, so today this file decides. Once
+T3 starts lenses itself, each decides what it starts: T3's setting the lenses T3 starts on that machine (the
+machine's half: which provider and model it has), this file every lens an agent starts by hand from the skill and
+what `plan` prints. Keep the two the same; the gate does not read either, so a difference changes cost and recall,
+never what passes.
 
 ## 5. Enforce
 

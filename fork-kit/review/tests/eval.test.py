@@ -6,7 +6,7 @@ lib/review_eval.py and shows its test then fails.
 
   python3 -I -B fork-kit/review/tests/eval.test.py
 """
-import io, json, os, shutil, socket, subprocess, sys, tempfile, types, unittest
+import glob, io, json, os, shutil, socket, subprocess, sys, tempfile, types, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True   # the CI runner has no -B; keep the kit folder free of __pycache__
@@ -263,8 +263,13 @@ def transcript(first, entries):
     return '\n'.join(lines) + '\n'
 
 
-def turn(mid, at, **usage):
-    return {'type': 'assistant', 'timestamp': at, 'message': {'id': mid, 'model': 'model-a', 'usage': usage}}
+def turn(mid, at, model='model-a', **usage):
+    return {'type': 'assistant', 'timestamp': at, 'message': {'id': mid, 'model': model, 'usage': usage}}
+
+
+def meta(parent=None, depth=1):
+    return json.dumps({'agentType': 'general-purpose', 'spawnDepth': depth,
+                       **({'parentAgentId': parent} if parent else {})})
 
 
 class Cost(Fixture):
@@ -280,7 +285,7 @@ class Cost(Fixture):
             turn('m2', '2026-01-01T00:02:00Z', input_tokens=0, output_tokens=900, cache_creation_input_tokens=500),
             turn('m3', '2026-01-01T03:00:00Z', output_tokens=0)]))   # after a long idle gap: not active
         self.put('transcripts/two.jsonl', transcript([{'type': 'text', 'text': f'RUN-ID: {b["id"]}'}], [
-            turn('n1', '2026-01-01T00:00:30Z', output_tokens=1)]))
+            turn('n1', '2026-01-01T00:00:30Z', 'model-b', output_tokens=1)]))
         self.put('transcripts/parent.jsonl', transcript(f'start the runs; RUN-ID: {a["id"]}', [
             turn('p1', '2026-01-01T00:00:30Z', output_tokens=10 ** 6)]))   # mentions a run, is none
         self.put('transcripts/broken.jsonl', '{not json\n')
@@ -301,6 +306,99 @@ class Cost(Fixture):
     def test_no_transcripts(self):
         self.ok('runs')
         self.assertIn('0 runs costed', self.ok('cost'))
+
+    def test_sub_agent_transcripts_count(self):   # #797 item 6
+        """A run's own sub-agents (<session>/subagents/*.jsonl) are its cost; a run started as a sub-agent is found by
+        the sub-agent glob, as in the example config."""
+        self.cfg['transcripts'] = ['../transcripts/*.jsonl', '../transcripts/*/subagents/*.jsonl']
+        self.put('eval/eval.json', json.dumps(self.cfg))
+        self.ok('runs')
+        a = next(r for r in self.runs() if r['model'] == 'model-a')
+        b = next(r for r in self.runs() if r['model'] == 'model-b')
+        self.put('transcripts/one.jsonl', transcript(f'RUN-ID: {a["id"]}\n\nYou are one reviewer', [
+            turn('m1', '2026-01-01T00:01:00Z', output_tokens=100)]))
+        self.put('transcripts/one/subagents/agent-x.jsonl', transcript('read src/store.py and report', [
+            turn('s1', '2026-01-01T00:01:30Z', output_tokens=40)]))
+        self.put('transcripts/orchestrator.jsonl', transcript('start the eval runs', [
+            turn('o1', '2026-01-01T00:00:10Z', output_tokens=10 ** 6)]))   # starts runs as sub-agents, is none
+        self.put('transcripts/orchestrator/subagents/agent-y.jsonl', transcript(f'RUN-ID: {b["id"]}\n\nreview', [
+            turn('y1', '2026-01-01T00:00:20Z', output_tokens=7)]))
+        out = self.ok('cost')
+        self.assertIn('2 runs costed', out)
+        with open(os.path.join(self.work, 'gt', 'cost.json')) as f:
+            cost = json.load(f)
+        self.assertEqual((cost[a['id']]['output'], cost[a['id']]['files']), (140, 2))
+        self.assertEqual((cost[b['id']]['output'], cost[b['id']]['files']), (7, 1))
+        self.assertEqual(self.ok('cost'), out)
+
+    def test_the_example_config_finds_sub_agent_transcripts(self):   # #797 item 6
+        with open(os.path.join(KIT, 'eval', 'eval.example.json'), encoding='utf-8') as f:
+            patterns = json.load(f)['transcripts']
+        home = os.path.join(self.dir, 'home')
+        os.environ['HOME'] = home
+        for rel in ('.claude/projects/p/s.jsonl', '.claude/projects/p/s/subagents/agent-a1.jsonl',
+                    '.claude/projects/p/s/subagents/workflows/wf_1/agent-a2.jsonl'):
+            self.put(os.path.join('home', rel), '{}\n')
+            with self.subTest(rel):
+                self.assertTrue(any(os.path.join(home, rel) in glob.glob(os.path.expanduser(g)) for g in patterns),
+                                f'no pattern of eval.example.json finds {rel}')
+
+    def test_sub_agents_at_every_depth_and_in_workflows_count(self):   # #957 item 3
+        """Claude Code keeps every sub-agent of a session flat in <session>/subagents/ (workflow agents under
+        subagents/workflows/wf_*/), each with a meta file naming its parentAgentId. A run that is the session counts
+        all of them; a run that is a sub-agent counts its own descendants only, never its siblings."""
+        self.cfg['transcripts'] = ['../transcripts/*.jsonl', '../transcripts/*/subagents/*.jsonl',
+                                   '../transcripts/*/subagents/workflows/*/*.jsonl']
+        self.put('eval/eval.json', json.dumps(self.cfg))
+        self.ok('runs')
+        a = next(r for r in self.runs() if r['model'] == 'model-a')
+        b = next(r for r in self.runs() if r['model'] == 'model-b')
+        self.put('transcripts/one.jsonl', transcript(f'RUN-ID: {a["id"]}\n\nreview', [
+            turn('m1', '2026-01-01T00:01:00Z', output_tokens=100)]))
+        self.put('transcripts/one/subagents/workflows/wf_1/agent-w1.jsonl', transcript('a workflow step', [
+            turn('w1', '2026-01-01T00:01:10Z', output_tokens=30)]))
+        self.put('transcripts/one/subagents/workflows/wf_1/agent-w1.meta.json', meta())
+        # the orchestrator starts run b as a sub-agent (y); y starts z, z starts zz (and a workflow agent wz);
+        # x is y's sibling (another run's work): not b's cost
+        self.put('transcripts/orch.jsonl', transcript('start the eval runs', [
+            turn('o1', '2026-01-01T00:00:10Z', output_tokens=10 ** 6)]))
+        for name, parent, out_tokens, depth, folder in (('y', None, 7, 1, ''), ('z', 'y', 11, 2, ''),
+                                                        ('zz', 'z', 13, 3, ''), ('wz', 'z', 17, 3, 'workflows/wf_2/'),
+                                                        ('x', None, 1000, 1, ''), ('xc', 'x', 1000, 2, '')):
+            first = f'RUN-ID: {b["id"]}\n\nreview' if name == 'y' else f'work of {name}'
+            self.put(f'transcripts/orch/subagents/{folder}agent-{name}.jsonl', transcript(first, [
+                turn(f'{name}1', '2026-01-01T00:00:20Z', 'model-b', output_tokens=out_tokens)]))
+            self.put(f'transcripts/orch/subagents/{folder}agent-{name}.meta.json', meta(parent, depth))
+        out = self.ok('cost')
+        with open(os.path.join(self.work, 'gt', 'cost.json')) as f:
+            cost = json.load(f)
+        self.assertEqual((cost[a['id']]['output'], cost[a['id']]['files']), (130, 2))
+        self.assertEqual((cost[b['id']]['output'], cost[b['id']]['files']), (7 + 11 + 13 + 17, 4))
+        self.assertEqual(self.ok('cost'), out)
+
+    def test_each_message_is_priced_at_its_own_model(self):   # #957 item 3
+        """A sub-agent on another model is priced at that model, and model_seen is the run's own model."""
+        self.cfg['prices'] = {'model-a': PRICE, 'model-c': {k: v * 10 for k, v in PRICE.items()}}
+        self.put('eval/eval.json', json.dumps(self.cfg))
+        self.ok('runs')
+        a = next(r for r in self.runs() if r['model'] == 'model-a')
+        self.put('transcripts/one.jsonl', transcript(f'RUN-ID: {a["id"]}\n\nreview', [
+            turn('m1', '2026-01-01T00:01:00Z', output_tokens=1000),
+            turn('m0', '2026-01-01T00:01:01Z', '<synthetic>', output_tokens=0)]))   # nothing to price
+        self.put('transcripts/one/subagents/agent-s.jsonl', transcript('help', [
+            turn('s1', '2026-01-01T00:01:30Z', 'model-c', output_tokens=1000)]))
+        out = self.ok('cost')
+        self.assertNotIn('no price', out)
+        with open(os.path.join(self.work, 'gt', 'cost.json')) as f:
+            ca = json.load(f)[a['id']]
+        self.assertEqual(ca['usd'], round((1000 * 20 + 1000 * 200) / 1e6, 3))
+        self.assertEqual(ca['model_seen'], 'model-a')
+        self.put('transcripts/one/subagents/agent-s.jsonl', transcript('help', [
+            turn('s1', '2026-01-01T00:01:30Z', 'model-d', output_tokens=1000)]))
+        out = self.ok('cost')
+        self.assertIn('no price for model-d: add it under prices', out)
+        with open(os.path.join(self.work, 'gt', 'cost.json')) as f:
+            self.assertIsNone(json.load(f)[a['id']]['usd'])
 
 
 class Analyze(Fixture):
@@ -365,6 +463,24 @@ class Analyze(Fixture):
         self.ok('judge-prep', 'A')
         self.put('work/judge/A/scores.json', json.dumps({'reviews': {}}))
         self.assertIn('judge the case again', self.plain(self.ev('analyze')))
+
+    def test_malformed_scores_are_a_plain_message(self):   # #797 item 5: never a traceback
+        self.ok('runs')
+        self.report_all()
+        self.ok('judge-prep', 'A')
+        with open(os.path.join(self.work, 'gt', 'judgemap.json')) as f:
+            review = sorted(json.load(f)['A'])[0]
+        good = {'found': ['A-M1'], 'findings': [{'n': 1, 'verdict': 'match'}]}
+        for scores in ([], 'x', {'reviews': []}, {'reviews': {review: {**good, 'found': 'A-M1'}}},
+                       {'reviews': {review: {**good, 'found': [1]}}},
+                       {'reviews': {review: {**good, 'findings': [1]}}},
+                       {'reviews': {review: {**good, 'findings': {'n': 1}}}},
+                       {'reviews': {review: {**good, 'findings': [{'verdict': ['fp']}]}}}):
+            with self.subTest(scores=scores):
+                self.put('work/judge/A/scores.json', json.dumps(scores))
+                said = self.plain(self.ev('analyze'))
+                self.assertIn('judge the case again', said)
+                self.assertIn('judge_prompt.txt', said)
 
 
 class Config(Fixture):
@@ -436,8 +552,26 @@ MUTATIONS = {
                                (Runs, 'test_runs_again_the_same')),
     'only a run\'s own session counts': ('m = RUN_RE.match(_first_user_text(f).lstrip())',
                                          'm = RUN_RE.search(_first_user_text(f))', (Cost, 'test_tokens_dollars_and_minutes')),
-    'a message is counted once': ("usage[m.get('id') or e.get('requestId') or len(usage)] = m['usage']",
-                                  "usage[len(usage)] = m['usage']", (Cost, 'test_tokens_dollars_and_minutes')),
+    "a run's own sub-agents count": ("tree = os.path.join(f[:-len('.jsonl')], 'subagents')",
+                                     "tree = os.path.join(f[:-len('.jsonl')], 'none')",
+                                     (Cost, 'test_sub_agent_transcripts_count')),
+    "workflow agents count": ("glob.glob(os.path.join(glob.escape(tree), '**', '*.jsonl'), recursive=True)",
+                              "glob.glob(os.path.join(glob.escape(tree), '*.jsonl'))",
+                              (Cost, 'test_sub_agents_at_every_depth_and_in_workflows_count')),
+    "a sub-agent run's own descendants count": ("_meta(g).get('parentAgentId') in ids", 'False',
+                                                (Cost, 'test_sub_agents_at_every_depth_and_in_workflows_count')),
+    "a sub-agent run's siblings do not count": ('    return own\n', '    return [f, *(g for g in agents.values() if g != f)]\n',
+                                                (Cost, 'test_sub_agents_at_every_depth_and_in_workflows_count')),
+    'each message at its own price': ("p = c['prices'].get(msg_model or runs[rid]['model'])",
+                                      "p = c['prices'].get(runs[rid]['model'])",
+                                      (Cost, 'test_each_message_is_priced_at_its_own_model')),
+    "the run's own model is seen": ("if f == fs[0] and any(_usage_tokens(m['usage']).values()):", 'if True:',
+                                    (Cost, 'test_each_message_is_priced_at_its_own_model')),
+    'malformed scores are refused': ("    if bad:\n        raise Problem(f'case {name}: {path} is not in the shape",
+                                     "    if False:\n        raise Problem(f'case {name}: {path} is not in the shape",
+                                     (Analyze, 'test_malformed_scores_are_a_plain_message')),
+    'a message is counted once': ("usage[m.get('id') or e.get('requestId') or len(usage)] = (m.get('model'), m['usage'])",
+                                  "usage[len(usage)] = (m.get('model'), m['usage'])", (Cost, 'test_tokens_dollars_and_minutes')),
     'idle gaps are not active': ('if b - a <= gap)', ')', (Cost, 'test_tokens_dollars_and_minutes')),
     'a case without blocker/major has no recall': ("'bm_recall': len(found & bm) / len(bm) if bm else None",
                                                    "'bm_recall': len(found & bm) / len(bm)",

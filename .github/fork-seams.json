@@ -25,6 +25,14 @@
         "added": ["...ForkSettings.ForkClientSettingsPatchFields,"]
       }
     },
+    "packages/client-runtime/package.json": {
+      "why": "The calm sidebar's shared logic (fork file src/state/threadRoles.ts) is exported for the web and phone lists with one line; it is announced for the sidebar PR that first imports it. One line, since the four-line form's closing brace is a line upstream already has.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": ["\"./state/thread-roles\": \"./src/state/threadRoles.ts\","]
+      }
+    },
     "packages/shared/src/serverSettings.ts": {
       "why": "A settings patch's fork fields are applied by forkSettingsPatch.ts, by the rules in forkSettings.ts.",
       "added": [
@@ -569,6 +577,7 @@
     "apps/web/src/clientPersistenceStorage.removedKeys.test.ts",
     "apps/web/src/components/settings/WaitsAndSlotsSettings*",
     "apps/web/src/components/settings/waitsAndSlotsSettings*",
+    "packages/client-runtime/src/state/threadRoles*",
     "packages/contracts/src/editor.test.ts",
     "packages/contracts/src/handoff.test.ts",
     "packages/contracts/src/handoff.ts",
@@ -576,6 +585,7 @@
     "packages/contracts/src/modelPolicy*",
     "packages/contracts/src/playtest*",
     "packages/contracts/src/reviewRules*",
+    "packages/contracts/src/threadRoles*",
     "packages/contracts/src/usagePacing.ts",
     "packages/contracts/src/waitFor*",
     "packages/shared/src/agentSlots*",

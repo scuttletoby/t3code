@@ -1088,7 +1088,7 @@ class Parts(unittest.TestCase):
         # #761 items 1 and 8. heavy makes ~/.local/state when it is missing: never in another user's home (root with a
         # user's HOME, `sudo -E heavy ...`, would leave a root-owned folder there) and never in the job's working
         # folder (no HOME and no passwd entry: expanduser('~') is a relative '~'). docker-label finds the same folder.
-        import contextlib, pwd, types
+        import contextlib, io, pwd, types
         from unittest import mock
         sweep = load_sweep_of_wrapper()
         mine, pw_home, work = (os.path.join(self.dir, n) for n in ('mine', 'pw-home', 'work'))
@@ -1165,6 +1165,28 @@ class Parts(unittest.TestCase):
         self.assertEqual(state(mine, pw_home)[:2], (labelled(pw_home), os.path.join(pw_home, '.local', 'state')))
         self.assertFalse(os.path.exists(os.path.join(mine, '.local')))
         os.chmod(mine, 0o700)
+        # #771 item 1: a ~/.local others can write is not used (they could swap state for a link): no second folder,
+        # nothing made in it; only this user's again: used
+        os.mkdir(os.path.join(mine, '.local'), 0o700)
+        os.chmod(os.path.join(mine, '.local'), 0o777)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(state(mine, pw_home)[0], '')
+        # #945: said, not dropped silently (a ~/.local of mode 775, as umask 002 makes it), with the repair
+        self.assertIn(f'chmod go-w {os.path.join(mine, ".local")}', err.getvalue())
+        self.assertEqual(os.listdir(os.path.join(mine, '.local')), [])
+        # a ~/.local another user owns (root's, from an older heavy run as root): the repair is chown, not chmod
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.mod.own_folder(os.path.join(theirs, 'state'), make_base=True), '')
+        self.assertIn(f'sudo chown "$USER:" {theirs}', err.getvalue())
+        self.assertNotIn('chmod go-w', err.getvalue())
+        os.chmod(os.path.join(mine, '.local'), 0o700)
+        self.assertEqual(state(mine, pw_home)[0], labelled(mine))
+        # #771 nit: a HOME given as a link is resolved once, so a link swapped after the check changes nothing
+        linked = os.path.join(self.dir, 'home-link')
+        os.symlink(mine, linked)
+        self.assertEqual(state(linked, pw_home), (labelled(mine),) + (os.path.join(mine, '.local', 'state'),) * 2)
         # as root: HOME=/tmp (root's, anyone can write it), where another user planted .local -> their own folder,
         # and HOME=/: root's own home from the passwd database instead, and nothing made in the planted folder
         tmp, victim, roots = (os.path.join(self.dir, n) for n in ('tmp', 'victim', 'root-home'))
@@ -1312,7 +1334,9 @@ def untimed(source, name):
     subprocess.run and friends without timeout= (also passed on uncalled, as to addCleanup, imported bare, or through
     `import subprocess as sp`), getoutput and getstatusoutput (no timeout at all), wait() without a time,
     communicate() without timeout= (its first positional argument is the input, not the time), a bound wait or
-    communicate passed on uncalled without timeout=, os.waitpid or os.wait4 without WNOHANG, and outside read_line
+    communicate passed on uncalled without timeout=, os.waitpid or os.wait4 without WNOHANG, both imported bare
+    (`from os import waitpid`: its flags are not checked), `with Popen(...)` (its exit waits with no time limit;
+    #771), and outside read_line
     any read of a process's stdout or stderr (called, or passed on uncalled as to iter), a loop over one, or one
     given to list/next/enumerate/map/join and the like."""
     import ast
@@ -1340,6 +1364,14 @@ def untimed(source, name):
         if isinstance(n, ast.ImportFrom) and n.module == 'subprocess':
             found += [f'{name}:{n.lineno} from subprocess import {a.name}' for a in n.names
                       if a.name in UNTIMED_CALLS + NEVER_TIMED]
+        elif isinstance(n, ast.ImportFrom) and n.module == 'os':
+            found += [f'{name}:{n.lineno} from os import {a.name} (use os.{a.name} with WNOHANG, or wait_pid)'
+                      for a in n.names if a.name in ('waitpid', 'wait4')]
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            found += [f'{name}:{n.lineno} with Popen(...) (its exit waits with no time limit)' for item in n.items
+                      if isinstance(item.context_expr, ast.Call)
+                      and (of_subprocess(item.context_expr.func, ('Popen',))
+                           or (isinstance(item.context_expr.func, ast.Name) and item.context_expr.func.id == 'Popen'))]
         elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)) and is_pipe(n.iter):
             found.append(f'{name}:{getattr(n, "lineno", n.iter.lineno)} loop over .{n.iter.attr} (use read_line)')
         elif isinstance(n, ast.Attribute) and n.attr in READS and is_pipe(n.value):
@@ -1409,6 +1441,10 @@ class Hygiene(unittest.TestCase):
             "subprocess.getoutput('x')": 1, "subprocess.getstatusoutput('x')": 1, 'from subprocess import getoutput': 1,
             "self.addCleanup(subprocess.getoutput, 'x')": 1,
             'os.waitpid(pid, 0)': 1, 'os.wait4(pid, 0)': 1, 'os.waitpid(pid, os.WNOHANG)': 0,
+            'from os import waitpid': 1, 'from os import wait4 as w': 1, 'from os import WNOHANG, getpid': 0,
+            "with subprocess.Popen(['x']) as p: pass": 1, "with Popen(['x']) as p: pass": 1,
+            "import subprocess as sp\nwith sp.Popen(['x']) as p: pass": 1, "with open('x') as f: pass": 0,
+            "p = subprocess.Popen(['x'])": 0,
             'self.addCleanup(p.wait)': 1, 'self.addCleanup(p.communicate)': 1, 'self.addCleanup(p.wait, 5)': 0,
             'self.addCleanup(p.wait, timeout=5)': 0, 'self.addCleanup(p.communicate, None, 5)': 0,
             'self.addCleanup(p.stdout.close)': 0,
