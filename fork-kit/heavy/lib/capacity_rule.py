@@ -281,9 +281,9 @@ def capacity_kind(rule, kind):
 
 def cost_of(rule, kind, learned, declared):
     spec = rule['kinds'][kind]
+    sane = math.ceil(declared) if is_num(declared) and 0 < declared <= rule['readingBounds']['maxTotalMb'] else None
     if spec.get('plusDeclared') is True:
-        ok = is_num(declared) and 0 < declared <= rule['readingBounds']['maxTotalMb']
-        mb = spec['startMb'] + (math.ceil(declared) if ok else spec.get('declaredFallbackMb', 0))
+        mb = spec['startMb'] + (sane if sane is not None else spec.get('declaredFallbackMb', 0))
         return {'mb': mb, 'centiCores': spec['startCentiCores'], 'unlearnedMb': mb}
     lo, hi = rule['learnedBounds']['minPercent'], rule['learnedBounds']['maxPercent']
 
@@ -293,8 +293,9 @@ def cost_of(rule, kind, learned, declared):
         return min(max(math.ceil(v), _ceil_div(start * lo, 100)), math.floor(start * hi / 100))
     own = learned.get(kind) if isinstance(learned, dict) else None
     own = own if isinstance(own, dict) else {}
-    return {'mb': clamp(own.get('mb'), spec['startMb']), 'centiCores': clamp(own.get('centiCores'),
-            spec['startCentiCores']), 'unlearnedMb': spec['startMb']}
+    floor = sane or 0       # a declared size is a floor of any other kind's cost (#800)
+    return {'mb': max(clamp(own.get('mb'), spec['startMb']), floor), 'centiCores': clamp(own.get('centiCores'),
+            spec['startCentiCores']), 'unlearnedMb': max(spec['startMb'], floor)}
 
 
 def _margin(rule, r, piece_caps):

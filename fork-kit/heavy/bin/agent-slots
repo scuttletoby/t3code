@@ -19,8 +19,18 @@ DEFAULTS = {'sessions_file': '', 'queue': '', 'ready_heading': '## Ready', 'max_
             'kind': 'agent-writer', 'note': ''}
 
 
-def kit_file(rel):
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), rel)
+KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def facts_module():
+    """lib/heavy_facts.py of this kit, imported from the kit's own lib folder (root's once installed); it loads the
+    rest with its own loader, the one copy (#800). Called inside the caller's try: a kit that cannot load is no
+    answer, never a traceback."""
+    lib = os.path.join(KIT, 'lib')
+    if sys.path[:1] != [lib]:
+        sys.path.insert(0, lib)
+    import heavy_facts
+    return heavy_facts
 
 
 def config():
@@ -52,8 +62,9 @@ def ready_items(c):
 
 
 def alive(c):
-    if 'AGENT_SLOTS_ALIVE' in os.environ:       # tests
-        return int(os.environ['AGENT_SLOTS_ALIVE'])
+    n = facts_module().test_env('AGENT_SLOTS_ALIVE')    # tests (with HEAVY_TESTING=1 only, #800)
+    if n is not None:
+        return int(n)
     r = subprocess.run(['pgrep', '-c', '-x', c['process_name']], capture_output=True, text=True)
     return int((r.stdout or '0').strip() or 0)
 
@@ -61,8 +72,8 @@ def alive(c):
 def machine(kind):
     """(slots the machine has for kind, the words for the line)."""
     try:
-        hf = load(kit_file('lib/heavy_facts.py'))
-        verdict, why, d = hf.ask(os.environ.get('AGENT_SLOTS_HEAVY') or kit_file('bin/heavy'), kind)
+        hf = facts_module()
+        verdict, why, d = hf.ask(hf.test_env('AGENT_SLOTS_HEAVY') or os.path.join(KIT, 'bin', 'heavy'), kind)
     except Exception as e:
         verdict, why, d = 'unavailable', f'{e.__class__.__name__}: {e}', None
     fits = d.get('fits') if isinstance(d, dict) else None
@@ -91,14 +102,6 @@ def decide(data, c):
         return {'decision': 'block', 'reason': msg + ' Fill the free slots from the ready queue before ending the '
                 'turn. If an item cannot start now, move it out of the ready list with the reason.'}
     return None
-
-
-def load(path):
-    import importlib.machinery, importlib.util
-    loader = importlib.machinery.SourceFileLoader('heavy_facts', path)
-    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader('heavy_facts', loader))
-    loader.exec_module(mod)
-    return mod
 
 
 def main():
