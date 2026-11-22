@@ -19,7 +19,7 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 | ---------------------------- | -------------------------------------------------------------------------------------------- |
 | `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends |
 | `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)        |
-| `heavy --self-check`         | checks the config, that the slice has a unit with a memory limit, and the installed files    |
+| `heavy --self-check`         | checks the config, the slice's limit and the installed files; warns on another `t3-capacity` |
 | `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                              |
 | `heavy sweep [--dry-run]`    | one leftover sweep (below); the user timer runs it every 5 minutes                           |
 | `heavy sweep --json`         | looks only: what a sweep would stop or report, as JSON                                       |
@@ -59,9 +59,11 @@ heavy asks Docker only after a run that labelled a container (`heavy docker-labe
 `/run/user` is full or a sandbox has a `/run/user` of its own, in `~/.local/state/heavy/labelled/`, which heavy
 reads too; the home is `$HOME`, else the password database's, and only one this user owns and no one else can
 write (not `/`), so heavy run as root with a user's `HOME` (`sudo -E heavy ...`) or `HOME=/tmp` uses root's own home
-and never makes a root-owned folder in the user's; `~/.local` must be a real folder (not a link) of the user's;
-an older heavy run as root with your `HOME` may have left a root-owned `~/.local/state` (heavy then skips it):
-`sudo chown -R "$USER:" ~/.local/state` gives it back;
+and never makes a root-owned folder in the user's; `~/.local` must be a real folder (not a link, even to a folder
+of the user's: kept fail-closed) of the user's that no one else can write; an older heavy run as root with your
+`HOME` may have left a root-owned `~/.local` or `~/.local/state`, and a umask of 002 a `~/.local` of mode 775
+(heavy then skips it and says so):
+`sudo chown "$USER:" ~/.local && sudo chown -R "$USER:" ~/.local/state && chmod go-w ~/.local` gives them back;
 heavy tells `docker-label` which folders it reads in `HEAVY_MARKS`; without either folder heavy asks after every
 run), so a run with no containers costs no `docker ps`. No Docker, or none this user can reach (a
 rootless Docker through `docker context use` counts as reachable): nothing to do, nothing said. Docker down: one
@@ -543,9 +545,25 @@ after another, up to the group's ceiling), the memory budget, the queue and note
 - **--kind K:** does the rule admit one piece of K (`agent-writer`, `job-build`, or heavy's own `build`). **--mb
   MB** alone: do MB fit the free budget at level "ok"; with --kind, the piece declares MB.
 - **T3 down or not installed:** no agent scopes, still an answer from the kernel.
-- **Tiers:** full with cgroup v2 and a systemd user manager. Without them (Basic) agents and other users' work
-  cannot be counted, so the answer is never free and every `fits` is 0 (a note says why). An other user's folder
-  that exists but cannot be listed is Basic too.
+- **Tiers:** full with cgroup v2 and a systemd user manager. Machine with cgroup v2 and `user.slice` but no user
+  manager of the caller's (a CI runner's user without lingering or a login session): it has no agents or heavy
+  jobs of its own, every user's are counted as usual, and so are other people's reservations (`tier: "machine"`, a
+  note, and the reason says "machine-wide numbers"). Its limits:
+  - It reads only each person's default `~/.config/t3-capacity/reserve.d`, not a `T3_CAPACITY_RESERVE_DIR` they
+    set for themselves.
+  - It reads the people of `/etc/passwd` with a UID from `UID_MIN` to `UID_MAX`, and anyone with a `user.slice`
+    session. Not read: root and system users (below `UID_MIN`), people known only through NSS (LDAP, sssd) who have
+    no session now, and homes that are `/` or not absolute.
+  - Each `.conf` there must be a plain file: a link (stow-style dotfiles) is refused and makes the tier Basic.
+  - A person's `reserve.d` it cannot read (a home closed to others, mode 750 or 700), or a user with a session but
+    no home it can find, makes it Basic.
+  - A caller that is not root cannot see another person's working folders, so their reservations hold their whole
+    size, and their agents' debts are counted too. That is stricter than a caller with a user manager, never looser.
+
+  Without cgroup v2, or without both a user manager and `user.slice` (Basic), agents and other users' work cannot
+  be counted, so the answer is never free and every `fits` is 0 (a note says why). An other user's folder that
+  exists but cannot be listed is Basic too.
+
 - **Unreadable signals** (PSI, a box with a live piece but without its `memory.pressure`, or with no folder at
   all) give "elevated", never "ok"; a missing MemAvailable or a container limit that cannot be read gives busy for
   every kind. A box with no live piece of its own passes no box pressure (as the server's observer). A piece whose
@@ -553,10 +571,15 @@ after another, up to the group's ceiling), the memory budget, the queue and note
 - **Reservations:** files `~/.config/t3-capacity/reserve.d/*.conf` (or `$T3_CAPACITY_RESERVE_DIR`), lines
   `<MB> <absolute folder> [until=YYYY-MM-DD]`. The folder matches itself and what is below it, with or without a
   trailing `/`, never a sibling sharing its first letters (`/x/app` is not `/x/app-x`); its real path (links
-  resolved) matches too. A reservation holds back its MB less what this user's processes working in that folder
-  already use; a caller working inside the folder (its real working folder) is not held back by its own
-  reservation. Ended, broken or unreadable lines hold nothing and give a note. Limit: another user's reservations
-  are not seen.
+  resolved) matches too. A reservation holds back its MB less what its user's processes working in that folder
+  already use, and less what agents and heavy jobs with a process working there still owe the rule (their cost
+  less their demand, `owedMb`): that room is already held as their debt, so it is counted once (one idle 300 MB
+  agent under a 1536 MB reservation holds 1536 MB in all, not 1536 + 768 - 300). Each process counts toward one
+  reservation only (the deepest folder that holds it, then the first by file name), and a piece's debt is split
+  over its processes by their use, so with two or nested reserved folders nothing is taken off twice. A caller working
+  inside the folder (its real working folder) is not held back by its own reservation. Ended, broken or unreadable
+  lines hold nothing and give a note. Limit: in the full tier another user's reservations are not seen (the
+  machine tier reads them, above).
 - **Holds (machine file):** a cgroup outside the user managers, such as a CI runners' slice, is not in the ledger.
   `heavy.capacity.holds` names such cgroups; one that uses more than `inUseFromMb` (anon + shmem + swap) keeps its
   budget (its `memory.max`, or `budgetMb` when it has none) less the RAM it uses (anon + shmem: `memory.max` limits
@@ -564,30 +587,45 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   Not there: nothing runs in it. There without a memory controller (no `memory.stat`): its whole `budgetMb` is held,
   with a note. Its use cannot be read: the whole budget is held, with a note. A reservation file named like a hold
   (`<label>.conf`) gives a note; both hold.
-- **Cache:** `/run/user/<uid>/heavy-facts.json` (or `$HEAVY_FACTS_CACHE`), 0600, read again after 5 s (`--fresh`:
-  now). Pressure levels carry from it (at most 5 minutes old) so calm must last before a level drops. Without a
-  cache folder nothing carries, so every call starts "elevated" (only the rule's floors admit; never straight to
-  "ok").
+- **Cache:** `/run/user/<uid>/heavy-facts-v<version>-<hash>.json`, one file per kit version and settings (slice,
+  queue, reservations folder, user, holds), so two callers of one user with other settings, or an old and a new
+  kit, never share one and each one's hold-down steps down on its own (or one file, `$HEAVY_FACTS_CACHE`), 0600,
+  read again after 5 s (`--fresh`: now). A user without `/run/user/<uid>` (no user manager) uses
+  `heavy-facts-<uid>/` in the temporary folder (`$TMPDIR`, else `/tmp`, never the working folder), made 0700; one that is a link, another user's or open to
+  others, or no temporary folder this user can write, is no cache (a note). Pressure levels carry from it (at most
+  5 minutes old) so calm must last before a level drops. Without a cache folder, with a cache file that is there
+  but cannot be used (broken, from the future, other settings in `$HEAVY_FACTS_CACHE`), or with no file of its own
+  yet but another cache file of this user's written in the last 5 minutes beside it (another version, as once after
+  an update, or other settings), nothing carries, so the call starts "elevated" (only the rule's floors admit; never
+  straight to "ok"). Cache files of other settings or versions older than 5 minutes are removed.
 
-Two thin callers come with it (not linked onto PATH: a host wires them in itself):
+Two thin callers come with it:
 
 - `bin/t3-capacity [--kind KIND] [MB]`: the older host check's output (first line `available=..MB swapfree=..MB
-  load=..`, available less the rule's whole reservation hold, last line `OK` or `NOT OK: why`, exit 0 or 1), now
-  from `heavy facts`. MB defaults to 3072.
-- `bin/agent-slots`: a Claude Code hook (UserPromptSubmit, Stop) for orchestrator sessions: free agent slots are
-  the smaller of the process limit and the machine's `fits` for its kind.
+  load=..`, available less the rule's whole reservation hold, `reserved=` what admitted jobs and agents may still
+  grow into (so `available - reserved` counts each once), last line `OK` or `NOT OK: why`, exit 0 or 1), now
+  from `heavy facts`. MB defaults to 3072. The installer links `/usr/local/bin/t3-capacity` to it, so the command
+  has one source, the release in use (a host's own plain copy there only with `--replace-t3-capacity`: Install,
+  below); `heavy --self-check` warns when the `t3-capacity` found on PATH is another copy (its readings can differ:
+  an older copy, for one, counts no reservations).
+- `bin/agent-slots` (not linked onto PATH: a host wires it in itself): a Claude Code hook (UserPromptSubmit, Stop)
+  for orchestrator sessions: free agent slots are the smaller of the process limit and the machine's `fits` for
+  its kind.
 
 A `heavy facts` that does not answer within 5 s (it is killed), fails or prints something else is never free for
 either caller.
 
 ### Facts run again, stop half-way, or meet old or empty state
 
+- **No user manager** (no `/run/user/<uid>`): Machine tier, and the cache in the temporary folder, so the level
+  carries and can reach "ok" as with one.
 - **Runs again:** within 5 s the cache answers; two callers in the same second both answer and leave one valid
   cache (each writes its own temporary file and renames it).
 - **Stops half-way:** a temporary cache file is left; the next run removes ones older than a minute.
 - **Old, empty, broken or foreign cache** (another owner, group or other access, a link, a time in the future, an
-  unknown key or version, or written with other settings: slice, queue or reservations folder): read again from
-  the kernel. A cache that cannot be written gives a note.
+  unknown key or version (an older kit's cache, without each reservation's `owedMb`, is version 2), or written with
+  other settings: slice, queue or reservations folder): read again from the kernel. A cache that cannot be written
+  gives a note.
 - **Cost file** (`peaks.json`) missing, empty or broken: the rule's start costs, with the queue's note.
 - **Reservation file cut short** (its writer stopped half-way): its whole lines hold, the cut line is a note.
   A reservation whose processes are all gone still holds all its MB (the room is kept for them), until its
@@ -645,9 +683,11 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | ----------------------------------------------- | ------------------------------------------------------------------------- |
 | `/usr/local/bin/heavy`                          | link to `current/bin/heavy`                                               |
 | `/usr/local/sbin/heavy-install`                 | link to `current/sbin/heavy-install`                                      |
+| `/usr/local/bin/t3-capacity`                    | link to `current/bin/t3-capacity`                                         |
 | `/usr/local/libexec/heavy/versions/<sha>/`      | the code of one release, with `MANIFEST.sha256` (root 755)                |
 | `/usr/local/libexec/heavy/current`              | link to the release in use (switched in one step)                         |
 | `/usr/local/libexec/heavy/replaced/`            | a plain `/usr/local/bin/heavy` from before the kit, put back on uninstall |
+| `/usr/local/libexec/heavy-kept/`                | a plain `/usr/local/bin/t3-capacity` (a host's copy), put back likewise   |
 | `/etc/heavy/config.json`                        | slice name and grace time                                                 |
 | `/etc/heavy/installed.tsv`                      | every installed path with its link target or hash (`--self-check`)        |
 | `/etc/systemd/user/<slice>`                     | only with limit options: the slice unit                                   |
@@ -657,7 +697,8 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | `/run/user/<uid>/heavy-queue/<slice>/`          | the memory queue: its lock and one ticket per queued job (tmpfs)          |
 | `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
 |                                                 | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
-| `/run/user/<uid>/heavy-facts.json`              | `heavy facts`' 5 s cache (tmpfs)                                          |
+| `/run/user/<uid>/heavy-facts-*.json`            | `heavy facts`' 5 s cache (tmpfs), one per version and settings            |
+| `/tmp/heavy-facts-<uid>/heavy-facts-*.json`     | the same, for a user without `/run/user/<uid>` (no user manager)          |
 | `~/.config/t3-capacity/reserve.d/*.conf`        | each user's reservations for `heavy facts` and its callers                |
 
 ## Install (owner, as root)
@@ -674,17 +715,30 @@ It prints the sha, the hash of the download and every installed path. Add `--sli
 runs `systemctl --user daemon-reload`). Add `--sweep-timer` to install the leftover sweep's user units (each user
 then runs `systemctl --user daemon-reload && systemctl --user enable --now heavy-sweep.timer`; `--no-sweep-timer`
 removes them again). Upgrade: the same line again. Remove:
-`/usr/local/sbin/heavy-install uninstall` (puts an old plain `/usr/local/bin/heavy` back). Check:
-`heavy --self-check` (as the user: config, slice and files) or `heavy-install self-check` (files only).
+`/usr/local/sbin/heavy-install uninstall` (puts an old plain `/usr/local/bin/heavy` and `/usr/local/bin/t3-capacity`
+back). Check: `heavy --self-check` (as the user: config, slice and files, and a warning when `t3-capacity` on the
+user's PATH is not the kit's) or `heavy-install self-check` (files only).
+
+`/usr/local/bin/t3-capacity`: with nothing there, or the kit's link, the installer links it. A plain file there is a
+host's own copy, which the host's scripts may read or compare: the installer leaves it as it is and says so (in a
+note and again in its closing `installed release` line), until it is run once with `--replace-t3-capacity` (it
+keeps the copy in `/usr/local/libexec/heavy-kept/`, links the kit's, and later runs keep the link without the
+option). A link there that the kit did not make is left alone the same way; with `--replace-t3-capacity` it is
+refused (remove it by hand first: there is no file to keep). A host whose own installer wrote that copy first changes it to stop writing
+that path and to run `heavy-install` (or check that the path is the link to
+`/usr/local/libexec/heavy/current/bin/t3-capacity`): a copy over the link would land in the release's own folder
+(`heavy-install self-check` then says `changed since install`), and one written beside it and renamed over it puts
+a plain copy back (`heavy --self-check` says the link differs and warns about the copy).
 
 ## Runs again, stops half-way, old or empty state
 
 - **Runs again:** every step checks what is there and only fixes what differs; a second run changes nothing.
 - **Stops half-way:** the steps run in this order: check, folders, copy, self-test, config, slice unit, switch,
   links, sweep units, record. A version folder is copied to a temporary name and renamed; a half-copied or changed
-  one is made again. The old `/usr/local/bin/heavy` keeps working until the links step, which copies it to
-  `replaced/` before the link replaces it. The sweep's units are written only after that, so a timer never runs
-  before the release it needs is in use. Running the same line again finishes the job.
+  one is made again. The old `/usr/local/bin/heavy` and `/usr/local/bin/t3-capacity` keep working until the links
+  step, which copies each to its kept folder before its link replaces it in one rename. The sweep's units are
+  written only after that, so a timer never runs before the release it needs is in use. Running the same line again
+  finishes the job.
 - **Rollback:** the timer's service runs `/usr/local/libexec/heavy/current/lib/heavy_sweep.py` (the sweep of the
   release in use, never an older `heavy` without the `sweep` verb), and only when that file exists. Before going
   back to a release without the sweep, run the newer installer with `--no-sweep-timer`; if you did not, the
@@ -697,10 +751,21 @@ removes them again). Upgrade: the same line again. Remove:
 - **Rollback past the memory queue:** remove the `queue` key from the machine file's `heavy` section first. A
   release from before the queue does not know it: its sweep refuses the whole machine file and says which key. That
   release cannot be changed from here, so the order is the guard: key out, then the older release.
+- **Rollback past the `t3-capacity` link:** an older installer leaves `/usr/local/bin/t3-capacity` as it is, a link
+  to `current/bin/t3-capacity`; every release since `heavy facts` has that file. Before going back further, run
+  `heavy-install uninstall` (it puts the old copy back). The old copy is kept in `/usr/local/libexec/heavy-kept/`,
+  outside `/usr/local/libexec/heavy` and `/etc/heavy`, because an older installer's uninstall deletes those two
+  folders whole (and puts the newest file of `replaced/` back as `heavy`). That older uninstall does not know the
+  `t3-capacity` link, so it leaves it broken (every `t3-capacity N && …` gate then fails): run this release's
+  `sbin/heavy-install uninstall` from its source folder, as root, which removes the broken link and puts the kept
+  copy back, or install again.
 - **Old state:** a plain-file `/usr/local/bin/heavy` (the one-line wrapper from before) is kept and put back by
-  uninstall. A link there that points elsewhere, a folder where the kit expects its own, or a slice unit in
-  `/etc/systemd/user/` the kit did not write is refused with a message, never overwritten. Config values stay
-  unless an option names a new one.
+  uninstall; a plain `/usr/local/bin/t3-capacity` (a host's own copy) is left alone, or with `--replace-t3-capacity`
+  kept and put back by uninstall. A link at `t3-capacity` that points elsewhere is left alone (refused with
+  `--replace-t3-capacity`). A link at `heavy` or `heavy-install` that points elsewhere, a folder where the kit
+  expects its own, or a slice unit in `/etc/systemd/user/` the kit did not write is refused with a message, never
+  overwritten. Config
+  values stay unless an option names a new one.
 - **Empty state:** a fresh machine installs with the defaults. heavy then refuses to run commands until the slice
   has a unit with a memory limit (install with limit options, or add the unit).
 

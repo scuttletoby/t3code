@@ -4,15 +4,20 @@
   * size budgets (lines and bytes) for instruction files, matched by glob, first match wins; above `warn_at` of a
     budget a WARN line that never fails;
   * no history in instruction files (changelog blocks, "is live on" claims, dated "Updated" banners);
-  * every relative link resolves to a file or folder in the repository (code fences are skipped; `/x` is from the
-    repository root, as GitHub reads it; a link that leaves the repository is broken);
+  * every relative link resolves to a file or folder in the repository (code fences, opened as CommonMark does, and
+    inline code are skipped; `/x` is from the repository root, as GitHub reads it; a link that leaves the repository is broken); with --base, a
+    file the change deletes or renames away must have no link left to it in any file the config selects;
   * a newly added file whose name looks like a dated report, handoff or review belongs in the pull request or an
-    issue, not in the repository.
+    issue, not in the repository;
+  * a checked file is UTF-8 text that can be read (anything else fails, and its size is still checked); a symlink is
+    checked as the file it points to, which must be in the repository and not in .git (with --base, a change that
+    removes the file an untouched symlink points to fails). Sizes are the bytes on disk (CRLF included).
 
 The rules come from the project's JSON config (README "Config"); every key is optional and a missing, empty or `{}`
 config means the defaults. With --base the config is read at the base commit, never from the checkout, so a change
-cannot loosen the rules that judge it (a change to the config applies from the next change); with --all (or --files) it is read from the checkout. A config that is not
-valid JSON, has an unknown key or a value of the wrong type is an error (exit 2), never a pass.
+cannot loosen the rules that judge it through the config (a change to the config applies from the next change; the
+calling workflow is the change's own, so only review guards it); with --all (or --files) it is read from the checkout.
+A config that is not valid JSON, has an unknown key or a value of the wrong type is an error (exit 2), never a pass.
 
     python3 -I doc_check.py --base origin/main [--config .github/doc-check.json]   # changed files (CI)
     python3 -I doc_check.py --all                                                  # every tracked .md file
@@ -48,7 +53,10 @@ DEFAULTS = {
 }
 FLAGS = {'i': re.I, 'm': re.M, 's': re.S}
 LINK = re.compile(r'\]\(\s*(?:<([^<>\n]+)>|([^()\s<>]+))(?:\s+(?:"[^"\n]*"|\'[^\'\n]*\'))?\s*\)')
-FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
+# CommonMark: a fence opens or closes with 0-3 spaces of indent, counted from the content of the list item it is in.
+FENCE = re.compile(r'(`{3,}|~{3,})')
+LIST_ITEM = re.compile(r'([-*+]|\d{1,9}[.)])(?=[ \t]|$)')
+INLINE_CODE = re.compile(r'(`+)(?!`).*?(?<!`)\1(?!`)')
 SCHEME = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:')
 GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
 GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '--no-replace-objects')
@@ -170,49 +178,85 @@ def budget(rules, path):
     return None
 
 
+def lf(text):
+    """The text with every line ending one '\\n', as Python's text mode reads it."""
+    return text.replace('\r\n', '\n').replace('\r', '\n')
+
+
 def usage(b, text):
-    n, size = text.count('\n') + (0 if text.endswith('\n') or not text else 1), len(text.encode('utf-8'))
+    """(lines, bytes, share of the budget) of a file's exact text: bytes as on disk, CRLF and undecodable bytes too."""
+    size, text = len(text.encode('utf-8', 'surrogateescape')), lf(text)
+    n = text.count('\n') + (0 if text.endswith('\n') or not text else 1)
     return n, size, max(n / b[1], size / b[2])
 
 
 def link_lines(text):
-    """(line number, target) of each link outside code fences."""
-    fence = None
+    """(line number, target) of each link outside code fences. As in CommonMark, a fence opens with 0-3 spaces of
+    indent (a tab is 4) counted from the content column of the list item it is in; a line indented 4 or more is no
+    fence, and a fence in a list item ends with the item."""
+    fence, fence_col, items = None, 0, []   # items: the content columns of the open list items
     for no, line in enumerate(text.split('\n'), 1):
-        m = FENCE.match(line)
-        if m:
-            mark = m.group(1)
-            if fence is None:
-                fence = mark
-            elif mark[0] == fence[0] and len(mark) >= len(fence) and not line.strip()[len(mark):].strip():
+        wide = line.expandtabs(4)
+        body = wide.lstrip(' ')
+        indent = len(wide) - len(body)
+        if body and fence is not None and indent < fence_col:
+            fence = None                        # the list item the fence was in has ended
+        if body:
+            while items and indent < items[-1]:
+                items.pop()
+        col = fence_col if fence is not None else (items[-1] if items else 0)
+        m = FENCE.match(body) if body and indent - col <= 3 else None
+        if fence is not None:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not body[len(m.group(1)):].strip():
                 fence = None
             continue
+        if m and not (m.group(1)[0] == '`' and '`' in body[len(m.group(1)):]):
+            fence, fence_col = m.group(1), col
+            continue
+        item = LIST_ITEM.match(body) if body and indent - col <= 3 else None
+        if item:
+            rest = body[item.end():]
+            gap = len(rest) - len(rest.lstrip(' '))
+            items.append(indent + item.end() + (gap if rest.strip() and 1 <= gap <= 4 else 1))
         if fence is None:
-            for lm in LINK.finditer(line):
-                target = (lm.group(1) or lm.group(2)).split('#', 1)[0]
+            for lm in LINK.finditer(INLINE_CODE.sub('', line)):
+                target = re.split(r'[#?]', lm.group(1) or lm.group(2), maxsplit=1)[0]
                 if target:
                     yield no, target
 
 
-def broken_link(path, target, root):
-    """Why a relative link target is broken, or None when it resolves (or is no file link)."""
+def link_path(path, target, root):
+    """The path a relative link target names (under root), or None when it is no file link."""
     if SCHEME.match(target) or target.startswith('//'):
         return None
     target = unquote(target)
-    full = os.path.normpath(os.path.join(root, target.lstrip('/')) if target.startswith('/')
+    return os.path.normpath(os.path.join(root, target.lstrip('/')) if target.startswith('/')
                             else os.path.join(root, os.path.dirname(path), target))
+
+
+def broken_link(path, target, root):
+    """Why a relative link target is broken, or None when it resolves (or is no file link)."""
+    full = link_path(path, target, root)
+    if full is None:
+        return None
     real_root = os.path.realpath(root)
-    if os.path.commonpath([real_root, os.path.realpath(full)]) != real_root:
+    try:
+        real = os.path.realpath(full)
+    except (ValueError, OSError) as e:   # a NUL byte (%00), for example
+        return f'not a path ({e.__class__.__name__})'
+    if os.path.commonpath([real_root, real]) != real_root:
         return 'points outside the repository'
     return None if os.path.exists(full) else 'no such file'
 
 
-def check(rules, path, text, added, root='.', base_text=None):
-    """(problems, warnings) for one file's text. base_text: the file at the merge base ('' new, None unknown)."""
+def check(rules, path, text, added, root='.', base_text=None, links_from=None):
+    """(problems, warnings) for one file's exact text. base_text: the file at the merge base ('' new, None unknown).
+    links_from: the path its links are relative to (a symlink's target), else the path."""
     probs, warns = [], []
     b = budget(rules, path)
+    exact, text = text, lf(text)
     if b is not None:
-        n, size, share = usage(b, text)
+        n, size, share = usage(b, exact)
         if share > 1:
             probs.append((path, None, f'{n} lines / {size} B, budget {b[1]} lines / {b[2]} B ({b[0]}): move '
                                       'sometimes-needed text into its own file (never raise the budget)'))
@@ -230,7 +274,7 @@ def check(rules, path, text, added, root='.', base_text=None):
         probs.append((path, None, 'dated report, handoff or review file: put it in the pull request or an issue'))
     if rules['links']:
         for no, target in link_lines(text):
-            why = broken_link(path, target, root)
+            why = broken_link(links_from or path, target, root)
             if why:
                 probs.append((path, no, f'broken link {target}: {why}'))
     return probs, warns
@@ -241,16 +285,111 @@ def selected(rules, path):
 
 
 def changed_files(base):
-    """(merge base, [(path, added)]) of the files the change adds or modifies; renames count as added."""
+    """(merge base, [(path, added)], [removed]): the files the change adds or modifies (a rename's new name counts as
+    added, and a change of type, such as a file turned into a symlink, as modified), and those it deletes (a rename's
+    old name)."""
     mb = git('merge-base', base, 'HEAD')
     if mb is None or not mb.strip():
         raise ConfigError(f'no merge base of {base} and HEAD (check out with fetch-depth: 0)')
     mb = mb.strip()
-    out = git('diff', '--name-status', '--no-renames', '--diff-filter=AM', '-z', mb, 'HEAD')
+    out = git('diff', '--name-status', '--no-renames', '--diff-filter=AMTD', '-z', mb, 'HEAD')
     if out is None:
         raise ConfigError(f'git diff {mb}..HEAD failed')
     parts = out.split('\0')
-    return mb, [(parts[i + 1], parts[i] == 'A') for i in range(0, len(parts) - 1, 2)]
+    pairs = [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
+    return (mb, [(path, kind == 'A') for kind, path in pairs if kind != 'D'],
+            [path for kind, path in pairs if kind == 'D'])
+
+
+def read_doc(path, root='.'):
+    """(exact text, links_from, problem) of a file to check. Undecodable bytes are kept (surrogateescape), so its
+    size is still checked; a symlink is read as the file it points to, which must be in the repository."""
+    links_from = None
+    if os.path.islink(path):
+        real, real_root = os.path.realpath(path), os.path.realpath(root)
+        if os.path.commonpath([real_root, real]) != real_root:
+            return None, None, 'a symlink that points outside the repository: make it a file'
+        if '.git' in os.path.relpath(real, real_root).split(os.sep):
+            return None, None, 'a symlink that points into .git: make it a file'
+        if not os.path.isfile(real):
+            return None, None, 'a symlink that points to no file: make it a file'
+        links_from = os.path.relpath(real, real_root)
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except OSError as e:
+        return None, None, f'cannot read it ({e.__class__.__name__})'
+    try:
+        return raw.decode('utf-8'), links_from, None
+    except UnicodeDecodeError as e:
+        return raw.decode('utf-8', 'surrogateescape'), links_from, f'not UTF-8 text (byte {e.start}): save it as UTF-8'
+
+
+def base_doc(mb, path):
+    """The text a path read at the merge base, through symlinks in the repository: '' when it was no file there (or
+    pointed to none), None when git cannot tell."""
+    for _ in range(40):
+        out = git('ls-tree', '-z', mb, '--', path)
+        if out is None:
+            return None
+        if not out:
+            return ''
+        mode, kind, rest = out.split(' ', 2)
+        if kind != 'blob':
+            return ''
+        blob = git('cat-file', 'blob', rest.split('\t', 1)[0])
+        if blob is None or mode != '120000':
+            return blob
+        path = os.path.normpath(os.path.join(os.path.dirname(path), blob))
+        if os.path.isabs(path) or path.split(os.sep)[0] == '..':
+            return ''
+    return None
+
+
+def removed_target(path, gone, root='.'):
+    """The path a symlink names (hop by hop, inside the repository) that the change removed, or None."""
+    for _ in range(40):
+        target = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+        rel = os.path.relpath(os.path.join(root, target), root)
+        if rel in gone or any(g.startswith(rel + os.sep) for g in gone):
+            return rel
+        if rel.split(os.sep)[0] == '..' or not os.path.islink(os.path.join(root, rel)):
+            return None
+        path = rel
+    return None
+
+
+def links_to_removed(rules, removed, checked, root='.'):
+    """Problems, in selected tracked files this run did not check, for a symlink to a file the change removed, and
+    (links on) for links to a file the change removed (or into a folder it emptied) that no longer resolve."""
+    gone = {os.path.normpath(p) for p in removed}
+    if not gone:
+        return []
+    out = git('ls-files', '-z')
+    if out is None:
+        raise ConfigError('git ls-files failed (run from the repository root)')
+    probs = []
+    for path in out.split('\0'):
+        if not path or path in checked or not selected(rules, path):
+            continue
+        if not (os.path.isfile(path) or os.path.islink(path)):
+            continue
+        text, links_from, problem = read_doc(path, root)
+        if text is None:
+            hit = os.path.islink(path) and removed_target(path, gone, root)
+            if hit:
+                probs.append((path, None, f'{problem}: this change removed {hit}'))
+            continue
+        if not rules['links']:
+            continue
+        for no, target in link_lines(lf(text)):
+            full = link_path(links_from or path, target, root)
+            if full is None or broken_link(links_from or path, target, root) is None:
+                continue
+            rel = os.path.relpath(full, root)
+            if rel in gone or any(g.startswith(rel + os.sep) for g in gone):
+                probs.append((path, no, f'broken link {target}: this change removed {rel}'))
+    return probs
 
 
 def annotate(kind, path, line, msg):
@@ -272,10 +411,10 @@ def main(argv=None):
             if not a.base.strip():
                 raise ConfigError('--base is empty: give the base commit, or use --all')
             rules, note = load_config(a.config, a.base)
-            mb, files = changed_files(a.base)
+            mb, files, removed = changed_files(a.base)
         else:
             rules, note = load_config(a.config)
-            mb = None
+            mb, removed = None, []
             if a.all:
                 out = git('ls-files', '-z')
                 if out is None:
@@ -288,27 +427,37 @@ def main(argv=None):
         annotate('error', a.config, None, f'doc-check: {e}')
         return 2
     print(f'doc_check: {shown(note)}')
-    probs, warns, count = [], [], 0
+    probs, warns, count, checked, found = [], [], 0, set(), {}
     for path, added in files:
-        if not selected(rules, path) or not os.path.isfile(path):
+        # A symlink to no file is checked (and fails); another path that is not a file is skipped.
+        if not selected(rules, path) or not (os.path.isfile(path) or os.path.islink(path)):
             continue
         count += 1
-        if os.path.islink(path):
-            warns.append((path, None, 'a symlink: not checked'))
-            continue
-        try:
-            with open(path, encoding='utf-8') as f:
-                text = f.read()
-        except (OSError, UnicodeDecodeError) as e:
-            warns.append((path, None, f'cannot read it ({e.__class__.__name__}): not checked'))
+        checked.add(path)
+        text, links_from, problem = read_doc(path)
+        first = [(path, None, problem)] if problem else []
+        if text is None:
+            probs += first
             continue
         base_text = None
         if mb is not None and budget(rules, path) is not None:
-            old = git('show', f'{mb}:{path}')
-            base_text = old if old is not None else ''
-        p, w = check(rules, path, text, added, '.', base_text)
+            base_text = base_doc(mb, path)
+        p, w = check(rules, path, text, added, '.', base_text, links_from)
+        found[path] = (links_from, first + p, w)
+    for path, (links_from, p, w) in found.items():
+        # A symlink whose target this run also checked: what the target already reports (same budget, history,
+        # links) is said once, at the target.
+        if links_from is not None and links_from in found and links_from != path:
+            said = {(no, msg) for _, no, msg in found[links_from][1] + found[links_from][2]}
+            p = [x for x in p if x[1:] not in said]
+            w = [x for x in w if x[1:] not in said]
         probs += p
         warns += w
+    try:
+        probs += links_to_removed(rules, removed, checked)
+    except ConfigError as e:
+        print(f'doc_check: ERROR {shown(e)}')
+        return 2
     for path, line, msg in probs:
         print(f'DOC  {shown(path)}{":" + str(line) if line else ""}: {shown(msg)}')
         annotate('error', path, line, msg)

@@ -60,6 +60,12 @@ def source_file(source, rel):
     return os.path.join(source, rel)
 
 
+def missing_sources(source):
+    """The SOURCE_FILES that SOURCE lacks (each looked up as copy_tool reads it); [] when it has them all.
+    .github/scripts/fork-ci-release.test.py runs it on the files a release commit holds."""
+    return [rel for rel in SOURCE_FILES if not os.path.isfile(source_file(source, rel))]
+
+
 def sha256_file(path):
     with open(path, 'rb') as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -306,9 +312,9 @@ def install(a, stop_after=None):
         raise Refused('run this as root')
     if not SHA_RE.match(a.sha or ''):
         raise Refused('--sha must be the full 40-character release commit')
-    for rel in SOURCE_FILES:
-        if not os.path.isfile(source_file(a.source or '', rel)):
-            raise Refused(f'--source {a.source}: {rel} is missing (point it at the fork-kit/model-guard folder)')
+    missing = missing_sources(a.source or '')
+    if missing:
+        raise Refused(f'--source {a.source}: {missing[0]} is missing (point it at the fork-kit/model-guard folder)')
     own = load_guard(OWN_LIB)
     check_old_state(own)
     check_policy(own)

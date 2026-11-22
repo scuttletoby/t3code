@@ -96,8 +96,11 @@ class Plan(Project):
         code, out, err = self.plan(changes(('M', 'src/storage/wallet.ts'), ('M', 'src/app.ts')))
         self.assertEqual((code, err), (0, ''))
         self.assertIn('weight: critical\n', out)
-        self.assertIn('lenses: data-1, data-2 (independent: one new read-only agent each, no shared context', out)
+        # every rule hit gives its lenses: the two critical reads, and the app file's own `code` read (issue 82)
+        self.assertIn('lenses: data-1, data-2, code (independent: one new read-only agent each, no shared context', out)
         self.assertIn('  data-1: prompt .github/lenses/data.md; runner claude-opus-5-5 high\n', out)
+        self.assertIn('  data-2: prompt .github/lenses/data.md; runner claude-opus-5-5 high\n', out)
+        self.assertIn('  code: prompt .github/lenses/code.md; runner claude-opus-5-5 high\n', out)
         self.assertIn('note: the review block is in shadow', out)
 
     def test_a_normal_path_needs_one_lens(self):
@@ -174,6 +177,62 @@ class Plan(Project):
     def test_a_base_that_is_no_commit(self):
         self.git('init', '-q')
         self.assertIn('nosuch is not a commit', self.plain(self.cli('plan', '--base', 'nosuch')))
+
+    def commit(self, message, *paths):
+        for rel in paths:
+            self.put(rel, f'{message}\n')
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', message)
+
+    def test_a_base_config_that_is_not_utf8_is_refused_as_the_gate_refuses_it(self):   # #797 item 1
+        path = self.config()
+        with open(path, 'rb') as f:
+            data = f.read().replace(b'docs/review.md', b'docs/r\xe9view.md')   # Latin-1, valid JSON otherwise
+        with open(path, 'wb') as f:
+            f.write(data)
+        self.git('init', '-q')
+        self.commit('base', 'src/app.ts')
+        self.git('checkout', '-q', '-b', 'topic')
+        self.commit('change', 'src/x.ts')
+        with self.assertRaises(review_kit.gate_config.ConfigError):   # the gate's reader, on the same bytes
+            review_kit.gate_config.parse(data, 'config')
+        self.assertIn('not UTF-8', self.plain(self.run_plan('--base', 'main')))
+        self.assertIn('not UTF-8', self.plain(self.cli('plan', '--base', 'main')))
+
+    def test_base_reads_every_merge_base_as_the_gate_does(self):   # #797 item 2: criss-cross merges
+        self.config()
+        self.git('init', '-q')
+        self.commit('root', 'src/app.ts')
+        self.git('checkout', '-q', '-b', 'x')
+        self.commit('x', 'src/storage/x.ts')
+        self.git('checkout', '-q', '-b', 'y', 'main')
+        self.commit('y', 'src/y.ts')
+        self.git('checkout', '-q', '-B', 'main', 'x')
+        self.git('merge', '-q', '--no-ff', '-m', 'main takes y', 'y')
+        self.git('checkout', '-q', '-b', 'topic', 'y')
+        self.git('merge', '-q', '--no-ff', '-m', 'topic takes x', 'x')
+        self.commit('topic', 'src/t.ts')
+        bases = subprocess.run([*GIT, '-C', self.dir, 'merge-base', '--all', 'main', 'topic'], capture_output=True,
+                               text=True, env=self.env).stdout.split()
+        self.assertEqual(len(bases), 2, 'the fixture needs two merge bases')
+        code, out, err = self.cli('plan', '--base', 'main')
+        self.assertEqual((code, err), (0, ''), out)
+        # from one merge base git sees two paths (src/t.ts and one of the others); the gate sees all three
+        self.assertIn('3 changed paths', out)
+        self.assertIn('weight: critical', out)
+
+    def test_base_reads_paths_whatever_the_repository_git_settings(self):   # #797 item 2: unusual git settings
+        self.config()
+        self.git('init', '-q')
+        self.commit('base', 'src/app.ts', 'src/sub/a.ts')
+        self.git('checkout', '-q', '-b', 'topic')
+        self.commit('change', 'src/storage/wallet.ts', 'src/sub/a.ts')
+        self.git('config', 'diff.relative', 'true')   # from src/sub, a plain git diff shows only src/sub's paths
+        out, err = io.StringIO(), io.StringIO()
+        code = self.m.run(['plan', '--root', os.path.join(self.dir, 'src', 'sub'), '--base', 'main'], out, err)
+        self.assertEqual((code, err.getvalue()), (0, ''), out.getvalue())
+        self.assertIn('2 changed paths', out.getvalue())
+        self.assertIn('weight: critical', out.getvalue())
 
 
 class States(Project):
@@ -271,6 +330,24 @@ class States(Project):
                 self.assertIn('exactly one of', self.plain(self.cli(*args)))
 
 
+class Fork(unittest.TestCase):
+    def test_the_fork_settings_point_the_kit_at_the_forks_queue_config(self):   # #914 item 3
+        settings, note = review_kit.load_settings(REPO, '.github/fork-review-kit.json')
+        cfg, cfg_note = review_kit.load_queue_config(REPO, settings)
+        self.assertEqual((settings['queue_config'], note, cfg_note), ('.github/fork-pr-queue.json', None, None))
+        self.assertEqual(cfg.review.mode, 'enforce')
+        out, err = io.StringIO(), io.StringIO()
+        changes_file = os.path.join(tempfile.mkdtemp(prefix='review-kit-fork-'), 'changes.bin')
+        self.addCleanup(shutil.rmtree, os.path.dirname(changes_file))
+        with open(changes_file, 'w', encoding='utf-8') as f:
+            f.write('M\0fork-kit/review/SKILL.md\0')
+        code = review_kit.run(['plan', '--root', REPO, '--settings', '.github/fork-review-kit.json', '--changes',
+                               changes_file], out, err)
+        self.assertEqual((code, err.getvalue()), (0, ''), out.getvalue())
+        self.assertNotIn('note:', out.getvalue())
+        self.assertIn('weight: critical', out.getvalue())
+
+
 # rule: (text in lib/review_kit.py, the text that breaks it, (test class, the test that must then fail))
 MUTATIONS = {
     'an empty settings file is refused': ('    if not text.strip():\n        raise Problem(f\'the kit settings',
@@ -298,6 +375,15 @@ MUTATIONS = {
                                           (Plan, 'test_the_state_question_is_in_every_plan')),
     'two lenses are independent': ("if len(lenses) > 1 else 'one read-only agent')", "if False else 'one read-only agent')",
                                    (Plan, 'test_a_critical_path_needs_two_independent_lenses')),
+    'a base config is read as bytes': ('text = r.stdout if r.returncode == 0 else None',
+                                       "text = r.stdout.decode('utf-8', 'replace') if r.returncode == 0 else None",
+                                       (Plan, 'test_a_base_config_that_is_not_utf8_is_refused_as_the_gate_refuses_it')),
+    'the gate\'s changed paths': ('found, why = head_check.changed_paths(head_check.Checkout(git_dir(root), '
+                                  'bare=(base, head)), base, head)',
+                                  "found, why = review_judge.parse_name_status(subprocess.run(['git', '-C', root, "
+                                  "'diff', '--name-status', '-z', '-M', f'{base}...HEAD'], capture_output=True)"
+                                  ".stdout.decode()), None",
+                                  (Plan, 'test_base_reads_paths_whatever_the_repository_git_settings')),
     'the config is read from the base': ("['git', '-C', root, 'show', f'{base}:{rel}']", "['false']",
                                          (Plan, 'test_base_reads_the_config_and_changes_from_git')),
 }

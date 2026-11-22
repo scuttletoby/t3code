@@ -849,6 +849,29 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(self.left_notes(), [['heavy-gone-0a1b2c3d.scope'], ['heavy-link-0a1b2c3d.scope']])
         self.assertTrue(os.path.isfile(target))
 
+    def test_state_notes_under_a_local_folder_others_can_write_or_a_linked_one_are_left(self):
+        # #771 nit: the second (state) folder's base's parent (~/.local) is checked as bin/heavy own_folder checks it:
+        # a real folder of this user's that no one else can write. The /run/user base's parent is root's: not checked
+        local = os.path.join(self.root, 'home', '.local')
+        self.note_dirs = (self.note_dirs[0], os.path.join(local, 'state', 'heavy', 'labelled'))
+        self.notes('heavy-gone-0a1b2c3d.scope')
+        os.chmod(local, 0o777)
+        self.addCleanup(os.chmod, local, 0o700)
+        code, out, err = self.run_sweep()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.left_notes(), [[], ['heavy-gone-0a1b2c3d.scope']])
+        self.assertIn(f'chmod go-w {local}', out + err, '#945: said, not left silently')
+        os.chmod(local, 0o700)                                  # only this user's again: removed
+        self.assertEqual(self.run_sweep()[0], 0)
+        self.assertEqual(self.left_notes(), [[], []])
+        real = os.path.join(self.root, 'dotfiles', '.local')    # a linked ~/.local, even to the user's own folder
+        os.makedirs(os.path.dirname(real), 0o700)
+        os.rename(local, real)
+        os.symlink(real, local)
+        self.notes('heavy-gone-0a1b2c3d.scope', folders=(self.note_dirs[1],))
+        self.assertEqual(self.run_sweep()[0], 0)
+        self.assertEqual(self.left_notes(), [[], ['heavy-gone-0a1b2c3d.scope']])
+
     def test_the_user_s_own_note_folders_by_default(self):
         # the sweep the timer runs reads the folders heavy reads (bin/heavy marks_dirs): /run/user/<uid> and the
         # state folder of a home this user owns
@@ -1541,6 +1564,26 @@ class Label(unittest.TestCase):
         os.chmod(run, 0o700)
         self.assertEqual(REAL.note_label(f'uid={UID},pid=1,start=2', both), '')   # a process owner: no note
         self.assertEqual((os.listdir(run), os.listdir(state)), ([], []))
+
+    def test_no_state_note_under_a_local_folder_others_can_write_or_a_linked_one(self):
+        # #771 nit: docker-label checks the state base's parent (~/.local) as bin/heavy own_folder does
+        unit = 'heavy-sh-0a1b2c3d.scope'
+        value = f'uid={UID},scope={unit}'
+        run, state, ids = self.notes()
+        local = os.path.dirname(os.path.dirname(os.path.dirname(state)))      # the state base's parent
+        os.chmod(local, 0o777)
+        self.addCleanup(os.chmod, local, 0o700)
+        self.assertIn('not a folder only this user can write', REAL.note_label(value, ids[state]))
+        self.assertEqual(os.listdir(state), [])
+        os.chmod(local, 0o700)
+        self.assertEqual(REAL.note_label(value, ids[state]), '')
+        self.assertEqual(os.listdir(state), [unit])
+        os.unlink(os.path.join(state, unit))
+        linked = os.path.join(local, 'linked')                                  # the parent a link to it
+        os.symlink(local, linked)
+        with mock.patch.object(REAL, 'STATE_ROOT', os.path.join(linked, 'state')):
+            self.assertIn('not a folder only this user can write', REAL.note_label(value, ids[state]))
+        self.assertEqual(os.listdir(state), [])
 
     def test_another_users_owner_pid_is_refused(self):
         # the sweep sees only its own user's processes: it would count the owner as gone and remove the container

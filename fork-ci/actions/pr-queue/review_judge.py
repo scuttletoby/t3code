@@ -9,8 +9,10 @@ every time, and the TypeScript side can be tested on the same vectors (review.ve
   - Built-in protected paths, not configurable: the config file itself, every lens prompt file named in `lenses`, and
     `.github/workflows/**`. Such a path also counts for the first critical rule of the list, whatever rule it
     belongs to.
-  - The heaviest weight hit decides. The required lenses are the lenses of every rule of that weight that was hit, in
-    the order of the rules and of each rule's list, each name once.
+  - The heaviest weight hit is the change's weight. The required lenses are the lenses of every rule that was hit,
+    whatever its weight, in the order of the rules and of each rule's list, each name once: each rule's paths get
+    their own rule's read, so an app change plus one gate file needs the code lens and the gate lenses (owner
+    decision: issue #82, "one extra review"), never the gate lenses alone.
   - No changed path at all (an empty diff) counts as the catch-all rule: the change is judged as a new folder would
     be, never as "no lens needed".
 Unknown never judges: a path no rule matches, a protected path with no critical rule (the parser refuses both, so
@@ -32,6 +34,10 @@ judge_rounds judges the review itself, from the lens comments (README.md, "Revie
     until a person's override for the head, newer than every lens comment, lets it through (it alone is enough: it
     also waives the approach lens). Owner decision: issue #100.
 Pure as judge is: the lens comments come in (lens.Review.lens_scan), the verdict goes out.
+
+has_state_line says what counts as a report's `state:` line (the answer to the state question). The `state_line`
+setting is parsed but not enforced yet; the review kit (fork-kit/review, `check`) imports this rule, so the gate and
+the kit read one rule when the gate starts enforcing it.
 """
 import html
 import re
@@ -169,8 +175,7 @@ def judge(review, changes, config_path):
     hits = tuple(Hit(r.name, r.weight, tuple(counted[r.name] or ())) for r in review.rules
                  if counted[r.name] is None or counted[r.name])
     weight = next(w for w in review_config.WEIGHTS if any(h.weight == w for h in hits))
-    lenses = tuple(dict.fromkeys(n for r in review.rules if r.weight == weight
-                                 and any(h.rule == r.name for h in hits) for n in r.lenses))
+    lenses = tuple(dict.fromkeys(n for r in review.rules if any(h.rule == r.name for h in hits) for n in r.lenses))
     return Judgement(weight, lenses, hits, tuple(protected), len(paths))
 
 
@@ -364,6 +369,15 @@ def read_findings(body):
         if (i in first and NOT_SAFE_RE.search(line)) or VERDICT_NOT_SAFE_RE.match(line):
             found[i] = ('blocker', f'the report says NOT SAFE: {line}'[:SHOW_FINDING])
     return [found[i] for i in sorted(found)], seen >= set(BLOCKING)
+
+
+STATE_RE = re.compile(r'state\s*:\s*\S', re.I)
+
+
+def has_state_line(body):
+    """A `state:` line with an answer (anything but blanks after the colon), outside fenced and indented code blocks and
+    quotes, read as a lens header is (folded, markdown and list markers stripped: `**State:** ok`, `- state: ok`)."""
+    return any(STATE_RE.match(lens.norm_line(fold(raw))) for raw in lens.plain_lines(body))
 
 
 def findings(body):

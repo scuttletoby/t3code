@@ -1,11 +1,13 @@
 """The review kit's helpers (../README.md): `plan` says which lenses a change needs and how to run them, `check` says how
 the gate reads one lens comment, and `doc` checks that every example in COMMENTS.md reads as it says.
 
-Every rule about paths, lens comments, findings and rounds is the gate's own code (fork-ci/actions/pr-queue: config.py,
-lens.py, review_config.py, review_judge.py), imported, never copied: the kit cannot read a comment another way than the
-gate does. The kit adds only what the gate does not judge: the project's kit settings (who runs a lens, how many lens
-rounds, what happens to minors, the state question) and the `state:` line check (the gate parses `state_line` but does
-not enforce it yet).
+Every rule about paths, lens comments, findings, rounds and the `state:` line is the gate's own code
+(fork-ci/actions/pr-queue: config.py, lens.py, review_config.py, review_judge.py; fork-ci/actions/head-check:
+head_check.changed_paths), imported, never copied: the kit cannot read a comment or a change another way than the gate
+does. It imports that code from the fork checkout it runs in, so run the kit at the release the project's gate pins
+(README.md). The kit adds only what the gate does not judge: the project's kit settings (who runs a lens, how many lens
+rounds, what happens to minors, the state question) and requiring the `state:` line in `check` (the gate parses
+`state_line` but does not enforce it yet; what counts as one is review_judge.has_state_line).
 
   python3 -I fork-kit/review/lib/review_kit.py plan  [--root DIR] [--settings FILE] (--base REF | --changes FILE|-)
   python3 -I fork-kit/review/lib/review_kit.py check [--root DIR] [--settings FILE] [--head SHA] FILE|-
@@ -25,7 +27,9 @@ sys.dont_write_bytecode = True   # keep the fork-ci folder free of __pycache__
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATE = os.path.join(os.path.dirname(os.path.dirname(KIT)), 'fork-ci', 'actions', 'pr-queue')
 sys.path.insert(0, GATE)
+sys.path.insert(0, os.path.join(os.path.dirname(GATE), 'head-check'))
 import config as gate_config  # noqa: E402
+import head_check  # noqa: E402
 import lens  # noqa: E402
 import review_judge  # noqa: E402
 
@@ -47,7 +51,6 @@ MINORS = {'issue': 'minors not fixed when the pull request stops go into one fol
           'same-round': 'minors are fixed in the same round; any left at the last round go into the pull request '
                         'description with a reason each'}
 FALLBACK_LENS = 'review'
-STATE_RE = re.compile(r'state\s*:\s*\S', re.I)
 
 
 class Problem(Exception):
@@ -127,21 +130,25 @@ def load_settings(root, path=None):
     return s, None
 
 
+def commit_of(root, ref):
+    """The full sha of the commit `ref` names in the repository at `root`; Problem when it names none."""
+    r = subprocess.run(['git', '-C', root, 'rev-parse', '--verify', '--quiet', '--end-of-options', f'{ref}^{{commit}}'],
+                       capture_output=True)
+    sha = r.stdout.decode('ascii', 'replace').strip()
+    if r.returncode != 0 or not head_check.SHA.fullmatch(sha):
+        raise Problem(f'{ref} is not a commit in {root}')
+    return sha
+
+
 def load_queue_config(root, settings, base=None):
-    """(gate Config or None, note). The config is read from `base` with git when given (as the gate reads it, from the
-    base tip), else from the file. No file, or no `review` block (a config from before the review rules): None, and the
-    note says how the plan judges. Problem for an empty or invalid config: the gate would refuse it too."""
+    """(gate Config or None, note). The config is read from the commit `base` (a full sha) with git when given (as the
+    gate reads it, from the base tip, as bytes: one that is not UTF-8 is refused as the gate refuses it), else from the
+    file. No file, or no `review` block (a config from before the review rules): None, and the note says how the plan
+    judges. Problem for an empty or invalid config: the gate would refuse it too."""
     rel = settings['queue_config']
     if base:
         r = subprocess.run(['git', '-C', root, 'show', f'{base}:{rel}'], capture_output=True)
-        if r.returncode != 0:
-            exists = subprocess.run(['git', '-C', root, 'rev-parse', '--verify', '--quiet', f'{base}^{{commit}}'],
-                                    capture_output=True).returncode == 0
-            if not exists:
-                raise Problem(f'{base} is not a commit in {root}')
-            text = None
-        else:
-            text = r.stdout.decode('utf-8', 'replace')
+        text = r.stdout if r.returncode == 0 else None
     else:
         text = read_text(os.path.join(root, rel), 'the queue config')
     where = f'{rel} at {base}' if base else rel
@@ -160,23 +167,31 @@ def load_queue_config(root, settings, base=None):
     return cfg, None
 
 
+def git_dir(root):
+    r = subprocess.run(['git', '-C', root, 'rev-parse', '--absolute-git-dir'], capture_output=True)
+    if r.returncode != 0:
+        raise Problem(f'{root} is not in a git repository: {r.stderr.decode("utf-8", "replace").strip()}')
+    return os.fsdecode(r.stdout.rstrip(b'\n'))
+
+
 def changes_from(root, base=None, changes=None):
-    """[(status, paths)] as the gate reads them: `git diff --name-status -z -M <base>...HEAD`, or a file of that output."""
+    """[(status, paths)] as the gate reads them: with `base` (a full sha), the gate's own head_check.changed_paths from
+    `base` to HEAD (every merge base, git's safe flags and no global config: never fewer paths than the gate sees), else
+    a file of `git diff --name-status -z -M` output."""
     if base:
-        r = subprocess.run(['git', '-C', root, 'diff', '--name-status', '-z', '-M', f'{base}...HEAD'],
-                           capture_output=True)
-        if r.returncode != 0:
-            raise Problem(f'git diff {base}...HEAD failed: {r.stderr.decode("utf-8", "replace").strip()}')
-        text = r.stdout.decode('utf-8', 'surrogateescape')
-    else:
-        try:
-            if changes == '-':
-                text = sys.stdin.buffer.read().decode('utf-8', 'surrogateescape')
-            else:
-                with open(changes, 'rb') as f:
-                    text = f.read().decode('utf-8', 'surrogateescape')
-        except OSError as e:
-            raise Problem(f'the changes file {changes} cannot be read: {e.strerror}') from None
+        head = commit_of(root, 'HEAD')
+        found, why = head_check.changed_paths(head_check.Checkout(git_dir(root), bare=(base, head)), base, head)
+        if found is None:
+            raise Problem(why)
+        return found
+    try:
+        if changes == '-':
+            text = sys.stdin.buffer.read().decode('utf-8', 'surrogateescape')
+        else:
+            with open(changes, 'rb') as f:
+                text = f.read().decode('utf-8', 'surrogateescape')
+    except OSError as e:
+        raise Problem(f'the changes file {changes} cannot be read: {e.strerror}') from None
     try:
         return review_judge.parse_name_status(text)
     except review_judge.JudgeError as e:
@@ -238,10 +253,8 @@ def plan(root, settings, cfg, note, changes):
 
 # --- one comment, as the gate reads it ---------------------------------------------------------------------------
 
-def has_state_line(body):
-    """A `state:` line with an answer, outside code blocks and quotes (the kit's check; the gate parses `state_line`
-    but does not enforce it yet)."""
-    return any(STATE_RE.match(lens.norm_line(review_judge.fold(raw))) for raw in lens.plain_lines(body))
+# What counts as a `state:` line is the gate's rule; the kit's `check` requires one (the gate does not enforce it yet).
+has_state_line = review_judge.has_state_line
 
 
 def reader(override_prefix):
@@ -380,7 +393,8 @@ def main(argv, out=sys.stdout):
         raise Problem('plan needs exactly one of --base REF or --changes FILE (git diff --name-status -z -M output)')
     root = opts.get('--root', '.')
     settings, note = load_settings(root, opts.get('--settings'))
-    cfg, cfg_note = load_queue_config(root, settings, opts.get('--base'))
+    base = commit_of(root, opts['--base']) if '--base' in opts else None
+    cfg, cfg_note = load_queue_config(root, settings, base)
     if cmd == 'check':
         if not rest:
             raise Problem('check needs the comment: a file, or - for stdin')
@@ -395,7 +409,7 @@ def main(argv, out=sys.stdout):
         code, text = check(body, cfg.override_prefix if cfg else '\0', opts.get('--head'))
         print(text, file=out)
         return code
-    changes = changes_from(root, opts.get('--base'), opts.get('--changes'))
+    changes = changes_from(root, base, opts.get('--changes'))
     for line in plan(root, settings, cfg, '; '.join(x for x in (note, cfg_note) if x), changes):
         print(line, file=out)
     return 0
