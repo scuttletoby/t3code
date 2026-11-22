@@ -320,6 +320,25 @@ it.effect("t3-only on the launcher refuses a launch into a project left on all (
   }),
 );
 
+it.effect("a refusal names what the new thread keeps: only built-in tools here", () =>
+  Effect.gen(function* () {
+    // Every MCP server and T3 tool, but no built-in tool: a launch into a project on all is
+    // wider only in its built-in tools, and the refusal says so.
+    const bare = { servers: "all", t3Tools: "all", builtinTools: "none" };
+    const { launched, launch } = harness({
+      mcpProfiles: { bare },
+      ...pickFor("bare"),
+    } as Settings);
+    const message = refusal(yield* launch({}));
+    expect(message).toContain('would get "all", which keeps built-in tools "bare" does not');
+    expect(message).not.toContain("MCP servers");
+    expect(launched).toHaveLength(0);
+    // A launcher on docs: the thread on all keeps more MCP servers.
+    const docs = harness({ ...DOCS_ONLY, ...pickFor("docs") } as Settings);
+    expect(refusal(yield* docs.launch({}))).toContain('which keeps MCP servers "docs" does not');
+  }),
+);
+
 it.effect("a launch the launcher's profile covers starts, also a narrower one", () =>
   Effect.gen(function* () {
     const settings = {

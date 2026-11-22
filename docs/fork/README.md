@@ -999,6 +999,32 @@ A thread with `all` delegates to any machine and any instance there, without ask
 arrives from a machine on an older T3 carries nothing, so it gets this machine's profile for its
 role as before, and the server log says so.
 
+A profile may also say `"builtinTools": "none"` (optional; absent, or `"all"`, keeps the provider's
+built-in tools as before). Such a thread gets no shell, file, web or other built-in tool, only MCP
+tools (T3's own, and the outside servers its `servers` keeps): a base for an assistant that reads
+the owner's data without changing files. Only Claude applies it: its query opens with no built-in
+tool (`tools: []`, and every built-in Claude names in `disallowedTools`), and a call to any tool
+that is not an MCP tool is refused at the call, with the reason. A thread whose profile changes to
+it starts a fresh Claude process for its next turn, so a process that still has its tools is not
+reused. Every other provider (Codex too) cannot run without its built-in tools, so a turn there is
+not started and says why (switch the thread to a Claude instance, or pick another profile); Codex
+also stops a turn it starts on its own for a goal, but only soon after that turn starts, so its first
+tool calls may already run. A child keeps `none` from its parent (never more
+than its parent), a delegated task carries it to the other machine, and a delegation refuses, before
+sending, a non-Claude instance there, as for any profile narrower than `all`. A T3 from before this
+field reads a profile or carried task with it as one it cannot read and refuses it, never giving it
+the tools; a machine on such a T3 that takes delegated tasks accepts the task, then refuses its
+turn, so a thread that does nothing is left there (never one with more tools). Any other value makes
+the profile broken.
+
+`builtinTools` removes only the provider's own tools. For a really tool-less (read-only) thread,
+also give `t3Tools` a list of only the groups it needs (leave out `orchestration`, `playtest`,
+`worktree`, `preview` and other groups that act: they can ask another thread to act, run build
+steps, change worktrees or run page script), and `servers` a
+list of read-only servers: an outside MCP server may wrap a shell or write files. Not a sandbox: a
+Claude setting that turns hooks off, or launch arguments that add tools, can weaken it on a machine
+the owner set up so.
+
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
 ```
@@ -1006,7 +1032,7 @@ role as before, and the server log says so.
 In the app: **Settings → Fork**, section MCP profiles. It lists `all` and `t3-only` (read-only)
 and each named profile, and adds, edits and deletes named ones: `servers` is all or a list of
 names (the editor offers the names other profiles use and takes any other; no list of the
-machine's servers reaches the app yet), `t3Tools` all or a list of groups. `request_secret`,
+machine's servers reaches the app yet), `t3Tools` all or a list of groups, and a "No built-in tools" box sets `builtinTools: "none"`. `request_secret`,
 `send_to_user` and `tool_search` always stay. A built-in name cannot be taken, and a profile that
 the default, the sub-agent rule, a project or a thread pick names cannot be deleted: the panel
 says which, and offers to clear the thread picks that name it; the server refuses such a delete
