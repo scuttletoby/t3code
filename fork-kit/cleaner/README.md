@@ -619,7 +619,7 @@ stays, each reads the same bytes as before, and the disk holds them once. Withou
 | `dedupe.folders[].path`    | required | a folder; files at any depth in it are looked at                       |
 | `dedupe.folders[].days`    | required | days without a change (7 or more): newer files are not looked at       |
 | `dedupe.folders[].layered` | false    | the folder may be on a filesystem that is not local (as compress-cold) |
-| `dedupe.writtenInPlace`    | required | more name patterns (no `/`) never linked: one program's own kinds      |
+| `dedupe.writtenInPlace`    | none     | more name patterns (no `/`) never linked: one program's own kinds      |
 
 **The risk it takes: read this before you name a folder.** Names of one hard-linked file are one file, so any
 write **into** one name changes every name, and the other names' old bytes are gone. Most ways of writing a file do
@@ -634,7 +634,8 @@ images, no working copies. The rule refuses the kinds it knows are written in pl
 `*.log`, `*.log.*`, `*.jsonl`, `*.ndjson`, `*.journal`, `*.pid`; disk images `*.qcow2`, `*.img`, `*.raw`, `*.vmdk`,
 `*.vdi`, `*.vhd`, `*.vhdx`; swap `*.swp`, `*.swap`; mail boxes `mbox`, `*.mbox`; partial downloads a client resumes
 in place `*.part`, `*.crdownload`, `*.partial`, `*.!qb`), plus the name patterns in `dedupe.writtenInPlace` (one
-program's own kinds, such as a game's save files; `[]` when the folders hold none), but such a list can never be
+program's own kinds, such as a game's save files; `[]` when the folders hold none: while `dedupe.folders` names a
+folder and this key is missing, the rule links nothing and the run exits 1, see below), but such a list can never be
 complete. Every plan and run that links says it again in one line (`dedupe: names of one file share every later
 write ...`). On btrfs or XFS a tool that shares blocks with a reflink (`FIDEDUPERANGE`) is the
 safer choice: later writes do not reach the other copies. This rule makes hard links because the hosts it was made
@@ -713,11 +714,12 @@ the rename)`. The report has a class
 - **it stops half-way:** the duplicate is either as it was or a name of the kept file, never gone. Killed before
   the new name: nothing changed. Killed between the new name and the rename: the duplicate is as it was and the
   part `.<name>.<8 hex>.cleaner-link` stays; the next run removes that part (only while it is one the cleaner wrote
-  down and still a name of a file with other names) and links again. Killed right after a link or rename, before its
-  inode time was written down: the kept file looks changed and waits its `days`, then the run goes on. Killed while
-  the cache is written: the old cache stays, and the list of its own steps still holds what it did. A part that is
-  the last name of its bytes is kept and named (`part without its file`). A failed rename removes the part and keeps
-  the duplicate. No entry goes into the journal of half deletes: there is nothing half gone.
+  down and still a name of a file with other names) and links again. While `dedupe.writtenInPlace` is missing the
+  rule reads no folder, so the part stays (one more name of the kept file) until the key is added. Killed right
+  after a link or rename, before its inode time was written down: the kept file looks changed and waits its `days`,
+  then the run goes on. Killed while the cache is written: the old cache stays, and the list of its own steps still
+  holds what it did. A part that is the last name of its bytes is kept and named (`part without its file`). A
+  failed rename removes the part and keeps the duplicate. No entry goes into the journal of half deletes: there is nothing half gone.
 - **a file changes or is opened:** while the plan reads it: kept as `changed`. Between the plan and the run, or
   while it is compared or linked: refused or failed, both files stay as they are (the next run sees other bytes and
   joins nothing). A kept file replaced, or given, losing or moving a name, after the plan: refused.
@@ -730,13 +732,12 @@ the rename)`. The report has a class
   links nothing. Each folder is kept with `could not read: dedupe.writtenInPlace is missing ...` and every run
   exits 1 until the key is there; the other rules run as usual. `[]` is the owner's word that no program writes
   its own kinds in place in these folders.
-- **the cleaner is older than the machine file:** an older cleaner refuses the unknown `dedupe` key and every daily
-  run exits 2. Install this cleaner on a machine first, then add the key.
-- **upgrading a machine whose `dedupe` section has no `writtenInPlace`:** add the key first (the kinds a program
-  there writes in place, or `[]`), then install this cleaner. Until the new cleaner is in, the older one refuses
-  the machine file (`unknown key 'writtenInPlace'`) and every rule stops, every daily run exits 2, nothing is
-  touched. The other order is safe too, only noisier: the new cleaner links nothing and exits 1 until the key is
-  added.
+- **upgrading a machine:** install this cleaner first, then add `dedupe` or, to a `dedupe` section an older cleaner
+  read, `writtenInPlace` (the kinds a program there writes in place, or `[]`). In between, the rule does nothing
+  (no `dedupe`) or links nothing and exits 1 (no `writtenInPlace`, above); the other rules run. The other order
+  stops more: a cleaner older than the machine file refuses the unknown key (`unknown key 'dedupe'` or
+  `unknown key 'writtenInPlace'`), so every rule stops and every daily run exits 2, touching nothing, until this
+  cleaner is in.
 
 ## The machine file
 
@@ -822,8 +823,8 @@ floor, a root folder that is `/`, the home folder or a folder above it: the comm
 exits 2 and does nothing.
 
 Every key can only pick what a rule looks at, raise a floor, or keep more (`KEY_KINDS` in `config.py`; a test
-fails for a key that is not placed there). Two keys free more. `layered` (a cold or dedupe folder may be on a
-filesystem that is not local: an overlay, FUSE or a share) is a yes or no, false by default. `regenerable` takes plain folder names
+fails for a key that is not placed there). Two keys take a refusal away. `layered` (a cold or dedupe folder may be
+on a filesystem that is not local: an overlay, FUSE or a share) is a yes or no, false by default. `regenerable` takes plain folder names
 only: no `/` and no wildcard, so `["*"]` is refused and can never take the `ignored files` refusal away. A name
 frees an ignored folder of that name (and what is in it), never a file, and never a credential-looking name.
 

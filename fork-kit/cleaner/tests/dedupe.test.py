@@ -274,6 +274,9 @@ class Stopped(Case):
         self.assertRegex(os.path.basename(part), r'^\.b\.bin\.[0-9a-f]{8}\.cleaner-link$')
         self.assertEqual((self.ino(b), self.read(b)), (dup, body()))         # the duplicate as it was
         self.assertEqual(self.ino(part), self.ino(a))                       # one more name of the kept file
+        # Without `dedupe.writtenInPlace` the rule reads no folder: the part stays until the key is back (README).
+        code, lines = self.run_cleaner(self.dd_cfg(in_place=None))
+        self.assertEqual((code, self.files()), (1, names), lines)
         plan = self.plan(self.dd_cfg())
         self.assertEqual(self.items(plan, 'link-part'), [part])
         self.assertEqual(self.items(plan), [b])
@@ -722,14 +725,14 @@ class Writes(Case):
 
     def test_the_machine_file_adds_kinds_written_in_place(self):
         """A program's own kinds (a game's save files) are named in the machine file, not in the code."""
-        a, b = self.put('r.0.0.MCA', days=50), self.put('r.0.1.mca')
+        a, b = self.put('slot1.SAV', days=50), self.put('slot2.sav')
         c, d = self.put('x.bin', days=50), self.put('y.bin')
         kinds = lambda value: self.dd_cfg(in_place=value)
-        plan = self.plan(kinds(['*.mca', 'world.dat']))
+        plan = self.plan(kinds(['*.sav', 'world.dat']))
         for path in (a, b):
             self.assertKept(plan, path, 'written in place')
         self.assertEqual(self.items(plan), [d])
-        for bad in (['saves/*.mca'], [''], ['..'], [5], '*.mca'):
+        for bad in (['saves/*.sav'], [''], ['..'], [5], '*.sav'):
             with self.subTest(bad=bad), self.assertRaises(machine_file.MachineFileError):
                 kinds(bad)
 

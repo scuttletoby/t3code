@@ -16,8 +16,9 @@ One name is replaced in two steps that each leave a whole file under every name:
    the kept file, never nothing.
 
 So a run killed between the two leaves the duplicate as it was and a part that is one more name of the kept file;
-the next run removes that part (a name whose content another name still holds) and links again. A part whose other
-names are all gone holds the only copy of its content and stays (named in the plan).
+the next run that reads the folders (not one without `dedupe.writtenInPlace`) removes that part (a name whose
+content another name still holds) and links again. A part whose other names are all gone holds the only copy of
+its content and stays (named in the plan).
 
 What it never takes: links (never followed), other filesystems and mount points (a hard link cannot cross one
 either), other owners' files, credential and lock names, must-keep names, folders with a KEEP file and git folders,
