@@ -35,7 +35,7 @@ import {
   PlacementSettingsFromSettingsFile,
   PlacementSettingsPatch,
 } from "./placement.ts";
-import { PlaytestSettings, PlaytestSettingsFromSettingsFile } from "./playtest.ts";
+import { PlaytestSettingsFromSettingsFile, PlaytestSettingsPatch } from "./playtest.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   ReviewRulesFromSettingsFile,
@@ -167,8 +167,8 @@ export const ForkServerSettingsPatchFields = {
   mcpThreadProfiles: Schema.optionalKey(McpThreadProfilesPatch),
   /** Strict: `apply` or `refuse`. */
   mcpCarriedProfiles: Schema.optionalKey(McpCarriedProfiles),
-  /** Strict: a save refuses a bad step, or `enabled` without all four steps. */
-  playtest: Schema.optionalKey(PlaytestSettings),
+  /** Strict: a save refuses a bad step, an unknown field, or `enabled` without all four steps. */
+  playtest: Schema.optionalKey(PlaytestSettingsPatch),
   /** Strict: a save refuses a bad value, an unknown field, or `source: command` without a command. */
   handoff: Schema.optionalKey(HandoffSettingsPatch),
   /** Strict: a save refuses a bad field, an unknown key, or a value without `preset`. */
@@ -331,10 +331,10 @@ export const ForkProjectOverridePatchFields = {
   mcpProfile: Schema.optionalKey(McpProjectProfileRefPatch),
   mcpSubagentProfile: Schema.optionalKey(McpProjectProfileRefPatch),
   /**
-   * A save refuses a bad step, or `enabled` without all four steps. Left out keeps the stored value;
-   * `null` clears it (the project then uses the server's).
+   * A save refuses a bad step, an unknown field, or `enabled` without all four steps. Left out keeps
+   * the stored value; `null` clears it (the project then uses the server's).
    */
-  playtest: Schema.optionalKey(Schema.NullOr(PlaytestSettings)),
+  playtest: Schema.optionalKey(Schema.NullOr(PlaytestSettingsPatch)),
   /** As `playtest`: left out keeps the stored value; `null` clears it. */
   handoff: Schema.optionalKey(Schema.NullOr(HandoffSettingsPatch)),
   /**
