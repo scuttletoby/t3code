@@ -1,0 +1,3514 @@
+#!/usr/bin/python3 -IB
+"""Claude Code PreToolUse hook (Bash): refuse disabling GitHub Actions workflows, or Actions itself, on any repo.
+Part of fork-kit/agent-guards (README.md there: install, settings entry, the machine file's "agent-guards" section).
+
+Owner rule ("guards that refuse, not trust"). Why: a GitHub security log showed workflows.disable_workflow events
+with the user agent "GitHub CLI ... Agent/claude-code_...": agents disabled workflows with the owner's gh login.
+
+Best effort against mistakes, not a sandbox; the wall is a token that cannot do it. An agent runs as the
+user who owns this hook, so one that sets out to get round a command-text hook can. Where the guard stops reading
+(a limit, a file too big, out of time, its own crash) it refuses when the text it did not read names a guarded token.
+A file too big to read whole, or one it cannot open, counts only where a shell or interpreter runs it (or a script
+is copied); data handed to a tool passes as before.
+How it reads a command (by parsing, not by pattern):
+  1. Shell text, as a shell reads it: quotes, backslashes, $'..', comments, redirections, heredocs, && ; | chains,
+     $(..) `..` <(..) (their insides are commands too), plain NAME=value and `for NAME in ..` variables (every value
+     a name gets in the text is tried). Text it cannot know (other $VARs, $(..) output, "$@", {a,b}) stays in the
+     word as a hidden mark, it is never dropped.
+  2. `gh` arguments, as gh reads them (cobra/pflag, gh 2.102): flags before the subcommand, `--flag=value`,
+     `--flag value`, joined short flags (`-iXPUT`, `-XPUT`, `-X=PUT`), and which `gh api` flags take a value, so a
+     value that looks like a flag (`-p -XGET`, `--jq --method=GET`) is a value. The last -X/--method wins. An
+     unknown flag, a flag without its value, or hidden text where a flag or the method may stand makes the call a
+     write to whatever guarded path is in sight.
+  3. Guarded tokens. After decoding (backslashes, \\uXXXX, \\xXX, %XX, quotes, case, /./ and /x/../) it looks for:
+     .../actions/workflows/<id>/disable, `workflow disable`, .../actions/permissions, branches/<b>/protection,
+     rulesets/<id>, and the GraphQL mutations deleteBranchProtectionRule, deleteRepositoryRuleset and
+     updateRepositoryRuleset. A command that names one of them passes only when the guard can PROVE it harmless:
+       - the command word only handles text (echo, cat, grep, rg, sed, jq ..: the DATA list below)
+       - gh, with a gh command this reader knows (rule 2 decides read or write)
+       - `curl -q ..` / `wget --no-config ..` as a plain read (the tool's read-only flags and nothing else)
+       - git commit/log/grep/diff/add ..: text git itself never runs
+       - shell text (bash -c '..', a .sh file, ssh host '..', a heredoc into sh): read again by these same rules
+     Every other use is refused: a command word the guard does not know (taskset, chrt, unshare, sg, screen, tmux,
+     at, expect, make, a project tool, a word from a variable), inline code or a script in any other language
+     (python -c, node -e, a .py file), an HTTP client without a flag table, gh under an alias or an extension.
+  4. Known command words only widen what passes; an unknown word never hides what follows it. The words behind it
+     are read as a command of their own (`taskset 1 bash -c ..`), its quoted arguments as shell text
+     (`sg users -c '..'`), and gh is still gh under a name the command gives it (`ln -s /usr/bin/gh g; ./g ..`).
+     Files it is handed are looked at too: a shell script is read in full, a file that looks like code in another
+     language (.py/.js/.. name, a `#!` line, the executable bit) may not name a guarded token. An interpreter's
+     script is found behind its own words (`deno run x.ts`, `python3 -m x`, `node -r ./x.js`). A wrapper is a
+     wrapper only under its own name or in a system folder: `./sudo` and the `nice` of `bash nice` are files.
+     Files that carry arguments are read: `curl -K`, `wget -i`, `xargs -a`.
+  5. Flow. Token text that goes on (a pipe into anything but a DATA word, a file, $(..), an exported variable, a
+     file that names a token and gets another name with cp/mv/ln) in a command that also runs a word the guard
+     cannot read is refused: `echo '<the command>' | at now`, `cp x.txt run.sh && bash run.sh`,
+     `curl -q -X PUT "$(cat url.txt)"`.
+  6. It answers in time: the hook has a 10 s limit and a hook that is not done by then does not stop the
+     command, so 5 s after the hook process started the guard refuses the command itself. Before that:
+       - fast exit: a command of plain words that cannot name or run anything guarded (ls, git status, cat a > b,
+         grep ..: quick_pass() below) passes before any file is read and whatever the clock says;
+       - cache: what it learns from files (a code file names a token or not, a `#!` line, the gh aliases) is kept
+         60 s in <stateDir>/cache-v1.json (default ~/.local/state/actions-disable-guard), per file name + inode + size + change times.
+         A file changed within the last 2 s is not cached; a missing, broken, old, foreign or odd cache is ignored
+         and written new (temp file, then rename). Shell scripts are still read every time (their reading depends
+         on the command around them).
+
+Refused:
+  - gh workflow disable ...                    (also through gh aliases: existing ones are expanded, new ones refused;
+                                                `gh workflow <hidden>` too)
+  - gh api / curl / wget / httpie to .../actions/workflows/<id or file>/disable
+  - any write (not GET/HEAD, fields or --input without -X, a method-override header) to .../actions/permissions[/...]
+    for a repo, org or enterprise; the one write that passes is the re-enable
+    `gh api -X PUT repos/O/R/actions/permissions -F enabled=true [-f allowed_actions=all]`
+  - curl and wget to a guarded path unless their own config is off: curl reads ~/.curlrc ($CURL_HOME,
+    $XDG_CONFIG_HOME) unless `-q`/`--disable` is the FIRST argument, wget reads ~/.wgetrc ($WGETRC, /etc/wgetrc)
+    unless `--no-config` is given, and a line there (`request = PUT`) turns a read into a write. The flag rule was
+    picked over "refuse when such a file exists" because it can be read from the command text alone: the guard
+    does not have to know every place the tool looks, or what the same command writes there first.
+  - a path with hidden parts that can spell one of those (`"$B/disable"`, `repos/$R/actions/$X`), when it is a write;
+    and, in the command itself, a `gh api` write whose path is hidden altogether (`gh api -X PUT "$URL"`)
+  - DELETE of branch protection (`.../branches/<b>/protection[/...]`, also for a branch name with slashes) or of a
+    ruleset, the GraphQL mutations that do the same, a write that switches one ruleset off (`enforcement=disabled`,
+    updateRepositoryRuleset with DISABLED, also written with \\u escapes) or carries a body the guard cannot
+    read. Other changes to protection with PUT/PATCH/POST pass (an owner decision)
+  - everything rule 3 cannot prove and rule 5 catches (see there)
+  - `gh` with a word that is no gh command when the gh config holds YAML outside the small subset this reader
+    follows (`!!str` tags, `? ` keys, anchors, flow maps ..), or sits in a folder the guard cannot read
+    (GH_CONFIG_DIR, XDG_CONFIG_HOME or HOME from a variable): the word may be an alias
+  - each script of the machine file's actionsDisable.refuseScripts run with its flag (a project tool that
+    disables workflows itself: {"name": "garden.py", "flag": "--fix", "why": "disables ..."}), where the file is real
+  - a command the guard cannot finish reading in time
+Passes: reads (GET), gh workflow enable/list/view/run, PUT .../enable, searching and writing text about all this
+(rg/grep, notes, commit messages, issue and PR bodies through gh), and every command that names no guarded token.
+A file that is byte for byte this guard is not read as a script (running or testing the guard is no attack).
+
+Known over-refusals (harmless, but not provable from the text; the message says what to change):
+  - a read with curl/wget without `-q` / `--no-config`, or with httpie/xh/aria2c: use `gh api`
+  - code that only mentions a token (python -c "print('gh workflow disable')", a heredoc into python that edits
+    a text, a .py file): change or search such text with an edit or search tool; this guard's own test file run
+    directly: run it through a test runner that is handed its folder
+  - a token in the words of a tool the guard does not know (`sometool -m "text about actions/permissions"`,
+    awk '/actions\\/permissions/'), in the words handed to a shell function, or written to a file / piped on in
+    the same command that runs such a tool
+  - a code file that names a token (this guard, its tests) as an argument of a tool the guard does not know
+    (`pytest tests/test_x.py`, `ruff check x.py`, a project commit tool): name the folder, or use git add
+  - an exported variable or a `VAR=.. command` prefix that carries a token
+  - a GraphQL body piped into gh (`echo '{..}' | gh api graphql --input -`): use `--input - <<< '{..}'` or -f query=
+  - a gh word that is no gh command (an alias) while the gh config is half-written or uses YAML outside the subset
+
+Not covered (a text guard cannot): a value hidden in a variable, file or command output that the command gets at
+run time (a download, base64, a file renamed by a tool other than cp/mv/ln), code that builds the words at run
+time or loads them from another file (import, require), a file of commands that is no shell script and does not
+look like code, written by an earlier command and handed to a tool the guard does not know (`at -f job.txt`,
+`make -f x.mk`, a Makefile, package.json scripts), a gh copy made by an earlier command when there is no gh on
+PATH to compare it with, a program that shadows a DATA or wrapper word on PATH, a remote shell's own config,
+emptying branch protection with PUT/PATCH/POST, raw clients (openssl s_client). Also not covered (a review round;
+each needs a command built to hide the action; closed by the token layer):
+  - known words that run code: sed `e`, rg --pre, find -exec, BASH_ENV, git diff.external / core.fsmonitor
+  - a command kept in a variable and run as the command word (`read -r c <<< '..'; $c`)
+  - a script changed by the same command before it runs it (mv, ln, >, >>, sed -i, then bash)
+  - a GraphQL query from a variable or command output (`-f query="$Q"`)
+A guarded call only in a script 4 or more levels deep (a.sh -> b.sh -> c.sh -> d.sh) passes as an unknown program
+unless other text in the command flows on.
+gh has no request hook, so this hook is the command-text layer; the wall is a token that cannot do it.
+
+Escape hatch (owner only, as root): `sudo agent-guards approve [--hours N] --command '<cmd>'` approves ONE command
+run in one folder, once: it prints a code and keeps in a root-owned file (lib/agent_guards/approval.py) only the
+code's hash, the normalised command's hash, the folder and the end time (1 hour by default). That command, ending in
+  #owner-approved:actions-disable:<code>
+passes once, in that folder, before the end time; the use is recorded in the state folder and a second run, or any
+other command with the code, is refused. A code seen in a transcript, the app's database or `ps` opens nothing else.
+An agent cannot write the file, so it cannot approve itself, and nothing is inherited: a nested session gets the
+code only when it is in its command. (The old CLAUDE_GUARD_OWNER_ALLOW_ACTIONS_DISABLE variable opens nothing any more: a variable reaches
+every nested `claude -p` or `codex exec` of the session.) Fails closed: an internal error refuses commands that
+look dangerous.
+
+Nested agents: a command that starts an agent session this machine's hooks do not reach is refused, since that
+session could do what this guard refuses: `claude --bare` / `--safe-mode` (safe mode runs managed hooks, but not
+hooks a user wired by hand in user settings), `claude` with CLAUDE_CODE_SIMPLE set, and `codex` with anything but
+login/logout/help/completion/mcp/--version (codex runs no Claude Code hooks). claude and codex count by name, by
+their program path (.../claude/versions/<v>, @anthropic-ai/claude-code, @openai/codex), as a link to or a copy of
+the installed program, as a name the same command gives one (ln -s), through npx/bunx/pnpm dlx/npm exec/bun x and
+`node <their cli>`, behind `$(which claude)`, and as text in python -c, node -e, at, systemd-run .. (the same token
+reading as for gh). CLAUDE_CODE_SIMPLE counts in the command, through env -S, from a file the command sources, from
+BASH_ENV/--rcfile, and from the agents' user's shell start files (~/.bashrc ..; files those read are not followed).
+A nested `claude -p` passes: managed hooks run there too, also with `--settings '{"disableAllHooks": true}'`.
+This is a list, and a list of strings cannot be complete: it stops mistakes and casual misuse, not an agent set on
+getting round it (other agent programs, an MCP tool that starts one, words built at run time). The wall against
+that is the GitHub permissions of the token the agent holds (README, "What the guards are and are not").
+
+Facts from the machine file (fork-kit/agent-guards/README.md): actionsDisable.stateDir (cache and log of
+refusals, default ~/.local/state/actions-disable-guard) and actionsDisable.refuseScripts (default none). A missing
+machine file or section gives those defaults; a broken one too, with one line on stderr: the guard never weakens.
+Tests: fork-kit/agent-guards/tests/actions-disable.test.py
+"""
+import fnmatch, itertools, json, os, re, shlex, signal, sys, time
+from stat import S_ISDIR, S_ISREG
+from urllib.parse import unquote
+
+
+def _settings():
+    """(actionsDisable settings, problem or None). The kit's lib sits next to bin/; a copy without it keeps the
+    built-in defaults and says so (on stderr, in answer())."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        return config.load('actionsDisable')
+    except BaseException as e:   # noqa: BLE001 - the guard works without its config
+        return ({'stateDir': '~/.local/state/actions-disable-guard', 'refuseScripts': []},
+                f'cannot load the kit\'s config code ({type(e).__name__}: {e})')
+
+
+SETTINGS, SETTINGS_PROBLEM = _settings()
+REFUSE_SCRIPTS = tuple(SETTINGS['refuseScripts'])
+
+MARK_CMD = '#owner-approved:actions-disable:'   # + the owner's code (agent_guards.approval)
+# Marks inside a word (private-use characters; the same characters in a command read as hidden text too):
+HID = ''    # text the guard cannot know, as one piece of this word
+WILD = ''   # text the guard cannot know that may be no word at all, or several ("$@", unquoted $X, {a,b})
+DISABLE_RE = re.compile(r'actions/workflows/[^/\s]+/disable(?![\w.-])', re.I)
+PERM_RE = re.compile(r'actions/permissions(?![\w-])', re.I)
+PROTECT_RE = re.compile(r'branches/[^\s?#]+?/protection(?![\w-])|(?<![\w-])rulesets/[^/\s?#]+/?(?:[?#]|$)', re.I)
+RULESET_RE = re.compile(r'(?<![\w-])rulesets/[^/\s?#]+/?(?:[?#]|$)', re.I)
+SHELL_VALUE = re.compile(r'\$[A-Za-z_{(]|`')   # $NAME, ${..}, $(..), `..` in text ($1 is a gh alias placeholder)
+# in a request body, any quoting. "evaluate" switches the rules off too: they are only reported, not enforced.
+RULESET_OFF = re.compile(r'enforcement["\'\s]*[:=]["\'\s]*(?:disabled|evaluate)', re.I)
+OFF_WORD = re.compile(r'disabled|evaluate', re.I)
+REPO_PERM_RE = re.compile(r'^(?:https?://[^/]+)?/?repos/[^/\s]+/[^/\s]+/actions/permissions/?$', re.I)
+GQL_RE = re.compile(r'deleteBranchProtectionRule|deleteRepositoryRuleset', re.I)
+GQL_UPDATE = re.compile(r'updateRepositoryRuleset', re.I)   # refused when the text also says disabled
+LOOSE_RE = re.compile(r'workflow\W+disable|/disable\b|actions/permissions', re.I)
+# kind -> (how it looks spelled out, [(its path words, None = any one word, ... = one or more (a branch name
+# may hold slashes); whether more may follow)])
+GUARDED = {'disable': (DISABLE_RE, [(['actions', 'workflows', None, 'disable'], False)]),
+           'perm': (PERM_RE, [(['actions', 'permissions'], True)]),
+           'protect': (PROTECT_RE, [(['branches', ..., 'protection'], True), (['rulesets', None], False)]),
+           'ruleset': (RULESET_RE, [(['rulesets', None], False)])}   # part of protect: one ruleset, by id
+PLACEHOLDER = re.compile(r'\{(?:owner|repo|branch)\}')   # gh api fills these in from the checkout
+READS = ('GET', 'HEAD')
+SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'busybox'}
+WRAPPERS = {'sudo', 'doas', 'env', 'command', 'exec', 'builtin', 'nohup', 'time', 'nice', 'ionice', 'timeout',
+            'stdbuf', 'xargs', 'setsid', 'unbuffer', 'chronic', 'flock', 'eval', 'source', '.', 'do', 'then',
+            'else', 'elif', 'if', 'while', 'until', '{', '}', '!', 'watch', 'script', 'runuser', 'systemd-run',
+            'coproc'} | SHELLS
+ARG_FLAGS = {'-u', '-g', '-n', '-k', '-s', '-I', '-P', '-L', '-d', '-E', '-C', '-p', '-o', '-e', '-i', '-l', '-a',
+             '--user', '--group', '--signal', '--kill-after', '--unit'}
+TEXT_ARGS = {'trap', 'ssh', 'su', 'parallel'}            # commands whose quoted arguments are shell text
+SETTERS = {'export', 'local', 'declare', 'typeset', 'readonly'}
+TAINTERS = {'read', 'mapfile', 'readarray', 'getopts', 'printf', 'let', 'unset', 'select'}   # set names from data
+INTERPRETERS = re.compile(r'^(python[\d.]*|pypy[\d.]*|node|nodejs|deno|bun|perl|ruby|php|pwsh|lua|tclsh|osascript)$')
+NET_CLIENTS = {'curl', 'wget', 'http', 'https', 'xh', 'xhs', 'curlie', 'httpie', 'aria2c'}
+# gh api (gh 2.102.0, `gh api --help`): the flags that take a value, and the switches
+API_VALUE = {'cache', 'field', 'header', 'hostname', 'input', 'jq', 'method', 'preview', 'raw-field', 'template'}
+API_SWITCH = {'allow-escape-sequences', 'include', 'paginate', 'silent', 'slurp', 'verbose', 'help'}
+API_SHORT = {'F': 'field', 'H': 'header', 'q': 'jq', 'X': 'method', 'p': 'preview', 'f': 'raw-field',
+             't': 'template'}
+API_SHORT_SWITCH = {'i', 'h'}
+GH_VERSION = '2.102'
+# gh's own commands and help topics (`gh help`, gh 2.102.0). An alias cannot take one of these names.
+GH_COMMANDS = {'auth', 'browse', 'codespace', 'discussion', 'gist', 'issue', 'org', 'pr', 'project', 'release',
+               'repo', 'skill', 'cache', 'run', 'workflow', 'agent-task', 'alias', 'api', 'attestation',
+               'completion', 'config', 'copilot', 'extension', 'gpg-key', 'label', 'licenses', 'preview', 'ruleset',
+               'search', 'secret', 'ssh-key', 'status', 'variable', 'help', 'version', 'accessibility', 'actions',
+               'environment', 'exit-codes', 'formatting', 'mintty', 'reference', 'telemetry',
+               'cs', 'rs', 'at', 'agent', 'agents', 'agent-tasks'}   # the short names gh has for its own commands
+# In the command itself (not in script files or alias texts): refuse a `gh api` write whose path is hidden
+# altogether. It stops careless calls only (a hidden value can always carry a whole command), so it is one switch.
+HIDDEN_PATH_RULE = True
+# curl and wget: what a plain read may carry, one table per tool because each reads flags its own way:
+# (switches, flags with a value, method flags, short switches, short flags with a value, short method flag,
+#  whether --flag=value is read). Anything else next to a guarded path is refused; a tool without a table
+# (httpie, xh, aria2c, a hidden command word) may carry no flags at all there.
+NET_TOOLS = {
+    'curl': ({'--silent', '--show-error', '--location', '--fail', '--fail-with-body', '--include', '--head',
+              '--verbose', '--compressed', '--get', '--globoff', '--no-buffer', '--no-progress-meter', '--http1.1',
+              '--http2', '--ipv4', '--ipv6', '--disable'},
+             {'--header', '--output', '--user-agent', '--max-time', '--connect-timeout', '--retry', '--retry-delay',
+              '--retry-max-time', '--write-out', '--user', '--oauth2-bearer', '--url', '--dump-header'},
+             {'--request'}, 'qsSLfiIvgGN46', 'HoAmwuD', 'X', False),
+    'wget': ({'--quiet', '--no-verbose', '--server-response', '--verbose', '--no-config'},
+             {'--output-document', '--header', '--tries', '--timeout', '--user-agent'},
+             {'--method'}, 'qSv46', 'OtTU', '', True),
+}
+NO_FLAGS = (set(), set(), set(), '', '', '', False)
+MAX_FILE, MAX_DEPTH, MAX_NEST, MAX_READINGS = 2_000_000, 2, 8, 64
+HARD_FILE = 64_000_000   # a bigger file that a shell or interpreter is about to run is refused unread
+TOO_BIG, NO_OPEN = f'a file over {HARD_FILE // 1_000_000} MB', 'a file the guard cannot open'
+# The hook is registered with a 10 s limit, and a hook that is not done by then does not stop the command. So the
+# guard stops itself earlier and refuses: a command it could not read to the end is one it cannot let through.
+BUDGET = 5.0
+START = time.monotonic()
+QUICK = True   # the fast exit (quick_pass); a switch for the tests that compare it with the full reading
+CACHE_VERSION, CACHE_LIFE, CACHE_MAX, CACHE_BYTES = 1, 60.0, 512, 1_000_000
+CACHE_RACY = 2.0
+CRASH_RE = re.compile(r'\bgh\b|curl|wget|httpie|\bxh\b|api\.github|workflow|disable', re.I)   # see main()
+SELF = os.path.realpath(os.path.abspath(__file__)) if '__file__' in globals() else ''
+RULE = ('Owner rule (2026-11-13, "guards that refuse, not trust"): no agent disables GitHub Actions workflows, or '
+        'Actions itself, on any repo; re-enabling (`gh workflow enable`, PUT .../enable) is fine. If disabling is '
+        'really needed, stop and ask the owner: name the repo, the workflow and why. Only the owner can approve '
+        'it: they run `sudo agent-guards approve --command \'<the exact command>\'` and give you a code; that '
+        f'one command, ending in {MARK_CMD}<code>, then passes once, in the folder they approved it for. Agents '
+        'must not make up a code, reuse one they were not given for this, start an agent '
+        'session without this machine\'s hooks, or route around this guard with scripts, aliases or other HTTP '
+        'clients.')
+UNREADABLE = ('If this call is harmless, write it so the guard can read it: the path and the flags spelled out in '
+              'the command, variables only for ids and only inside quotes.')
+
+
+PREFIX = 'Refused by actions-disable-guard: '
+
+
+def reason(what, hint=''):
+    return f'{PREFIX}{what}. {hint + " " if hint else ""}{RULE}'
+
+
+class Slow(BaseException):
+    """The guard is out of time for this command. Not an Exception, so no `except Exception` on the way swallows it."""
+
+
+def out_of_time(*_):
+    raise Slow()
+
+
+SLOW = reason(f'the guard could not finish reading this command and the scripts it runs within {BUDGET:g} s of '
+              'its start, so it refuses (a hook that runs out of time would let the command through unread)',
+              'Run it as smaller commands; tell the owner if this repeats.')
+
+
+def process_age():
+    """Seconds the hook process has used of its limit. The 10 s limit counts from the start of the process, so
+    Python's own start and the reading of the event count too. Loaded as a module (tests, gh-as) there is no hook
+    clock: 0."""
+    return since_start() if __name__ == '__main__' else 0.0
+
+
+def since_start():
+    """Seconds since this process started: from /proc where it is there and makes sense, else since this file was
+    loaded (the first thing the process does)."""
+    since = time.monotonic() - START
+    try:
+        with open('/proc/self/stat') as f:
+            ticks = int(f.read().rsplit(')', 1)[1].split()[19])   # field 22: start time, in clock ticks since boot
+        with open('/proc/uptime') as f:
+            age = float(f.read().split()[0]) - ticks / os.sysconf('SC_CLK_TCK')
+        if since <= age < 3600:
+            return age
+    except (OSError, ValueError, IndexError):
+        pass
+    return since
+
+
+def hidden(tok):
+    return HID in tok or WILD in tok
+
+
+# ---------- shell text -> commands of words
+
+ORD = re.compile(r'[^ \t\n\\\'"$`<>;&|()#]+')
+DQ_ORD = re.compile(r'[^"\\$`]+')
+NAME = re.compile(r'[A-Za-z_]\w*')
+REDIR = re.compile(r'<<<|<<-|<<|<>|<&|>>|>&|>\||<|>')
+ASSIGN = re.compile(r'^([A-Za-z_]\w*)(\+?)=(.*)$', re.S)
+BRACE = re.compile(r'\{[^{}\s]*(?:,|\.\.)[^{}\s]*\}')
+ANSI = re.compile(r'\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c.|.)', re.S)
+ANSI_ONE = {'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'b': '\b', 'e': '\x1b', 'E': '\x1b', 'f': '\f', 'v': '\v',
+            '\\': '\\', "'": "'", '"': '"', '?': '?'}
+FUNC_RE = re.compile(r'(?:^|[;&|\n{(])\s*(?:function\s+([A-Za-z_][\w.:-]*)|([A-Za-z_][\w.:-]*)\s*\(\s*\))')
+
+
+def ansi_c(s):
+    """The text of a $'..' string."""
+    def one(m):
+        e = m.group(1)
+        if e[0] in 'xuU' and len(e) > 1:
+            return chr(min(int(e[1:], 16), 0x10ffff))
+        if e[0] in '01234567':
+            return chr(int(e, 8) & 0xff)
+        if e[0] == 'c' and len(e) == 2:
+            return chr(ord(e[1]) & 0x1f)
+        return ANSI_ONE.get(e, '\\' + e)
+    return ANSI.sub(one, s)
+
+
+class Lex:
+    """Shell text as a shell splits it. cmds: one dict per simple command with words (lists of pieces), redirs
+    [(operator, word)] and docs [heredoc body]. A piece is (kind, text, quoted): L literal text, V a $NAME, H text
+    no reader can know ($(..), $1, ${X:-y}), M the same but maybe several words ("$@"). subs: the texts inside
+    $(..), `..`, <(..), which are commands too. taint: names that get a value no reader can know. Never raises:
+    an unclosed quote or bracket runs to the end (a shell runs the lines before it all the same)."""
+
+    def __init__(self, text, run=True):
+        self.t, self.n = text, len(text)
+        self.cmds, self.subs, self.taint, self.spans = [], [], set(), []
+        self.cur, self.word, self.redir, self.pending, self.depth = self.new(), None, None, [], 0
+        if run:
+            self.run()
+
+    @staticmethod
+    def new():
+        return {'words': [], 'redirs': [], 'docs': []}
+
+    @classmethod
+    def expansions(cls, text):
+        """The commands inside the $(..) and `..` of text a shell expands without reading quotes (a heredoc body)."""
+        lx, i = cls(text, run=False), 0
+        while i < lx.n:
+            c = text[i]
+            if c == '\\':
+                i += 2
+            elif c == '$':
+                i = lx.dollar(i, True)
+            elif c == '`':
+                i = lx.backtick(i, True)
+            else:
+                i += 1
+        return lx.subs
+
+    def plain(self):
+        """The text without its heredoc bodies."""
+        out, at = [], 0
+        for a, b in self.spans:
+            out.append(self.t[at:a])
+            at = b
+        return ''.join(out) + self.t[at:]
+
+    def lit(self, s, quoted=False):
+        if self.word is None:
+            self.word = []
+        if self.word and self.word[-1][0] == 'L' and self.word[-1][2] == quoted:
+            self.word[-1] = ('L', self.word[-1][1] + s, quoted)
+        else:
+            self.word.append(('L', s, quoted))
+
+    def piece(self, kind, text, quoted):
+        if self.word is None:
+            self.word = []
+        self.word.append((kind, text, quoted))
+
+    def end_word(self):
+        w, self.word = self.word, None
+        if w is None:
+            return
+        op, self.redir = self.redir, None
+        if op is None:
+            self.cur['words'].append(w)
+        elif op in ('<<', '<<-'):   # the word is the heredoc's end marker; quoted = its body is not expanded
+            mark = ''.join(p[1] if p[0] == 'L' else '$' + p[1] for p in w)
+            self.pending.append((mark, self.cur, any(p[0] == 'L' and p[2] for p in w)))
+        else:
+            self.cur['redirs'].append((op, w))
+
+    def end_cmd(self):
+        self.end_word()
+        self.redir = None
+        if self.cur['words'] or self.cur['redirs'] or any(c is self.cur for _, c, _ in self.pending):
+            self.cmds.append(self.cur)
+        self.cur = self.new()
+
+    def run(self):
+        t, n, i = self.t, self.n, 0
+        while i < n:
+            m = ORD.match(t, i)
+            if m:
+                self.lit(m.group())
+                i = m.end()
+                continue
+            c, nxt = t[i], t[i + 1:i + 2]
+            if c in ' \t':
+                self.end_word()
+                i += 1
+            elif c == '\n':
+                self.end_cmd()
+                i = self.docs(i + 1) if self.pending else i + 1
+            elif c == '\\':
+                if nxt != '\n':   # backslash + line break joins the lines
+                    self.lit(nxt or '\\', True)
+                i += 2
+            elif c == "'":
+                j = t.find("'", i + 1)
+                j = n if j < 0 else j
+                self.lit(t[i + 1:j], True)
+                i = j + 1
+            elif c == '"':
+                i = self.dquote(i + 1)
+            elif c == '$':
+                i = self.dollar(i, False)
+            elif c == '`':
+                i = self.backtick(i, False)
+            elif c == '#':
+                if self.word is None:   # a comment, to the end of the line
+                    j = t.find('\n', i)
+                    i = n if j < 0 else j
+                else:
+                    self.lit(c)
+                    i += 1
+            elif c in '<>':
+                if nxt == '(':   # <(..) >(..)
+                    j = self.close(i + 1, '(', ')')
+                    self.subs.append(t[i + 2:j])
+                    self.piece('H', '', False)
+                    i = j + 1
+                    continue
+                if self.word is not None and all(p[0] == 'L' and not p[2] and p[1].isdigit() for p in self.word):
+                    self.word = None   # 2>file: the 2 is no argument
+                self.end_word()
+                self.redir = REDIR.match(t, i).group()   # the next word is its target, no argument
+                i += len(self.redir)
+            elif c == '&':
+                if nxt == '>':
+                    self.end_word()
+                    self.redir = '&>'
+                    i += 3 if t[i + 2:i + 3] == '>' else 2
+                else:
+                    self.end_cmd()
+                    i += 2 if nxt == '&' else 1
+            elif c == '|':
+                if nxt != '|':
+                    self.cur['pipe'] = True   # its output is the next command's input
+                self.end_cmd()
+                i += 2 if nxt in ('|', '&') else 1
+            elif c == ';':
+                self.end_cmd()
+                i += 1
+                while t[i:i + 1] in (';', '&') and t[i:i + 1]:
+                    i += 1
+            elif c == '(':
+                w = self.word
+                if w and len(w) == 1 and w[0][0] == 'L' and not w[0][2] and re.fullmatch(r'[A-Za-z_]\w*\+?=', w[0][1]):
+                    self.taint.add(w[0][1].rstrip('+='))   # NAME=( .. ): an array, no single known text
+                    j = self.close(i, '(', ')')
+                    self.subs.append(t[i + 1:j])
+                    self.word = None
+                    i = j + 1
+                else:
+                    self.end_cmd()
+                    self.depth += 1
+                    i += 1
+            else:   # ')': the end of a ( .. ) group, or of a `case` pattern
+                if self.depth:
+                    self.depth -= 1
+                else:
+                    self.cur['pat'] = True
+                self.end_cmd()
+                i += 1
+        self.end_cmd()
+
+    def dquote(self, i):
+        t, n = self.t, self.n
+        self.lit('', True)
+        while i < n:
+            c = t[i]
+            if c == '"':
+                return i + 1
+            if c == '\\' and t[i + 1:i + 2] in ('$', '`', '"', '\\', '\n') and i + 1 < n:
+                if t[i + 1] != '\n':
+                    self.lit(t[i + 1], True)
+                i += 2
+            elif c == '$':
+                i = self.dollar(i, True)
+            elif c == '`':
+                i = self.backtick(i, True)
+            else:
+                m = DQ_ORD.match(t, i)
+                self.lit(m.group() if m else c, True)
+                i = m.end() if m else i + 1
+        return n
+
+    def dollar(self, i, q):
+        t = self.t
+        c = t[i + 1:i + 2]
+        if c == '(':   # $(..) and $((..))
+            j = self.close(i + 1, '(', ')')
+            self.subs.append(t[i + 2:j])
+            self.piece('H', '', q)
+            return j + 1
+        if c == '{':
+            j = self.close(i + 1, '{', '}')
+            body = t[i + 2:j]
+            if NAME.fullmatch(body):
+                self.piece('V', body, q)
+            elif re.fullmatch(r'[@*]|[A-Za-z_]\w*\[[@*]\]', body):
+                self.piece('H' if q and '*' in body else 'M', '', q)
+            else:   # ${X:-y}, ${X/a/b}, ${#X}, ${!X}: unknown text; ${X:=y} also sets X
+                m = NAME.match(body)
+                if m and re.match(r':?=', body[m.end():]):
+                    self.taint.add(m.group())
+                self.subs += Lex(body).subs
+                self.piece('H', '', q)
+            return j + 1
+        m = NAME.match(t, i + 1)
+        if m:
+            self.piece('V', m.group(), q)
+            return m.end()
+        if c in ('@', '*') and c:
+            self.piece('H' if q and c == '*' else 'M', '', q)
+            return i + 2
+        if c and c in '0123456789?$!#-':
+            self.piece('H', '', q)
+            return i + 2
+        if c == "'" and not q:   # $'..'
+            j = i + 2
+            while j < self.n and t[j] != "'":
+                j += 2 if t[j] == '\\' else 1
+            self.lit(ansi_c(t[i + 2:j]), True)
+            return j + 1
+        if c == '"' and not q:   # $".."
+            return self.dquote(i + 2)
+        self.lit('$', q)
+        return i + 1
+
+    def backtick(self, i, q):
+        t, j = self.t, i + 1
+        while j < self.n and t[j] != '`':
+            j += 2 if t[j] == '\\' else 1
+        self.subs.append(re.sub(r'\\([`$\\])', r'\1', t[i + 1:j]))
+        self.piece('H', '', q)
+        return j + 1
+
+    def close(self, i, opener, closer):
+        """Index of the bracket that closes the one at i (quotes and backslashes respected); the end if none does."""
+        t, n, depth = self.t, self.n, 0
+        while i < n:
+            c = t[i]
+            if c == '\\':
+                i += 2
+                continue
+            if c == "'":
+                j = t.find("'", i + 1)
+                i = n if j < 0 else j + 1
+                continue
+            if c == '"':
+                i += 1
+                while i < n and t[i] != '"':
+                    i += 2 if t[i] == '\\' else 1
+                i += 1
+                continue
+            if c == opener:
+                depth += 1
+            elif c == closer:
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return n
+
+    def docs(self, i):
+        """Read the heredoc bodies that start at line start i; the index after the last one."""
+        t, n = self.t, self.n
+        for mark, cmd, quoted in self.pending:
+            start, body = i, []
+            while i < n:
+                j = t.find('\n', i)
+                j = n if j < 0 else j
+                line, i = t[i:j], j + 1
+                if line.strip() == mark.strip():
+                    break
+                body.append(line)
+            text = '\n'.join(body)
+            self.spans.append((start, min(i, n)))
+            cmd['docs'].append(text)
+            if not quoted:   # an unquoted marker: the shell runs $(..) and `..` in the body
+                self.subs += self.expansions(text)
+        self.pending = []
+        return i
+
+
+def parse(text):
+    """(every simple command of the text, also those inside $(..) `..` <(..); the text without heredoc bodies;
+    names that get a value no reader can know; the pieces left unread at the 400-piece limit, which decide_text
+    refuses or marks unknown: never a shorter command list without saying so)."""
+    cmds, taint, queue, plain, done = [], set(), [text], None, 0
+    while queue and done < 400:
+        lx = Lex(queue.pop(0))
+        done += 1
+        plain = lx.plain() if plain is None else plain
+        for c in lx.cmds:
+            c['sub'] = done > 1   # inside $(..), `..`, <(..): its output goes into another command
+        cmds += lx.cmds
+        taint |= lx.taint
+        queue += lx.subs
+    return cmds, plain, taint, queue
+
+
+def word_text(w):
+    """The text of a word made of literal pieces only, else None."""
+    return ''.join(p[1] for p in w) if all(p[0] == 'L' for p in w) else None
+
+
+def split_assign(w, any_quoting=False):
+    """(name, '+' for +=, the value's pieces) when the word is NAME=value, else None. A shell wants NAME= bare;
+    declare/export/local take it quoted too (`declare "X=y"`)."""
+    lead = ''
+    for k, (kind, text, quoted) in enumerate(w):
+        if kind != 'L' or (not any_quoting and (k or quoted)):
+            return None
+        name, eq, rest = text.partition('=')
+        if not eq:
+            lead += text
+            continue
+        m = re.fullmatch(r'([A-Za-z_]\w*)(\+?)', lead + name)
+        if not m:
+            return None
+        return m.group(1), m.group(2), ([('L', rest, quoted)] if rest else []) + list(w[k + 1:])
+    return None
+
+
+def runs_unseen_code(texts):
+    """Whether eval, source, `.` or trap is the command (or a wrapper before it), not one of its arguments:
+    `git add .` and `--jq .` set no variables."""
+    lit = [HID if x is None else x for x in texts]
+    h, _ = head(lit)
+    return any(os.path.basename(x) in ('eval', 'source', '.', 'trap') for x in (lit if h is None else lit[:h + 1]))
+
+
+def variables(cmds, taint):
+    """What the text says about its variables. vals: name -> every value it gets anywhere in the text, as (from a
+    `for`, pieces). Not by order: a name set twice has two values and both are tried, so a harmless first value
+    hides nothing. Any word that looks like NAME=value counts (also after `then`, `do`, `env`). Names set from
+    data (read, +=, arrays, unset) are left out, so they read as hidden. open: other code may set any name (eval,
+    source, trap, declare -n), so every name is also tried as hidden. standalone: names set for the commands that
+    follow (`X=y`, `export X=y`), not only for one command (`X=y cmd`)."""
+    vals, taint, open_world, standalone = {}, set(taint), False, set()
+    for c in cmds:
+        ws = c['words']
+        texts = [word_text(w) for w in ws]
+        setter = any(x in SETTERS for x in texts)
+        found = [a for a in (split_assign(w, setter) for w in ws) if a]
+        for name, plus, value in found:
+            vals.setdefault(name, []).append((False, value))
+            if plus:
+                taint.add(name)
+            if setter or len(found) == len(ws):
+                standalone.add(name)
+        for n, x in enumerate(texts):
+            if x == 'for' and n + 1 < len(ws):
+                name = texts[n + 1]
+                if name and NAME.fullmatch(name) and n + 2 < len(ws) and texts[n + 2] == 'in':
+                    vals.setdefault(name, []).extend((True, w) for w in ws[n + 3:])
+                elif name:
+                    taint.add(name)
+            if x in TAINTERS and (x != 'printf' or '-v' in texts):
+                taint.update(y for y in texts[n + 1:] if y and NAME.fullmatch(y))
+        if runs_unseen_code(texts) or \
+                (setter and any(x and re.fullmatch(r'-[A-Za-z]*n[A-Za-z]*', x) for x in texts)):
+            open_world = True
+    return {'vals': {n: v for n, v in vals.items() if n not in taint}, 'open': open_world,
+            'set': set(vals) | taint, 'standalone': standalone}
+
+
+def var_texts(name, env, stack=()):
+    """Every text $name can be; HID for what cannot be known."""
+    vals = env['vals']
+    if name not in vals or name in stack or len(stack) > 4:
+        base = env.get('base', {}).get(name)   # $HOME as the hook got it, when the text never sets it
+        if base and name not in env['set'] and not hidden(base):
+            return [base, HID] if env['open'] else [base]
+        return [HID]
+    out = []
+    for from_for, value in vals[name]:
+        texts = ['']
+        if from_for and any(not q and (k != 'L' or re.search(r'[{}*?\[]', t)) for k, t, q in value):
+            texts = [HID]   # for x in $LIST *.sh {a,b}: the shell makes the values, they are not in the text
+            value = ()
+        for kind, text, _ in value:
+            opts = [text] if kind == 'L' else var_texts(text, env, stack + (name,)) if kind == 'V' else \
+                [WILD if kind == 'M' else HID]
+            texts = [a + b for a in texts for b in opts]
+            if len(texts) > 32:
+                return [HID]
+        out += [x for x in texts if x not in out]
+    if env['open'] and HID not in out:
+        out.append(HID)
+    return out if len(out) <= 32 else [HID]
+
+
+# Quoted text and $X values take no part in {a,b} expansion, quoted text also none in * ? [..] matching: their
+# characters are swapped for private ones while a word is put together, and swapped back when it is done.
+SHIELD_QUOTED = str.maketrans('{},.*?[', '')
+SHIELD_VALUE = str.maketrans('{},.', '')
+UNSHIELD = {v: k for k, v in SHIELD_QUOTED.items()}
+GLOB = re.compile(r'[*?]|\[[^\]\s]+\]')
+IFS = ' \t\n'
+
+
+def finish(tok, wild):
+    """A word, once put together: an unquoted {a,b} or * ? [..] becomes hidden text (the shell fills it in from
+    the folder), and the word gets the WILD mark when it may come out as several words or as none."""
+    while True:
+        tok, k = BRACE.subn(HID, tok)
+        if not k:
+            break
+        wild = True
+    if GLOB.search(tok):
+        wild = wild or GLOB.match(tok) is not None   # a leading * can match a file named like a flag
+        tok = GLOB.sub(HID, tok)
+    tok = tok.translate(UNSHIELD)
+    return tok + WILD if wild and WILD not in tok else tok
+
+
+def expand_word(w, bind):
+    """The tokens one word becomes. Quoted text stays one piece. An unquoted $X with a known value is split at
+    blanks (at $IFS when the text sets it). Unknown text is HID inside the word; when it is unquoted the shell may
+    split it anywhere, so the word also gets the WILD mark: it may be no word at all, or several."""
+    out, cur, has, wild = [], '', False, False
+    ifs = bind.get('IFS', IFS)
+    for kind, text, quoted in w:
+        if kind == 'L':
+            cur += text.translate(SHIELD_QUOTED) if quoted else text
+            has = True
+            continue
+        val = WILD if kind == 'M' else HID if kind == 'H' else bind.get(text, HID)
+        if quoted or kind == 'M':
+            cur += val.translate(SHIELD_QUOTED)
+            has = True
+            continue
+        if hidden(val) or hidden(ifs):
+            cur += val.translate(SHIELD_VALUE)
+            has = wild = True
+            continue
+        for k, part in enumerate(re.split('[' + re.escape(ifs) + ']+', val) if ifs else [val]):
+            if k and has:
+                out.append(finish(cur, wild))
+            if k:
+                cur, has, wild = '', False, False
+            if part:
+                cur += part.translate(SHIELD_VALUE)
+                has = True
+    if has:
+        out.append(finish(cur, wild))
+    return out
+
+
+def readings(cmd, env):
+    """The token lists a command can be: one per combination of the values its variables have in the text."""
+    names = []
+    for w in cmd['words']:
+        names += [p[1] for p in w if p[0] == 'V' and p[1] not in names]
+    if names and 'IFS' in env['set'] and 'IFS' not in names:
+        names.append('IFS')
+    opts, total = [], 1
+    for name in names:
+        o = var_texts(name, env)
+        if name == 'IFS':   # also the value it has before the text sets it
+            o = [IFS] + [x for x in o if x != IFS]
+        if total * len(o) > MAX_READINGS:
+            o = [HID]
+        total *= len(o)
+        opts.append(o)
+    out = []
+    for combo in itertools.product(*opts):
+        bind, toks = dict(zip(names, combo)), []
+        for w in cmd['words']:
+            toks += expand_word(w, bind)
+        out.append(toks)
+    return out
+
+
+def segments(cmd):
+    """One token list per simple command. gh-as (an app-token wrapper of gh) relies on this: its text has
+    one word per gh argument, and each must stay one token here."""
+    cmds, _, taint, _ = parse(cmd)
+    env = variables(cmds, taint)
+    return [r[0] for r in (readings(c, env) for c in cmds) if r[0]]
+
+
+def quote(tok):
+    return "'" + tok.replace("'", "'\\''") + "'"
+
+
+def is_assign(tok):
+    return re.match(r'^[A-Za-z_]\w*(\[[^\]]*\])?=', tok) is not None
+
+
+def is_dur(tok):
+    return re.match(r'^\d+(\.\d+)?[smhd]?$', tok) is not None or tok == '{}'
+
+
+def head(toks):
+    """(index of the command word after assignments and wrappers, which of shell/eval/xargs wrapped it)."""
+    i, via, prev_flag, script_next = 0, set(), False, False
+    while i < len(toks):
+        t = toks[i]
+        base = os.path.basename(t)
+        if prev_flag:
+            prev_flag = False
+        elif is_assign(t) or t in ('export', 'local', 'declare'):
+            pass
+        elif t == 'function':   # function NAME { ..
+            i += 1
+        # A wrapper only under its own name or in a system folder (`./sudo` is a file of the project), and not as
+        # the word a shell takes as its script (`bash nice` runs the file `nice` of the folder).
+        elif base in WRAPPERS and not script_next and ('/' not in t or os.path.dirname(t) in STD_BINS):
+            if base in SHELLS or base in ('source', '.'):
+                via.add('shell')
+                script_next = base != 'busybox'
+            if base in ('eval', 'xargs'):
+                via.add(base)
+        elif t.startswith('-'):
+            prev_flag = t in ARG_FLAGS
+        elif is_dur(t):
+            pass
+        elif base == 'uv' and i + 1 < len(toks) and toks[i + 1] == 'run':
+            i += 1
+            via.add('shell')
+        else:
+            return i, via
+        i += 1
+    return None, via
+
+
+def positional(args, valflags):
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in valflags:
+            i += 2
+            continue
+        if not a.startswith('-'):
+            out.append(a)
+        i += 1
+    return out
+
+
+# ---------- guarded paths
+
+def forms(tok):
+    """The spellings of a path a server may take as the same: percent-decoded, /./ and /x/../ resolved."""
+    out, t = [tok], tok
+    for _ in range(3):
+        u = unquote(t)
+        if u == t:
+            break
+        out.append(u)
+        t = u
+    for s in list(out):
+        r = re.sub(r'(?<!:)/(?:\.?/)+', '/', re.sub(r'/\.(?=[?#]|$)', '', s))
+        k = 1
+        while k:   # every /x/.. (no round limit, as in canon())
+            r, k = re.subn(r'/(?!\.\.?/)[^/?#]+/\.\.(?=/|$|[?#])', '', r)
+        if r not in out:
+            out.append(r)
+    return out
+
+
+def spells(tok, want):
+    """Whether a word is `want`, or has hidden parts that can make it so."""
+    if not hidden(tok):
+        return tok == want
+    rx = '.*'.join(re.escape(x) for x in re.split(f'[{HID}{WILD}]+', tok))
+    return re.fullmatch(rx, want, re.S | re.I) is not None
+
+
+def seg_match(segs, pat, more):
+    """Whether path words with hidden ones among them can spell pat. A hidden word stands for one or more words
+    of pat (a variable can hold `a/b`), and at least one of pat's own words must be visible."""
+    last = len(segs) - 1
+
+    def can(s, want):
+        return want is None or spells(s, want)
+
+    def go(si, pi, seen):
+        if pi == len(pat):
+            return seen and (more or si > last)
+        if si > last:
+            return False
+        if pat[pi] is ...:
+            return any(go(sj, pi + 1, seen) for sj in range(si + 1, last + 2))
+        s = segs[si]
+        if not can(s, pat[pi]):
+            return False
+        if not hidden(s):
+            return go(si + 1, pi + 1, seen or pat[pi] is not None)
+        seen = seen or (pat[pi] is not None and len(s.replace(HID, '').replace(WILD, '')) >= 3)
+        return any(go(si + 1, pj, seen) for pj in range(pi + 1, len(pat) + 1))
+
+    return any(go(i, 0, False) for i in range(len(segs)))
+
+
+def hits(tok, kind):
+    """2: the word spells the guarded path; 1: hidden text in it could complete it; 0: neither."""
+    rx, pats = GUARDED[kind]
+    best = 0
+    for f in forms(tok):
+        if rx.search(f):
+            return 2
+        g = PLACEHOLDER.sub(HID, f)
+        if hidden(g):
+            path = re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', g, flags=re.I), maxsplit=1)[0]
+            segs = [x.lower() for x in path.split('/') if x]
+            if any(seg_match(segs, pat, more) for pat, more in pats):
+                best = 1
+    return best
+
+
+def far_hits(tok, kind):
+    """hits() for the word as written and as the far end may read it (\\uXXXX, %XX and backslashes decoded)."""
+    best = hits(tok, kind)
+    if best < 2 and ('\\' in tok or '%' in tok):
+        best = max(best, hits(canon(tok), kind))
+    return best
+
+
+def visible_path(tok):
+    """Whether a path shows any text at all besides hidden parts and gh placeholders."""
+    return re.search(r'[A-Za-z0-9]', PLACEHOLDER.sub('', tok).replace(HID, '').replace(WILD, '')) is not None
+
+
+GRAPHQL_END = re.compile(r'(^|/)graphql/?$', re.I)
+
+
+def may_be_graphql(tok):
+    """Whether a `gh api` path can be the GraphQL endpoint: it ends in `graphql` in some spelling, hidden text in
+    it can complete that word, or it shows no text at all. `repos/o/r/issues/comments/$id` cannot."""
+    if not visible_path(tok):
+        return True
+    for f in forms(PLACEHOLDER.sub(HID, tok)):
+        path = re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', f, flags=re.I), maxsplit=1)[0]
+        if GRAPHQL_END.search(path.rstrip(HID + WILD)):
+            return True
+        if hidden(path) and seg_match([x.lower() for x in path.split('/') if x], ['graphql'], False):
+            return True
+    return False
+
+
+def certain_path(args):
+    """The path of a `gh api` call the guard cannot read fully, when the path itself is still certain: every word
+    before the first word that is no flag reads cleanly, and that word starts with plain text. gh api takes exactly
+    one path, so hidden text after it can add flags but cannot swap the path. None when it is not certain."""
+    if len(args) > 200:
+        return None
+    for i, a in enumerate(args):
+        _, pos, bad = api_parse(args[:i] + ['x'])
+        if bad or len(pos) > 1:
+            return None
+        if pos == ['x']:   # this word is no flag value
+            if a.startswith('-') and api_parse(args[:i] + ['--include'])[1] != ['--include']:
+                continue   # a flag
+            return None if a[:1] in ('', HID, WILD) else a
+    return None
+
+
+def override_header(value):
+    """Whether a header (key:value) may change the request method on the server."""
+    name = value.partition(':')[0]
+    return hidden(name) or 'method' in name.lower()
+
+
+# ---------- gh
+
+def looks_risky(text):
+    """Whether text that is no command line (a config, a request body) mentions what this guard refuses."""
+    t = re.sub(r'["\'\\]', '', text or '')
+    return LOOSE_RE.search(t) is not None or GQL_RE.search(t) is not None
+
+
+def yaml_text(s):
+    s = s.strip()
+    if len(s) > 1 and s[0] == s[-1] == "'":
+        return s[1:-1].replace("''", "'")
+    if len(s) > 1 and s[0] == s[-1] == '"':
+        return ansi_c(s[1:-1])
+    return s
+
+
+def gh_config(ctx):
+    """(the gh aliases [(the words of the name, the expansion)], whether a config may hold an alias this reader
+    missed) from the gh config of the hook's environment and of every config folder the command text points gh
+    at (GH_CONFIG_DIR=.. gh ..). A name can be several words (`pr wd` is `gh pr wd`)."""
+    env = ctx['env']
+    dirs = [env.get('GH_CONFIG_DIR') or os.path.join(env.get('XDG_CONFIG_HOME') or os.path.join(
+        env.get('HOME', os.path.expanduser('~')), '.config'), 'gh')] + list(ctx.get('cfg', ()))
+    memo, key = ctx.setdefault('memo', {}), ('gh config', tuple(dirs))
+    if key not in memo:
+        memo[key] = gh_config_cached(dirs, ctx)
+    return list(memo[key][0]), memo[key][1], memo[key][2]
+
+
+YAML_KEY = r"""(?:[A-Za-z0-9_][\w .-]*?|'[^'\\]*'|"[^"\\]*")"""
+YAML_ODD = re.compile(r'[!&*{\[|>?%@`"\']|- |:(?:\s|$)')   # the start of a value this reader does not follow
+
+
+def yaml_value_plain(v):
+    """Whether the value on a key's line is one of the few forms the reader below reads the way gh does: plain
+    text, one quoted text ('..' or ".." with \\\\ \\" \\n \\t only), or the start of a | or > block."""
+    v = v.strip()
+    if not v or re.fullmatch(r'[|>][+-]?\d*', v):
+        return True
+    if v[0] in '"\'':
+        return re.fullmatch(r"'(?:[^']|'')*'" + '|' + r'"(?:[^"\\]|\\[\\"nt])*"', v) is not None
+    return not YAML_ODD.match(v)
+
+
+def odd_yaml(text):
+    """Whether a gh config holds YAML outside the small subset the reader below follows: tags (`!!str`), `? ` keys,
+    anchors and `*` references, flow maps, escapes in keys, quoted values over several lines, tabs, `---`. The
+    guard does not try to read more YAML; it refuses a gh word that may be an alias from such a config."""
+    top = inside = block = False
+    base = None
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if '\t' in line[:indent]:
+            return True
+        if not indent:
+            m = re.fullmatch(r'(%s)\s*:(?:\s+(.*))?\s*' % YAML_KEY, line)
+            if not m or not yaml_value_plain(m.group(2) or ''):
+                return True
+            value = (m.group(2) or '').strip()
+            top, inside, base, block = True, m.group(1).strip('"\'') == 'aliases', None, value[:1] in ('|', '>')
+            if inside and value:   # aliases: {..}, aliases: *x
+                return True
+        elif not top:   # the whole map is indented: the reader below looks for `aliases:` at the line start
+            return True
+        elif not inside or (block and base is not None and indent > base):
+            continue
+        elif base is None or indent <= base:
+            m = re.fullmatch(r'\s+(%s)\s*:(?:\s+(.*))?\s*' % YAML_KEY, line)
+            if not m or not yaml_value_plain(m.group(2) or '') or (base is not None and indent != base):
+                return True
+            base, block = indent, (m.group(2) or '').strip()[:1] in ('|', '>')
+        elif YAML_ODD.match(line.strip()):   # a plain value that goes on in the next line
+            return True
+    return False
+
+
+def gh_config_now(dirs):
+    out, risky, odd = [], False, False
+    for cfg in dict.fromkeys(dirs):
+        path = os.path.join(cfg, 'config.yml')
+        text = read_text(path)
+        if text is None:
+            risky = risky or os.path.exists(path)   # too big, binary, no file: it cannot be read here, gh can
+            continue
+        found, inside, cur, base = [], False, None, 0
+        for line in text.splitlines():
+            m = re.match(r'^(["\']?)aliases\1\s*:\s*(.*)$', line)
+            if m:
+                inside, cur = True, None
+                for k, v in re.findall(r'["\']?([^,{}:"\']+)["\']?\s*:\s*([^,{}]*)', m.group(2)):   # aliases: {a: b}
+                    found.append([k.split(), yaml_text(v)])
+                continue
+            if not inside or not line.strip() or line.lstrip().startswith('#'):
+                continue
+            if not line.startswith((' ', '\t')):
+                inside = False
+                continue
+            indent = len(line) - len(line.lstrip())
+            m = re.match(r'^\s+(["\']?)([^:"\']+?)\1\s*:(?:\s+(.*)|\s*)$', line)
+            if m and (cur is None or indent <= base):
+                base, value = indent, (m.group(3) or '').strip()
+                cur = [m.group(2).split(), '' if re.fullmatch(r'[|>][+-]?\d*', value) else yaml_text(value)]
+                found.append(cur)
+            elif cur is not None:   # a value on the next lines (| and > blocks)
+                cur[1] = (cur[1] + '\n' + line.strip()).strip()
+        out += [(w, e) for w, e in found if w]
+        risky = risky or (looks_risky(text) and not any(looks_risky(e) for _, e in found))
+        odd = odd or odd_yaml(text)
+    return out, risky, odd
+
+
+def alias_forms(exp):
+    """An alias text as written and with its line breaks as blanks (a YAML `>` block folds them; gh splits a
+    plain alias at any blank)."""
+    exp = exp.strip()
+    return list(dict.fromkeys([exp, ' '.join(exp.split())]))
+
+
+def alias_text_reason(exp, ctx):
+    for x in alias_forms(exp):
+        # the bare text is read as a command too (a `!` the reader lost); its words are no command of this text,
+        # so it has its own flow and no gate on unknown words
+        r = decide_text(x[1:], ctx) if x.startswith('!') else \
+            decide_text('gh ' + x, ctx) or decide_text(x, dict(ctx, flow={}, nogate=True))
+        if r:
+            return r
+    return None
+
+
+def sub_candidates(args, value_flags=('-R', '--repo'), switches=('--help', '--version', '-h')):
+    """Indexes of the words that may be the subcommand. cobra takes the first word that is no flag and no flag
+    value, and which flags take a value depends on the command, so after a flag this table does not know both
+    readings count; a hidden word may be a flag too."""
+    out, value, maybe = [], False, False
+    for i, a in enumerate(args):
+        if value:
+            value = False
+            continue
+        if a.startswith('-') and len(a) > 1:
+            value = a in value_flags
+            maybe = not value and a not in switches and '=' not in a
+            continue
+        out.append(i)
+        if not maybe and not hidden(a):
+            break
+        maybe = False
+    return out
+
+
+def gh_reason(args, ctx, sure=True):
+    """Why these gh arguments are refused, or None. sure: the command word is `gh` for certain (not a hidden
+    word or a shell function that may be gh)."""
+    top = sure and ctx['depth'] == 0
+    cands = sub_candidates(args)
+    says = re.search(r'disable|actions/permissions', re.sub(r'["\'\\]', '', ctx.get('all') or ''), re.I)
+    # A config folder nobody can read here may hold any alias. An alias cannot take the name of a gh command, so
+    # `GH_CONFIG_DIR=$(mktemp -d) gh pr list` passes; a word that is no gh command may be an alias.
+    if top and ctx.get('cfg_hidden') and cands and (says or args[cands[0]] not in GH_COMMANDS):
+        return reason('`gh` with a config folder the guard cannot read (GH_CONFIG_DIR, XDG_CONFIG_HOME or HOME '
+                      'set from a variable or command output) and a word that is no gh command, or in a command '
+                      'that names `disable` or `actions/permissions`: the folder may hold an alias that disables '
+                      'Actions', 'Write the folder out in the command.')
+    if top and cands and hidden(args[cands[0]]) and says:
+        return reason('`gh` with a subcommand the guard cannot read (an array, a variable, "$@"), in a command '
+                      'that also names `disable` or `actions/permissions`', UNREADABLE)
+    for i in cands:
+        sub, after = args[i], args[i + 1:]
+        guess = hidden(sub)   # `gh "$X" ..`: X may be workflow or api
+        for name in (('workflow', 'api', 'alias') if guess else (sub,)):
+            r = gh_sub_reason(name, args[:i] + after, after, ctx, guess, top)
+            if r:
+                return r
+    aliases, risky, odd = gh_config(ctx)
+    aliases += ctx.get('gh_set', [])
+    sub_ctx = dict(ctx, depth=ctx['depth'] + 1)
+    first = args[cands[0]] if cands else ''
+    if ctx['depth'] >= MAX_DEPTH:   # too deep to expand an alias: what it stands for is read only for tokens
+        if not first or first in GH_COMMANDS:
+            return None
+        exps = [e for _, e in aliases]
+        if risky or odd or any(hidden(e) for e in exps):
+            return reason(f'`gh {redact(first)}` may be an alias, in a script that scripts run, too deep for the '
+                          'guard to expand, and the gh config is one it cannot read in full')
+        return stopped('\n'.join(exps), f'`gh {redact(first)}` may be an alias that names disabling Actions, in a '
+                       'script that scripts run, too deep for the guard to expand', ctx['flow'])
+    for words, exp in aliases:
+        if words is None:   # an alias of any name
+            if not first or first in GH_COMMANDS:
+                continue
+            j = cands[0]
+        else:
+            at = 0
+            for j, a in enumerate(args):
+                if spells(a, words[at]):
+                    at += 1
+                    if at == len(words):
+                        break
+            else:
+                continue
+        rest = ' '.join(quote(a) for a in args[j + 1:])
+        if any(decide_text(x[1:] if x.startswith('!') else f'gh {x} {rest}', sub_ctx) for x in alias_forms(exp)):
+            return reason(f'the gh alias `{" ".join(words or ["?"])}` expands to a command that disables Actions')
+    if risky and sure and first and first not in GH_COMMANDS:   # also when it is an alias this reader did find
+        return reason(f'`gh {redact(first)}` is no gh command, and the gh config holds text about disabling Actions '
+                      'that the guard cannot read as an alias', 'Tell the owner: the gh config needs a look.')
+    if odd and sure and first and first not in GH_COMMANDS:
+        return reason(f'`gh {redact(first)}` is no gh command, and the gh config holds YAML the guard does not read '
+                      '(a tag like `!!str`, a `? ` key, an anchor, a flow map, an escape in a key ..), so the word '
+                      'may be an alias the guard cannot see', 'Tell the owner: the gh config needs a look.')
+    return None
+
+
+def gh_sub_reason(sub, rest, after, ctx, guess, top):
+    if sub == 'workflow':
+        for j in sub_candidates(after):
+            if after[j] == 'disable':
+                return reason('`gh workflow disable` disables a GitHub Actions workflow')
+            if hidden(after[j]) and spells(after[j], 'disable') and not guess:
+                return reason('`gh workflow` with a subcommand the guard cannot read (it may be `disable`)',
+                              UNREADABLE)
+        return None
+    if sub == 'api':
+        return api_reason(rest, ctx, top)
+    if sub == 'alias':
+        verb = [a for a in after if not a.startswith('-')][:1]
+        tail = after[after.index(verb[0]) + 1:] if verb else []
+        pos = [a for a in tail if a == '-' or not a.startswith('-')]   # --clobber and -s/--shell are switches
+        # blind: the call is not known to be `gh alias <verb>` (a hidden word stands where `alias` or the verb
+        # would be), or it only prints help. Then only alias text that can be read and disables is refused.
+        blind = guess or not verb or hidden(verb[0]) or bool({'--help', '-h'} & set(tail))
+        if verb and (verb[0] == 'set' or hidden(verb[0]) and not guess):
+            exp = ' '.join(pos[1:])
+            if exp in ('-', ''):   # the alias text comes on stdin
+                known = ctx.get('stdin')
+                if exp == '-' and not blind and (known is None or hidden(known) or SHELL_VALUE.search(known)):
+                    return reason('`gh alias set .. -` with alias text the guard cannot read (a pipe, a file that '
+                                  'is not there yet, a variable)', 'Write the alias text out in the command.')
+                if (known is not None and alias_text_reason(known, ctx)) or looks_risky(stdin_texts(ctx)[0]):
+                    return reason('`gh alias set` from stdin with an alias that disables Actions')
+                return None
+            if hidden(exp) and blind:
+                return None
+            if hidden(exp):
+                return reason('a gh alias with text the guard cannot read (a variable or command output)',
+                              'Write the alias text out in the command.')
+            if any(a == '--shell' or re.fullmatch(r'-[a-z]*s[a-z]*', a) for a in tail) and not exp.startswith('!'):
+                exp = '!' + exp
+            if alias_text_reason(exp, ctx):
+                return reason('a gh alias that disables Actions')
+        if verb and (verb[0] == 'import' or hidden(verb[0]) and not guess):
+            src = pos[0] if pos else '-'
+            text = ctx.get('stdin') if src == '-' else read_named(src, ctx)
+            if text is None and not blind:
+                return reason('`gh alias import` of a file or pipe the guard cannot read',
+                              'Import a file that is there before the command runs.')
+            for _, exp in yaml_aliases(text or ''):
+                if alias_text_reason(exp, ctx):
+                    return reason('`gh alias import` of an alias that disables Actions')
+            if looks_risky(text if text is not None else ctx.get('raw')):   # also what the lines above cannot read
+                return reason('`gh alias import` of text about disabling Actions')
+    return None
+
+
+def yaml_aliases(text):
+    """[(the words of the name, the expansion)] of the `name: expansion` lines of a gh alias import file."""
+    out = []
+    for line in text.splitlines():
+        m = re.match(r'^\s*(["\']?)([^:#"\']+)\1\s*:\s*(.*)$', line)
+        if m and m.group(2).split():
+            out.append((m.group(2).split(), yaml_text(m.group(3))))
+    return out
+
+
+def text_aliases(toks, stdin, ctx):
+    """The gh aliases a command of the text sets up itself (`gh alias set`, `gh alias import`): they are not in the
+    gh config yet when the guard reads the text, and a later command of the same text may use them. A name of
+    None stands for any name (an import the guard cannot read)."""
+    for i, t in enumerate(toks):
+        if os.path.basename(t) != 'gh':
+            continue
+        rest = [a for a in toks[i + 1:] if a == '-' or not a.startswith('-')]
+        if rest[:2] == ['alias', 'set'] and len(rest) > 3:
+            exp = ' '.join(rest[3:])
+            exp = (HID if stdin is None or SHELL_VALUE.search(stdin) else stdin) if exp == '-' else exp
+            shell = any(a == '--shell' or re.fullmatch(r'-[a-z]*s[a-z]*', a) for a in toks[i + 1:])
+            return [(rest[2].split() or None, '!' + exp if shell and not exp.startswith('!') else exp)]
+        if rest[:2] == ['alias', 'import']:
+            src = rest[2] if len(rest) > 2 else '-'
+            text = stdin if src == '-' else read_named(src, ctx)
+            return [(None, HID)] if text is None else yaml_aliases(text)
+    return []
+
+
+def stdin_texts(ctx):
+    """What a command reads on stdin: its heredoc or <<< text; when it comes from a pipe or a file, the command
+    text itself stands in (what is piped in is most often written there)."""
+    return [ctx['stdin']] if ctx.get('stdin') is not None else [ctx.get('raw') or '']
+
+
+def file_or_text(path, ctx):
+    """A file the command names, or the command text when the file is not there to read (it may be written by
+    the same command)."""
+    text = read_named(path, ctx)
+    return ctx.get('raw') or '' if text is None else text
+
+
+def api_parse(args):
+    """`gh api` arguments as gh's flag reader (pflag) takes them: (flags [(long name, value)], positionals, what
+    went wrong or ''). `--` ends the flags; `--name=value` or `--name value`; short flags join (`-iXPUT`), a short
+    flag's value is the rest of the word (`-XPUT`, `-X=PUT`) or the next word; a flag that takes a value takes the
+    next word whatever it looks like (`-p -XGET`: the preview is "-XGET")."""
+    flags, pos, bad = [], [], ''
+    if any(WILD in a for a in args):
+        bad = 'an unquoted variable or command output, which may add flags: put it in double quotes'
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        i += 1
+        if a == '--':
+            pos += args[i:]
+            break
+        if not a.startswith('-') or a == '-':
+            pos.append(a)
+            continue
+        if a.startswith('--'):
+            name, eq, val = a[2:].partition('=')
+            if hidden(name):
+                bad = bad or 'a flag name the guard cannot read'
+            elif name in API_SWITCH:
+                pass
+            elif name not in API_VALUE:
+                bad = bad or f'the flag --{redact(name)}, which gh api {GH_VERSION} does not have'
+            elif eq:
+                flags.append((name, val))
+            elif i < n:
+                flags.append((name, args[i]))
+                i += 1
+            else:
+                bad = bad or f'--{name} without its value'
+            continue
+        s = a[1:]
+        while s:
+            c, s = s[0], s[1:]
+            if c in API_SHORT_SWITCH:
+                s = '' if s[:1] == '=' else s   # -i=false
+                continue
+            if c not in API_SHORT:
+                bad = bad or ('a flag the guard cannot read' if c in (HID, WILD) else
+                              f'the flag -{c}, which gh api {GH_VERSION} does not have')
+                break
+            if len(s) > 1 and s[0] == '=':
+                val = s[1:]
+            elif s:
+                val = s
+            elif i < n:
+                val = args[i]
+                i += 1
+            else:
+                bad = bad or f'-{c} without its value'
+                break
+            flags.append((API_SHORT[c], val))
+            s = ''
+    return flags, pos, bad
+
+
+def api_reason(args, ctx, top=False):
+    flags, pos, bad = api_parse(args)
+    if not bad and len(pos) > 1 and any(a[:1] in (HID, WILD) for a in pos):
+        bad = 'a hidden word that may be a flag'   # `gh api "$X" path`: X may be -XPUT
+    exact = not bad
+    method, fields, inputs = None, [], []
+    override = any('x-http-method-override' in a.lower() for a in args)
+    for name, val in flags:
+        if name == 'method':
+            method = val
+        elif name in ('field', 'raw-field'):
+            fields.append(val)
+        elif name == 'input':
+            inputs.append(val)
+        elif name == 'header' and override_header(val):
+            override = True
+    eff = 'POST' if method is None and (fields or inputs) else 'GET' if method is None else \
+        '?' if hidden(method) else method.upper()
+    if override and eff in READS:
+        eff = 'POST'
+    write = not exact or eff not in READS
+    cands = pos if exact else args   # an unreadable call: any word may be the path
+    how = f'a {eff} with' if exact and eff != '?' else 'a call the guard cannot read fully ' \
+        f'({bad or "the method is hidden"}), so it counts as a write, with'
+    best = {k: max([far_hits(a, k) for a in cands] or [0]) for k in GUARDED}
+    if best['disable'] == 2 or (best['disable'] and write):
+        return reason('a call to the GitHub `.../actions/workflows/<id>/disable` endpoint' if best['disable'] == 2
+                      else f'{how} `gh api` to a path that hidden text can turn into `.../actions/workflows/<id>/'
+                      'disable`', '' if best['disable'] == 2 else UNREADABLE)
+    if best['perm'] and write:
+        if exact and eff == 'PUT' and not inputs and not override and len(pos) == 1 and REPO_PERM_RE.match(pos[0]) \
+                and not hidden(pos[0]) and reenables(fields):
+            return None   # re-enabling Actions for a repo
+        return reason(f'{how} `gh api` to GitHub `.../actions/permissions` (turns Actions off or limits it)',
+                      '' if exact and best['perm'] == 2 and eff != '?' else UNREADABLE)
+    if write:
+        srcs = [('', s) for s in inputs] + [(k + '=', v[1:]) for k, _, v in (f.partition('=') for f in fields)
+                                            if v.startswith('@')]   # -F key=@file reads the value from a file
+        known = [(pre, ctx.get('stdin') if s == '-' else read_named(s, ctx)) for pre, s in srcs]
+        unread = any(b is None or hidden(b) for _, b in known)
+        # a file that is not there yet is often written by the same command, so its text is in the command
+        bodies = [ctx.get('raw') or '' if b is None else pre + b.strip() for pre, b in known]
+        seen = [canon(x) for x in list(args) + bodies]   # as the far end reads them: \u0064isabled is disabled
+        if best['protect'] and (not exact or eff in ('DELETE', '?')):
+            return reason(f'{how} `gh api` to branch protection or a ruleset: a DELETE there removes the rules '
+                          'that keep `main` behind CI and review (changing them with PUT/PATCH/POST is not '
+                          'refused)', '' if exact and eff == 'DELETE' else UNREADABLE)
+        if best['ruleset'] and (any(re.fullmatch(r'enforcement=(disabled|evaluate|.*[%s%s].*)' % (HID, WILD), f,
+                                                 re.S | re.I) for f in fields)
+                                or any(RULESET_OFF.search(canon(x, cue=False)) for x in list(args) + bodies)):
+            return reason(f'{how} `gh api` that switches a ruleset off (enforcement=disabled or evaluate)')
+        if best['ruleset'] and unread:
+            return reason(f'{how} `gh api` to a ruleset with a body the guard cannot read (a pipe, a file that is '
+                          'not there yet, a file named by a variable): it may switch the ruleset off',
+                          'Write the body to a file in a command before this one and name the file in full.')
+        # GraphQL only when the path can be the GraphQL endpoint: a comment posted to `repos/o/r/issues/$n/comments`
+        # with its text from a file named by a variable is no GraphQL call
+        path = certain_path(args)
+        gql = any(may_be_graphql(a) for a in pos) if exact else path is None or may_be_graphql(path)
+        if gql and any(GQL_RE.search(x) for x in seen):
+            return reason('a GraphQL mutation that deletes branch protection or a ruleset')
+        # the off word may stand alone in a variable (-F e=EVALUATE, `"variables": {"e": "EVALUATE"}`): read without
+        # the cue words, as for a ruleset body (canon() blanks text that names no guarded word)
+        if gql and any(GQL_UPDATE.search(x) for x in seen) and (unread or any(
+                OFF_WORD.search(canon(x, cue=False)) for x in list(args) + bodies)):
+            return reason('a GraphQL updateRepositoryRuleset that switches the ruleset off (enforcement: DISABLED '
+                          'or EVALUATE), '
+                          'or one with a body the guard cannot read')
+        if gql and unread:
+            return reason('a GraphQL call with a body the guard cannot read (a pipe, a file that is not there yet, '
+                          'a file named by a variable): it may delete branch protection or a ruleset',
+                          'Write the query to a file in a command before this one and name the file in full.')
+    if top and HIDDEN_PATH_RULE and write and (eff not in READS or any(WILD in a for a in args)) \
+            and not any(visible_path(a) for a in pos):
+        return reason(f'{how} `gh api` to a path that is hidden altogether (a variable or command output), so the '
+                      'guard cannot tell it from the Actions settings', UNREADABLE)
+    return None
+
+
+def reenables(fields):
+    """Whether gh api fields are exactly `enabled=true`, with at most `allowed_actions=all`."""
+    seen = set()
+    for f in fields:
+        k, _, v = f.partition('=')
+        if hidden(f) or (k, v) not in (('enabled', 'true'), ('allowed_actions', 'all')):
+            return False
+        seen.add(k)
+    return 'enabled' in seen
+
+
+# ---------- curl, wget, httpie
+
+def net_reason(word, args, ctx):
+    """curl, wget, httpie and the like next to a guarded path. Only a call that is plainly a read passes: the
+    tool's known read-only flags and nothing the guard cannot read. (Each tool reads flags its own way, so there
+    is one table per tool, and a tool without a table may carry no flags at all.)"""
+    best = {k: max([far_hits(a, k) for a in args] or [0]) for k in GUARDED}
+    if best['disable'] == 2:
+        return reason('a call to the GitHub `.../actions/workflows/<id>/disable` endpoint')
+    if not (best['disable'] or best['perm'] or best['protect']):
+        return None
+    paths = [a for a in args if any(far_hits(a, k) for k in GUARDED)]
+    if plain_read(NET_TOOLS.get(word), args, paths):
+        return None
+    if best['perm'] or best['disable']:
+        return reason('a request to GitHub `.../actions/permissions` (or to a path that hidden text can turn into '
+                      'a guarded one) that is not plainly a read: it may turn Actions off or limit it',
+                      'A read passes with the tool\'s own config off and read-only flags only: `curl -q -sS -L '
+                      '-f -H .. -o ..` (-q first), `wget --no-config -q -O ..`.')
+    if any('DELETE' in a.upper() or hidden(a) for a in args if a not in paths):
+        return reason('a DELETE (or a request the guard cannot read) to branch protection or a ruleset: it removes '
+                      'the rules that keep `main` behind CI and review')
+    if best['ruleset']:   # a body that switches the ruleset off, written out or in a file (-d @file)
+        files = [m.group(1) for a in args for m in [re.search(r'@([^@=\s]+)$', a)] if m and a not in paths]
+        texts = [read_named(f, ctx) for f in files]
+        if any(t is None or RULESET_OFF.search(canon(t, cue=False)) for t in texts) \
+                or any(RULESET_OFF.search(canon(a, cue=False)) for a in args):
+            return reason('a request that switches a ruleset off (enforcement=disabled or evaluate), or one to a '
+                          'ruleset with a '
+                          'body file the guard cannot read')
+    return None
+
+
+def plain_read(tool, args, paths):
+    """Whether the arguments are a read for certain: the path, GET/HEAD, and flags from the tool's table."""
+    switches, values, methods, short_switches, short_values, short_method, eq = tool or NO_FLAGS
+    i, n = 0, len(args)
+
+    def value(joined=None):   # a value that looks like a flag is refused: the tool may read it as one
+        nonlocal i
+        if joined is None:
+            i += 1
+            joined = args[i - 1] if i <= n else None
+        return None if joined is None or (joined.startswith('-') and len(joined) > 1) else joined
+
+    while i < n:
+        a = args[i]
+        i += 1
+        if a in paths or (a.upper() in READS and not tool):   # httpie: `http GET url`
+            continue
+        if not a.startswith('-') or a == '-' or hidden(a) and WILD in a:
+            return False
+        if a.startswith('--'):
+            name, has_eq, val = a.partition('=')
+            if name in switches and not has_eq:
+                continue
+            if (name not in values and name not in methods) or (has_eq and not eq):
+                return False
+            val = value(val if has_eq else None)
+            if val is None or hidden(val) and name in methods or (name in methods and val.upper() not in READS) \
+                    or (name == '--header' and override_header(val)):
+                return False
+            continue
+        s = a[1:]
+        while s:
+            c, s = s[0], s[1:]
+            if c in short_switches:
+                continue
+            if c not in short_values and c != short_method:
+                return False
+            val, s = value(s or None), ''
+            if val is None or (c == short_method and val.upper() not in READS) or (c == 'H' and override_header(val)):
+                return False
+    return True
+
+
+# ---------- code and script files
+
+def read_text(path):
+    """A file's text; None for no file, a file over MAX_FILE, an error and a binary (NUL in the first 8 KB). Where a
+    shell or interpreter runs the file, file_token() and unread() tell those apart."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        if os.path.getsize(path) > MAX_FILE:
+            return None
+        with open(path, 'rb') as f:
+            data = f.read()
+    except OSError:
+        return None
+    if b'\0' in data[:8192]:
+        return None
+    return data.decode('utf-8', 'replace')
+
+
+def file_token(path):
+    """The guarded token a file names, also in a file over MAX_FILE (read in 1 MB pieces that overlap by 4 KB). None
+    when it names none, is not there or is a compiled binary (a NUL in the first 8 KB: today's pass); a file the
+    guard cannot read at all (an error, over HARD_FILE) counts as naming one."""
+    text = read_text(path)
+    if text is not None:
+        return named(text)
+    try:
+        if not path or not os.path.isfile(path):
+            return None
+        with open(path, 'rb') as f:
+            if b'\0' in f.read(8192):
+                return None
+            if os.path.getsize(path) > HARD_FILE:
+                return TOO_BIG
+            f.seek(0)
+            tail = ''
+            while True:
+                piece = f.read(1 << 20)
+                if not piece:
+                    return None
+                s = tail + piece.decode('utf-8', 'replace')
+                tok = named(s) or (LOOSE_RE.search(s) and 'disabling Actions')
+                if tok:
+                    return tok
+                tail = s[-4096:]
+    except OSError:
+        return NO_OPEN
+
+
+def unread(path, any_file=True):
+    """Why a file that a shell or interpreter is about to run, and that read_text() could not give in full, is
+    refused; None for no file, a compiled binary and a big file that names no token anywhere. any_file=False: only
+    a file that looks like a script (its name, a `#!` line, the executable bit); data passes as before."""
+    if not path or read_text(path) is not None or not os.path.isfile(path) or not (any_file or script_like(path)):
+        return None
+    tok, name, mb = file_token(path), redact(os.path.basename(path)), MAX_FILE // 1_000_000
+    if tok == NO_OPEN:
+        return reason(f'the file {name} is about to run, and the guard cannot open it to read it', 'Make it readable.')
+    return tok and reason(f'the file {name} is about to run, and the guard reads files whole only up to {mb} MB: '
+                          + (f'it is {tok}' if tok == TOO_BIG else f'read in pieces, it names {tok}'),
+                          f'Split the file, or run the part you need from a file under {mb} MB.')
+
+
+def script_like(path, unopened=True):
+    """A file that looks like a script (its name, the executable bit, a `#!` line) and is no compiled binary.
+    unopened: the answer for a file the guard cannot open (True where a shell or interpreter runs it)."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(8192)
+    except OSError:
+        return unopened
+    return b'\0' not in head and (head[:2] == b'#!' or path.endswith(SHELL_EXT + CODE_EXT) or os.access(path, os.X_OK))
+
+
+def resolve_path(tok, cwd):
+    tok = os.path.expanduser(tok)
+    return os.path.normpath(tok if os.path.isabs(tok) else os.path.join(cwd, tok))
+
+
+def folders(ctx):
+    """The folders a command of the text may run in: the hook's, and every one the text moves to with `cd`."""
+    return ctx.get('cwds') or [ctx['cwd']]
+
+
+def read_named(tok, ctx):
+    """The text of a file the command names, looked for in every folder the command may run in; None when it is
+    hidden, not there or no text."""
+    if hidden(tok):
+        return None
+    for d in folders(ctx):
+        text = read_text(resolve_path(tok, d))
+        if text is not None:
+            return text
+    return None
+
+
+def named_file(tok, ctx):
+    """file_token() of a file the command names, in every folder the command may run in."""
+    return None if hidden(tok) else next((t for d in folders(ctx) for t in [file_token(resolve_path(tok, d))] if t),
+                                         None)
+
+
+def resolve_cmd(tok, ctx, via_shell):
+    """The script file a command word runs: through a shell/source any file, else only an executable one."""
+    if '/' in tok:
+        p = resolve_path(tok, ctx['cwd'])
+        return p if via_shell or (os.path.isfile(p) and os.access(p, os.X_OK)) else None
+    if via_shell:
+        p = resolve_path(tok, ctx['cwd'])
+        if os.path.isfile(p):
+            return p
+    for d in home_path_dirs(ctx['env'].get('PATH') or '', ctx['env'].get('HOME') or os.path.expanduser('~')):
+        p = os.path.join(d, tok)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+_HOME_DIRS = {}
+
+
+def home_path_dirs(path, home):
+    """PATH entries under $HOME (computed once: realpath on every entry for every segment was slow)."""
+    key = (path, home)
+    if key not in _HOME_DIRS:
+        h = os.path.realpath(home) + os.sep
+        _HOME_DIRS[key] = [d for d in path.split(':') if d and os.path.realpath(d).startswith(h)]
+    return _HOME_DIRS[key]
+
+
+def file_reason(path, ctx, force_shell=False):
+    if not path or os.path.realpath(path) == SELF:
+        return None   # the guard's own text is full of what it refuses
+    # One answer per file and setting: a script that calls its helpers fifty times is read once, not fifty times.
+    memo = ctx.setdefault('memo', {})
+    key = (path, force_shell, ctx['depth'], tuple(folders(ctx)), tuple(ctx.get('cfg', ())),
+           bool(ctx.get('cfg_hidden')), repr(ctx.get('gh_set', ())))
+    if key not in memo:
+        memo[key] = None   # a script that runs itself: the run that is being read already answers for it
+        memo[key] = deep_reason(path, ctx) if ctx['depth'] >= MAX_DEPTH else file_reason_now(path, ctx, force_shell)
+    return memo[key]
+
+
+def deep_reason(path, ctx):
+    """A script too deep to read as shell: it and the scripts it names are read for tokens only; anything further
+    counts as a program the guard does not know. A file it names that cannot be opened is no script here."""
+    text = read_text(path)
+    near = {resolve_path(w, d) for w in re.findall(r'[\w.~/+-]+', text or '') for d in folders(ctx)} - {path}
+    hit = next((q for q in sorted(near) if os.path.isfile(q) and os.path.realpath(q) != SELF and
+                script_like(q, unopened=False) and file_token(q)), None)
+    what = 'a script that scripts run, too deep for the guard to read'
+    return unread(path) or (hit and reason(f'{what} ({redact(os.path.basename(path))}) names the script '
+                                           f'{redact(os.path.basename(hit))}, which names a guarded token',
+                                           'Run the inner script as a command of its own.')) or \
+        stopped(text or '', what, ctx['flow'], 'Run the inner script as a command of its own.')
+
+
+def file_reason_now(path, ctx, force_shell):
+    f = facts(path, ctx)
+    if not f['text']:   # an interpreter's file counts only when it looks like a script (lockout care for data)
+        return unread(path, any_file=force_shell)
+    if f['own']:
+        return None
+    shellish = force_shell or path.endswith(('.sh', '.bash', '.zsh')) or f['bang'] in SHELLS
+    if not shellish:
+        f = facts(path, ctx, ('named',))
+        if not f['text']:   # changed under the guard since it was cached
+            return unread(path, any_file=force_shell)
+        tok = f['named']
+        return tok and reason(f'{redact(os.path.basename(path))}: a script that names {tok}. The guard reads shell '
+                              'scripts only, not code in other languages, so it cannot prove this one is harmless',
+                              CODE_HINT + ' Run tests of this guard through a test runner that is handed their folder.')
+    text = body(path, ctx)
+    if text is None:
+        return unread(path, any_file=force_shell)
+    sub_ctx = dict(ctx, depth=ctx['depth'] + 1, raw=text, nest=0)
+    inner = decide_text(text, sub_ctx, scan_raw=False)
+    if inner:   # say what in the script is refused, not only that something is
+        what = inner[len(PREFIX):] if inner.startswith(PREFIX) else inner
+        return PREFIX + f'the script {os.path.basename(path)} holds: {what}'
+    return None
+
+
+_OWN = []
+
+
+def own_text():
+    """The guard's own text: a copy that is the same byte for byte (the repo copy next to the installed one) is the
+    guard, not a script that disables Actions."""
+    if not _OWN:
+        _OWN.append(read_text(SELF) if SELF else None)
+    return _OWN[0]
+
+
+def shebang(text):
+    """The program a `#!` first line names (`#!/usr/bin/env -S python3 -I` is python3), '' without one."""
+    first = text.split('\n', 1)[0]
+    if not first.startswith('#!'):
+        return ''
+    parts = first[2:].split()
+    if parts and os.path.basename(parts[0]) == 'env':
+        parts = [x for x in parts[1:] if not x.startswith('-') and '=' not in x]
+    return os.path.basename(parts[0]) if parts else ''
+
+
+# ---------- the cache: what files say, kept 60 s between hook runs
+
+# One file per user: {"v": CACHE_VERSION, "guard": the stat of this guard file, "files": {path: entry}, "gh": {dirs:
+# entry}}. A file entry: {"sig": [dev, inode, size, mtime_ns, ctime_ns], "t": unix time of the reading, "text": true,
+# "own": byte-equal to this guard, "bang": the `#!` program or null without a `#!` line, "named": the guarded token
+# it names or null (only once it was looked for)}. A gh entry: {"sig": [the sig or null (no file) per config.yml],
+# "t", "aliases", "risky", "odd"}: gh_config_now() of those files. Every entry is checked on use; a cache that is
+# not this user's own plain file, is too big, broken, from another guard file or version, counts as no cache.
+# Same-user code can forge it, as it can edit this guard: best effort against mistakes, not a wall (see the top).
+CACHE_FILE = 'cache-v1.json'
+
+
+def state_dir(env):
+    """The guard's state folder (stateDir; "~/" is this HOME); None for "~/.." without an absolute HOME (no cache)."""
+    d = SETTINGS['stateDir']
+    if not d.startswith('~/'):
+        return d
+    home = env.get('HOME') or ''
+    return os.path.join(home, d[2:]) if os.path.isabs(home) else None
+
+
+def file_sig(path):
+    """[dev, inode, size, mtime_ns, ctime_ns] of a plain file (links followed); None for anything else. The change
+    time cannot be set back by a program (utime sets only mtime), so a file written again shows a new sig."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns] if S_ISREG(st.st_mode) else None
+
+
+def racy(sig, now):
+    """A file changed within CACHE_RACY seconds (or in the future): a change in the same clock tick as the reading
+    would not show in its times, so it is not cached."""
+    return sig is None or max(sig[3], sig[4]) / 1e9 > now - CACHE_RACY
+
+
+def guard_sig():
+    return file_sig(SELF) if SELF else None
+
+
+# The guard file as this process found it when it started. If the file is replaced while the hook runs (an update),
+# the code in memory is the old guard: it must not keep facts under the new file's stat, nor use the new one's cache.
+GUARD_AT_START = guard_sig()
+
+
+def guard_now():
+    """The guard file's stat, or None when it is not the file this process started from."""
+    me = guard_sig()
+    return me if me and me == GUARD_AT_START else None
+
+
+def is_sig(v):
+    return isinstance(v, list) and len(v) == 5 and all(type(x) is int for x in v)
+
+
+def fresh(t, now):
+    return type(t) in (int, float) and 0 <= now - t <= CACHE_LIFE
+
+
+def file_entry_ok(e, now):
+    labels = {label for label, _ in TOKENS}
+    return isinstance(e, dict) and is_sig(e.get('sig')) and fresh(e.get('t'), now) and e.get('text') is True \
+        and type(e.get('own')) is bool and (e.get('bang') is None or type(e.get('bang')) is str) \
+        and ('named' not in e or e['named'] is None or (type(e['named']) is str and e['named'] in labels))
+
+
+def gh_entry_ok(e, now):
+    return isinstance(e, dict) and isinstance(e.get('sig'), list) and all(s is None or is_sig(s) for s in e['sig']) \
+        and fresh(e.get('t'), now) and type(e.get('risky')) is bool and type(e.get('odd')) is bool \
+        and isinstance(e.get('aliases'), list) and all(
+            isinstance(a, list) and len(a) == 2 and isinstance(a[0], list) and a[0]
+            and all(type(w) is str for w in a[0]) and type(a[1]) is str for a in e['aliases'])
+
+
+def cache_load(env):
+    """The cache file as a dict, or None: no file, not a plain file of this user that only this user can write, over
+    CACHE_BYTES, not JSON, from another guard file or cache version. Never waits (O_NONBLOCK: a FIFO)."""
+    d, me = state_dir(env), guard_now()
+    if not d or not me:
+        return None
+    try:
+        fd = os.open(os.path.join(d, CACHE_FILE), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | getattr(os, 'O_CLOEXEC', 0))
+    except (OSError, ValueError):
+        return None
+    try:
+        st = os.fstat(fd)
+        if not S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022 or st.st_size > CACHE_BYTES:
+            return None
+        data = b''
+        while len(data) <= CACHE_BYTES:
+            piece = os.read(fd, 1 << 16)
+            if not piece:
+                break
+            data += piece
+        if len(data) > CACHE_BYTES:
+            return None
+        c = json.loads(data.decode('utf-8'))
+    except Exception:   # also RecursionError (deep nesting) and a half-written file
+        return None
+    finally:
+        os.close(fd)
+    if not isinstance(c, dict) or type(c.get('v')) is not int or c['v'] != CACHE_VERSION or c.get('guard') != me \
+            or not isinstance(c.get('files'), dict) or not isinstance(c.get('gh'), dict):
+        return None
+    return c
+
+
+def cache_disk(ctx):
+    """The cache of this run, read once and only when a file is first looked at; None without one."""
+    h = ctx.get('cache')
+    if h is None:
+        return None
+    if 'disk' not in h:
+        h['disk'] = cache_load(ctx['env'])
+    return h['disk']
+
+
+def facts(path, ctx, need=()):
+    """What the guard knows of a file: {'text': whether read_text() gives it, and then 'own' (byte-equal to this
+    guard), 'bang' (the `#!` program, None without a `#!` line), 'named' (the guarded token it names, with 'named' in
+    need), '_body' (the text, with 'body' in need)}. From this run's memo, else the cache, else the file."""
+    memo = ctx.setdefault('memo', {})
+    key = ('facts', path)
+    f = memo.get(key)
+    if f is None:
+        f = cached_facts(path, ctx) or fresh_facts(path, ctx)
+        memo[key] = f
+    if f['text'] and '_body' not in f and ('body' in need or ('named' in need and 'named' not in f)):
+        f = memo[key] = fresh_facts(path, ctx)
+    if f['text'] and 'named' in need and 'named' not in f:
+        f['named'] = named(f['_body'])
+    return f
+
+
+def body(path, ctx):
+    """The text of a file (read_text()), through facts()."""
+    f = facts(path, ctx, ('body',))
+    return f['_body'] if f['text'] else None
+
+
+def cached_facts(path, ctx):
+    disk = cache_disk(ctx)
+    e = disk['files'].get(path) if disk else None
+    if not file_entry_ok(e, time.time()) or e['sig'] != file_sig(path):
+        return None
+    return {k: e[k] for k in ('text', 'own', 'bang', 'named') if k in e}
+
+
+_OWN_SIZE = []
+
+
+def own_size():
+    if not _OWN_SIZE:
+        sig = guard_sig()
+        _OWN_SIZE.append(sig[2] if sig else None)
+    return _OWN_SIZE[0]
+
+
+def fresh_facts(path, ctx):
+    before = file_sig(path)
+    text = read_text(path)
+    if text is None:
+        return {'text': False}
+    after, size = file_sig(path), own_size()
+    own = (after is None or size is None or after[2] == size) and text == own_text()
+    f = {'text': True, 'own': own, 'bang': shebang(text) if text.startswith('#!') else None, '_body': text}
+    now = time.time()
+    if ctx.get('cache') is not None and before is not None and before == after and not racy(after, now):
+        f.update(sig=after, t=now)
+        ctx['cache'].setdefault('files', {})[path] = f
+    return f
+
+
+def gh_config_cached(dirs, ctx):
+    """gh_config_now(dirs), from the cache while every config.yml is the same file as when it was read."""
+    paths = [os.path.abspath(os.path.join(cfg, 'config.yml')) for cfg in dict.fromkeys(dirs)]
+    def sigs():
+        out = []
+        for p in paths:
+            try:
+                st = os.stat(p)
+            except FileNotFoundError:
+                out.append(None)
+                continue
+            except (OSError, ValueError):
+                return False   # unreadable folder, a loop: not cached
+            if not S_ISREG(st.st_mode):
+                return False
+            out.append([st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns])
+        return out
+    key, now = repr(paths), time.time()
+    before = sigs()
+    disk = cache_disk(ctx) if before is not False else None
+    e = disk['gh'].get(key) if disk else None
+    if gh_entry_ok(e, now) and e['sig'] == before:
+        return [(list(w), x) for w, x in e['aliases']], e['risky'], e['odd']
+    got = gh_config_now(dirs)
+    if before is not False and before == sigs() and not any(racy(s, now) for s in before if s is not None) \
+            and ctx.get('cache') is not None:
+        ctx['cache'].setdefault('gh', {})[key] = {'sig': before, 't': now, 'aliases': [[list(w), x] for w, x in got[0]],
+                                                  'risky': bool(got[1]), 'odd': bool(got[2])}
+    return got
+
+
+def cache_save(ctx):
+    """Add what this run learned to the cache file: under a lock, merged with the file as it is now, written to a
+    temp file and renamed over it (a reader sees the old or the new file, never half of one). decide() calls it last,
+    when the answer is known: any failure (a full disk, a folder that is no folder, out of time) keeps the old file
+    or none, and leaves that answer as it is."""
+    h = ctx.get('cache') or {}
+    new_files = {p: {k: v for k, v in f.items() if not k.startswith('_')} for p, f in h.get('files', {}).items()}
+    new_gh = h.get('gh', {})
+    # The hook's stop_at is 1 s before the budget ends (answer()); the write may use the first half of that second.
+    # A slow first run is the one whose reads most need keeping. The hook's alarm still cuts a write that runs over
+    # (Slow, caught below), so the answer is never late for it.
+    stop_at = ctx.get('stop_at')
+    save_by = None if stop_at is None else stop_at + 0.5
+    if not (new_files or new_gh) or (save_by is not None and time.monotonic() > save_by):
+        return
+    lock = tmp = None
+    try:
+        d, me = state_dir(ctx['env']), guard_now()
+        if not d or not me:
+            return
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+        if not S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+            return
+        if st.st_mode & 0o077:
+            os.chmod(d, 0o700)
+        import fcntl
+        lock = os.open(os.path.join(d, 'cache.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                       | getattr(os, 'O_CLOEXEC', 0), 0o600)
+        give_up = time.monotonic() + 0.5 if save_by is None else min(time.monotonic() + 0.5, save_by)
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > give_up:
+                    return
+                time.sleep(0.01)
+        now = time.time()
+        cur = cache_load(ctx['env']) or {}
+        files = {p: e for p, e in (cur.get('files') or {}).items() if file_entry_ok(e, now)}
+        gh = {k: e for k, e in (cur.get('gh') or {}).items() if gh_entry_ok(e, now)}
+        files.update((p, e) for p, e in new_files.items() if file_entry_ok(e, now))
+        gh.update((k, e) for k, e in new_gh.items() if gh_entry_ok(e, now))
+        files = dict(sorted(files.items(), key=lambda kv: kv[1]['t'])[-CACHE_MAX:])
+        gh = dict(sorted(gh.items(), key=lambda kv: kv[1]['t'])[-16:])
+        data = json.dumps({'v': CACHE_VERSION, 'guard': me, 'files': files, 'gh': gh},
+                          separators=(',', ':')).encode('utf-8')
+        if len(data) > CACHE_BYTES:
+            return
+        tmp = os.path.join(d, f'.cache-{os.getpid()}-{os.urandom(4).hex()}.tmp')
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+        os.replace(tmp, os.path.join(d, CACHE_FILE))
+        tmp = None
+        for n in os.listdir(d):   # temp files of hooks that were killed half-way
+            p = os.path.join(d, n)
+            if n.startswith('.cache-') and n.endswith('.tmp') and os.lstat(p).st_mtime < now - CACHE_LIFE:
+                os.unlink(p)
+    except BaseException:   # also Slow: the answer is already known, the cache is only a help
+        pass
+    finally:
+        for f in ([lambda: os.unlink(tmp)] if tmp else []) + ([lambda: os.close(lock)] if lock is not None else []):
+            try:
+                f()
+            except OSError:
+                pass
+
+
+# ---------- guarded tokens and the gate that fails closed
+
+# \uXXXX is four digits and no more (JSON, JS, Python, Go): in \u0070ermissions the `e` is the next letter
+ESCAPES = re.compile(r'\\+(?:u([0-9a-fA-F]{4})|u\{([0-9a-fA-F]{1,6})\}|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2}))'
+                     r'|\\+([0-3][0-7]{2})|%([0-9a-fA-F]{2})')
+AGENT_LABEL = 'an agent session without this machine\'s hooks (`claude --bare`, CLAUDE_CODE_SIMPLE, `codex exec`)'
+CUES = ('disable', 'permissions', 'protection', 'ruleset', 'bare', 'safe-mode', 'claude_code_simple', 'codex')
+# What may not be changed, as it looks after canon(): wherever one of these shows up, the command passes only when
+# the guard can prove it is harmless (a plain read, a known allowed form, or text that goes nowhere unread).
+TOKENS = [
+    ('the `.../actions/workflows/<id>/disable` endpoint', re.compile(r'actions/workflows/[^/\s]+/disable(?![\w-])')),
+    ('`workflow disable`', re.compile(r'workflow\b[\s\S]{0,60}?(?<![\w-])disable(?![\w-])')),
+    ('`.../actions/permissions`', re.compile(r'actions/permissions(?![\w-])')),
+    ('branch protection', re.compile(r'branches/[^\s?#]{1,200}?/protection(?![\w-])')),
+    ('a ruleset', re.compile(r'(?<![\w-])rulesets/[^/\s?#]')),
+    ('a GraphQL mutation on branch protection or a ruleset',
+     re.compile(r'deletebranchprotectionrule|deleterepositoryruleset|updaterepositoryruleset')),
+    # an agent session this machine's hooks do not reach (lens B r2 major 1): the same text inside python -c,
+    # node -e, at, a script .. is refused as for gh. The program path counts too (.../claude/versions/2.1.3 --bare,
+    # @anthropic-ai/claude-code, @openai/codex); `codex app-server` and `codex mcp ...` are no session of their own.
+    (AGENT_LABEL,
+     re.compile(r'(?<![\w-])claude[^\s;|&]*(?:\s+[^\s;|&]+){0,8}?\s+--(?:bare|safe-mode)(?![\w-])'
+                r'|claude_code_simple'
+                r'|(?<![\w-])codex[^\s;|&,]*(?:\s+-[^\s;|&]*(?:\s+[^\s;|&-][^\s;|&]*)?){0,6}?\s+'
+                r'(?:exec|e|review|resume|fork|mcp-server)'
+                r'(?![\w-])')),
+]
+# Command words that never run their arguments or their input as a command: shell keywords and builtins, and tools
+# that only read, print, compare or move text and files. Text that names a guarded token may go to these. (Not
+# here on purpose: awk, tar, less, vim, man, yq, patch, mapfile, xargs: each can run a command.)
+DATA = frozenset('''echo printf cat head tail wc ls stat file du df basename dirname realpath readlink mkdir rmdir rm cp
+    mv ln touch chmod chown tee sort uniq cut tr paste column fold fmt nl tac rev comm join diff cmp grep egrep fgrep rg
+    jq date printenv id whoami hostname uname uptime nproc seq mktemp sha256sum sha1sum md5sum base64 xxd od tree ps
+    pgrep kill sleep true false : test [ [[ ]] cd pushd popd pwd set shopt unset read alias unalias type which hash
+    umask ulimit let shift wait exit return break continue for in case esac done fi select function getopts sed find
+    typeset readonly local declare export'''.split())
+STD_BINS = ('/bin', '/usr/bin', '/usr/local/bin', '/sbin', '/usr/sbin', '/opt/homebrew/bin')
+WRITERS = {'tee', 'cp', 'mv', 'ln', 'sed'}                         # data words that write files themselves
+READERS = {'cat', 'head', 'tail', 'tac', 'sed', 'tee'}              # data words that pass a file's text on
+COPIERS = {'cp', 'mv', 'ln'}                                        # data words that give a file another name
+NO_SINK = {'tee', 'read'}   # data words that hand piped text on (a file, a variable) instead of ending it
+AWKS = {'awk', 'gawk', 'mawk', 'nawk'}
+# Words behind an unknown command word that the guard reads as the start of a command of their own
+RUNNERS = {'sudo', 'doas', 'env', 'command', 'exec', 'nohup', 'nice', 'ionice', 'timeout', 'stdbuf', 'xargs',
+           'setsid', 'unbuffer', 'chronic', 'flock', 'runuser', 'systemd-run', 'watch', 'script', 'git'}
+# git subcommands that take text (a message, a pattern, a path) and run none of it
+GIT_SAFE = frozenset('''commit log grep diff show add status tag blame rm mv checkout switch branch restore ls-files
+    rev-parse merge notes reflog shortlog describe cat-file ls-tree rev-list stash cherry-pick reset revert
+    format-patch worktree'''.split())
+GIT_COMMANDS = GIT_SAFE | frozenset('''fetch push pull clone remote config init rebase bisect submodule gc clean am
+    apply archive bundle fsck prune repack sparse-checkout range-diff verify-commit whatchanged show-ref symbolic-ref
+    update-ref update-index for-each-ref merge-base name-rev diff-tree diff-index diff-files ls-remote count-objects
+    check-ignore check-attr var version help maintenance mergetool difftool show-branch merge-tree write-tree
+    commit-tree hash-object read-tree checkout-index pack-refs verify-tag stripspace interpret-trailers lfs'''.split())
+GIT_RUNS = re.compile(r'--upload-pack|--receive-pack|--exec|--open-files-in-pager|-O')   # flags that run a command
+GIT_RUNS_LONG = ('--upload-pack', '--receive-pack', '--exec', '--open-files-in-pager')
+
+
+def git_runs(a):
+    """A git argument that can run a command: GIT_RUNS, -O in a cluster of short flags (-nO), or a long flag cut
+    short the way git accepts (--open=less, --upl=x)."""
+    if GIT_RUNS.match(a) or re.match(r'-[A-Za-z0-9]*O', a):
+        return True
+    name = a.split('=', 1)[0]
+    return len(name) > 2 and name.startswith('--') and any(f.startswith(name) for f in GIT_RUNS_LONG)
+
+SED_RUNS = re.compile(r'(?:^|[;{}!,$/\d\s])e(?:\s|$)|[^\w\s][a-zA-Z0-9]*e[a-zA-Z0-9]*\s*(?:[;}\n]|$)')   # e, s///e
+HOOK_PATH = re.compile(r'(^|/)(\.git|\.husky|\.githooks|hooks)/')
+NO_FILE = re.compile(r'/dev/(null|stdout|stderr|tty|fd/\d+)|&?\d+|-')
+SHELL_TEXT = re.compile(r'[\s;|&]')
+SEPARATE = 'Run it as separate commands, or write it so the guard can read it (gh or curl as the command word).'
+CODE_HINT = ('Make the call with `gh api` as a command of its own. To only change or search text that names it, use '
+             'an edit or search tool instead of code.')
+
+
+# ---------- the fast exit
+
+# Words the fast exit lets through: DATA words that run no command, set no variable and read no shell text (not
+# printf/read/export/alias/[ ..: they set names or take text that matters later), and git with a subcommand that
+# runs none of its text. Each one is checked below for the forms of it that do run something.
+QUICK_WORDS = frozenset('''echo cat head tail wc ls stat file du df basename dirname realpath readlink mkdir rmdir rm cp
+    mv ln touch chmod tee sort uniq cut tr paste column fold fmt nl tac rev comm join diff cmp grep egrep fgrep rg jq
+    date printenv id whoami hostname uname uptime nproc seq mktemp sha256sum sha1sum md5sum base64 xxd od tree ps
+    pgrep sleep true false test cd pushd popd pwd sed find'''.split())
+QUICK_GIT = GIT_SAFE
+QUICK_FLOW = frozenset('if then else elif fi do done while until'.split())   # keywords in front of a command word
+# Text that sends the command to the full reading wherever it stands, letters only (dis-able, Work_Flow ..):
+QUICK_KEYS = ('disable', 'permission', 'protection', 'ruleset', 'workflow', 'graphql', 'mutation', 'github', 'curl',
+              'wget', 'http', 'aria2') \
+    + tuple(re.sub(r'[^a-z0-9]', '', os.path.splitext(r['name'])[0].lower()) for r in REFUSE_SCRIPTS)   # garden.py: garden
+QUICK_NAMES = frozenset({'gh', 'xh', 'xhs', 'curlie', 'httpie'})   # as a word anywhere (/usr/bin/gh, ln -s .. gh)
+QUICK_SED = frozenset({'-n', '-E', '-r', '-e', '-i', '-s', '-u', '-z', '--quiet', '--silent', '--regexp-extended',
+                       '--null-data', '--expression'})
+QUICK_CHARS = re.compile(r'[^\x20-\x7e\t\n]|[$`\\%!]|<<')
+QUICK_MAX, QUICK_CDS = 4000, 8
+# sed scripts the fast exit takes: lines printed, deleted or counted, s/a/b/ with plain flags (no e, no w file)
+_SED_ADDR = r'(?:\d+|\$|/[^/\n]*/)'
+_SED_ONE = (rf'\s*(?:{_SED_ADDR}(?:\s*,\s*(?:{_SED_ADDR}|[+~]\d+))?\s*)?'
+            r'(?:[pdnNgGhHxlz=]|[qQ]\d*|s/[^/\n]*/[^/\n]*/[gpiI\d]*)\s*')
+QUICK_SED_SCRIPT = re.compile(rf'{_SED_ONE}(?:;{_SED_ONE})*(?:;\s*)?')
+
+
+def quick_words(cmd, globs=None):
+    """[[(word without its quotes, whether it had quotes)] per command] of a command in the small shell subset the
+    fast exit reads (plain words, '..' and ".." with no $ ` \\ inside, ; | & && || and line breaks, redirections);
+    None for anything else: an unclosed quote, # ( ) { } ! outside quotes. globs: each word with * ? [ outside
+    quotes (the shell may turn it into other names) is added to it, when given."""
+    out, cmd_, word, quoted, started, glob, i = [], [], '', False, False, False, 0
+    def end_word():
+        nonlocal word, quoted, started, glob
+        if started:
+            cmd_.append((word, quoted))
+            if glob and globs is not None:
+                globs.append(word)
+        word, quoted, started, glob = '', False, False, False
+    while i < len(cmd):
+        c = cmd[i]
+        if c in '\'"':
+            j = cmd.find(c, i + 1)
+            if j < 0:
+                return None
+            word, quoted, started, i = word + cmd[i + 1:j], True, True, j + 1
+            continue
+        if c in '#(){}!' or (c == '|' and cmd[i - 1:i] == '>'):   # >| writes a file, it is no pipe
+            return None
+        if c in ' \t':
+            end_word()
+        elif c in ';|\n' or (c == '&' and not (cmd[i - 1:i] in ('<', '>') or cmd[i + 1:i + 2] == '>')):
+            end_word()
+            out.append(cmd_)
+            cmd_ = []
+        else:
+            word, started, glob = word + c, True, glob or c in '*?['
+        i += 1
+    end_word()
+    out.append(cmd_)
+    return out
+
+
+def quick_sed_scripts(args):
+    """The scripts of a sed command the fast exit reads (-e X, --expression X, else the first word that is no
+    option); None for a form it does not read."""
+    scripts, i, rest = [], 0, []
+    while i < len(args):
+        a = args[i]
+        if a in ('-e', '--expression'):
+            if i + 1 >= len(args):
+                return None
+            scripts.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith('-') and a != '-':
+            if a not in QUICK_SED:
+                return None
+        else:
+            rest.append(a)
+        i += 1
+    if not scripts:
+        scripts = rest[:1]
+    return scripts or None
+
+
+def quick_pass(cmd):
+    """True for a command that cannot name or run anything this guard refuses, decided from its text alone, before
+    any file is read: every command in it is a QUICK_WORDS word (or safe git) in a form that runs nothing, and no
+    word of it can name a guarded token, gh, an HTTP client or a git hook, or one of its own command words (a file
+    the text writes and then runs). Anything else, however harmless, goes to the full reading. The tests compare
+    the two over every command they know and over random ones (what is fast passes there too)."""
+    if not isinstance(cmd, str) or len(cmd) > QUICK_MAX or QUICK_CHARS.search(cmd):
+        return False
+    low = cmd.lower()
+    letters = re.sub(r'[^a-z0-9]', '', low)
+    plain = re.sub(r'[\'"]', '', low)
+    if any(k in letters for k in QUICK_KEYS) or any(k in plain for k in ('hooks', '.git/', '.husky')) \
+            or QUICK_NAMES & set(re.split(r'[^a-z0-9_.-]+', plain)):
+        return False
+    globs = []
+    cmds = quick_words(cmd, globs)
+    if cmds is None:
+        return False
+    cds, heads, rest = 0, set(), set()
+    for words in cmds:
+        while words and not words[0][1] and words[0][0] in QUICK_FLOW:
+            words = words[1:]
+        if not words:
+            continue
+        (head, quoted), args = words[0], [w for w, _ in words[1:]]
+        if quoted or (head not in QUICK_WORDS and head != 'git'):
+            return False
+        heads.add(head)
+        rest.update(p for a in args for p in re.split(r'[^a-z0-9_.+-]+', a.lower()))
+        cds += head in ('cd', 'pushd', 'popd')
+        if cds > QUICK_CDS:
+            return False
+        if head == 'find' and any(a in ('-exec', '-execdir', '-ok', '-okdir') for a in args):
+            return False
+        if head in COPIERS and re.search(r'[*?\[]', cmd):
+            return False
+        if head == 'sed':
+            scripts = quick_sed_scripts(args)
+            if scripts is None or not all(QUICK_SED_SCRIPT.fullmatch(t) for t in scripts) \
+                    or any(SED_RUNS.search(a) for a in args):
+                return False
+        if head == 'rg' and any(a.startswith(('--pre', '--hostname-bin')) for a in args):
+            return False
+        if head == 'sort' and any(a.startswith('--co') for a in args):
+            return False
+        if head == 'git':
+            i = 0
+            while i < len(args) and args[i] in ('-C', '--no-pager', '-P'):
+                i += 2 if args[i] == '-C' else 1
+            if i >= len(args) or args[i] not in QUICK_GIT or any(git_runs(a) for a in args[i + 1:]):
+                return False
+    # echo .. > ~/.local/bin/ls; ls: a file the text may write under a name it runs, also as a glob (l?, [l]s)
+    return not heads & rest and not any(quick_glob_names(g, heads) for g in globs)
+
+
+def quick_glob_names(word, heads):
+    """Whether a word with * ? [ outside quotes may name one of heads (each part between / = < > & : , is a glob).
+    A part with [ may name anything ([[:lower:]], [^x] ..: the guard does not read classes); * and ? are read the
+    way the shell does."""
+    for part in re.split(r'[/=<>&:,]+', word.lower()):
+        if '[' in part:
+            return True
+        if re.search(r'[*?]', part) and any(fnmatch.fnmatchcase(h, part) for h in heads):   # no [ here; never
+            return True                                                                     # backtracks on ***
+    return False
+
+
+def _unescape(m):
+    try:
+        return chr(int(m.group(5), 8) if m.group(5) else
+                   int(m.group(1) or m.group(2) or m.group(3) or m.group(4) or m.group(6), 16))
+    except (ValueError, OverflowError):
+        return m.group(0)
+
+
+def canon(text, blank=True, cue=True):
+    """Text as the program at the far end may read it: \\uXXXX, \\xXX, octal and %XX decoded (up to three rounds),
+    backslashes and all quotes dropped (blank: \\n \\t \\r read as a blank first), 'a' + 'b' joined, lower case,
+    /./ // and /x/../ in paths resolved. '' when no guarded word is left at all (cue=False: the text all the same,
+    for a ruleset body, where `"enforcement": "evaluate"` holds no guarded word)."""
+    s = text
+    if '\\' in s or '%' in s:
+        for _ in range(3):
+            before = s
+            s = ESCAPES.sub(_unescape, s)
+            if s == before:
+                break
+        if blank:
+            s = re.sub(r'\\+[ntr]', ' ', s)
+        s = s.replace('\\', '')
+    s = re.sub(r'["\']\s*[+.]\s*["\']', '', s)
+    s = re.sub(r'["\'`]', '', s).lower()
+    if cue and not any(c in s for c in CUES):
+        return ''
+    s = re.sub(r'(?<!:)/(?:\.?/)+', '/', s)
+    k = 1
+    while k:   # every /x/.. (no round limit: 21 nested ones are no way past the guard)
+        s, k = re.subn(r'/(?!\.\.?/)[^/?#\s]+/\.\.(?=[/?#\s]|$)', '', s)
+    return s
+
+
+def named(text):
+    """What guarded thing the text names after decoding (for the message), or None."""
+    if not text:
+        return None
+    for blank in ((True, False) if re.search(r'\\+[ntr]', text) else (True,)):
+        s = canon(text, blank)
+        label = next((label for label, rx in TOKENS if rx.search(s)), None) if s else None
+        if label:
+            return label
+    return None
+
+
+def unproven(label, what, hint=SEPARATE):
+    return reason(f'a command that names {label} {what}, so the guard cannot prove it is harmless', hint)
+
+
+def is_gh(tok, ctx):
+    """gh under its own name, or under a name the same command gave it (ln -s /usr/bin/gh g; cp gh hub)."""
+    base = os.path.basename(tok)
+    return base == 'gh' or (base != '' and base in ctx.get('ghs', ()))
+
+
+_GH_BINS, _WHICH = {}, {}
+
+
+def gh_file(path, ctx):
+    """Whether an executable on disk is gh under another name: a link to it, or a copy of a gh on PATH."""
+    try:
+        if os.path.basename(os.path.realpath(path)) == 'gh':
+            return True
+        size = os.path.getsize(path)
+        key = ctx['env'].get('PATH') or ''
+        if key not in _GH_BINS:
+            dirs = dict.fromkeys(key.split(':') + list(STD_BINS) + ['/snap/bin'])
+            _GH_BINS[key] = [p for p in (os.path.join(d, 'gh') for d in dirs if d) if os.path.isfile(p)]
+        for gh in _GH_BINS[key]:
+            if os.path.getsize(gh) == size:
+                with open(gh, 'rb') as a, open(path, 'rb') as b:
+                    if a.read(65536) == b.read(65536):
+                        return True
+    except OSError:
+        pass
+    return False
+
+
+def which(name, ctx):
+    """The file a bare command word runs from PATH, or None."""
+    key = (name, ctx['env'].get('PATH') or '')
+    if key not in _WHICH:
+        _WHICH[key] = next((p for p in (os.path.join(d, name) for d in key[1].split(':') if d)
+                            if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+    return _WHICH[key]
+
+
+def is_self(path, ctx):
+    """Whether a file is this guard (the file itself or a byte-equal copy): running or testing it is no attack."""
+    if SELF and os.path.realpath(path) == SELF:
+        return True
+    return facts(path, ctx).get('own', False)
+
+
+def gh_names(toks):
+    """The names a command gives a copy of or a link to gh (`ln -s /usr/bin/gh g`: g; `hash -p /usr/bin/gh g`). A
+    source the guard cannot read (`$(command -v gh)`) may be gh too."""
+    h, _ = head(toks)
+    if h is None:
+        return set()
+    word, rest = os.path.basename(toks[h]), [a for a in toks[h + 1:] if not a.startswith('-') or hidden(a)]
+    if word == 'hash' and '-p' in toks and len(rest) >= 2:
+        rest = rest[:2]
+    elif word not in ('ln', 'cp', 'mv', 'install', 'link', 'rsync'):
+        return set()
+    if len(rest) < 2 or hidden(rest[-1]) \
+            or not any(hidden(a) or os.path.basename(a.rstrip('/')) == 'gh' for a in rest[:-1]):
+        return set()
+    name = os.path.basename(rest[-1].rstrip('/'))
+    return {name} if name not in ('', '.', '..') else set()
+
+
+def runner_at(toks, start):
+    """Behind a command word the guard does not know: where a word it does know how to read starts (a shell, an
+    interpreter, git, curl, a wrapper ..), or None. An unknown word must not hide the command that follows it."""
+    for i in range(start, len(toks)):
+        base = os.path.basename(toks[i])
+        if base in RUNNERS or base in SHELLS or base in NET_CLIENTS or base in TEXT_ARGS or base in AWKS \
+                or INTERPRETERS.match(base):
+            return i
+    return None
+
+
+def exported(toks, flow):
+    return 'export' in toks or bool(flow.get('seta')) or \
+        (('declare' in toks or 'typeset' in toks) and any(re.fullmatch(r'-[A-Za-z]*x[A-Za-z]*', t) for t in toks))
+
+
+def gh_gate(args, ctx, own):
+    """gh passed the checks above. What is left: a first word that is no gh command (an alias the reader may not
+    know, an extension: another program) and words gh hands on to another program."""
+    cands = sub_candidates(args)
+    first = args[cands[0]] if cands else ''
+    if first and first not in GH_COMMANDS:
+        if own and not ctx.get('nogate'):
+            return unproven(own, f'and runs `gh {redact(first)}`, which is no gh command (an alias, an extension, '
+                                 'or a word the guard cannot read)', 'Use the gh command itself, spelled out.')
+        ctx['flow']['unknown'] = f'gh {redact(first)}'
+    if own and first in ('extension', 'codespace', 'cs'):
+        return unproven(own, f'and runs `gh {first}`, which starts other programs')
+    if own and first != 'api' and '--' in args and named(' '.join(args[args.index('--') + 1:])):
+        return unproven(own, 'behind `--`, where gh hands the words on to another program')
+    return None
+
+
+def rc_files(word, toks, h, ctx):
+    """The config files curl or wget would read first, as far as the text and the hook's environment show them."""
+    env = dict(ctx['env'])
+    for t in toks[:h]:
+        m = ASSIGN.match(t)
+        if m and not hidden(t):
+            env[m.group(1)] = m.group(3)
+    home = env.get('HOME') or ''
+    if word == 'curl':
+        dirs = [env.get('CURL_HOME'), env.get('XDG_CONFIG_HOME'), home, home and os.path.join(home, '.config')]
+        return [os.path.join(d, n) for d in dirs if d for n in ('.curlrc', 'curlrc')]
+    return [p for p in (env.get('WGETRC'), home and os.path.join(home, '.wgetrc'), '/etc/wgetrc') if p]
+
+
+def net_gate(word, toks, h, ctx, own):
+    """curl, wget and the like passed net_reason. A guarded token passes only as a request path the guard can read,
+    with the tool's own config switched off (a ~/.curlrc can turn a read into `request = PUT`)."""
+    args = toks[h + 1:]
+    files = [m.group(1) for a in args for m in [re.search(r'@([^@=\s]+)$', a)] if m]
+    bodies = [ctx.get('stdin') or ''] + [read_named(f, ctx) or '' for f in files]
+    if any(GQL_RE.search(c) or GQL_UPDATE.search(c) for c in (canon(x) for x in list(args) + bodies)):
+        return reason('a GraphQL mutation that deletes branch protection or a ruleset, or changes a ruleset, sent '
+                      f'with `{word}`: the guard reads GraphQL only through `gh api graphql`')
+    no_rc = (word == 'curl' and bool(args) and not hidden(args[0]) and (args[0] == '--disable'
+                                                                         or re.match(r'-q', args[0]) is not None)) \
+        or (word == 'wget' and '--no-config' in args)
+    hint = 'Put `-q` (or `--disable`) as the FIRST argument: curl then skips its config file.' if word == 'curl' \
+        else 'Add `--no-config`: wget then skips its config files.'
+    for i, a in enumerate(args):   # more arguments or addresses, from a file: curl -K/--config, wget -i/--input-file
+        after = args[i + 1] if i + 1 < len(args) else ''
+        short = re.match(r'-[A-Za-z0-9#:]*?%s(.*)$' % ('K' if word == 'curl' else 'i'), a, re.S) \
+            if word in ('curl', 'wget') and not a.startswith('--') else None
+        if short:   # also joined: -sK file, -Kfile
+            name = short.group(1) or after
+        elif word == 'curl' and a.startswith('--config') or word == 'wget' and a.startswith('--input-file'):
+            name = a.partition('=')[2] or after
+        else:
+            continue
+        tok = named_file(name, ctx)
+        if not tok and read_named(name, ctx) is None:
+            ctx['flow']['unknown'] = f'{word} with arguments from a file the guard cannot read'
+        elif tok:
+            return unproven(tok, f'in a file that `{word}` reads its arguments or addresses from '
+                                         '(curl -K/--config, wget -i/--input-file)', 'Use `gh api` for it.')
+    if any(hidden(a) for a in args):   # "$(cat url.txt)": what the same command sends on may land here
+        ctx['flow']['unknown'] = f'{word} with a word the guard cannot read'
+    if not no_rc:
+        for p in rc_files(word, toks, h, ctx) if word in NET_TOOLS else ():
+            tok = file_token(resolve_path(p, ctx['cwd']))
+            if tok:
+                return unproven(tok, f'in {word}\'s own config file ({os.path.basename(p)}), which {word} reads '
+                                     'before its arguments', hint)
+        ctx['flow']['unknown'] = f'{word} (it reads its config file first)'
+    if not own:
+        return None
+    if word not in NET_TOOLS:
+        return unproven(own, f'and uses `{word}`, an HTTP client the guard has no flag table for',
+                        'Use `gh api`, or `curl -q` for a read.')
+    if not no_rc:
+        return unproven(own, 'with curl, which reads ~/.curlrc (or $CURL_HOME, $XDG_CONFIG_HOME) first: a line '
+                             'there can turn a read into a write' if word == 'curl' else
+                        'with wget, which reads ~/.wgetrc (or $WGETRC, /etc/wgetrc) first: a line there can turn a '
+                        'read into a write', hint)
+    if not any(hits(a, k) for a in args for k in GUARDED) or named(' '.join(toks[:h])):
+        return unproven(own, f'in an argument of `{word}` that is no request path the guard can read',
+                        'Use `gh api` for it.')
+    return None
+
+
+def git_sub(args):
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ('-C', '-c', '--git-dir', '--work-tree', '--namespace'):
+            i += 2
+        elif a.startswith('-') or hidden(a) and WILD in a:
+            i += 1
+        else:
+            return a, i
+    return '', len(args)
+
+
+def git_gate(args, ctx, own, fed):
+    """git with a guarded token: only subcommands that take text and run none of it (a commit message, a grep
+    pattern), with nothing git would run as a command (a pager, an alias, a transport helper)."""
+    sub, i = git_sub(args)
+    if not sub or sub not in GIT_COMMANDS:   # an alias, git-<name> on PATH, a hidden word
+        ctx['flow']['unknown'] = f'git {redact(sub)}'.strip()
+    tok = own or fed
+    if tok and (sub not in GIT_SAFE or named(' '.join(args[:i])) or any(git_runs(a) for a in args[i + 1:])):
+        return unproven(tok, f'and runs `git {redact(sub)}` in a form that can run a command (an alias, a pager, '
+                             'a transport, a config value)', 'Keep such text to commit messages and patterns.')
+    return None
+
+
+def sed_scripts(args):
+    """The arguments sed reads as its script: after -e/--expression, else the first word that is no flag."""
+    out = [a.partition('=')[2] or (args[i + 1] if i + 1 < len(args) else '')
+           for i, a in enumerate(args) if a == '-e' or a.startswith('--expression')]
+    return out or [a for a in args if not a.startswith('-')][:1]
+
+
+def data_token(tok, ctx):
+    """The guarded token in a file that cat/cp/.. hand on: its text as read_text() gives it, so data over MAX_FILE or
+    that cannot be opened passes unread (lockout care). A file that looks like a script, or one piped into a shell
+    or interpreter that runs its stdin (`cat f | bash`), is read in pieces and counts when unread (file_token)."""
+    for d in [] if hidden(tok) else folders(ctx):
+        p = resolve_path(tok, d)
+        f = facts(p, ctx, ('named',))
+        t = f['named'] if f['text'] else \
+            (ctx.get('feeds_code') or script_like(p, unopened=False)) and file_token(p)
+        if t:
+            return t
+    return None
+
+
+def stdin_runs(toks, how, loose):
+    """Whether a command runs what it reads on stdin as shell or code: a shell or interpreter with no script of
+    its own (`bash`, `sh -s x`, `python3 -`), not `python3 load.py` or `awk '{..}'`, whose stdin is data."""
+    if not toks or doc_kind(toks, how, loose, '') == 'data':
+        return False
+    h, via = head(toks)
+    if 'shell' in via or h is None:   # head() takes the shell's script as the command word
+        return h is None or '-s' in toks[:h]
+    return not any(a in ('-c', '-e', '-m', '--eval') or not a.startswith('-') for a in toks[h + 1:])
+
+
+def data_gate(word, args, ctx, own, fed, loose):
+    """A command word that only handles text. Its text may name a guarded token; where the text goes is noted (a
+    pipe, a file, $(..)), and decide() refuses when the same command also runs a word the guard cannot read."""
+    flow = ctx['flow']
+    if word == 'find':   # -exec cmd ..: a command of its own
+        for i, a in enumerate(args):
+            if a in ('-exec', '-execdir', '-ok', '-okdir') and args[i + 1:]:
+                r = segment_reason(args[i + 1:], dict(ctx, stdin=None, cmd={}, leak=False, targets=()), loose)
+                if r:
+                    return r
+    if word == 'set' and (any(re.fullmatch(r'-[A-Za-z]*a[A-Za-z]*', a) for a in args) or 'allexport' in args):
+        flow['seta'] = True
+    if word in ('typeset', 'readonly', 'local', 'declare', 'export'):
+        if own and exported([word] + args, flow):
+            flow['env'] = own
+        return None
+    if own and (word == 'sed' and any(SED_RUNS.search(a) for a in sed_scripts(args))
+                or word == 'rg' and any(a.startswith(('--pre', '--hostname-bin')) for a in args)
+                or word == 'sort' and any(a.startswith('--compress-prog') for a in args)):
+        return unproven(own, f'in `{word}` arguments that can run a command (sed `e`, rg --pre, '
+                             'sort --compress-program)')
+    tok, moved = own or fed, False
+    if not tok and (ctx.get('leak') and word in READERS or word in COPIERS):
+        # cat x | ..: the file's text goes on; cp x run.sh: it gets a name the next word may run
+        tok = next((t for t in (data_token(a, ctx) for a in args if not a.startswith('-')) if t), None)
+        moved = word in COPIERS
+    targets = list(ctx.get('targets', ())) + (args if word in WRITERS else [])
+    if tok and any(HOOK_PATH.search(t) for t in targets):
+        return unproven(tok, 'and writes it under .git/ or a hooks folder, where git runs it later')
+    if tok and ctx.get('proven'):   # the text is a script the same command runs: it was read as shell text
+        return None
+    if tok and (ctx.get('leak') or moved or (own and word in WRITERS)):
+        flow['free'] = tok
+    return None
+
+
+SHELL_EXT = ('.sh', '.bash', '.zsh')
+CODE_EXT = ('.py', '.pyw', '.js', '.mjs', '.cjs', '.ts', '.mts', '.cts', '.jsx', '.tsx', '.rb', '.pl', '.pm', '.php',
+            '.lua', '.tcl', '.ps1', '.psm1', '.awk', '.go', '.groovy', '.kts', '.swift', '.exp', '.fish', '.nu')
+LOADS = {'-r', '--require', '--import', '--loader', '-f', '--file', '-m', '--module'}   # flags that name code to run
+
+
+def arg_scripts_reason(word, args, ctx):
+    """Files handed to a command word the guard does not know (`taskset 1 ./x.sh`, `at -f x.sh`, `uv run x.py`,
+    `chrt 1 ./tool.py`): the word may run them. A shell script is read in full, as if it were the command word
+    itself. A file that looks like code in another language (its name, a `#!` line, the executable bit) may not
+    name a guarded token. Plain data files (.md, .json, .yml, .txt ..) are not looked at."""
+    for a in args:
+        a = a.partition('=')[2] if a.startswith('--') and '=' in a else a
+        if a.startswith('-') or hidden(a) or not a:
+            continue
+        files = cmd_files(a, ctx, False) + [(p, d) for d in folders(ctx) for p in [resolve_path(a, d)]]
+        for p, d in dict.fromkeys(files):
+            f = facts(p, ctx)
+            if not f['text'] or is_self(p, ctx):
+                r = not f['text'] and unread(p, any_file=False)
+                if r:
+                    return r
+                continue
+            if a.endswith(SHELL_EXT) or f['bang'] in SHELLS:
+                r = file_reason(p, dict(ctx, cwd=d), force_shell=True)
+                if r:
+                    return r
+            elif (a.endswith(CODE_EXT) or f['bang'] is not None or os.access(p, os.X_OK)) and \
+                    facts(p, ctx, ('named',)).get('named'):
+                return unproven(facts(p, ctx)['named'], f'in `{redact(os.path.basename(a))}`, a code file that is handed to '
+                                             f'`{word}`, which may run it (the guard cannot follow what that word '
+                                             'does with its arguments)',
+                                'If the file is only data here (a path to commit, lint or copy), name its folder '
+                                'instead, or use a tool the guard knows (git add, cp).')
+    return None
+
+
+def interp_files(kind, args, pos, ctx):
+    """[(file, folder)]: the code files an interpreter runs for these arguments. The script is the first of its
+    leading words that is a file (`python3 x.py a b`: x.py; `deno run x.ts`: x.ts; what follows the script is the
+    script's own business), plus what a flag loads (`node -r ./x.js`, `python3 -m x`, `php -f x.php`)."""
+    names = []
+    if kind not in AWKS and not {'-m', '-c', '-e', '-', '--eval'} & set(args):
+        names.append([a for a in pos[:3] if not hidden(a)])
+    for i, a in enumerate(args):
+        flag, eq, value = a.partition('=')
+        if flag in LOADS and not hidden(a):
+            value = value if eq else (args[i + 1] if i + 1 < len(args) else '')
+            if value and not hidden(value) and not value.startswith('-'):
+                if flag in ('-m', '--module'):
+                    mod = value.replace('.', '/')
+                    names += [[mod + '.py'], [mod + '/__main__.py']]
+                else:
+                    names += [[value], [value + '.js'], [value + '.rb'], [value + '.pl']]
+    out = []
+    for group in names:   # of a group, the first name that is a file
+        for name in group:
+            found = [(p, d) for d in folders(ctx) for p in [resolve_path(name, d)] if os.path.isfile(p)]
+            if found:
+                out += found
+                break
+    return out
+
+
+def launcher_gate(toks, h, ctx, own, fed, loose):
+    """A command word the guard does not know. With a guarded token in its words or its input it is refused: the
+    guard cannot tell what the word does with them. Without one, the words behind it are still read (a shell, an
+    interpreter, a script file), and decide() refuses when token text flows anywhere in the same command."""
+    word = toks[h]
+    name = redact(os.path.basename(word)) if not hidden(word) else 'a command word from a variable'
+    if (own or fed) and not ctx.get('nogate'):
+        return unproven(own or fed, f'and runs `{name}`, a command word the guard does not know (a launcher, a '
+                                    'project tool, a renamed program ..)')
+    i = runner_at(toks, h + 1)
+    r = (i is not None and segment_reason(toks[i:], ctx, loose)) or arg_scripts_reason(name, toks[h + 1:], ctx)
+    if r:
+        return r
+    ctx['flow']['unknown'] = name
+    return None
+
+
+def flow_reason(flow):
+    """The whole command read: token text that went somewhere, next to a word the guard could not read."""
+    if flow.get('free') and flow.get('unknown'):
+        return unproven(flow['free'], f'in text that goes on (a pipe, a file, a variable), and that also runs '
+                                      f'`{flow["unknown"]}`, which the guard cannot read')
+    if flow.get('env') and (flow.get('unknown') or flow.get('ran')):
+        return unproven(flow['env'], 'in an exported variable, which the programs run after it may take as a '
+                                     'command (PAGER, GIT_SSH_COMMAND ..)')
+    return None
+
+
+# ---------- decision
+
+def cmd_files(tok, ctx, via_shell):
+    """[(file, folder)]: the script files a command word may run, one per folder the command may run in."""
+    out = []
+    for d in folders(ctx):
+        p = resolve_cmd(tok, dict(ctx, cwd=d), via_shell)
+        if p and os.path.isfile(p) and all(p != q for q, _ in out):
+            out.append((p, d))
+    return out
+
+
+def flag_values(toks, h):
+    """The words head() took as the value of a wrapper's flag (`sudo -u NAME`). Which flags take a value depends
+    on the wrapper, so such a word may be the command word itself (`env -i bash x.sh`, `bash -e x.sh`)."""
+    end = len(toks) if h is None else h
+    return [i for i in range(1, end) if toks[i - 1] in ARG_FLAGS and not toks[i].startswith('-')]
+
+
+CODEX_SAFE = {'login', 'logout', 'help', 'completion', 'mcp', '--version', '-V', '--help', '-h'}
+# codex's options that take a value (codex --help): `codex -m o3 exec x` runs `exec`, not `o3`
+CODEX_VALUE = {'-c', '--config', '--enable', '--disable', '--remote', '--remote-auth-token-env', '-i', '--image',
+               '-m', '--model', '--local-provider', '-p', '--profile', '-s', '--sandbox', '-C', '--cd', '--add-dir',
+               '-a', '--ask-for-approval'}
+# claude words that start no session (a session started with CLAUDE_CODE_SIMPLE from a file is what matters)
+CLAUDE_TOOLS = {'mcp', 'config', 'update', 'doctor', 'install', 'auth', 'plugin', 'plugins', 'setup-token',
+                'migrate-installer', 'logs', 'purge', 'import', 'auto-mode', '--version', '-v', '--help', '-h'}
+NO_HOOKS_ENV = 'CLAUDE_CODE_SIMPLE'   # bare mode: Claude Code runs no hooks, managed ones neither
+# where the programs are installed: the native build's version folder, the npm packages
+AGENT_PATH = re.compile(r'/claude/versions/|@anthropic-ai/claude-code(?:/|$)|@openai/codex(?:-[\w-]+)?(?:/|$)', re.I)
+AGENT_PKGS = {'@anthropic-ai/claude-code': 'claude', '@openai/codex': 'codex', 'claude': 'claude', 'codex': 'codex'}
+PKG_RUNNERS = {'npx': (), 'bunx': (), 'pnpx': (), 'pnpm': ('dlx',), 'yarn': ('dlx',), 'npm': ('exec', 'x'),
+               'bun': ('x',)}
+# the shell start files of the agents' user: a `claude` session the Bash tool starts may get its variables from them
+START_FILES = ('.bashrc', '.bash_profile', '.bash_login', '.profile', '.zshrc', '.zshenv', '.zprofile', '.zlogin')
+KNOWN_WORDS = DATA | QUICK_WORDS | WRAPPERS | NET_CLIENTS | {'git', 'gh', 'ssh', 'make', 'npm', 'pnpm', 'yarn'}
+_AGENT_BINS = {}
+
+
+def agent_path_kind(path):
+    m = AGENT_PATH.search(path or '')
+    return None if not m else ('codex' if 'codex' in m.group(0).lower() else 'claude')
+
+
+def agent_copy(path, ctx):
+    """'claude'/'codex' when a file is a copy of the installed program (same size, same first 64 KB)."""
+    try:
+        size = os.path.getsize(path)
+        for kind in ('claude', 'codex'):
+            key = (kind, ctx['env'].get('PATH') or '')
+            if key not in _AGENT_BINS:
+                p = which(kind, ctx)
+                _AGENT_BINS[key] = os.path.realpath(p) if p else None
+            real = _AGENT_BINS[key]
+            if real and real != path and os.path.isfile(real) and os.path.getsize(real) == size:
+                with open(real, 'rb') as a, open(path, 'rb') as b:
+                    if a.read(65536) == b.read(65536):
+                        return kind
+    except OSError:
+        pass
+    return None
+
+
+def agent_kind(tok, ctx, script=False):
+    """'claude' or 'codex' when a word runs one of them: by name, by a name the same command gave it (ln -s ..),
+    by the path of its program (.../claude/versions/2.1.3, @openai/codex), by a link to it or by a copy of the
+    installed one; 'maybe' for a name the same command gave a program it cannot read; else None. script: the
+    word is a script an interpreter runs (`node cli.js`)."""
+    if not tok or hidden(tok):
+        return None
+    base = os.path.basename(tok).lower()
+    if base in ('claude', 'codex'):
+        return base
+    given = ctx.get('agents', {}).get(base)
+    if given:
+        return given
+    kind = agent_path_kind(tok)
+    if kind or (not script and '/' not in tok and (base in KNOWN_WORDS or INTERPRETERS.match(base))):
+        return kind
+    p = resolve_path(tok, ctx['cwd']) if script or '/' in tok else which(tok, ctx)
+    if not p or not os.path.isfile(p):
+        return None
+    real = os.path.realpath(p)
+    return agent_path_kind(real) or {'claude': 'claude', 'codex': 'codex'}.get(os.path.basename(real).lower()) \
+        or agent_copy(real, ctx)
+
+
+def agent_names(toks, ctx):
+    """The names a command gives a link to or a copy of claude or codex (`ln -s ~/.local/share/claude/versions/2.1.3
+    cc`: cc), as gh_names() does for gh. A source the guard cannot read gives 'maybe'."""
+    h, _ = head(toks)
+    if h is None or os.path.basename(toks[h]) not in ('ln', 'cp', 'mv', 'install', 'link', 'rsync'):
+        return {}
+    rest = [a for a in toks[h + 1:] if not a.startswith('-') or hidden(a)]
+    if len(rest) < 2 or hidden(rest[-1]):
+        return {}
+    kinds = [agent_kind(a, ctx) or ('maybe' if hidden(a) else None) for a in rest[:-1]]
+    kind = next((k for k in kinds if k and k != 'maybe'), None) or next((k for k in kinds if k), None)
+    name = os.path.basename(rest[-1].rstrip('/')).lower()
+    return {name: kind} if kind and name not in ('', '.', '..') else {}
+
+
+def package_agent(toks, h, ctx):
+    """(kind, the agent's own words) when the command word runs claude or codex through a package runner (npx,
+    bunx, pnpm dlx, npm exec ..) or an interpreter (`node .../@anthropic-ai/claude-code/cli.js`); else (None, [])."""
+    base, rest = os.path.basename(toks[h]).lower(), toks[h + 1:]
+    if INTERPRETERS.match(base):
+        i = next((i for i, a in enumerate(rest) if not a.startswith('-')), None)
+        kind = i is not None and agent_kind(rest[i], ctx, script=True)
+        return (kind, rest[i + 1:]) if kind else (None, [])
+    if base not in PKG_RUNNERS or (PKG_RUNNERS[base] and rest[:1] and rest[0] not in PKG_RUNNERS[base]) \
+            or (PKG_RUNNERS[base] and not rest):
+        return None, []
+    rest = rest[1:] if PKG_RUNNERS[base] else rest
+    pkgs, i = [], 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ('-p', '--package'):
+            pkgs.append(rest[i + 1] if i + 1 < len(rest) else '')
+            i += 2
+            continue
+        if a.startswith('--package='):
+            pkgs.append(a.partition('=')[2])
+        elif a in ('-c', '--call'):   # npm exec -c 'text': shell text, read by the shell reading
+            return None, []
+        elif a != '--' and not a.startswith('-'):
+            break
+        i += 1
+    word = rest[i] if i < len(rest) else ''
+    names = [re.sub(r'(?<=.)@[^/]*$', '', p.lower()) for p in pkgs + [word] if p]
+    kind = next((AGENT_PKGS[n] for n in names if n in AGENT_PKGS), None)
+    return (kind, rest[i + 1:]) if kind else (None, [])
+
+
+def start_files(ctx):
+    """Why a `claude` session may get CLAUDE_CODE_SIMPLE from a file the command or its shell reads (a sourced
+    file, BASH_ENV/ENV, --rcfile, the user's shell start files), as far as the guard can see; else None. Not
+    followed: files those files read in turn."""
+    for f in ctx.get('sourced', ()):
+        if hidden(f):
+            return 'the command reads a file the guard cannot name (`. "$F"`) that may set ' + NO_HOOKS_ENV
+        text = read_named(f, ctx)
+        if text is None:
+            return f'the command reads {f}, which the guard cannot read, and it may set {NO_HOOKS_ENV}'
+        if NO_HOOKS_ENV.lower() in text.lower():
+            return f'the command reads {f}, which names {NO_HOOKS_ENV}'
+    if re.search(r'(?<![\w$])(?:BASH_ENV|ENV)=', ctx.get('all') or ''):
+        return f'the command sets BASH_ENV or ENV: a file the shell reads first may set {NO_HOOKS_ENV}'
+    home = ctx['env'].get('HOME') or ''
+    for name in START_FILES if os.path.isabs(home) else ():
+        text = read_text(os.path.join(home, name))
+        if text and NO_HOOKS_ENV.lower() in text.lower():
+            return f'~/{name} names {NO_HOOKS_ENV}'
+    return None
+
+
+def nested_agent(toks, h, ctx):
+    """Why this command word starts an agent session without this machine's hooks, or None."""
+    if h is None:
+        return None
+    tok, args = toks[h], toks[h + 1:]
+    kind = agent_kind(tok, ctx)
+    shown = os.path.basename(tok) if kind and kind != 'maybe' else kind or ''
+    if not kind:
+        kind, pargs = package_agent(toks, h, ctx)
+        if kind:
+            args, shown = pargs, f'{os.path.basename(tok)} ... {kind}'
+    if not kind and hidden(tok):
+        # `$(which claude) --bare`, `env $(cat vars) claude -p x`: the word is unknown, what follows may say more
+        j = next((j for j in range(h + 1, len(toks)) if agent_kind(toks[j], ctx) in ('claude', 'codex')), None)
+        if j is not None:
+            if agent_kind(toks[j], ctx) == 'claude' and claude_starts(toks[j + 1:]):
+                return (f'`{os.path.basename(toks[j])}` behind a word the guard cannot read (`env $(..)`, `$X`), '
+                        f'which may set {NO_HOOKS_ENV}, starts a session that may run without this machine\'s hooks')
+            return nested_agent(toks, j, ctx)
+        if re.search(r'(?<![\w-])codex(?![\w-])', ctx.get('raw') or '', re.I) and codex_sub(args) not in CODEX_SAFE:
+            return ('a program the guard cannot name, in a command that names codex (`$(which codex) exec`), may start '
+                    'an agent session that runs no Claude Code hooks')
+        kind, shown = 'maybe', 'a program the guard cannot name'
+    if kind in ('claude', 'maybe'):
+        flags = [a for a in args if a in ('--bare', '--safe-mode') or a.startswith(('--bare=', '--safe-mode='))]
+        if flags:
+            return f'`{shown} {flags[0]}` starts a session that runs without this machine\'s hooks'
+    if kind == 'claude':
+        if any(NO_HOOKS_ENV in t for t in toks[:h]) or NO_HOOKS_ENV in (ctx.get('all') or ''):
+            return f'`{shown}` with {NO_HOOKS_ENV} set starts a session that runs without this machine\'s hooks'
+        why = claude_starts(args) and start_files(ctx)
+        if why:
+            return f'`{shown}` starts a session, and {why} (a session that runs without this machine\'s hooks)'
+    if kind == 'codex':
+        sub = codex_sub(args)
+        if sub not in CODEX_SAFE:
+            return (f'`{shown} {sub}`' if sub else f'`{shown}`') + \
+                ' starts an agent session that runs no Claude Code hooks'
+    return None
+
+
+def sourced_files(toks):
+    """The files a command reads as shell text into the shell that runs what follows: `. f`, `source f`, and a
+    shell's --rcfile/--init-file."""
+    out = []
+    for i, t in enumerate(toks):
+        if t in ('.', 'source') and i + 1 < len(toks):
+            out.append(toks[i + 1])
+        elif t in ('--rcfile', '--init-file') and i + 1 < len(toks) and i and os.path.basename(toks[0]) in SHELLS:
+            out.append(toks[i + 1])
+    return out
+
+
+def env_split(toks):
+    """`env -S 'A=1 cmd x' y` / --split-string: the shell-like text env splits and runs, or None."""
+    h, _ = head(toks)
+    for i, t in enumerate(toks[:h if h is not None else len(toks)]):
+        if os.path.basename(t) != 'env':
+            continue
+        for j in range(i + 1, len(toks)):
+            a = toks[j]
+            if a in ('-S', '--split-string') and j + 1 < len(toks):
+                return ' '.join([toks[j + 1]] + [shlex.quote(x) for x in toks[j + 2:]])
+            if a.startswith('--split-string=') or (a.startswith('-S') and len(a) > 2):
+                v = a.partition('=')[2] if a.startswith('--') else a[2:]
+                return ' '.join([v] + [shlex.quote(x) for x in toks[j + 1:]])
+            if not a.startswith('-') and not is_assign(a):
+                break
+    return None
+
+
+def claude_starts(args):
+    """Whether claude with these words starts a session (not `claude --version`, `claude mcp list` ..)."""
+    return not any(a in CLAUDE_TOOLS for a in args[:1]) and not any(a in ('--version', '-v', '--help', '-h')
+                                                                    for a in args)
+
+
+def codex_sub(args):
+    """codex's subcommand: the first word that is no option and no option's value (`codex -m o3 exec x`: exec),
+    or a safe option (--version); None for the interactive session."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in CODEX_SAFE and a.startswith('-'):
+            return a
+        if a == '--':
+            return args[i + 1] if i + 1 < len(args) else None
+        if a in CODEX_VALUE:
+            i += 2
+            continue
+        if not a.startswith('-'):
+            return a
+        i += 1
+    return None
+
+
+def segment_reason(toks, ctx, loose):
+    h, via = head(toks)
+    why = nested_agent(toks, h, ctx)
+    if why:
+        return reason(why, 'Run the work in this session (or a nested `claude -p` without --bare), or ask the '
+                           'owner.')
+    split = env_split(toks)
+    if split:   # env -S 'A=1 cmd x': read the text env runs as a command
+        r = decide_text(split, ctx)
+        if r:
+            return r
+    flow = ctx['flow']
+    for j in flag_values(toks, h):   # the other reading: the flag takes no value and the word starts the command
+        base = os.path.basename(toks[j])
+        if base in SHELLS or base in NET_CLIENTS or base in TEXT_ARGS or base in AWKS or INTERPRETERS.match(base) \
+                or is_gh(toks[j], ctx) or (not hidden(toks[j]) and cmd_files(toks[j], ctx, True)) \
+                or base in PKG_RUNNERS or agent_kind(toks[j], ctx):
+            r = segment_reason(toks[:j - 1] + toks[j:], ctx, loose)
+            if r:
+                return r
+    extra = [WILD] if 'xargs' in via else []   # xargs adds words nobody can read here
+    for i, t in enumerate(toks if 'xargs' in via else ()):   # xargs -a file: the words come from that file
+        name = t.partition('=')[2] if t.startswith('--arg-file=') else \
+            (toks[i + 1] if t in ('-a', '--arg-file') and i + 1 < len(toks) else '')
+        tok = name and named_file(name, ctx)
+        if tok:
+            return unproven(tok, 'in the file that `xargs` takes the words of its command from (-a/--arg-file)')
+    for i, t in enumerate(toks):   # gh anywhere in the command: behind find -exec, ssh, a wrapper not listed here
+        if is_gh(t, ctx):
+            r = gh_reason(toks[i + 1:] + extra, dict(ctx, cfg_hidden=ctx.get('cfg_hidden') or any(
+                hidden(a) and re.match(r'(GH_CONFIG_DIR|XDG_CONFIG_HOME|HOME)=', a) for a in toks[:i])), sure=i == h)
+            if r:
+                return r
+    word = os.path.basename(toks[h]) if h is not None else ''
+    # plain: the word is the program of that name for certain (no function, no alias, no file in another folder)
+    plain = h is not None and not hidden(toks[h]) and toks[h] not in ctx.get('funcs', ()) \
+        and toks[h] not in ctx.get('aliases', {}) and ('/' not in toks[h] or os.path.dirname(toks[h]) in STD_BINS)
+    kind = word if plain else ''
+    gh_word = h is not None and is_gh(toks[h], ctx)
+    shellish = bool(via & {'shell', 'eval'})
+    interp = INTERPRETERS.match(kind) is not None or kind in AWKS
+    # gh-as <app> -- gh ..: gh with an app token (a wrapper that may run this guard on the gh words too)
+    rest = toks[h + 1:] if kind == 'gh-as' else []
+    cut = rest.index('--') if '--' in rest else -1
+    gh_as = rest[cut + 2:] if 0 <= cut <= 2 and rest[cut + 1:cut + 2] == ['gh'] else None
+    lost = h is not None and not (shellish or gh_word or interp or kind in DATA or kind in NET_CLIENTS
+                                  or kind in TEXT_ARGS or kind == 'git' or gh_as is not None)
+    texts = []   # words that are shell text themselves
+    if 'eval' in via and h is not None:
+        texts.append(' '.join(toks[h:]))
+    if (shellish and not interp) or loose or kind in TEXT_ARGS or lost:
+        texts += [t for t in toks if SHELL_TEXT.search(t)]   # also behind a word the guard does not know (sg -c ..)
+    elif h is not None and re.search(r'\s', toks[h]):   # env -S ".." and other wrappers that take one string
+        texts.append(toks[h])
+    for t in toks[:h] if h is not None else toks:   # --split-string=".." and the like
+        if t.startswith('-') and re.search(r'\s', t):
+            texts += [t.partition('=')[2], t[2:]]
+    how, proven = ctx.get('writes'), False
+    if how and h is not None:   # echo/printf/tee .. > x.sh; sh x.sh: the words are the script
+        said = toks[h + 1:]
+        made = [' '.join(said), ' '.join(said[1:])] + [t for t in said if re.search(r'\s', t)]
+        made += [t.replace('\\n', '\n') for t in made if '\\n' in t]
+        if how == 'code' or (how == 'exec' and any(shebang(t.lstrip()) not in SHELLS | {''} for t in made)):
+            tok = named(' '.join(toks)) or named(ctx.get('stdin') or '')
+            if tok:
+                return reason(f'a script that the same command writes and runs names {tok}; the guard reads shell '
+                              'scripts only, not code', 'Run the calls as gh commands the guard can read.')
+        else:
+            texts += made
+            proven = True
+    ctx = dict(ctx, writes='', proven=proven)
+    texts += [t.replace('\\n', '\n') for t in texts if '\\n' in t]   # printf 'a\ngh ..' | sh
+    inner = dict(ctx, nogate=True) if lost and not loose else ctx   # the gate below speaks for the whole command
+    for text in dict.fromkeys(texts):
+        r = text and decide_text(text, inner)
+        if r and lost and not loose and text in toks[h + 1:]:   # -m/--what/-p text of a tool the guard does not know
+            what = r[len(PREFIX):] if r.startswith(PREFIX) else r
+            return PREFIX + (f'an argument of `{redact(word)}`, a tool the guard does not know, is text that reads as '
+                             'shell, and read as shell it is refused. If it is only text (a message, a title, a '
+                             'prompt), put it in a file and pass the file (--body-file, -F), or reword it; to run it, '
+                             f'run it as a command of its own. As shell: {what}')
+        if r:
+            return r
+    own, fed = named(' '.join(toks)), named(ctx.get('stdin') or '')
+    if h is None:
+        if own and exported(toks, flow):
+            flow['env'] = own
+        if 'shell' in via and ctx.get('stdin') is None:
+            flow['unknown'] = 'a shell that reads a pipe or a file the guard cannot read'
+        return None
+    if (ctx.get('cmd') or {}).get('pat') and not own:   # a `case` pattern, not a command
+        return None
+    args = toks[h + 1:] + extra
+    if not gh_word and (hidden(toks[h]) or toks[h] in ctx.get('funcs', ())):   # "$GH" .., g() { gh "$@"; }; g ..
+        r = gh_reason([WILD] + args, ctx, sure=False) or net_reason('', args, ctx)
+        if r:
+            return r
+    expansions = ctx.get('aliases', {}).get(toks[h], ())
+    for exp in expansions:   # alias g='gh workflow'; g ..: read as the text it stands for
+        r = decide_text(exp + ' ' + ' '.join(quote(a) for a in args), ctx)
+        if r:
+            return r
+    if kind in DATA and not shellish:
+        if 'xargs' in via and (own or kind in ('sed', 'find')):
+            flow['unknown'] = 'xargs'
+        return data_gate(kind, args, ctx, own, fed, loose)
+    flow['ran'] = True
+    if 'xargs' in via:
+        flow['unknown'] = 'xargs'
+    pre = named(' '.join(toks[:h]))
+    if pre and not ctx.get('nogate'):
+        return unproven(pre, 'in a variable or an option set in front of the command word, which the program may '
+                             'take as a command (PAGER, GIT_SSH_COMMAND, a wrapper option ..)')
+    if gh_word:
+        if not plain:
+            flow['unknown'] = 'gh under another name or path'
+        return gh_gate(args, ctx, own)
+    if gh_as is not None:
+        return gh_reason(gh_as, ctx, sure=True) or gh_gate(gh_as, ctx, own)
+    pos = positional(args, {'-m', '-W', '-X', '--eval', '-e', '-c', '-r', '--require'})
+    script = toks[h] if not interp else (pos[0] if pos else '')
+    for rs in REFUSE_SCRIPTS:   # the machine file's refuseScripts: a project tool that disables workflows itself
+        if os.path.basename(script) == rs['name'] and rs['flag'] in args \
+                and any(os.path.isfile(resolve_path(script, d)) for d in folders(ctx)):   # a real run, not prose
+            return reason(f'`{rs["name"]} {rs["flag"]}` {rs.get("why") or "is refused by this machine's settings"}')
+    if interp:
+        files = interp_files(kind, args, pos, ctx)
+        if any(is_self(p, ctx) for p, _ in files):
+            return None
+        if own or fed:
+            return unproven(own or fed, f'in inline code, arguments or input of `{word}`: the guard reads shell '
+                                        'text and gh/curl calls, not code in other languages', CODE_HINT)
+        flow['unknown'] = word
+        for p, d in dict.fromkeys(files):
+            r = file_reason(p, dict(ctx, cwd=d))
+            if r:
+                return r
+        return None
+    if shellish:
+        tok = named(' '.join(t for t in toks if not (SHELL_TEXT.search(t) and named(t))))
+        if tok:   # sh -c 'curl -X PUT "$1"' _ <url>: the token is no shell text the guard has read
+            return unproven(tok, 'in the arguments of a shell, `eval` or a script, outside the shell text itself')
+        if 'eval' in via:
+            if any(hidden(t) for t in toks[h:]):
+                flow['unknown'] = 'eval'
+            return None
+        if any(re.fullmatch(r'-[A-Za-z]*c', t) for t in toks[:h]):   # sh -c word: the word is the whole text
+            return None if SHELL_TEXT.search(toks[h]) else decide_text(toks[h], ctx)
+        files = [] if hidden(toks[h]) else cmd_files(toks[h], ctx, True)
+        for p, d in files:
+            r = file_reason(p, dict(ctx, cwd=d), force_shell=True)
+            if r:
+                return r
+        if not files and not SHELL_TEXT.search(toks[h]):
+            flow['unknown'] = 'a script that is not there to read (written later, or named by a variable)'
+        return None
+    if kind in TEXT_ARGS:   # ssh, su, parallel, trap: their quoted arguments were read as shell text above
+        tok = named(' '.join(t for t in toks if not (SHELL_TEXT.search(t) and named(t)))) or fed
+        if tok:
+            return unproven(tok, f'in the words or the input of `{word}`, outside one quoted shell text')
+        if kind != 'trap':
+            flow['unknown'] = word
+        return None
+    if kind in NET_CLIENTS:
+        return net_reason(word, args, ctx) or net_gate(word, toks, h, ctx, own or fed)
+    if kind == 'git':
+        for a in args:   # git -c alias.x='!cmd' x, git config alias.x '!cmd': the text after ! is a shell command
+            bang = a[1:] if a.startswith('!') else a.partition('=!')[2]
+            r = bang and decide_text(bang, ctx)
+            if r:
+                return r
+        return git_gate(args, ctx, own, fed)
+    # Every other command word: a script file the guard can read, a function, or a word it does not know.
+    if hidden(toks[h]):
+        return launcher_gate(toks, h, ctx, own, fed, loose)
+    if toks[h] in ctx.get('funcs', ()) or expansions:
+        if own or fed:   # its body is in the text and was read; the words it gets may go anywhere
+            flow['free'] = own or fed
+        return None
+    files = cmd_files(toks[h], ctx, False)
+    if any(is_self(p, ctx) for p, _ in files):
+        return None
+    bare = '/' not in toks[h] and which(toks[h], ctx)
+    if any(gh_file(p, ctx) for p in [q for q, _ in files] + ([bare] if bare else [])):
+        return gh_reason(args, ctx, sure=True) or gh_gate(args, ctx, own)   # gh, renamed or linked earlier
+    read = False
+    for p, d in files:
+        f = facts(p, ctx)
+        if not f['text']:
+            r = unread(p)
+            if r:
+                return r
+            continue
+        read = True
+        if (own or fed) and not ctx.get('nogate'):
+            return unproven(own or fed, f'and hands it to the script `{redact(word)}`, whose use of its '
+                                        'arguments and input the guard cannot follow')
+        r = file_reason(p, dict(ctx, cwd=d))
+        if r:
+            return r
+        if not (p.endswith(('.sh', '.bash', '.zsh')) or f['bang'] in SHELLS):
+            flow['unknown'] = redact(word)   # code in another language: only looked through for guarded tokens
+    if read:
+        return arg_scripts_reason(redact(word), toks[h + 1:], ctx)
+    return launcher_gate(toks, h, ctx, own, fed, loose)
+
+
+def reads_stdin_as_shell(toks):
+    """bash, sh -s, eval ..: a shell that runs what a pipe or heredoc feeds it."""
+    h, via = head(toks)
+    if 'eval' in toks:
+        return True
+    return 'shell' in via and (h is None or toks[h] in ('-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'))
+
+
+def written(toks, cmd, env, ran):
+    """How a file this command writes (> file, tee file) is run by a command of the same text: 'shell' (through a
+    shell or `source`), 'exec' (as a command: its `#!` line picks the reader), 'code' (as an interpreter's script)
+    or '' (not run, as far as the text shows). Files are matched by name, not by folder."""
+    h, _ = head(toks)
+    targets = [t for op, w in cmd['redirs'] if op.startswith(('>', '&>')) for r in readings({'words': [w]}, env)
+               for t in [''.join(r)]]
+    if h is not None and os.path.basename(toks[h]) == 'tee':
+        targets += [t for t in toks[h + 1:] if not t.startswith('-')]
+    names = {os.path.basename(t) for t in targets if os.path.basename(t)}
+    return next((k for k in ('shell', 'exec', 'code') if any(same_name(a, b) for a in names for b in ran[k])), '')
+
+
+def same_name(a, b):
+    """Whether two file names can be the same file: equal (two hidden names count as equal: f=$(mktemp); cat > "$f"
+    ..; bash "$f"), or one has hidden parts and its visible text fits the other."""
+    if a == b:
+        return True
+    if hidden(a) and hidden(b):
+        return True
+    for x, y in ((a, b), (b, a)):
+        if hidden(x) and x.replace(HID, '').replace(WILD, '') and spells(x, y):
+            return True
+    return False
+
+
+def doc_kind(toks, how, loose, body):
+    """A heredoc (or <<< word, < file) is shell (fed to a shell), code (fed to an interpreter), script (written to
+    a file that a command in this text runs as shell) or data. how: written() of the command."""
+    h, via = head(toks)
+    word = os.path.basename(toks[h]) if h is not None else ''
+    if 'shell' in via or 'eval' in via:
+        return 'shell'
+    if INTERPRETERS.match(word):
+        return 'code'
+    if how == 'exec':
+        how = 'shell' if shebang(body) in SHELLS | {''} else 'code'
+    if how:
+        return 'script' if how == 'shell' else 'code'
+    return 'shell' if loose else 'data'
+
+
+def stdin_of(cmd, env, ctx):
+    """The text a command gets on stdin when the command text shows it (heredoc, <<< word, < file that is there to
+    read), else None (a pipe, the terminal, a file written later)."""
+    parts = list(cmd['docs'])
+    for op, w in cmd['redirs']:
+        if op not in ('<<<', '<'):
+            continue
+        words = redir_texts(op, w, env)
+        word = words[0] if len(words) == 1 else HID   # a variable with several values: not known
+        text = word if op == '<<<' else read_named(word, ctx)
+        if text is None:
+            return None
+        parts.append(text)
+    return '\n'.join(parts) if parts or any(op == '<<<' for op, _ in cmd['redirs']) else None
+
+
+def redir_texts(op, w, env):
+    """Every text the word of a redirection can be (`<<< word` is not split into words)."""
+    return list(dict.fromkeys((' ' if op == '<<<' else '').join(r) for r in readings({'words': [w]}, env)))
+
+
+def fed_texts(cmd, env, ctx):
+    """The texts a command reads from `<<< word` and `< file`, in every reading; what cannot be read is left out."""
+    out = []
+    for op, w in cmd['redirs']:
+        if op in ('<<<', '<'):
+            for word in redir_texts(op, w, env):
+                text = word if op == '<<<' else read_named(word, ctx)
+                if text and text not in out:
+                    out.append(text)
+    return out
+
+
+def pure_sink(variants):
+    """Whether a command ends the text piped into it: in every reading its command word only handles text."""
+    for toks in variants:
+        h, via = head(toks) if toks else (None, set())
+        if h is None or via or hidden(toks[h]) or os.path.basename(toks[h]) not in DATA - NO_SINK \
+                or ('/' in toks[h] and os.path.dirname(toks[h]) not in STD_BINS):
+            return False
+    return bool(variants)
+
+
+def stopped(text, what, flow, hint=''):
+    """The guard stopped reading (a limit, a file it cannot read whole): refused when the text it did not read names
+    a guarded token, else the command counts as running a word the guard cannot read (flow_reason)."""
+    if LOOSE_RE.search(text) or named(text):
+        return reason(what, hint)
+    flow['unknown'] = what
+    return None
+
+
+def decide_text(text, ctx, scan_raw=True):
+    nest, flow = ctx.get('nest', 0), ctx.setdefault('flow', {})
+    if ctx.get('stop_at') is not None and time.monotonic() > ctx['stop_at']:
+        raise Slow()
+    if nest > MAX_NEST:
+        return stopped(text, 'shell text nested too deep to read', flow)
+    cmds, plain, taint, rest = parse(text)
+    if rest:   # more than 400 $(..) `..` <(..): what was not read is no harmless text
+        r = stopped('\n'.join(rest) + '\n' + text, 'more than 400 $(..), `..` or <(..) in one text, more than the '
+                    'guard reads', flow, 'Run it as smaller commands.')
+        if r:
+            return r
+    env = variables(cmds, taint)
+    env['base'] = {'HOME': ctx['env'].get('HOME') or ''}
+    runs = [(c, readings(c, env)) for c in cmds]
+    firsts = [r[0] for _, r in runs if r[0]]
+    loose = any(reads_stdin_as_shell(t) for t in firsts)
+    funcs, aliases, cfg = set(), {}, list(ctx.get('cfg', ()))
+    ran = {'shell': set(), 'exec': set(), 'code': set()}   # the files the text runs, by how: see written()
+    for m in FUNC_RE.finditer(plain):
+        funcs.add(m.group(1) or m.group(2))
+    for toks in (t for _, r in runs for t in r if t):
+        h, via = head(toks)
+        if h is None:
+            continue
+        word = os.path.basename(toks[h])
+        if INTERPRETERS.match(word):
+            ran['code'].update(os.path.basename(a) for a in positional(toks[h + 1:], set())[:1])
+        elif word:
+            ran['shell' if 'shell' in via else 'exec'].add(word)
+    for toks in firsts:
+        h, _ = head(toks)
+        if h is None:
+            continue
+        word = os.path.basename(toks[h])
+        if word == 'alias':
+            for a in toks[h + 1:]:
+                name, eq, val = a.partition('=')
+                if eq:
+                    aliases.setdefault(name, []).append(val)
+    cwds, lost = list(folders(ctx)), False   # where the commands may run: `cd a && ./x` runs a/x
+    every = cwds[-1]   # the folder after every `cd` so far worked
+    for toks in firsts:
+        h, _ = head(toks)
+        if h is not None and toks[h] in ('cd', 'pushd', 'popd'):
+            to = [a for a in toks[h + 1:] if not a.startswith('-')][:1]
+            if to and not hidden(to[0]):
+                every = resolve_path(to[0], every)
+            if to and not hidden(to[0]) and len(cwds) < 16:
+                cwds += [p for p in dict.fromkeys(resolve_path(to[0], d) for d in cwds) if p not in cwds]
+            else:
+                lost = True
+                cwds += [every] if to and not hidden(to[0]) and every not in cwds else []   # past 16: one per cd
+                r = to and not hidden(to[0]) and stopped(text, 'more than 16 folders to follow (cd)', flow,
+                                                         'Run it as smaller commands.')
+                if r:
+                    return r
+    cfg_hidden, closed = ctx.get('cfg_hidden', False), dict(env, open=False)
+    for name, tail in (('GH_CONFIG_DIR', ''), ('XDG_CONFIG_HOME', 'gh'), ('HOME', '.config/gh')):
+        dirs = var_texts(name, closed) if name in env['set'] else []
+        cfg += [resolve_path(os.path.join(d, tail), w) for d in dirs if d and not hidden(d) for w in cwds]
+        cfg_hidden = cfg_hidden or (name in env['standalone'] and any(hidden(d) for d in dirs)) or \
+            (lost and any(d and not hidden(d) and not os.path.isabs(os.path.expanduser(d)) for d in dirs))
+    c = dict(ctx, raw=plain if scan_raw else ctx.get('raw', text), scan_raw=scan_raw, nest=nest + 1, funcs=funcs,
+             aliases=aliases, cfg=cfg, cfg_hidden=cfg_hidden, cwds=cwds)
+    gh_set = list(ctx.get('gh_set', ()))
+    for cmd, variants in runs:
+        for toks in variants:
+            gh_set += [a for a in text_aliases(toks, stdin_of(cmd, env, c), c) if a not in gh_set]
+    c['gh_set'] = gh_set
+    c['ghs'] = set(ctx.get('ghs', ())).union(*(gh_names(toks) for _, variants in runs for toks in variants if toks))
+    c['agents'] = dict(ctx.get('agents', {}))
+    for _, variants in runs:
+        for toks in (t for t in variants if t):
+            c['agents'].update(agent_names(toks, c))
+    c['sourced'] = list(ctx.get('sourced', ())) + [f for _, variants in runs for toks in variants[:1] if toks
+                                                    for f in sourced_files(toks)]
+    # Where each command's text goes on: into a file, into another command's words ($(..)), or down a pipe that
+    # does not end in a word that only handles text.
+    tgts = [[t for op, w in cmd['redirs'] if op.startswith('>') for t in redir_texts(op, w, env)
+             if not NO_FILE.fullmatch(t)] for cmd, _ in runs]
+    leaks = [False] * len(runs)
+    for k in range(len(runs) - 1, -1, -1):
+        piped = runs[k][0].get('pipe') and k + 1 < len(runs)
+        leaks[k] = bool(runs[k][0].get('sub') or tgts[k] or (piped and (leaks[k + 1] or not pure_sink(runs[k + 1][1]))))
+    hows = [written(variants[0], cmd, env, ran) for cmd, variants in runs]
+    for how, (cmd, variants) in zip(hows, runs):   # .. | tee x.sh; sh x.sh: the script comes through a pipe
+        h, _ = head(variants[0])
+        if how in ('shell', 'exec') and not cmd['docs'] and h is not None \
+                and os.path.basename(variants[0][h]) not in ('echo', 'printf'):
+            loose = True
+    for k, (how, (cmd, variants)) in enumerate(zip(hows, runs)):
+        fed = list(cmd['docs']) + fed_texts(cmd, env, c)   # heredocs, <<< words, < files
+        for op, w in cmd['redirs']:   # bash < big.sh: a file the shell runs that the guard could not read whole
+            if op == '<' and stdin_runs(variants[0], how, loose):
+                r = next((r for word in redir_texts(op, w, env) if not hidden(word) for d in folders(c)
+                          for r in [unread(resolve_path(word, d))] if r), None)
+                if r:
+                    return r
+        for body in fed:
+            kind = doc_kind(variants[0], how, loose, body)
+            tok = kind == 'code' and named(body)
+            if tok:
+                return unproven(tok, 'in inline code (a heredoc into an interpreter, or a script in another '
+                                     'language that the same command writes and runs): the guard reads shell text '
+                                     'and gh/curl calls, not code', CODE_HINT)
+            if kind in ('shell', 'script'):
+                r = decide_text(body, c)
+                if r:
+                    return r
+        feeds = bool(cmd.get('pipe')) and k + 1 < len(runs) and stdin_runs(runs[k + 1][1][0], hows[k + 1], loose)
+        cc = dict(c, stdin=stdin_of(cmd, env, c), writes=how, cmd=cmd, leak=leaks[k], targets=tgts[k], feeds_code=feeds)
+        for toks in variants:
+            r = toks and segment_reason(toks, cc, loose)
+            if r:
+                return r
+    return None
+
+
+def decide(cmd, cwd, env, budget=None, use_id=None):
+    """None to let the command run, else the deny reason. budget: seconds the reading may take (None: no limit).
+    use_id: the tool call's id (an owner approval is used up by one call; the same call's second hook run passes)."""
+    if not cmd or (QUICK and quick_pass(cmd)):
+        return None
+    ctx = {'cwd': cwd or os.getcwd(), 'env': env, 'depth': 0, 'raw': cmd, 'all': cmd, 'memo': {}, 'flow': {},
+           'stop_at': None if budget is None else time.monotonic() + budget, 'cache': {}}
+    try:
+        why = decide_text(cmd, ctx) or flow_reason(ctx['flow'])
+    except Slow:
+        why = SLOW
+        ctx['cache'] = {}   # a reading cut off half-way keeps nothing
+    if why:
+        why = owner_marker(why, cmd, ctx['cwd'], env, use_id)
+    try:   # last, with the answer known: an alarm or a failure in it changes nothing
+        cache_save(ctx)
+    except BaseException:
+        pass
+    return why
+
+
+def owner_marker(why, cmd, cwd, env, use_id=None):
+    """The refusal, or None when the command is the one command the owner approved (agent_guards.approval): it ends
+    with the approval's code, runs in its folder, and the approval was not used before (this use is recorded in the
+    state folder, so it is used up). A code that is wrong, used, for another command or folder, or too old, or one
+    with no approval file, adds why to the refusal."""
+    if MARK_CMD not in cmd:
+        return why
+    try:
+        from agent_guards import approval
+        used = state_dir(env) or state_dir({'HOME': os.path.expanduser('~')})   # where its one use is recorded
+        ok, problem = approval.approved(cmd, cwd, use_id=use_id, used_dir=used)
+    except BaseException as e:   # noqa: BLE001 - no approval code: no approval
+        ok, problem = False, f'the approval code cannot be loaded ({type(e).__name__})'
+    if ok:
+        return None
+    return why + (f' (The owner marker is not accepted: {problem}.)' if problem else '')
+
+
+def redact(s):
+    s = re.sub(r'(gh[pousr]_|github_pat_)[A-Za-z0-9_]+', r'\1***', s)
+    s = re.sub(r'(?i)(bearer\s+|token[=:\s]+)\S+', r'\1***', s)
+    return s[:300]
+
+
+def log(cmd, why, env):
+    """One line per refusal. Written after the answer, and only until 2 s past the budget: a slow disk must not
+    keep the hook past its limit (a hook that is cut off answers nothing)."""
+    try:
+        left = BUDGET + 2.0 - process_age()
+        if left <= 0:
+            return
+        if hasattr(signal, 'SIGALRM'):
+            signal.signal(signal.SIGALRM, out_of_time)
+            signal.setitimer(signal.ITIMER_REAL, left)
+        d = state_dir(env) or state_dir({'HOME': os.path.expanduser('~')})
+        if not d:
+            return
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'log'), 'a') as f:
+            f.write(time.strftime('%Y-%m-%dT%H:%M:%SZ ', time.gmtime()) + json.dumps(
+                {'cmd': redact(cmd), 'why': why[:160], 'cwd': os.getcwd()}) + '\n')
+    except BaseException:   # also Slow: the answer is out already
+        pass
+    finally:
+        alarm_off()
+
+
+ANSWERED = []
+
+
+TOOLS = ('Bash', 'Monitor')   # the tools whose tool_input.command is shell text
+
+
+def with_problem(out):
+    """The answer with a machine file problem added where the agent and the owner see it."""
+    if not SETTINGS_PROBLEM:
+        return out
+    try:
+        from agent_guards import config
+        return config.notice('actions-disable-guard', SETTINGS_PROBLEM, {'hook_event_name': 'PreToolUse'}, out)
+    except BaseException:   # noqa: BLE001 - no lib: say it plainly
+        return dict(out or {}, systemMessage=f'actions-disable-guard: {SETTINGS_PROBLEM}; built-in defaults used. '
+                                             'Tell the owner.')
+
+
+def deny(why):
+    out = {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+                                  'permissionDecisionReason': why}}
+    try:
+        out = with_problem(out)
+    except BaseException:   # noqa: BLE001 - the refusal matters more than the notice
+        pass
+    print(json.dumps(out), flush=True)
+    ANSWERED.append(True)
+
+
+def passed():
+    """Let the command run; with a machine file problem, say so in the answer."""
+    if SETTINGS_PROBLEM:
+        try:
+            print(json.dumps(with_problem(None)), flush=True)
+            ANSWERED.append(True)
+        except BaseException:   # noqa: BLE001
+            pass
+    return 0
+
+
+def alarm_off():
+    if hasattr(signal, 'SIGALRM'):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def main():
+    """The hook. Exit 1 or no answer lets the command run, so whatever happens on the way ends in an answer: a
+    late Slow or a crash in the handlers below (named, log, deny) still refuses."""
+    del ANSWERED[:]
+    try:
+        return answer()
+    except BaseException as e:
+        alarm_off()
+        if ANSWERED:   # a second answer would break the first one (two JSON objects are no answer)
+            return 0
+        deny(reason(f'the guard itself failed ({type(e).__name__}) while it answered, so it refuses; tell the owner '
+                    'if this repeats'))
+        return 0
+
+
+def answer():
+    raw, env = '', dict(os.environ)
+    try:
+        # The limit counts from the start of the hook process (Python's start-up and a slow machine use it up too),
+        # so the guard answers BUDGET seconds after that start at the latest: 5 s before the hook's 10 s limit.
+        # A command the fast exit passes needs no time, so the clock is looked at only after that.
+        left = BUDGET - process_age()
+        if hasattr(signal, 'SIGALRM'):   # also when one long step never comes back to the clock check
+            signal.signal(signal.SIGALRM, out_of_time)
+            signal.setitimer(signal.ITIMER_REAL, max(left, 0.5))   # reading stdin may hang
+        raw = sys.stdin.read()
+        if SETTINGS_PROBLEM:
+            try:
+                from agent_guards import config
+                config.warn('actions-disable-guard', SETTINGS_PROBLEM)
+            except BaseException:   # noqa: BLE001
+                try:
+                    sys.stderr.write(f'actions-disable-guard: {SETTINGS_PROBLEM}; built-in defaults used.\n')
+                except Exception:   # noqa: BLE001
+                    pass
+        if env.get('ACTIONS_DISABLE_GUARD_TEST_CRASH'):
+            raise RuntimeError('test crash')
+        ev = json.loads(raw)
+        if ev.get('tool_name') not in TOOLS:
+            alarm_off()
+            return passed()
+        cmd = (ev.get('tool_input') or {}).get('command') or ''
+        if QUICK and quick_pass(cmd):
+            alarm_off()
+            return passed()
+        left = BUDGET - process_age()
+        if left <= 0:
+            raise Slow()
+        why = decide(cmd, ev.get('cwd') or os.getcwd(), env, max(left - 1.0, 0.0), ev.get('tool_use_id'))
+        alarm_off()
+    except Slow:
+        alarm_off()   # first: the handlers below must not be cut off by the alarm (that answers nothing)
+        why, cmd = SLOW, raw
+    except Exception as e:
+        alarm_off()
+        # also when quotes split the words, or the word is put together from variables: gh or an HTTP client is enough
+        try:
+            tok = named(raw)
+        except Exception:
+            tok = True
+        if tok or LOOSE_RE.search(raw) or LOOSE_RE.search(re.sub(r'["\'\\]', '', raw)) or CRASH_RE.search(raw):
+            why = reason(f'the guard itself failed ({type(e).__name__}) on a command that uses gh or an HTTP client '
+                         'or names disabling Actions, so it refuses; tell the owner if this repeats')
+            cmd = raw
+        else:
+            return passed()
+    if why:
+        deny(why)   # first: logging may be slow
+        log(cmd, why, env)
+        return 0
+    return passed()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

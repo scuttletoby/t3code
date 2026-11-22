@@ -15,6 +15,7 @@ Every kit follows the same pattern:
 
 | Kit                                      | What                                                                                                                                                                                                                       |
 | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [agent-guards](agent-guards/README.md)   | Claude Code hooks that guard every agent on a machine: no disabling Actions, no piped capacity check, a memory index in budget, no stop with a background command, agent slots (Linux)                                     |
 | [cleaner](cleaner/README.md)             | `fork-cleaner`: free disk space by rules (`worktrees` with merged branches, `tmp`, `agent-scratch`, `docker`; `compress-cold` and `dedupe` delete no content) and never what could be needed; daily timer (Linux, systemd) |
 | [desk](desk/README.md)                   | A desktop's side of a fork fleet desk pool: runner users, walls, desk agent; one folder (Linux, WSL2)                                                                                                                      |
 | [gh-apps](gh-apps/README.md)             | GitHub App tokens for agents through `gh-as`, without giving agents the keys (Linux)                                                                                                                                       |
@@ -27,7 +28,7 @@ Every kit follows the same pattern:
 
 [common](common/README.md) is code the kits share, copied into each kit's version folder: the loader of the one
 private machine file (`/etc/fork-kit/machine.json`) where the facts of one machine live, and the installer and
-bootstrap of the cleaner, golive and schedule-kick kits.
+bootstrap of the agent-guards, cleaner, golive and schedule-kick kits.
 
 [review](review/README.md) is the one kit with no installer: a skill, docs and tools an agent uses from a checkout
 of the fork, beside the merge gate whose parser it imports.
