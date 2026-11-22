@@ -493,16 +493,24 @@ describe("a set worked out by a request, not a turn (fork issues #812, #918)", (
   it.effect("while a turn's set is being fixed, a request waits for it", () =>
     withServer(({ list }) =>
       Effect.gen(function* () {
-        const release = T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
+        const release = T3ToolSets.holdT3ToolSet(
+          "thread-prs",
+          yield* Clock.currentTimeMillis,
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
         const listing = yield* Effect.forkChild(list("prs"));
         yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
         expect(listing.pollUnsafe()).toBeUndefined();
         // The turn's check fixes the thread's new set, then releases: the request gets that one.
-        T3ToolSets.fixT3ToolSet("thread-prs", {
-          _tag: "Groups",
-          name: "waits",
-          groups: new Set(["waits"]),
-        });
+        T3ToolSets.fixT3ToolSet(
+          "thread-prs",
+          {
+            _tag: "Groups",
+            name: "waits",
+            groups: new Set(["waits"]),
+          },
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
         release();
         release();
         expect(grouped(yield* Fiber.join(listing))).toEqual({ waits: WAIT_TOOLS, prs: false });
@@ -514,8 +522,16 @@ describe("a set worked out by a request, not a turn (fork issues #812, #918)", (
   it.effect("a hold never released: the request is refused, not given the set before", () =>
     withServer(({ call }) =>
       Effect.gen(function* () {
-        T3ToolSets.fixT3ToolSet("thread-all", { _tag: "Groups", name: "all", groups: "all" });
-        T3ToolSets.holdT3ToolSet("thread-all", yield* Clock.currentTimeMillis);
+        T3ToolSets.fixT3ToolSet(
+          "thread-all",
+          { _tag: "Groups", name: "all", groups: "all" },
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
+        T3ToolSets.holdT3ToolSet(
+          "thread-all",
+          yield* Clock.currentTimeMillis,
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
         const calling = yield* Effect.forkChild(call("all", "wait_list"));
         yield* Deferred.await(T3ToolSets.__testing.asked("thread-all")!);
         const refused = yield* drive(calling, McpT3ToolRule.T3_TOOL_SET_HOLD_WAIT_MS);
@@ -612,11 +628,11 @@ describe("the T3 tool sets in memory", () => {
   it.effect("a set worked out for a request never replaces one a turn fixed", () =>
     Effect.sync(() => {
       T3ToolSets.__testing.clear();
-      T3ToolSets.fixT3ToolSet("t", groups("turn"));
+      T3ToolSets.fixT3ToolSet("t", groups("turn"), T3ToolSets.nextT3ToolSetTurn());
       expect(T3ToolSets.rememberT3ToolSet("t", groups("request"))).toEqual(groups("turn"));
       expect(T3ToolSets.rememberT3ToolSet("u", groups("request"))).toEqual(groups("request"));
       // A later turn start does replace it.
-      T3ToolSets.fixT3ToolSet("u", groups("turn"));
+      T3ToolSets.fixT3ToolSet("u", groups("turn"), T3ToolSets.nextT3ToolSetTurn());
       expect(T3ToolSets.t3ToolSetFor("u")).toEqual(groups("turn"));
     }),
   );
@@ -624,13 +640,27 @@ describe("the T3 tool sets in memory", () => {
   it.effect("keeps at most MAX_T3_TOOL_SETS threads, dropping the oldest", () =>
     Effect.sync(() => {
       T3ToolSets.__testing.clear();
-      for (let index = 0; index <= T3ToolSets.MAX_T3_TOOL_SETS; index += 1) {
-        T3ToolSets.fixT3ToolSet(`thread-${index}`, groups("p"));
+      // thread-0's older turn is still checking (it read a wider profile) as a newer turn fixes.
+      const older = T3ToolSets.nextT3ToolSetTurn();
+      T3ToolSets.fixT3ToolSet("thread-0", groups("newer"), T3ToolSets.nextT3ToolSetTurn());
+      for (let index = 1; index <= T3ToolSets.MAX_T3_TOOL_SETS; index += 1) {
+        T3ToolSets.fixT3ToolSet(`thread-${index}`, groups("p"), T3ToolSets.nextT3ToolSetTurn());
       }
       expect(T3ToolSets.__testing.size()).toBe(T3ToolSets.MAX_T3_TOOL_SETS);
       // The dropped thread has no set: its next request works it out again, never `all`.
       expect(T3ToolSets.t3ToolSetFor("thread-0")).toBeUndefined();
       expect(T3ToolSets.t3ToolSetFor(`thread-${T3ToolSets.MAX_T3_TOOL_SETS}`)).toBeDefined();
+      // The order outlives the drop: the older turn's late check writes nothing, nor replaces
+      // the set a request works out from the settings; a later turn fixes as usual.
+      T3ToolSets.fixT3ToolSet("thread-0", groups("older"), older);
+      expect(T3ToolSets.t3ToolSetFor("thread-0")).toBeUndefined();
+      expect(T3ToolSets.rememberT3ToolSet("thread-0", groups("request"))).toEqual(
+        groups("request"),
+      );
+      T3ToolSets.fixT3ToolSet("thread-0", groups("older"), older);
+      expect(T3ToolSets.t3ToolSetFor("thread-0")).toEqual(groups("request"));
+      T3ToolSets.fixT3ToolSet("thread-0", groups("next"), T3ToolSets.nextT3ToolSetTurn());
+      expect(T3ToolSets.t3ToolSetFor("thread-0")).toEqual(groups("next"));
     }),
   );
 
@@ -671,7 +701,7 @@ describe("the T3 tool sets in memory", () => {
     }),
   );
 
-  it.effect("empty state (after a restart, or a thread dropped at the cap): any check writes", () =>
+  it.effect("empty state (after a restart): any check writes", () =>
     Effect.sync(() => {
       T3ToolSets.__testing.clear();
       const older = T3ToolSets.nextT3ToolSetTurn();
@@ -708,9 +738,13 @@ describe("the hold bound, without a socket (fork issue #918)", () => {
     Effect.gen(function* () {
       T3ToolSets.__testing.clear();
       McpT3ToolRule.__testing.clearRefused();
-      T3ToolSets.fixT3ToolSet("thread-prs", prs);
+      T3ToolSets.fixT3ToolSet("thread-prs", prs, T3ToolSets.nextT3ToolSetTurn());
       expect(yield* checkAll("prs", "tools/list", [PR_TOOL])).toEqual([[PR_TOOL, true]]);
-      T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
+      T3ToolSets.holdT3ToolSet(
+        "thread-prs",
+        yield* Clock.currentTimeMillis,
+        T3ToolSets.nextT3ToolSetTurn(),
+      );
       const listing = yield* Effect.forkChild(
         checkAll("prs", "tools/list", [...WAIT_TOOLS, PR_TOOL]),
       );
@@ -732,8 +766,12 @@ describe("the hold bound, without a socket (fork issue #918)", () => {
       Effect.gen(function* () {
         T3ToolSets.__testing.clear();
         McpT3ToolRule.__testing.clearRefused();
-        T3ToolSets.fixT3ToolSet("thread-prs", prs);
-        T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
+        T3ToolSets.fixT3ToolSet("thread-prs", prs, T3ToolSets.nextT3ToolSetTurn());
+        T3ToolSets.holdT3ToolSet(
+          "thread-prs",
+          yield* Clock.currentTimeMillis,
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
         const first = yield* Effect.forkChild(checkAll("prs", "tools/call", [PR_TOOL]));
         yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
         expect(yield* drive(first, McpT3ToolRule.T3_TOOL_SET_HOLD_WAIT_MS)).toEqual([
@@ -744,10 +782,14 @@ describe("the hold bound, without a socket (fork issue #918)", () => {
         expect(T3ToolSets.__testing.asked("thread-prs")).toBeUndefined();
         expect(yield* checkAll("prs", "tools/call", [PR_TOOL])).toEqual([[PR_TOOL, false]]);
         // The next turn's hold starts fresh, and its check's set applies once it releases.
-        const release = T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
+        const release = T3ToolSets.holdT3ToolSet(
+          "thread-prs",
+          yield* Clock.currentTimeMillis,
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
         const second = yield* Effect.forkChild(checkAll("prs", "tools/call", [PR_TOOL]));
         yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
-        T3ToolSets.fixT3ToolSet("thread-prs", prs);
+        T3ToolSets.fixT3ToolSet("thread-prs", prs, T3ToolSets.nextT3ToolSetTurn());
         release();
         expect(yield* Fiber.join(second)).toEqual([[PR_TOOL, true]]);
       }),
@@ -759,12 +801,20 @@ describe("the hold bound, without a socket (fork issue #918)", () => {
       Effect.gen(function* () {
         T3ToolSets.__testing.clear();
         McpT3ToolRule.__testing.clearRefused();
-        T3ToolSets.fixT3ToolSet("thread-prs", { _tag: "Groups", name: "all", groups: "all" });
-        T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
+        T3ToolSets.fixT3ToolSet(
+          "thread-prs",
+          { _tag: "Groups", name: "all", groups: "all" },
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
+        T3ToolSets.holdT3ToolSet(
+          "thread-prs",
+          yield* Clock.currentTimeMillis,
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
         const waiting = yield* Effect.forkChild(checkAll("prs", "tools/call", [PR_TOOL]));
         yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
         // The turn's check fixes its set; the wait ends before it releases.
-        T3ToolSets.fixT3ToolSet("thread-prs", prs);
+        T3ToolSets.fixT3ToolSet("thread-prs", prs, T3ToolSets.nextT3ToolSetTurn());
         expect(yield* drive(waiting, McpT3ToolRule.T3_TOOL_SET_HOLD_WAIT_MS)).toEqual([
           [PR_TOOL, true],
         ]);
@@ -789,5 +839,33 @@ describe("the hold bound, without a socket (fork issue #918)", () => {
       release();
       expect(T3ToolSets.t3ToolSetFor("thread-prs")).toEqual(prs);
     }),
+  );
+
+  it.effect(
+    "a joined turn still checking as the bound passes: the first's late check cannot widen (#986)",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        McpT3ToolRule.__testing.clearRefused();
+        // Turn A's check read the wide profile and is stuck; the profile is narrowed; turn B joins
+        // A's hold, and B's check is still running too as the bound passes.
+        const a = T3ToolSets.nextT3ToolSetTurn();
+        const b = T3ToolSets.nextT3ToolSetTurn();
+        const now = yield* Clock.currentTimeMillis;
+        T3ToolSets.holdT3ToolSet("thread-prs", now, a);
+        T3ToolSets.holdT3ToolSet("thread-prs", now, b);
+        const waiting = yield* Effect.forkChild(checkAll("prs", "tools/call", [PR_TOOL]));
+        yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
+        expect(yield* drive(waiting, McpT3ToolRule.T3_TOOL_SET_HOLD_WAIT_MS)).toEqual([
+          [PR_TOOL, false],
+        ]);
+        expect(T3ToolSets.t3ToolSetFor("thread-prs")?._tag).toBe("Refused");
+        // The refusal stands for B: A's late check, with its wide read, writes nothing.
+        T3ToolSets.fixT3ToolSet("thread-prs", { _tag: "Groups", name: "all", groups: "all" }, a);
+        expect(T3ToolSets.t3ToolSetFor("thread-prs")?._tag).toBe("Refused");
+        // B's own late check replaces it.
+        T3ToolSets.fixT3ToolSet("thread-prs", prs, b);
+        expect(T3ToolSets.t3ToolSetFor("thread-prs")).toEqual(prs);
+      }),
   );
 });

@@ -54,28 +54,35 @@ export const nextT3ToolSetTurn = (): number => ++lastTurn;
  */
 const sets = new Map<string, { readonly turn: number; readonly set: T3ToolSet | undefined }>();
 
+/**
+ * The latest turn of any thread dropped at the cap. A thread with no entry may have been dropped
+ * with a turn up to this one, so a check older than it writes nothing: the thread's next request
+ * works its set out again from the settings instead.
+ */
+let droppedTurn = 0;
+
 const keep = (threadId: string, turn: number, set: T3ToolSet | undefined) => {
   sets.delete(threadId);
   sets.set(threadId, { turn, set });
-  for (const oldest of sets.keys()) {
+  for (const [oldest, entry] of sets) {
     if (sets.size <= MAX_T3_TOOL_SETS) break;
+    droppedTurn = Math.max(droppedTurn, entry.turn);
     sets.delete(oldest);
   }
 };
 
+/** The latest turn that fixed the thread's set (or stopped half-way), or may have, if dropped. */
+const lastFixed = (threadId: string) => sets.get(threadId)?.turn ?? droppedTurn;
+
 /** True when no turn after `turn` has fixed the thread's set (or stopped half-way). */
-const newest = (threadId: string, turn: number) => (sets.get(threadId)?.turn ?? 0) <= turn;
+const newest = (threadId: string, turn: number) => lastFixed(threadId) <= turn;
 
 /**
  * A turn of the thread starts: its set from now until the next turn starts. A check that finishes
- * after a later turn's has fixed its set writes nothing: the later turn's set stands. With no
- * `turn`, the set is fixed as the newest turn's.
+ * after a later turn's has fixed its set writes nothing: the later turn's set stands. `turn` is
+ * the one drawn before the profile was read (a number drawn after would rank a stale read newest).
  */
-export const fixT3ToolSet = (
-  threadId: string,
-  set: T3ToolSet,
-  turn: number = nextT3ToolSetTurn(),
-): void => {
+export const fixT3ToolSet = (threadId: string, set: T3ToolSet, turn: number): void => {
   if (newest(threadId, turn)) keep(threadId, turn, set);
 };
 
@@ -97,7 +104,7 @@ export const rememberT3ToolSet = (threadId: string, set: T3ToolSet): T3ToolSet =
   const fixed = sets.get(threadId);
   if (fixed?.set !== undefined) return fixed.set;
   // As old as the last turn: that turn's late check, or any later turn, still replaces it.
-  keep(threadId, fixed?.turn ?? 0, set);
+  keep(threadId, lastFixed(threadId), set);
   return set;
 };
 
@@ -127,13 +134,9 @@ const holds = new Map<
  * Holds the thread's T3 requests (mcpT3ToolRule.ts) until the returned release runs, so a turn
  * Codex started gets the set its check fixes. Release always; a second release does nothing. A hold
  * taken while one is in force joins it (keeping its bound); one taken after that bound starts
- * afresh. `turn` is the turn whose check takes it; with none, the newest.
+ * afresh. `turn` is the turn whose check takes it, drawn before that check reads the profile.
  */
-export const holdT3ToolSet = (
-  threadId: string,
-  now: number,
-  turn: number = nextT3ToolSetTurn(),
-): (() => void) => {
+export const holdT3ToolSet = (threadId: string, now: number, turn: number): (() => void) => {
   let hold = holds.get(threadId);
   if (hold === undefined || hold.until <= now) {
     hold = {
@@ -176,8 +179,7 @@ export const t3ToolSetHold = (threadId: string, now: number): T3ToolSetHold | un
 /**
  * A hold its bound passed: dropped, and the thread keeps `set` (never the one before the hold)
  * until a turn, or the late check, fixes one. False when it was released meanwhile, or when the
- * hold's latest turn, or a turn after it, has fixed its set (the check fixed it and has not
- * released yet, or a turn T3 started itself): that set stands.
+ * hold's latest turn or a later one has fixed its set (or may have, if dropped at the cap).
  */
 export const dropT3ToolSetHold = (
   threadId: string,
@@ -187,7 +189,7 @@ export const dropT3ToolSetHold = (
   const held = holds.get(threadId);
   if (held?.done !== hold.done) return false;
   holds.delete(threadId);
-  if ((sets.get(threadId)?.turn ?? 0) >= held.turn) return false;
+  if (lastFixed(threadId) >= held.turn) return false;
   // As the hold's latest turn: that turn's late check still replaces it; an older one does not.
   keep(threadId, held.turn, set);
   return true;
@@ -197,6 +199,7 @@ export const __testing = {
   clear: () => {
     sets.clear();
     holds.clear();
+    droppedTurn = 0;
   },
   size: () => sets.size,
   /** Done once a request waits on the thread's hold; `undefined` when none is held. */

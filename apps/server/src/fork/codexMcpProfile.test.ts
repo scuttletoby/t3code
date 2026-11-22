@@ -1501,7 +1501,12 @@ describe("a newer turn's T3 tool set is never overwritten by an older one (fork 
     const next = (profile: McpProfileResolved) => void queue.push(Effect.succeed(profile));
     return { profileFor, gated, next };
   };
-  const settle = TestClock.withLive(Effect.sleep("20 millis"));
+  /**
+   * The thread's hold, for its `done`: done once every check holding it has released, which each
+   * does after fixing (or not) its set. A check whose profile read is not gated runs inside `emit`
+   * (forked to start at once, nothing to wait on), so only a gated read's end needs awaiting.
+   */
+  const holdOf = (threadId: string) => T3ToolSets.t3ToolSetHold(threadId, 0)!.done;
   const TIMED_OUT = T3ToolSets.refusedT3ToolSet("timed out");
   /** What the T3 tool rule does as a request's wait on the hold reaches its bound. */
   const dropAtBound = (threadId: string) =>
@@ -1525,17 +1530,16 @@ describe("a newer turn's T3 tool set is never overwritten by an older one (fork 
       yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
       yield* Deferred.await(slow.reached);
       yield* fake.emit("turn/started", turnStarted(id, "goal-3"));
-      yield* settle;
       assert.deepStrictEqual(groupsOf("t"), ["waits"]);
       // goal-2's check finishes last: it must not widen the thread back to `all`.
+      const done = holdOf("t");
       yield* Deferred.succeed(slow.open, undefined);
-      yield* settle;
+      yield* Deferred.await(done);
       assert.deepStrictEqual(groupsOf("t"), ["waits"]);
       assert.isUndefined(T3ToolSets.__testing.asked("t"));
       // Runs again: the thread's next turn fixes its set as usual.
       next(resolved("threads", "all", ["threads"]));
       yield* fake.emit("turn/started", turnStarted(id, "goal-4"));
-      yield* settle;
       assert.deepStrictEqual(groupsOf("t"), ["threads"]);
     }),
   );
@@ -1553,16 +1557,16 @@ describe("a newer turn's T3 tool set is never overwritten by an older one (fork 
       yield* Deferred.await(stuck.reached);
       // goal-3 joins goal-2's hold (and its bound), and fixes its set; goal-2's check still runs.
       yield* fake.emit("turn/started", turnStarted(id, "goal-3"));
-      yield* settle;
       assert.deepStrictEqual(groupsOf("t"), ["waits"]);
       assert.isDefined(T3ToolSets.__testing.asked("t"));
       // The bound passes: the hold goes, but goal-3's set stands (not Refused over it).
+      const done = holdOf("t");
       assert.isFalse(dropAtBound("t"));
       assert.isUndefined(T3ToolSets.__testing.asked("t"));
       assert.deepStrictEqual(groupsOf("t"), ["waits"]);
       // goal-2's late check gives nothing either.
       yield* Deferred.succeed(stuck.open, undefined);
-      yield* settle;
+      yield* Deferred.await(done);
       assert.deepStrictEqual(groupsOf("t"), ["waits"]);
     }),
   );
@@ -1583,10 +1587,11 @@ describe("a newer turn's T3 tool set is never overwritten by an older one (fork 
         next(LEAN);
         assert.strictEqual(yield* outcome(turn(client, id)), "ok");
         assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+        const done = holdOf("t");
         assert.isFalse(dropAtBound("t"));
         assert.deepStrictEqual(groupsOf("t"), ["waits"]);
         yield* Deferred.succeed(stuck.open, undefined);
-        yield* settle;
+        yield* Deferred.await(done);
         assert.deepStrictEqual(groupsOf("t"), ["waits"]);
       }),
   );
@@ -1598,15 +1603,20 @@ describe("a newer turn's T3 tool set is never overwritten by an older one (fork 
       const { profileFor, gated } = scripted();
       const client = yield* withCodexMcpProfiles(fake.client, profileFor);
       const id = (yield* start(client, "t")).thread.id;
-      T3ToolSets.fixT3ToolSet("t", { _tag: "Groups", name: "all", groups: "all" });
+      T3ToolSets.fixT3ToolSet(
+        "t",
+        { _tag: "Groups", name: "all", groups: "all" },
+        T3ToolSets.nextT3ToolSetTurn(),
+      );
       const stuck = yield* gated(LEAN);
       yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
       yield* Deferred.await(stuck.reached);
+      const done = holdOf("t");
       assert.isTrue(dropAtBound("t"));
       assert.strictEqual(groupsOf("t"), "Refused");
       // The stuck check is that turn's: when it finishes late, its set replaces the refusal.
       yield* Deferred.succeed(stuck.open, undefined);
-      yield* settle;
+      yield* Deferred.await(done);
       assert.deepStrictEqual(groupsOf("t"), ["waits"]);
     }),
   );

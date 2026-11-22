@@ -291,7 +291,7 @@ describe("makeClaudeMcpProfiles", () => {
           }),
         );
         const before: T3ToolSets.T3ToolSet = { _tag: "Groups", name: "all", groups: "all" };
-        T3ToolSets.fixT3ToolSet("t", before);
+        T3ToolSets.fixT3ToolSet("t", before, T3ToolSets.nextT3ToolSetTurn());
         const planned = yield* plan(thread("t"), {});
         // Planned, not opened (a continuation, or background work blocks the replacement).
         assert.strictEqual(planned.name, "lean");
@@ -413,7 +413,11 @@ describe("makeClaudeMcpProfiles", () => {
   it.effect("a profile that cannot be worked out fixes no T3 tool but the ungrouped ones", () =>
     Effect.gen(function* () {
       T3ToolSets.__testing.clear();
-      T3ToolSets.fixT3ToolSet("t", { _tag: "Groups", name: "all", groups: "all" });
+      T3ToolSets.fixT3ToolSet(
+        "t",
+        { _tag: "Groups", name: "all", groups: "all" },
+        T3ToolSets.nextT3ToolSetTurn(),
+      );
       // The thread names a profile that is gone: the turn refuses, and the old `all` set is gone.
       assert.include(
         (yield* plansFor([{ mcpProfile: "gone" }]))[0],
@@ -428,7 +432,11 @@ describe("makeClaudeMcpProfiles", () => {
     () =>
       Effect.gen(function* () {
         T3ToolSets.__testing.clear();
-        T3ToolSets.fixT3ToolSet("t", { _tag: "Groups", name: "all", groups: "all" });
+        T3ToolSets.fixT3ToolSet(
+          "t",
+          { _tag: "Groups", name: "all", groups: "all" },
+          T3ToolSets.nextT3ToolSetTurn(),
+        );
         const reading = yield* Deferred.make<void>();
         const service = yield* ServerSettingsService.ServerSettingsService;
         const plan = yield* makeClaudeMcpProfiles.pipe(

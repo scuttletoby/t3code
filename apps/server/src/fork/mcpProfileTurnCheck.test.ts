@@ -367,7 +367,11 @@ describe("mcpProfileTurnCheck", () => {
             assert.match(yield* start(own, OPENCODE), /"lean" leaves out some outside MCP servers/);
             T3ToolSets.__testing.clear();
             for (const how of ["start", "resume", "compact"] as const) {
-              T3ToolSets.fixT3ToolSet(own.id, { _tag: "Groups", name: "all", groups: "all" });
+              T3ToolSets.fixT3ToolSet(
+                own.id,
+                { _tag: "Groups", name: "all", groups: "all" },
+                T3ToolSets.nextT3ToolSetTurn(),
+              );
               assert.strictEqual(yield* start(own, CODEX, how), "ok");
               assert.deepStrictEqual(groupsOf(own.id), ["threads", "waits"]);
             }
@@ -462,7 +466,11 @@ describe("mcpProfileTurnCheck", () => {
         Effect.gen(function* () {
           const own = appThread("own");
           for (const id of [CODEX, OPENCODE]) {
-            T3ToolSets.fixT3ToolSet(own.id, { _tag: "Groups", name: "all", groups: "all" });
+            T3ToolSets.fixT3ToolSet(
+              own.id,
+              { _tag: "Groups", name: "all", groups: "all" },
+              T3ToolSets.nextT3ToolSetTurn(),
+            );
             assert.include(yield* start(own, id, "compact"), 'MCP profile "gone" is not set up');
             assert.strictEqual(T3ToolSets.t3ToolSetFor(own.id)?._tag, "Refused");
           }
@@ -611,7 +619,11 @@ describe("mcpProfileTurnCheck", () => {
         ({ calls, start }) =>
           Effect.gen(function* () {
             const own = appThread("own");
-            T3ToolSets.fixT3ToolSet(own.id, { _tag: "Groups", name: "all", groups: "all" });
+            T3ToolSets.fixT3ToolSet(
+              own.id,
+              { _tag: "Groups", name: "all", groups: "all" },
+              T3ToolSets.nextT3ToolSetTurn(),
+            );
             const fiber = yield* Effect.forkChild(start(own, OPENCODE));
             yield* Deferred.await(reading);
             yield* Fiber.interrupt(fiber);
