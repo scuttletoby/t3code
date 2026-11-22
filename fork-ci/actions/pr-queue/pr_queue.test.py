@@ -5664,6 +5664,18 @@ class Notify(unittest.TestCase):
         self.assertEqual([c['argv'] for c in self.calls()], [[
             'owner/proj', '7', self.H, 'red', 'required check build is red', self.RUN]])
 
+    def test_a_red_that_only_cancels_followed_links_the_red_run(self):   # #924 r1: never the cancel, it shows no failure
+        cancel = 'https://github.com/owner/proj/actions/runs/12/job/23'
+        runs = (('2026-11-09T02:00:00Z', 'FAILURE', self.RUN), ('2026-11-09T03:00:00Z', 'CANCELLED', cancel))
+        self.sweep(self.queue(), state='BEHIND', runs=runs)
+        q = self.queue(update_when_base_was_red=True)
+        q.red_from_old_base = lambda p, cache: ('main is still red', 'build', True)
+        self.comments = []
+        self.sweep(q, state='BEHIND', runs=runs)
+        self.assertEqual([c['argv'][3:] for c in self.calls()],
+                         [['red', 'required check build is red', self.RUN],
+                          ['base-red', 'required check build failed as on main', self.RUN]])
+
     def test_a_cancelled_check_on_an_up_to_date_pr_is_stuck(self):
         runs = (('2026-11-09T02:00:00Z', 'CANCELLED', self.RUN),)
         self.sweep(self.queue(), state='BLOCKED', runs=runs, wf=({'status': 'completed', 'workflowName': 'ci'},))

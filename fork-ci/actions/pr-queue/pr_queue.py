@@ -207,11 +207,12 @@ CHECK_NOT_DONE_RE = re.compile(r'required status checks?\b(?:"[^"\n]*"|[^."\n])*
                                r'(?:queued|in progress|expected|pending)\b', re.I)
 
 
-def merge_tree(git, p, side):
+def merge_tree(git, p, side, **kw):
     """git's merge of the commits `p` and `side`: exit 0 and the tree's name when clean. As GitHub's update branch
     merges (measured, issue 924): a file added in a folder the other side renamed stays where it was added, so no
-    directory rename follows it (git's default would call it a conflict, `true` would move it)."""
-    return git('-c', 'merge.directoryRenames=false', 'merge-tree', '--write-tree', p, side)
+    directory rename follows it (git's default would call it a conflict, `true` would move it). head-check's merged
+    config check merges with it too (issue 1033), so the queue and the gate merge one way. `kw` goes to `git`."""
+    return git('-c', 'merge.directoryRenames=false', 'merge-tree', '--write-tree', p, side, **kw)
 
 
 def holds(git, head, read, depth=UPDATES, base='refs/queue/base', merge=None):
@@ -1557,6 +1558,13 @@ class Queue:
         c = max(runs, key=lambda c: c.get('startedAt') or '9999')
         return c.get('detailsUrl') or c.get('targetUrl')
 
+    def red_link(self, p, check):
+        """The page of the run that makes required check `check` red on the listed PR `p` (red_checks' item), for the
+        red notices: when only cancelled runs followed the red, the newest run is a cancel with no failure in it, so
+        the notice links the red run itself. check_link when that run has no page."""
+        c = self.red_checks(p).get(check) or {}
+        return c.get('detailsUrl') or c.get('targetUrl') or self.check_link(p, check)
+
     def tell_dirty(self, n, head, base):
         """tell() for an armed PR that conflicts with its base (merge state DIRTY): GitHub cannot merge it and the queue
         cannot update it, and auto-merge stays on without a word, so without this it waits unseen. Once per head: a
@@ -2146,13 +2154,13 @@ class Queue:
                         self.tell_red(n, head, bad, f'failed as on {base}',
                                       f'{base} failed {bad} too, so this is not this PR\'s fault: the queue '
                                       f'updates it by itself once {bad} is green on {base}',
-                                      kind='base-red', link=self.check_link(p, bad))
+                                      kind='base-red', link=self.red_link(p, bad))
                     continue
             elif bad:
                 print(f'skip #{n}: required check {bad} failed (its author fixes it)')
             if bad:
                 if not dry:
-                    self.tell_red(n, head, bad, link=self.check_link(p, bad))
+                    self.tell_red(n, head, bad, link=self.red_link(p, bad))
                 continue
             if p.get('mergeStateStatus') != 'BEHIND':
                 if p.get('mergeStateStatus') == 'UNKNOWN' and may_wait:
