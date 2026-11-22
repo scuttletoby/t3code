@@ -10,7 +10,7 @@ temporary folder in the command line, scopes by those processes.
 """
 # How CI runs it (.github/scripts/fork-ci-tests.cjs, which records what it ran; fork-ci-result checks that):
 # fork-ci: run with HEAVY_REAL_TESTS=1
-import json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
+import json, os, pwd, re, secrets, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAKE_TOOLS = os.path.join(KIT, 'tests', 'fake_tools.py')
@@ -20,6 +20,9 @@ OLD = os.path.join(KIT, 'tests', 'old-heavy.sh')
 WRAPPERS = {os.path.realpath(HEAVY), os.path.realpath(OLD)}
 SLICE = os.environ.get('HEAVY_TEST_SLICE') or 'heavy.slice'
 REQUIRED = os.environ.get('HEAVY_REAL_TESTS') == '1'
+# #996: every setting that names a folder heavy writes in. A test hands heavy each one inside its own folder: HOME
+# alone is not enough, as the measured history is in the password database's home (lib/heavy_measure.py default_dir)
+STATE_SETTINGS = ('HOME', 'HEAVY_STATE_DIR', 'HEAVY_QUEUE_ROOT', 'HEAVY_FACTS_CACHE')
 
 
 def manager_problem():
@@ -126,6 +129,8 @@ class Heavy(unittest.TestCase):
         self.docker = self.script('docker', f'exec "{sys.executable}" -I -B "{FAKE_TOOLS}" "{self.docker_state}" '
                                             f'docker "$@"')
         # HOME: heavy makes ~/.local/state/heavy/labelled; a test never makes it in the tester's real home (#761)
+        # HEAVY_STATE_DIR: the measured history of every --kind/--measure job; its default is the password
+        # database's home, not HOME, so without it each test job wrote the tester's real history (#996)
         # the capacity check of a job without --kind (#866): a fake that answers free at once, so no test waits on the
         # tester's busy machine; test_the_real_capacity_check_answers runs the kit's own. Its 20 s hold goes into the
         # test folder, never the user's live one
@@ -133,7 +138,8 @@ class Heavy(unittest.TestCase):
         self.env = dict(os.environ, HEAVY_SLICE=SLICE, HEAVY_CONFIG=os.path.join(self.dir, 'no-config.json'),
                         HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root, HEAVY_DOCKER=self.docker, HOME=self.dir,
                         HEAVY_TESTING='1', HEAVY_CHECK_HEAVY=self.check_script('free-check', True),
-                        HEAVY_FACTS_CACHE=os.path.join(self.dir, 'facts', 'heavy-facts.json'))
+                        HEAVY_FACTS_CACHE=os.path.join(self.dir, 'facts', 'heavy-facts.json'),
+                        HEAVY_STATE_DIR=os.path.join(self.dir, 'measured'))
         self.env.pop('HEAVY_KEEP', None)
 
     hung = None     # the first test whose heavy did not end in time: every later test fails at once, not at its timeout
@@ -280,10 +286,23 @@ class Heavy(unittest.TestCase):
         if not getattr(self, 'leaves_on_purpose', False):
             self.assertEqual(stray, [], 'a test left processes running (stopped by the cleanup)')
 
+    def isolated(self, env):
+        """#996: env keeps every folder heavy writes in (STATE_SETTINGS) inside this test's folder, and HOME is one
+        only this user can write (else heavy's state notes fall back to the password database's home): a test never
+        writes the tester's real home, history or queue. Every run of heavy goes through here (heavy(), start())."""
+        for key in STATE_SETTINGS:
+            value = env.get(key) or ''
+            self.assertTrue(os.path.isabs(value) and os.path.commonpath([self.dir, os.path.realpath(value)]) ==
+                            self.dir, f'{key}={value!r} is not in the test folder {self.dir}: heavy would write '
+                                      f'outside it')
+        self.assertFalse(os.stat(env['HOME']).st_mode & 0o022, 'HOME can be written by others: heavy would use the '
+                                                               'real home instead')
+        return env
+
     def heavy(self, *args, env=None, wrapper=None, timeout=60, **kw):
         try:
             return subprocess.run([wrapper or HEAVY, *args], capture_output=True, text=True, timeout=timeout,
-                                  env=env or self.env, cwd=self.dir, **kw)
+                                  env=self.isolated(env or self.env), cwd=self.dir, **kw)
         except subprocess.TimeoutExpired as e:        # what it said till then shows where it hangs
             said = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else e.stderr or ''
             raise AssertionError(f'heavy {" ".join(args)} still running after {timeout:g} s; it said: {said!r}')
@@ -607,7 +626,7 @@ class Heavy(unittest.TestCase):
         # Python's C-locale coercion (PEP 538) adds LC_CTYPE=C.UTF-8 to heavy's own environment: not to the command's
         env = {k: v for k, v in self.env.items() if k in ('PATH', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
                                                           'HEAVY_SLICE', 'HEAVY_CONFIG', 'HEAVY_GRACE', 'HEAVY_DOCKER',
-                                                          'HEAVY_TESTING', 'HEAVY_CHECK_HEAVY', 'HEAVY_FACTS_CACHE')}
+                                                          'HEAVY_TESTING', 'HEAVY_CHECK_HEAVY', *STATE_SETTINGS)}
         env['LANG'] = 'C'
         r = self.heavy('env', '-0', env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -651,7 +670,7 @@ class Heavy(unittest.TestCase):
 
     def start(self, *args, env=None):
         p = subprocess.Popen([HEAVY, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                             env=env or self.env, cwd=self.dir, start_new_session=True)
+                             env=self.isolated(env or self.env), cwd=self.dir, start_new_session=True)
         self.addCleanup(lambda: p.poll() is None and p.kill())
         return p
 
@@ -868,6 +887,29 @@ class Heavy(unittest.TestCase):
         self.assertGreater(len(self.peaks()['heavy-test']), 0)
         self.assertEqual(self.queue_jobs(env), [])
         self.assertTrue(os.path.isdir(os.path.join(self.queue_root, SLICE)))       # the private queue was used
+
+    def test_a_measured_job_never_writes_the_testers_real_history(self):
+        # #996: the tests set a fake HOME, but heavy takes the measured history's folder from the password database,
+        # so each `heavy --kind heavy-test` run added a line to the tester's real ~/.local/state/heavy/measured.jsonl.
+        # A kind no other run uses, run both ways (--kind, --measure): its lines are in the test folder, not the
+        # real one
+        real = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, '.local', 'state', 'heavy')
+        kind = f'heavy-test-{secrets.token_hex(4)}'
+
+        def lines(folder):
+            found = []
+            for name in ('measured.jsonl', 'measured.jsonl.1'):
+                try:
+                    with open(os.path.join(folder, name), encoding='utf-8', errors='replace') as f:
+                        found += [line for line in f if f'"kind":"{kind}"' in line]
+                except FileNotFoundError:
+                    pass
+            return found
+        for args in (('--kind', kind, '--mb', '64', '--wait', '60'), ('--measure', kind)):
+            r = self.heavy(*args, '--', 'sleep', '3')
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(lines(real), [], f'a test wrote the real history in {real}')
+        self.assertEqual(len(lines(self.env['HEAVY_STATE_DIR'])), 2, 'recorded in the test folder instead')
 
     def test_a_failed_run_leaves_its_peak_too(self):
         env = dict(self.env, HOME=self.dir)

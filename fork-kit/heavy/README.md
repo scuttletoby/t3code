@@ -596,8 +596,10 @@ after another, up to the group's ceiling), the memory budget, the queue and note
     session. Not read: root and system users (below `UID_MIN`), people known only through NSS (LDAP, sssd) who have
     no session now, homes that are `/` or not absolute, and, for a person with no session now, a home behind an
     automount trigger (`autofs`) that is not mounted: reading it on every call would mount every home. Their
-    reservations count again from their next login (then the home is mounted). A mount table that cannot be read:
-    every home is read, as before.
+    reservations count again from their next login (then the home is mounted). A mount table that cannot be read
+    or is longer than 4 MiB (a note), or a `user.slice` that cannot be listed (sessions cannot be known, a note):
+    every home is read, as before. Mount points and homes are compared as the file system names them, so a
+    non-ASCII home (`\303\274` in the mount table) matches its mount.
   - Each `.conf` there must be a plain file: a link (stow-style dotfiles) is refused and makes the tier Basic.
   - A person's `reserve.d` it cannot read (a home closed to others, mode 750 or 700), or a user with a session but
     no home it can find, makes it Basic.
@@ -647,7 +649,9 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   read again after 5 s (`--fresh`: now). A user without `/run/user/<uid>` (no user manager) uses
   `heavy-facts-<uid>/` in the temporary folder (`$TMPDIR`, else `/tmp`, never the working folder), made 0700. When
   that one is a link, another user's or open to others (someone took the name first), or there is no temporary
-  folder this user can write, it uses `~/.cache/heavy-facts-<host>/` (made 0700) with a note, if the home (`$HOME`,
+  folder this user can write, it uses `~/.cache/heavy-facts-<host>-<machine>/` (made 0700; `<machine>`: the
+  first 16 characters of `/etc/machine-id`, else of the boot id, so two machines of one home and host name never
+  share it; the previous kit's `heavy-facts-<host>/` is never read or removed) with a note, if the home (`$HOME`,
   else the password database's) is this user's, no one else can write it, and no folder above it lets someone else
   swap it (one not root's or this user's, or one others can write that is not sticky like `/tmp`). None of these: no
   cache (a note). The folder is opened once without following a link, and every cache and hold file is reached
@@ -755,29 +759,29 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 
 ## Files on the host
 
-| Path                                             | What                                                                      |
-| ------------------------------------------------ | ------------------------------------------------------------------------- |
-| `/usr/local/bin/heavy`                           | link to `current/bin/heavy`                                               |
-| `/usr/local/sbin/heavy-install`                  | link to `current/sbin/heavy-install`                                      |
-| `/usr/local/bin/t3-capacity`                     | link to `current/bin/t3-capacity`                                         |
-| `/usr/local/libexec/heavy/versions/<sha>/`       | the code of one release, with `MANIFEST.sha256` (root 755)                |
-| `/usr/local/libexec/heavy/current`               | link to the release in use (switched in one step)                         |
-| `/usr/local/libexec/heavy/replaced/`             | a plain `/usr/local/bin/heavy` from before the kit, put back on uninstall |
-| `/usr/local/libexec/heavy-kept/`                 | a plain `/usr/local/bin/t3-capacity` (a host's copy), put back likewise   |
-| `/etc/heavy/config.json`                         | slice name and grace time                                                 |
-| `/etc/heavy/installed.tsv`                       | every installed path with its link target or hash (`--self-check`)        |
-| `/etc/systemd/user/<slice>`                      | only with limit options: the slice unit                                   |
-| `/etc/systemd/user/heavy-sweep.{service,timer}`  | only with `--sweep-timer`: the leftover sweep (each user enables it)      |
-| `/etc/fork-kit/machine.json`                     | written by the owner, never the kit: sweep and queue settings             |
-| `~/.local/state/heavy-sweep/`                    | each user's sweep log, last report and lock                               |
-| `/run/user/<uid>/heavy-queue/<slice>/`           | the memory queue: its lock and one ticket per queued job (tmpfs)          |
-| `~/.local/state/heavy/`                          | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
-|                                                  | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
-| `/run/user/<uid>/heavy-facts-*.json`             | `heavy facts`' 5 s cache (tmpfs), one per version and settings            |
-| `/tmp/heavy-facts-<uid>/heavy-facts-*.json`      | the same, for a user without `/run/user/<uid>` (no user manager)          |
-| `~/.cache/heavy-facts-<host>/heavy-facts-*.json` | the same, when the temporary one is taken or cannot be written            |
-| `<that folder>/t3-capacity-hold.json`            | `t3-capacity`'s 20 s hold of a NOT OK                                     |
-| `~/.config/t3-capacity/reserve.d/*.conf`         | each user's reservations for `heavy facts` and its callers                |
+| Path                                                       | What                                                                      |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `/usr/local/bin/heavy`                                     | link to `current/bin/heavy`                                               |
+| `/usr/local/sbin/heavy-install`                            | link to `current/sbin/heavy-install`                                      |
+| `/usr/local/bin/t3-capacity`                               | link to `current/bin/t3-capacity`                                         |
+| `/usr/local/libexec/heavy/versions/<sha>/`                 | the code of one release, with `MANIFEST.sha256` (root 755)                |
+| `/usr/local/libexec/heavy/current`                         | link to the release in use (switched in one step)                         |
+| `/usr/local/libexec/heavy/replaced/`                       | a plain `/usr/local/bin/heavy` from before the kit, put back on uninstall |
+| `/usr/local/libexec/heavy-kept/`                           | a plain `/usr/local/bin/t3-capacity` (a host's copy), put back likewise   |
+| `/etc/heavy/config.json`                                   | slice name and grace time                                                 |
+| `/etc/heavy/installed.tsv`                                 | every installed path with its link target or hash (`--self-check`)        |
+| `/etc/systemd/user/<slice>`                                | only with limit options: the slice unit                                   |
+| `/etc/systemd/user/heavy-sweep.{service,timer}`            | only with `--sweep-timer`: the leftover sweep (each user enables it)      |
+| `/etc/fork-kit/machine.json`                               | written by the owner, never the kit: sweep and queue settings             |
+| `~/.local/state/heavy-sweep/`                              | each user's sweep log, last report and lock                               |
+| `/run/user/<uid>/heavy-queue/<slice>/`                     | the memory queue: its lock and one ticket per queued job (tmpfs)          |
+| `~/.local/state/heavy/`                                    | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
+|                                                            | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
+| `/run/user/<uid>/heavy-facts-*.json`                       | `heavy facts`' 5 s cache (tmpfs), one per version and settings            |
+| `/tmp/heavy-facts-<uid>/heavy-facts-*.json`                | the same, for a user without `/run/user/<uid>` (no user manager)          |
+| `~/.cache/heavy-facts-<host>-<machine>/heavy-facts-*.json` | the same, when the temporary one is taken or cannot be written            |
+| `<that folder>/t3-capacity-hold.json`                      | `t3-capacity`'s 20 s hold of a NOT OK                                     |
+| `~/.config/t3-capacity/reserve.d/*.conf`                   | each user's reservations for `heavy facts` and its callers                |
 
 ## Install (owner, as root)
 
@@ -854,7 +858,9 @@ clock; real processes where the kernel matters (a waiter killed with -9, a crash
 instant). Its red check breaks each admission and clean-up rule and shows the test for it then fails.
 `heavy.test.py` runs queued jobs with the real systemd user manager in a private queue folder (`HEAVY_QUEUE_ROOT`,
 never the user's live queue): one that runs, one that fails and still leaves its peak, one whose heavy is killed
-with -9 (its guard stops the scope, and the reservation ends with it) and one give-up (exit 76).
+with -9 (its guard stops the scope, and the reservation ends with it) and one give-up (exit 76). Every heavy it
+runs has `HOME`, `HEAVY_STATE_DIR`, `HEAVY_QUEUE_ROOT` and `HEAVY_FACTS_CACHE` in its test folder (checked before
+each run), so a measured run never writes the tester's real history (the password database's home).
 
 `python3 -I -B fork-kit/heavy/tests/measure.test.py`: the measured history and the capacity front in temporary
 folders (`HEAVY_STATE_DIR`, `--state-dir`), a fake scope folder and a fake check script, no systemd: first run,
