@@ -7,6 +7,7 @@ import { type ServerSettings, ServerSettingsError } from "@t3tools/contracts";
 import {
   ForkSettingsWriteError,
   forkSettingsWriteProblem,
+  placementFactsCommandSaveProblem,
   playtestProgramProblem,
 } from "@t3tools/shared/forkSettingsPatch";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -20,7 +21,9 @@ export function check(
 ): Effect.Effect<void, ServerSettingsError> {
   return Effect.flatMap(HostProcess.Platform, (platform) => {
     const problem =
-      forkSettingsWriteProblem(current, next) ?? playtestProgramProblem(current, next, platform);
+      forkSettingsWriteProblem(current, next) ??
+      playtestProgramProblem(current, next, platform) ??
+      placementFactsCommandSaveProblem(current, next, platform);
     return problem === undefined
       ? Effect.void
       : Effect.fail(

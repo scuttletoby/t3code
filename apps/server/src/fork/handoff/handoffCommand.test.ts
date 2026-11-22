@@ -48,14 +48,20 @@ const services = ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer)
 /** Runs `command` in a fresh temporary project folder; the source times out at `timeoutSeconds`. */
 const runIn = (
   command: ReadonlyArray<string>,
-  options: { readonly timeoutSeconds?: number; readonly root?: "temp" | null } = {},
+  options: { readonly timeoutSeconds?: number; readonly root?: "temp" | "missing" | null } = {},
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const root = yield* fs.makeTempDirectoryScoped({ prefix: "handoff-command-" });
     const source = yield* make(
       options.timeoutSeconds === undefined ? {} : { timeoutSeconds: options.timeoutSeconds },
-    ).pipe(Effect.provide(projectAt(options.root === null ? null : root)));
+    ).pipe(
+      Effect.provide(
+        projectAt(
+          options.root === null ? null : options.root === "missing" ? `${root}/gone` : root,
+        ),
+      ),
+    );
     const result = yield* source.run({ command, threadId, projectId });
     return { result, root, source };
   });
@@ -156,9 +162,12 @@ describe("handoffCommand", () => {
 
   it.live("a program that cannot start, or a project that is gone, is a failure", () =>
     Effect.gen(function* () {
-      // On Linux it runs under `timeout`, which exits 127 for a missing program; elsewhere the
-      // spawn itself fails. Either way the reason says it could not start.
-      failedWith((yield* runIn(["/no/such/handoff-program"])).result, "could not start");
+      // A spawn that fails (its project folder is gone) could not start. Not a missing program:
+      // `timeout` can exit before its empty stdin is written, which then reads as an output error.
+      failedWith(
+        (yield* runIn(node("console.log('x')"), { root: "missing" })).result,
+        "could not start",
+      );
       // 126 and 127, as a launcher reports them, read the same on every platform.
       for (const code of [126, 127]) {
         failedWith(
@@ -167,6 +176,24 @@ describe("handoffCommand", () => {
         );
       }
       failedWith((yield* runIn(node("console.log('x')"), { root: null })).result, "project");
+    }).pipe(Effect.scoped, Effect.provide(services)),
+  );
+
+  it.live("a missing program reads as not started every time, not as unreadable output", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "handoff-command-" });
+      const source = yield* make().pipe(Effect.provide(projectAt(root)));
+      // `timeout` exits 127 at once, often before its closed stdin is written: that write then
+      // failed with EPIPE in a few runs of ten, read as "its output could not be read".
+      for (let run = 0; run < 30; run += 1) {
+        const result = yield* source.run({
+          command: ["/no/such/handoff-program"],
+          threadId,
+          projectId,
+        });
+        failedWith(result, "could not start");
+      }
     }).pipe(Effect.scoped, Effect.provide(services)),
   );
 });
