@@ -27,6 +27,7 @@ import * as PullRequestWatchSlot from "./pullRequestWatchSlot.ts";
 import * as RemoteTaskPrompts from "./remoteTaskPrompts.ts";
 import * as RemoteTaskPromptWakes from "./remoteTaskPromptWakes.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
+import * as StopFinishedChildren from "./stopFinishedChildren.ts";
 import * as ThreadRoleTargets from "./threadRoleTargetsLayer.ts";
 import * as WorkerWakeSlots from "./workerWakeSlots.ts";
 
@@ -50,7 +51,8 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
 /**
  * In server.ts's `layerRuntimeCoreDependenciesBase`: usage pacer and history, slot gate, usage
  * refresher, handoff service (built beside upstream's idle compaction worker), run records, result
- * reminder, and the `threadRoles` save check's thread lookup, which every settings write reaches.
+ * reminder, the stop of finished children's sessions, and the `threadRoles` save check's thread
+ * lookup, which every settings write reaches.
  */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
@@ -59,6 +61,7 @@ export const layerRuntimeServices = Layer.mergeAll(
   HandoffService.layer,
   RunRecorder.layer,
   DelegatedResultReminder.layer,
+  StopFinishedChildren.layer,
   ThreadRoleTargets.layer,
 );
 
