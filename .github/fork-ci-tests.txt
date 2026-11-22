@@ -72,6 +72,7 @@
 .github/scripts/fork-vitest-gc-check.test.cjs
 .github/scripts/fork-workflow-triggers.test.cjs
 fork-ci/actions/ci-demand/ci_demand.test.py ~17s
+fork-ci/actions/doc-check/doc_check.test.py
 fork-ci/actions/docs-scope/docs-scope.test.py ~12s
 fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/fleet-watch/fleet_watch.test.py
