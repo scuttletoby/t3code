@@ -126,14 +126,14 @@ class Vectors(unittest.TestCase):
                 self.assertEqual({k: got.get(k) for k in v['expect']}, v['expect'], v['why'])
 
     def test_a_changed_rule_value_turns_the_vectors_red(self):
-        """Every number of the rule, changed by +1, -1, x2 or /2 (one at a time), turns some vector red, so a value
-        changed in capacity-rule.json shows in this test and in capacityRule.test.ts alike. Not held: the agents'
-        startCentiCores, which no decision reads (the core check is for jobs)."""
+        """Every number of the rule, changed by +1 and changed by -1 (each one at a time, #800: both directions), turns
+        some vector red, so a value changed either way in capacity-rule.json shows in this test and in
+        capacityRule.test.ts alike. Not held: the agents' startCentiCores, which no decision reads (the core check is
+        for jobs)."""
         self.assertEqual(failing(self.rule), [])
         quiet = []
         for path in number_paths(RULE_JSON):
-            seen = False
-            for change in (lambda v: v + 1, lambda v: max(0, v - 1), lambda v: v * 2, lambda v: v // 2):
+            for name, change in (('+1', lambda v: v + 1), ('-1', lambda v: max(0, v - 1))):
                 changed = copy.deepcopy(RULE_JSON)
                 box = changed
                 for k in path[:-1]:
@@ -142,12 +142,10 @@ class Vectors(unittest.TestCase):
                     continue
                 box[path[-1]] = change(box[path[-1]])
                 rule, errors = cr.parse_rule(changed, FORMAT)
-                if errors or failing(rule):         # refused outright, or a vector differs: red either way
-                    seen = True
-                    break
-            if not seen:
-                quiet.append('.'.join(path))
-        self.assertEqual(quiet, ['kinds.agent-light.startCentiCores', 'kinds.agent-writer.startCentiCores'],
+                if not (errors or failing(rule)):   # neither refused outright nor a vector that differs
+                    quiet.append('.'.join(path) + ' ' + name)
+        self.assertEqual(quiet, ['kinds.agent-light.startCentiCores +1', 'kinds.agent-light.startCentiCores -1',
+                                 'kinds.agent-writer.startCentiCores +1', 'kinds.agent-writer.startCentiCores -1'],
                          'rule numbers no vector holds: a change to them goes unseen by both evaluators')
 
     def test_unknown_fact_set_and_ask_or_fill(self):

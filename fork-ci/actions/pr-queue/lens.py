@@ -64,10 +64,11 @@ OPT_OUT_READ = 'says on its first line that it is no lens report, but holds a he
 # `lens:`, a `read at:` or `read at <hex>`, `safe to merge`, or in its first TOP_LINES plain lines a Markdown heading
 # naming a lens (LOOKS_HEADING_RE reads the raw line: normalising drops `#`), or two `covered:`/`checks:` field lines;
 # on ANY line, fenced, indented or quoted too, a `read at` with a hex sha, a header line or a `lens:` field with any hex
-# sha (loose_header). Such a comment without a valid first-line header is a lens that read nothing. So is a comment
-# with two or more header lines (one comment per lens). A round, fix or note comment says so on its first line,
-# `not a lens: ...`; that clears it only when none of its lines is a header line or a lens field with a sha, and no line
-# outside a `>` quote (a fence or an indented block is no quote) holds a hex `read at` (unquoted_lines, issue #77).
+# sha (loose_header). Such a comment without a valid first-line header is a lens that read nothing when it carries the
+# lens marker (has_marker) or, without it, holds an open finding (Review.report_problem); else it is no lens report at
+# all (issue #865). So is a comment with two or more header lines (one comment per lens). A round, fix or note comment says so on its first line, `not a lens: ...`; that clears
+# it only when none of its lines is a header line or a lens field with a sha, and no line outside a `>` quote (a fence
+# or an indented block is no quote) holds a hex `read at` (unquoted_lines, issue #77).
 LOOKS_RE = re.compile(r'\blens\s*:|\bread[\s-]*at\b\s*(?::|[0-9a-f]{7})|\bsafe\s+to\s+merge\b', re.I)
 NOT_A_LENS_RE = re.compile(r'not\s+a\s+lens\s*:', re.I)
 FIELD_LINE_RE = re.compile(r'(?:covered|checks)\s*:', re.I)
@@ -75,6 +76,26 @@ LOOKS_HEADING_RE = re.compile(r' {0,3}#{1,6}[ \t].*\blens\b', re.I)
 TOP_LINES = 5
 # Any hex sha with a digit (7-40 hex, not part of a longer word): `abc1234`, never `defaced` or `facade1x`.
 HEX_RE = re.compile(r'(?<![0-9a-z])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}(?![0-9a-z])', re.I)
+# A comment without the lens marker (has_marker) that looks like a report (looks_problem): no lens report, named so;
+# but one that holds an open finding still blocks (Review.report_problem, issue #865 round 1).
+NOT_LENS = 'not a lens report'
+NO_MARKER = 'no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha)'
+# report_problem's kinds besides NOT_LENS: a lens report (with the marker) that is not one valid read; a comment without
+# the marker that holds an open finding. Both block.
+BROKEN = 'broken lens report'
+HELD = 'no lens marker, open finding'
+# How a lens fixes a report without the marker, for the reasons (the queue posts them through no_lens_text).
+REPOST = ('post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the '
+          'marker into an old comment does not count)')
+# REPOST as the queue posts it (no_lens_text): the header described, not written, so the queue's comment never looks
+# like a lens report, and nothing in it is garbled by the cleaning.
+REPOST_PLAIN = ('post a NEW comment whose first line is the lens header as the format doc writes it (`lens`, a colon, '
+                'the lens name, the reviewer and the full sha it read); editing the marker into an old comment does '
+                'not count')
+# The one way out of a comment without the marker that holds an open finding (kind HELD), in its reason and in the head
+# check's: it holds until then (or until it is edited so it holds no open finding, which is the same as deleting it).
+# Lens-free as written (no `lens:`): the queue posts it.
+HELD_WAY_OUT = 'delete the old one or edit it to start with `not a lens` and a colon'
 OK_CONCLUSIONS = ('SUCCESS', 'SKIPPED', 'NEUTRAL')
 STRANGER_SCAN = 4096   # characters of a post that does not count read to decide whether to log it
 
@@ -265,21 +286,46 @@ def loose_header(line):
     return bool(m and HEX_RE.search(m.group(1)))
 
 
+def marker_line(line):
+    """A normalised line that carries the lens marker: it starts with the lens field (`lens:`, also `lens=`, `lens —`,
+    `lens –`: FIELD_START_RE), holds a lens field naming a hex sha anywhere (loose_header), or names a read, `read at`
+    and a hex sha (READ_AT_RE): what says "a lens" or "read this commit"."""
+    return bool(FIELD_START_RE.match(line) or READ_AT_RE.search(line)) or loose_header(line)
+
+
+def has_marker(body):
+    """The comment carries the lens marker (COMMENTS.md, "The lens marker"): one of its lines, in a code block or quote
+    too, read either way (clean_inline narrow or not), is a marker_line. Only such a comment is a lens report: one
+    that is not exactly one valid read blocks (lens_problem); without the marker, a comment is no lens report however
+    much it looks like one (not_lens_reports), unless it holds an open finding (Review.report_problem). Every line lens_problem flags as a header line, a lens field with a
+    sha or a first-line `lens:` is a marker line, so every comment with such a problem carries the marker."""
+    lines = (body or '').splitlines()
+    return any(marker_line(norm_line(line, narrow)) for narrow in (False, True) for line in lines)
+
+
 def no_lens_text(text, keep_markdown=False):
     """Text that can never count as a lens read, name a lens or look like a lens report (lens_problem), for anything
     the queue quotes into a comment (gh errors): no `read at`, no lens field (`lens:`, `lens=`, `lens —`, `lens –`),
     no `safe to merge`. keep_markdown: the
     queue's own advice (a command in backticks, a `<sha>` placeholder) stays as written when, read without its markdown
-    either way (clean_inline narrow or not), it holds none of these; otherwise it is cleaned like any other text."""
+    either way (clean_inline narrow or not), it holds none of these; otherwise it is cleaned like any other text. A
+    REPOST in the text (a held reason) is posted as REPOST_PLAIN, as written, when the whole stays free of them."""
+    if REPOST in text:
+        out = REPOST_PLAIN.join(no_lens_text(part, keep_markdown) for part in text.split(REPOST))
+        if _lens_free(out):
+            return out
+    if keep_markdown and _lens_free(text):   # the reader cleans the text as written once, either way
+        return text
     plain = clean_inline(text)
-    if keep_markdown and _no_lens_forms(plain) == plain:   # the reader cleans the text as written once, either way
-        narrow = clean_inline(text, narrow=True)
-        if _no_lens_forms(narrow) == narrow:
-            return text
     # Cleaned text is cleaned AGAIN by the reader, and nested markup (`lens<<a>b>=`, `lens[[](z)](w)=`) left by one
     # pass would turn into a field on the second (issue #303). So the `<` `>` `[` `]` one pass left become blanks: with
     # none of them, another pass (either way) changes nothing.
     return _no_lens_forms(re.sub(r'[<>\[\]]', ' ', plain))
+
+
+def _lens_free(text):
+    """No lens form no_lens_text names in the text read without its markdown either way (clean_inline narrow or not)."""
+    return all(_no_lens_forms(clean_inline(text, narrow)) == clean_inline(text, narrow) for narrow in (False, True))
 
 
 def _no_lens_forms(text):
@@ -355,12 +401,47 @@ class Review:
         m = self.override_re.match(post.get('body') or '')
         return m.group(1) if m else None
 
+    def report_problem(self, post):
+        """(why, kind) for a comment that looks like a lens report but is not one valid read (looks_problem); (None,
+        None) for a valid read or a comment that does not look like a report. The one rule of issue #865: it blocks,
+        as a NO_HEADER entry with why as its reason, when it carries the lens marker (has_marker: kind BROKEN), or when
+        it does not but holds an open finding, a blocker or major line that is not none or a NOT SAFE verdict as
+        review_judge.read_findings reads them (kind HELD: a real report with a broken header must not pass because an
+        older read of that lens is clean). Without the marker and with no open finding it is no lens report (kind
+        NOT_LENS): named, never blocking."""
+        problem = self.looks_problem(post)
+        if not problem:
+            return None, None
+        body = post.get('body') or ''
+        if has_marker(body):
+            return problem, BROKEN
+        import review_judge   # noqa: PLC0415 - review_judge imports this module
+        found = review_judge.findings(body, unmarked=True)   # no header: the title line and NOT SAFE prose count
+        if found:
+            return (f'{NO_MARKER}, but it holds an open {found[0][0]}: {REPOST}, and {HELD_WAY_OUT}; it looks like one: '
+                    f'{problem}'), HELD
+        return f'{NO_MARKER}; it looks like one: {problem}', NOT_LENS
+
     def lens_problem(self, post):
+        """Why a comment that looks like a lens report blocks (report_problem kind BROKEN or HELD), or None: it is one
+        valid read, it does not look like a report, or it is no lens report (not_lens_report)."""
+        why, kind = self.report_problem(post)
+        return why if kind in (BROKEN, HELD) else None
+
+    def not_lens_report(self, post):
+        """Why a comment that looks like a lens report is none (no lens marker and no open finding: report_problem
+        kind NOT_LENS), for the summary; None when it is a lens report (valid or not), blocks, or does not look like
+        one."""
+        why, kind = self.report_problem(post)
+        return why if kind == NOT_LENS else None
+
+    def looks_problem(self, post):
         """Why a comment that looks like a lens report is not one valid lens read (None: it is one, or it does not look
-        like a lens report). An override comment never counts. Every line is read normalised, in code blocks and
-        quotes too. Two or more header lines, a first-line header that names no lens, or a header line that is not the
-        first plain line: flagged, and `not a lens:` cannot clear it (the text holds EMBEDDED). Read both ways
-        (clean_inline narrow or not): flagged when either way flags it, or when the two read different headers."""
+        like a lens report), with or without the lens marker. An override comment never counts. Every line is read
+        normalised, in code blocks and quotes too. Two or more header lines, a first-line header that names no lens, or
+        a header line that is not the first plain line: flagged, and `not a lens:` cannot clear it (the text holds
+        EMBEDDED). Read both ways (clean_inline narrow or not): flagged when either way flags it, or when the two read
+        different headers."""
         body = post.get('body') or ''
         if self.override_re.match(body):
             return None
@@ -442,30 +523,57 @@ class Review:
 
     def lens_scan(self, pr):
         """(entries, history). entries: {lens key: ((when, index), sha or None, why or None, post)}: each lens's NEWEST
-        header, from the posts that count (counts). A comment that looks like a lens report but is not one valid read
-        (lens_problem) is an entry of its own, keyed by the comment, with no sha: a correct new post of that lens does
-        not replace it, and hiding it does not clear it. It reads nothing until it is deleted, its first line is edited
-        to `not a lens: ...` with no lens header line left in it, or a newer override covers it (NO_HEADER_WAY_OUT). A
+        header, from the posts that count (counts). A comment that blocks (lens_problem: a lens report, one with the
+        lens marker, that is not one valid read, or one without the marker that holds an open finding) is an entry of
+        its own, keyed by the comment, with no sha: a correct new post of that lens does not replace it, and hiding it
+        does not clear it. It reads nothing until it is deleted, its first line is edited to `not a lens: ...` with no
+        lens header line left in it, or a newer override covers it (NO_HEADER_WAY_OUT). A
         lens comment edited after posting (includesCreatedEdit not false: GitHub records that it changed, not what) or
         hidden (minimized) reads nothing until that lens posts a new comment; so does a review whose flags were not read
         (FLAGS_UNREAD). A lens-looking post that does not count is logged (log only, never a comment), so a wrong
         lens_author_associations shows in the run. review_judge.judge_rounds reads the newest report's findings from the
         entry's post. history: [(lens name, sha or None)] of EVERY counted post with a valid lens header, in list order,
         older rounds and edited or hidden ones too (review_judge.judge_rounds counts the rounds by it: hiding an old
-        round must not lower the count)."""
-        found, history = {}, []
+        round must not lower the count). A comment that looks like a report but carries no lens marker is no entry and
+        no history (not_lens_reports), unless it holds an open finding: then it is such an entry (report_problem)."""
+        return self.scan_posts(pr)[:2]
+
+    def not_lens_reports(self, pr):
+        """[(where, why)] of the counted posts that look like a lens report but carry no lens marker and hold no open
+        finding (report_problem), in list order: no lens report, so neither a read nor a block; the head check names
+        each in its summary."""
+        return self.scan_posts(pr)[2]
+
+    def unmarked_held(self, pr):
+        """[(where, why)] of the counted posts without the lens marker that block because they hold an open finding
+        (report_problem), in list order: each is also a NO_HEADER entry of lens_scan. The head check puts the fix
+        (REPOST) first in its reason when there is one."""
+        return self.scan_posts(pr)[3]
+
+    def scan_posts(self, pr):
+        """(entries, history, not lens reports, unmarked held): lens_scan, not_lens_reports and unmarked_held in one
+        pass. Each comment that is not a lens report is logged once per Review."""
+        found, history, notes, held = {}, [], [], []
         for when, i, post in self.lens_posts(pr):
             where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
             if not self.counts(post):   # the author first: a stranger's text is only ever read in part, for the log
                 head = {**post, 'body': (post.get('body') or '')[:STRANGER_SCAN]}
-                if where not in self.logged and (self.lens_problem(head) or lens_header(head['body'])):
+                if where not in self.logged and (self.looks_problem(head) or lens_header(head['body'])):
                     self.logged.add(where)
                     association = post.get('authorAssociation')
                     self.log(f'ignored a lens-looking post {where}: '
                              f'{"author association " + association if association else "no author association"} '
                              f'is not one of lens_author_associations ({", ".join(self.lens_associations)})')
                 continue
-            problem = self.lens_problem(post)
+            problem, kind = self.report_problem(post)
+            if kind == NOT_LENS:
+                notes.append((where, problem))
+                if ('not', where) not in self.logged:
+                    self.logged.add(('not', where))
+                    self.log(f'{NOT_LENS} ({where}): {problem}')
+                continue
+            if kind == HELD:
+                held.append((where, problem))
             header = None if problem else lens_header(post.get('body') or '')
             if problem:
                 hidden = ', hidden' if self.hidden(post) else ''
@@ -479,7 +587,7 @@ class Review:
                 why = FLAGS_UNREAD if post.get(UNREAD) else HIDDEN if self.hidden(post) \
                     else EDITED if post.get('includesCreatedEdit') is not False else None
                 found[key] = ((when, i), None, why, post) if why else ((when, i), header[1], None, post)
-        return found, history
+        return found, history, notes, held
 
     def lens_reads(self, pr):
         """{lens key: (sha, gap, override)}: what each lens of lens_entries counts as reading, the one rule reviewed_head

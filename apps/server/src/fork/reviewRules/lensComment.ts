@@ -1,9 +1,12 @@
 /**
- * Port of lens.py's header rules and lens.Review.lens_problem/lens_scan (fork-ci/actions/pr-queue), held to the shared
- * vectors and the gate's lens corpus. A comment that only looks like a report, or holds a second header, is a
- * NO_HEADER entry that reads nothing, as in the gate. The caller picks the posts that count, in the gate's order.
+ * Port of lens.py's lens rules (fork-ci/actions/pr-queue), held to the shared vectors and the gate's corpus. A lens
+ * report (one with the lens marker) that is not one valid read is a NO_HEADER entry, and so is a look-alike without
+ * the marker that holds an open finding; one with no open finding is no report (notLens). The caller picks the posts
+ * that count, in the gate's order.
  */
 import * as Schema from "effect/Schema";
+
+import { readFindings } from "./findings.ts";
 
 import {
   ALNUM,
@@ -63,6 +66,19 @@ export const HIDDEN = "hidden: post a new comment instead";
 const FLAGS_UNREAD =
   "a review whose edit and hidden flags were not read from GitHub: re-run, or post a new comment";
 export const EMBEDDED = "holds a lens header line";
+export const NO_MARKER =
+  "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha)";
+/** How a lens fixes a report without the marker (lens.REPOST): every reason that names a look-alike says it. */
+export const REPOST =
+  "post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the " +
+  "marker into an old comment does not count)";
+/** The one way out of a held comment (lens.HELD_WAY_OUT): delete it or opt it out. */
+const HELD_WAY_OUT = "delete the old one or edit it to start with `not a lens` and a colon";
+/**
+ * reportProblem's kinds (lens.BROKEN, HELD, NOT_LENS): a lens report (with the marker) that is not one valid read; a
+ * comment without the marker that holds an open finding (both block); one without either (no report, never blocks).
+ */
+export type ReportKind = "broken" | "held" | "notLens";
 const OPT_OUT_READ =
   "says on its first line that it is no lens report, but holds a hex read-at sha outside a `>` quote";
 
@@ -203,6 +219,19 @@ function looseHeader(line: string): boolean {
   return !!m && HEX_RE.test(m[1]!);
 }
 
+/** lens.marker_line: the line starts with the lens field, names a read (`read at <hex>`) or a lens field with a sha. */
+const markerLine = (line: string) =>
+  FIELD_START_RE.test(line) || READ_AT_RE.test(line) || looseHeader(line);
+
+/**
+ * lens.has_marker: a line of the comment, in a code block or quote too, read either way, carries the lens marker.
+ * Only such a comment is a lens report (COMMENTS.md, "The lens marker").
+ */
+export function hasMarker(body: string): boolean {
+  const lines = splitlines(body);
+  return [false, true].some((narrow) => lines.some((line) => markerLine(normLine(line, narrow))));
+}
+
 const starts = (first: string) => `starts with ${repr(cut(strip(first), 60))}`;
 
 /** lens.Review.read_problem: lensProblem's rules with one way of reading tags and links. */
@@ -246,11 +275,52 @@ function readProblem(body: string, narrow: boolean): string | null {
 }
 
 /**
- * lens.Review.lens_problem: why a comment that looks like a lens report is not one valid read, or null. Every line
- * counts, in fences and quotes too; read both ways (narrow or not). An override comment (`<prefix> <40-hex sha>:`)
- * never counts.
+ * lens.Review.report_problem: [why, kind] for a look-alike (looksProblem), null otherwise. Blocks with the marker
+ * (broken), or without it when readFindings sees an open finding (held: an older clean read must not win). Otherwise
+ * no lens report (notLens): named, never blocking.
+ */
+export function reportProblem(
+  body: string,
+  overridePrefix?: string,
+): [why: string, kind: ReportKind] | null {
+  const problem = looksProblem(body, overridePrefix);
+  if (!problem) return null;
+  if (hasMarker(body)) return [problem, "broken"];
+  const found = readFindings(body, true)[0]; // no header: the title line and NOT SAFE prose count
+  if (found.length > 0) {
+    return [
+      `${NO_MARKER}, but it holds an open ${found[0]![0]}: ${REPOST}, and ${HELD_WAY_OUT}; it looks like one: ` +
+        problem,
+      "held",
+    ];
+  }
+  return [`${NO_MARKER}; it looks like one: ${problem}`, "notLens"];
+}
+
+/**
+ * lens.Review.lens_problem: why a comment that looks like a lens report blocks (reportProblem kind broken or held), or
+ * null: it is one valid read, does not look like a report, or is no lens report (notLensReport).
  */
 export function lensProblem(body: string, overridePrefix?: string): string | null {
+  const got = reportProblem(body, overridePrefix);
+  return got && got[1] !== "notLens" ? got[0] : null;
+}
+
+/**
+ * lens.Review.not_lens_report: why a comment that looks like a lens report is none (no lens marker and no open
+ * finding: reportProblem kind notLens), or null.
+ */
+export function notLensReport(body: string, overridePrefix?: string): string | null {
+  const got = reportProblem(body, overridePrefix);
+  return got && got[1] === "notLens" ? got[0] : null;
+}
+
+/**
+ * lens.Review.looks_problem: why a comment that looks like a lens report is not one valid read, with or without the
+ * marker, or null. Every line counts, in fences and quotes too; read both ways (narrow or not). An override comment
+ * (`<prefix> <40-hex sha>:`) never counts.
+ */
+export function looksProblem(body: string, overridePrefix?: string): string | null {
   pyUnicodeCheck(body);
   if (
     overridePrefix !== undefined &&
@@ -316,6 +386,11 @@ export interface LensScan {
   readonly history: Array<[string, string | null]>;
   /** Each lens key's newest [sha or null, why it reads nothing or null]. */
   readonly entries: Record<string, [string | null, string | null]>;
+  /**
+   * [where, why] of each post that looks like a report, has no lens marker and no open finding
+   * (lens.Review.not_lens_reports).
+   */
+  readonly notLens: Array<[string, string]>;
 }
 
 /**
@@ -327,28 +402,37 @@ export function lensEntries(
   posts: ReadonlyArray<LensPost>,
   overridePrefix?: string,
   skip: (post: LensPost) => boolean = () => false,
-): { history: Array<[string, string | null]>; entries: Map<string, LensEntry> } {
+): {
+  history: Array<[string, string | null]>;
+  entries: Map<string, LensEntry>;
+  notLens: Array<[string, string]>;
+} {
   const history: Array<[string, string | null]> = [];
   const entries = new Map<string, LensEntry>();
+  const notLens: Array<[string, string]> = [];
   posts.forEach((post, i) => {
     if (skip(post)) return;
     const at: PostAt = [post.when, i];
     const { body } = post;
     const hidden = !post.unread && post.hidden;
-    let problem: string | null;
+    let got: [string, ReportKind] | null;
     let header: [string, string | null] | null;
     let key: string;
     try {
-      problem = lensProblem(body, overridePrefix);
-      header = problem ? null : lensHeader(body);
+      got = reportProblem(body, overridePrefix);
+      header = got ? null : lensHeader(body);
       key = header ? lensKey(header[0]) : "";
     } catch (error) {
       if (isPyTextError(error) && error.where === undefined)
         throw new PyTextError({ codePoints: error.codePoints, where: post.where });
       throw error;
     }
-    if (problem) {
-      key = `${NO_HEADER} (${post.where}, ${problem}${hidden ? ", hidden" : ""})`;
+    if (got?.[1] === "notLens") {
+      notLens.push([post.where, got[0]]);
+      return;
+    }
+    if (got) {
+      key = `${NO_HEADER} (${post.where}, ${got[0]}${hidden ? ", hidden" : ""})`;
       entries.set(key, { at, sha: null, why: null, name: null, body });
       return;
     }
@@ -359,13 +443,13 @@ export function lensEntries(
     const why = post.unread ? FLAGS_UNREAD : hidden ? HIDDEN : post.edited ? EDITED : null;
     entries.set(key, { at, sha: why ? null : header[1], why, name: header[0], body });
   });
-  return { history, entries };
+  return { history, entries, notLens };
 }
 
 /** lens.Review.lens_scan on posts that count, with the repository's override prefix. */
 export function lensScan(posts: ReadonlyArray<LensPost>, overridePrefix?: string): LensScan {
-  const { history, entries } = lensEntries(posts, overridePrefix);
+  const { history, entries, notLens } = lensEntries(posts, overridePrefix);
   const out: Record<string, [string | null, string | null]> = {};
   for (const [key, { sha, why }] of entries) out[key] = [sha, why];
-  return { history, entries: out };
+  return { history, entries: out, notLens };
 }

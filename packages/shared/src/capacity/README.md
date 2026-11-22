@@ -36,7 +36,9 @@ machine is `available + demand of live pieces - margin - reserved`, and builds a
 Kinds: unknown names are expensive, never cheap: a name starting with `unknownKinds.jobPrefix` counts as
 `unknownKinds.job`, anything else as `unknownKinds.other` (a writer). A `plusDeclared` kind costs `startMb` plus
 the size the piece declares (`declaredFallbackMb` when missing or impossible). Learned costs are clamped to
-`learnedBounds` percent of the start cost; a broken one is the start cost.
+`learnedBounds` percent of the start cost; a broken one is the start cost. Any other kind's cost is at least the
+size the piece declares (a floor, not clamped by `learnedBounds`; a missing or impossible one is no floor), so a
+job whose own tool reserved more than its kind's cost (heavy's `--mb` or learned peak) owes that.
 
 **Pressure level.** `severe` or `elevated` when any of its limits is met (PSI, available against the margin,
 swap under `swapFreeBelowPercent` free that is also filling; the OS level where there is no PSI). Swap
