@@ -281,7 +281,7 @@
       ]
     },
     "apps/server/src/mcp/McpToolExposure.ts": {
-      "why": "MCP profile design PR 4 (T3 tool groups): tool_search leaves out the T3 tools the calling thread's MCP profile leaves out (its t3Tools groups), before it ranks them, so a search never finds or loads a tool the thread cannot call. The filter and the global rule that hides those tools from tools/list and refuses them on tools/call are in fork/mcpT3ToolFilter.ts; the rule is installed in McpHttpServer's production `layer` (a pending file, no new line). A server without the rule (upstream's tests) searches as upstream does. Tested in apps/server/src/fork/mcpT3ToolFilter.test.ts.",
+      "why": "MCP profile design PR 4 (T3 tool groups): tool_search leaves out the T3 tools the calling thread's MCP profile leaves out (its t3Tools groups), before it ranks them, so a search never finds or loads a tool the thread cannot call. The filter is in fork/mcpT3ToolFilter.ts, which imports no toolkit, profile resolver or store (fork issue #812); the global rule that hides those tools from tools/list, refuses them on tools/call and installs the filter's check is in fork/mcpT3ToolRule.ts, installed in McpHttpServer's production `layer` (a pending file, no new line; its import names the rule's module). A server without the rule (upstream's tests) searches as upstream does. Tested in apps/server/src/fork/mcpT3ToolFilter.test.ts.",
       "added": [
         "import { searchableT3Tool } from \"../fork/mcpT3ToolFilter.ts\"; // Fork: MCP profile T3 tool groups",
         ".filter(searchableT3Tool) // Fork: MCP profile T3 tool groups"
@@ -596,6 +596,18 @@
         "added": [
           "import * as ForkAuthUnavailable from \"../fork/authUnavailable.ts\";",
           "Effect.catchIf(isServerAuthInternalError, ForkAuthUnavailable.answerUnavailable),"
+        ]
+      }
+    },
+    "apps/server/src/provider/Drivers/ClaudeSkills.ts": {
+      "why": "#978 (model policy): the hook that checks Claude's Skill tool reads a skill's frontmatter with the skill list's own parser, so the repair of an unquoted \": \" in a value (which Claude Code accepts) is one source. parseSkillFrontmatter is exported, and its parsed result also carries the whole frontmatter record (fork/claudeAgentModelPolicy.ts reads context, model and effort from it). Tested in apps/server/src/fork/claudeAgentModelPolicy.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "readonly record: Record<string, unknown>; // Fork: for the model policy's skill check",
+          "record, // Fork: the model policy reads context, model and effort from it",
+          "export { parseSkillFrontmatter }; // Fork: one frontmatter read for skills and the model policy"
         ]
       }
     }
