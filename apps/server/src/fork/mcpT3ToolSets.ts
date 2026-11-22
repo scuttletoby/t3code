@@ -2,9 +2,11 @@
  * Fork: the T3 tool groups each thread's MCP credential may use, fixed as each of its turns starts
  * (MCP profile design PR 4). A running turn keeps the set it started with, and a profile change
  * applies from the thread's next turn. Memory only, like the credentials it goes with: after a
- * restart each thread's set is worked out again from the settings (mcpT3ToolFilter.ts).
+ * restart each thread's set is worked out again from the settings (mcpT3ToolRule.ts).
  */
 import type { McpT3ToolGroup } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
 
 import type { McpProfileResolved } from "./mcpProfile.ts";
 
@@ -67,4 +69,91 @@ export const rememberT3ToolSet = (threadId: string, set: T3ToolSet): T3ToolSet =
   return set;
 };
 
-export const __testing = { clear: () => sets.clear(), size: () => sets.size };
+/**
+ * How long a hold lasts: a request waits for it at most until then, and a hold still there after
+ * that is dropped (mcpT3ToolRule.ts), so one that is never released holds the thread's requests
+ * once, not until a restart.
+ */
+export const T3_TOOL_SET_HOLD_WAIT_MS = 10_000;
+
+/** Threads whose next set is being worked out right now, as a turn Codex started begins. */
+const holds = new Map<
+  string,
+  {
+    readonly done: Deferred.Deferred<void>;
+    /** Done once a request waits on this hold (a milestone tests await). */
+    readonly asked: Deferred.Deferred<void>;
+    /** When the hold stops holding: requests then stop waiting, and it is dropped. */
+    readonly until: number;
+    count: number;
+  }
+>();
+
+/**
+ * Holds the thread's T3 requests (mcpT3ToolRule.ts) until the returned release runs, so a turn
+ * Codex started gets the set its check fixes. Release always; a second release does nothing. A hold
+ * taken while one is in force joins it; one taken after the last one's bound starts afresh.
+ */
+export const holdT3ToolSet = (threadId: string, now: number): (() => void) => {
+  let hold = holds.get(threadId);
+  if (hold === undefined || hold.until <= now) {
+    hold = {
+      done: Deferred.makeUnsafe<void>(),
+      asked: Deferred.makeUnsafe<void>(),
+      until: now + T3_TOOL_SET_HOLD_WAIT_MS,
+      count: 0,
+    };
+    holds.set(threadId, hold);
+  }
+  const held = hold;
+  held.count += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    held.count -= 1;
+    if (held.count > 0) return;
+    if (holds.get(threadId) === held) holds.delete(threadId);
+    Deferred.doneUnsafe(held.done, Effect.void);
+  };
+};
+
+/** The thread's hold: done once every hold on it is released; wait for it at most `waitMs`. */
+export interface T3ToolSetHold {
+  readonly done: Deferred.Deferred<void>;
+  readonly waitMs: number;
+}
+
+/** The hold on the thread's set; `undefined` when none is held. */
+export const t3ToolSetHold = (threadId: string, now: number): T3ToolSetHold | undefined => {
+  const hold = holds.get(threadId);
+  if (hold === undefined) return undefined;
+  Deferred.doneUnsafe(hold.asked, Effect.void);
+  return { done: hold.done, waitMs: Math.max(0, hold.until - now) };
+};
+
+/**
+ * A hold its bound passed: dropped, and the thread keeps `set` (never the one before the hold)
+ * until a turn, or the late check, fixes one. False when it was released meanwhile: the set its
+ * check fixed stands.
+ */
+export const dropT3ToolSetHold = (
+  threadId: string,
+  hold: T3ToolSetHold,
+  set: T3ToolSet,
+): boolean => {
+  if (holds.get(threadId)?.done !== hold.done) return false;
+  holds.delete(threadId);
+  keep(threadId, set);
+  return true;
+};
+
+export const __testing = {
+  clear: () => {
+    sets.clear();
+    holds.clear();
+  },
+  size: () => sets.size,
+  /** Done once a request waits on the thread's hold; `undefined` when none is held. */
+  asked: (threadId: string) => holds.get(threadId)?.asked,
+};
