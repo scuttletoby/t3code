@@ -3,14 +3,19 @@
  * report (one with the lens marker) that is not one valid read is a NO_HEADER entry; a look-alike without the marker
  * is no report (notLens). The caller picks the posts that count, in the gate's order.
  */
+import * as Schema from "effect/Schema";
+
 import {
   ALNUM,
   B,
   S,
   WS,
+  byCodePoint,
   cut,
   isBlank,
+  PyTextError,
   pyI,
+  pyUnicodeCheck,
   repr,
   split,
   splitlines,
@@ -18,6 +23,7 @@ import {
   stripChars,
 } from "./pyText.ts";
 
+const isPyTextError = Schema.is(PyTextError);
 const TAG_OPEN = /<\/?[A-Za-z]/gu;
 const TAG_NARROW = /<\/?[A-Za-z][^<>]*>/gu;
 const LINK_NARROW = /!?\[([^[\]]*)\]\([^()]*\)/gu;
@@ -54,6 +60,8 @@ const TOP_LINES = 5;
 export const NO_HEADER = "comment without a first-line lens header";
 export const EDITED = "edited after posting: post a new comment instead";
 export const HIDDEN = "hidden: post a new comment instead";
+const FLAGS_UNREAD =
+  "a review whose edit and hidden flags were not read from GitHub: re-run, or post a new comment";
 export const EMBEDDED = "holds a lens header line";
 export const NO_MARKER =
   "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha)";
@@ -112,6 +120,7 @@ const opensPlain = (line: string) => !/^(?: {4}|\t| {0,3}(?:>|`{3}|~{3}))/u.test
 
 /** One key per lens across rounds: the name lower-case, without a trailing round marker or emphasis. */
 export function lensKey(name: string): string {
+  pyUnicodeCheck(name);
   const words = split(name.toLowerCase());
   let lo = 0;
   let hi = words.length;
@@ -142,6 +151,7 @@ export function namesALens(name: string): boolean {
 
 /** [name, sha or null] of a comment's first-line lens header, or null. */
 export function lensHeader(body: string, narrow = false): [string, string | null] | null {
+  pyUnicodeCheck(body);
   const first = splitlines(body).find((line) => !isBlank(line)) ?? "";
   if (!opensPlain(first)) return null;
   const line = normLine(first, narrow);
@@ -271,6 +281,7 @@ export function notLensReport(body: string, overridePrefix?: string): string | n
  * (`<prefix> <40-hex sha>:`) never counts.
  */
 export function looksProblem(body: string, overridePrefix?: string): string | null {
+  pyUnicodeCheck(body);
   if (
     overridePrefix !== undefined &&
     body.startsWith(`${overridePrefix} `) &&
@@ -290,15 +301,44 @@ export function looksProblem(body: string, overridePrefix?: string): string | nu
   return problem;
 }
 
-/** A pull request comment or review whose author counts (a lens author association, no bot), in posting order. */
+/**
+ * A pull request comment, review or inline review comment whose author counts (a lens author association, no bot),
+ * in the gate's list order (lens.Review.lens_posts): the comments, then the reviews, then the inline comments.
+ */
 export interface LensPost {
   readonly body: string;
   /** GitHub's includesCreatedEdit: anything but a recorded false is an edit. */
   readonly edited: boolean;
   /** GitHub's isMinimized. */
   readonly hidden: boolean;
-  /** How the gate names the post in a NO_HEADER key: its url, else `by <login> at <createdAt>`. Default `post <n>`. */
-  readonly where?: string;
+  /**
+   * How the gate names the post in a NO_HEADER key: its url, else `by <login> at <when or ?>`. A key holds the post's
+   * text, so a caller never matches on a key's text: it reads `NO_HEADER` entries by their prefix only.
+   */
+  readonly where: string;
+  /** createdAt of a comment or inline comment, submittedAt of a review, or "": with the list index, the post's age. */
+  readonly when: string;
+  /** A review whose edit and hidden flags were not read (lens.UNREAD): it reads nothing (FLAGS_UNREAD). */
+  readonly unread?: boolean;
+}
+
+/** A post's age as the gate orders it: [when, list index], `when` by code point first. */
+export type PostAt = readonly [when: string, index: number];
+
+/** a is older than b (Python's tuple `<`). */
+export const olderThan = (a: PostAt, b: PostAt): boolean => {
+  const by = byCodePoint(a[0], b[0]);
+  return by < 0 || (by === 0 && a[1] < b[1]);
+};
+
+export interface LensEntry {
+  readonly at: PostAt;
+  readonly sha: string | null;
+  readonly why: string | null;
+  /** The lens name of its newest header; null for a NO_HEADER entry. */
+  readonly name: string | null;
+  /** The post's body: review_judge reads the newest report's findings from it. */
+  readonly body: string;
 }
 
 export interface LensScan {
@@ -310,27 +350,65 @@ export interface LensScan {
   readonly notLens: Array<[string, string]>;
 }
 
-/** lens.Review.lens_scan on posts that count, with the repository's override prefix. */
-export function lensScan(posts: ReadonlyArray<LensPost>, overridePrefix?: string): LensScan {
+/**
+ * lens.Review.lens_scan with each entry's age: the newest post per lens key by [when, index], `index` the post's place
+ * in `posts`. `skip` leaves a post out (an override) but keeps its index. History stays in list order. A post the
+ * rules cannot read as Python does throws PyTextError naming that post (`where`).
+ */
+export function lensEntries(
+  posts: ReadonlyArray<LensPost>,
+  overridePrefix?: string,
+  skip: (post: LensPost) => boolean = () => false,
+): {
+  history: Array<[string, string | null]>;
+  entries: Map<string, LensEntry>;
+  notLens: Array<[string, string]>;
+} {
   const history: Array<[string, string | null]> = [];
-  const entries: Record<string, [string | null, string | null]> = {};
+  const entries = new Map<string, LensEntry>();
   const notLens: Array<[string, string]> = [];
   posts.forEach((post, i) => {
-    const problem = looksProblem(post.body, overridePrefix);
-    const where = post.where ?? `post ${i + 1}`;
-    if (problem && !hasMarker(post.body)) {
-      notLens.push([where, `${NO_MARKER}; it looks like one: ${problem}`]);
+    if (skip(post)) return;
+    const at: PostAt = [post.when, i];
+    const { body } = post;
+    const hidden = !post.unread && post.hidden;
+    let problem: string | null;
+    let marked: boolean;
+    let header: [string, string | null] | null;
+    let key: string;
+    try {
+      problem = looksProblem(body, overridePrefix);
+      marked = problem !== null && hasMarker(body);
+      header = problem ? null : lensHeader(body);
+      key = header ? lensKey(header[0]) : "";
+    } catch (error) {
+      if (isPyTextError(error) && error.where === undefined)
+        throw new PyTextError({ codePoints: error.codePoints, where: post.where });
+      throw error;
+    }
+    if (problem && !marked) {
+      notLens.push([post.where, `${NO_MARKER}; it looks like one: ${problem}`]);
       return;
     }
     if (problem) {
-      entries[`${NO_HEADER} (${where}, ${problem}${post.hidden ? ", hidden" : ""})`] = [null, null];
+      key = `${NO_HEADER} (${post.where}, ${problem}${hidden ? ", hidden" : ""})`;
+      entries.set(key, { at, sha: null, why: null, name: null, body });
       return;
     }
-    const header = lensHeader(post.body);
     if (!header) return;
     history.push(header);
-    const why = post.hidden ? HIDDEN : post.edited ? EDITED : null;
-    entries[lensKey(header[0])] = why ? [null, why] : [header[1], null];
+    const was = entries.get(key);
+    if (was && olderThan(at, was.at)) return;
+    const why = post.unread ? FLAGS_UNREAD : hidden ? HIDDEN : post.edited ? EDITED : null;
+    entries.set(key, { at, sha: why ? null : header[1], why, name: header[0], body });
   });
   return { history, entries, notLens };
+}
+
+/** lens.Review.lens_scan on posts that count, with the repository's override prefix. */
+export function lensScan(posts: ReadonlyArray<LensPost>, overridePrefix?: string): LensScan {
+  const { history, entries, notLens } = lensEntries(posts, overridePrefix);
+  const out: Record<string, [string | null, string | null]> = {};
+  for (const [key, { sha, why }] of entries) out[key] = [sha, why];
+  return { history, entries: out, notLens };
 }

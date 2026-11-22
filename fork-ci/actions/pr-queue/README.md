@@ -157,15 +157,24 @@ whole). Then (`review_judge.py`, `review_glob.py`):
 
 `review.vectors.json` holds the shared cases (globs, rule sets, changed paths with
 their status, and the expected weight and lenses; lens report bodies and the
-findings read in them; lens comment scans; review rounds). The Python tests and
-T3's pure copy of these rules (`apps/server/src/fork/reviewRules/`) both replay
+findings read in them; lens comment scans; review rounds; what the head check
+reads of a pull request's lens posts and overrides at a head (`lens_reads`,
+`review_rounds`' lenses that must post again, the verdict), which T3's
+`lens_start` reads the same way; bodies each rule must read in linear time,
+with a time bound; the gate's Unicode version and the code points it assigns,
+and text whose code points T3's newer Unicode assigns otherwise, which T3
+refuses rather than reads another way when a rule reads them). The Python tests
+and T3's pure copy of these rules (`apps/server/src/fork/reviewRules/`) both replay
 every vector, and each side fails on a section or field it does not run. A rule
 change updates both sides and the vectors in one pull request.
 
 How a vector is made: write its input (name, body or posts, config) by hand,
 run the gate's own function on it (`review_judge.judge`, `read_findings`,
-`judge_rounds`, or `lens.Review.lens_scan` the way `review_judge.test.py`'s
-`scan()` posts it, with `override_prefix`), and paste the gate's answer as the
+`judge_rounds`, `lens.Review.lens_scan` the way `review_judge.test.py`'s
+`scan()` posts it, with `override_prefix`, or its `replay_reads()`: a post is a
+comment, or a `review` or an `inline` review comment, with its own `when` and,
+for a review, `flags` false when its flags were not read), and paste the gate's
+answer as the
 expected value. Check that the answer is the one the rule means: a vector
 copied from a broken gate holds both sides to the broken answer. The Python
 test checks each expected value against the gate, so a stale one fails there.
