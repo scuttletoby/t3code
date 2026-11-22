@@ -16,6 +16,9 @@
         "testcontainers"
       ],
       "ignorePatterns": ["^(tmux|screen|SCREEN)( |:|$)", "^-", "^ssh-agent"]
+    },
+    "capacity": {
+      "holds": [{ "label": "ci-slice", "cgroup": "ci.slice/ci-runners.slice", "users": ["ci-*"] }]
     }
   },
   "golive": {
