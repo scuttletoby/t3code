@@ -26,7 +26,12 @@ import {
   makeThreadMcpProfiles,
 } from "./claudeMcpProfile.ts";
 import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
-import { isEveryMcpTool, isWithinMcpProfile, type McpProfileResolved } from "./mcpProfile.ts";
+import {
+  isEveryMcpTool,
+  isWithinMcpProfile,
+  mcpProfileWiderParts,
+  type McpProfileResolved,
+} from "./mcpProfile.ts";
 import { boundToWiderRefusal } from "./scheduledTaskMcpProfile.ts";
 
 type Refusal = { readonly reason: string };
@@ -91,7 +96,7 @@ export const makeLaunchMcpProfileCheck = Effect.gen(function* () {
         : `Use delegate_task (its sub-agent keeps this thread's profile), start the thread in a project whose MCP profile is within ${named(own)}, or ask the owner to start it.`;
     return yield* new OrchestratorMcpFailure({
       code: "capability_denied",
-      message: `This thread's MCP profile is ${named(own)}, and a thread it starts in that project would get ${named(theirs)}, which keeps MCP servers or T3 tools ${named(own)} does not, so it was not started. ${instead}`,
+      message: `This thread's MCP profile is ${named(own)}, and a thread it starts in that project would get ${named(theirs)}, which keeps ${mcpProfileWiderParts(theirs.profile, own.profile)} ${named(own)} does not, so it was not started. ${instead}`,
     });
   });
 });
@@ -128,7 +133,7 @@ const checkStarted = Effect.fn("LaunchMcpProfile.checkStarted")(function* (
   if (isWithinMcpProfile(theirs.profile, own.profile)) return;
   return yield* new OrchestratorMcpFailure({
     code: "capability_denied",
-    message: `This thread's MCP profile is ${named(own)}, and ${what} would get ${named(theirs)}, which keeps MCP servers or T3 tools ${named(own)} does not, so it was not started. ${instead(named(own))}`,
+    message: `This thread's MCP profile is ${named(own)}, and ${what} would get ${named(theirs)}, which keeps ${mcpProfileWiderParts(theirs.profile, own.profile)} ${named(own)} does not, so it was not started. ${instead(named(own))}`,
   });
 });
 

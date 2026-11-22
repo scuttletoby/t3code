@@ -1,10 +1,9 @@
 /**
- * Fork: every turn start (also resume, compaction) fixes its thread's T3 tool groups for
- * mcpT3ToolFilter.ts, on every driver but Claude (claudeMcpProfile.ts fixes its own). Outside
- * `MCP_PROFILE_DRIVERS` the turn also refuses when its profile leaves out an outside server.
- * A profile that cannot be worked out refuses on every wrapped driver.
+ * Fork: each turn start fixes the thread's T3 tool groups (mcpT3ToolFilter.ts) on every driver but
+ * Claude. It refuses outside `MCP_PROFILE_DRIVERS` when the profile leaves out an outside server, and
+ * on every wrapped driver for `builtinTools: "none"` or a profile that cannot be worked out.
  */
-import { MCP_PROFILE_ALL, ProviderDriverKind } from "@t3tools/contracts";
+import { MCP_BUILTIN_TOOLS_NONE, MCP_PROFILE_ALL, ProviderDriverKind } from "@t3tools/contracts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as Effect from "effect/Effect";
@@ -18,7 +17,11 @@ import {
   type LineageThread,
   makeThreadMcpProfiles,
 } from "./claudeMcpProfile.ts";
-import { MCP_PROFILE_DRIVERS, type McpProfileResolved } from "./mcpProfile.ts";
+import {
+  MCP_PROFILE_DRIVERS,
+  type McpProfileResolved,
+  builtinToolsNoneRefusal,
+} from "./mcpProfile.ts";
 import { fixT3ToolSet, forgetT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
 
 type ProfileFor = Effect.Success<typeof makeThreadMcpProfiles>;
@@ -91,6 +94,11 @@ const checkTurnProfile = Effect.fn("McpProfileTurnCheck.check")(function* (
     Effect.onInterrupt(() => Effect.sync(() => forgetT3ToolSet(thread.id))),
   );
   fixT3ToolSet(thread.id, t3ToolSetOf(resolved));
+  if (resolved.profile.builtinTools === MCP_BUILTIN_TOOLS_NONE) {
+    return yield* new ClaudeMcpProfileError({
+      reason: builtinToolsNoneRefusal(resolved.name, instance.driverKind),
+    });
+  }
   if (appliesMcpProfiles(instance.driverKind) || resolved.profile.servers === "all") return;
   return yield* new ClaudeMcpProfileError({ reason: refusalReason(resolved, instance) });
 });
