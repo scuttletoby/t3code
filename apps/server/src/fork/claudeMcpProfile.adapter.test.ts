@@ -44,7 +44,7 @@ const POLICY = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
   cwd: "/workspace",
 });
 
-type McpSettings = Partial<Pick<ServerSettings, "mcpProfile" | "mcpProfiles">>;
+type McpSettings = Partial<Pick<ServerSettings, "mcpProfile" | "mcpProfiles" | "modelPolicy">>;
 const NATIVE_THREAD = "native-thread-mcp-profile";
 
 /**
@@ -220,12 +220,13 @@ const preToolUse = (
   tool: unknown,
   /** Replaces the hook input, for a malformed one. */
   rawInput?: object,
+  toolInput: object = {},
 ) =>
   Effect.promise(async () => {
     const input = (rawInput ?? {
       hook_event_name: "PreToolUse",
       tool_name: tool,
-      tool_input: {},
+      tool_input: toolInput,
       tool_use_id: "toolu_profile",
       session_id: NATIVE_THREAD,
       transcript_path: "/tmp/transcript.jsonl",
@@ -233,6 +234,13 @@ const preToolUse = (
     }) as unknown as HookInput;
     const answers = [];
     for (const matcher of options?.hooks?.PreToolUse ?? []) {
+      // As Claude Code does: a matcher runs its hooks only for the tools it names.
+      if (
+        matcher.matcher !== undefined &&
+        !(typeof tool === "string" && new RegExp(matcher.matcher).test(tool))
+      ) {
+        continue;
+      }
       for (const hook of matcher.hooks) {
         answers.push(await hook(input, "toolu_profile", { signal: new AbortController().signal }));
       }
@@ -249,6 +257,68 @@ describe("ClaudeAdapterV2 MCP profile", () => {
       assert.notProperty(opened[0], "strictMcpConfig");
       assert.notProperty(opened[0], "managedSettings");
       assert.deepStrictEqual(yield* preToolUse(opened[0], "mcp__github__x"), []);
+    }),
+  );
+
+  it.effect("every query carries the model policy's check of Claude's Agent tool once (#128)", () =>
+    Effect.gen(function* () {
+      const modelPolicy = {
+        mode: "enforce",
+        allow: [{ driver: "claudeAgent", model: "claude-opus-5-5", efforts: ["high"] }],
+      } as never;
+      const bare = { servers: "all", t3Tools: "all", builtinTools: "none" } as const;
+      // With no profile, and with a profile that adds its own PreToolUse hooks.
+      for (const settings of [
+        { modelPolicy },
+        { modelPolicy, mcpProfile: "t3-only" },
+        { modelPolicy, mcpProfile: "bare", mcpProfiles: { bare } },
+      ] as ReadonlyArray<McpSettings>) {
+        // Runs again: a second turn on the same thread.
+        const { opened, refusal } = yield* runTurns(
+          settings,
+          settings.mcpProfile === "t3-only" ? [] : "unexpected",
+          [settings],
+        );
+        assert.isUndefined(refusal);
+        assert.isAtLeast(opened.length, 1);
+        const reasons = (answers: ReadonlyArray<unknown>) =>
+          answers.map(
+            (answer) =>
+              (answer as { hookSpecificOutput?: { permissionDecisionReason?: string } })
+                .hookSpecificOutput?.permissionDecisionReason,
+          );
+        for (const options of opened) {
+          // Once per query, first, refusing when it cannot answer: never stacked.
+          const policyHooks = (options.hooks?.PreToolUse ?? []).filter(
+            (matcher) => matcher.matcher === "^(Agent|Task|Skill)$",
+          );
+          assert.lengthOf(policyHooks, 1, JSON.stringify(settings));
+          assert.strictEqual(options.hooks?.PreToolUse?.[0], policyHooks[0]);
+          assert.strictEqual(policyHooks[0]?.onFailure, "block");
+          const refused = yield* preToolUse(options, "Agent", undefined, {
+            model: "sonnet",
+            effort: "high",
+          });
+          assert.lengthOf(
+            reasons(refused).filter((text) =>
+              text?.startsWith(
+                "Model policy refused this pick: claude-sonnet-5-5 (claudeAgent) is in no row.",
+              ),
+            ),
+            1,
+            JSON.stringify(settings),
+          );
+          // Inside the rows: the policy's hook lets it run (builtinTools "none" refuses Agent anyway).
+          const inside = yield* preToolUse(options, "Agent", undefined, {
+            model: "opus",
+            effort: "high",
+          });
+          assert.isFalse(
+            reasons(inside).some((text) => text?.startsWith("Model policy")),
+            JSON.stringify(settings),
+          );
+        }
+      }
     }),
   );
 

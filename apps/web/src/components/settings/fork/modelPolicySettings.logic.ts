@@ -214,22 +214,36 @@ export interface PersonModelPickMark {
 }
 
 /**
- * The person's own picks, each marked inside or outside the rows. Agents only: these picks
- * are never refused; the mark only shows which ones an agent could not make. Empty while the policy
- * is off or cannot be read (its warning says so). A pick on an instance no selected environment
- * has reads without a driver, so every row naming its model must allow it.
+ * The person's own picks, marked inside or outside the rows (a mark only; never refused). Empty
+ * while the policy is off or unreadable. Only `environmentId`'s instances are read (a provider
+ * without one counts); a pick on an instance it lacks reads without a driver, so every row naming
+ * its model must allow it.
  */
 export function personModelPickMarks(
   policy: ModelPolicy,
   picks: Partial<Record<PersonModelPickKey, ModelSelection | null | undefined>>,
-  providers: ReadonlyArray<ModelPolicyAliasProvider & { readonly instanceId: string }>,
+  providers: ReadonlyArray<
+    ModelPolicyAliasProvider & {
+      readonly instanceId: string;
+      readonly environmentId?: string | undefined;
+    }
+  >,
+  environmentId?: string,
 ): ReadonlyArray<PersonModelPickMark> {
   const stance = modelPolicyStance(policy);
   if (stance.mode === "off" || stance.unreadable) return [];
   return PERSON_MODEL_PICKS.flatMap(({ key, label }) => {
     const selection = picks[key];
     if (selection === null || selection === undefined) return [];
-    const provider = providers.find((candidate) => candidate.instanceId === selection.instanceId);
+    // The machine whose settings hold the picks runs them: its instance, not another machine's
+    // instance with the same id (the default `claudeAgent` is on every machine).
+    const provider = providers.find(
+      (candidate) =>
+        candidate.instanceId === selection.instanceId &&
+        (environmentId === undefined ||
+          candidate.environmentId === undefined ||
+          candidate.environmentId === environmentId),
+    );
     // The effort control the instance's catalog marks, as the server reads an agent's pick.
     const effortOptionIds =
       provider === undefined

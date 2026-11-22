@@ -8,9 +8,11 @@ import {
   checkModelPolicyPick,
   type ModelPolicy,
   modelPolicyAliasTargets,
+  type ModelPolicyFix,
   modelPolicyCatalogEffortIds,
   type ModelPolicyPick,
   modelPolicyPickEfforts,
+  type ModelPolicyRow,
   modelPolicyRowsText,
   modelPolicyStance,
   type ModelSelection,
@@ -33,7 +35,11 @@ export type PolicyRoute =
   | "delegate_task"
   | "create_threads"
   | "t3_thread_launch"
-  | "t3_thread_configure";
+  | "t3_thread_configure"
+  /** Claude's own Agent tool (claudeAgentModelPolicy.ts). */
+  | "Agent"
+  /** Claude's Skill tool, for a skill that runs in a sub-agent or names a model (same file). */
+  | "Skill";
 
 /** Where the call names its model, for the refusal's hint. */
 const FIELDS: Record<PolicyRoute, string> = {
@@ -41,6 +47,9 @@ const FIELDS: Record<PolicyRoute, string> = {
   create_threads: "target.model, with one of its efforts in target.options",
   t3_thread_launch: "modelSelection.model, with one of its efforts in modelSelection.options",
   t3_thread_configure: "modelSelection.model, with one of its efforts in modelSelection.options",
+  Agent: "the Agent call's model, with one of its efforts in effort",
+  Skill:
+    "the skill's frontmatter: model, with one of its efforts in effort (or use a skill that runs inline and names neither)",
 };
 
 /** Where the call names its model alone, and its options. */
@@ -49,19 +58,20 @@ const MODEL_FIELD: Record<PolicyRoute, string> = {
   create_threads: "target.model",
   t3_thread_launch: "modelSelection.model",
   t3_thread_configure: "modelSelection.model",
+  Agent: "model",
+  Skill: "the skill's frontmatter model",
 };
 const OPTIONS_FIELD: Record<PolicyRoute, string> = {
   delegate_task: "target.options",
   create_threads: "target.options",
   t3_thread_launch: "modelSelection.options",
   t3_thread_configure: "modelSelection.options",
+  Agent: "the call",
+  Skill: "the skill's frontmatter",
 };
 
 /** What the agent does to fix a refused pick, per the verdict's `fix`. */
-const fixText = (
-  fix: "option" | "model-option" | "effort-id" | undefined,
-  route: PolicyRoute,
-): string => {
+const fixText = (fix: ModelPolicyFix | undefined, route: PolicyRoute): string => {
   switch (fix) {
     case "model-option":
       return `Pick the model in the model field (${MODEL_FIELD[route]}) and leave the model option out of ${OPTIONS_FIELD[route]}: this option is not allowed while the model policy is on.`;
@@ -69,6 +79,10 @@ const fixText = (
       return `Leave that option out of ${OPTIONS_FIELD[route]}: this option is not allowed while the model policy is on. Pick the model in ${MODEL_FIELD[route]} and its effort under the id its driver reads.`;
     case "effort-id":
       return "Start that agent on this machine once so its model list shows the effort control, or pick a model whose driver has a fixed effort id.";
+    case "agent-option":
+      return `Leave that option out of ${OPTIONS_FIELD[route]}: an option that picks an agent or a mode is not allowed while the model policy is on. Pick the model in ${MODEL_FIELD[route]} and its effort under the id its driver reads.`;
+    case "ultracode":
+      return `Name the option ultracode in ${OPTIONS_FIELD[route]}: { "id": "ultracode", "value": false } runs the effort named, true runs ultracode (when its row allows it).`;
     case undefined:
       return `Name one of these models in ${FIELDS[route]}.`;
   }
@@ -83,6 +97,16 @@ const SETTINGS_PLACE = "Settings → Fork → Model policy";
  */
 export interface ServerPick extends ModelPolicyPick {
   readonly aliasOf?: string | undefined;
+  /**
+   * What passes on this route, in place of the rows (Claude's Agent tool names only aliases, so it
+   * says which alias and effort pass, `claudeAgentModelPolicy.ts`).
+   */
+  readonly allowedText?: ((allow: ReadonlyArray<ModelPolicyRow>) => string) | undefined;
+  /**
+   * Why the pick cannot be read at all (a skill whose file T3 cannot read): `enforce` refuses it,
+   * `advise` lets it run with a note.
+   */
+  readonly unreadable?: string | undefined;
 }
 
 /** What the check answers: refuse with a text, or let the pick run (with a note for the agent). */
@@ -117,6 +141,16 @@ export function answerPick(
           warn: true,
         };
   }
+  if (pick.unreadable !== undefined) {
+    return stance.mode === "enforce"
+      ? {
+          refuse: `Model policy refused this call (fail closed): ${pick.unreadable}. Allowed: ${modelPolicyRowsText(stance.allow)}.`,
+        }
+      : {
+          note: `Model policy (advise): ${pick.unreadable}, so this call was not checked; it runs, and enforce would refuse it.`,
+          warn: true,
+        };
+  }
   const verdict = checkModelPolicyPick(stance.allow, pick);
   if (verdict.inside) {
     const useFor = verdict.row.useFor;
@@ -124,7 +158,8 @@ export function answerPick(
       ? {}
       : { note: `Model policy: ${verdict.row.model} is for ${useFor}.` };
   }
-  const allowed = `Allowed: ${modelPolicyRowsText(stance.allow)}.`;
+  const allowed =
+    pick.allowedText?.(stance.allow) ?? `Allowed: ${modelPolicyRowsText(stance.allow)}.`;
   const why =
     pick.aliasOf === undefined || pick.model === undefined
       ? verdict.why
@@ -280,6 +315,8 @@ const pickOfRemote = (
     // What any list here describes for the model: the driver there is not known.
     describedOptionIds: describedIds(lists, listed),
     ...(ultracodeByDefault(lists, listed, options) ? { ultracodeMaybeDefault: true } : {}),
+    // The machine there reads its own list for the ultracode default: a Claude row reads both ways.
+    ultracodeDefaultUnknown: true,
     ...(aliasOf === undefined ? {} : { aliasOf }),
   };
 };
@@ -316,8 +353,11 @@ export const makePickCheck = Effect.gen(function* () {
   const settings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
   return Effect.fn("ModelPolicyCheck.checkPick")(function* (
     route: PolicyRoute,
-    /** The pick, read only while a policy is on (it may read the providers). */
-    readPick: Effect.Effect<ServerPick>,
+    /**
+     * The pick, read only while a policy is on (it may read the providers); `undefined`: the call
+     * picks no model (a skill that runs inline and names none), so nothing is checked or logged.
+     */
+    readPick: Effect.Effect<ServerPick | undefined>,
     options: PickCheckOptions = {},
   ) {
     if (Option.isNone(settings)) return undefined;
@@ -329,6 +369,7 @@ export const makePickCheck = Effect.gen(function* () {
     );
     if (policy !== undefined && modelPolicyStance(policy).mode === "off") return undefined;
     const pick = yield* readPick;
+    if (pick === undefined) return undefined;
     const answer = answerPick(policy, route, pick);
     const annotations = {
       route,

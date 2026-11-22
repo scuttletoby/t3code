@@ -33,6 +33,7 @@ type SkillFrontmatter =
       readonly description?: string;
       readonly userInvocationOnly?: boolean;
       readonly userInvocable?: boolean;
+      readonly record: Record<string, unknown>; // Fork: for the model policy's skill check
     };
 
 /** Claude accepts YAML 1.1 booleans that this YAML 1.2 parser leaves as strings or numbers. */
@@ -95,6 +96,7 @@ function parseSkillFrontmatter(contents: string): SkillFrontmatter {
   const description = typeof record.description === "string" ? record.description.trim() : "";
   return {
     kind: "parsed",
+    record, // Fork: the model policy reads context, model and effort from it
     ...(name ? { name } : {}),
     ...(description ? { description } : {}),
     ...(parseFrontmatterBoolean(record["disable-model-invocation"]) === true
@@ -105,6 +107,8 @@ function parseSkillFrontmatter(contents: string): SkillFrontmatter {
       : {}),
   };
 }
+
+export { parseSkillFrontmatter }; // Fork: one frontmatter read for skills and the model policy
 
 // A caller-supplied environment is a plain object, without Windows' case-insensitive keys.
 function windowsEnvironmentValue(environment: NodeJS.ProcessEnv, name: string) {
