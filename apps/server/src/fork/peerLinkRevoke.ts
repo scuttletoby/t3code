@@ -14,12 +14,38 @@ import type * as SqlClient from "effect/sql/SqlClient";
 import type * as PeerLinks from "../peer/PeerLinks.ts";
 
 /** PeerMcpClient.ts's MCP version, sent the same way when a fresh session confirms a refusal. */
-const PROTOCOL_VERSION = "2025-06-18";
+export const PROTOCOL_VERSION = "2025-06-18";
+
+/** The request that starts a fresh MCP session, as PeerMcpClient's own. */
+export const initializeSession = {
+  jsonrpc: "2.0",
+  id: 0,
+  method: "initialize",
+  params: {
+    protocolVersion: PROTOCOL_VERSION,
+    capabilities: {},
+    clientInfo: { name: "t3code-peer", version: "1" },
+  },
+};
 
 const revokedThere = new OrchestratorMcpFailure({
   code: "capability_denied",
   message:
     "The linked environment no longer accepts this link. It may have been revoked there; link it again.",
+});
+
+/** PeerMcpClient's answer to a 403 at a session's start. */
+const linkedEnvironmentsOffThere = new OrchestratorMcpFailure({
+  code: "orchestration_error",
+  message:
+    "The linked environment has Linked environments turned off. Turn it on in its Settings → Labs.",
+});
+
+/** A fresh session showed the link is good, so a 401 on its call is not a revoke. */
+const refusedOnFreshSession = new OrchestratorMcpFailure({
+  code: "orchestration_error",
+  message:
+    "The linked environment accepted this link but refused the call (HTTP 401). Try again shortly.",
 });
 
 /**
@@ -88,25 +114,12 @@ export const makeRefusals = (deps: {
     headers: Record<string, string>,
   ) {
     yield* forget(link.environmentId);
-    const initialized = yield* post(
-      url,
-      token,
-      {
-        jsonrpc: "2.0",
-        id: 0,
-        method: "initialize",
-        params: {
-          protocolVersion: PROTOCOL_VERSION,
-          capabilities: {},
-          clientInfo: { name: "t3code-peer", version: "1" },
-        },
-      },
-      headers,
-    );
+    const initialized = yield* post(url, token, initializeSession, headers);
     if (initialized.status === 401) {
       yield* links.recordRevoked(link);
       return yield* revokedThere;
     }
+    if (initialized.status === 403) return yield* linkedEnvironmentsOffThere;
     const sessionId = initialized.headers["mcp-session-id"];
     if (initialized.status !== 200 || sessionId === undefined) {
       return yield* new OrchestratorMcpFailure({
@@ -139,7 +152,9 @@ export const makeRefusals = (deps: {
     // A refusal there drops the kept session (`reopen`); one it accepts replaces it.
     const sessionId = yield* open;
     yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, sessionId));
-    return yield* callOnce(sessionId);
+    const response = yield* callOnce(sessionId);
+    if (response.status === 401) return yield* refusedOnFreshSession;
+    return response;
   });
 
   return { reopen, retry };
