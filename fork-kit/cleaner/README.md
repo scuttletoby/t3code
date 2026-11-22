@@ -45,8 +45,9 @@ systemd unit files, the pull request lists and Docker's list.
 
 **When GitHub is asked.** The pull request lists of a repository are read once for the plan, and again before
 every worktree or clone delete of that repository (never for a temp entry or a volume). Each read is two `gh pr
-list` calls (merged and open, `--limit 1000`); gh fetches 100 rows per GraphQL page, so one read costs
-ceil(merged/100) + ceil(open/100) GraphQL requests, at least 2 and at most 20. A run that deletes N worktrees
+list` calls (`--state closed`, which lists the merged ones and the ones closed without a merge, and `--state open`,
+each `--limit 1000`); gh fetches 100 rows per GraphQL page, so one read costs ceil(closed/100) + ceil(open/100)
+GraphQL requests, at least 2 and at most 20. A run that deletes N worktrees
 and clones of one repository makes N + 1 reads. With [`mergedBranches`](#merged-branches) on, each clone's branches
 take one read for the plan and one before each branch delete. Each item's last check also runs `git ls-remote`
 against GitHub (git, not the API).
@@ -130,6 +131,18 @@ not be read) (180.2 GB of 250.0 GB used); freed since the last report at 2026-01
 ```
 
 (one line; wrapped here). It deletes nothing.
+
+**Low disk (#982).** When the home folder's disk has less than `report.warnFreeGB` free (60 GB unless the machine
+file says otherwise; free is what the user may still write), the line ends with a warning and the five largest
+folders directly in the home folder, measured as the classes are (a folder it cannot read in full says `at least`):
+
+```
+...; LOW DISK: 41.3 GB free, under 60 GB: largest folders in /home/u: work 80.1 GB, .cache 12.3 GB, .claude 6.0 GB,
+.local 2.2 GB, projects 1.0 GB
+```
+
+Only then is the home folder walked for it. The warning changes no exit code. The daily report of a host (the
+project's own gardener, say) carries the line as it is.
 
 - **The classes** are `CLASSES` in `config.py`, the one list, and each name says what it measures. A rule's class
   is what that rule looks at: `worktrees` (the worktrees and clones of the listed repositories), `temp` (the temp
@@ -235,9 +248,9 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | `no commit`                    | its branch has no commit: deleted under the worktree, or never had one                                                                      |
 | `open PR`                      | an open pull request has its branch                                                                                                         |
 | `base branch`                  | it is GitHub's default branch (`git ls-remote --symref`), or a pull request merges into its branch                                          |
-| `no merged PR`                 | no merged pull request **from this repository** (not a fork) has its branch                                                                 |
-| `commits not in the merged PR` | HEAD is not the head of a merged pull request of that branch, nor inside one                                                                |
-| `merged under 24 h ago`        | the pull request merged less than `mergedHours` ago (24 or more)                                                                            |
+| `no merged PR`                 | no merged pull request, and none closed without a merge, **from this repository** (not a fork) has its branch                               |
+| `commits not in the merged PR` | HEAD is not the head of a merged (or closed: `... closed PR`) pull request of that branch, nor inside one                                   |
+| `merged under 24 h ago`        | the pull request merged (or closed: `closed under 24 h ago`) less than `mergedHours` ago (24 or more)                                       |
 | `branch not listed`            | `branches` is set and the branch matches none of its patterns                                                                               |
 | `used under 24 h ago`          | in the last `usedHours` (24 or more): a file in it, its HEAD reflog, `HEAD`, `index`, `ORIG_HEAD`, `FETCH_HEAD` or `COMMIT_EDITMSG` changed |
 | `uncommitted or untracked`     | `git status` shows anything                                                                                                                 |
@@ -257,6 +270,13 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | `could not read`               | git or GitHub gave no full answer; an unreadable merge time or folder; a moved worktree                                                     |
 | `orphaned worktree`            | its `.git` file names a git folder that is gone (main repository removed): kept, but no error (exit 0)                                      |
 | `unknown parent`               | tmp: its git folder is not there but may be elsewhere (see [`tmp`](#tmp)): kept, but no error (exit 0)                                      |
+
+A pull request closed without a merge finishes its branch's worktree as a merged one does (#982): GitHub keeps
+its head (`refs/pull/<n>/head`), and the branch stays in the clone, so the same checks show nothing is only there.
+A full clone still goes only when GitHub has every commit in it, and a closed pull request's head counts as on
+GitHub: when its branch was deleted there, the clone's branch lives on GitHub only in `refs/pull/<n>/head`, and the
+clone is removed. The [merged branches](#merged-branches) step
+takes merged pull requests only.
 
 A worktree is removed with `git worktree remove`, never with `--force`: git itself refuses when a file changed
 after the last check. The local branch and its reflog stay in the clone, so a commit that was amended or reset
@@ -619,7 +639,7 @@ stays, each reads the same bytes as before, and the disk holds them once. Withou
 | `dedupe.folders[].path`    | required | a folder; files at any depth in it are looked at                       |
 | `dedupe.folders[].days`    | required | days without a change (7 or more): newer files are not looked at       |
 | `dedupe.folders[].layered` | false    | the folder may be on a filesystem that is not local (as compress-cold) |
-| `dedupe.writtenInPlace`    | required | more name patterns (no `/`) never linked: one program's own kinds      |
+| `dedupe.writtenInPlace`    | none     | more name patterns (no `/`) never linked: one program's own kinds      |
 
 **The risk it takes: read this before you name a folder.** Names of one hard-linked file are one file, so any
 write **into** one name changes every name, and the other names' old bytes are gone. Most ways of writing a file do
@@ -634,7 +654,8 @@ images, no working copies. The rule refuses the kinds it knows are written in pl
 `*.log`, `*.log.*`, `*.jsonl`, `*.ndjson`, `*.journal`, `*.pid`; disk images `*.qcow2`, `*.img`, `*.raw`, `*.vmdk`,
 `*.vdi`, `*.vhd`, `*.vhdx`; swap `*.swp`, `*.swap`; mail boxes `mbox`, `*.mbox`; partial downloads a client resumes
 in place `*.part`, `*.crdownload`, `*.partial`, `*.!qb`), plus the name patterns in `dedupe.writtenInPlace` (one
-program's own kinds, such as a game's save files; `[]` when the folders hold none), but such a list can never be
+program's own kinds, such as a game's save files; `[]` when the folders hold none: while `dedupe.folders` names a
+folder and this key is missing, the rule links nothing and the run exits 1, see below), but such a list can never be
 complete. Every plan and run that links says it again in one line (`dedupe: names of one file share every later
 write ...`). On btrfs or XFS a tool that shares blocks with a reflink (`FIDEDUPERANGE`) is the
 safer choice: later writes do not reach the other copies. This rule makes hard links because the hosts it was made
@@ -713,11 +734,12 @@ the rename)`. The report has a class
 - **it stops half-way:** the duplicate is either as it was or a name of the kept file, never gone. Killed before
   the new name: nothing changed. Killed between the new name and the rename: the duplicate is as it was and the
   part `.<name>.<8 hex>.cleaner-link` stays; the next run removes that part (only while it is one the cleaner wrote
-  down and still a name of a file with other names) and links again. Killed right after a link or rename, before its
-  inode time was written down: the kept file looks changed and waits its `days`, then the run goes on. Killed while
-  the cache is written: the old cache stays, and the list of its own steps still holds what it did. A part that is
-  the last name of its bytes is kept and named (`part without its file`). A failed rename removes the part and keeps
-  the duplicate. No entry goes into the journal of half deletes: there is nothing half gone.
+  down and still a name of a file with other names) and links again. While `dedupe.writtenInPlace` is missing the
+  rule reads no folder, so the part stays (one more name of the kept file) until the key is added. Killed right
+  after a link or rename, before its inode time was written down: the kept file looks changed and waits its `days`,
+  then the run goes on. Killed while the cache is written: the old cache stays, and the list of its own steps still
+  holds what it did. A part that is the last name of its bytes is kept and named (`part without its file`). A
+  failed rename removes the part and keeps the duplicate. No entry goes into the journal of half deletes: there is nothing half gone.
 - **a file changes or is opened:** while the plan reads it: kept as `changed`. Between the plan and the run, or
   while it is compared or linked: refused or failed, both files stay as they are (the next run sees other bytes and
   joins nothing). A kept file replaced, or given, losing or moving a name, after the plan: refused.
@@ -730,13 +752,12 @@ the rename)`. The report has a class
   links nothing. Each folder is kept with `could not read: dedupe.writtenInPlace is missing ...` and every run
   exits 1 until the key is there; the other rules run as usual. `[]` is the owner's word that no program writes
   its own kinds in place in these folders.
-- **the cleaner is older than the machine file:** an older cleaner refuses the unknown `dedupe` key and every daily
-  run exits 2. Install this cleaner on a machine first, then add the key.
-- **upgrading a machine whose `dedupe` section has no `writtenInPlace`:** add the key first (the kinds a program
-  there writes in place, or `[]`), then install this cleaner. Until the new cleaner is in, the older one refuses
-  the machine file (`unknown key 'writtenInPlace'`) and every rule stops, every daily run exits 2, nothing is
-  touched. The other order is safe too, only noisier: the new cleaner links nothing and exits 1 until the key is
-  added.
+- **upgrading a machine:** install this cleaner first, then add `dedupe` or, to a `dedupe` section an older cleaner
+  read, `writtenInPlace` (the kinds a program there writes in place, or `[]`). In between, the rule does nothing
+  (no `dedupe`) or links nothing and exits 1 (no `writtenInPlace`, above); the other rules run. The other order
+  stops more: a cleaner older than the machine file refuses the unknown key (`unknown key 'dedupe'` or
+  `unknown key 'writtenInPlace'`), so every rule stops and every daily run exits 2, touching nothing, until this
+  cleaner is in.
 
 ## The machine file
 
@@ -796,7 +817,7 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
 | `worktrees.repos[].regenerable`          | none                                      | plain names of ignored build folders, on top of `node_modules`, `__pycache__` and `.pytest_cache`    |
 | `worktrees.repos[].branches`             | all                                       | branch patterns (shell style, case as written; `*` crosses `/`): only these branches are taken       |
 | `worktrees.repos[].mergedBranches`       | false                                     | also deletes merged local branches the patterns name (see Merged branches); needs `branches`         |
-| `worktrees.mergedHours`                  | 24                                        | hours after the merge (24 or more)                                                                   |
+| `worktrees.mergedHours`                  | 24                                        | hours after the merge or close (24 or more)                                                          |
 | `worktrees.usedHours`                    | 24                                        | hours since the worktree or clone was last used (24 or more)                                         |
 | `docker.enabled`                         | false                                     | turns the rule on                                                                                    |
 | `docker.days`                            | 7                                         | age of an unused anonymous volume (7 or more)                                                        |
@@ -816,14 +837,15 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
 | `daily.outDir`                           | `~/.local/state/fork-cleaner/daily`       | where `daily` writes its files                                                                       |
 | `daily.keepDays`                         | 30                                        | days `daily` keeps its dated files (1 or more)                                                       |
 | `daily.compare[]`                        | none                                      | the old tools' dry runs: `name`, `command` (absolute program, no shell), `pattern` (one group)       |
+| `report.warnFreeGB`                      | 60                                        | the report warns below this many GB free on the home folder's disk (0: never); see The report        |
 
 An empty section (`"cleaner": {}`) is valid and does nothing. An unknown key, a wrong type, a number below its
 floor, a root folder that is `/`, the home folder or a folder above it: the command names the file and the key,
 exits 2 and does nothing.
 
 Every key can only pick what a rule looks at, raise a floor, or keep more (`KEY_KINDS` in `config.py`; a test
-fails for a key that is not placed there). Two keys free more. `layered` (a cold or dedupe folder may be on a
-filesystem that is not local: an overlay, FUSE or a share) is a yes or no, false by default. `regenerable` takes plain folder names
+fails for a key that is not placed there). Two keys take a refusal away. `layered` (a cold or dedupe folder may be
+on a filesystem that is not local: an overlay, FUSE or a share) is a yes or no, false by default. `regenerable` takes plain folder names
 only: no `/` and no wildcard, so `["*"]` is refused and can never take the `ignored files` refusal away. A name
 frees an ignored folder of that name (and what is in it), never a file, and never a credential-looking name.
 
