@@ -573,18 +573,23 @@ def read_machine(rule, where, carry, now):
     learned = where['learned'](learned_notes)
     res, more, _ = reservation_files(where['reserveDir'], now.date())
     notes += more
-    if tier == 'machine':
+    if tier != 'basic':
         # #945: a caller with no user manager is often another user (a CI runner, root), whose own reserve.d is not
         # the owner's: read every person's, so it never takes the room they keep. One it cannot read: never free.
+        # #800: the full tier reads them too, so one person's reservation holds against every other person's work;
+        # there one it cannot read (a home closed to others, as most are by default) is a note, as before #800 it
+        # was not read at all: a person who wants it seen makes ~/.config/t3-capacity/reserve.d readable to others.
         dirs, blind = other_reserve_dirs(uid)
         for name, u, folder in dirs:
             more_res, more, cannot = reservation_files(folder, now.date(), (name, u))
             res += more_res
             notes += more
             blind += cannot
-        if blind:
+        if blind and tier == 'machine':
             full, tier = False, 'basic'
             notes += blind
+        elif blind:
+            notes += [b.replace(': never free here', '') + ': not counted' for b in blind[:8]]
     # #923, #945: a piece working in a reservation's folder owes its debt once, not there too, and never in two
     count_in_reservations(res, owners, {i: debt(rule, learned, pieces[i], m['totalMb']) for i in set(owners.values())})
     held, more = held_cgroups(host, where['holds'], where['user'])
@@ -872,11 +877,14 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
     return code
 
 
-def ask(heavy, kind=None, mb=None, timeout=ANSWER_SECONDS):
-    """For the callers (t3-capacity, agent-slots): run `heavy facts`, at most `timeout` seconds, and judge the answer
-    with free/v1's one reader. (verdict 'free', 'busy' or 'unavailable', reason, the object or None)."""
+def ask(heavy, kind=None, mb=None, timeout=ANSWER_SECONDS, fresh=False):
+    """For the callers (t3-capacity, agent-slots, heavy's own start, #866): run `heavy facts`, at most `timeout`
+    seconds, and judge the answer with free/v1's one reader. (verdict 'free', 'busy' or 'unavailable', reason, the
+    object or None). fresh: read the machine now, not the 5 s cache (heavy's start: a job admitted a second ago must
+    count)."""
     fc = load('free_contract', 'common/free_contract.py')
-    argv = [heavy, 'facts'] + (['--kind', kind] if kind else []) + (['--mb', str(mb)] if mb is not None else [])
+    argv = [heavy, 'facts'] + (['--kind', kind] if kind else []) + (['--mb', str(mb)] if mb is not None else []) + \
+        (['--fresh'] if fresh else [])
     try:
         p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              start_new_session=True)

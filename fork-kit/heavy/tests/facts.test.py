@@ -264,7 +264,7 @@ class Ledger(Case):
         d = self.facts('--kind', WRITER, '--fresh')[1]
         self.assertEqual(d['queue']['agents'], 2, 'still counts every user\'s agents')
 
-    def test_the_machine_tier_sees_every_person_s_reservations(self):
+    def test_the_machine_and_full_tiers_see_every_person_s_reservations(self):
         # #945: a caller with no user manager is often another user (a CI runner, root) with another home: it reads
         # every person's reserve.d, so it never takes the room the owner keeps; one it cannot read: never free
         owner_home = '/home/owner'
@@ -282,7 +282,13 @@ class Ledger(Case):
         self.m.process(4001, game, 300)             # the caller's process in the owner's folder: not the owner's use
         os.makedirs(self.m.root + OTHER)
         full = self.facts('--mb', '64')[1]
-        self.assertEqual((full['tier'], full['memory']['holdMb']), ('full', 0), 'full tier: as before')
+        self.assertEqual((full['tier'], full['memory']['holdMb']), ('full', 1536), '#800: the full tier sees it too')
+        if os.geteuid() != 0:                       # #800: in the full tier one that cannot be read is a note
+            os.chmod(owner_reserve, 0)
+            code, d = self.facts('--mb', '64', '--fresh')
+            os.chmod(owner_reserve, 0o755)
+            self.assertEqual((code, d['tier'], d['memory']['holdMb']), (0, 'full', 0), d.get('reason'))
+            self.assertIn('reservations of user owner cannot be read (Permission denied): not counted', d['notes'])
         shutil.rmtree(self.m.root + MANAGER)
         code, d = self.facts('--mb', '64', '--fresh')
         self.assertEqual((code, d['tier']), (0, 'machine'), d.get('reason'))
@@ -1071,6 +1077,17 @@ class TestOnlySettings(Case):
         with mock.patch.dict(os.environ, dict(env, HEAVY_TESTING='yes'), clear=True):
             self.assertIsNone(hf.test_env('HEAVY_FACTS_ROOT'), 'only "1" turns it on')
 
+    def test_heavy_s_own_start_asks_for_a_fresh_reading(self):
+        # #866: heavy's start check must count a job admitted a second ago, so it never takes the 5 s cache
+        marker = os.path.join(self.tmp, 'argv')
+        fake = fake_heavy(self.tmp, f'echo "$@" > {marker}; exit 75')
+        self.assertEqual(hf.ask(fake, 'build', 64, fresh=True)[0], 'unavailable')
+        with open(marker) as f:
+            self.assertEqual(f.read().split(), ['facts', '--kind', 'build', '--mb', '64', '--fresh'])
+        hf.ask(fake)
+        with open(marker) as f:
+            self.assertEqual(f.read().split(), ['facts'])
+
     def test_the_callers_fake_heavy_and_process_count_need_the_test_flag(self):
         marker = os.path.join(self.tmp, 'fake-ran')
         fake = fake_heavy(self.tmp, f'touch {marker}; echo garbled; exit 0')
@@ -1336,10 +1353,13 @@ class RedCheck(Case):
                  'test_two_folders_nested_folders_and_work_across_them_count_each_debt_once'),
                 ("        if d > depth:\n", "        if d >= 0 and found is None:\n", Reservations,
                  'test_two_folders_nested_folders_and_work_across_them_count_each_debt_once'),
-                ("    if tier == 'machine':\n        # #945", "    if False:\n        # #945", Ledger,
-                 'test_the_machine_tier_sees_every_person_s_reservations'),
+                ("    if tier != 'basic':\n        # #945", "    if False:\n        # #945", Ledger,
+                 'test_the_machine_and_full_tiers_see_every_person_s_reservations'),
                 ("            blind += cannot\n", "            pass\n", Ledger,
-                 'test_the_machine_tier_sees_every_person_s_reservations'),
+                 'test_the_machine_and_full_tiers_see_every_person_s_reservations'),
+                # #800: the full tier read no other person's reservations
+                ("    if tier != 'basic':\n        # #945", "    if tier == 'machine':\n        # #945", Ledger,
+                 'test_the_machine_and_full_tiers_see_every_person_s_reservations'),
                 ("        return None, no_carry()\n    age = now_ms", "        return None, None\n    age = now_ms", State,
                  'test_a_cache_of_another_version_never_skips_the_hold_down'),
                 # one cache file for every setting and version (the round-2 file): callers keep each other elevated

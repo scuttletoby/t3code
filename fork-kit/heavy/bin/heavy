@@ -1,7 +1,10 @@
 #!/usr/bin/python3 -IB
 """heavy: run a command in a capped systemd user slice, and stop whatever it leaves behind.
 
-  heavy <command> [args...]       run <command> in its own scope in the slice, wait for it, stop the scope
+  heavy [--wait S] <command> [args...]
+                                  run <command> in its own scope in the slice, wait for it, stop the scope; first
+                                  wait (up to S seconds, default 7200, then exit 76) until the machine's capacity
+                                  rule (`heavy facts`) says free, unless heavy.queue.capacityCheck is false
   HEAVY_KEEP=1 heavy <command>    the same, but processes the command leaves running are kept (a daemon)
   heavy --self-check              check the config, the slice and the installed files (exit 1 on a problem), and
                                   warn when the t3-capacity on PATH is not this kit's
@@ -12,8 +15,9 @@
   heavy docker-label [--value]    the owner label for a container a test starts, so heavy (when its command ends)
                                   and the sweep can remove it (--owner-pid PID: the long-lived test process; README)
   heavy --kind <name> [--mb N] [--wait S] [--] <command> [args...]
-                                  the same, but first wait in the memory queue until the job's memory fits
-                                  (lib/heavy_queue.py; exit 76 after --wait seconds, default 7200, with the
+                                  the same, but first wait in the memory queue until the job's memory fits and
+                                  the capacity rule admits it (lib/heavy_queue.py; exit 76 after --wait seconds,
+                                  default 7200, with the
                                   line "heavy: gave up after waiting" on stderr: a command that exits 76 by itself
                                   has no such line)
   heavy --measure <kind> [--] <command> [args...]
@@ -86,6 +90,7 @@ RUNTIME_ROOT = '/run/user'      # <root>/<uid>/heavy/labelled: the scopes `heavy
 STATE_ROOT = ''                 # <root>/heavy/labelled: the same, where /run/user is out of reach ('' = ~/.local/state)
 DOCKER_TIMEOUT = 20
 MAX_NAMES = 5
+DEFAULT_WAIT = 7200             # seconds a job waits for memory (--kind) or capacity (any job, #866) before exit 76
 # Python sets these to SIG_IGN at startup, and SIG_IGN survives exec: put them back before the command starts
 # (subprocess does the same for its children)
 PYTHON_IGNORED = [getattr(signal, n) for n in ('SIGPIPE', 'SIGXFSZ', 'SIGXFZ') if hasattr(signal, n)]
@@ -844,11 +849,23 @@ def queue_root():
     return root or None
 
 
-def queue_for(hq, cfg, systemctl, slice_cg, limits):
+def queue_for(hq, cfg, systemctl, slice_cg, limits, capacity=None):
     """The memory queue of the slice (lib/heavy_queue.py), with its settings from the machine file."""
     box = hq.Box(cfg['slice'], slice_cg, limits.get('MemoryHigh') or limits.get('MemoryMax'), cg_root=cgroup_root(),
                  queue_root=queue_root(), resolve=lambda: slice_cgroup(systemctl, cfg['slice']))
-    return hq.Queue(box, hq.settings())
+    return hq.Queue(box, hq.settings(), capacity=capacity)
+
+
+def capacity_check():
+    """(kind, mb) -> (free?, why): this kit's `heavy facts --fresh` for the job (#866), judged by free/v1's reader;
+    busy, no answer within 5 s or a broken answer is not free."""
+    hf = kit_module('heavy_facts')
+    heavy = os.path.realpath(__file__)
+
+    def check(kind, mb):
+        verdict, why, _ = hf.ask(heavy, kind, mb, fresh=True)
+        return verdict == 'free', why
+    return check
 
 
 def run(argv, cfg, job=None):
@@ -872,11 +889,26 @@ def run(argv, cfg, job=None):
     unit = unit_name(argv[0], keep)
     env[b'HEAVY_SCOPE'] = unit.encode()
     queue = ticket = sampler = child_mask = None
+    if not nested and not (job is not None and job['kind']):
+        # #866: a job without --kind waits for the machine's capacity rule too (a queued one asks it in the queue)
+        hq = queue_module()
+        settings = hq.settings()
+        if settings['capacityCheck']:
+            check = capacity_check()
+            try:
+                hq.capacity_wait(lambda: check(None, None), (job or {}).get('wait', DEFAULT_WAIT),
+                                 settings['pollSeconds'])
+            except hq.GaveUp as e:
+                say(f'{e}; not running {argv[0]}')
+                return hq.EXIT_GAVE_UP
+            except hq.Stopped as e:
+                say(f'{signal.Signals(e.sig).name} while waiting for capacity; not running {argv[0]}')
+                return finish(e.sig, None)
     if job is not None and job['kind'] and not nested:
         hq = queue_module()
         child_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])     # the mask now: the command's, as without a queue
         try:
-            queue = queue_for(hq, cfg, systemctl, slice_cg, limits)
+            queue = queue_for(hq, cfg, systemctl, slice_cg, limits, capacity=capacity_check())
             hq.check_kind(job['kind'])
             mb, _how = queue.reservation(job['kind'], job['mb'])
             # admitted: INT/TERM/HUP stay blocked from here until run_scope takes them, so one that comes just after
@@ -1149,8 +1181,9 @@ def kit_module(name):
 
 
 def job_options(argv):
-    """(--kind/--mb/--wait/--measure as a dict, or None without them, or 'usage'; the rest of argv). --mb and
-    --wait need --kind; --measure works alone (no queue) or with --kind (another kind for the record)."""
+    """(--kind/--mb/--wait/--measure as a dict, or None without them, or 'usage'; the rest of argv). --mb needs
+    --kind; --measure works alone (no queue) or with --kind (another kind for the record); --wait alone is how long
+    a job without --kind waits for capacity."""
     opts, rest = {}, list(argv)
     while rest and rest[0].split('=', 1)[0] in ('--kind', '--mb', '--wait', '--measure'):
         key, eq, value = rest.pop(0).partition('=')
@@ -1163,11 +1196,12 @@ def job_options(argv):
         opts[key] = value
     if not opts:
         return None, argv
-    if not rest or ('--kind' not in opts and set(opts) != {'--measure'}):
+    # --mb needs --kind; --measure and --wait (how long a job without --kind waits for capacity, #866) work alone
+    if not rest or ('--kind' not in opts and not set(opts) <= {'--measure', '--wait'}):
         return 'usage', argv
     try:
         mb = int(opts.get('--mb', 3072))
-        wait = float(opts.get('--wait', 7200))
+        wait = float(opts.get('--wait', DEFAULT_WAIT))
     except ValueError:
         return 'usage', argv
     if not 64 <= mb <= 1 << 20 or not 0 <= wait <= 7 * 86400:

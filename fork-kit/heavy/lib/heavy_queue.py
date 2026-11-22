@@ -72,6 +72,7 @@ LEARN_ROUND_MB = 128
 WAITS_KEEP_LINES = 5000
 WAITS_MAX_BYTES = 1 << 20
 SAMPLE_SECONDS = 3
+CAPACITY_SECONDS = 5        # one `heavy facts` answer (heavy_facts.ANSWER_SECONDS) under the queue lock
 
 
 def _load_machine_file():
@@ -120,6 +121,7 @@ SETTINGS = {
     'pollSeconds': ((int, float), 2, _at_least(0.2, 30)),
     'admitCommand': (list, [], _argv),                      # the machine's own check: exit 0 = admit now
     'admitTimeoutSeconds': ((int, float), 20, _at_least(1, 300)),
+    'capacityCheck': (bool, True, None),                    # heavy facts must say free too (#866); false: off
 }
 SECTION = {'sweep': (dict, None, None), 'queue': (dict, None, None), 'capacity': (dict, None, None)}  # heavy_facts.py
 
@@ -299,10 +301,13 @@ def _mb(value):
 
 
 class Queue:
-    def __init__(self, box, cfg, now=time.time, sleep=None, monotonic=time.monotonic, out=say, hook=None):
+    def __init__(self, box, cfg, now=time.time, sleep=None, monotonic=time.monotonic, out=say, hook=None,
+                 capacity=None):
         self.box, self.cfg = box, cfg
         self.now, self.sleep, self.monotonic, self.out = now, sleep, monotonic, out
         self.hook = hook or run_hook
+        # (kind, mb) -> (free?, why): the machine's capacity rule (`heavy facts`, read fresh); None: not asked
+        self.capacity = capacity if cfg.get('capacityCheck', True) else None
         self.lock_fd = None
         self.sigs = None            # the stop signals, while enter() keeps them blocked
 
@@ -372,7 +377,8 @@ class Queue:
 
     def lock_wait(self):
         """How long the verbs and the peaks wait for the queue lock: longer than one admit command can hold it."""
-        return LOCK_TIMEOUT + (self.cfg['admitTimeoutSeconds'] if self.cfg.get('admitCommand') else 0)
+        return LOCK_TIMEOUT + (self.cfg['admitTimeoutSeconds'] if self.cfg.get('admitCommand') else 0) + \
+            (CAPACITY_SECONDS if self.capacity else 0)
 
     def __enter__(self):
         self.take(self.monotonic() + self.lock_wait())
@@ -541,13 +547,27 @@ class Queue:
         detail = f': {line}' if code is not None and line else ''
         return False, f'the admit command says not now ({what}{detail})'
 
+    def ask_capacity(self, kind, mb):
+        """(admit?, reason) from the machine's capacity rule (#866: heavy checks it itself, so a job started right
+        after a NOT OK still waits). Anything but a clear "free" is not now: busy, no answer, a broken answer."""
+        if self.capacity is None:
+            return True, 'fits'
+        try:
+            ok, why = self.capacity(kind, mb)
+        except Exception as e:          # the check itself failed: never a yes
+            ok, why = False, f'{e.__class__.__name__}: {e}'
+        return (True, 'fits') if ok is True else (False, f'the capacity check says not now ({why})')
+
     def look(self, t):
-        """One look for waiting ticket t (under the lock): the queue's rule, then the admit command. Whether the admit
-        command refused it goes into its ticket (hookNo), so the jobs behind it do not keep its room for it."""
+        """One look for waiting ticket t (under the lock): the queue's rule, the machine's capacity rule, then the
+        admit command. Whether one of the last two refused it goes into its ticket (hookNo), so the jobs behind it do
+        not keep its room for it."""
         ok, why, fig = self.decide(t, self.tickets(), self.box.facts(self.cfg))
         refused = False
         if ok:
-            ok, why = self.ask_hook(t.mb)
+            ok, why = self.ask_capacity(t.kind, t.mb)
+            if ok:
+                ok, why = self.ask_hook(t.mb)
             refused = not ok
         if t.data.get('hookNo', False) != refused:
             t.data['hookNo'] = refused
@@ -712,6 +732,44 @@ def run_hook(argv, timeout):
         p.stdout.close()
     lines = [x.strip() for x in out.decode('utf-8', 'replace').splitlines() if x.strip()]
     return p.returncode, (lines[-1][:200] if lines else '')
+
+
+def capacity_wait(check, limit, poll_s, out=say, monotonic=time.monotonic, sleep=None):
+    """#866: a heavy job without --kind waits here until the machine's capacity rule says free (check() ->
+    (free?, why); an error or anything but True is not free), asking every poll_s seconds and saying why when that
+    changes and once a minute. Raises GaveUp after limit seconds, Stopped on INT/TERM/HUP (blocked meanwhile and taken only
+    between asks, as in the queue). Returns the seconds waited."""
+    sigs = [s for s in STOP_SIGS if signal.getsignal(s) != signal.SIG_IGN]
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+    start = monotonic()
+    last = last_print = None
+    try:
+        while True:
+            try:
+                ok, why = check()
+            except Exception as e:
+                ok, why = False, f'{e.__class__.__name__}: {e}'
+            waited = monotonic() - start
+            if ok is True:
+                if waited >= 1:
+                    out(f'the capacity check says free after waiting {_dur(waited)}')
+                return waited
+            if waited >= limit:
+                raise GaveUp(f'gave up after waiting {_dur(waited)} for capacity: {why}')
+            if why != last or last_print is None or monotonic() - last_print >= PRINT_EVERY:
+                out(f'waiting for capacity: {why}; waited {_dur(waited)} (of {_dur(limit)}, then exit '
+                    f'{EXIT_GAVE_UP})')
+                last, last_print = why, monotonic()
+            seconds = max(0.0, min(poll_s, limit - waited + 0.01))
+            if sleep is None:
+                info = signal.sigtimedwait(sigs, seconds) if sigs else time.sleep(seconds)
+            else:                       # tests: a fake clock, then a look at what is pending
+                sleep(seconds)
+                info = signal.sigtimedwait(sigs, 0) if sigs else None
+            if info is not None:
+                raise Stopped(info.si_signo)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)
 
 
 def stopped_already():
