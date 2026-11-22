@@ -87,7 +87,8 @@ Refused:
     (GH_CONFIG_DIR, XDG_CONFIG_HOME or HOME from a variable): the word may be an alias
   - each script of the machine file's actionsDisable.refuseScripts run with its flag (a project tool that
     disables workflows itself: {"name": "garden.py", "flag": "--fix", "why": "disables ..."}), where the file is real;
-    and a line that calls one in a file whose text a shell runs (sed e, `cat f | bash`, eval "$(cat f)")
+    and a line that calls one in a file whose text goes on (sed e, `cat f | bash`, eval "$(cat f)", `$(cat f)`,
+    `cat f | heavy bash`, `cat f | at now` ..)
   - a GraphQL call whose query (or a field name that can be `query`) the guard cannot read
   - a command the guard cannot finish reading in time
 Passes: reads (GET), gh workflow enable/list/view/run, PUT .../enable, searching and writing text about all this
@@ -107,6 +108,8 @@ Known over-refusals (harmless, but not provable from the text; the message says 
   - a code file too big to read whole, as an argument of a tool the guard does not know (`gzip -c big.js`): pipe
     it in (`cat big.js | gzip`)
   - an exported variable or a `VAR=.. command` prefix that carries a token
+  - a file that only mentions a refuseScripts line, piped or substituted into a program that reads it as data
+    (`cat msg.md | python3 tools/check.py`): give it as a redirect (`python3 tools/check.py < msg.md`)
   - a GraphQL body piped into gh (`echo '{..}' | gh api graphql --input -`): use `--input - <<< '{..}'` or -f query=
   - a GraphQL query from a variable or command output, also a read (`-f query="$(cat q.graphql)"`): use
     `-F query=@q.graphql`; a $variable inside "quotes" in the query (an id) is fine
@@ -2734,7 +2737,14 @@ def named(text):
     return None
 
 
+REFUSE_TAG = "this machine's refuseScripts"   # in the label refuse_script_named() gives
+MENTION_HINT = ('If the file only mentions the script (a message, notes), give it to the program as a redirect, '
+                '`python3 tools/check.py < msg.md`, which is read as data, or do not pipe or substitute a file that '
+                'names a refuse script.')
+
+
 def unproven(label, what, hint=SEPARATE):
+    hint = f'{MENTION_HINT} {hint}' if REFUSE_TAG in label else hint
     return reason(f'a command that names {label} {what}, so the guard cannot prove it is harmless', hint)
 
 
@@ -3125,10 +3135,11 @@ def data_token(tok, ctx, runs=False):
     """The guarded token in a file that cat/cp/.. hand on: its text as read_text() gives it, so data over MAX_FILE or
     that cannot be opened passes unread (lockout care), whatever its name (`cat app.js | gzip`). Only in a run
     position, where a shell or interpreter runs the text (`cat f | grep x | bash`, `eval "$(cat f)"`; runs: the
-    command itself runs it, sed e), is a file read in pieces and counts when unread (file_token), and does a line
-    that calls a refuseScripts entry count: piped into a program that reads it as data (`cat msg.md | python3
-    check.py`) the text only mentions it, as with `< msg.md`. A copy under a name the text runs is read where it is
-    written (segment_reason)."""
+    command itself runs it, sed e), is a file read in pieces and counts when unread (file_token). A line that calls
+    a refuseScripts entry counts wherever the text goes on, as any guarded token does: the guard cannot tell every
+    place that runs it (`$(cat f)`, `| heavy bash`, `| bash /dev/stdin`, `| at now`, `| awk '{system($0)}'` ..), so
+    `cat msg.md | python3 check.py` is refused too, and the refusal names the way out (`< msg.md`). A copy under a
+    name the text runs is read where it is written (segment_reason)."""
     runs = runs or ctx.get('feeds_code')
     for d in [] if hidden(tok) else folders(ctx):
         p = resolve_path(tok, d)
@@ -3136,8 +3147,9 @@ def data_token(tok, ctx, runs=False):
         t = f['named'] if f['text'] else runs and file_token(p)
         if t:
             return t
-        # the whole text is read (the cache holds no text): only where it runs and the machine names a script
-        t = runs and REFUSE_SCRIPTS and f['text'] and refuse_script_named(body(p, ctx))
+        # the whole text is read (the cache holds no text): only when the cached names found nothing and the
+        # machine names a script at all
+        t = REFUSE_SCRIPTS and f['text'] and refuse_script_named(body(p, ctx))
         if t:
             return t
     return None
@@ -3150,7 +3162,7 @@ def refuse_script_named(text):
     for rs in REFUSE_SCRIPTS if text else ():
         rx = r'(?<![\w.-])%s(?![\w.-])[^\n]*?(?<![\w-])%s(?![\w-])' % (re.escape(rs['name']), re.escape(rs['flag']))
         if re.search(rx, text):
-            return f'`{rs["name"]} {rs["flag"]}` (this machine\'s refuseScripts: {rs.get("why") or "refused"})'
+            return f'`{rs["name"]} {rs["flag"]}` ({REFUSE_TAG}: {rs.get("why") or "refused"})'
     return None
 
 

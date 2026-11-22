@@ -3254,33 +3254,59 @@ class Pr993Round2Test(Case):
         self.passes("gh api repos/o/r/issues?q=graphql", 'gh api -X POST repos/o/r/issues/1/comments?x=1 -f body=hi',
                     "gh api search/issues?q=graphql+is:open --jq '.items[]'")
 
-    def test_2_a_refuse_script_named_in_piped_data_counts_only_where_a_shell_runs_it(self):
-        """msg.md only names `<script> <flag>`: piped into a program that reads it as data, it passes (as `< msg.md`
-        does); piped or fed into a shell, eval or source, the line runs and is refused."""
+    # each was refused by round 1 and passed in round 2 (the narrow check's list): the text runs, not as `| bash`
+    PIPED_RUNS = (
+        '$(cat q.txt)', '`cat q.txt`', 'cat q.txt | heavy bash', 'cat q.txt | su', 'cat q.txt | script -q /dev/null',
+        'cat q.txt | docker exec -i c sh', 'cat q.txt | ssh localhost', 'cat q.txt | ssh localhost bash',
+        'cat q.txt | bash /dev/stdin', 'cat q.txt | source /dev/stdin', 'cat q.txt | . /dev/stdin',
+        'cat q.txt | bash -c "$(cat)"', 'cat q.txt | sh -c \'eval "$(cat)"\'', 'watch "$(cat q.txt)"',
+        'cat q.txt | at now', 'cat q.txt | batch', 'cat q.txt | crontab -', 'cat q.txt | parallel',
+        'cat q.txt | while read -r l; do $l; done', "cat q.txt | awk '{system($0)}'",
+        'cat q.txt | awk \'{print | "sh"}\'', "cat q.txt | perl -ne 'system $_'", "cat q.txt | ruby -ne 'system $_'",
+        "cat q.txt | python3 -c 'import os, sys; os.system(sys.stdin.read())'")
+
+    def test_2_a_refuse_script_named_in_piped_data_counts_wherever_the_text_goes_on(self):
+        """A file that names `<script> <flag>` counts wherever its text goes on, as round 1 had it: the guard
+        cannot list every place that runs piped or substituted text, so a mere mention piped into a program that
+        reads it as data is refused too (known over-refusal), and the refusal names the way out (`< msg.md`)."""
         self.write(GARDEN['name'], 'print(1)\n', 0o644)
         self.write('msg.md', f'Fix: never run {GARDEN["name"]} {GARDEN["flag"]} on CI\n', 0o644)
         self.write('q.txt', f'python3 {GARDEN["name"]} {GARDEN["flag"]}\n', 0o644)
+        self.write('notes.md', 'Fix: the CI cache\n', 0o644)
         self.write('tools/check.py', 'import sys\nprint(len(sys.stdin.read()))\n', 0o644)
         self.write('x.js', 'process.stdin.resume()\n', 0o644)
-        self.passes('cat msg.md | python3 tools/check.py', 'cat msg.md | node x.js', 'cat msg.md | ssh host cat',
-                    "cat msg.md | claude -p hi", 'python3 tools/check.py < msg.md', 'cat msg.md | gzip > m.gz',
-                    'cat q.txt | python3 tools/check.py', 'cp msg.md notes.md', "cat msg.md | sed -n 1p")
-        self.refused('cat q.txt | bash', 'cat q.txt | sh', 'cat q.txt | zsh', 'cat q.txt | dash',
-                     'cat q.txt | grep -v x | bash', 'eval "$(cat q.txt)"', 'source <(cat q.txt)', '. <(cat q.txt)',
-                     'bash < q.txt', 'bash <<< "$(cat q.txt)"', "sed -n '1e' q.txt", 'sed e q.txt',
-                     'cat q.txt | sed e', 'cat q.txt | grep -v x | sed e')
+        self.refused(*self.PIPED_RUNS)
+        self.refused('cat q.txt | bash', 'cat q.txt | sh', 'cat q.txt | zsh', 'cat q.txt | dash', 'cat q.txt | python3',
+                     'cat q.txt | python3 -', 'cat q.txt | sudo bash', 'cat q.txt | timeout 60 bash',
+                     'cat q.txt | nice bash', 'cat q.txt | grep -v x | bash', 'eval "$(cat q.txt)"',
+                     'source <(cat q.txt)', '. <(cat q.txt)', 'bash < q.txt', 'bash <<< "$(cat q.txt)"',
+                     'cat q.txt > run.sh; bash run.sh', 'cp q.txt run.sh && bash run.sh', "sed -n '1e' q.txt",
+                     'sed e q.txt', 'cat q.txt | sed e', "cat q.txt | sed 's/^//e'", 'cat q.txt | grep -v x | sed e',
+                     'head -1 q.txt | sed e')
+        # a mere mention, piped: refused (known over-refusal), told the redirect
+        mentions = ('cat msg.md | python3 tools/check.py', 'cat msg.md | node x.js', 'cat msg.md | ssh host cat',
+                    'cat msg.md | claude -p hi', 'cat msg.md | grep -v y | python3 tools/check.py',
+                    'cat q.txt | python3 tools/check.py')
+        self.refused(*mentions)
+        for cmd in mentions + self.PIPED_RUNS:
+            self.assertIn('`python3 tools/check.py < msg.md`', self.decide(cmd), cmd)
+        self.passes('python3 tools/check.py < msg.md', 'cp msg.md notes2.md', 'cat msg.md | sed -n 1p',
+                    'cat notes.md | python3 tools/check.py', "cat notes.md | ssh host 'cat > f'",
+                    'grep -n fix msg.md', 'git add msg.md && git commit -F msg.md')
 
-    def test_2_data_files_are_read_only_where_a_refuse_script_could_run(self):
-        """The refuseScripts check reads a whole data file (up to MAX_FILE): only where the text runs, and only when
-        the machine has refuseScripts at all, so a warm cache still saves the read (`cat app.js | gzip`)."""
+    def test_2_data_files_are_read_in_full_only_when_needed(self):
+        """The refuseScripts check reads a whole data file (up to MAX_FILE): only when the machine has refuseScripts
+        at all, and only after the cached names found nothing (a file that names a guarded token is not read again)."""
         self.write('app.js', 'console.log(1)\n' * 1000, 0o644)
         self.write('q.txt', f'python3 {GARDEN["name"]} {GARDEN["flag"]}\n', 0o644)
-        with mock.patch.object(self.g, 'body', wraps=self.g.body) as body:
-            self.passes('cat app.js | gzip > out.gz', 'cp app.js copy.js && ls', 'cat app.js | python3 tools/x.py')
-            self.assertEqual(body.call_count, 0)
+        self.write('d.txt', 'gh workflow disable 1\n', 0o644)
         with mock.patch.object(self.g, 'REFUSE_SCRIPTS', []), \
                 mock.patch.object(self.g, 'body', wraps=self.g.body) as body:
-            self.passes('cat q.txt | bash')
+            self.passes('cat app.js | gzip > out.gz', 'cp app.js copy.js && ls', 'cat app.js | python3 tools/x.py',
+                        'cat q.txt | bash')
+            self.assertEqual(body.call_count, 0)
+        with mock.patch.object(self.g, 'body', wraps=self.g.body) as body:
+            self.refused('cat d.txt | python3 tools/x.py')
             self.assertEqual(body.call_count, 0)
         self.refused('cat q.txt | bash')
 
