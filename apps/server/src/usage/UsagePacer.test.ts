@@ -875,6 +875,59 @@ describe("UsagePacer reserve and verdicts", () => {
     assert.strictEqual(windowOf(reserved, "seven_day").verdict, "ahead");
   });
 
+  it("burn first on weekly windows only (#969): the 5-hour window keeps the even pace", () => {
+    const pacing = { burnFirst: true, burnFirstWindows: ["weekly", "monthly"] } as const;
+    const result = pace([], provider(-MINUTE, [weekly(80), session(70)]), { pacing });
+    // The 5-hour window is half way through: 70 is over its even pace, so ahead.
+    assert.strictEqual(windowOf(result, "five_hour").verdict, "ahead");
+    near(windowOf(result, "five_hour").targetPercent, 50);
+    // The weekly window drops the even pace: 80 is room.
+    assert.strictEqual(windowOf(result, "seven_day").verdict, "behind");
+    near(windowOf(result, "seven_day").targetPercent, 100);
+    assert.strictEqual(result.verdict, "ahead");
+    assert.deepStrictEqual(result.burnFirstWindows, ["weekly", "monthly"]);
+    const onPace = pace([], provider(-MINUTE, [weekly(80), session(52)]), { pacing });
+    assert.strictEqual(windowOf(onPace, "five_hour").verdict, "onPace");
+  });
+
+  it("burn first on weekly windows only (#969): weekly is behind up to 100 − reserve", () => {
+    const pacing = {
+      burnFirst: true,
+      reservePercent: 2,
+      burnFirstWindows: ["weekly", "monthly"],
+    } as const;
+    const verdict = (used: number) =>
+      pace([], provider(-MINUTE, [weekly(used), session(20)]), { pacing }).verdict;
+    assert.strictEqual(verdict(80), "behind");
+    assert.strictEqual(verdict(97.9), "behind");
+    assert.strictEqual(verdict(98), "ahead");
+    assert.strictEqual(verdict(100), "ahead");
+    const window = windowOf(pace([], provider(-MINUTE, [weekly(97)]), { pacing }), "seven_day");
+    near(window.targetPercent, 98);
+  });
+
+  it("burn first without a window list burns every window, as before (#969)", () => {
+    const result = pace([], provider(-MINUTE, [weekly(80), session(70)]), {
+      pacing: { burnFirst: true },
+    });
+    assert.strictEqual(windowOf(result, "five_hour").verdict, "behind");
+    assert.strictEqual(windowOf(result, "seven_day").verdict, "behind");
+    assert.strictEqual(result.verdict, "behind");
+    assert.deepStrictEqual(result.burnFirstWindows, ["session", "weekly", "monthly", "other"]);
+  });
+
+  it("a window list alone, or an empty one, burns nothing first (#969)", () => {
+    for (const pacing of [
+      { burnFirstWindows: ["weekly"] },
+      { burnFirst: true, burnFirstWindows: [] },
+    ] as const) {
+      const result = pace([], provider(-MINUTE, [weekly(80)]), { pacing });
+      assert.strictEqual(windowOf(result, "seven_day").verdict, "ahead");
+      assert.deepStrictEqual(result.burnFirstWindows, []);
+    }
+    assert.deepStrictEqual(pace([], provider(-MINUTE, [weekly(40)])).burnFirstWindows, []);
+  });
+
   it("the pace band never eats the reserve: at or over the ceiling is ahead", () => {
     const verdict = (
       used: number,
@@ -960,6 +1013,75 @@ describe("UsagePacer settings", () => {
     assert.isTrue(kept.usagePacing[INSTANCE]!.noLimits);
     assert.isTrue(decodeEncoded(encodeSettings(kept)).usagePacing[INSTANCE]!.noLimits);
     assert.throws(() => decodePatch({ usagePacing: { [INSTANCE]: { noLimits: "yes" } } }));
+  });
+
+  it("old settings files decode unchanged: no window list, every window burns first (#969)", () => {
+    const old = { reservePercent: 2, burnFirst: true, noLimits: false };
+    const decoded = decodeSettings({ usagePacing: { [INSTANCE]: old } });
+    assert.deepStrictEqual(decoded.usagePacing[INSTANCE], old);
+    assert.deepStrictEqual(encodeSettings(decoded).usagePacing, { [INSTANCE]: old });
+    assert.isUndefined(DEFAULT_PACING.burnFirstWindows);
+  });
+
+  it("burnFirstWindows decodes, saves and survives a patch of another field (#969)", () => {
+    const entry: UsagePacingInstanceSettings = {
+      reservePercent: 0,
+      burnFirst: true,
+      noLimits: false,
+      burnFirstWindows: ["weekly", "monthly"],
+    };
+    const decoded = decodeSettings({ usagePacing: { [INSTANCE]: entry } });
+    assert.deepStrictEqual(decoded.usagePacing[INSTANCE], entry);
+    assert.deepStrictEqual(decodeEncoded(encodeSettings(decoded)).usagePacing[INSTANCE], entry);
+    const patched = applyServerSettingsPatch(
+      DEFAULT_SERVER_SETTINGS,
+      decodePatch({
+        usagePacing: { [INSTANCE]: { burnFirst: true, burnFirstWindows: ["weekly", "monthly"] } },
+      }),
+    );
+    assert.deepStrictEqual(patched.usagePacing[INSTANCE], entry);
+    const kept = applyServerSettingsPatch(
+      patched,
+      decodePatch({ usagePacing: { [INSTANCE]: { reservePercent: 5 } } }),
+    );
+    assert.deepStrictEqual(kept.usagePacing[INSTANCE]!.burnFirstWindows, ["weekly", "monthly"]);
+    // The way back: list every kind again (the same as no list).
+    const all = applyServerSettingsPatch(
+      kept,
+      decodePatch({
+        usagePacing: {
+          [INSTANCE]: { burnFirstWindows: ["session", "weekly", "monthly", "other"] },
+        },
+      }),
+    );
+    assert.deepStrictEqual(all.usagePacing[INSTANCE]!.burnFirstWindows, [
+      "session",
+      "weekly",
+      "monthly",
+      "other",
+    ]);
+  });
+
+  it("unknown window names: a read drops them (that window keeps its pace), a save refuses them (#969)", () => {
+    const read = (burnFirstWindows: unknown) =>
+      decodeSettings({ usagePacing: { [INSTANCE]: { burnFirst: true, burnFirstWindows } } })
+        .usagePacing[INSTANCE]!.burnFirstWindows;
+    assert.deepStrictEqual(read(["weekly", "five_hour", "Weekly", 7, "weekly"]), ["weekly"]);
+    // Not a list: nothing burns first, the even pace holds everywhere (the safe side).
+    assert.deepStrictEqual(read("weekly"), []);
+    assert.deepStrictEqual(read(null), []);
+    // The rest of the file still loads.
+    const settings = decodeSettings({
+      usagePacingGate: "advise",
+      usagePacing: { [INSTANCE]: { burnFirst: true, burnFirstWindows: ["weekley"] } },
+    });
+    assert.strictEqual(settings.usagePacingGate, "advise");
+    assert.throws(() =>
+      decodePatch({ usagePacing: { [INSTANCE]: { burnFirstWindows: ["weekly", "five_hour"] } } }),
+    );
+    assert.throws(() =>
+      decodePatch({ usagePacing: { [INSTANCE]: { burnFirstWindows: "weekly" } } }),
+    );
   });
 
   it("old settings files decode to no pacing; an entry fills its defaults", () => {

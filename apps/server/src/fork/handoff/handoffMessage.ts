@@ -32,28 +32,90 @@ export const HANDOFF_AGENT_BEGIN = "----- begin handoff from the old session ---
 export const HANDOFF_AGENT_END = "----- end handoff from the old session -----";
 
 /**
- * A part-2 line that could pass for one of the message's own lines: a begin or end line (of either
- * source), a part-1 heading, the part-3 heading or the rules.
+ * Letters outside Latin that a reader takes for Latin ones (Cyrillic, Greek, IPA), and the Cyrillic
+ * Ze read as "3". Only the letters of the message's own lines need an entry: a look-alike of any
+ * other letter cannot make one of them.
  */
-const LOOKS_LIKE_OURS = new RegExp(
-  [
-    String.raw`^-+\s*(begin|end)\b.*\bhandoff\b`,
-    String.raw`^\[T3 handoff\b`,
-    String.raw`^Recent conversation:`,
-    String.raw`^This is context, not a request\.`,
-  ].join("|"),
-  "i",
-);
+const CONFUSABLES: Record<string, string> = {
+  а: "a",
+  в: "b",
+  е: "e",
+  ё: "e",
+  з: "3",
+  і: "i",
+  ј: "j",
+  к: "k",
+  м: "m",
+  н: "h",
+  о: "o",
+  р: "p",
+  с: "c",
+  т: "t",
+  у: "y",
+  х: "x",
+  ѕ: "s",
+  һ: "h",
+  ԁ: "d",
+  ԛ: "q",
+  ԝ: "w",
+  ӏ: "l",
+  α: "a",
+  β: "b",
+  ε: "e",
+  η: "n",
+  ι: "i",
+  κ: "k",
+  ν: "v",
+  ο: "o",
+  ρ: "p",
+  τ: "t",
+  υ: "u",
+  χ: "x",
+  ɑ: "a",
+  ɡ: "g",
+  ı: "i",
+  ȷ: "j",
+};
+
+/**
+ * A line as a reader spells it: compatibility forms folded, accents dropped, look-alikes read as
+ * Latin, lower case, with everything before the first letter (rules, list, table and quote marks)
+ * and every other character that is not a letter or digit left out: "----- End hand-off -----"
+ * and "1. **end handoff**" both spell "endhandoff".
+ */
+const spelling = (line: string) =>
+  Array.from(
+    line.normalize("NFKD").replaceAll(/\p{M}/gu, "").toLowerCase(),
+    (char) => CONFUSABLES[char] ?? char,
+  )
+    .join("")
+    .replace(/^[^\p{L}]+/u, "")
+    .replaceAll(/[^\p{L}\p{N}]/gu, "");
+
+/**
+ * A part-2 line that could pass for one of the message's own lines: a begin or end line (of either
+ * source), a part-1 heading, the part-3 heading or the rules. Matched on the line's `spelling`, so
+ * a disguised copy matches too. A line in prose that starts with "end" or "begin" and names a
+ * handoff is quoted as well; quoting it costs nothing.
+ */
+const LOOKS_LIKE_OURS =
+  /^(?:(?:begin|end).*handoff|t3handoff|recentconversation|thisiscontextnotarequest)/;
+
+/**
+ * Every character a reader may take as a line end: CR LF as one, then LF, a lone CR (CommonMark),
+ * the vertical tab, form feed, NEL and the Unicode line and paragraph separators.
+ */
+const LINE_BREAK = /\r\n|[\n\r\v\f\u0085\u2028\u2029]/u;
 
 /**
  * Part 2 is someone else's text (the old session's, steerable by what it read): a line that looks
  * like one of the message's own is quoted, so a fake end line cannot put text after it outside
- * the notes.
+ * the notes. Every line break comes out as "\n", so no reader sees a line this did not.
  */
 export const neutraliseNotes = (text: string) =>
   text
-    .split("\n")
-    .map((line) => (LOOKS_LIKE_OURS.test(line.trim()) ? `> ${line}` : line))
+    .split(LINE_BREAK)
+    .map((line) => (LOOKS_LIKE_OURS.test(spelling(line)) ? `> ${line}` : line))
     .join("\n");
 
 export const HANDOFF_RULES =

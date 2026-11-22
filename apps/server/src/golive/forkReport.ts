@@ -6,6 +6,7 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
 import {
+  burnFirstWindowKinds,
   FORK_REPORT_PROJECT_FEATURES,
   FORK_SERVER_SETTING_KEYS,
   forkFeaturesWhere,
@@ -550,6 +551,14 @@ function readSettings(
         automaticUpdates: settings.automaticUpdates,
         automaticUpdatesQuietCommandSet: settings.automaticUpdatesQuietCommand !== "",
         usagePacing: settings.usagePacing,
+        // The window kinds each instance spends first: an old `burnFirst` without a list is
+        // every kind. Instances that spend nothing first are left out.
+        usagePacingBurnFirstWindows: Object.fromEntries(
+          Object.entries(settings.usagePacing).flatMap(([id, pacing]) => {
+            const kinds = burnFirstWindowKinds(pacing);
+            return kinds.length === 0 ? [] : [[id, kinds]];
+          }),
+        ),
         usagePacingGate: settings.usagePacingGate,
         usagePacingLowerEffort: settings.usagePacingLowerEffort,
         waitFor: settings.waitFor,
