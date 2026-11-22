@@ -6,5 +6,5 @@
   "audit_runner": { "model": "claude-fable-5-2", "effort": "high" },
   "forbidden_efforts": ["low", "max"],
   "lens_rounds": 2,
-  "minors": "issue"
+  "minors": "same-round"
 }

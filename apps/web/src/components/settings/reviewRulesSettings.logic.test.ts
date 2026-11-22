@@ -74,6 +74,7 @@ describe("the effective values", () => {
       `${lensRunners.approach!.driver} · ${lensRunners.approach!.model} · high effort`,
     );
     expect(value("stateQuestion")).toBe(REVIEW_RULES_RECOMMENDED.stateQuestion);
+    expect(value("minors")).toBe("Fixed in the pull request or dropped (same-round)");
     expect(value("configPath")).toBe(REVIEW_RULES_RECOMMENDED.configPath);
     expect(value("reportMaxChars")).toBe("60000 characters");
   });

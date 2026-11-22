@@ -120,8 +120,8 @@ describe("effectiveReviewRules", () => {
     { name: "the preset alone", server: ON, expected: RECOMMENDED },
     {
       name: "explicit fields over the preset",
-      server: { ...ON, runner: RUNNER, minors: "same-round", reportMaxChars: 2000 },
-      expected: { ...RECOMMENDED, runner: RUNNER, minors: "same-round", reportMaxChars: 2000 },
+      server: { ...ON, runner: RUNNER, minors: "issue", reportMaxChars: 2000 },
+      expected: { ...RECOMMENDED, runner: RUNNER, minors: "issue", reportMaxChars: 2000 },
     },
     {
       name: "a lens runner beside the preset's",
