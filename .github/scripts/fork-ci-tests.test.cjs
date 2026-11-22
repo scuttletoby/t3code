@@ -205,31 +205,51 @@ test("the real release-smoke.ts names its listed test outside a comment", () => 
 
 test("the list ignores comments and blank lines and reads `run by` and weights", () => {
   assert.deepEqual(
-    readList("# head\n\na.test.sh  # from #2\n  b.test.py run by c.yml\nd.test.cjs ~120s\n"),
+    readList(
+      "# head\n\na.test.sh  # from #2\n  b.test.py run by c.yml unittest\nd.test.cjs ~120s\n",
+    ),
     [
       { file: "a.test.sh", runBy: null, weight: null, format: null },
       { file: "b.test.py", runBy: "c.yml", weight: null, format: "unittest" },
       { file: "d.test.cjs", runBy: null, weight: 120, format: null },
     ],
   );
-  // A Python test is a unittest test unless it says it prints ok lines, after any other word.
+  // A Python test says its format, "unittest" or "ok lines", after any other word.
   assert.deepEqual(
     readList(
-      "e.test.py ok lines\nf.test.py ~40s ok lines\ng.test.py run by c.yml ok lines\nh.test.py ~40s\n",
+      "e.test.py ok lines\nf.test.py ~40s ok lines\ng.test.py run by c.yml ok lines\nh.test.py ~40s unittest\n" +
+        "i.test.py unittest\n",
     ).map((e) => [e.file, e.weight, e.runBy, e.format]),
     [
       ["e.test.py", null, null, "ok lines"],
       ["f.test.py", 40, null, "ok lines"],
       ["g.test.py", null, "c.yml", "ok lines"],
       ["h.test.py", 40, null, "unittest"],
+      ["i.test.py", null, null, "unittest"],
     ],
   );
-  for (const other of ["a.test.sh ok lines", "a.test.cjs ~20s ok lines"])
-    assert.throws(() => readList(`${other}\n`), /only a Python test says "ok lines"/, other);
+  for (const [other, word] of [
+    ["a.test.sh ok lines", "ok lines"],
+    ["a.test.cjs ~20s ok lines", "ok lines"],
+    ["a.test.sh unittest", "unittest"],
+    ["a.test.mjs run by c.yml unittest", "unittest"],
+  ])
+    assert.throws(
+      () => readList(`${other}\n`),
+      new RegExp(`only a Python test says "${word}"`),
+      other,
+    );
+  // A Python test without its format is refused, whatever else its line says: none is read as unittest.
+  for (const bare of ["a.test.py", "a.test.py ~40s", "a.test.py run by c.yml"])
+    assert.throws(
+      () => readList(`b.test.py unittest\n${bare}\n`),
+      /a Python test says its format at the end of its line: "unittest" .* or "ok lines"/,
+      bare,
+    );
   // One spelling of a runner's path, so `./a/b` and `a//b` compare equal to `a/b` wherever the list is read.
   assert.deepEqual(
     readList(
-      "e.test.py run by ./.github/workflows/x.yml\nf.test.py run by .github//workflows/x.yml\n",
+      "e.test.py run by ./.github/workflows/x.yml unittest\nf.test.py run by .github//workflows/x.yml ok lines\n",
     ).map((e) => e.runBy),
     [".github/workflows/x.yml", ".github/workflows/x.yml"],
   );
@@ -242,6 +262,11 @@ test("the list ignores comments and blank lines and reads `run by` and weights",
     "a.test.py ok lines ~12s",
     "a.test.py oklines",
     "a.test.py ok lines ok lines",
+    "a.test.py unittest ~12s",
+    "a.test.py unittest ok lines",
+    "a.test.py ok lines unittest",
+    "a.test.py unittests",
+    "a.test.py Unittest",
   ])
     assert.throws(() => readList(`${bad}\n`), /cannot read/, bad);
 });
@@ -860,11 +885,13 @@ test("no listed shell test pipes into a reader that stops early", () => {
 
 test("countTests reads fork-ci-unittest.py's plan and count lines, node's reporter line, else ok lines", () => {
   const py = "fork-ci/a.test.py";
+  // The list's format for a Python test (readList() refuses one without).
+  const ut = { format: "unittest" };
   const line = (tests, skipped = [], failed = 0) => ({ tests, skipped, failed });
   const plan = (n) => ({ plan: n });
   // The shim's last line, when the file ended: the tests its source defines that no run planned.
   const end = (...unloaded) => ({ unloaded });
-  assert.deepEqual(countTests(py, "", "", [plan(3), line(3, ["T.test_b"]), end()]), {
+  assert.deepEqual(countTests(py, "", "", [plan(3), line(3, ["T.test_b"]), end()], ut), {
     format: "unittest",
     tests: 3,
     skipped: 1,
@@ -878,7 +905,7 @@ test("countTests reads fork-ci-unittest.py's plan and count lines, node's report
     [plan(2), line(2, [], 1), plan(4), line(4, ["U.test_x", "U.test_y"], 2), end()],
     [plan(4), plan(2), line(2, [], 1), line(4, ["U.test_x", "U.test_y"], 2), end()],
   ])
-    assert.deepEqual(countTests(py, "", "", lines), {
+    assert.deepEqual(countTests(py, "", "", lines, ut), {
       format: "unittest",
       tests: 6,
       skipped: 2,
@@ -889,33 +916,42 @@ test("countTests reads fork-ci-unittest.py's plan and count lines, node's report
     });
   // A test its source defines that no run planned (a class only under a condition, a load_tests that drops it) is a
   // skip by its name; an own run of one class counts only that class's.
-  assert.deepEqual(countTests(py, "", "", [plan(2), line(2), end("Tool.test_a", "Tool.test_b")]), {
-    format: "unittest",
-    tests: 4,
-    skipped: 2,
-    names: ["Tool.test_a", "Tool.test_b"],
-    unloaded: ["Tool.test_a", "Tool.test_b"],
-    failed: 0,
-    note: null,
-  });
+  assert.deepEqual(
+    countTests(py, "", "", [plan(2), line(2), end("Tool.test_a", "Tool.test_b")], ut),
+    {
+      format: "unittest",
+      tests: 4,
+      skipped: 2,
+      names: ["Tool.test_a", "Tool.test_b"],
+      unloaded: ["Tool.test_a", "Tool.test_b"],
+      failed: 0,
+      note: null,
+    },
+  );
   const only = countTests(py, "", "", [plan(1), line(1), end("Tool.test_a", "L.test_b")], {
+    ...ut,
     only: "L",
   });
   assert.deepEqual([only.tests, only.names, only.unloaded], [2, ["L.test_b"], ["L.test_b"]]);
   // A hard stop before the first plan (at import, while it loads): no line at all, whatever its stdout says (a
   // child's ok lines and end line). Not an ok-lines test unless the list says so.
-  for (const how of [{}, { format: "unittest" }]) {
-    const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", [], how);
-    assert.deepEqual([counted.format, counted.tests], ["unittest", null]);
-    assert.match(counted.note, /wrote no line: it stopped hard before its first unittest run/);
-  }
+  const hard = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", [], ut);
+  assert.deepEqual([hard.format, hard.tests], ["unittest", null]);
+  assert.match(hard.note, /wrote no line: it stopped hard before its first unittest run/);
+  // A Python test with no format from the list is never read as either: nothing counts, whatever its lines.
+  for (const lines of [[], [plan(1), line(1), end()], [end()]])
+    for (const how of [{}, { format: null }, { format: "ok" }, { only: "T" }]) {
+      const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", lines, how);
+      assert.deepEqual([counted.format, counted.tests], [null, null], JSON.stringify([lines, how]));
+      assert.match(counted.note, /declares no format for it \("unittest" or "ok lines"\)/);
+    }
   // Its runs ended, then a hard stop before the file's end; or the file ended without a run (sys.exit at import).
   for (const [lines, note] of [
     [[plan(2), line(2)], /runs ended, but the file never reached its end/],
     [[end()], /started no unittest run/],
     [[end("T.test_a")], /started no unittest run/],
   ]) {
-    const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", lines);
+    const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", lines, ut);
     assert.deepEqual([counted.format, counted.tests], ["unittest", null], JSON.stringify(lines));
     assert.match(counted.note, note);
   }
@@ -926,23 +962,23 @@ test("countTests reads fork-ci-unittest.py's plan and count lines, node's report
     [plan(4), plan(2), line(2)],
     [plan(4), end()],
   ]) {
-    const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", lines);
+    const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", lines, ut);
     assert.equal(counted.format, "unittest");
     assert.equal(counted.tests, null);
     assert.match(counted.note, /started but never ended/);
   }
   // Stopped half-way through writing a line, counts without their plan, a count not its plan's, or another shape.
-  assert.equal(countTests(py, "", "", [plan(2), line(2), null]), null);
-  assert.equal(countTests(py, "", "", [line(2)]), null);
-  assert.equal(countTests(py, "", "", [plan(3), line(2)]), null);
-  assert.equal(countTests(py, "", "", [plan(2), { tests: 2, skipped: 1, failed: 0 }]), null);
-  assert.equal(countTests(py, "", "", [{ plan: 2, tests: 2 }, line(2)]), null);
-  assert.equal(countTests(py, "", "", [plan(2), line(2), end(), end()]), null);
-  assert.equal(countTests(py, "", "", [end(), plan(2), line(2)]), null);
-  assert.equal(countTests(py, "", "", [plan(2), line(2), { unloaded: [1] }]), null);
-  assert.equal(countTests(py, "", "", [plan(2), line(2), { unloaded: [], more: 1 }]), null);
+  assert.equal(countTests(py, "", "", [plan(2), line(2), null], ut), null);
+  assert.equal(countTests(py, "", "", [line(2)], ut), null);
+  assert.equal(countTests(py, "", "", [plan(3), line(2)], ut), null);
+  assert.equal(countTests(py, "", "", [plan(2), { tests: 2, skipped: 1, failed: 0 }], ut), null);
+  assert.equal(countTests(py, "", "", [{ plan: 2, tests: 2 }, line(2)], ut), null);
+  assert.equal(countTests(py, "", "", [plan(2), line(2), end(), end()], ut), null);
+  assert.equal(countTests(py, "", "", [end(), plan(2), line(2)], ut), null);
+  assert.equal(countTests(py, "", "", [plan(2), line(2), { unloaded: [1] }], ut), null);
+  assert.equal(countTests(py, "", "", [plan(2), line(2), { unloaded: [], more: 1 }], ut), null);
   // unittest's own summary is never read (a class skip counts once there; stderr may go on after it).
-  assert.equal(countTests(py, "", "Ran 3 tests in 0.01s\n\nOK (skipped=1)\n", []).tests, null);
+  assert.equal(countTests(py, "", "Ran 3 tests in 0.01s\n\nOK (skipped=1)\n", [], ut).tests, null);
   const js = "fork-ci/a.test.cjs";
   const node = (tests, more = {}) => ({
     tests,
@@ -1251,6 +1287,7 @@ test("record keeps what a run was, what its output counted and the skips its tes
         ],
       },
       ["L.test_y", "L.test_x"],
+      "unittest",
     ),
     {
       key: "f --run only L",
@@ -1271,7 +1308,7 @@ test("record keeps what a run was, what its output counted and the skips its tes
       allowed: ["L.test_x", "L.test_y"],
     },
   );
-  // A Python test's format is the list's (none given: unittest), so a hard stop as it loads is never read as ok lines.
+  // A Python test's format is the list's (none given: no count), so a hard stop as it loads is never read as ok lines.
   const printed = {
     status: 0,
     seconds: "1",
@@ -1293,6 +1330,7 @@ test("record keeps what a run was, what its output counted and the skips its tes
     ],
     [null, null, 1],
   );
+  assert.equal(record("p", "fork-ci/p.test.py", null, printed, []).format, null);
   const none = record("f", "fork-ci/f.test.sh", null, { status: 0, seconds: "0.1" }, ["b", "a"]);
   assert.deepEqual(
     [none.own, none.vars, none.tests, none.skipped, none.skipped_tests, none.allowed],
@@ -1464,7 +1502,7 @@ test("a part writes one record of every test it ran, keyed by run, attempt, job 
       "      - run: node .github/scripts/fork-ci-tests.cjs --run fork-ci/own.test.py\n",
   };
   const list =
-    "fork-ci/a.test.sh\nfork-ci/b.test.sh\nfork-ci/own.test.py run by .github/workflows/fork-tests.yml\n";
+    "fork-ci/a.test.sh\nfork-ci/b.test.sh\nfork-ci/own.test.py run by .github/workflows/fork-tests.yml unittest\n";
   const { run, records, cleanup } = runRecording(tests, ["fork-ci/"], list, {
     FORK_CI_TEST_SHARD: "2/2",
   });
@@ -1513,7 +1551,7 @@ test("a part fails on a skip its test does not declare or a declared one that ra
     const { run, records, cleanup } = runRecording(
       { "fork-ci/s.test.py": head + SKIPPING_PY },
       [],
-      "fork-ci/s.test.py",
+      "fork-ci/s.test.py unittest",
     );
     try {
       assert.equal(run.status, status, head + run.stdout + run.stderr);
@@ -1634,7 +1672,7 @@ test("a class or module skip counts every test it skips, by name, so a skipped c
     const { run, records, cleanup } = runRecording(
       { "fork-ci/c.test.py": text },
       [],
-      "fork-ci/c.test.py",
+      "fork-ci/c.test.py unittest",
     );
     try {
       assert.equal(run.status, status, text + run.stdout + run.stderr);
@@ -1660,7 +1698,7 @@ test("a Python test run through the shim imports its own folder's modules and se
       "if __name__ == '__main__':\n" +
       "    unittest.main()\n",
   };
-  const { run, records, cleanup } = runRecording(tests, [], "fork-ci/i.test.py");
+  const { run, records, cleanup } = runRecording(tests, [], "fork-ci/i.test.py unittest");
   try {
     assert.equal(run.status, 0, run.stdout + run.stderr);
     assert.equal(Object.values(readRecords(records))[0].results[0].tests, 3);
@@ -1919,8 +1957,8 @@ test("a part's owed list is its plan (its shard's tests), not what came back fro
 });
 
 // One test file run as a listed part test, recording: [exit status, its record, the part's stdout]. `line`: its line
-// in the list.
-function recordOf(file, text, more = {}, line = file) {
+// in the list (a Python test's says "unittest" unless given).
+function recordOf(file, text, more = {}, line = file.endsWith(".py") ? `${file} unittest` : file) {
   const { run, records, cleanup } = runRecording({ [file]: text, ...more }, [], line);
   try {
     return [run.status, Object.values(readRecords(records))[0].results[0], run.stdout + run.stderr];
@@ -2002,7 +2040,7 @@ test("a Python test that stops before its first unittest run counts nothing, wha
     ["os._exit(0)", /wrote no line: it stopped hard before its first unittest run/],
     ["sys.exit(0)", /started no unittest run/],
   ]) {
-    const [status, r, out] = recordOf(file, STOPS_AS_IT_LOADS(exit));
+    const [status, r, out] = recordOf(file, STOPS_AS_IT_LOADS(exit), {}, `${file} unittest`);
     assert.equal(status, 1, exit + out);
     assert.deepEqual([r.format, r.tests], ["unittest", null], exit);
     assert.match(r.note, note, exit);
@@ -2025,7 +2063,12 @@ test("a Python test that prints ok lines is read by them only where the list say
   );
   assert.equal(status, 0, out);
   assert.deepEqual([r.format, r.tests, r.skipped_tests, r.note], ["ok lines", 2, ["net"], null]);
-  const [status2, r2] = recordOf(file, "# fork-ci: may skip net\n" + OK_LINES_PY);
+  const [status2, r2] = recordOf(
+    file,
+    "# fork-ci: may skip net\n" + OK_LINES_PY,
+    {},
+    `${file} unittest`,
+  );
   assert.equal(status2, 1);
   assert.deepEqual([r2.format, r2.tests], ["unittest", null]);
   assert.match(
@@ -2040,13 +2083,78 @@ test("a Python test that prints ok lines is read by them only where the list say
   const plain = "print('ok one')\nprint('all passed: 1 ok, 0 skipped')\n";
   for (const [line, status4, format] of [
     [`${file} run by .github/workflows/fork-tests.yml ok lines`, 0, "ok lines"],
-    [`${file} run by .github/workflows/fork-tests.yml`, 1, "unittest"],
+    [`${file} run by .github/workflows/fork-tests.yml unittest`, 1, "unittest"],
   ]) {
     const { run, records, cleanup } = runRecording({ [file]: plain }, ["--run", file], line);
     try {
       assert.equal(run.status, status4, line + run.stdout + run.stderr);
       const r = Object.values(readRecords(records))[0].results[0];
       assert.deepEqual([r.key, r.format, r.tests], [`${file} --run`, format, status4 ? null : 1]);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+// A unittest file that stops hard as it loads, before any unittest run: no shim line, nothing on stdout.
+const EXITS_AT_IMPORT =
+  "import os\n" +
+  "os._exit(0)\n" +
+  "import unittest\n" +
+  "class T(unittest.TestCase):\n" +
+  "    def test_a(self): pass\n" +
+  "unittest.main()\n";
+
+test("each listed Python test declares its format and is judged by it alone; none declared is refused (#702)", () => {
+  const file = "fork-ci/d.test.py";
+  // What a record says, without its time: a run again must give the same.
+  const verdict = ([status, r]) => [status, r.format, r.tests, r.skipped_tests, r.note];
+  // Declared unittest, it stops as it loads: no plan line, red; the same again on a second run.
+  const first = verdict(recordOf(file, EXITS_AT_IMPORT, {}, `${file} unittest`));
+  assert.deepEqual(first.slice(0, 4), [1, "unittest", null, []]);
+  assert.match(first[4], /wrote no line: it stopped hard before its first unittest run/);
+  assert.deepEqual(verdict(recordOf(file, EXITS_AT_IMPORT, {}, `${file} unittest`)), first);
+  // Declared ok lines, an ok-lines file passes, by its own count, again on a second run.
+  const ok = verdict(
+    recordOf(file, "# fork-ci: may skip net\n" + OK_LINES_PY, {}, `${file} ok lines`),
+  );
+  assert.deepEqual(ok, [0, "ok lines", 2, ["net"], null]);
+  assert.deepEqual(
+    verdict(recordOf(file, "# fork-ci: may skip net\n" + OK_LINES_PY, {}, `${file} ok lines`)),
+    ok,
+  );
+  // A declared format the file does not keep is red, either way round.
+  for (const [text, line, format, note] of [
+    [OK_LINES_PY, `${file} unittest`, "unittest", /started no unittest run/],
+    [SKIPPING_PY, `${file} ok lines`, "ok lines", /says it prints ok lines, but it ran unittest/],
+    [EXITS_AT_IMPORT, `${file} ok lines`, "ok lines", /stopped before its end \(a hard exit/],
+  ]) {
+    const [status, r, out] = recordOf(file, text, {}, line);
+    assert.equal(status, 1, line + out);
+    assert.deepEqual([r.format, r.tests], [format, null], line);
+    assert.match(r.note, note, line);
+  }
+  // No format declared: the list is refused, with what to write, before any test runs (MARKS/ran stays absent).
+  for (const line of [file, `${file} ~20s`, `${file} run by .github/workflows/fork-tests.yml`]) {
+    const tests = {
+      [file]:
+        "import os\nopen(os.path.join(os.environ['MARKS'], 'ran'), 'w').close()\n" + OK_LINES_PY,
+      "fork-ci/a.test.sh": 'echo "ok a"\n' + END(1),
+    };
+    const { root, run, records, cleanup } = runRecording(
+      tests,
+      line.includes("run by") ? ["--run", file] : [],
+      `fork-ci/a.test.sh\n${line}`,
+    );
+    try {
+      assert.equal(run.status, 1, line + run.stdout + run.stderr);
+      assert.match(
+        run.stderr,
+        /fork-ci-tests\.txt: ".*d\.test\.py.*": a Python test says its format at the end of its line: "unittest"/,
+        line,
+      );
+      assert.equal(fs.existsSync(path.join(root, "ran")), false, line);
+      assert.equal(fs.existsSync(path.join(records, "records")), false, line);
     } finally {
       cleanup();
     }
@@ -2123,7 +2231,7 @@ test("an own run of one class counts that class's unloaded tests only", () => {
     "class M(unittest.TestCase):\n" +
     "    def test_m(self): pass\n" +
     "unittest.main()\n";
-  const list = `${file} run by .github/workflows/fork-tests.yml`;
+  const list = `${file} run by .github/workflows/fork-tests.yml unittest`;
   for (const [cond, status, skipped] of [
     ["True", 0, []],
     ["False", 1, ["L.test_b"]],
@@ -2390,7 +2498,7 @@ test("--run refuses what it may not run, and an own run may skip no test", () =>
     "fork-ci/part.test.sh",
     "fork-ci/other.test.sh run by .github/workflows/fork-other.yml",
     "fork-ci/bad.test.sh run by .github/workflows/fork-tests.yml",
-    "fork-ci/skip.test.py",
+    "fork-ci/skip.test.py unittest",
     "fork-ci/gone.test.sh",
   ].join("\n");
   const refused = [

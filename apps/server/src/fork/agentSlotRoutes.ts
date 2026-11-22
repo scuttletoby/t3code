@@ -401,7 +401,7 @@ const CurrentDirectDelivery = Context.Reference<DirectDelivery | undefined>(
  * Places in the gate's line (`SlotGate.SlotPlace`): a scheduled run that waits keeps one per task,
  * at its due time; a webhook delivery one per delivery, at the time it was stored (direct: its
  * first ask). Each leaves when its run starts (the gate), when it is given up or its task deleted
- * (`waitForWebhookSlot`, and `leaveEndedPlaces` every 5 s).
+ * (`waitForWebhookSlot`, and `leaveEndedPlaces` every 5 s), or refused for its profile (`admitRun`).
  */
 const SCHEDULED_PLACE = "scheduled-run:";
 const DELIVERY_PLACE = "webhook-delivery:";
@@ -897,9 +897,10 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
     // A new thread wider than the profile the task was saved with starts nothing: on its schedule
     // a failed run with the reason (moved to its next time), "run now" fails, a webhook skips.
     const profileRefusal = task.threadId === null ? yield* profiles.runRefusal(task) : null;
-    // Refused for its profile, a place it had from an earlier ask goes at the next sweep (its task
-    // is no longer due, its delivery no longer pending: `leaveEndedPlaces`).
+    // Refused for its profile, a place it had from an earlier ask (a stored delivery's first,
+    // direct ask) leaves now: left until the sweep, it would refuse another run a free slot.
     if (profileRefusal !== null) {
+      if (trigger !== "manual" && Option.isSome(gate)) yield* leave(yield* placeOf(task, trigger));
       if (trigger === "manual") {
         return yield* new ScheduledTaskError({ message: profileRefusal, taskId: task.id });
       }

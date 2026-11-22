@@ -7,9 +7,11 @@ What the lenses attack, one test each: T3 down or not installed (the kernel stil
 (unlabelled = writer), every heavy ticket a job (unknown kinds: the job default, up to the job ceiling), other
 users' jobs and agents, the Basic tier (never free), an unreadable signal (elevated, never ok), container limits,
 reservations (own folder, other folder, sibling folder, with and without '/', through a link, ended, broken,
-missing), the state question (a second call within 5 s, an old, future, broken, empty, foreign or other-settings
-cache, no cache folder at all, a writer stopped half-way, a broken cost file), two callers at once, and a caller
-whose `heavy facts` is slow or fails (5 s, never free). Expected numbers come from capacity-rule.json, never copied
+missing, cut short, their processes gone), the machine file's holds (in use or not, its own users, missing or
+unreadable cgroup files, a missing, empty, broken or changed machine file), the state question (a second call
+within 5 s, an old, future, broken, empty, foreign or other-settings cache, no cache folder at all, a writer
+stopped half-way, a broken cost file), two callers at once, and a caller whose `heavy facts` is slow or fails (5 s,
+never free). Expected numbers come from capacity-rule.json, never copied
 here. RedCheck takes fix lines out of a copy of lib/heavy_facts.py and shows their tests fail.
 """
 import contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess
@@ -67,6 +69,8 @@ class Machine:
         self.held = []
         for d in (self.home, os.path.join(self.queue, 'heavy.slice'), self.reserve, os.path.dirname(self.cache)):
             os.makedirs(d)
+        os.makedirs(self.root, mode=0o755)
+        os.chmod(self.root, 0o755)      # the machine file's folders on the way: never group-writable (umask 002)
         self.write('/proc/meminfo', self.meminfo(16384, 12288))
         self.write('/proc/pressure/memory', CALM)
         self.write('/proc/loadavg', '1.50 1.00 0.50 2/300 4000\n')
@@ -295,6 +299,137 @@ class Reservations(Case):
         d = self.facts()[1]
         self.assertEqual(d['memory']['holdMb'], 0)
         self.assertIn('cannot be read', d['notes'][0])
+
+
+    def test_a_reservation_file_cut_short_holds_its_whole_lines(self):
+        other = os.path.join(self.tmp, 'other')
+        with open(os.path.join(self.m.reserve, 'half.conf'), 'w') as f:
+            f.write(f'1000 {other}/\n20')               # its writer stopped half-way through the second line
+        d = self.facts('--mb', '64')[1]
+        self.assertEqual(d['memory']['holdMb'], 1000)
+        self.assertEqual([n.split(' ')[1] for n in d['notes']], ['half.conf:2'])
+
+    def test_a_reservation_whose_processes_are_gone_still_holds_it_all(self):
+        other = os.path.join(self.tmp, 'other')
+        self.m.process(4001, other, 300)
+        with open(os.path.join(self.m.reserve, 'game.conf'), 'w') as f:
+            f.write(f'2000 {other}/\n')
+        self.assertEqual(self.facts('--mb', '64')[1]['memory']['holdMb'], 1700)
+        shutil.rmtree(f'{self.m.root}/proc/4001')    # its process ended: the room is still kept for it
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 2000)
+
+
+class Holds(Case):
+    """heavy.capacity.holds of the machine file: a cgroup outside the user managers (here a CI runners' slice) that
+    is in use keeps its budget less its use for every other user."""
+    CG = '/sys/fs/cgroup/ci.slice/ci-runners.slice'
+
+    def machine_file(self, data, mode=0o644):
+        path = self.m.root + '/etc/fork-kit/machine.json'
+        for folder in ('/etc', '/etc/fork-kit'):
+            os.makedirs(self.m.root + folder, exist_ok=True)
+            os.chmod(self.m.root + folder, 0o755)
+        with open(path, 'w') as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+        os.chmod(path, mode)
+
+    def holds(self, *holds):
+        self.machine_file({'version': 1, 'heavy': {'capacity': {'holds': list(holds)}}})
+
+    def runners(self, anon_mb, limit='4294967296'):
+        self.m.write(self.CG + '/memory.stat', f'anon {anon_mb * MB}\nshmem 0\n')
+        if limit is not None:
+            self.m.write(self.CG + '/memory.max', f'{limit}\n')
+
+    def held(self, *args):
+        code, d = self.facts('--mb', '64', '--fresh', *args)
+        return code, d, {r['name']: (r['mb'], r['useMb']) for r in d['reservations']} if d else None
+
+    def test_a_cgroup_in_use_holds_its_budget_less_its_use(self):
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'})
+        self.runners(2000)
+        code, d, held = self.held()
+        self.assertEqual((code, held), (0, {'ci-slice': (4096, 2000)}))
+        self.assertEqual(d['memory']['holdMb'], 4096 - 2000)
+        self.runners(1000)                          # at most inUseFromMb (1024): idle, holds nothing
+        self.assertEqual(self.held()[2], {})
+        self.runners(5000)                          # more than its budget: holds nothing more
+        code, d, held = self.held()
+        self.assertEqual((held, d['memory']['holdMb']), ({'ci-slice': (4096, 5000)}, 0))
+        self.runners(2000, 'max')                   # no limit: the hold's budgetMb (6144)
+        self.assertEqual(self.held()[2], {'ci-slice': (6144, 2000)})
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice', 'budgetMb': 3000, 'inUseFromMb': 0})
+        self.assertEqual(self.held()[2], {'ci-slice': (3000, 2000)})
+
+    def test_its_own_users_the_missing_cgroup_and_unreadable_files(self):
+        me = hf.user_name()
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice', 'users': ['nobody-*', me[:1] + '*']})
+        self.runners(2000)
+        self.assertEqual(self.held()[2], {}, 'a hold is never held back from its own users')
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'})
+        shutil.rmtree(self.m.root + self.CG)
+        code, d, held = self.held()
+        self.assertEqual((code, held), (0, {}), 'no cgroup: nothing runs in it (also a machine without cgroup v2)')
+        self.runners(2000, limit=None)              # memory.max cannot be read: the hold's budgetMb
+        code, d, held = self.held()
+        self.assertEqual(held, {'ci-slice': (6144, 2000)})
+        self.assertTrue(any(n.startswith('hold ci-slice: its memory.max') for n in d['notes']), d['notes'])
+        self.m.write(self.CG + '/memory.stat', 'anon 1')   # cut short: no shmem line, so its use is not known
+        code, d, held = self.held()
+        self.assertEqual(held, {'ci-slice': (6144, 0)}, 'use not known: the whole budget is held')
+        self.assertTrue(any('memory.stat cannot be read' in n for n in d['notes']), d['notes'])
+
+    def test_the_machine_file_missing_empty_or_broken(self):
+        self.runners(2000)
+        for data in (None, {'version': 1}, {'version': 1, 'heavy': {}}, {'version': 1, 'heavy': {'queue': {}}},
+                     {'version': 1, 'heavy': {'capacity': {}}}):
+            if data is not None:
+                self.machine_file(data)
+            code, d, held = self.held()
+            self.assertEqual((code, held), (0, {}), data)
+        hold = {'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'}
+        for data, mode in (('', 0o644), ('{"version": 1, "heavy": {"capac', 0o644),
+                           ({'version': 1, 'heavy': {'capacity': {'holds': [hold]}}}, 0o666),
+                           ({'version': 1, 'heavy': {'capacity': {'holds': [hold, hold]}}}, 0o644),
+                           ({'version': 1, 'heavy': {'capacity': {'holds': [dict(hold, cgroup='user.slice/x')]}}},
+                            0o644),
+                           ({'version': 1, 'heavy': {'capacity': {'holds': [dict(hold, cgroup='a/../b')]}}}, 0o644),
+                           ({'version': 1, 'heavy': {'capacity': {'holds': [dict(hold, budget=1)]}}}, 0o644),
+                           ({'version': 1, 'heavy': {'capacity': {'holds': [{'label': 'x'}]}}}, 0o644),
+                           ({'version': 1, 'heavy': {'capacity': {'holds': [hold] * 9}}}, 0o644),
+                           ({'version': 1, 'heavy': {'capacity': {'slots': 2}}}, 0o644)):
+            self.machine_file(data, mode)
+            self.assertEqual(self.facts('--fresh'), (1, None), data)    # never free on a broken machine file
+        code, out, err = self.cli([T3CAP, '64'])
+        self.assertEqual(code, 1)
+        self.assertRegex(out.splitlines()[-1], r'^NOT OK: heavy facts: .*heavy\.capacity')
+
+    def test_a_changed_machine_file_is_read_again_within_5_s(self):
+        self.runners(2000)
+        self.assertEqual(self.facts('--mb', '64')[1]['reservations'], [])
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'})
+        self.assertEqual([r['name'] for r in self.facts('--mb', '64')[1]['reservations']], ['ci-slice'])
+
+    def test_t3_capacity_shows_the_hold(self):
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'})
+        self.runners(2000)
+        code, out, _ = self.cli([T3CAP, '64'])
+        self.assertEqual(code, 0, out)
+        self.assertIn('available=10192MB', out.splitlines()[0])
+        self.assertEqual(out.splitlines()[1], 'reservations: ci-slice:4096MB(using 2000,holding 2096)')
+
+    def test_the_example_machine_file_is_accepted(self):
+        with open(os.path.join(os.path.dirname(KIT), 'common', 'machine.example.json')) as f:
+            self.machine_file(f.read())
+        self.assertEqual(self.facts('--fresh')[0], 0)
+        self.assertEqual([h['label'] for h in hf.capacity_settings(
+            hq.machine_file, hq.SECTION, self.m.root + '/etc/fork-kit/machine.json', os.getuid())['holds']],
+            ['ci-slice'])
+
+    def test_the_sweep_and_the_queue_accept_the_capacity_part(self):
+        sweep = load_module('heavy_sweep', os.path.join(KIT, 'lib', 'heavy_sweep.py'))
+        self.assertIn('capacity', sweep.SECTION_SPEC)
+        self.assertIn('capacity', hq.SECTION)
 
 
 class State(Case):
@@ -709,6 +844,15 @@ class RedCheck(Case):
             self.assertGreater(self.failing(Folders, name, mod), 0, line)
             self.assertEqual(self.failing(Folders, name, hf), 0, name)
 
+
+    def test_without_the_in_use_or_own_user_rule_the_hold_tests_fail(self):
+        for line, name in (("            continue                                # not in use\n",
+                             'test_a_cgroup_in_use_holds_its_budget_less_its_use'),
+                           ("            continue                                # the caller's own budget is not "
+                            "held back from it\n", 'test_its_own_users_the_missing_cgroup_and_unreadable_files')):
+            mod = self.broken(line, '            pass\n')
+            self.assertGreater(self.failing(Holds, name, mod), 0, line)
+            self.assertEqual(self.failing(Holds, name, hf), 0, name)
 
 if __name__ == '__main__':
     unittest.main()
