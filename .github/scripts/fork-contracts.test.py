@@ -1095,7 +1095,7 @@ fi
 # new run does, so the reset run's record or the empty one. It sees only the reset runs listed.
 if [[ -n "$self" ]]; then
   while read -r id sha kind; do
-    [[ "$kind" == reset && "$id" =~ ^[1-9][0-9]{0,17}$ ]] && (( id > GITHUB_RUN_ID )) || continue
+    [[ "$kind" == reset && "$id" =~ ^[1-9][0-9]{0,17}$ && "$id" -gt "$GITHUB_RUN_ID" ]] || continue
     echo "::warning title=Secret scan::this re-run's run started before sweep run $id, a reset run (input reset_record), so its own earlier attempt's record, from before that reset, is not read: it reads as a new run does" >&2
     self=""
     break
@@ -3294,7 +3294,7 @@ for what, old, new in (
     ("this run's own skip", '[[ "$id" != "$GITHUB_RUN_ID" || "$id $sha" == "$self" ]] || continue', ":"),
     ("a re-run from before a reset run reads as a new run (#992)", '    self=""\n    break\n', "    break\n"),
     ("the reset run's kind in the re-run check (#992)", '[[ "$kind" == reset && "$id" =~ ^[1-9]', '[[ "$id" =~ ^[1-9]'),
-    ("the higher run id in the re-run check (#992)", "&& (( id > GITHUB_RUN_ID )) ||", "||"),
+    ("the higher run id in the re-run check (#992)", ' && "$id" -gt "$GITHUB_RUN_ID" ]] ||', " ]] ||"),
     ("a re-run's own first attempt first (#703)", 'done <<< "$self"$\'\\n\'"$runs"', 'done <<< "$runs"'),
     ("the first attempt's check (#703)", '[[ "${GITHUB_RUN_ATTEMPT:-1}" != 1 \\', "[[ true \\"),
     ("the sweep's own workflow check for a re-run (#703)",
