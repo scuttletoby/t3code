@@ -525,8 +525,9 @@ wiring). Fields, each with its default:
   cannot start, or no answer within 5 seconds means not available, with the reason. The machine
   that runs it checks the path again on its own OS first and runs it with no arguments; on Windows
   only an `.exe` runs, since a `.cmd`, `.bat` or script needs a shell, and that holds for the file
-  the server's lookup would start, not only the text (with `.EXE` missing from PATHEXT, a
-  `facts.exe` path finds a planted `facts.exe.CMD`, which is refused). A failed run's reason is the
+  the server's lookup would start, not only the text. A Windows server whose PATHEXT has no `.EXE`
+  refuses every `factsCommand`: its lookup would try `facts.exe` plus each PATHEXT ending, so a
+  `facts.exe.CMD` planted after the check could run through a shell. A failed run's reason is the
   first line of its error output, else of its output. The runner is in the fork
   (`apps/server/src/fork/factsCommand.ts`); placement row P4 wires it into the facts read.
 - `never`: `[]`. Label groups that must not meet on one machine, such as
