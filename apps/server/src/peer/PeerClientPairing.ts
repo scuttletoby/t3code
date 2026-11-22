@@ -22,6 +22,7 @@ import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiClient from "effect/http-api/HttpApiClient";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import * as ForkRevokeCheck from "../fork/peerLinkRevokeCheck.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 
@@ -244,6 +245,7 @@ const make = Effect.gen(function* () {
           HttpClientError: () => Effect.succeed(unsupported("unreachable", peer.link.label)),
           TimeoutError: () => Effect.succeed(unsupported("unreachable", peer.link.label)),
         }),
+        Effect.tapError(ForkRevokeCheck.onUnauthorized(links, httpClient, peer)),
         Effect.orElseSucceed(() => unsupported("refused", peer.link.label)),
       );
   });

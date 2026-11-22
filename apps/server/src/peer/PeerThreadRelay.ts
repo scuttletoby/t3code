@@ -26,6 +26,7 @@ import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import type * as HttpClientResponse from "effect/http/HttpClientResponse";
 
+import * as ForkRevokeCheck from "../fork/peerLinkRevokeCheck.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 
@@ -201,6 +202,7 @@ const make = Effect.gen(function* () {
       yield* links.recordOutcome(input.environmentId, {
         error: failure.reason === "thread_not_found" ? null : failure.message,
       });
+      if (response.status === 401) yield* ForkRevokeCheck.confirm(links, httpClient, resolved);
       return yield* failure;
     }
     yield* links.recordOutcome(input.environmentId, { error: null });
