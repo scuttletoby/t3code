@@ -88,7 +88,10 @@ Refused:
   - each script of the machine file's actionsDisable.refuseScripts run with its flag (a project tool that
     disables workflows itself: {"name": "garden.py", "flag": "--fix", "why": "disables ..."}), where the file is real;
     and a line that calls one in a file whose text goes on (sed e, `cat f | bash`, eval "$(cat f)", `$(cat f)`,
-    `cat f | heavy bash`, `cat f | at now` ..)
+    `cat f | heavy bash`, `cat f | at now` ..). One rule follows what runs: a file's lines reach a program that runs
+    its input (a shell, also `sudo -s` or a bare interpreter, `bash -c "$(< f)"`, `xargs -L1 env`) through any
+    filters (`sort f | bash`, `nl f | cut -f2 | bash`), or a program that runs the lines it reads (awk system() or
+    a pipe to a command, perl/ruby system/qx); writes by sed -f / awk -f scripts and rsync count as copies
   - a GraphQL call whose query (or a field name that can be `query`) the guard cannot read
   - a command the guard cannot finish reading in time
 Passes: reads (GET), gh workflow enable/list/view/run, PUT .../enable, searching and writing text about all this
@@ -108,8 +111,9 @@ Known over-refusals (harmless, but not provable from the text; the message says 
   - a code file too big to read whole, as an argument of a tool the guard does not know (`gzip -c big.js`): pipe
     it in (`cat big.js | gzip`)
   - an exported variable or a `VAR=.. command` prefix that carries a token
-  - a file that only mentions a refuseScripts line, piped or substituted into a program that reads it as data
-    (`cat msg.md | python3 tools/check.py`): give it as a redirect (`python3 tools/check.py < msg.md`)
+  - a file that only mentions a refuseScripts line, piped or substituted into a program that may run what it
+    reads (a bare `python3`, `ssh host` with no command, a pipe that ends in a shell); into a script, a pager, a
+    compressor, `ssh host CMD` or `claude -p` it passes (issue 999): give it as a redirect (`prog < msg.md`)
   - a GraphQL body piped into gh (`echo '{..}' | gh api graphql --input -`): use `--input - <<< '{..}'` or -f query=
   - a GraphQL query from a variable or command output, also a read (`-f query="$(cat q.graphql)"`): use
     `-F query=@q.graphql`; a $variable inside "quotes" in the query (an id) is fine
@@ -118,7 +122,7 @@ Known over-refusals (harmless, but not provable from the text; the message says 
     same command: the owner marker, or write the body file in a command before
 
 Not covered (a text guard cannot): a value hidden in a variable, file or command output that the command gets at
-run time (a download, base64, a file renamed by a tool other than cp/mv/ln/install/dd, awk -f programs), code
+run time (a download, base64, a file renamed by a tool other than cp/mv/ln/install/dd/rsync or a sed/awk program), code
 that builds the words at run time or loads them from another file (import, require), a file of commands that is no
 shell script and does not look like code, written by an earlier command and handed to a tool the guard does not
 know (`at -f job.txt`, `make -f x.mk`, a Makefile, package.json scripts), a gh copy made by an earlier command when
@@ -975,11 +979,11 @@ def hits(tok, kind):
         if rx.search(f):
             return 2
         g = PLACEHOLDER.sub(HID, f)
-        if hidden(g):
-            path = url_path(g)
-            segs = [x.lower() for x in path.split('/') if x]
-            if any(seg_match(segs, pat, more) for pat, more in pats):
-                best = 1
+        if hidden(g):   # also cut at each hidden or glob part: an unquoted `?` may start the query string
+            for path in path_cuts(url_path(g)):
+                segs = [x.lower() for x in path.split('/') if x]
+                if rx.search(path) or any(seg_match(segs, pat, more) for pat, more in pats):
+                    best = 1
     return best
 
 
@@ -3138,8 +3142,9 @@ def data_token(tok, ctx, runs=False):
     command itself runs it, sed e), is a file read in pieces and counts when unread (file_token). A line that calls
     a refuseScripts entry counts wherever the text goes on, as any guarded token does: the guard cannot tell every
     place that runs it (`$(cat f)`, `| heavy bash`, `| bash /dev/stdin`, `| at now`, `| awk '{system($0)}'` ..), so
-    `cat msg.md | python3 check.py` is refused too, and the refusal names the way out (`< msg.md`). A copy under a
-    name the text runs is read where it is written (segment_reason)."""
+    a text that goes only into a program that reads it as data (ctx quiet: `| python3 check.py`, `| gzip`, see
+    ends_text) passes; elsewhere the refusal names the way out (`< msg.md`). A copy under a name the text runs is
+    read where it is written (segment_reason)."""
     runs = runs or ctx.get('feeds_code')
     for d in [] if hidden(tok) else folders(ctx):
         p = resolve_path(tok, d)
@@ -3149,7 +3154,7 @@ def data_token(tok, ctx, runs=False):
             return t
         # the whole text is read (the cache holds no text): only when the cached names found nothing and the
         # machine names a script at all
-        t = REFUSE_SCRIPTS and f['text'] and refuse_script_named(body(p, ctx))
+        t = REFUSE_SCRIPTS and f['text'] and (runs or not ctx.get('quiet')) and refuse_script_named(body(p, ctx))
         if t:
             return t
     return None
@@ -3159,6 +3164,7 @@ def refuse_script_named(text):
     """A machine file refuseScripts entry that a line of the text calls (its name and its flag as words on one line,
     `python3 garden.py --fix`), as a label for unproven(), or None. Text that a shell runs (sed e, cat f | bash,
     eval "$(cat f)") would run it, as the same line in a script does."""
+    text = re.sub(r'\\\r?\n', '', text) if text else text   # a line split by backslash-newline is one line
     for rs in REFUSE_SCRIPTS if text else ():
         rx = r'(?<![\w.-])%s(?![\w.-])[^\n]*?(?<![\w-])%s(?![\w-])' % (re.escape(rs['name']), re.escape(rs['flag']))
         if re.search(rx, text):
@@ -3269,13 +3275,14 @@ def data_gate(word, args, ctx, own, fed, loose):
         r = segment_reason([prog, WILD], dict(ctx, stdin=None, cmd={}, leak=False, targets=()), loose)
         if r:
             return r
-    if word in COPIERS:
+    if word in COPIERS or word == 'rsync':
         r = into_path_reason(args, ctx)
         if r:
             return r
     tok, moved = own or fed, False
-    if not tok and (ctx.get('leak') and word in READERS or word in COPIERS):
-        # cat x | ..: the file's text goes on; cp x run.sh: it gets a name the next word may run
+    if not tok and (ctx.get('leak') and (word in READERS or ctx.get('feeds_code')) or word in COPIERS):
+        # cat x | ..: the file's text goes on; cp x run.sh: it gets a name the next word may run; sort x | bash,
+        # nl x | cut -f2 | bash: whatever the filter, the text a shell runs comes from the files it reads
         tok = next((t for t in (data_token(a, ctx) for a in args if not a.startswith('-')) if t), None)
         moved = word in COPIERS
     targets = list(ctx.get('targets', ())) + (args if word in WRITERS else [])
@@ -3350,6 +3357,72 @@ def interp_files(kind, args, pos, ctx):
                 out += found
                 break
     return out
+
+
+AWK_STRING = r'"(?:[^"\\\n]|\\.)*"'   # an awk "string" literal
+# awk calls that run a command built from what it reads: system(EXPR) and print | EXPR, EXPR | getline (not a
+# "literal" alone), a coprocess |&
+AWK_RUNS = re.compile(r'\bsystem\s*\((?!\s*%s\s*\))|(?<!\|)\|&?(?!\|)\s*(?!getline\b)(?=[A-Za-z_$(])'
+                      r'|[\w$)\]]\s*\|&?\s*getline\b' % AWK_STRING)
+PERL_RUNS = re.compile(r'\b(?:system|exec|qx|spawn|popen|eval|open|IO\.popen|Open3)\b|`|%x')   # perl and ruby
+
+
+def code_args(args, perl):
+    """perl/ruby arguments: (-e code, perl -E code, input files: the words after it, which -n/-p and <>/ARGF read)."""
+    code, inputs, i, ended = [], [], 0, False
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if ended or a == '-' or not a.startswith('-'):
+            inputs.append(a)
+            if not code:   # no -e: the first word is the script file
+                return code, []
+        elif a == '--':
+            ended = True
+        else:
+            for j, ch in enumerate(a[1:], 1):   # a cluster: -lne CODE, -I lib
+                if ch == 'e' or ch == 'E' and perl:
+                    value = a[j + 1:]
+                    if not value:
+                        value, i = (args[i] if i < len(args) else ''), i + 1
+                    code.append(value)
+                    break
+                if ch in 'IMmrCxFi' or ch == 'E' and not perl:   # the rest of the word is the value (or the
+                    if j == len(a) - 1 and ch in 'IMmrE':          # next word for -I lib, -r lib, ruby -E enc)
+                        i += 1
+                    break
+    return code, inputs
+
+
+def input_runs_reason(kind, args, ctx):
+    """awk '{system($0)}' q.txt, awk '{print | "sh"}' q.txt, perl -ne 'system $_' q.txt: the lines of the input
+    files run as commands, as in `cat q.txt | sh`. A "command" awk pipes its text into is read as that pipe
+    (`cat q.txt | sort -u` passes), a system("command") as shell text."""
+    if kind in AWKS:
+        progs, _, inputs, unread = awk_args(args, ctx)
+        runs = unread or any(AWK_RUNS.search(p) for p in progs)
+        for prog in progs:
+            for m in re.finditer(r'\bsystem\s*\(\s*(%s)\s*\)' % AWK_STRING, prog):
+                r = decide_text(m.group(1)[1:-1], dict(ctx, stdin=None, cmd={}, leak=False, targets=()))
+                if r:
+                    return r
+            for m in re.finditer(r'\|&?\s*(%s)' % AWK_STRING, prog):
+                for f in [a for a in inputs if a != '-' and not hidden(a)][:8]:
+                    r = decide_text(f'cat {shlex.quote(f)} | {m.group(1)[1:-1]}',
+                                    dict(ctx, stdin=None, cmd={}, leak=False, targets=()))
+                    if r:
+                        return r
+    elif os.path.basename(kind).startswith(('perl', 'ruby')):
+        code, inputs = code_args(args, os.path.basename(kind).startswith('perl'))
+        runs = any(PERL_RUNS.search(c) for c in code)
+    else:
+        return None
+    for f in inputs if runs else ():
+        tok = f != '-' and data_token(f, ctx, runs=True)
+        if tok:
+            return unproven(tok, f'in the file {redact(f)}, whose lines `{kind}` runs as commands (system, a pipe '
+                                 'to a command, qx)')
+    return None
 
 
 def launcher_gate(toks, h, ctx, own, fed, loose):
@@ -3703,7 +3776,7 @@ def segment_reason(toks, ctx, loose):
         said = toks[h + 1:]
         filed, made = [], []
         if kind in READERS | COPIERS | FILE_WRITERS and kind != 'tee':   # cat p.txt > x.sh, cp p.txt x.sh: the
-            srcs = file_writes(toks, h)[1] if kind in FILE_WRITERS else said   # files are the script
+            srcs = file_writes(toks, h, ctx)[1] if kind in FILE_WRITERS else said   # files are the script
             for a in (a for a in srcs if not a.startswith('-') and not hidden(a)):
                 text = read_named(a, ctx)
                 tok = text is None and named_file(a, ctx)
@@ -3739,8 +3812,16 @@ def segment_reason(toks, ctx, loose):
     if h is None:
         if own and exported(toks, flow):
             flow['env'] = own
-        if 'shell' in via and ctx.get('stdin') is None:
+        if ('shell' in via or bare_shell(toks)) and ctx.get('stdin') is None:
             flow['unknown'] = 'a shell that reads a pipe or a file the guard cannot read'
+        if xargs_runs_words(toks, via):   # cat f | xargs -L1 env, xargs -a f sh -c: the words read are run
+            flow['unknown'] = 'xargs that runs the words it reads'
+            for i, t in enumerate(toks):
+                name = t.partition('=')[2] if t.startswith('--arg-file=') else \
+                    (toks[i + 1] if t in ('-a', '--arg-file') and i + 1 < len(toks) else '')
+                tok = name and data_token(name, ctx, runs=True)
+                if tok:
+                    return unproven(tok, 'in the file whose words `xargs` runs as commands (-a/--arg-file)')
         return None
     if (ctx.get('cmd') or {}).get('pat') and not own:   # a `case` pattern, not a command
         return None
@@ -3784,6 +3865,9 @@ def segment_reason(toks, ctx, loose):
         if own or fed:
             return unproven(own or fed, f'in inline code, arguments or input of `{word}`: the guard reads shell '
                                         'text and gh/curl calls, not code in other languages', CODE_HINT)
+        r = input_runs_reason(kind, args, ctx)
+        if r:
+            return r
         flow['unknown'] = word
         for p, d in dict.fromkeys(files):
             r = file_reason(p, dict(ctx, cwd=d))
@@ -3860,22 +3944,44 @@ def segment_reason(toks, ctx, loose):
     return launcher_gate(toks, h, ctx, own, fed, loose)
 
 
+LOGIN_RUNNERS = {'sudo', 'doas', 'runuser'}   # with no command word: a shell that reads its input (sudo -s, sudo -i)
+NO_SHELL = {'-v', '-k', '-K', '-l', '-ll', '-V', '-h', '-e', '--validate', '--list', '--version', '--help', '--edit',
+            '--reset-timestamp', '--remove-timestamp'}   # ... unless a flag says it starts none
+
+
+def bare_shell(toks):
+    """`sudo -s`, `sudo -i`, `doas -s`, `runuser -u x`, a bare `sudo`: no command word, so they start a shell that runs
+    what a pipe, heredoc or < file feeds it."""
+    h, via = head(toks) if toks else (0, set())
+    return h is None and not via & {'shell', 'eval', 'xargs'} and not any(t in NO_SHELL for t in toks) \
+        and any(os.path.basename(t) in LOGIN_RUNNERS for t in toks)
+
+
+def xargs_runs_words(toks, via):
+    """xargs with no command word of its own but a runner (`xargs -L1 env`, `xargs sudo`, `xargs sh -c`): the words
+    it reads are the command it runs. A bare `xargs` runs echo."""
+    if 'xargs' not in via:
+        return False
+    at = next(i for i, t in enumerate(toks) if os.path.basename(t) == 'xargs')
+    return any(os.path.basename(t) in WRAPPERS - {'xargs'} for t in toks[at + 1:])
+
+
 def reads_stdin_as_shell(toks):
-    """bash, sh -s, eval ..: a shell that runs what a pipe or heredoc feeds it."""
+    """bash, sh -s, eval, sudo -s ..: a shell that runs what a pipe or heredoc feeds it."""
     h, via = head(toks)
-    if 'eval' in toks:
+    if 'eval' in toks or bare_shell(toks):
         return True
     return 'shell' in via and (h is None or toks[h] in ('-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'))
 
 
-def written(toks, cmd, env, ran):
+def written(toks, cmd, env, ran, ctx=None):
     """How a file this command writes (> file, tee file) is run by a command of the same text: 'shell' (through a
     shell or `source`), 'exec' (as a command: its `#!` line picks the reader), 'code' (as an interpreter's script)
     or '' (not run, as far as the text shows). Files are matched by name, not by folder."""
     h, _ = head(toks)
     targets = [t for op, w in cmd['redirs'] if op.startswith(('>', '&>')) for r in readings({'words': [w]}, env)
                for t in [''.join(r)]]
-    targets += file_writes(toks, h)[0]
+    targets += file_writes(toks, h, ctx)[0]
     names = {os.path.basename(t) for t in targets if os.path.basename(t)}
     # tee ~/.local/bin/* (also ??, *?, $n): a name that is only hidden text can be any file of its folder, so any
     # name the text runs, when the folder is named or the name is unquoted (a glob, $f); a quoted "$f" alone still
@@ -3887,41 +3993,98 @@ def written(toks, cmd, env, ran):
                  or any(same_name(a, b) for a in names for b in ran[k])), '')
 
 
-FILE_WRITERS = {'install', 'dd'} | AWKS   # words that write the text of files they name into other files
+FILE_WRITERS = {'install', 'dd', 'rsync'} | AWKS   # words that write the text of files they name into other files
 
 
-def file_writes(toks, h):
-    """(files the command word writes, files whose text it writes there) as the text shows them: tee FILE, cp/mv/ln
-    and install (cp p.txt ~/.local/bin/ls, cp ls ~/.local/bin/: every word, the sources' names land there too), dd
-    of=/if=, sed w FILE and s///w FILE, awk print > "FILE". Other writers (a program's -o FILE) are not read."""
+def script_texts(files, ctx):
+    """The texts of script files (sed -f, awk -f) and whether one of them could not be read (stdin, a hidden
+    name, a file not there yet): a script the guard cannot read may write any file."""
+    texts, unread = [], False
+    for f in files:
+        text = None if f == '-' or ctx is None else read_named(f, ctx)
+        texts += [] if text is None else [text]
+        unread = unread or text is None
+    return texts, unread
+
+
+def awk_args(args, ctx=None):
+    """awk's arguments as gawk reads them: (program texts, variables, input files, whether a program file could not
+    be read). A program is the value of -e/--source and the text of -f/--file files (also glued: -vf=x, -fprog);
+    without either the first word that is no flag. Variables come from -v/--assign and from `name=value` operands,
+    which awk takes as assignments, not as files."""
+    progs, files, vars_, inputs, i, ended, given = [], [], {}, [], 0, False, False
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if ended or a == '-' or not a.startswith('-'):
+            name, eq, value = a.partition('=')
+            if eq and re.fullmatch(r'[A-Za-z_]\w*', name) and (given or progs):
+                vars_[name] = value
+            elif not given and not progs:
+                progs.append(a)
+            else:
+                inputs.append(a)
+            continue
+        if a == '--':
+            ended = True
+            continue
+        flag, eq, value = a.partition('=') if a.startswith('--') else (a[:2], '', a[2:])
+        if flag in ('-v', '--assign', '-f', '--file', '-e', '--source', '-F', '--field-separator'):
+            if not (eq or value):
+                value, i = (args[i] if i < len(args) else ''), i + 1
+            if flag in ('-v', '--assign'):
+                name, _, val = value.partition('=')
+                vars_[name] = val
+            elif flag in ('-f', '--file'):
+                files.append(value)
+                given = True
+            elif flag in ('-e', '--source'):
+                progs.append(value)
+                given = True
+    texts, unread = script_texts(files, ctx)
+    return progs + texts, vars_, inputs, unread
+
+
+def awk_writes(progs, vars_):
+    """The files an awk program writes: print/printf > or >> a "literal", a variable (-v f=x) or WILD (an
+    expression the guard does not follow), and the files a "command" it pipes into writes (print | "tee x",
+    print | "cat > x")."""
+    out = []
+    for prog in progs:
+        for m in re.finditer(r'\b(?:print|printf)\b(?:%s|[^;}>|"\n])*(?<!>)>>?\s*(%s|[A-Za-z_]\w*\b(?!\s*\()|\S?)'
+                             % (AWK_STRING, AWK_STRING), prog):
+            t = m.group(1)
+            out.append(t[1:-1] if t.startswith('"') else vars_.get(t, WILD) if t else WILD)
+        for m in re.finditer(r'\|&?\s*(%s)' % AWK_STRING, prog):
+            for toks in (seg.split() for seg in re.split(r'[;&|]+', m.group(1)[1:-1])):
+                h, _ = head(toks) if toks else (None, set())
+                out += re.findall(r'>>?\s*([^\s;&|<>]+)', ' '.join(toks)) + file_writes(toks, h)[0]
+    return out
+
+
+def file_writes(toks, h, ctx=None):
+    """(files the command word writes, files whose text it writes there) as the text shows them: tee FILE, cp/mv/ln,
+    install and rsync (cp p.txt ~/.local/bin/ls, cp ls ~/.local/bin/: every word, the sources' names land there
+    too), dd of=/if=, sed w FILE and s///w FILE (also in -f files), awk print > "FILE" or > VAR, print | "tee FILE"
+    (also in -f files). A script file the guard cannot read (ctx None: not read) writes WILD, any name. Other
+    writers (a program's -o FILE) are not read."""
     if h is None:
         return [], []
     word, args = os.path.basename(toks[h]), toks[h + 1:]
     if word == 'tee':
         return [t for t in args if not t.startswith('-')], []
-    if word in COPIERS or word == 'install':
+    if word in COPIERS or word in ('install', 'rsync'):
         words = [t.partition('=')[2] or t for t in args if not t.startswith('-') or t.startswith('--target-directory=')]
         return words, [t for t in args if not t.startswith('-')]
     if word == 'dd':
         return [a[3:] for a in args if a.startswith('of=')], [a[3:] for a in args if a.startswith('if=')]
     if word == 'sed':
-        scripts, _, inputs, sandbox = sed_args(args)
-        return ([] if sandbox else [w for t in scripts for w in sed_program(t)[2]]), inputs
+        scripts, files, inputs, sandbox = sed_args(args)
+        texts, unread = script_texts(files, ctx)
+        return ([] if sandbox else [w for t in scripts + texts for w in sed_program(t)[2]] + [WILD] * unread), inputs
     if word in AWKS:
-        progs, inputs, i = [], [], 0
-        while i < len(args):
-            a = args[i]
-            i += 1
-            if a in ('-F', '-v', '-f') or a in ('--field-separator', '--assign', '--file'):
-                progs += [args[i]] if a in ('-f', '--file') and i < len(args) else []
-                i += 1
-            elif a.startswith('-') and a != '-':
-                continue
-            elif not progs:
-                progs.append(a)
-            else:
-                inputs.append(a)
-        return [t for p in progs for t in re.findall(r'>>?\s*"([^"]+)"', p)], inputs
+        progs, vars_, inputs, unread = awk_args(args, ctx)
+        return awk_writes(progs, vars_) + [WILD] * unread, inputs
     return [], []
 
 
@@ -3948,7 +4111,7 @@ def doc_kind(toks, how, loose, body):
     a file that a command in this text runs as shell) or data. how: written() of the command."""
     h, via = head(toks)
     word = os.path.basename(toks[h]) if h is not None else ''
-    if 'shell' in via or 'eval' in via:
+    if 'shell' in via or 'eval' in via or bare_shell(toks):
         return 'shell'
     if INTERPRETERS.match(word):
         return 'code'
@@ -3957,6 +4120,15 @@ def doc_kind(toks, how, loose, body):
     if how:
         return 'script' if how == 'shell' else 'code'
     return 'shell' if loose else 'data'
+
+
+def file_sub(cmd, env):
+    """`$(< f)` is `$(cat f)` to the shell: the readings of a command substitution with no words and only `< f`,
+    as cat's words, so the file's text goes on (a pipe, a word, a shell that runs it) as cat's would."""
+    if not cmd.get('sub') or any(cmd['words']) or cmd['docs'] or not cmd['redirs'] \
+            or any(op != '<' for op, _ in cmd['redirs']):
+        return None
+    return [['cat'] + [t for op, w in cmd['redirs'] for t in redir_texts(op, w, env)[:1]]]
 
 
 def stdin_of(cmd, env, ctx):
@@ -4011,6 +4183,66 @@ def pure_word(variants):
                                   and os.path.basename(toks[head(toks)[0]]) in DATA for toks in variants)
 
 
+COMPRESSORS = {'gzip', 'bzip2', 'xz', 'zstd', 'lz4', 'lzma', 'brotli'}
+PAGERS = {'less', 'more'}
+SSH_VALUE = set('BbcDEeFIiJLlmOoPpQRSWw')   # ssh flags that take a value
+
+
+def ends_text(variants):
+    """Whether a command reads piped text only as data, whatever the text says (in every reading): a script file of
+    an interpreter or `-m module` (python3 check.py, node x.js; not `python3`, `-`, -c/-e/-p code), `claude -p` (a
+    prompt; not --bare, which skips the hooks), a compressor that does not unpack, a pager, `ssh host CMD` whose
+    remote command is one such data word with no redirection. Used only for lines that call a refuseScripts entry
+    (data_token): a guarded token still counts wherever its text goes."""
+    for toks in variants:
+        h, via = head(toks) if toks else (None, set())
+        if h is None or via or hidden(toks[h]) or ('/' in toks[h] and os.path.dirname(toks[h]) not in STD_BINS):
+            return False
+        word, args = os.path.basename(toks[h]), toks[h + 1:]
+        if word in COMPRESSORS:
+            if any(a in ('--decompress', '--uncompress') or re.fullmatch(r'-[a-zA-Z0-9]*d[a-zA-Z0-9]*', a)
+                   for a in args):
+                return False
+        elif word in PAGERS:
+            pass
+        elif word == 'claude':
+            if not any(a in ('-p', '--print') for a in args) or any(a.startswith('--bare') for a in args):
+                return False
+        elif word == 'ssh':
+            i, rest = 0, None
+            while i < len(args):
+                a = args[i]
+                if a.startswith('-') and len(a) > 1:
+                    i += 2 if a[-1] in SSH_VALUE and len(a) == 2 else 1
+                    continue
+                rest = args[i + 1:]
+                break
+            text = ' '.join(rest or [])
+            if not text or re.search(r'[;&|<>`$()\n]', text) or hidden(text) \
+                    or not pure_sink([segments(text)[0]] if segments(text) else []) or len(segments(text)) != 1:
+                return False
+        elif INTERPRETERS.match(word) and word not in ('perl', 'ruby', 'php'):
+            takes = next((v for k, v in INTERP_VALUE.items() if word.startswith(k)), ())
+            i, script = 0, None
+            while i < len(args):
+                a = args[i]
+                if a == '-m' and word.startswith(('python', 'pypy')):
+                    script = args[i + 1] if i + 1 < len(args) else None
+                    break
+                if a == '-' or a.startswith(('--eval', '--print', '--interactive')) \
+                        or (a[:1] == '-' and a[1:2] != '-' and re.search('[ceip]', a[1:])):
+                    return False
+                if not a.startswith('-'):
+                    script = a
+                    break
+                i += 2 if a in takes else 1
+            if not script or hidden(script) or script in ('/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'):
+                return False
+        else:
+            return False
+    return bool(variants)
+
+
 def pure_sink(variants):
     """Whether a command ends the text piped into it: in every reading its command word only handles text."""
     for toks in variants:
@@ -4052,7 +4284,7 @@ def decide_text(text, ctx, scan_raw=True):
             return r
     env = variables(cmds, taint)
     env['base'] = {'HOME': ctx['env'].get('HOME') or ''}
-    runs = [(c, readings(c, env)) for c in cmds]
+    runs = [(c, file_sub(c, env) or readings(c, env)) for c in cmds]
     firsts = [r[0] for _, r in runs if r[0]]
     loose = any(reads_stdin_as_shell(t) for t in firsts)
     funcs, aliases, cfg = set(), {}, list(ctx.get('cfg', ()))
@@ -4123,7 +4355,7 @@ def decide_text(text, ctx, scan_raw=True):
     for k in range(len(runs) - 1, -1, -1):
         piped = runs[k][0].get('pipe') and k + 1 < len(runs)
         leaks[k] = bool(runs[k][0].get('sub') or tgts[k] or (piped and (leaks[k + 1] or not pure_sink(runs[k + 1][1]))))
-    hows = [written(variants[0], cmd, env, ran) for cmd, variants in runs]
+    hows = [written(variants[0], cmd, env, ran, ctx) for cmd, variants in runs]
     for how, (cmd, variants) in zip(hows, runs):   # .. | tee x.sh; sh x.sh: the script comes through a pipe
         h, _ = head(variants[0])
         if how in ('shell', 'exec') and not cmd['docs'] and h is not None \
@@ -4145,6 +4377,22 @@ def decide_text(text, ctx, scan_raw=True):
     for k in range(len(runs) - 2, -1, -1):
         if not outs[k] and runs[k][0].get('pipe') and outs[k + 1] and pure_word(runs[k + 1][1]):
             outs[k] = outs[k + 1]
+    # Where a stage's text ends in a program that reads it only as data (cat msg.md | python3 check.py, .. | gzip >
+    # m.gz, through data filters): a line there that calls a refuseScripts entry runs nowhere (data_token)
+    quiet = [False] * len(runs)
+    for k in range(len(runs) - 2, -1, -1):
+        cmd, nxt = runs[k][0], runs[k + 1]
+        if not cmd.get('pipe') or cmd.get('sub') or tgts[k] or outs[k] or feeds_at[k]:
+            continue
+        on = nxt[0].get('pipe') and k + 2 < len(runs)
+        reader = ends_text(nxt[1]) and not nxt[0].get('sub') and not hows[k + 1] and \
+            (not tgts[k + 1] or all(head(t)[0] is not None and os.path.basename(t[head(t)[0]]) in COMPRESSORS
+                                    for t in nxt[1])) and \
+            (not on or not leaks[k + 1])
+        passes_on = pure_word(nxt[1]) and not any(os.path.basename(t[head(t)[0]]) in WRITERS | NO_SINK
+                                                  for t in nxt[1]) \
+            and not nxt[0].get('sub') and not tgts[k + 1] and quiet[k + 1]
+        quiet[k] = bool(reader or passes_on)
     for k, (how, (cmd, variants)) in enumerate(zip(hows, runs)):
         fed = list(cmd['docs']) + fed_texts(cmd, env, c)   # heredocs, <<< words, < files
         for op, w in cmd['redirs']:   # bash < big.sh: a file the shell runs that the guard could not read whole
@@ -4166,7 +4414,7 @@ def decide_text(text, ctx, scan_raw=True):
                     return r
         feeds = feeds_at[k] or (cmd.get('sub') and sub_runs)
         cc = dict(c, stdin=stdin_of(cmd, env, c), writes=how, cmd=cmd, leak=leaks[k], targets=tgts[k], feeds_code=feeds,
-                  feeds_script='' if how else outs[k])
+                  feeds_script='' if how else outs[k], quiet=quiet[k] and not feeds)
         for toks in variants:
             r = toks and segment_reason(toks, cc, loose)
             if r:
