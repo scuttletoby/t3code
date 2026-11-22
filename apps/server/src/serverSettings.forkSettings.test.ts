@@ -21,6 +21,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -30,6 +31,7 @@ import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ServerConfig from "./config.ts";
 import * as ForkModelPolicyCheck from "./fork/modelPolicyCheck.ts";
 import * as ForkModelPolicyFile from "./fork/modelPolicyFile.ts";
+import * as ForkSettingsFileRead from "./fork/settingsFileRead.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import * as PlaytestKit from "./playtest/PlaytestService.testkit.ts";
@@ -963,3 +965,108 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))(
     );
   },
 );
+
+describe("the load's decode, moved to fork/settingsFileRead.ts (#975)", () => {
+  const usagePacingEntry = { reservePercent: 0, burnFirst: true, noLimits: false };
+  const FILES: ReadonlyArray<string> = [
+    "",
+    "{}",
+    "{ not json",
+    // As main saves usagePacing (no list), as this change saves it (a list), and hand-edited.
+    JSON.stringify({ usagePacing: { "claude-a": usagePacingEntry } }),
+    JSON.stringify({
+      usagePacing: { "claude-a": { ...usagePacingEntry, burnFirstWindows: ["weekly"] } },
+    }),
+    JSON.stringify({ usagePacing: { "claude-a": { burnFirst: true, burnFirstWindow: ["x"] } } }),
+    JSON.stringify({
+      usagePacing: { "claude-a": { burnFirst: true, burnFirstWindows: "weekly" } },
+    }),
+    JSON.stringify({ autoUpdateServer: false, headlessUsageRefreshInterval: -1 }),
+    JSON.stringify({ defaultRuntimeMode: 5 }),
+  ];
+  const withDefaults = (persisted: unknown) => persisted;
+
+  /** Runs `effect` under a logger that keeps each warning's text. */
+  const capturingWarnings = <A>(effect: Effect.Effect<A>) => {
+    const warnings: Array<string> = [];
+    const logger = Logger.layer(
+      [
+        Logger.make(({ logLevel, message }) => {
+          if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+        }),
+      ],
+      { mergeWithExisting: false },
+    );
+    return effect.pipe(
+      Effect.map((value) => ({ value, warnings })),
+      Effect.provide(logger),
+    );
+  };
+
+  it.effect("reads each file as main's synchronous decode does", () =>
+    Effect.gen(function* () {
+      for (const raw of FILES) {
+        const main = ServerSettingsModule.decodeSettingsFileText(raw, withDefaults);
+        const { value: logged } = yield* capturingWarnings(
+          ForkSettingsFileRead.decodeSettingsFile(
+            raw,
+            withDefaults,
+            ServerSettingsModule.decodePersistedSettings,
+          ),
+        );
+        const silent = ForkSettingsFileRead.decodeSettingsFileSilently(
+          raw,
+          withDefaults,
+          ServerSettingsModule.decodePersistedSettings,
+        );
+        for (const moved of [logged, silent]) {
+          assert.strictEqual(moved._tag, main._tag, raw);
+          if (Exit.isSuccess(main) && Exit.isSuccess(moved)) {
+            assert.deepStrictEqual(moved.value, main.value, raw);
+          }
+        }
+      }
+    }),
+  );
+
+  it.effect(
+    "logs an interval and a lenient field to the caller's logger; the silent read logs nothing",
+    () =>
+      Effect.gen(function* () {
+        const raw = JSON.stringify({
+          headlessUsageRefreshInterval: -1,
+          usagePacing: { "claude-a": { burnFirst: true, burnFirstWindow: ["weekly"] } },
+        });
+        const { warnings } = yield* capturingWarnings(
+          ForkSettingsFileRead.decodeSettingsFile(
+            raw,
+            withDefaults,
+            ServerSettingsModule.decodePersistedSettings,
+          ),
+        );
+        assert.lengthOf(
+          warnings.filter((text) => text.includes("headlessUsageRefreshInterval")),
+          1,
+        );
+        assert.lengthOf(
+          warnings.filter((text) => text.includes('burnFirstWindow"')),
+          1,
+        );
+        const printed: Array<unknown> = [];
+        const { log, error } = console;
+        console.log = (...args: Array<unknown>) => void printed.push(args);
+        console.error = (...args: Array<unknown>) => void printed.push(args);
+        try {
+          ForkSettingsFileRead.decodeSettingsFileSilently(
+            raw,
+            withDefaults,
+            ServerSettingsModule.decodePersistedSettings,
+          );
+        } finally {
+          console.log = log;
+          console.error = error;
+        }
+        assert.deepStrictEqual(printed, []);
+      }),
+  );
+});
