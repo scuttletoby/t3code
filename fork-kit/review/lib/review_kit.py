@@ -45,12 +45,17 @@ DEFAULTS = {
     'audit_runner': {'model': 'claude-fable-5-2', 'effort': 'high'},
     'forbidden_efforts': ['low', 'max'],
     'lens_rounds': 2,
-    'minors': 'issue',
+    'minors': 'same-round',
     'state_question': STATE_QUESTION,
 }
 MINORS = {'issue': 'minors not fixed when the pull request stops go into one follow-up issue, linked on it',
-          'same-round': 'minors are fixed in the same round; any left at the last round go into the pull request '
-                        'description with a reason each'}
+          # The one place the kit states the same-round rule; SKILL.md, REVIEW.md and docs point here.
+          'same-round': 'a minor or nit is fixed in the same pull request when it is small and in scope (in the fix round '
+                        'that is running, adding no lens round), else dropped with a one-line reason under "Left" in the '
+                        'pull request description; it becomes an issue only when it is a real bug (wrong result, data, '
+                        'hang or security) outside the pull request\'s scope, as a comment on an open issue that covers '
+                        'that area if there is one. A follow-up pull request\'s own minors and nits never become an '
+                        'issue, and missing tests, wording, naming or style are never an issue by themselves'}
 FALLBACK_LENS = 'review'
 
 

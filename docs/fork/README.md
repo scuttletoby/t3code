@@ -326,8 +326,9 @@ setting's.
 
 Fields: `runner` and each `lensRunners` entry are `{driver, model, effort}` (a driver kind, not a
 provider instance), and a lens name is not a built-in object key such as `constructor`;
-`stateQuestion` is 20 to 600 characters; `minors` is `same-round`, `issue` or
-`free`; `configPath` is relative to the repository, without `..`; `reportMaxChars` is a whole number
+`stateQuestion` is 20 to 600 characters; `minors` is `same-round` (the review kit's default and
+rule, written once in `MINORS` in `fork-kit/review/lib/review_kit.py`), `issue` or `free`;
+`configPath` is relative to the repository, without `..`; `reportMaxChars` is a whole number
 from 1000 to 65000.
 
 Only the person can change it; agents cannot. A save must name `preset` (it replaces the stored
