@@ -1,4 +1,5 @@
 import {
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ServerSettings,
@@ -12,10 +13,13 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  type MakeAssistantSteps,
   assistantModelSelection,
+  assistantPickRemovalPatch,
   assistantProfilePatch,
   assistantRolePatch,
   assistantThreadState,
+  makeAssistantThread,
 } from "./assistantSetup.logic";
 
 const provider = (
@@ -80,5 +84,124 @@ describe("Make assistant", () => {
     expect(assistantThreadState(null, active)).toEqual({ kind: "none" });
     expect(assistantThreadState("a", active)).toMatchObject({ kind: "ok", title: "Assistant" });
     expect(assistantThreadState("b", active)).toEqual({ kind: "inactive", threadId: "b" });
+  });
+});
+
+const decodeServerSettings = Schema.decodeSync(ServerSettings);
+
+describe("Make assistant's run (#953)", () => {
+  const NEW = ThreadId.make("thread-new");
+
+  /** Steps that log what they did; `overrides` make one fail, refuse or throw. */
+  const stepsWith = (overrides: Partial<MakeAssistantSteps> = {}) => {
+    const log: Array<string> = [];
+    const steps: MakeAssistantSteps = {
+      openScratchProject: async () => ProjectId.make("scratch"),
+      newThreadId: () => NEW,
+      save: async (patch) => {
+        log.push(`save ${JSON.stringify(patch)}`);
+        return true;
+      },
+      createThread: async () => {
+        log.push("create");
+        return true;
+      },
+      waitForThread: async () => true,
+      discardThread: async () => {
+        log.push("discard");
+        return true;
+      },
+      ...overrides,
+    };
+    return { steps, log };
+  };
+  const pick = `save ${JSON.stringify(assistantProfilePatch(NEW))}`;
+  const role = `save ${JSON.stringify(assistantRolePatch(NEW))}`;
+  const removal = `save ${JSON.stringify(assistantPickRemovalPatch(NEW))}`;
+
+  it("saves the pick, makes the thread, then the role, and cleans up nothing", async () => {
+    const { steps, log } = stepsWith();
+    expect(await makeAssistantThread(steps)).toEqual({ _tag: "Made", threadId: NEW });
+    expect(log).toEqual([pick, "create", role]);
+  });
+
+  it("always ends with an outcome when a step throws or rejects, so the button leaves busy", async () => {
+    const throwing: ReadonlyArray<Partial<MakeAssistantSteps>> = [
+      { openScratchProject: () => Promise.reject(new Error("scratch")) },
+      {
+        save: () => {
+          throw new Error("save threw");
+        },
+      },
+      { createThread: () => Promise.reject(new Error("rpc")) },
+      { waitForThread: () => Promise.reject(new Error("wait")) },
+    ];
+    for (const overrides of throwing) {
+      const outcome = await makeAssistantThread(stepsWith(overrides).steps);
+      expect(outcome._tag).toBe("Stopped");
+      expect(outcome._tag === "Stopped" ? outcome.error : null).toContain("Try again");
+    }
+  });
+
+  it("a refused role removes the empty thread, then its pick, so retries leave no picks", async () => {
+    let first = true;
+    const { steps, log } = stepsWith({
+      save: async (patch) => {
+        log.push(`save ${JSON.stringify(patch)}`);
+        if (patch.threadRoles === undefined) return true;
+        return (first = false);
+      },
+    });
+    const outcome = await makeAssistantThread(steps);
+    expect(outcome._tag).toBe("Stopped");
+    expect(first).toBe(false);
+    expect(log).toEqual([pick, "create", role, "discard", removal]);
+  });
+
+  it("each stop after the pick cleans up; a refused pick has nothing to clean up", async () => {
+    const notMade = stepsWith({ createThread: async () => false });
+    await makeAssistantThread(notMade.steps);
+    expect(notMade.log).toEqual([pick, "discard", removal]);
+    const notSeen = stepsWith({ waitForThread: async () => false });
+    await makeAssistantThread(notSeen.steps);
+    expect(notSeen.log).toEqual([pick, "create", "discard", removal]);
+    const threw = stepsWith({ waitForThread: () => Promise.reject(new Error("wait")) });
+    await makeAssistantThread(threw.steps);
+    expect(threw.log).toEqual([pick, "create", "discard", removal]);
+    const refused = stepsWith();
+    refused.steps = {
+      ...refused.steps,
+      save: async (patch) => {
+        refused.log.push(`save ${JSON.stringify(patch)}`);
+        return false;
+      },
+    };
+    await makeAssistantThread(refused.steps);
+    expect(refused.log).toEqual([pick]);
+  });
+
+  it("a thread that stays (someone wrote in it, or the delete failed) keeps its narrow pick", async () => {
+    const kept = stepsWith({
+      waitForThread: async () => false,
+      discardThread: async () => false,
+    });
+    await makeAssistantThread(kept.steps);
+    expect(kept.log).toEqual([pick, "create"]);
+    // A clean-up that throws leaves the pick and still ends with the outcome.
+    const broken = stepsWith({
+      waitForThread: async () => false,
+      discardThread: () => Promise.reject(new Error("delete")),
+    });
+    expect((await makeAssistantThread(broken.steps))._tag).toBe("Stopped");
+    expect(broken.log).toEqual([pick, "create"]);
+  });
+
+  it("the removal clears only this thread's pick", () => {
+    const settings = decodeServerSettings({
+      mcpThreadProfiles: { [NEW]: "assistant", other: "assistant" },
+    });
+    expect(
+      applyServerSettingsPatch(settings, assistantPickRemovalPatch(NEW)).mcpThreadProfiles,
+    ).toEqual({ other: "assistant" });
   });
 });

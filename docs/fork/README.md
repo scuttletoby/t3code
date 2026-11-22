@@ -1192,7 +1192,9 @@ the Scratch project, picks the built-in MCP profile `assistant` for it and point
 `threadRoles.assistant` at it, in two saves from the person (the pick first, before the thread
 exists). Off (the default): no such button; a
 thread already named the assistant stays as it is. Only the person can change it. Anything but
-`{"enabled": true}` in the file reads as off; a save with a bad value is refused. More in
+`{"enabled": true}` in the file reads as off; a save with a bad value is refused. The thread
+`threadRoles.assistant` names never gets more than the profile `assistant`, whatever its pick (a
+managed policy that owns `mcpThreadProfiles` can drop the pick). More in
 [assistant.md](assistant.md).
 
 ### `projectOverride.waitChecks`

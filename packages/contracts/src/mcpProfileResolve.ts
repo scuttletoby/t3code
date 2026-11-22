@@ -25,7 +25,13 @@ import type { ServerSettings } from "./settings.ts";
 export type McpProfileSettings = Pick<
   ServerSettings,
   "mcpProfiles" | "mcpProfile" | "mcpSubagentProfile" | "mcpThreadProfiles" | "mcpCarriedProfiles"
->;
+> & {
+  /**
+   * The role pointers; only `assistant` is read: that thread never gets more than the built-in
+   * `assistant` profile (see {@link resolveMcpProfile}).
+   */
+  readonly threadRoles: { readonly assistant: string | null };
+};
 
 /** One thread of a lineage, as the resolver needs it. */
 export interface McpProfileThread {
@@ -49,8 +55,16 @@ export interface McpProfileSet {
   readonly builtinTools?: typeof MCP_BUILTIN_TOOLS_NONE;
 }
 
-/** Where a thread's profile came from. */
-export type McpProfileSource = "thread-pick" | "subagent-rule" | "project" | "environment";
+/**
+ * Where a thread's profile came from. `assistant-role`: the thread is `threadRoles.assistant` and
+ * what it would get otherwise keeps more than the built-in `assistant` profile, so it gets that.
+ */
+export type McpProfileSource =
+  | "thread-pick"
+  | "subagent-rule"
+  | "project"
+  | "environment"
+  | "assistant-role";
 
 export interface McpProfileResolved {
   readonly _tag: "Resolved";
@@ -425,7 +439,34 @@ function cannotApply(
   };
 }
 
+/**
+ * The thread's profile, held within the built-in `assistant` for the `threadRoles.assistant` thread,
+ * so a managed policy that drops its pick cannot give it the wide defaults. Within stands; wider is
+ * cut to `assistant`; a broken `assistant` refuses.
+ */
 function resolveAt(
+  settings: McpProfileSettings,
+  lineage: ReadonlyArray<McpProfileThread>,
+  index: number,
+  carried: unknown,
+): McpProfileResolution {
+  const thread = lineage[index]!;
+  const resolved = resolveOwnAt(settings, lineage, index, carried);
+  const roles: unknown = settings.threadRoles;
+  const assistant = isRecord(roles) ? roles.assistant : undefined;
+  if (resolved._tag === "CannotApply" || assistant !== thread.threadId) return resolved;
+  const bound = lookUp(settings, MCP_PROFILE_ASSISTANT);
+  if (!bound.ok) return cannotApply(bound.problem, thread, MCP_PROFILE_ASSISTANT, bound.issue);
+  if (isWithinMcpProfile(resolved.profile, bound.profile)) return resolved;
+  return {
+    ...resolved,
+    name: MCP_PROFILE_ASSISTANT,
+    source: "assistant-role",
+    profile: cutTo(resolved.profile, bound.profile),
+  };
+}
+
+function resolveOwnAt(
   settings: McpProfileSettings,
   lineage: ReadonlyArray<McpProfileThread>,
   index: number,

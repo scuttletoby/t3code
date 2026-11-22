@@ -9,6 +9,7 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   type EnvironmentId,
+  type ScopedThreadRef,
   type ServerSettingsPatch,
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -17,10 +18,12 @@ import { useRef, useState } from "react";
 
 import { newThreadId } from "~/lib/utils";
 import { useScratchProject } from "../../../hooks/useScratchProject";
+import { appAtomRegistry } from "../../../rpc/atomRegistry";
 import { useThreadShells, waitForThreadShell } from "../../../state/entities";
 import { useEnvironmentProviders } from "../../../state/environments";
-import { threadEnvironment } from "../../../state/threads";
+import { environmentThreadShells, threadEnvironment } from "../../../state/threads";
 import { useAtomCommand } from "../../../state/use-atom-command";
+import { waitForAtomValue } from "../../../state/waitForAtomValue";
 import { buildThreadRouteParams } from "../../../threadRoutes";
 import { Button } from "../../ui/button";
 import { Switch } from "../../ui/switch";
@@ -31,11 +34,19 @@ import { useUpdateScopedSettings } from "../useScopedSettings";
 import { ForkRow } from "./ForkRow";
 import {
   assistantModelSelection,
-  assistantProfilePatch,
-  assistantRolePatch,
   assistantThreadState,
   assistantThreadText,
+  makeAssistantThread,
 } from "./assistantSetup.logic";
+
+/** True once this client holds no thread `ref` (deleted, or never made); false after 5 seconds. */
+const waitForThreadShellGone = (ref: ScopedThreadRef) =>
+  waitForAtomValue({
+    registry: appAtomRegistry,
+    atom: environmentThreadShells.threadShellAtom(ref),
+    predicate: (thread) => thread === null,
+    timeoutMs: 5_000,
+  });
 
 export function AssistantSettings() {
   const searchableSetting = useSearchableSetting();
@@ -80,58 +91,50 @@ export function AssistantSettings() {
       updateSettings(patch, { onFailed: () => resolve(false), onSaved: () => resolve(true) }),
     );
 
-  const makeAssistant = async () => {
+  const makeAssistant = () => {
     // A ref, not only the state: a double click arrives before the disabled button re-renders.
     if (modelSelection === null || running.current) return;
     running.current = true;
     setBusy(true);
     setError(null);
-    try {
-      const project = await openScratchProject(environmentId);
-      if (project === null) return;
-      const threadId = newThreadId();
-      // The pick first: a stop at any later point leaves no thread, or a thread already narrowed.
-      // A pick for a thread that never gets made does nothing.
-      if (!(await save(assistantProfilePatch(threadId)))) {
-        setError("The server refused the assistant profile. Nothing was made.");
-        return;
-      }
-      const created = await createThread({
-        environmentId,
-        input: {
-          threadId,
-          projectId: project.id,
-          title: "Assistant",
-          modelSelection,
-          runtimeMode: DEFAULT_RUNTIME_MODE,
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          branch: null,
-          worktreePath: null,
-        },
+    // `makeAssistantThread` never rejects; `.finally` still leaves the busy state on any path.
+    void makeAssistantThread({
+      openScratchProject: async () => (await openScratchProject(environmentId))?.id ?? null,
+      newThreadId,
+      save,
+      createThread: async (threadId, projectId) =>
+        (
+          await createThread({
+            environmentId,
+            input: {
+              threadId,
+              projectId,
+              title: "Assistant",
+              modelSelection,
+              runtimeMode: DEFAULT_RUNTIME_MODE,
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              branch: null,
+              worktreePath: null,
+            },
+          })
+        )._tag !== "Failure",
+      waitForThread: (threadId) => waitForThreadShell(scopeThreadRef(environmentId, threadId)),
+      discardThread: async (threadId) =>
+        (await deleteThread({ environmentId, input: { threadId, onlyIfUnused: true } }))._tag !==
+          "Failure" && (await waitForThreadShellGone(scopeThreadRef(environmentId, threadId))),
+    })
+      .then((outcome) => {
+        if (outcome._tag === "Stopped") {
+          setError(outcome.error);
+          return;
+        }
+        const ref = scopeThreadRef(environmentId, outcome.threadId);
+        void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(ref) });
+      })
+      .finally(() => {
+        running.current = false;
+        setBusy(false);
       });
-      if (created._tag === "Failure") {
-        setError("Could not make the assistant's thread. Try again.");
-        return;
-      }
-      // An empty thread the role save did not name is removed; one that got a message stays.
-      const discard = () =>
-        void deleteThread({ environmentId, input: { threadId, onlyIfUnused: true } });
-      const ref = scopeThreadRef(environmentId, threadId);
-      if (!(await waitForThreadShell(ref))) {
-        setError("The assistant's thread was made, but it did not reach this client. Try again.");
-        discard();
-        return;
-      }
-      if (!(await save(assistantRolePatch(threadId)))) {
-        setError("The server refused to name the new thread the assistant. It was removed.");
-        discard();
-        return;
-      }
-      void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(ref) });
-    } finally {
-      running.current = false;
-      setBusy(false);
-    }
   };
 
   return (
@@ -141,7 +144,7 @@ export function AssistantSettings() {
         {...searchableSetting("assistant")}
         settingKeys={["assistant"]}
         lockPaths={["assistant"]}
-        description="One thread you talk to across projects. It runs with the assistant profile: no shell, files, web or outside servers; it can read, start and message threads. Claude only. Off: Settings offers no Make assistant."
+        description="One thread you talk to across projects, Claude only. Its profile `assistant` has no shell, files, web or outside servers, but its T3 tools do more than read, start and message threads, and it uses them without asking you: it can also change another thread's model and settings, interrupt threads, stop workflows, link and unlink environments, create projects, clone a repository onto disk, and delete projects (a forced delete also deletes all of that project's threads, archived ones too). Splitting these tools is fork issue #954. Off: Settings offers no Make assistant."
         control={
           <Switch
             checked={enabled}
@@ -167,7 +170,7 @@ export function AssistantSettings() {
               size="sm"
               variant="outline"
               disabled={busy || modelSelection === null}
-              onClick={() => void makeAssistant()}
+              onClick={() => makeAssistant()}
             >
               Make assistant
             </Button>

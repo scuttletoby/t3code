@@ -390,6 +390,7 @@ const SOURCE_TEXT = {
   "subagent-rule": "the sub-agent rule",
   project: "the project's default",
   environment: "the default profile",
+  "assistant-role": "the assistant thread's limit",
 } as const;
 
 /** One line on what a thread gets, from the resolver's result. */
