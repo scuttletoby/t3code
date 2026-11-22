@@ -1008,7 +1008,8 @@ SCAN_RUN_LINE = 'bash "${RUNNER_TEMP:?}/scan-from-default-branch.sh"'
 # within hours (review B). The read step runs only for the sweep, holds only the job's read-only token
 # (no secret), takes the record only from a run of fork-secret-sweep.yml (that path, schedule or
 # workflow_dispatch, this branch, this repository and not a fork, ended success or failure or a reset run
-# in any state, #992, an ancestor commit, not this run but for a re-run's own newest earlier attempt, in a run of the sweep's workflow) and its
+# in any state, #992, an ancestor commit, not this run but for a re-run's own newest earlier attempt, in a
+# run of the sweep's workflow, unless the re-run's run started before a listed reset run, #992) and its
 # one artifact of that name, never unpacks the archive (one plain file read in memory, every line
 # checked), and falls back to a first run on any doubt; it reads nothing while a tag is named like the
 # branch (#703); reset_record leaves an empty record instead (a reset run's re-run: its own newest
@@ -1088,6 +1089,17 @@ if [[ "$RESET" != true ]] && ! runs="$(gh api -X GET "repos/$GITHUB_REPOSITORY/a
           or (.status == "completed" and (.conclusion == "success" or .conclusion == "failure")))) |
       "\(.id) \(.head_sha) \(if .display_title == "Fork secret sweep (reset_record)" then "reset" else "sweep" end)"')"; then
   none failed "the sweep's earlier runs cannot be listed"
+fi
+# A re-run of a sweep run that started before a reset run (a higher run id: ids only go up) does
+# not read its own earlier attempt's record, which is from before that reset (#992): it reads as a
+# new run does, so the reset run's record or the empty one. It sees only the reset runs listed.
+if [[ -n "$self" ]]; then
+  while read -r id sha kind; do
+    [[ "$kind" == reset && "$id" =~ ^[1-9][0-9]{0,17}$ ]] && (( id > GITHUB_RUN_ID )) || continue
+    echo "::warning title=Secret scan::this re-run's run started before sweep run $id, a reset run (input reset_record), so its own earlier attempt's record, from before that reset, is not read: it reads as a new run does" >&2
+    self=""
+    break
+  done <<< "$runs"
 fi
 # unread WHY: a run whose record is not read. A reset run's (none kept: cancelled, failed before
 # its upload, a re-run of it still under way; expired; or on a commit this branch lacks): an older
@@ -2739,8 +2751,9 @@ check("secret-scan e2e: no clone (cat-file fails): the job fails before asking G
 # this run; whose commit this run's has) and its one live artifact of that name; never unpacks the
 # archive (exactly one plain file named deleted-tips, read in memory), checks every line, and on any
 # doubt warns and leaves no record (a first run); a reset run whose record it does not read leaves the
-# empty one (#992). The stub applies the API's status filter, as GitHub does. Run again, stopped half-way (a zip or record left in RUNNER_TEMP), a link where the
-# record's folder goes, reset_record, a tag: the same.
+# empty one (#992); a re-run of a run that started before a listed reset run reads as a new run does
+# (#992). The stub applies the API's status filter, as GitHub does. Run again, stopped half-way (a zip or
+# record left in RUNNER_TEMP), a link where the record's folder goes, reset_record, a tag: the same.
 read_work = pathlib.Path(tempfile.mkdtemp(prefix="fork-contracts-read-"))
 read_stub = read_work / "bin"
 read_stub.mkdir()
@@ -2919,6 +2932,21 @@ def rerun_log(matched=True, kept=None, listed=None):
                 and (own in s.out if kept is not None else "this run's own records" not in s.out)
                 and ((NO_OWN_RECORD in s.out) == (kept == 0)))
     return ok
+
+
+# What a re-run of a sweep run that started before a reset run warns (#992): it reads as a new run does.
+PRE_RESET_RERUN = ("::warning title=Secret scan::this re-run's run started before sweep run {}, a reset run (input "
+                   "reset_record), so its own earlier attempt's record, from before that reset, is not read: it reads "
+                   "as a new run does")
+
+
+def pre_reset_rerun(s, n):
+    """The run S without the warning PRE_RESET_RERUN for reset run n, which it must carry (else None's
+    record, so a found read's check fails)."""
+    line = PRE_RESET_RERUN.format(n)
+    if line not in s.out:
+        return types.SimpleNamespace(**{**vars(s), "record": None})
+    return types.SimpleNamespace(**{**vars(s), "out": s.out.replace(line, "")})
 
 
 def first_attempt_log(s):
@@ -3104,6 +3132,32 @@ READ_CASES = {
         {"runs": [a_run(802, status="in_progress", conclusion=None, display_title=RESET_RUN_TITLE), a_run(801)],
          "artifacts": {802: [an_artifact(902, 802)], 801: [an_artifact(901, 801)]}, "zips": {902: good_zip, 901: other_zip}},
         read_as(good_record, 802)),
+    # #992: a re-run of a sweep run that started before a reset run (run ids only go up, so the reset
+    # run's id is higher) reads as a new run does, never its own earlier attempt's record, which is from
+    # before the reset. A reset run older than it, or a newer run that is not a reset run, changes nothing.
+    "a re-run of a sweep that started before a reset run (950) that kept a record: the reset run's record, "
+    "never its own from before the reset (#992)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802, id=950, display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {900: [an_artifact(903, 900)], 950: [an_artifact(902, 950)], 801: [an_artifact(901, 801)]},
+         "zips": {903: other_zip, 902: good_zip, 901: other_zip}},
+        lambda s: read_as(good_record, 950)(pre_reset_rerun(s, 950)) and "runs/900/" not in s.calls and rerun_log()(s)),
+    "a re-run of a sweep that started before a reset run (950) that kept none: the empty record, never its "
+    "own from before the reset (#992)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802, id=950, display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {900: [an_artifact(903, 900)], 801: [an_artifact(901, 801)]},
+         "zips": {903: other_zip, 901: other_zip}},
+        lambda s: reset_by(950, "kept no record (or it expired)")(s) and "runs/900/" not in s.calls
+        and PRE_RESET_RERUN.format(950) in s.out and "artifacts/903/zip" not in s.calls),
+    "a re-run of a sweep that started after a reset run (802): its own first attempt's record (#992)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802, display_title=RESET_RUN_TITLE), a_run(801)],
+         "artifacts": {900: [an_artifact(903, 900)], 802: [an_artifact(902, 802)], 801: [an_artifact(901, 801)]},
+         "zips": {903: good_zip, 902: other_zip, 901: other_zip}},
+        lambda s: read_as(good_record, 900)(s) and rerun_log(kept=1)(s)),
+    "a re-run of a sweep before a newer run (950) that is not a reset run: its own first attempt's record (#992)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802, id=950), a_run(801)],
+         "artifacts": {900: [an_artifact(903, 900)], 950: [an_artifact(902, 950)], 801: [an_artifact(901, 801)]},
+         "zips": {903: good_zip, 902: other_zip, 901: other_zip}},
+        lambda s: read_as(good_record, 900)(s) and rerun_log(kept=1)(s)),
     "a run still in progress": (two_runs({"status": "in_progress", "conclusion": None}), read_as(good_record)),
     "a run still waiting (queued)": (two_runs({"status": "queued", "conclusion": None}), read_as(good_record)),
     "a failed run (its record is whole: the scan step wrote it)": (
@@ -3238,6 +3292,9 @@ for what, old, new in (
     ("no older record after a reset run on a commit this branch lacks (#992)",
      '|| { unread "ran on a commit this branch does not have"; continue; }', "|| continue"),
     ("this run's own skip", '[[ "$id" != "$GITHUB_RUN_ID" || "$id $sha" == "$self" ]] || continue', ":"),
+    ("a re-run from before a reset run reads as a new run (#992)", '    self=""\n    break\n', "    break\n"),
+    ("the reset run's kind in the re-run check (#992)", '[[ "$kind" == reset && "$id" =~ ^[1-9]', '[[ "$id" =~ ^[1-9]'),
+    ("the higher run id in the re-run check (#992)", "&& (( id > GITHUB_RUN_ID )) ||", "||"),
     ("a re-run's own first attempt first (#703)", 'done <<< "$self"$\'\\n\'"$runs"', 'done <<< "$runs"'),
     ("the first attempt's check (#703)", '[[ "${GITHUB_RUN_ATTEMPT:-1}" != 1 \\', "[[ true \\"),
     ("the sweep's own workflow check for a re-run (#703)",
