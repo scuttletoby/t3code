@@ -9,13 +9,17 @@ name: Fork Windows tests
 # the runner (GitHub's windows-2025, not upstream's Blacksmith runner, which the
 # fork does not have), the trigger (a nightly schedule and a manual run, not
 # upstream's manual run with inputs), and the package, which comes from the matrix
-# (upstream's two default runs: every package but apps/server, and apps/server).
-# The fork does not run upstream's file itself: fork-follow's sweep
-# (fork-workflows.sh) disables every upstream workflow and cancels its runs, and
-# a changed runs-on line there would be a seam line in an upstream file. When
-# upstream changes windows-tests.yml, the drift check in fork-tests.yml's
-# `workflows` job fails (.github/scripts/fork-tests-drift.cjs) until this copy
-# follows and the record is updated. Contract: fork-contracts.test.py (windows).
+# (upstream's default run, every package but apps/server, and the apps/server run
+# that default leaves out). The fork does not run upstream's file itself:
+# fork-follow's sweep (fork-workflows.sh) disables every upstream workflow and
+# cancels its runs, and a changed runs-on line there would be a seam line.
+#
+# Following upstream: the `drift` job (fork-tests-drift.cjs --windows) fails when
+# upstream's windows-tests.yml changed since .github/fork-windows-tests-upstream.json
+# recorded it, when upstream removed it, or when the steps here (names, pinned
+# actions) differ from upstream's. It runs only here, so an upstream change turns
+# this report red, never Fork tests, a pull request or a release: nothing in
+# fork-tests.yml reads windows-tests.yml (contract: fork-contracts.test.py, windows).
 #
 # Reading a night's result: Actions, "Fork Windows tests", the newest run. Each
 # leg (all non-server, apps/server) passes or fails on its own; a failed leg's
@@ -37,6 +41,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Upstream drift of windows-tests.yml (see the header); the test legs run either way.
+  drift:
+    name: Upstream drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: .github
+      - name: Compare upstream's windows-tests.yml with the recorded copy
+        run: node .github/scripts/fork-tests-drift.cjs --windows
+
   test:
     name: Test (${{ matrix.package || 'all non-server' }})
     runs-on: windows-2025

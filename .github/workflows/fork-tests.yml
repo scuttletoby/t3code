@@ -10,8 +10,7 @@ name: Fork tests
 # changes. The `workflows` job lints the fork workflows (actionlint) and the
 # fleet launcher (shellcheck), and fails
 # when upstream's ci.yml or release.yml test jobs change and this copy did not
-# follow, or upstream's windows-tests.yml and fork-windows-tests.yml's copy
-# (.github/scripts/fork-tests-drift.cjs). The fork's own script tests run
+# follow (.github/scripts/fork-tests-drift.cjs). The fork's own script tests run
 # side by side in `workflows`, `action_tests`, the `kit_tests` shards and
 # `kit_root_tests`.
 #
