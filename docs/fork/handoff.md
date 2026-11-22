@@ -243,7 +243,10 @@ The new session's first message has these parts:
        however late a busy restart makes that (the worker runs a few rows at a time); for a retry
        whose row is not written yet (upstream writes it right after the failure), up to a minute
        past the time it is due. A continuation that still does not come leaves the chain judged as
-       it is (the log says so). The row's id is upstream's own, which upstream does not export:
+       it is (the log says so). A row that cannot be read counts as owed, never as "no row": the
+       handoff reads it again every 5 seconds, with no time limit, and logs a warning each time, so
+       it is never sent without its notes; an outbox that stays unreadable keeps that one handoff
+       waiting (other threads go on). The row's id is upstream's own, which upstream does not export:
        `handoffContinuationRow.test.ts` runs upstream's restart writer and checks the handoff finds
        its row.
      - **Quiet.** A write turn that completes is marked quiet as the handoff run is (same rule,
