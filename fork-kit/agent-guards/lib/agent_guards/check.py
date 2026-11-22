@@ -1,7 +1,10 @@
 """agent_guards.check: prove the wired hooks work. Each hook's command, as a settings file has it, is run with one
 event it must refuse (block) and one it must let through, the way Claude Code runs it (`/bin/sh -c COMMAND`, the
-event on stdin). Nothing of the machine is changed: the memory index and the session ids are made up in a temporary
-folder, and the few state files the hooks write for those made-up sessions are removed afterwards.
+event on stdin), and the entry's matcher must take the case's tool (Bash, Monitor, Write). Nothing of the machine is
+changed: the memory index and the session ids are made up in a temporary folder, the hooks run with HOME there (so
+the "~/" state folders, the refusal log and the cache are written there and removed with it; agent-slots keeps the
+real HOME, it writes nothing), and the state files a hook writes in a configured absolute folder for those made-up
+sessions are removed afterwards.
 
 A hook that is not wired is reported as MISSING (a problem); agent-slots with no sessionsFile only gets its pass
 case (it does nothing for any session then).
@@ -49,7 +52,9 @@ def _answer(r):
         return 'refused'
     if r.returncode != 0:
         return f'failed (exit {r.returncode})'
-    return 'context' if spec.get('additionalContext') else 'passed'
+    ctx = spec.get('additionalContext')
+    # a hook that only says its machine file section is broken (config.notice) passed: the self-check names that
+    return 'context' if ctx and ctx != out.get('systemMessage') else 'passed'
 
 
 def _remove(path):
@@ -91,6 +96,8 @@ def cases(tmp, sid):
     out = [
         ('actions-disable-guard', 'PreToolUse', 'gh workflow disable', bash('gh workflow disable 1 -R example/example'),
          'refused', None),
+        ('actions-disable-guard', 'PreToolUse', 'the same in a Monitor',
+         dict(bash('gh workflow disable 1 -R example/example'), tool_name='Monitor'), 'refused', None),
         ('actions-disable-guard', 'PreToolUse', 'echo that only mentions it',
          bash("echo 'gh workflow disable 1 is refused'"), 'passed', None),
         ('capacity-pipe-guard', 'PreToolUse', f'{cap} piped', bash(f'{cap} 2048 | tail -1 && true'), 'refused', None),
@@ -100,6 +107,8 @@ def cases(tmp, sid):
         ('memory-index-guard', 'PreToolUse', 'Write of a small index', write('- [a](a.md) - ok\n'), 'passed', None),
         ('memory-index-guard', 'PostToolUse', 'index over budget, changed', post, 'refused', None),
         ('memory-index-guard', 'PostToolUse', 'same index again (seen)', post, 'passed', None),
+        ('memory-index-guard', 'PostToolUse', 'same index after a Monitor (seen)', dict(post, tool_name='Monitor'),
+         'passed', None),
         ('bg-guard', 'Stop', 'stop with a background command running', {'hook_event_name': 'Stop', 'session_id': sid},
          'refused', 'claude'),
         ('bg-guard', 'Stop', 'stop with none', {'hook_event_name': 'Stop', 'session_id': sid}, 'passed', 'idle'),
@@ -139,20 +148,24 @@ def run(settings, source, say=print):
     bad = 0
     try:
         fake, scripts = _fake_claude(tmp)
+        home = os.path.join(tmp, 'home')
+        os.makedirs(home)
         missing = set()
         for hook, event, label, ev, want, how in cases(tmp, sid):
-            cmd = wiring.find(settings, hook, event)
+            tool = ev.get('tool_name') if event.endswith('ToolUse') else None
+            cmd = wiring.find(settings, hook, event, tool)
             if cmd is None:
-                if (hook, event) not in missing:
-                    missing.add((hook, event))
+                if (hook, event, tool) not in missing:
+                    missing.add((hook, event, tool))
                     bad += 1
-                    say(f'MISSING {hook} ({event}): not wired in {source}')
+                    say(f'MISSING {hook} ({event}{", " + tool if tool else ""}): not wired in {source}')
                 continue
+            env = dict(os.environ, HOME=home) if hook != 'agent-slots' else dict(os.environ)
             if how:
-                env = dict(os.environ, AG_EVENT=json.dumps(ev), AG_HOOK=cmd)
+                env.update(AG_EVENT=json.dumps(ev), AG_HOOK=cmd)
                 r = _run(cmd, ev, tmp, env=env, argv=[fake, '-c', scripts[how]])
             else:
-                r = _run(cmd, ev, tmp)
+                r = _run(cmd, ev, tmp, env=env)
             got = _answer(r)
             ok = got == want
             bad += not ok

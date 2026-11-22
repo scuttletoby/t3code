@@ -52,7 +52,9 @@
   "agent-guards": {
     "actionsDisable": {
       "stateDir": "~/.local/state/actions-disable-guard",
-      "refuseScripts": [{ "name": "example_garden.py", "flag": "--fix", "why": "disables workflows in the forks" }]
+      "refuseScripts": [
+        { "name": "example_garden.py", "flag": "--fix", "why": "disables workflows in the forks" }
+      ]
     },
     "capacityPipe": { "commands": ["t3-capacity"] },
     "memoryIndex": { "maxChars": 6000, "maxLine": 160, "stateDir": "~/.cache/memory-index-guard" },

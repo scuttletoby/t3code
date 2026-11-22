@@ -1,5 +1,6 @@
 """agent_guards.config: the machine file's "agent-guards" section, and what every hook does with a section that is
-missing, empty, garbled or not safe: its built-in defaults (never a weaker guard), and one line on stderr.
+missing, empty, garbled or not safe: its built-in defaults (never a weaker guard), named in its answer (a
+systemMessage the agent sees) and on stderr. Each hook reads only its own part, key by key.
 
   python3 -I -B fork-kit/agent-guards/tests/config.test.py
 """
@@ -61,7 +62,6 @@ class Load(unittest.TestCase):
             'a newer version': dict(text='{"version": 99, "agent-guards": {}}'),
             'a duplicate key': dict(text='{"version": 1, "agent-guards": {}, "agent-guards": {}}'),
             'section not an object': dict(section=[]),
-            'unknown hook': dict(section={'memoryIndx': {}}),
             'unknown key': dict(section={'memoryIndex': {'maxchars': 1}}),
             'wrong type': dict(section={'memoryIndex': {'maxChars': '6000'}}),
             'a bool for a number': dict(section={'memoryIndex': {'maxChars': True}}),
@@ -74,6 +74,42 @@ class Load(unittest.TestCase):
                 got, problem = self.load('memoryIndex', **kw)
                 self.assertEqual(got, config.defaults('memoryIndex'))
                 self.assertTrue(problem)
+
+    def test_an_unknown_sibling_key_keeps_each_hooks_facts(self):
+        """Lens A major: a key no hook knows (a later kit's section, a typo of a hook's name) once made every hook
+        drop the whole file. Each hook now gets its own facts, with no problem; self-check names the key."""
+        with open(EXAMPLE) as f:
+            section = json.load(f)['agent-guards']
+        section = dict(section, gardener={'any': 'thing'}, memoryIndx={})
+        for hook in config.HOOKS:
+            with self.subTest(hook):
+                got, problem = self.load(hook, section)
+                self.assertIsNone(problem)
+                self.assertEqual(got, dict(config.defaults(hook), **section[hook]))
+        settings, problems = config.load_all()
+        self.assertEqual(settings, {h: dict(config.defaults(h), **section[h]) for h in config.HOOKS})
+        self.assertEqual(sorted(p.split("'")[1] for p in problems), ['gardener', 'memoryIndx'])
+
+    def test_another_hooks_broken_part_changes_nothing(self):
+        section = {'memoryIndex': {'maxChars': 4000}, 'bgGuard': {'maxBlocks': -1}, 'agentSlots': []}
+        got, problem = self.load('memoryIndex', section)
+        self.assertEqual((got['maxChars'], problem), (4000, None))
+        got, problem = self.load('bgGuard', section)
+        self.assertEqual(got, config.defaults('bgGuard'))
+        self.assertIn('maxBlocks', problem)
+
+    def test_a_bad_or_unknown_key_keeps_the_others(self):
+        got, problem = self.load('memoryIndex', {'memoryIndex': {'maxChars': 4000, 'maxLine': 0, 'maxchars': 1}})
+        self.assertEqual(got, dict(config.defaults('memoryIndex'), maxChars=4000))
+        self.assertIn('maxLine', problem)
+        self.assertIn("'maxchars'", problem)
+
+    def test_a_bad_row_keeps_the_good_rows(self):
+        good = {'name': 'garden.py', 'flag': '--fix', 'why': 'x'}
+        got, problem = self.load('actionsDisable', {'actionsDisable': {
+            'refuseScripts': [good, {'name': '../x.py', 'flag': '--fix'}, {'name': 'b.py', 'flag': '--off'}]}})
+        self.assertEqual([r['name'] for r in got['refuseScripts']], ['garden.py', 'b.py'])
+        self.assertIn('refuseScripts', problem)
 
     def test_each_hook_checks_its_own_keys(self):
         bad = {
@@ -114,14 +150,27 @@ class Hooks(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.env = dict(os.environ, HOME=self.tmp)
 
-    def test_a_broken_section_is_named_on_stderr_and_the_defaults_used(self):
+    def test_a_broken_section_is_named_to_the_agent_and_the_defaults_used(self):
+        """Lens A/B minor: the fallback was on stderr only, which Claude Code does not show for exit 0. The answer
+        now carries it as a systemMessage (and as additionalContext where the event takes one)."""
         machine = fx.machine_file(self.tmp, text='{"version": 1, "agent-guards": ')
+        pre = {'hook_event_name': 'PreToolUse', 'session_id': 'config-test', 'tool_name': 'Read',
+               'tool_input': {'file_path': '/nonexistent'}}
         for hook in fx.wiring.HOOKS:
-            with self.subTest(hook):
-                r = fx.run_hook(hook, QUIET_EVENT, machine, env=self.env)
-                self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertIn(f'{hook}: the machine file\'s "agent-guards" section cannot be used', r.stderr)
-                self.assertIn('built-in defaults used', r.stderr)
+            for ev in (QUIET_EVENT, pre):
+                with self.subTest(hook=hook, event=ev['hook_event_name']):
+                    r = fx.run_hook(hook, ev, machine, env=self.env)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertIn(f'{hook}: the machine file\'s "agent-guards" section cannot be used', r.stderr)
+                    self.assertIn('built-in defaults used', r.stderr)
+                    out = json.loads(r.stdout)
+                    self.assertIn('built-in defaults used', out['systemMessage'])
+                    self.assertNotIn('decision', out)
+                    if ev is pre:
+                        spec = out['hookSpecificOutput']
+                        self.assertEqual(spec['hookEventName'], 'PreToolUse')
+                        self.assertIn('built-in defaults used', spec['additionalContext'])
+                        self.assertNotIn('permissionDecision', spec)
 
     def test_a_good_file_or_none_is_quiet(self):
         good = fx.machine_file(self.tmp, {'memoryIndex': {'maxChars': 5000}})
@@ -142,6 +191,7 @@ class Hooks(unittest.TestCase):
                                    text=True, input=json.dumps(QUIET_EVENT), timeout=60, env=self.env)
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertIn("cannot load the kit's config code", r.stderr)
+                self.assertIn("cannot load the kit's config code", json.loads(r.stdout)['systemMessage'])
 
     def test_a_usage_error_never_refuses(self):
         """An argument: exit 1 with a usage line (the call runs). actions-disable-guard ignores arguments, as it

@@ -113,18 +113,28 @@ A guarded call only in a script 4 or more levels deep (a.sh -> b.sh -> c.sh -> d
 unless other text in the command flows on.
 gh has no request hook, so this hook is the command-text layer; the wall is a token that cannot do it.
 
-Escape hatch (owner only, by hand): start the Claude Code session with
-  CLAUDE_GUARD_OWNER_ALLOW_ACTIONS_DISABLE=$(date -u +%F) claude
-and put  #owner-approved:actions-disable  in the command. The value must be today's UTC date (a stale export opens
-nothing); a command prefix or `export` in the Bash tool never reaches this hook; the variable in any settings file
-is refused (an agent could write those). Fails closed: an internal error refuses commands that look dangerous.
+Escape hatch (owner only, as root): `sudo agent-guards approve [--hours N]` prints a one-time code and keeps its
+hash in a root-owned file (lib/agent_guards/approval.py); a command that carries
+  #owner-approved:actions-disable:<code>
+passes while that file holds the code and its time (1 hour by default) has not run out. An agent cannot write the
+file, so it cannot approve itself, and nothing is inherited: a nested session gets the code only when it is in its
+command. (The old CLAUDE_GUARD_OWNER_ALLOW_ACTIONS_DISABLE variable opens nothing any more: a variable reaches
+every nested `claude -p` or `codex exec` of the session.) Fails closed: an internal error refuses commands that
+look dangerous.
+
+Nested agents: a command that starts an agent session this machine's hooks do not reach is refused, since that
+session could do what this guard refuses: `claude --bare` / `--safe-mode`, `claude` with CLAUDE_CODE_SIMPLE set in
+the same command, and `codex` with anything but login/logout/help/completion/--version (codex runs no Claude Code
+hooks). A nested `claude -p` passes: managed hooks run there too, also with `--settings '{"disableAllHooks":
+true}'` (settings outside managed settings cannot turn managed hooks off). Not covered: other agent programs, and
+an agent started by a program the guard does not read (a Python script, a container).
 
 Facts from the machine file (fork-kit/agent-guards/README.md): actionsDisable.stateDir (cache and log of
 refusals, default ~/.local/state/actions-disable-guard) and actionsDisable.refuseScripts (default none). A missing
 machine file or section gives those defaults; a broken one too, with one line on stderr: the guard never weakens.
 Tests: fork-kit/agent-guards/tests/actions-disable.test.py
 """
-import datetime as dt, fnmatch, glob, itertools, json, os, re, signal, sys, time
+import fnmatch, itertools, json, os, re, signal, sys, time
 from stat import S_ISDIR, S_ISREG
 from urllib.parse import unquote
 
@@ -144,7 +154,7 @@ def _settings():
 SETTINGS, SETTINGS_PROBLEM = _settings()
 REFUSE_SCRIPTS = tuple(SETTINGS['refuseScripts'])
 
-MARK_ENV, MARK_CMD = 'CLAUDE_GUARD_OWNER_ALLOW_ACTIONS_DISABLE', '#owner-approved:actions-disable'
+MARK_CMD = '#owner-approved:actions-disable:'   # + the owner's code (agent_guards.approval)
 # Marks inside a word (private-use characters; the same characters in a command read as hidden text too):
 HID = ''    # text the guard cannot know, as one piece of this word
 WILD = ''   # text the guard cannot know that may be no word at all, or several ("$@", unquoted $X, {a,b})
@@ -153,7 +163,9 @@ PERM_RE = re.compile(r'actions/permissions(?![\w-])', re.I)
 PROTECT_RE = re.compile(r'branches/[^\s?#]+?/protection(?![\w-])|(?<![\w-])rulesets/[^/\s?#]+/?(?:[?#]|$)', re.I)
 RULESET_RE = re.compile(r'(?<![\w-])rulesets/[^/\s?#]+/?(?:[?#]|$)', re.I)
 SHELL_VALUE = re.compile(r'\$[A-Za-z_{(]|`')   # $NAME, ${..}, $(..), `..` in text ($1 is a gh alias placeholder)
-RULESET_OFF = re.compile(r'enforcement["\'\s]*[:=]["\'\s]*disabled', re.I)   # in a request body, any quoting
+# in a request body, any quoting. "evaluate" switches the rules off too: they are only reported, not enforced.
+RULESET_OFF = re.compile(r'enforcement["\'\s]*[:=]["\'\s]*(?:disabled|evaluate)', re.I)
+OFF_WORD = re.compile(r'disabled|evaluate', re.I)
 REPO_PERM_RE = re.compile(r'^(?:https?://[^/]+)?/?repos/[^/\s]+/[^/\s]+/actions/permissions/?$', re.I)
 GQL_RE = re.compile(r'deleteBranchProtectionRule|deleteRepositoryRuleset', re.I)
 GQL_UPDATE = re.compile(r'updateRepositoryRuleset', re.I)   # refused when the text also says disabled
@@ -226,9 +238,10 @@ SELF = os.path.realpath(os.path.abspath(__file__)) if '__file__' in globals() el
 RULE = ('Owner rule (2026-11-13, "guards that refuse, not trust"): no agent disables GitHub Actions workflows, or '
         'Actions itself, on any repo; re-enabling (`gh workflow enable`, PUT .../enable) is fine. If disabling is '
         'really needed, stop and ask the owner: name the repo, the workflow and why. Only the owner can approve '
-        f'it: they start the session with {MARK_ENV}=<today, UTC> in its environment and the command then carries '
-        f'{MARK_CMD}. Agents must not set that variable (command prefix, export, settings file or anywhere else), '
-        'add the marker on their own, or route around this guard with scripts, aliases or other HTTP clients.')
+        'it: they run `sudo agent-guards approve` and give you a code, and the command then carries '
+        f'{MARK_CMD}<code>. Agents must not make up a code, reuse one they were not given for this, start an agent '
+        'session without this machine\'s hooks, or route around this guard with scripts, aliases or other HTTP '
+        'clients.')
 UNREADABLE = ('If this call is harmless, write it so the guard can read it: the path and the flags spelled out in '
               'the command, variables only for ids and only inside quotes.')
 
@@ -1387,10 +1400,10 @@ def api_reason(args, ctx, top=False):
             return reason(f'{how} `gh api` to branch protection or a ruleset: a DELETE there removes the rules '
                           'that keep `main` behind CI and review (changing them with PUT/PATCH/POST is not '
                           'refused)', '' if exact and eff == 'DELETE' else UNREADABLE)
-        if best['ruleset'] and (any(re.fullmatch(r'enforcement=(disabled|.*[%s%s].*)' % (HID, WILD), f, re.S)
-                                    for f in fields)
-                                or any(RULESET_OFF.search(x) for x in seen)):
-            return reason(f'{how} `gh api` that switches a ruleset off (enforcement=disabled)')
+        if best['ruleset'] and (any(re.fullmatch(r'enforcement=(disabled|evaluate|.*[%s%s].*)' % (HID, WILD), f,
+                                                 re.S | re.I) for f in fields)
+                                or any(RULESET_OFF.search(canon(x, cue=False)) for x in list(args) + bodies)):
+            return reason(f'{how} `gh api` that switches a ruleset off (enforcement=disabled or evaluate)')
         if best['ruleset'] and unread:
             return reason(f'{how} `gh api` to a ruleset with a body the guard cannot read (a pipe, a file that is '
                           'not there yet, a file named by a variable): it may switch the ruleset off',
@@ -1401,8 +1414,9 @@ def api_reason(args, ctx, top=False):
         gql = any(may_be_graphql(a) for a in pos) if exact else path is None or may_be_graphql(path)
         if gql and any(GQL_RE.search(x) for x in seen):
             return reason('a GraphQL mutation that deletes branch protection or a ruleset')
-        if gql and any(GQL_UPDATE.search(x) for x in seen) and (unread or any('disabled' in x for x in seen)):
-            return reason('a GraphQL updateRepositoryRuleset that switches the ruleset off (enforcement: DISABLED), '
+        if gql and any(GQL_UPDATE.search(x) for x in seen) and (unread or any(OFF_WORD.search(x) for x in seen)):
+            return reason('a GraphQL updateRepositoryRuleset that switches the ruleset off (enforcement: DISABLED '
+                          'or EVALUATE), '
                           'or one with a body the guard cannot read')
         if gql and unread:
             return reason('a GraphQL call with a body the guard cannot read (a pipe, a file that is not there yet, '
@@ -1451,9 +1465,10 @@ def net_reason(word, args, ctx):
     if best['ruleset']:   # a body that switches the ruleset off, written out or in a file (-d @file)
         files = [m.group(1) for a in args for m in [re.search(r'@([^@=\s]+)$', a)] if m and a not in paths]
         texts = [read_named(f, ctx) for f in files]
-        if any(t is None or RULESET_OFF.search(canon(t)) for t in texts) \
-                or any(RULESET_OFF.search(canon(a)) for a in args):
-            return reason('a request that switches a ruleset off (enforcement=disabled), or one to a ruleset with a '
+        if any(t is None or RULESET_OFF.search(canon(t, cue=False)) for t in texts) \
+                or any(RULESET_OFF.search(canon(a, cue=False)) for a in args):
+            return reason('a request that switches a ruleset off (enforcement=disabled or evaluate), or one to a '
+                          'ruleset with a '
                           'body file the guard cannot read')
     return None
 
@@ -2213,10 +2228,11 @@ def _unescape(m):
         return m.group(0)
 
 
-def canon(text, blank=True):
+def canon(text, blank=True, cue=True):
     """Text as the program at the far end may read it: \\uXXXX, \\xXX, octal and %XX decoded (up to three rounds),
     backslashes and all quotes dropped (blank: \\n \\t \\r read as a blank first), 'a' + 'b' joined, lower case,
-    /./ // and /x/../ in paths resolved. '' when no guarded word is left at all."""
+    /./ // and /x/../ in paths resolved. '' when no guarded word is left at all (cue=False: the text all the same,
+    for a ruleset body, where `"enforcement": "evaluate"` holds no guarded word)."""
     s = text
     if '\\' in s or '%' in s:
         for _ in range(3):
@@ -2229,7 +2245,7 @@ def canon(text, blank=True):
         s = s.replace('\\', '')
     s = re.sub(r'["\']\s*[+.]\s*["\']', '', s)
     s = re.sub(r'["\'`]', '', s).lower()
-    if not any(c in s for c in CUES):
+    if cue and not any(c in s for c in CUES):
         return ''
     s = re.sub(r'(?<!:)/(?:\.?/)+', '/', s)
     k = 1
@@ -2624,8 +2640,35 @@ def flag_values(toks, h):
     return [i for i in range(1, end) if toks[i - 1] in ARG_FLAGS and not toks[i].startswith('-')]
 
 
+CODEX_SAFE = {'login', 'logout', 'help', 'completion', '--version', '-V', '--help', '-h'}
+NO_HOOKS_ENV = 'CLAUDE_CODE_SIMPLE'   # bare mode: Claude Code runs no hooks, managed ones neither
+
+
+def nested_agent(toks, h, ctx):
+    """Why this command word starts an agent session without this machine's hooks, or None."""
+    if h is None:
+        return None
+    word = os.path.basename(toks[h]).lower()
+    args = toks[h + 1:]
+    if word == 'claude':
+        flags = [a for a in args if a in ('--bare', '--safe-mode') or a.startswith(('--bare=', '--safe-mode='))]
+        if flags:
+            return f'`claude {flags[0]}` starts a session that runs without this machine\'s hooks'
+        if any(NO_HOOKS_ENV in t for t in toks[:h]) or NO_HOOKS_ENV in (ctx.get('all') or ''):
+            return f'`claude` with {NO_HOOKS_ENV} set starts a session that runs without this machine\'s hooks'
+    if word == 'codex':
+        sub = next((a for a in args if not a.startswith('-') or a in CODEX_SAFE), None)
+        if sub not in CODEX_SAFE:
+            return (f'`codex {sub}`' if sub else '`codex`') + ' starts an agent session that runs no Claude Code hooks'
+    return None
+
+
 def segment_reason(toks, ctx, loose):
     h, via = head(toks)
+    why = nested_agent(toks, h, ctx)
+    if why:
+        return reason(why, 'Run the work in this session (or a nested `claude -p` without --bare), or ask the '
+                           'owner.')
     flow = ctx['flow']
     for j in flag_values(toks, h):   # the other reading: the flag takes no value and the word starts the command
         base = os.path.basename(toks[j])
@@ -3036,18 +3079,6 @@ def decide_text(text, ctx, scan_raw=True):
     return None
 
 
-def settings_files(env, cwd):
-    home = env.get('HOME') or os.path.expanduser('~')
-    pats = [os.path.join(home, '.claude*', 'settings*.json'), os.path.join(cwd, '.claude', 'settings*.json'),
-            '/etc/claude-code/*.json']
-    if env.get('CLAUDE_CONFIG_DIR'):
-        pats.append(os.path.join(env['CLAUDE_CONFIG_DIR'], 'settings*.json'))
-    out = set()
-    for p in pats:
-        out.update(glob.glob(p))
-    return sorted(out)
-
-
 def decide(cmd, cwd, env, budget=None):
     """None to let the command run, else the deny reason. budget: seconds the reading may take (None: no limit)."""
     if not cmd or (QUICK and quick_pass(cmd)):
@@ -3069,20 +3100,18 @@ def decide(cmd, cwd, env, budget=None):
 
 
 def owner_marker(why, cmd, cwd, env):
-    """The refusal, or None when the owner marker of today lets this one command through."""
-    today = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d')
-    if env.get(MARK_ENV) == today and MARK_CMD in cmd:
-        for f in settings_files(env, cwd or os.getcwd()):
-            try:
-                with open(f, encoding='utf-8', errors='replace') as fh:
-                    found = MARK_ENV in fh.read()
-            except OSError:
-                found = True   # a settings file that cannot be read may hold it
-            if found:
-                return why + f' (The owner marker is refused: {MARK_ENV} is in the settings file {f}, or the ' \
-                             'file cannot be read; only the owner sets it, by hand, when starting a session.)'
+    """The refusal, or None when the command carries the code of the owner's approval (agent_guards.approval).
+    A code that is wrong, too old, or one with no approval file adds why to the refusal."""
+    if MARK_CMD not in cmd:
+        return why
+    try:
+        from agent_guards import approval
+        ok, problem = approval.approved(cmd)
+    except BaseException as e:   # noqa: BLE001 - no approval code: no approval
+        ok, problem = False, f'the approval code cannot be loaded ({type(e).__name__})'
+    if ok:
         return None
-    return why
+    return why + (f' (The owner marker is not accepted: {problem}.)' if problem else '')
 
 
 def redact(s):
@@ -3117,10 +3146,41 @@ def log(cmd, why, env):
 ANSWERED = []
 
 
+TOOLS = ('Bash', 'Monitor')   # the tools whose tool_input.command is shell text
+
+
+def with_problem(out):
+    """The answer with a machine file problem added where the agent and the owner see it."""
+    if not SETTINGS_PROBLEM:
+        return out
+    try:
+        from agent_guards import config
+        return config.notice('actions-disable-guard', SETTINGS_PROBLEM, {'hook_event_name': 'PreToolUse'}, out)
+    except BaseException:   # noqa: BLE001 - no lib: say it plainly
+        return dict(out or {}, systemMessage=f'actions-disable-guard: {SETTINGS_PROBLEM}; built-in defaults used. '
+                                             'Tell the owner.')
+
+
 def deny(why):
-    print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
-                                             'permissionDecisionReason': why}}), flush=True)
+    out = {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+                                  'permissionDecisionReason': why}}
+    try:
+        out = with_problem(out)
+    except BaseException:   # noqa: BLE001 - the refusal matters more than the notice
+        pass
+    print(json.dumps(out), flush=True)
     ANSWERED.append(True)
+
+
+def passed():
+    """Let the command run; with a machine file problem, say so in the answer."""
+    if SETTINGS_PROBLEM:
+        try:
+            print(json.dumps(with_problem(None)), flush=True)
+            ANSWERED.append(True)
+        except BaseException:   # noqa: BLE001
+            pass
+    return 0
 
 
 def alarm_off():
@@ -3156,20 +3216,23 @@ def answer():
         raw = sys.stdin.read()
         if SETTINGS_PROBLEM:
             try:
-                sys.stderr.write('actions-disable-guard: the machine file\'s "agent-guards" section cannot be used '
-                                 f'({SETTINGS_PROBLEM}); built-in defaults used. Run `agent-guards self-check`.\n')
-            except Exception:   # noqa: BLE001
-                pass
+                from agent_guards import config
+                config.warn('actions-disable-guard', SETTINGS_PROBLEM)
+            except BaseException:   # noqa: BLE001
+                try:
+                    sys.stderr.write(f'actions-disable-guard: {SETTINGS_PROBLEM}; built-in defaults used.\n')
+                except Exception:   # noqa: BLE001
+                    pass
         if env.get('ACTIONS_DISABLE_GUARD_TEST_CRASH'):
             raise RuntimeError('test crash')
         ev = json.loads(raw)
-        if ev.get('tool_name') != 'Bash':
+        if ev.get('tool_name') not in TOOLS:
             alarm_off()
-            return 0
+            return passed()
         cmd = (ev.get('tool_input') or {}).get('command') or ''
         if QUICK and quick_pass(cmd):
             alarm_off()
-            return 0
+            return passed()
         left = BUDGET - process_age()
         if left <= 0:
             raise Slow()
@@ -3190,11 +3253,12 @@ def answer():
                          'or names disabling Actions, so it refuses; tell the owner if this repeats')
             cmd = raw
         else:
-            return 0
+            return passed()
     if why:
         deny(why)   # first: logging may be slow
         log(cmd, why, env)
-    return 0
+        return 0
+    return passed()
 
 
 if __name__ == '__main__':

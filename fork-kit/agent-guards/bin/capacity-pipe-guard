@@ -327,23 +327,49 @@ def main(argv=None):
     if argv:
         sys.stderr.write(f'usage: {NAME} (hook: PreToolUse JSON on stdin; its settings entry: `agent-guards hooks`)\n')
         return 1
+    event = None
     try:
-        if SETTINGS_PROBLEM:
-            sys.stderr.write(f'{NAME}: the machine file\'s "agent-guards" section cannot be used ({SETTINGS_PROBLEM}); '
-                             'built-in defaults used. Run `agent-guards self-check`.\n')
         event = json.loads(sys.stdin.read())
-        if event.get('tool_name') not in TOOLS:
-            return 0
-        command = (event.get('tool_input') or {}).get('command')
-        tool = piped(command) if isinstance(command, str) else None
+        tool = None
+        if event.get('tool_name') in TOOLS:
+            command = (event.get('tool_input') or {}).get('command')
+            tool = piped(command) if isinstance(command, str) else None
         if not tool:
+            _say_problem(event)
             return 0
     except BaseException as e:   # fail open: this guards a mistake, not an attack
         sys.stderr.write(f'{NAME}: failed ({type(e).__name__}: {e}); the command is NOT checked and runs. '
                          'Tell the owner if this repeats.\n')
         return 1
     sys.stderr.write(reason(tool) + '\n')
+    if SETTINGS_PROBLEM:    # exit 2: stderr is what the agent reads
+        sys.stderr.write(_problem_text() + '\n')
     return 2
+
+
+def _problem_text():
+    try:
+        from agent_guards import config
+        return config.problem_text(NAME, SETTINGS_PROBLEM)
+    except BaseException:   # noqa: BLE001 - no lib
+        return f'{NAME}: {SETTINGS_PROBLEM}; built-in defaults used. Tell the owner.'
+
+
+def _say_problem(event):
+    """A config problem, where the agent and the owner see it (the call runs: exit 0 with an answer)."""
+    if not SETTINGS_PROBLEM:
+        return
+    text = _problem_text()
+    try:
+        sys.stderr.write(text + '\n')
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from agent_guards import config
+        out = config.notice(NAME, SETTINGS_PROBLEM, event, None)
+    except BaseException:   # noqa: BLE001
+        out = {'systemMessage': text}
+    print(json.dumps(out))
 
 
 if __name__ == '__main__':

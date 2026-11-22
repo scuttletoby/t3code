@@ -4,25 +4,57 @@
   agent-guards self-check              the machine file's "agent-guards" section, the hook files, the managed
                                        settings drop-in (exit 1 on a problem)
   agent-guards check [--settings F]    run each hook wired in F (default: the managed settings drop-in) with one
-                                       case it must refuse and one it must pass (exit 1 on a problem)
+                                       case it must refuse and one it must pass (exit 1 on a problem). As root,
+                                       F must be root's and only root may write it (its commands are run)
   agent-guards hooks [--bin DIR]       print the "hooks" settings of every hook of the kit, for a settings file
+  agent-guards approve [--hours N]     as root: approve actions-disable-guard refusals for N hours (default 1, at
+                                       most 24); prints the code the command must carry
+  agent-guards approve --revoke        as root: end the approval now
 """
-import argparse, json, os, sys
+import argparse, grp, json, os, pwd, subprocess, sys
 
 _kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, os.path.join(_kit, 'lib'))
 
 PROG = 'agent-guards'
+ROOT_UID = 0   # tests only
 
 
-def self_check(bin_dir, drop_in):
-    from agent_guards import config, wiring
+def root_ways(user):
+    """How `user` can become root without the owner (sudo without a password, the docker group): one text each.
+    The approval file and the managed settings are root's; such a user can write them."""
+    out = []
+    try:
+        pw = pwd.getpwnam(user)
+        docker = grp.getgrnam('docker')
+        if user in docker.gr_mem or pw.pw_gid == docker.gr_gid:
+            out.append(f'{user} is in the docker group (a container can write any root file)')
+    except KeyError:
+        pass
+    try:
+        if os.geteuid() == ROOT_UID:
+            r = subprocess.run(['sudo', '-n', '-l', '-U', user], capture_output=True, text=True, timeout=10)
+            if 'NOPASSWD' in r.stdout:
+                out.append(f'{user} may run sudo without a password (NOPASSWD)')
+        else:
+            r = subprocess.run(['sudo', '-n', 'true'], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                out.append(f'{user} can run sudo now without typing a password')
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return out
+
+
+def self_check(bin_dir, drop_in, links_dir=None):
+    from agent_guards import approval, config, wiring
+    links_dir = links_dir or wiring.BIN
     problems, notes = [], []
     settings, cfg_problems = config.load_all()
-    problems += [f'machine file: {p} (the hooks use their built-in defaults)' for p in cfg_problems]
+    problems += [f'machine file: {p}' for p in cfg_problems]
     for hook in wiring.HOOKS:
         if not os.access(os.path.join(bin_dir, hook), os.R_OK):
             problems.append(f'{os.path.join(bin_dir, hook)} is missing or cannot be read')
+    wired = False
     try:
         with open(drop_in, encoding='utf-8') as f:
             text = f.read()
@@ -30,12 +62,31 @@ def self_check(bin_dir, drop_in):
             problems.append(f'{drop_in} is not the kit\'s drop-in of this release: run the installer again '
                             '(agent-guards-install install ... --settings)')
         else:
+            wired = True
             notes.append(f'{drop_in}: every hook is wired in managed settings')
     except FileNotFoundError:
         notes.append(f'{drop_in} is not there: the hooks are not in managed settings (installer --settings, or '
                      'by hand from `agent-guards hooks`)')
     except (OSError, ValueError) as e:
         problems.append(f'{drop_in} cannot be read ({e})')
+    for hook in wiring.HOOKS:   # what the settings entries run: the links, not this version folder
+        link = os.path.join(links_dir, hook)
+        if os.path.realpath(link) != os.path.realpath(os.path.join(bin_dir, hook)):
+            (problems if wired else notes).append(
+                f'{link} is not this kit\'s {hook} ({os.path.realpath(link) if os.path.lexists(link) else "missing"})')
+    data, why = approval.read()
+    if data is not None:
+        import time
+        left = data['until'] - time.time()
+        notes.append(f'an owner approval for actions-disable-guard is open for {int(left // 60)} more minutes'
+                     if left > 0 else 'an owner approval file is there, its time is over')
+    user = os.environ.get('SUDO_USER') or pwd.getpwuid(os.getuid()).pw_name
+    if user == 'root':
+        notes.append('run the self-check as the agents\' user, or through sudo, to see whether that user can become '
+                     'root without the owner')
+    for way in root_ways(user) if user != 'root' else ():
+        notes.append(f'WARNING: {way}: an agent of that user can become root, and then write the managed settings, '
+                     'the machine file and the approval file; the hooks do not hold against it')
     for hook, s in settings.items():
         notes.append(f'{hook}: {json.dumps(s, sort_keys=True)}')
     for n in notes:
@@ -58,19 +109,64 @@ def main(argv):
     c.add_argument('--settings', default=wiring.DROP_IN)
     h = sub.add_parser('hooks')
     h.add_argument('--bin', default=wiring.BIN)
+    p = sub.add_parser('approve')
+    p.add_argument('--hours', type=float, default=1.0)
+    p.add_argument('--revoke', action='store_true')
     a = ap.parse_args(argv)
     if a.cmd == 'self-check':
         return self_check(os.path.dirname(os.path.realpath(__file__)), wiring.DROP_IN)
     if a.cmd == 'hooks':
         print(json.dumps({'hooks': wiring.hooks(a.bin)}, indent=2))
         return 0
+    if a.cmd == 'approve':
+        return approve(a)
     try:
-        with open(a.settings, encoding='utf-8') as f:
-            settings = json.load(f)
+        settings = json.loads(read_settings(a.settings))
     except (OSError, ValueError) as e:
         print(f'{PROG}: cannot read {a.settings} ({e})', file=sys.stderr)
         return 1
     return check.run(settings, a.settings)
+
+
+def read_settings(path):
+    """The text of a settings file whose commands `check` runs. As root only a file root owns, that only root can
+    write, in folders only root can write (else anyone who can write it runs commands as root)."""
+    if os.geteuid() != ROOT_UID:
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+    from agent_guards import approval   # noqa: F401 - puts fork-kit/common on the path
+    import machine_file
+    try:
+        return machine_file.read_protected_text(os.path.abspath(path), ROOT_UID)
+    except machine_file.MachineFileError as e:
+        raise OSError(f'not safe to run as root: {e}') from None
+
+
+def approve(a):
+    from agent_guards import approval
+    if os.geteuid() != ROOT_UID:
+        print(f'{PROG} approve: run this as root (sudo {PROG} approve): only root can write the approval',
+              file=sys.stderr)
+        return 1
+    if a.revoke:
+        print(f'{PROG}: approval removed' if approval.revoke() else f'{PROG}: there was no approval')
+        return 0
+    if not 0 < a.hours <= approval.MAX_HOURS:
+        print(f'{PROG} approve: --hours must be above 0 and at most {approval.MAX_HOURS}', file=sys.stderr)
+        return 1
+    code = approval.new_code()
+    try:
+        data = approval.write(code, a.hours)
+    except OSError as e:
+        print(f'{PROG} approve: cannot write {approval.PATH} ({e})', file=sys.stderr)
+        return 1
+    import time
+    until = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(data['until']))
+    print(f'Approved until {until}. Give the agent this marker for the one command you approve:\n'
+          f'  {approval.MARK}{code}\n'
+          f'Every command carrying it passes actions-disable-guard until then; end it early with '
+          f'`sudo {PROG} approve --revoke`.')
+    return 0
 
 
 if __name__ == '__main__':

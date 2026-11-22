@@ -7,7 +7,7 @@ No root, no network.
 
   python3 -I -B fork-kit/agent-guards/tests/install.test.py
 """
-import json, os, shutil, sys, unittest
+import json, os, shutil, sys, time, unittest
 
 sys.dont_write_bytecode = True   # the CI runner has no -B: a __pycache__ in an installed version folder is a change
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +24,30 @@ FOREIGN = {'permissions': {'deny': ['Bash(rm -rf /)']}}
 
 class Install(fx.FakeHost):
     KIT_DIR, INSTALLER = KIT, os.path.join(KIT, 'sbin', 'agent-guards-install')
+
+    def setUp(self):
+        super().setUp()
+        self.boot = int(time.time()) - 3600           # the fake host booted an hour ago
+        with open(os.path.join(self.m.PROC, 'stat'), 'w') as f:
+            f.write(f'cpu  1 2 3\nbtime {self.boot}\n')
+        self.homes = os.path.join(self.host, 'home')
+        os.makedirs(self.homes)
+        self.m.HOMES = [os.path.join(self.homes, 'agent')]
+
+    def session(self, pid, argv=('claude', '-p'), started=None):
+        """A fake process in PROC: argv, started at `started` (epoch seconds; default: at boot). started='bad': a
+        stat that cannot be read."""
+        d = os.path.join(self.m.PROC, str(pid))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'cmdline'), 'wb') as f:
+            f.write(b'\0'.join(a.encode() for a in argv) + b'\0')
+        with open(os.path.join(d, 'stat'), 'w') as f:
+            if started == 'bad':
+                f.write('garbled')
+            else:
+                ticks = int(((started or self.boot) - self.boot) * os.sysconf('SC_CLK_TCK'))
+                f.write(f'{pid} (node) S 1 ' + ' '.join(['0'] * 17) + f' {ticks} 0 0\n')
+        return d
 
     def config(self):
         with open(self.path(CONFIG)) as f:
@@ -162,6 +186,106 @@ class Install(fx.FakeHost):
             self.assertIsNone(self.drop_in())
             self.assertFalse(os.path.lexists(self.path('/usr/local/bin/actions-disable-guard')))
         self.assertGreater(n, 3)
+
+    # lens A/B minor: uninstall removed hook files that running sessions or other settings files still named
+    def test_rollback_is_no_settings_and_keeps_the_hooks(self):
+        self.assertEqual(self.install('--settings')[0], 0)
+        self.session(4242)                                      # a session that started with the hooks
+        code, out, err = self.install('--no-settings', sha=SHA2)
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self.drop_in())
+        for hook in wiring.HOOKS:                               # the running session still finds every hook
+            self.assertTrue(self.is_file(f'/usr/local/bin/{hook}'), hook)
+        cfg = self.config()
+        self.assertEqual(cfg['settings'], False)
+        self.assertIsInstance(cfg['settingsOff'], int)
+        self.assertGreater(cfg['settingsOff'], time.time() - 60)
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        before = self.snapshot()                                # run again: the time is kept, nothing changes
+        self.assertEqual(self.install('--no-settings', sha=SHA2)[0], 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_uninstall_refused_while_a_session_that_had_the_hooks_runs(self):
+        self.assertEqual(self.install('--settings')[0], 0)
+        for argv, started in ((('claude', '-p', 'x'), None), (('/usr/bin/node', '/x/@anthropic-ai/claude-code/cli.js'),
+                                                              None), (('claude',), 'bad')):
+            with self.subTest(argv=argv, started=started):
+                d = self.session(4242, argv, started)
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1)
+                self.assertIn('started while the hooks were in managed settings', err)
+                self.assertIn('process 4242', err)
+                self.assertIsNone(self.drop_in())               # the drop-in went first: no new session gets them
+                self.assertEqual(self.config()['settings'], False)
+                for hook in wiring.HOOKS:
+                    self.assertTrue(self.is_file(f'/usr/local/bin/{hook}'), hook)
+                shutil.rmtree(d)
+        self.session(4243, ('bash', '-c', 'claude')) # not Claude Code itself
+        self.session(4244, started=time.time() + 5)            # started after the drop-in went: it never had them
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.lexists(self.path('/usr/local/bin/actions-disable-guard')))
+
+    def test_uninstall_refused_while_another_settings_file_names_a_hook(self):
+        entry = {'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [
+            {'type': 'command', 'command': '/usr/local/bin/actions-disable-guard'}]}]}}
+        user = os.path.join(self.m.HOMES[0], '.claude', 'settings.json')
+        for where in (self.path(f'{wiring.MANAGED_DIR}/managed-settings.json'),
+                      self.path(f'{os.path.dirname(DROP_IN)}/zz-hand.json'), user,
+                      os.path.join(self.m.HOMES[0], '.claude-other', 'settings.local.json')):
+            with self.subTest(where):
+                self.fresh()
+                self.assertEqual(self.install('--settings')[0], 0)
+                os.makedirs(os.path.dirname(where), exist_ok=True)
+                with open(where, 'w') as f:
+                    json.dump(entry, f)
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1)
+                self.assertIn('names /usr/local/bin/actions-disable-guard', err)
+                self.assertIn('Remove those entries by hand', err)
+                os.unlink(where)
+                self.assertEqual(self.config(), {'version': 1, 'settings': True})   # nothing changed
+                self.assertIsNotNone(self.drop_in())
+                self.assertEqual(self.run_main('self-check')[0], 0)
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 0, err)
+        if os.geteuid() != 0:                                    # a file it cannot read may name one
+            self.fresh()
+            self.assertEqual(self.install('--settings')[0], 0)
+            os.makedirs(os.path.dirname(user), exist_ok=True)
+            with open(user, 'w') as f:
+                f.write('{}')
+            os.chmod(user, 0)
+            self.addCleanup(os.chmod, user, 0o600)
+            code, _, err = self.run_main('uninstall')
+            self.assertEqual(code, 1)
+            self.assertIn('cannot be read', err)
+
+    def test_uninstall_stopped_after_pending_then_a_session_is_still_refused(self):
+        """Stopped between "pending" and the drop-in's removal: the next run removes it, puts the time and still
+        counts a session that started while it was there."""
+        self.assertEqual(self.install('--settings')[0], 0)
+        cfg = dict(self.config(), settings=False, settingsOff='pending')    # the state such a stop leaves
+        with open(self.path(CONFIG), 'w') as f:
+            json.dump(cfg, f)
+        self.assertIsNotNone(self.drop_in())
+        self.assert_named_hooks_there()
+        self.session(4242)
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1)
+        self.assertIsInstance(self.config()['settingsOff'], int)
+        self.assertIsNone(self.drop_in())
+        self.assertEqual(self.install('--settings')[0], 0)     # the owner keeps the kit after all: back as it was
+        self.assertEqual(self.config(), {'version': 1, 'settings': True})
+        self.assertEqual(self.run_main('self-check')[0], 0)
+
+    def test_a_managed_folder_others_can_write_is_refused(self):
+        os.makedirs(self.path(wiring.MANAGED_DIR))
+        os.chmod(self.path(wiring.MANAGED_DIR), 0o777)
+        code, _, err = self.install('--settings')
+        self.assertEqual(code, 1)
+        self.assertIn('only root can write', err)
+        self.assertEqual(os.listdir(self.path(wiring.MANAGED_DIR)), [])
 
     def fresh(self):
         shutil.rmtree(self.root)

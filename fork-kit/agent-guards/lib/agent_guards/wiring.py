@@ -3,14 +3,18 @@
 Each hook is one command in Claude Code's settings, at the installed path (/usr/local/bin/<hook>). The command
 first checks that the hook file is there, so a missing hook fails the way its kind must, and says so on stderr:
 
-  actions-disable-guard  fails CLOSED: exit 2 (every Bash command is refused until the hook is back), also when
-                         the hook process itself fails (`|| exit 2`). It answers itself within 5 s of its start.
+  actions-disable-guard  fails CLOSED: exit 2 (every Bash and Monitor command is refused until the hook is back),
+                         also when the hook process itself fails (`|| exit 2`) and when the file is empty (an
+                         empty Python file would answer nothing, which lets the call run). It answers itself within 5 s of
+                         its start; should Claude Code still cut it off at its timeout, the entry's
+                         "onFailure": "block" refuses the call (without it a timed-out hook lets the call run).
   capacity-pipe-guard,   fail OPEN: exit 1, which Claude Code shows as a hook error and then runs the call. These
   memory-index-guard,    guard mistakes, not attacks; refusing every call because a helper is gone would stop all
   bg-guard, agent-slots  work on the machine.
 
 The same entries go in the managed settings drop-in the installer writes (--settings) or, by hand, in any settings
-file (`agent-guards hooks`). Timeouts and matchers are the ones these hooks always had.
+file (`agent-guards hooks`). Monitor runs shell text like Bash, so every hook that reads a command reads it for
+Monitor too.
 """
 import json
 
@@ -22,7 +26,7 @@ DROP_IN = f'{MANAGED_DIR}/managed-settings.d/{DROP_IN_NAME}'
 HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard', 'bg-guard', 'agent-slots')
 CLOSED = {'actions-disable-guard'}               # a missing or failed hook refuses
 WHAT_IS_LOST = {
-    'actions-disable-guard': 'every Bash command is refused until it is back',
+    'actions-disable-guard': 'every Bash and Monitor command is refused until it is back',
     'capacity-pipe-guard': 'hook skipped, commands are NOT checked',
     'memory-index-guard': 'hook skipped, the memory index is NOT checked',
     'bg-guard': 'hook skipped, background commands are NOT checked',
@@ -31,9 +35,9 @@ WHAT_IS_LOST = {
 # (event, matcher or None, [(hook, timeout)]): one settings entry each, in this order
 ENTRIES = (
     ('PreToolUse', 'Write|Edit|MultiEdit', [('memory-index-guard', 5)]),
-    ('PreToolUse', 'Bash', [('actions-disable-guard', 10)]),
+    ('PreToolUse', 'Bash|Monitor', [('actions-disable-guard', 10)]),
     ('PreToolUse', 'Bash|Monitor', [('capacity-pipe-guard', 10)]),
-    ('PostToolUse', 'Write|Edit|MultiEdit|Bash', [('memory-index-guard', 5)]),
+    ('PostToolUse', 'Write|Edit|MultiEdit|Bash|Monitor', [('memory-index-guard', 5)]),
     ('UserPromptSubmit', None, [('agent-slots', 5)]),
     ('Stop', None, [('agent-slots', 5), ('bg-guard', 5)]),
 )
@@ -43,7 +47,7 @@ def command(hook, bin_dir=BIN, python='/usr/bin/python3'):
     """The shell command of one hook's settings entry."""
     path = f'{bin_dir}/{hook}'
     if hook in CLOSED:
-        return (f'g={path}; [ -r "$g" ] || {{ echo "{hook}: $g is missing: {WHAT_IS_LOST[hook]}" >&2; exit 2; }}; '
+        return (f'g={path}; [ -r "$g" ] && [ -s "$g" ] || {{ echo "{hook}: $g is missing or empty: {WHAT_IS_LOST[hook]}" >&2; exit 2; }}; '
                 f'{python} -IB "$g" || {{ echo "{hook}: the guard failed (exit $?): the command is refused" >&2; '
                 'exit 2; }')
     return (f'g={path}; [ -r "$g" ] || {{ echo "{hook}: $g is missing: {WHAT_IS_LOST[hook]}" >&2; exit 1; }}; '
@@ -55,7 +59,8 @@ def hooks(bin_dir=BIN, python='/usr/bin/python3'):
     out = {}
     for event, matcher, items in ENTRIES:
         entry = {'matcher': matcher} if matcher else {}
-        entry['hooks'] = [{'type': 'command', 'command': command(h, bin_dir, python), 'timeout': t} for h, t in items]
+        entry['hooks'] = [dict({'type': 'command', 'command': command(h, bin_dir, python), 'timeout': t},
+                               **({'onFailure': 'block'} if h in CLOSED else {})) for h, t in items]
         out.setdefault(event, []).append(entry)
     return out
 
@@ -75,13 +80,28 @@ def commands_in(settings):
     return out
 
 
-def find(settings, hook, event):
-    """The command of `hook` for `event` in a settings object (the first one naming it), or None. A name is found
-    as a whole word of a path (`/x/bg-guard`, `bg-guard;`), not inside another name."""
+def matches(matcher, tool):
+    """Whether a settings entry's matcher takes this tool, as Claude Code reads it: none, "" or "*" take every tool;
+    letters, digits, _ and | only are an exact list; anything else is a regular expression."""
+    import re
+    if tool is None or matcher in (None, '', '*'):
+        return True
+    if re.fullmatch(r'[A-Za-z0-9_|]+', matcher):
+        return tool in matcher.split('|')
+    try:
+        return re.search(matcher, tool) is not None
+    except re.error:
+        return False
+
+
+def find(settings, hook, event, tool=None):
+    """The command of `hook` for `event` in a settings object (the first one naming it, in an entry whose matcher
+    takes `tool` when one is given), or None. A name is found as a whole word of a path (`/x/bg-guard`,
+    `bg-guard;`), not inside another name."""
     import re
     pat = re.compile(r'(^|[/\s="\'])' + re.escape(hook) + r'($|[\s;"\'])')
-    for ev, _matcher, cmd in commands_in(settings):
-        if ev == event and pat.search(cmd):
+    for ev, matcher, cmd in commands_in(settings):
+        if ev == event and pat.search(cmd) and matches(matcher, tool):
             return cmd
     return None
 
@@ -90,5 +110,7 @@ def ours(settings):
     """True for a settings object this kit wrote: only "hooks", and every command one of the kit's hooks."""
     if not isinstance(settings, dict) or set(settings) != {'hooks'}:
         return False
+    import re
     cmds = commands_in(settings)
-    return bool(cmds) and all(any(f'/{h}' in c for h in HOOKS) for _e, _m, c in cmds)
+    kit = re.compile(r'^g=' + re.escape(BIN) + r'/(' + '|'.join(re.escape(h) for h in HOOKS) + r'); ')
+    return bool(cmds) and all(kit.match(c) for _e, _m, c in cmds)

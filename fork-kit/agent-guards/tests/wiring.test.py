@@ -49,8 +49,9 @@ class Entries(unittest.TestCase):
     def test_the_entries_are_the_ones_settings_had(self):
         self.assertEqual(sorted((e, x.get('matcher'), [h['timeout'] for h in x['hooks']])
                                 for e, xs in wiring.hooks().items() for x in xs),
-                         sorted([('PreToolUse', 'Write|Edit|MultiEdit', [5]), ('PreToolUse', 'Bash', [10]),
-                                 ('PreToolUse', 'Bash|Monitor', [10]), ('PostToolUse', 'Write|Edit|MultiEdit|Bash', [5]),
+                         sorted([('PreToolUse', 'Write|Edit|MultiEdit', [5]), ('PreToolUse', 'Bash|Monitor', [10]),
+                                 ('PreToolUse', 'Bash|Monitor', [10]),
+                                 ('PostToolUse', 'Write|Edit|MultiEdit|Bash|Monitor', [5]),
                                  ('UserPromptSubmit', None, [5]), ('Stop', None, [5, 5])]))
         for _e, _m, cmd in wiring.commands_in({'hooks': wiring.hooks()}):
             self.assertIn('/usr/local/bin/', cmd)
@@ -59,6 +60,37 @@ class Entries(unittest.TestCase):
         self.assertFalse(wiring.ours({'hooks': wiring.hooks(), 'permissions': {}}))
         self.assertFalse(wiring.ours({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': '/x/other'}]}]}}))
         self.assertFalse(wiring.ours({'hooks': {}}))
+        # lens B nit: a command that only names a kit hook somewhere is not the kit's
+        other = {'type': 'command', 'command': 'echo /usr/local/bin/bg-guard; g=/usr/local/bin/bg-guard; x'}
+        self.assertFalse(wiring.ours({'hooks': {'Stop': [{'hooks': [other]}]}}))
+        self.assertFalse(wiring.ours({'hooks': {'Stop': [{'hooks': [
+            {'type': 'command', 'command': 'g=/usr/local/bin/bg-guard-old; exec x'}]}]}}))
+
+    def test_every_tool_that_runs_shell_text_is_matched(self):
+        """Lens B major: Monitor runs shell text like Bash; a guard wired for Bash only let it through."""
+        for event, hook in (('PreToolUse', 'actions-disable-guard'), ('PreToolUse', 'capacity-pipe-guard'),
+                            ('PostToolUse', 'memory-index-guard')):
+            for tool in ('Bash', 'Monitor'):
+                with self.subTest(hook=hook, tool=tool):
+                    self.assertIsNotNone(wiring.find({'hooks': wiring.hooks()}, hook, event, tool))
+        self.assertIsNone(wiring.find({'hooks': wiring.hooks()}, 'actions-disable-guard', 'PreToolUse', 'Read'))
+
+    def test_matches_reads_the_matcher_as_claude_code_does(self):
+        for matcher, tool, want in ((None, 'Monitor', True), ('', 'Monitor', True), ('*', 'Monitor', True),
+                                    ('Bash', 'Monitor', False), ('Bash|Monitor', 'Monitor', True),
+                                    ('Bash|Monitor', 'Mon', False), ('Mon.*', 'Monitor', True),
+                                    ('(', 'Monitor', False), ('Bash', None, True)):
+            with self.subTest(matcher=matcher, tool=tool):
+                self.assertEqual(wiring.matches(matcher, tool), want)
+
+    def test_the_closed_hook_blocks_on_a_timeout(self):
+        """Lens B minor: Claude Code lets the call run when a hook times out, unless the entry says
+        "onFailure": "block". The closed hook says it; the open ones do not."""
+        for _event, entries in wiring.hooks().items():
+            for e in entries:
+                for h in e['hooks']:
+                    closed = 'actions-disable-guard' in h['command']
+                    self.assertEqual(h.get('onFailure'), 'block' if closed else None, h['command'])
 
     def test_find_matches_whole_names_only(self):
         s = {'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': '/x/my-bg-guard-2'},
@@ -83,7 +115,8 @@ class Entries(unittest.TestCase):
                 os.unlink(os.path.join(self.bin, hook))
                 r = self.sh(hook, BASH)
                 self.assertEqual(r.returncode, 2 if hook in wiring.CLOSED else 1)
-                self.assertIn(f'{hook}: {self.bin}/{hook} is missing: {wiring.WHAT_IS_LOST[hook]}', r.stderr)
+                gone = 'is missing or empty' if hook in wiring.CLOSED else 'is missing'
+                self.assertIn(f'{hook}: {self.bin}/{hook} {gone}: {wiring.WHAT_IS_LOST[hook]}', r.stderr)
                 self.stand_in(hook)
 
     def test_a_hook_that_cannot_be_read_counts_as_missing(self):
@@ -103,17 +136,18 @@ class Entries(unittest.TestCase):
                     self.stand_in(hook, text)
                     r = self.sh(hook, BASH)
                     if hook in wiring.CLOSED:
-                        self.assertEqual(r.returncode, 2 if name != 'empty' else 0)   # an empty file says nothing
+                        self.assertEqual(r.returncode, 2, r.stderr)   # lens A nit: empty refuses too
+                        self.assertIn('is missing or empty' if name == 'empty'
+                                      else 'actions-disable-guard: the guard failed (exit', r.stderr)
                         if name != 'empty':
-                            self.assertIn('actions-disable-guard: the guard failed (exit', r.stderr)
                             self.assertIn('the command is refused', r.stderr)
                     else:
                         self.assertNotEqual(r.returncode, 2)
                     self.stand_in(hook)
 
     def test_a_hook_killed_by_a_timeout_refuses_only_the_closed_one(self):
-        """Claude Code ends a hook at its timeout and goes on (no onFailure). Killed by a signal on its own (the
-        machine ran out of memory, say), the closed entry still refuses."""
+        """Killed by a signal on its own (the machine ran out of memory, say), the closed entry still refuses.
+        Claude Code's own timeout is the entry's "onFailure" (test_the_closed_hook_blocks_on_a_timeout)."""
         for hook in ('actions-disable-guard', 'capacity-pipe-guard'):
             with self.subTest(hook):
                 self.stand_in(hook, 'import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n')
@@ -148,10 +182,11 @@ class Check(unittest.TestCase):
     def test_the_kit_entries_pass(self):
         code, lines = self.run_check(self.settings)
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 11, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 13, '\n'.join(lines))
         self.assertEqual(lines[-1], 'check: test settings: OK')
-        self.assertEqual(os.listdir(os.path.join(self.home, '.cache', 'memory-index-guard')), [])   # cleaned up
-        self.assertEqual(os.listdir(os.path.join(self.home, '.local', 'state', 'bg-guard')), [])
+        # lens A nit: the hooks ran with HOME in check's own temporary folder; nothing (log, cache, state) is
+        # written in the caller's HOME
+        self.assertEqual(os.listdir(self.home), [])
 
     def test_a_hook_not_wired_is_missing(self):
         s = json.loads(json.dumps(self.settings))
@@ -161,6 +196,14 @@ class Check(unittest.TestCase):
         self.assertEqual([ln for ln in lines if ln.startswith('MISSING')],
                          ['MISSING bg-guard (Stop): not wired in test settings'])
         self.assertEqual(self.run_check({})[0], 1)
+
+    def test_a_guard_wired_for_bash_only_is_missing_for_monitor(self):
+        s = json.loads(json.dumps(self.settings))
+        for e in s['hooks']['PreToolUse']:
+            e['matcher'] = e['matcher'].replace('|Monitor', '')
+        code, lines = self.run_check(s)
+        self.assertEqual(code, 1)
+        self.assertIn('MISSING actions-disable-guard (PreToolUse, Monitor): not wired in test settings', lines)
 
     def test_a_missing_or_broken_hook_fails_the_check(self):
         os.unlink(os.path.join(self.bin, 'capacity-pipe-guard'))
@@ -199,6 +242,125 @@ class Check(unittest.TestCase):
                            text=True, timeout=60)
         self.assertEqual(r.returncode, 1)
         self.assertIn('cannot read', r.stderr)
+
+
+
+def load_cli():
+    import importlib.machinery, importlib.util
+    loader = importlib.machinery.SourceFileLoader('agent_guards_cli', os.path.join(fx.BIN, 'agent-guards'))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+class Command(unittest.TestCase):
+    """bin/agent-guards as a module: root is this test's user (ROOT_UID), the approval file is in a temporary
+    folder (approval.PATH, approval.OWNER_UID)."""
+
+    def setUp(self):
+        from agent_guards import approval
+        self.cli, self.approval = load_cli(), approval
+        self.tmp = tempfile.mkdtemp(prefix='agent-guards-cli-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cli.ROOT_UID = os.geteuid()
+        for name, value in (('PATH', os.path.join(self.tmp, 'etc', 'approval.json')), ('OWNER_UID', os.geteuid())):
+            self.addCleanup(setattr, approval, name, getattr(approval, name))
+            setattr(approval, name, value)
+        fx.use_machine(fx.NO_MACHINE)
+
+    def main(self, *argv):
+        import contextlib
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.cli.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def settings_file(self, mode=0o644, name='s.json'):
+        path = os.path.join(self.tmp, name)
+        with open(path, 'w') as f:
+            f.write('{"hooks": {}}')
+        os.chmod(path, mode)
+        return path
+
+    def test_check_as_root_runs_only_a_settings_file_only_root_can_write(self):
+        """Lens B minor: as root, `check --settings F` runs F's commands; a file another user can write (or a link
+        to one) would run that user's commands as root."""
+        good = self.settings_file()
+        self.assertEqual(self.cli.read_settings(good), '{"hooks": {}}')
+        for path in (self.settings_file(0o666, 'w.json'), self.settings_file(0o620, 'g.json')):
+            with self.subTest(path):
+                with self.assertRaises(OSError) as e:
+                    self.cli.read_settings(path)
+                self.assertIn('not safe to run as root', str(e.exception))
+                code, _out, err = self.main('check', '--settings', path)
+                self.assertEqual(code, 1)
+                self.assertIn('not safe to run as root', err)
+        link = os.path.join(self.tmp, 'link.json')
+        os.symlink(good, link)
+        with self.assertRaises(OSError):
+            self.cli.read_settings(link)
+        self.cli.ROOT_UID = os.geteuid() + 1          # not root: the user's own file, as it is
+        self.assertEqual(self.cli.read_settings(os.path.join(self.tmp, 'w.json')), '{"hooks": {}}')
+
+    def test_approve_prints_a_code_that_the_approval_takes(self):
+        code, out, err = self.main('approve', '--hours', '2')
+        self.assertEqual(code, 0, err)
+        mark = [w for w in out.split() if w.startswith(self.approval.MARK)]
+        self.assertEqual(len(mark), 1, out)
+        self.assertEqual(self.approval.approved(f'gh x {mark[0]}'), (True, None))
+        self.assertEqual(oct(os.stat(self.approval.PATH).st_mode & 0o777), '0o644')
+        code, out, _ = self.main('approve', '--revoke')
+        self.assertEqual((code, os.path.exists(self.approval.PATH)), (0, False))
+        self.assertFalse(self.approval.approved(f'gh x {mark[0]}')[0])
+        self.assertEqual(self.main('approve', '--revoke')[0], 0)          # again: nothing there, still fine
+        for hours in ('0', '25', '-1'):
+            self.assertEqual(self.main('approve', '--hours', hours)[0], 1)
+        self.assertFalse(os.path.exists(self.approval.PATH))
+        self.cli.ROOT_UID = os.geteuid() + 1
+        code, _out, err = self.main('approve')
+        self.assertEqual(code, 1)
+        self.assertIn('run this as root', err)
+        self.assertFalse(os.path.exists(self.approval.PATH))
+
+    def test_self_check_names_links_root_ways_and_the_approval(self):
+        self.cli.root_ways = lambda user: [f'{user} is in the docker group (a container can write any root file)']
+        links = os.path.join(self.tmp, 'links')
+        os.makedirs(links)
+        drop_in = os.path.join(self.tmp, 'agent-guards.json')
+        import contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.cli.self_check(fx.BIN, drop_in, links)          # not wired: a link elsewhere is a note
+        text = out.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertIn(f'note: {links}/bg-guard is not this kit\'s bg-guard (missing)', text)
+        self.assertIn('WARNING:', text)
+        self.assertIn('docker group', text)
+        with open(drop_in, 'w') as f:                                    # wired: the same is a problem
+            f.write(wiring.drop_in_text())
+        self.approval.write(self.approval.new_code(), 1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.cli.self_check(fx.BIN, drop_in, links)
+        text = out.getvalue()
+        self.assertEqual(code, 1, text)
+        self.assertIn(f'PROBLEM: {links}/bg-guard is not this kit\'s bg-guard', text)
+        self.assertIn('an owner approval for actions-disable-guard is open', text)
+        for hook in wiring.HOOKS:
+            os.symlink(os.path.join(fx.BIN, hook), os.path.join(links, hook))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.cli.self_check(fx.BIN, drop_in, links), 0, out.getvalue())
+
+    def test_self_check_names_an_unknown_key(self):
+        machine = fx.machine_file(self.tmp, {'gardener': {}})
+        fx.use_machine(machine)
+        import contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.cli.self_check(fx.BIN, os.path.join(self.tmp, 'none.json'), self.tmp)
+        self.assertEqual(code, 1)
+        self.assertIn("PROBLEM: machine file: agent-guards: unknown key 'gardener'", out.getvalue())
 
 
 if __name__ == '__main__':

@@ -17,6 +17,8 @@ one line on stderr. Tests: fork-kit/agent-guards/tests/agent-slots.test.py
 """
 import json, os, subprocess, sys
 
+NAME = 'agent-slots'
+
 
 def _settings():
     """(agentSlots settings, problem or None); a copy without the kit's lib keeps the defaults and says so."""
@@ -76,18 +78,38 @@ def decide(data, c):
     return None
 
 
+def _notice(problem, event, out):
+    """`out` with a config problem added where the agent and the owner see it (and one line on stderr)."""
+    if not problem:
+        return out
+    try:
+        from agent_guards import config
+        config.warn(NAME, problem)
+        return config.notice(NAME, problem, event, out)
+    except BaseException:   # noqa: BLE001 - no lib: say it plainly
+        text = f'{NAME}: {problem}; built-in defaults used. Tell the owner.'
+        try:
+            sys.stderr.write(text + '\n')
+        except Exception:  # noqa: BLE001
+            pass
+        return dict(out or {}, systemMessage=text)
+
+
 def main():
     if sys.argv[1:]:
         sys.stderr.write('usage: agent-slots (hook: UserPromptSubmit or Stop JSON on stdin)\n')
         return 1
+    event, problem = None, None
     try:
         c, problem = _settings()
-        if problem:
-            sys.stderr.write('agent-slots: the machine file\'s "agent-guards" section cannot be used '
-                             f'({problem}); built-in defaults used. Run `agent-guards self-check`.\n')
-        out = decide(json.load(sys.stdin), c)
+        event = json.load(sys.stdin)
+        out = decide(event, c)
     except Exception:  # never break a call because of this hook
-        return 0
+        out = None
+    try:
+        out = _notice(problem, event, out)
+    except Exception:  # noqa: BLE001
+        pass
     if out:
         print(json.dumps(out))
     return 0

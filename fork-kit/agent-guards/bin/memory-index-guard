@@ -32,6 +32,7 @@ def _settings():
 
 
 SETTINGS, SETTINGS_PROBLEM = _settings()
+NAME = 'memory-index-guard'
 MAX_CHARS = SETTINGS['maxChars']
 MAX_LINE = SETTINGS['maxLine']
 STATE = SETTINGS['stateDir']
@@ -164,22 +165,38 @@ def post(data):
     return {'decision': 'block', 'reason': message(idx, probs)}
 
 
+def _notice(problem, event, out):
+    """`out` with a config problem added where the agent and the owner see it (and one line on stderr)."""
+    if not problem:
+        return out
+    try:
+        from agent_guards import config
+        config.warn(NAME, problem)
+        return config.notice(NAME, problem, event, out)
+    except BaseException:   # noqa: BLE001 - no lib: say it plainly
+        text = f'{NAME}: {problem}; built-in defaults used. Tell the owner.'
+        try:
+            sys.stderr.write(text + '\n')
+        except Exception:  # noqa: BLE001
+            pass
+        return dict(out or {}, systemMessage=text)
+
+
 def main():
     if sys.argv[1:]:
         sys.stderr.write('usage: memory-index-guard (hook: PreToolUse or PostToolUse JSON on stdin)\n')
         return 1
-    if SETTINGS_PROBLEM:
-        try:
-            sys.stderr.write('memory-index-guard: the machine file\'s "agent-guards" section cannot be used '
-                             f'({SETTINGS_PROBLEM}); built-in defaults used. Run `agent-guards self-check`.\n')
-        except Exception:  # noqa: BLE001
-            pass
+    data = None
     try:
         data = json.load(sys.stdin)
         ev = data.get('hook_event_name')
         out = pre(data) if ev == 'PreToolUse' else post(data) if ev == 'PostToolUse' else None
     except Exception:  # never break a tool call because of this guard
-        return 0
+        out = None
+    try:
+        out = _notice(SETTINGS_PROBLEM, data, out)
+    except Exception:  # noqa: BLE001
+        pass
     if out:
         print(json.dumps(out))
     return 0

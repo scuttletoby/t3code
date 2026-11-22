@@ -15,6 +15,8 @@ import guards_fixture as fx  # noqa: E402
 
 HOOK = os.path.join(fx.BIN, 'actions-disable-guard')
 GARDEN = {'name': 'example_garden.py', 'flag': '--fix', 'why': 'disables every workflow it does not know'}
+# the old escape hatch (a session variable and a bare marker): it opens nothing any more (lens B major: a nested
+# session inherited the variable)
 MARK_ENV, MARK_CMD = 'CLAUDE_GUARD_OWNER_ALLOW_ACTIONS_DISABLE', '#owner-approved:actions-disable'
 
 
@@ -1149,8 +1151,10 @@ class GuardTest(Case):
 
     def test_reason_names_rule_owner_and_marker(self):
         why = self.decide('gh workflow disable 1')
-        for part in ('owner', 'refuse', MARK_ENV, 'must not'):
+        for part in ('owner', 'refuse', 'sudo agent-guards approve', MARK_CMD + ':<code>', 'must not',
+                     'without this machine\'s hooks'):
             self.assertIn(part, why)
+        self.assertNotIn(MARK_ENV, why)
 
     # scripts the command runs
     def test_shell_script_file(self):
@@ -1223,24 +1227,108 @@ class GuardTest(Case):
         self.write('al.yml', 'wd: workflow disable\n', 0o644)
         self.assertIsNotNone(self.decide('gh alias import al.yml'))
 
-    # the owner's escape hatch
-    def hatch_env(self, value):
-        return dict(self.env, **{MARK_ENV: value})
+    # the owner's approval (lens B major): a root-owned file `sudo agent-guards approve` writes, and the code it
+    # prints in the command. A session variable reached every nested agent; the old one now opens nothing.
+    def approve(self, hours=1, now=None):
+        """An approval file in this test's folder, owned by the test user (approval.PATH, approval.OWNER_UID);
+        (the approval module, the marker with its code)."""
+        from agent_guards import approval
+        for name, value in (('PATH', os.path.join(self.dir, 'etc', 'approval.json')), ('OWNER_UID', os.geteuid())):
+            self.addCleanup(setattr, approval, name, getattr(approval, name))
+            setattr(approval, name, value)
+        code = approval.new_code()
+        approval.write(code, hours, now=now)
+        return approval, approval.MARK + code
 
-    def test_hatch_needs_env_of_today_and_marker(self):
-        cmd = f'gh workflow disable 1 -R a/b {MARK_CMD}'
-        self.assertIsNone(self.decide(cmd, self.hatch_env(today())))
-        self.assertIsNotNone(self.decide('gh workflow disable 1 -R a/b', self.hatch_env(today())))
-        self.assertIsNotNone(self.decide(cmd, self.hatch_env('2026-01-01')))
-        self.assertIsNotNone(self.decide(cmd, self.hatch_env('1')))
-        self.assertIsNotNone(self.decide(cmd))
-
-    def test_hatch_refused_when_set_in_a_settings_file(self):
+    def test_the_old_variable_and_marker_open_nothing(self):
+        env = dict(self.env, **{MARK_ENV: today()})
+        for cmd in (f'gh workflow disable 1 -R a/b {MARK_CMD}', f'gh workflow disable 1 {MARK_CMD}:',
+                    f'gh workflow disable 1 {MARK_CMD}:abc'):
+            with self.subTest(cmd):
+                self.assertIsNotNone(self.decide(cmd, env))
         self.write('.claude/settings.json', json.dumps({'env': {MARK_ENV: today()}}), 0o644)
-        cmd = f'gh workflow disable 1 {MARK_CMD}'
-        why = self.decide(cmd, self.hatch_env(today()))
-        self.assertIsNotNone(why)
-        self.assertIn('settings', why)
+        self.assertIsNotNone(self.decide(f'gh workflow disable 1 {MARK_CMD}', env))
+
+    def test_an_approval_needs_the_owners_file_and_its_code(self):
+        approval, mark = self.approve()
+        cmd = 'gh workflow disable 1 -R a/b'
+        self.assertIsNone(self.decide(f'{cmd} {mark}'))
+        self.assertIsNone(self.decide(f'{cmd}  {mark} (the owner asked for it in issue 9)'))
+        self.assertIsNotNone(self.decide(cmd))                                   # no code: refused
+        why = self.decide(f'{cmd} {approval.MARK}{approval.new_code()}')         # a made-up code
+        self.assertIn('not the one the owner approved', why)
+        self.assertIsNotNone(self.decide(f'{cmd} {mark}x'))                      # not the code: longer
+        self.assertIsNotNone(self.decide(f'{cmd} {mark[:-1]}'))                  # not the code: shorter
+        with open(approval.PATH) as f:
+            self.assertNotIn(mark.rpartition(':')[2], f.read())                  # only its hash is kept
+        self.assertTrue(approval.revoke())
+        self.assertIn('not there', self.decide(f'{cmd} {mark}'))
+
+    def test_an_approval_that_is_over_or_not_safe_opens_nothing(self):
+        import time
+        approval, mark = self.approve(hours=1, now=time.time() - 7200)
+        self.assertIn('the approval is over', self.decide(f'gh workflow disable 1 {mark}'))
+        approval, mark = self.approve()
+        cmd = f'gh workflow disable 1 {mark}'
+        os.chmod(approval.PATH, 0o666)                                            # an agent could write it
+        self.assertIn('writable by group or others', self.decide(cmd))
+        os.chmod(approval.PATH, 0o644)
+        os.rename(approval.PATH, approval.PATH + '.real')
+        os.symlink(approval.PATH + '.real', approval.PATH)
+        self.assertIn('symbolic link', self.decide(cmd))
+        os.unlink(approval.PATH)
+        for text in ('', '{', '[]', '{"version": 1}', '{"version": 2, "sha256": "' + 'a' * 64 + '", "until": 9e9}',
+                     '{"version": 1, "sha256": "x", "until": 9e9}', '{"version": 1, "sha256": "' + 'a' * 64
+                     + '", "until": "9e9"}'):
+            with self.subTest(text):
+                with open(approval.PATH, 'w') as f:
+                    f.write(text)
+                self.assertIsNotNone(self.decide(cmd))
+        with self.assertRaises(ValueError):
+            approval.write(approval.new_code(), approval.MAX_HOURS + 1)
+
+    # nested agent sessions (lens B minor): one without this machine's hooks would run anything
+    def test_a_nested_session_without_the_hooks_is_refused(self):
+        refused = ['claude --bare -p "x"', 'claude -p --bare x', 'claude --safe-mode -p x', 'claude --bare=1 -p x',
+                   'CLAUDE_CODE_SIMPLE=1 claude -p x', 'env CLAUDE_CODE_SIMPLE=1 claude -p x',
+                   'export CLAUDE_CODE_SIMPLE=1; claude -p x',
+                   'claude -p --settings \'{"env": {"CLAUDE_CODE_SIMPLE": "1"}}\' x',
+                   '/usr/local/bin/claude --bare -p x', 'bash -c "claude --bare -p x"',
+                   'codex exec "x"', 'codex "x"', 'codex', 'codex --full-auto exec x', 'cd /tmp && codex exec x',
+                   'timeout 60 codex exec x', 'bash -c "codex exec x"']
+        for cmd in refused:
+            with self.subTest(cmd):
+                why = self.decide(cmd)
+                self.assertIsNotNone(why, cmd)
+                self.assertIn('without this machine\'s hooks' if 'claude' in cmd else 'runs no Claude Code hooks',
+                              why)
+        # managed hooks run in a nested `claude -p` whatever its own settings say: disableAllHooks in a session's
+        # or user's settings does not turn managed hooks off
+        passed = ['claude -p "x"', 'claude -p --settings \'{"disableAllHooks": true}\' x', 'claude --version',
+                  'claude mcp list', 'codex login', 'codex --version', 'codex --help', 'codex help exec',
+                  'echo "codex exec x"', 'git commit -m "no claude --bare here"', 'grep -rn CLAUDE_CODE_SIMPLE .']
+        for cmd in passed:
+            with self.subTest(cmd):
+                self.assertIsNone(self.decide(cmd), cmd)
+
+    def test_the_owner_can_approve_a_nested_session_too(self):
+        _approval, mark = self.approve()
+        self.assertIsNone(self.decide(f'codex exec x {mark}'))
+
+    # rulesets: "evaluate" only reports, so it switches the rules off as "disabled" does (lens B minor)
+    def test_a_ruleset_set_to_evaluate_is_refused(self):
+        self.write('rs_eval.json', '{"name": "main", "enforcement": "evaluate", "rules": []}\n', 0o644)
+        for cmd in ('gh api -X PUT repos/a/b/rulesets/1 -f enforcement=evaluate',
+                    'gh api -X PUT repos/a/b/rulesets/1 -f enforcement=EVALUATE',
+                    'gh api -X PUT repos/a/b/rulesets/1 --input rs_eval.json',
+                    'gh api -X PUT repos/a/b/rulesets/1 --input - <<EOF\n{"enforcement": "evaluate"}\nEOF',
+                    'curl -X PUT -d \'{"enforcement":"evaluate"}\' https://api.github.com/repos/a/b/rulesets/1',
+                    'curl -X PUT -d @rs_eval.json https://api.github.com/repos/a/b/rulesets/1',
+                    "gh api graphql -f query='mutation { updateRepositoryRuleset(input: {repositoryRulesetId: \"x\", "
+                    "enforcement: EVALUATE}) { clientMutationId } }'"):
+            with self.subTest(cmd):
+                self.assertIsNotNone(self.decide(cmd), cmd)
+        self.assertIsNone(self.decide('gh api -X PUT repos/a/b/rulesets/1 -f enforcement=active'))
 
     # the hook as Claude Code runs it: JSON on stdin, JSON decision on stdout
     def pipe(self, payload, env=None):
@@ -1260,6 +1348,15 @@ class GuardTest(Case):
         self.assertEqual(out['hookEventName'], 'PreToolUse')
         self.assertEqual(out['permissionDecision'], 'deny')
         self.assertIn('owner', out['permissionDecisionReason'])
+
+    def test_pipe_deny_for_a_monitor_command(self):
+        # lens B major: the Monitor tool runs its command as shell text too; Write is not a command and passes
+        r = self.pipe(self.event('gh workflow disable 1 -R example/repo', tool='Monitor'))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+        r = self.pipe(self.event('gh workflow disable 1 -R example/repo', tool='Write'))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('permissionDecision', r.stdout)
 
     def test_pipe_refusal_is_logged_and_a_failed_log_still_refuses(self):
         home = os.path.join(self.dir, 'loghome')
@@ -1355,8 +1452,9 @@ class GuardTest(Case):
             r = subprocess.run([sys.executable, '-I', os.path.join(self.dir, 'slow-hook')], input=self.event(cmd),
                                capture_output=True, text=True, env={'PATH': '/usr/bin:/bin', 'HOME': self.dir},
                                timeout=60)
-            if cmd == 'ls -la':
-                self.assertEqual((r.returncode, r.stdout), (0, ''), r.stderr)
+            if cmd == 'ls -la':   # passed: no decision (a copy without the kit's lib only says so, config.notice)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn('permissionDecision', r.stdout)
                 continue
             got = json.loads(r.stdout)['hookSpecificOutput']
             self.assertEqual(got['permissionDecision'], 'deny')
@@ -2415,8 +2513,9 @@ class SlowBackendTest(CacheCase):
         r = subprocess.run([sys.executable, '-I', hook], input=ev, capture_output=True, text=True, timeout=60,
                            env={'PATH': '/usr/bin:/bin', 'HOME': self.dir}, cwd=self.dir)
         took = time.monotonic() - t
-        out = json.loads(r.stdout)['hookSpecificOutput'] if r.stdout else None
-        return out, took
+        # a copy without the kit's lib says so (config.notice: a systemMessage and context, no decision): passed
+        out = (json.loads(r.stdout).get('hookSpecificOutput') or {}) if r.stdout else {}
+        return (out if 'permissionDecision' in out else None), took
 
     def test_plain_commands_do_not_wait_for_a_slow_disk(self):
         hook = slow_copy(self, read=5.0, gh=5.0)
