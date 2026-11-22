@@ -5,10 +5,12 @@
  */
 import { assert, describe, it } from "@effect/vitest";
 import {
+  DEFAULT_SERVER_SETTINGS,
   type OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadShellSnapshot,
   ProviderInstanceId,
   type ServerSettings as ServerSettingsValue,
+  ServerSettingsError,
   ThreadId,
 } from "@t3tools/contracts";
 import { type SlotRuleStatus, WaitToolFailure } from "@t3tools/contracts/waitFor";
@@ -19,6 +21,7 @@ import type { DeepPartial } from "@t3tools/shared/Struct";
 import { DISPATCH_SAFETY_MS, type SlotReservation } from "@t3tools/shared/agentSlots";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import { TestClock } from "effect/testing";
 
@@ -56,6 +59,8 @@ interface World {
   files: Map<string, string>;
   hostReads: number;
   host: "ok" | "hang" | "throw";
+  /** No agent scopes of their own (Linux without systemd, macOS, Windows). */
+  noScopes?: boolean;
 }
 
 /** 16 GB, 12 GB available, swap unused, no pressure: everything fits once the level is calm. */
@@ -108,18 +113,29 @@ const scopesOf = (world: World): AgentScopeShape => ({
   stop: () => Effect.void,
   kill: () => Effect.succeed(false),
   clear: () => Effect.void,
-  ownScope: (threadId) =>
-    Effect.sync(() => {
-      const unit = world.threads.find((thread) => thread.id === threadId)?.unit;
-      return unit === undefined ? undefined : { unit, slice: SLICE };
-    }),
+  ...(world.noScopes === true
+    ? {}
+    : {
+        ownScope: (threadId: string) =>
+          Effect.sync(() => {
+            const unit = world.threads.find((thread) => thread.id === threadId)?.unit;
+            return unit === undefined ? undefined : { unit, slice: SLICE };
+          }),
+      }),
 });
 
-const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue>) =>
+const layerFor = (
+  world: World,
+  settings: DeepPartial<ServerSettingsValue>,
+  settingsLayer: Layer.Layer<
+    ServerSettings.ServerSettingsService,
+    ServerSettingsError
+  > = ServerSettings.layerTest(settings),
+) =>
   SlotGate.layerOver.pipe(
     Layer.provideMerge(
       Layer.mergeAll(
-        ServerSettings.layerTest(settings),
+        settingsLayer,
         Layer.mock(ActiveRunShells.ActiveRunShells)({
           read: Effect.suspend(() => {
             world.snapshotReads += 1;
@@ -260,12 +276,12 @@ describe("SlotGate observe mode", () => {
     }),
   );
 
-  it.effect("off without a mode (the default) observes; the answer stays today's", () =>
+  it.effect("off in observe mode observes; the answer stays today's", () =>
     Effect.gen(function* () {
       const world = newWorld();
       const status = yield* run(
         world,
-        {},
+        observe(),
         Effect.gen(function* () {
           const answer = yield* acquire;
           // A token for the rule's own record of the start (the gate keeps none while off).
@@ -1220,4 +1236,545 @@ describe("SlotGate observe mode", () => {
       "/app.slice/app-t3code.slice/app-t3code-agents.slice/app-t3code-agents-0123.slice",
     );
   });
+});
+
+describe("SlotGate enforce mode (the default)", () => {
+  // Literal names (capacity-rule.json), so these fail on a build without the kinds.
+  const LIGHT_KIND = "agent-light";
+  const WRITER_KIND = "agent-writer";
+  /** `availableMb` free on the 16 GB machine, and the kernel's OOM kill count. */
+  const enforceWorld = (availableMb: number, oomKills = 0) => {
+    const world = newWorld();
+    world.files.set(
+      "/proc/meminfo",
+      `MemTotal:       16777216 kB\nMemFree:         1048576 kB\nMemAvailable:   ${availableMb * 1024} kB\nSwapCached:            0 kB\nSwapTotal:       4194304 kB\nSwapFree:        4194304 kB\n`,
+    );
+    world.files.set("/proc/vmstat", `nr_free_pages 1\noom_kill ${oomKills}\n`);
+    return world;
+  };
+  const ask = (kind?: string) =>
+    SlotGate.SlotGate.pipe(
+      Effect.flatMap((gate) =>
+        gate.acquire({
+          callerThreadId: caller,
+          targetInstanceId: MAIN,
+          ...(kind === undefined ? {} : { kind }),
+        }),
+      ),
+    );
+  const status = SlotGate.SlotGate.pipe(Effect.flatMap((gate) => gate.observed));
+  /**
+   * The first decision after a (re)start is "elevated" (under the floor of two it may still start:
+   * released at once); past the calm wait the rule decides. Its answer.
+   */
+  const warmUp = Effect.gen(function* () {
+    const first = yield* ask(LIGHT_KIND);
+    yield* SlotGate.SlotGate.pipe(
+      Effect.flatMap((gate) => gate.release(first.type === "allow" ? first.token : null)),
+    );
+    yield* TestClock.adjust(CALM_WAIT);
+    return first;
+  });
+
+  it.effect("no settings: the rule decides, and wait_list shows it with the fallback", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000);
+      world.threads = TWO_RUNNING;
+      const [allowed, shown] = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          const first = yield* warmUp;
+          assert.strictEqual(first.type, "refuse");
+          // Right after a start the reason says so, not "under pressure".
+          if (first.type === "refuse") {
+            assert.include(first.message, "started a short while ago");
+            assert.notInclude(first.message, "under pressure");
+          }
+          return [yield* ask(), yield* status] as const;
+        }),
+      );
+      assert.strictEqual(allowed.type, "allow");
+      assert.deepInclude(shown, { mode: "enforce", fallback: true, observed: 2 });
+      assert.deepInclude(shown?.last, { rule: "allow", reason: "fits", pieces: 2 });
+    }),
+  );
+
+  it.effect("two starts in one second: the second counts the first's whole cost", () =>
+    Effect.gen(function* () {
+      // Margin 2458 MB; two running agents with no reading owe 768 MB: 574 MB left, one agent.
+      const world = enforceWorld(3_800);
+      world.threads = TWO_RUNNING;
+      const [first, second, shown] = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          yield* warmUp;
+          const first = yield* ask(LIGHT_KIND);
+          const second = yield* ask(LIGHT_KIND);
+          return [first, second, yield* status] as const;
+        }),
+      );
+      assert.strictEqual(first.type, "allow");
+      assert.strictEqual(second.type, "refuse");
+      if (second.type === "refuse") {
+        assert.include(second.message, "only 190 MB of memory is free for new work");
+        assert.deepInclude(second.refusal, { type: "full" });
+      }
+      assert.deepInclude(shown?.last, { rule: "refuse", reason: "budget", owedMb: 1152 });
+    }),
+  );
+
+  it.effect(
+    "a restart mid-run counts every running agent as a writer, elevated and in fallback",
+    () =>
+      Effect.gen(function* () {
+        // 8 cores and room for four builds: four writers at most (two per build that fits, by cores).
+        const world = enforceWorld(12_000);
+        world.threads = [];
+        const before = yield* run(
+          world,
+          {},
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* warmUp;
+            for (const id of ["l1", "l2", "l3", "l4"]) {
+              const allowed = yield* ask(LIGHT_KIND);
+              assert.strictEqual(allowed.type, "allow", id);
+              yield* gate.started(
+                allowed.type === "allow" ? allowed.token : null,
+                ThreadId.make(id),
+              );
+              // Their own scopes read small: they stay light (unread growth would count as writers).
+              world.threads.push({ id, unit: `${id}.scope` });
+              scopeFiles(world, `${id}.scope`, 200);
+            }
+            // The four run as light agents: a writer still fits.
+            return yield* ask(WRITER_KIND);
+          }),
+        );
+        assert.strictEqual(before.type, "allow");
+        // A new gate (a server restart, the four still running) knows no kinds: four writers.
+        const after = yield* run(
+          world,
+          {},
+          Effect.gen(function* () {
+            yield* warmUp;
+            // A light start beside them: counted, but no writer.
+            const light = yield* ask(LIGHT_KIND);
+            assert.strictEqual(light.type, "allow");
+            const writer = yield* ask(WRITER_KIND);
+            // Runs again: the same answer, no record left behind by the refusal.
+            return [writer, yield* ask(WRITER_KIND), yield* status] as const;
+          }),
+        );
+        assert.deepStrictEqual([after[0].type, after[1].type], ["refuse", "refuse"]);
+        // The true number: 4 writers (5 agents counted).
+        if (after[0].type === "refuse") {
+          assert.include(after[0].message, "4 writing agents are running or starting");
+        }
+        assert.deepInclude(after[2]?.last, { reason: "writers", pieces: 5 });
+        assert.strictEqual(after[2]?.fallback, true);
+      }),
+  );
+
+  it.effect("a light role whose growth cannot be read counts as a writer", () =>
+    Effect.gen(function* () {
+      // Four agents started as light, with no scopes to read (growth unseen): four writers.
+      const world = enforceWorld(12_000);
+      world.threads = [];
+      const [light, writer] = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          yield* warmUp;
+          for (const id of ["l1", "l2", "l3", "l4"]) {
+            const allowed = yield* ask(LIGHT_KIND);
+            assert.strictEqual(allowed.type, "allow", id);
+            yield* gate.started(allowed.type === "allow" ? allowed.token : null, ThreadId.make(id));
+            world.threads.push({ id });
+          }
+          return [yield* ask(LIGHT_KIND), yield* ask(WRITER_KIND)] as const;
+        }),
+      );
+      // Another light start fits; a writer does not: the four count as writers.
+      assert.strictEqual(light.type, "allow");
+      assert.strictEqual(writer.type, "refuse");
+      if (writer.type === "refuse") {
+        assert.include(writer.message, "writing agents are running or starting");
+      }
+    }),
+  );
+
+  it.effect("the fallback ends after ten calm minutes and trips again on a new OOM kill", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000, 7);
+      world.threads = Array.from({ length: 10 }, (_, index) => ({ id: `r${index}` }));
+      const [fixed, lifted, tripped, shown] = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          yield* warmUp;
+          // Ten running: the fixed ceiling while in fallback (after a start too).
+          const fixed = yield* ask(LIGHT_KIND);
+          yield* TestClock.adjust(Duration.minutes(10));
+          // Kills from before the start are no new kill: the derived ceiling (24) applies.
+          const lifted = yield* ask(LIGHT_KIND);
+          yield* SlotGate.SlotGate.pipe(
+            Effect.flatMap((gate) => gate.release(lifted.type === "allow" ? lifted.token : null)),
+          );
+          world.files.set("/proc/vmstat", "oom_kill 8\n");
+          const tripped = yield* ask(LIGHT_KIND);
+          return [fixed, lifted, tripped, yield* status] as const;
+        }),
+      );
+      assert.strictEqual(fixed.type, "refuse");
+      if (fixed.type === "refuse") assert.include(fixed.message, "the limit is 10 now");
+      assert.strictEqual(lifted.type, "allow");
+      assert.strictEqual(tripped.type, "refuse");
+      assert.deepInclude(shown, { fallback: true });
+      assert.deepInclude(shown?.last, { reason: "ceiling" });
+    }),
+  );
+
+  it.effect("readings that fail refuse (unreadable), never fit; it recovers after calm", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000);
+      world.threads = TWO_RUNNING;
+      const [thrown, shown, calming, back] = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          yield* warmUp;
+          world.host = "throw";
+          const thrown = yield* ask(LIGHT_KIND);
+          const shown = yield* status;
+          world.host = "ok";
+          // Unreadable left the level elevated: calm again before the rule says yes.
+          const calming = yield* ask(LIGHT_KIND);
+          yield* TestClock.adjust(CALM_WAIT);
+          return [thrown, shown, calming, yield* ask(LIGHT_KIND)] as const;
+        }),
+      );
+      assert.strictEqual(thrown.type, "refuse");
+      if (thrown.type === "refuse") {
+        assert.include(
+          thrown.message,
+          "cannot be read now and 2 agents are running or starting; only 2 start without readings",
+        );
+      }
+      assert.deepInclude(shown?.last, { rule: "refuse", reason: "unreadable", level: "elevated" });
+      assert.strictEqual(calming.type, "refuse");
+      assert.strictEqual(back.type, "allow");
+    }),
+  );
+
+  it.effect("a restart lifts on the gate's own readings, with no asks in between", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000);
+      world.threads = TWO_RUNNING;
+      const first = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          // No ask for a minute and a half: the timer reads the machine every 30 s.
+          yield* TestClock.adjust(Duration.seconds(91));
+          return yield* ask(LIGHT_KIND);
+        }),
+      );
+      assert.strictEqual(first.type, "allow");
+    }),
+  );
+
+  it.effect(
+    "readings that fail: the floor starts with none running, then the fixed 10 by count",
+    () =>
+      Effect.gen(function* () {
+        const huge = enforceWorld(12_000);
+        // More than 1 TiB of RAM: read, but out of the rule's range (unreadable).
+        huge.files.set(
+          "/proc/meminfo",
+          "MemTotal:       2147483648 kB\nMemFree:         1048576 kB\nMemAvailable:   1073741824 kB\nSwapTotal:       0 kB\nSwapFree:        0 kB\n",
+        );
+        const thrown = enforceWorld(12_000);
+        thrown.host = "throw";
+        for (const [name, world] of [
+          ["throw", thrown],
+          ["over 1 TiB", huge],
+        ] as const) {
+          world.threads = [];
+          const answers = yield* run(
+            world,
+            {},
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              const one = (id: string) =>
+                Effect.gen(function* () {
+                  const answer = yield* ask(LIGHT_KIND);
+                  if (answer.type === "allow") {
+                    yield* gate.started(answer.token, ThreadId.make(id));
+                    world.threads.push({ id });
+                  }
+                  return answer;
+                });
+              // None running, a restart, nothing readable: the floor of two starts at once.
+              const floor = [yield* one("f1"), yield* one("f2")];
+              const third = yield* one("f3");
+              // Runs again: the same refusal.
+              const again = yield* one("f3");
+              // Past the 2 minutes unread (the timer reads every 30 s meanwhile).
+              yield* TestClock.adjust(Duration.seconds(125));
+              const counted: Array<SlotGate.SlotAcquire> = [];
+              for (let index = 3; index <= 11; index += 1) counted.push(yield* one(`f${index}`));
+              return { floor, third, again, counted };
+            }),
+          );
+          assert.deepStrictEqual(
+            answers.floor.map((answer) => answer.type),
+            ["allow", "allow"],
+            name,
+          );
+          assert.strictEqual(answers.third.type, "refuse", name);
+          assert.strictEqual(answers.again.type, "refuse", name);
+          if (answers.third.type === "refuse") {
+            assert.include(answers.third.message, "only 2 start without readings", name);
+          }
+          // After 2 minutes unread: by count up to the fixed 10, never a wait without end.
+          assert.deepStrictEqual(
+            answers.counted.map((answer) => answer.type),
+            [...Array.from({ length: 8 }, () => "allow"), "refuse"],
+            name,
+          );
+          const last = answers.counted.at(-1)!;
+          if (last.type === "refuse") assert.include(last.message, "the limit is 10 now", name);
+        }
+      }),
+  );
+
+  it.effect("hung readings: the floor still starts, no ask waits past the read's time limit", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000);
+      world.host = "hang";
+      world.threads = [];
+      const answers = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          const both = yield* Effect.forkChild(Effect.all([ask(LIGHT_KIND), ask(LIGHT_KIND)]));
+          // Each read gives up after its time limit; with two hanging, no new read starts (busy).
+          for (let turn = 0; turn < 6; turn += 1) {
+            yield* TestClock.adjust(OBSERVE_READ_TIMEOUT);
+            yield* settle;
+          }
+          return yield* Fiber.join(both);
+        }),
+      );
+      assert.deepStrictEqual(
+        answers.map((answer) => answer.type),
+        ["allow", "allow"],
+      );
+    }),
+  );
+
+  it.effect("no OOM counter (basic tier): the fixed 10 stays, however long it is calm", () =>
+    Effect.gen(function* () {
+      // The control first: with the counter (full tier) the rule's own ceiling lets an 11th start.
+      // Then no counter line, no /proc/vmstat, and a counter but no agent scopes (no systemd).
+      for (const [vmstat, noScopes] of [
+        ["nr_free_pages 1\noom_kill 0\n", false],
+        ["nr_free_pages 1\n", false],
+        [undefined, false],
+        ["nr_free_pages 1\noom_kill 0\n", true],
+      ] as const) {
+        const world = enforceWorld(12_000);
+        world.noScopes = noScopes;
+        if (vmstat === undefined) world.files.delete("/proc/vmstat");
+        else world.files.set("/proc/vmstat", vmstat);
+        world.threads = Array.from({ length: 10 }, (_, index) => ({ id: `r${index}` }));
+        const [answer, shown] = yield* run(
+          world,
+          {},
+          Effect.gen(function* () {
+            yield* warmUp;
+            yield* TestClock.adjust(Duration.minutes(30));
+            return [yield* ask(LIGHT_KIND), yield* status] as const;
+          }),
+        );
+        if (vmstat?.includes("oom_kill") === true && !noScopes) {
+          assert.strictEqual(answer.type, "allow", "full tier");
+          assert.deepInclude(shown, { fallback: false });
+          continue;
+        }
+        assert.strictEqual(answer.type, "refuse", `${vmstat} ${noScopes}`);
+        if (answer.type === "refuse") assert.include(answer.message, "the limit is 10 now");
+      }
+    }),
+  );
+
+  it.effect("a held slot owes a writer's cost: a start that fits only without it is refused", () =>
+    Effect.gen(function* () {
+      // Margin 2458 MB; two running agents with no reading owe 768 MB, 968 MB more is free: a
+      // light start (384) fits, not beside a held slot (a writer's 768).
+      const results: Array<string> = [];
+      for (const holds of [
+        [],
+        [{ key: "w_held", threadId: ThreadId.make("waiter"), untilMs: 600_000 }],
+      ]) {
+        const world = enforceWorld(2458 + 768 + 968);
+        world.threads = TWO_RUNNING;
+        const answer = yield* run(
+          world,
+          { waitFor: { enabled: true } },
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* gate.attachReservations({
+              read: Effect.succeed(holds),
+              used: () => Effect.void,
+            });
+            yield* TestClock.adjust(CALM_WAIT);
+            return yield* ask(LIGHT_KIND);
+          }),
+        );
+        results.push(
+          answer.type === "refuse" ? `refuse: ${answer.message}` : `allow (${holds.length})`,
+        );
+      }
+      assert.strictEqual(results[0], "allow (0)");
+      assert.include(results[1], "only 200 MB of memory is free for new work");
+    }),
+  );
+
+  it.effect("a start that never completes gives its owed cost back when its dispatch ends", () =>
+    Effect.gen(function* () {
+      // Past the floor: two running owe 768 MB; 500 MB more: one light start (384) fits, not two.
+      const world = enforceWorld(2458 + 768 + 500);
+      world.threads = TWO_RUNNING;
+      const answers = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          yield* TestClock.adjust(CALM_WAIT);
+          const first = yield* ask(LIGHT_KIND);
+          const second = yield* ask(LIGHT_KIND);
+          // Stopped half-way: the dispatch ended with no child.
+          yield* gate.release(first.type === "allow" ? first.token : null);
+          return [first, second, yield* ask(LIGHT_KIND)].map((answer) => answer.type);
+        }),
+      );
+      assert.deepStrictEqual(answers, ["allow", "refuse", "allow"]);
+    }),
+  );
+
+  it.effect(
+    "an OOM kill in the agents' slice raises the costs; one elsewhere does not; calm lowers them",
+    () =>
+      Effect.gen(function* () {
+        const world = enforceWorld(12_000);
+        world.threads = [{ id: "w1", unit: "w1.scope" }];
+        scopeFiles(world, "w1.scope", 500);
+        world.files.set(`${BOX}/memory.events`, "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n");
+        const costs = yield* run(
+          world,
+          {},
+          Effect.gen(function* () {
+            yield* warmUp;
+            const cost = Effect.gen(function* () {
+              const answer = yield* ask(WRITER_KIND);
+              yield* SlotGate.SlotGate.pipe(
+                Effect.flatMap((gate) =>
+                  gate.release(answer.type === "allow" ? answer.token : null),
+                ),
+              );
+              return (yield* status)?.last?.costMb;
+            });
+            const before = yield* cost;
+            // A kill in the agents' slice (the kernel counts it too): one raise.
+            world.files.set(`${BOX}/memory.events`, "oom 1\noom_kill 1\n");
+            world.files.set("/proc/vmstat", "oom_kill 1\n");
+            const agentKill = yield* cost;
+            // A kill elsewhere (a build box at its own cap): the fallback, no raise.
+            world.files.set("/proc/vmstat", "oom_kill 2\n");
+            const otherKill = yield* cost;
+            // Ten calm minutes (the timer's readings): the fallback lifts, one raise comes off.
+            yield* TestClock.adjust(Duration.minutes(11));
+            const calm = yield* cost;
+            return { before, agentKill, otherKill, calm, shown: yield* status };
+          }),
+        );
+        assert.deepStrictEqual(
+          [costs.before, costs.agentKill, costs.otherKill, costs.calm],
+          [768, 960, 960, 768],
+        );
+        assert.deepInclude(costs.shown, { fallback: false });
+      }),
+  );
+
+  it.effect("settings that cannot be read: the fixed limit of 10, never no limit", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000);
+      world.threads = Array.from({ length: 9 }, (_, index) => ({ id: `r${index}` }));
+      let unreadable = true;
+      const failing = Layer.mock(ServerSettings.ServerSettingsService)({
+        getSettings: Effect.suspend(() =>
+          unreadable
+            ? Effect.fail(
+                new ServerSettingsError({ settingsPath: "<test>", operation: "read-file" }),
+              )
+            : Effect.succeed(DEFAULT_SERVER_SETTINGS),
+        ),
+      });
+      const [nine, ten, readAgain] = yield* SlotGate.SlotGate.pipe(
+        Effect.flatMap((gate) =>
+          Effect.gen(function* () {
+            const nine = yield* gate.acquire({ callerThreadId: caller, targetInstanceId: MAIN });
+            world.threads.push({ id: "r9" });
+            const ten = yield* gate.acquire({ callerThreadId: caller, targetInstanceId: MAIN });
+            unreadable = false;
+            // Read again: the default (enforce) decides once more.
+            yield* TestClock.adjust(CALM_WAIT);
+            const readAgain = yield* gate.observed;
+            return [nine, ten, readAgain] as const;
+          }),
+        ),
+        Effect.provide(layerFor(world, {}, failing)),
+      );
+      assert.strictEqual(nine.type, "allow");
+      assert.strictEqual(ten.type, "refuse");
+      if (ten.type === "refuse") assert.include(ten.message, "the limit is 10");
+      assert.deepInclude(readAgain, { mode: "enforce" });
+    }),
+  );
+
+  it.effect("old and empty settings, and mode fixed: each keeps its own way", () =>
+    Effect.gen(function* () {
+      const cases = [
+        // A file from before `mode`, switched on with typed numbers: fixed, exactly those numbers.
+        { settings: { agentSlots: { enabled: true, maxPerMachine: 3 } }, mode: null, limit: 3 },
+        { settings: { agentSlots: { mode: "fixed" } }, mode: null, limit: null },
+        // Empty: the default, the capacity rule.
+        { settings: {}, mode: "enforce", limit: null },
+      ];
+      for (const entry of cases) {
+        const world = enforceWorld(12_000);
+        world.threads = [{ id: "a" }, { id: "b" }, { id: "c" }];
+        const [answer, shown] = yield* run(
+          world,
+          entry.settings,
+          Effect.gen(function* () {
+            yield* TestClock.adjust(CALM_WAIT);
+            return [yield* ask(LIGHT_KIND), yield* status] as const;
+          }),
+        );
+        assert.strictEqual(shown?.mode ?? null, entry.mode, JSON.stringify(entry.settings));
+        assert.strictEqual(
+          answer.type,
+          entry.limit === 3 ? "refuse" : "allow",
+          JSON.stringify(entry.settings),
+        );
+        if (answer.type === "refuse") assert.include(answer.message, "the limit is 3");
+      }
+    }),
+  );
 });

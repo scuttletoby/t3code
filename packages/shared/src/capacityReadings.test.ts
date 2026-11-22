@@ -235,7 +235,7 @@ describe("capacity level: state passed in, not kept", () => {
       previous: first.pressure,
       nowMs: 1000,
     });
-    expect(waiting.pressure).toEqual({ level: "elevated", calmSinceMs: 1000 });
+    expect(waiting.pressure).toEqual({ level: "elevated", calmSinceMs: 1000, swapFreeMb: 2851 });
     const later = capacityLevel(CAPACITY_RULE, {
       facts: calm,
       previous: waiting.pressure,

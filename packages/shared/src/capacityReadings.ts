@@ -409,6 +409,24 @@ export async function readBoxPsi(
   return psi === null ? "unreadable" : psi;
 }
 
+/**
+ * The OOM kills of a box's processes (`memory.events` `oom_kill`, which counts them below the box
+ * too and by any OOM killer, the kernel's or the box's own cap). `null` without cgroup v2, or when
+ * the file is missing or broken.
+ */
+export async function readBoxOomKills(
+  host: CapacityHost,
+  cgroup: CapacityCgroup,
+  box: string,
+): Promise<number | null> {
+  if (cgroup !== "v2") return null;
+  const path = cgroupPath(box);
+  if (path === null) return null;
+  const read = await readText(host, `${CGROUP}${path}/memory.events`);
+  const match = "text" in read ? /^oom_kill (\d+)$/m.exec(read.text) : null;
+  return match === null ? null : Number(match[1]);
+}
+
 /** One piece's memory from its cgroup (`/a.slice/b.scope`). A missing swap part counts 0 (owes more). */
 export async function readPieceDemand(
   host: CapacityHost,

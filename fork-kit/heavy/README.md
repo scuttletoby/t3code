@@ -557,6 +557,11 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   already use; a caller working inside the folder (its real working folder) is not held back by its own
   reservation. Ended, broken or unreadable lines hold nothing and give a note. Limit: another user's reservations
   are not seen.
+- **Holds (machine file):** a cgroup outside the user managers, such as a CI runners' slice, is not in the ledger.
+  `heavy.capacity.holds` names such cgroups; one that uses more than `inUseFromMb` keeps its budget (its
+  `memory.max`, or `budgetMb` when it has none) less what it uses (anon + shmem + swap), as a reservation named by
+  its `label`, for every user except its own (`users`). Not there: nothing runs in it. Its use cannot be read: the
+  whole budget is held, with a note.
 - **Cache:** `/run/user/<uid>/heavy-facts.json` (or `$HEAVY_FACTS_CACHE`), 0600, read again after 5 s (`--fresh`:
   now). Pressure levels carry from it (at most 5 minutes old) so calm must last before a level drops. Without a
   cache folder nothing carries, so every call starts "elevated" (only the rule's floors admit; never straight to
@@ -582,6 +587,34 @@ either caller.
   unknown key or version, or written with other settings: slice, queue or reservations folder): read again from
   the kernel. A cache that cannot be written gives a note.
 - **Cost file** (`peaks.json`) missing, empty or broken: the rule's start costs, with the queue's note.
+- **Reservation file cut short** (its writer stopped half-way): its whole lines hold, the cut line is a note.
+  A reservation whose processes are all gone still holds all its MB (the room is kept for them), until its
+  `until=` date or until the line is removed.
+- **Machine file** missing, or without `heavy` or `capacity`: no holds. Broken (not JSON, an unknown key, a wrong
+  value, a `user.slice` cgroup, a label twice, writable by others): `heavy facts` gives no answer, so
+  `t3-capacity` says `NOT OK` naming the key. A changed file is read again at once (the cache key holds it).
+
+### Settings: the machine file's `heavy.capacity`
+
+Optional, in `/etc/fork-kit/machine.json` (`fork-kit/common/README.md`):
+
+```json
+"heavy": {
+  "capacity": {
+    "holds": [{ "label": "ci-slice", "cgroup": "ci.slice/ci-runners.slice", "users": ["ci-*"] }]
+  }
+}
+```
+
+| Key in a hold | Default  | What                                                                             |
+| ------------- | -------- | -------------------------------------------------------------------------------- |
+| `label`       | required | the name in `reservations:` (lower-case letters, digits, `_ . -`; at most 40)    |
+| `cgroup`      | required | its folder below the cgroup root; never below `user.slice` (counted already)     |
+| `inUseFromMb` | 1024     | held only while it uses more than this                                           |
+| `budgetMb`    | 6144     | its budget when its `memory.max` is `max` or cannot be read                      |
+| `users`       | `[]`     | user name patterns (`fnmatch`) whose own budget it is: never held back from them |
+
+At most 8 holds. The sweep and the queue accept the `capacity` key and leave it to `heavy facts`.
 
 ## Settings
 
@@ -655,6 +688,8 @@ removes them again). Upgrade: the same line again. Remove:
   installer drops the setting from `config.json` but keeps the units; rolling forward again with the usual line
   (without `--sweep-timer`) keeps them and says so. If one of the two units there is not the kit's, that line
   refuses and names the file; remove it, or run with `--no-sweep-timer`.
+- **Rollback past `heavy.capacity`:** remove the `capacity` key from the machine file's `heavy` section first; a
+  release from before it refuses the whole section (as below).
 - **Rollback past the memory queue:** remove the `queue` key from the machine file's `heavy` section first. A
   release from before the queue does not know it: its sweep refuses the whole machine file and says which key. That
   release cannot be changed from here, so the order is the guard: key out, then the older release.

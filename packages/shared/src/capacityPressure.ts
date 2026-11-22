@@ -17,6 +17,11 @@ export interface PressureState {
   readonly level: CapacityLevel;
   /** When the readings last became quiet enough to step down; `null` when they are not. */
   readonly calmSinceMs: number | null;
+  /**
+   * Swap free at the last read (`swapFillingMb` compares the next one with it); `null` or absent:
+   * none read (no swap, unreadable, or no read yet), so the swap trend is unknown.
+   */
+  readonly swapFreeMb?: number | null;
 }
 
 export interface PressureRule {
@@ -34,8 +39,12 @@ export interface PressureRule {
     readonly psiSomeAvg10Pct: number;
     readonly psiFullAvg10Pct: number;
     readonly availableAtLeastMarginPercent: number;
-    readonly swapFreeAtLeastPercent: number;
   };
+  /**
+   * Swap is filling when its free MB fell by more than this since the last read: pages are being
+   * pushed out now. Swap that is full but not filling (old cold pages) is not a signal.
+   */
+  readonly swapFillingMb: number;
   readonly elevatedClearSeconds: number;
   readonly severeClearSeconds: number;
 }
@@ -61,14 +70,16 @@ export function readPsi(value: unknown): CapacityPsi | null | "unreadable" {
 }
 
 /**
- * The level of one read. PSI is the worst of the machine's and the box's: a box can stall at its
- * cap while the machine has free memory. An unreadable PSI, swap or OS level is at least elevated.
+ * The level of one read. PSI is the worse of machine and box; anything unreadable is elevated. Swap
+ * counts by trend, not level: nearly full and filling is elevated, filling is never calm. With no
+ * previous swap read the trend is unknown (`trendKnown: false`; see `nextPressure`).
  */
 export function rawLevel(
   rule: PressureRule,
   readings: PressureReadings,
   marginMb: number,
-): { readonly level: CapacityLevel; readonly calm: boolean } {
+  previousSwapFreeMb?: number | null,
+): { readonly level: CapacityLevel; readonly calm: boolean; readonly trendKnown: boolean } {
   const { elevated, severe, calm } = rule;
   const { swap, osLevel } = readings;
   const psiReads = [readings.psi, readings.boxPsi].filter(
@@ -81,9 +92,14 @@ export function rawLevel(
     available100 < marginMb * severe.availableBelowMarginPercent ||
     osLevel === "severe"
   ) {
-    return { level: "severe", calm: false };
+    return { level: "severe", calm: false, trendKnown: true };
   }
   const swapRead = typeof swap === "object" && swap !== null ? swap : null;
+  const trendKnown = swapRead === null || isFiniteNumber(previousSwapFreeMb);
+  const filling =
+    swapRead !== null &&
+    isFiniteNumber(previousSwapFreeMb) &&
+    previousSwapFreeMb - swapRead.freeMb > rule.swapFillingMb;
   if (
     psiUnreadable ||
     swap === "unreadable" ||
@@ -95,28 +111,29 @@ export function rawLevel(
         psi.fullAvg10Pct >= elevated.psiFullAvg10Pct,
     ) ||
     available100 < marginMb * elevated.availableBelowMarginPercent ||
-    (swapRead !== null && swapRead.freeMb * 100 < swapRead.totalMb * elevated.swapFreeBelowPercent)
+    (filling &&
+      swapRead !== null &&
+      swapRead.freeMb * 100 < swapRead.totalMb * elevated.swapFreeBelowPercent)
   ) {
-    return { level: "elevated", calm: false };
+    return { level: "elevated", calm: false, trendKnown: true };
   }
   const quiet =
     psiReads.every(
       (psi) => psi.someAvg10Pct < calm.psiSomeAvg10Pct && psi.fullAvg10Pct < calm.psiFullAvg10Pct,
     ) &&
     available100 >= marginMb * calm.availableAtLeastMarginPercent &&
-    (swapRead === null || swapRead.freeMb * 100 >= swapRead.totalMb * calm.swapFreeAtLeastPercent);
-  return { level: "ok", calm: quiet };
+    !filling;
+  return { level: "ok", calm: quiet, trendKnown };
 }
 
 /**
- * The next level from this read's raw level and the kept state. Up at once; "severe" steps down to
- * "elevated" after `severeClearSeconds` without severe readings, "elevated" to "ok" after
- * `elevatedClearSeconds` of calm readings. No previous state (first read, restart): the raw level.
- * No `nowMs`: never steps down. A clock that went back restarts the wait.
+ * The next level: up at once; down one step after the rule's clear time of calm reads. No previous
+ * state: the raw level. No `nowMs` never steps down; a clock that went back restarts the wait. A read
+ * with an unknown swap trend starts or keeps the wait but never ends it.
  */
 export function nextPressure(
   rule: PressureRule,
-  raw: { readonly level: CapacityLevel; readonly calm: boolean },
+  raw: { readonly level: CapacityLevel; readonly calm: boolean; readonly trendKnown?: boolean },
   previous: PressureState | null | undefined,
   nowMs: number | undefined,
 ): PressureState {
@@ -136,5 +153,15 @@ export function nextPressure(
   };
   if (previous.level === "severe") return stepDown("elevated", rule.severeClearSeconds);
   if (raw.level === "elevated" || !raw.calm) return { level: "elevated", calmSinceMs: null };
+  if (raw.trendKnown === false) {
+    const since =
+      isFiniteNumber(previous.calmSinceMs) &&
+      (!isFiniteNumber(nowMs) || previous.calmSinceMs <= nowMs)
+        ? previous.calmSinceMs
+        : isFiniteNumber(nowMs)
+          ? nowMs
+          : null;
+    return { level: previous.level, calmSinceMs: since };
+  }
   return stepDown("ok", rule.elevatedClearSeconds);
 }

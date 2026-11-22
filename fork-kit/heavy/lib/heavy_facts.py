@@ -27,13 +27,14 @@ working folder is in it; past its until date, or broken, it holds nothing (a not
 
 Readings are kept 5 seconds in /run/user/<uid>/heavy-facts.json ($HEAVY_FACTS_CACHE; --fresh reads again), written
 whole through a rename; a cache that is old, from the future, broken, of another version, of other settings (slice,
-queue, reservations folder) or not this user's own is read again. The pressure level carries from one reading to the
+queue, reservations folder) or not this user's own is read again. The pressure level (and the swap free its trend
+needs; a state without it waits one more read before it can step down) carries from one reading to the
 next (the rule's hysteresis) while the last one is at most 5 minutes old; without a cache folder nothing can carry,
 so the level starts "elevated" on every call (it never drops straight to ok). Learned job costs: heavy's peaks
 (lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost, not heavy's own
 reservation for it (heavy's queue holds that one back itself).
 """
-import datetime, errno, fcntl, json, math, os, re, signal, stat, subprocess, sys, time
+import datetime, errno, fcntl, fnmatch, json, math, os, pwd, re, signal, stat, subprocess, sys, time
 
 CACHE_SECONDS, CARRY_SECONDS, ANSWER_SECONDS, STALE_TMP_SECONDS = 5, 300, 5, 60
 EXIT_FREE, EXIT_BUSY, EXIT_ERROR = 0, 75, 1
@@ -43,6 +44,8 @@ SCOPE_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\.scope\Z')
 TICKET_RE = re.compile(r'^t-[0-9]{1,15}-[0-9]{1,10}\.json\Z')
 KIND_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,59}\Z')
 USER_RE = re.compile(r'^user-([0-9]{1,10})\.slice\Z')
+HOLD_LABEL_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,39}\Z')
+CG_PART_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\Z')
 CACHE_KEYS = {'v', 'key', 'atMs', 'tier', 'facts', 'boxPsi', 'reservations', 'learned', 'carry', 'notes', 'load1',
               'queue', 'pressure'}
 USERS = '/sys/fs/cgroup/user.slice'
@@ -201,6 +204,90 @@ def reservations(cfg_dir, today):
     return out, notes
 
 
+def _hold_cgroup(value):
+    parts = value.split('/')
+    if len(parts) > 16 or any(p in ('.', '..') or not CG_PART_RE.match(p) for p in parts):
+        return 'must be a folder below the cgroup root, like "ci.slice/ci-runners.slice"'
+    if parts[0] == 'user.slice':
+        return 'is below user.slice, whose heavy jobs and agents are counted already (it would count them twice)'
+    return None
+
+
+def _users(value):
+    ok = len(value) <= 32 and all(isinstance(g, str) and 0 < len(g) <= 64 for g in value)
+    return None if ok else 'must be a list of at most 32 user name patterns (like "ci-*")'
+
+
+def _label(value):
+    return None if HOLD_LABEL_RE.match(value) else 'lower-case letters, digits, _ . -; at most 40'
+
+
+def hold_spec(required):
+    """One hold of heavy.capacity.holds (machine_file.fields spec; required: machine_file.REQUIRED)."""
+    return {'label': (str, required, _label), 'cgroup': (str, required, _hold_cgroup),
+            'inUseFromMb': (int, 1024, lambda v: None if 0 <= v <= 1 << 24 else 'must be 0 to 16777216'),
+            'budgetMb': (int, 6144, lambda v: None if 1 <= v <= 1 << 24 else 'must be 1 to 16777216'),
+            'users': (list, [], _users)}
+
+
+MAX_HOLDS = 8
+
+
+def capacity_settings(mf, section_spec, path=None, owner_uid=0):
+    """heavy.capacity of the machine file (mf: fork-kit/common/machine_file.py): {'holds': [...]}. A missing file,
+    section or key is no holds; anything broken raises mf.MachineFileError naming the key."""
+    where = path or mf.default_path()
+    section = mf.read_section('heavy', path, owner_uid, optional=True)
+    if section is None:
+        return {'holds': []}
+    section = mf.fields(section, section_spec, f'{where}: heavy')
+    cap = mf.fields(section.get('capacity') or {}, {'holds': (list, [], None)}, f'{where}: heavy.capacity')
+    if len(cap['holds']) > MAX_HOLDS:
+        raise mf.MachineFileError(f'{where}: heavy.capacity.holds: at most {MAX_HOLDS}')
+    spec = hold_spec(mf.REQUIRED)
+    holds = []
+    for i, h in enumerate(cap['holds']):
+        h = mf.fields(h, spec, f'{where}: heavy.capacity.holds[{i}]')
+        if any(h['label'] == o['label'] for o in holds):
+            raise mf.MachineFileError(f'{where}: heavy.capacity.holds[{i}]: label {h["label"]!r} is there twice')
+        holds.append(h)
+    return {'holds': holds}
+
+
+def user_name():
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return str(os.getuid())
+
+
+def held_cgroups(host, holds, user):
+    """The machine file's holds: a cgroup outside the user managers (a CI runners' slice, say) that is in use keeps
+    its budget less what it uses, as a reservation, for every user but its own (`users`). ([reservation], notes)"""
+    out, notes = [], []
+    for h in holds:
+        if any(fnmatch.fnmatchcase(user, g) for g in h['users']):
+            continue                                # the caller's own budget is not held back from it
+        folder = f'{rd.CGROUP}/{h["cgroup"]}'
+        if not os.path.isdir(ROOT + folder):
+            continue                                # not there: nothing runs in it
+        use = rd.read_piece_demand(host, 'v2', cg(folder))
+        if use.get('gone'):
+            continue
+        if use['demandMb'] is None:
+            notes.append(f'hold {h["label"]}: its memory.stat cannot be read: holds its whole budget')
+        elif use['demandMb'] <= h['inUseFromMb']:
+            continue                                # not in use
+        try:
+            raw = _read(folder + '/memory.max').strip()
+            mb = h['budgetMb'] if raw == 'max' else int(raw) // (1 << 20)
+        except (OSError, ValueError):
+            mb = h['budgetMb']
+            notes.append(f'hold {h["label"]}: its memory.max cannot be read: budget {mb} MB')
+        out.append({'name': h['label'], 'prefixes': [], 'mb': mb, 'useMb': use['demandMb'] or 0})
+    return out, notes
+
+
 def scope_demand(host, folder):
     """A live piece's demand in MB (None: owes its whole cost), or False when its cgroup has ended."""
     d = rd.read_piece_demand(host, 'v2', cg(folder))
@@ -283,6 +370,9 @@ def read_machine(rule, where, carry, now):
             full = False
             notes += blind
     res, more = reservations(where['reserveDir'], now.date())
+    notes += more
+    held, more = held_cgroups(host, where['holds'], where['user'])
+    res += held
     notes += more
     notes += [f'{g["reading"]}: {g["instead"]}' for g in m['gaps']]
     if not full:
@@ -445,7 +535,13 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
                  'queueDir': os.path.join(queue_root or run + '/heavy-queue', slice_name),
                  'reserveDir': os.environ.get('T3_CAPACITY_RESERVE_DIR') or os.path.join(
                      os.path.expanduser('~'), '.config', 't3-capacity', 'reserve.d')}
-        where['key'] = '\n'.join((slice_name, where['queueDir'], where['reserveDir']))
+        # the machine file: under HEAVY_FACTS_ROOT too (tests: a fake machine, which also fakes all of /proc and /sys)
+        mf = hq.machine_file
+        where['holds'] = capacity_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None,
+                                           os.getuid() if ROOT else 0)['holds']
+        where['user'] = user_name()
+        where['key'] = '\n'.join((slice_name, where['queueDir'], where['reserveDir'], where['user'],
+                                  json.dumps(where['holds'], sort_keys=True)))
         cache = os.environ.get('HEAVY_FACTS_CACHE') or (run + '/heavy-facts.json' if os.path.isdir(run) else None)
         now = now or datetime.datetime.now(datetime.timezone.utc)
         now_ms = int(now.timestamp() * 1000)
