@@ -3231,5 +3231,101 @@ class Pr993Round1Test(Case):
                     "{ clientMutationId } }' -f id=\"$ID\"")
 
 
+class Pr993Round2Test(Case):
+    """Round 2 of the lens reviews on the #930/#931 leftovers: each test is red without its fix."""
+    refused = Issue930Test.refused
+    passes = Issue930Test.passes
+    UBP_OFF = ('mutation { updateBranchProtectionRule(input: {branchProtectionRuleId: "x", requiresStatusChecks: '
+               'false}) { clientMutationId } }')
+    URR_DEL = ('mutation { updateRepositoryRuleset(input: {repositoryRulesetId: "x", rules: [{type: DELETION}]}) '
+               '{ clientMutationId } }')
+    READ = 'query { viewer { login } }'
+
+    def test_1_a_query_string_on_the_graphql_path(self):
+        """gh sends GraphQL mode only for the path `graphql`, but any other path gets the fields as a JSON body, so
+        `graphql?x=1` with `-f query=..` is the same request. An unquoted `?` is a glob to the shell (left as written
+        when it matches no file): the path is cut there too, as on the protection path."""
+        paths = ['graphql?x=1', "'graphql?x=1'", 'graphql?*', 'graphql#x', '/graphql?x=1', "'/graphql?x=1'",
+                 'graphql', '/graphql', 'https://api.github.com/graphql?x=1', 'graphql"?$Q"', 'graphql/?x=1']
+        for q in (self.UBP_OFF, self.URR_DEL):
+            self.refused(*[f"gh api {p} -f query='{q}'" for p in paths])
+            self.refused(f"gh api graphql?x=1 -F query='{q}'", f"gh api -X POST graphql?x=1 -f query='{q}'")
+        self.passes(*[f"gh api {p} -f query='{self.READ}'" for p in paths])
+        self.passes("gh api repos/o/r/issues?q=graphql", 'gh api -X POST repos/o/r/issues/1/comments?x=1 -f body=hi',
+                    "gh api search/issues?q=graphql+is:open --jq '.items[]'")
+
+    def test_2_a_refuse_script_named_in_piped_data_counts_only_where_a_shell_runs_it(self):
+        """msg.md only names `<script> <flag>`: piped into a program that reads it as data, it passes (as `< msg.md`
+        does); piped or fed into a shell, eval or source, the line runs and is refused."""
+        self.write(GARDEN['name'], 'print(1)\n', 0o644)
+        self.write('msg.md', f'Fix: never run {GARDEN["name"]} {GARDEN["flag"]} on CI\n', 0o644)
+        self.write('q.txt', f'python3 {GARDEN["name"]} {GARDEN["flag"]}\n', 0o644)
+        self.write('tools/check.py', 'import sys\nprint(len(sys.stdin.read()))\n', 0o644)
+        self.write('x.js', 'process.stdin.resume()\n', 0o644)
+        self.passes('cat msg.md | python3 tools/check.py', 'cat msg.md | node x.js', 'cat msg.md | ssh host cat',
+                    "cat msg.md | claude -p hi", 'python3 tools/check.py < msg.md', 'cat msg.md | gzip > m.gz',
+                    'cat q.txt | python3 tools/check.py', 'cp msg.md notes.md', "cat msg.md | sed -n 1p")
+        self.refused('cat q.txt | bash', 'cat q.txt | sh', 'cat q.txt | zsh', 'cat q.txt | dash',
+                     'cat q.txt | grep -v x | bash', 'eval "$(cat q.txt)"', 'source <(cat q.txt)', '. <(cat q.txt)',
+                     'bash < q.txt', 'bash <<< "$(cat q.txt)"', "sed -n '1e' q.txt", 'sed e q.txt',
+                     'cat q.txt | sed e', 'cat q.txt | grep -v x | sed e')
+
+    def test_2_data_files_are_read_only_where_a_refuse_script_could_run(self):
+        """The refuseScripts check reads a whole data file (up to MAX_FILE): only where the text runs, and only when
+        the machine has refuseScripts at all, so a warm cache still saves the read (`cat app.js | gzip`)."""
+        self.write('app.js', 'console.log(1)\n' * 1000, 0o644)
+        self.write('q.txt', f'python3 {GARDEN["name"]} {GARDEN["flag"]}\n', 0o644)
+        with mock.patch.object(self.g, 'body', wraps=self.g.body) as body:
+            self.passes('cat app.js | gzip > out.gz', 'cp app.js copy.js && ls', 'cat app.js | python3 tools/x.py')
+            self.assertEqual(body.call_count, 0)
+        with mock.patch.object(self.g, 'REFUSE_SCRIPTS', []), \
+                mock.patch.object(self.g, 'body', wraps=self.g.body) as body:
+            self.passes('cat q.txt | bash')
+            self.assertEqual(body.call_count, 0)
+        self.refused('cat q.txt | bash')
+
+    def test_3_graphql_strings_and_comments_name_no_kept_check(self):
+        """GraphQL text inside a "string" or after a # is no field; `[,]` is an empty list (commas are blanks)."""
+        name = '"requiredStatusChecks: [ci]"'
+        self.write('del_comment.graphql', '# keeps requiredStatusChecks: [ci]\n' + self.URR_DEL + '\n', 0o644)
+        self.write('ok_comment.graphql', '# requiresStatusChecks: false is refused\n'
+                   'mutation { updateBranchProtectionRule(input: {branchProtectionRuleId: "x", requiresStatusChecks: '
+                   'true, requiredStatusCheckContexts: ["ci"]}) { clientMutationId } }\n', 0o644)
+        self.write('del_comment.json', json.dumps({'query': '# requiredStatusChecks: [ci]\n' + self.URR_DEL}), 0o644)
+        self.refused(
+            "gh api graphql -f query='mutation { updateRepositoryRuleset(input: {repositoryRulesetId: \"x\", rules: "
+            f"[{{type: DELETION}}], name: {name}}}) {{ clientMutationId }} }}'",
+            "gh api graphql -f query='mutation { updateRepositoryRuleset(input: {repositoryRulesetId: \"x\", rules: "
+            "[{type: DELETION}], name: \"\"\"requiredStatusChecks: [ci]\"\"\"}) { clientMutationId } }'",
+            "gh api graphql -f query='mutation { updateRepositoryRuleset(input: {repositoryRulesetId: \"x\", rules: "
+            "[{type: DELETION}], name: \"a\\\" requiredStatusChecks: [ci]\"}) { clientMutationId } }'",
+            'gh api graphql -F query=@del_comment.graphql', 'gh api graphql --input del_comment.json',
+            "gh api graphql -f query='mutation { updateBranchProtectionRule(input: {branchProtectionRuleId: \"x\", "
+            "requiredStatusCheckContexts: [,]}) { clientMutationId } }'",
+            "gh api graphql -f query='mutation { updateBranchProtectionRule(input: {branchProtectionRuleId: \"x\", "
+            "requiredStatusCheckContexts: [ , , ]}) { clientMutationId } }'",
+            "gh api graphql -f query='mutation { updateRepositoryRuleset(input: {repositoryRulesetId: \"x\", rules: "
+            "[{type: REQUIRED_STATUS_CHECKS, parameters: {requiredStatusChecks: {requiredStatusChecks: [,], "
+            "strictRequiredStatusChecksPolicy: true}}}]}) { clientMutationId } }'")
+        self.passes(
+            'gh api graphql -F query=@ok_comment.graphql',
+            "gh api graphql -f query='mutation { updateRepositoryRuleset(input: {repositoryRulesetId: \"x\", rules: "
+            "[{type: REQUIRED_STATUS_CHECKS, parameters: {requiredStatusChecks: {requiredStatusChecks: "
+            "[{context: \"ci\"}], strictRequiredStatusChecksPolicy: true}}}]}) { clientMutationId } }'",
+            "gh api graphql -f query='mutation { updateBranchProtectionRule(input: {branchProtectionRuleId: \"x\", "
+            "requiresStatusChecks: true, requiredStatusCheckContexts: [\"ci\", \"lint\"]}) { clientMutationId } }'",
+            "gh api graphql -f query='mutation { updateBranchProtectionRule(input: {branchProtectionRuleId: \"x\", "
+            "requiredStatusCheckContexts: [\"ci\",]}) { clientMutationId } }'")
+
+    def test_4_an_inline_shell_number_is_told_the_variable_form(self):
+        why = self.decide("gh api graphql -f query='query { repository(owner: \"o\", name: \"r\") { pullRequest("
+                          "number: '\"$N\"') { title } } }'")
+        self.assertIsNotNone(why)
+        self.assertIn('-F n="$N"', why)
+        self.assertIn('query($n: Int!)', why)
+        self.passes("gh api graphql -f query='query($n: Int!) { repository(owner: \"o\", name: \"r\") { pullRequest("
+                    "number: $n) { title } } }' -F n=\"$N\"")
+
+
 if __name__ == '__main__':
     unittest.main()

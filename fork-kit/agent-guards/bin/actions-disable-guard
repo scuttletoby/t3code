@@ -951,6 +951,19 @@ def seg_match(segs, pat, more):
     return any(go(i, 0, False) for i in range(len(segs)))
 
 
+def url_path(form):
+    """A path or URL (one form of a word) without its scheme and host, and without its query string or fragment."""
+    return re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', form, flags=re.I), maxsplit=1)[0]
+
+
+def path_cuts(path):
+    """The paths a request may go to: the path, and the path cut at each hidden or glob part. An unquoted `?` is a
+    glob to the shell (left as written when it matches no file) and `$Q` may hold one, so the query string may start
+    at any of them: `graphql?x=1` and `.../protection"$Q"x` are the GraphQL endpoint and the protection. Every path
+    check reads its path through this (protect_kinds, may_be_graphql)."""
+    return [path] + [path[:i].rstrip('/') for i, c in enumerate(path) if c in (HID, WILD)]
+
+
 def hits(tok, kind):
     """2: the word spells the guarded path; 1: hidden text in it could complete it; 0: neither."""
     rx, pats = GUARDED[kind]
@@ -960,7 +973,7 @@ def hits(tok, kind):
             return 2
         g = PLACEHOLDER.sub(HID, f)
         if hidden(g):
-            path = re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', g, flags=re.I), maxsplit=1)[0]
+            path = url_path(g)
             segs = [x.lower() for x in path.split('/') if x]
             if any(seg_match(segs, pat, more) for pat, more in pats):
                 best = 1
@@ -989,8 +1002,8 @@ def may_be_graphql(tok):
     if not visible_path(tok):
         return True
     for f in forms(PLACEHOLDER.sub(HID, tok)):
-        path = re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', f, flags=re.I), maxsplit=1)[0]
-        if GRAPHQL_END.search(path.rstrip(HID + WILD)):
+        path = url_path(f)
+        if any(GRAPHQL_END.search(p.rstrip(HID + WILD)) for p in path_cuts(path)):
             return True
         if hidden(path) and seg_match([x.lower() for x in path.split('/') if x], ['graphql'], False):
             return True
@@ -1473,12 +1486,13 @@ def api_reason(args, ctx, top=False):
                 return reason('a GraphQL call whose query (or a field name) the guard cannot read (command output, '
                               'a variable): it may delete or empty branch protection or a ruleset',
                               'Write the query to a file in a command before this one and pass it with '
-                              '`-F query=@<file>`; variables only for ids, as -f/-F fields.')
+                              '`-F query=@<file>`; give ids and numbers as variables, never inside the query: '
+                              '`-F n="$N"` with `query($n: Int!)` and `number: $n`, `-f id="$ID"` with `$id: ID!`.')
             vb = gh_fields_body([(m, f) for m, f in typed if f.partition('=')[0] not in ('query', 'operationName')],
                                 ctx, keep_hidden=True)
             gvars = [vb] + [j['variables'] for _, b in known[:len(inputs)] for j in [json_body(b)]
                             if isinstance(j, dict) and j.get('variables') is not None]
-            why = gql_empties([canon(x, cue=False) for x in list(args) + bodies], gvars)
+            why = gql_empties([canon(gql_code(x), cue=False) for x in list(args) + bodies], gvars)
             if why:
                 return reason(f'a GraphQL update of branch protection or a ruleset that {why}: that takes `main` '
                               'out from behind CI as surely as a delete',
@@ -1516,7 +1530,7 @@ ALL_KINDS = frozenset(k for k, _ in PROTECT_KINDS)
 GQL_EMPTYING = re.compile(r'updateRepositoryRuleset|updateBranchProtectionRule', re.I)
 # in a GraphQL text: a field set to nothing, or to a $variable (looked up in the variables)
 GQL_EMPTY = re.compile(r'\b(requiresStatusChecks|requiredStatusCheckContexts|requiredStatusChecks|rules)\s*'
-                       r'["\']?\s*:\s*(?:(false|null|\[\s*\])|\$(\w+))', re.I)
+                       r'["\']?\s*:\s*(?:(false|null|\[[\s,]*\])|\$(\w+))', re.I)   # commas are blanks: [,] is []
 
 
 def protect_kinds(tok):
@@ -1526,12 +1540,10 @@ def protect_kinds(tok):
     no file) and `$Q` may hold one, so `.../protection?x=1` and `.../protection"$Q"x` are the protection too."""
     out = set()
     for f in set(forms(PLACEHOLDER.sub(HID, tok))) | ({canon(tok, cue=False)} if '\\' in tok else set()):
-        path = re.split(r'[?#]', re.sub(r'^[a-z][a-z0-9+.-]*://[^/]*', '', f, flags=re.I), maxsplit=1)[0]
-        path = path.rstrip('/').lower()
+        path = url_path(f).rstrip('/').lower()
         if path[-1:] in (HID, WILD):
             return set(ALL_KINDS)
-        cuts = [path] + [path[:i].rstrip('/') for i, c in enumerate(path) if c in (HID, WILD)]
-        out |= {k for k, rx in PROTECT_KINDS for p in cuts if rx.search(p.replace(WILD, HID))}
+        out |= {k for k, rx in PROTECT_KINDS for p in path_cuts(path) if rx.search(p.replace(WILD, HID))}
     return out
 
 
@@ -1663,11 +1675,44 @@ def gql_hidden(text):
     return False
 
 
+def gql_code(text):
+    """GraphQL text as the rules below read it: each "string" and \"\"\"block string\"\"\" stands as one word
+    (`"_"`) and # comments are gone, so `name: "requiredStatusChecks: [ci]"` or a comment names no kept check. A
+    JSON request body (--input) gives its query (its variables are read as variables). Before canon(), which drops
+    all quotes."""
+    try:
+        j = json.loads(text) if text.lstrip()[:1] == '{' else None
+    except ValueError:
+        j = None
+    if isinstance(j, dict) and isinstance(j.get('query'), str):
+        text = j['query']
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '#':
+            end = text.find('\n', i)
+            i = n if end < 0 else end
+        elif text.startswith('"""', i):
+            end = re.search(r'(?<!\\)"""', text[i + 3:])   # \""" is a quote inside a block string
+            out.append(' "_" ')
+            i = n if end is None else i + 3 + end.end()
+        elif c == '"':
+            i += 1
+            while i < n and text[i] not in '"\n':
+                i += 2 if text[i] == '\\' else 1
+            out.append(' "_" ')
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out)
+
+
 def gql_unset(v):
     """A GraphQL value that turns a required-check setting off: false, null, an empty list, or text the guard cannot
     read."""
     return v is None or v is False or v == [] or (isinstance(v, str) and (
-        hidden(v) or v.strip().lower() in ('', 'false', 'null', '[]')))
+        hidden(v) or re.fullmatch(r'\s*(?:false|null|\[[\s,]*\])?\s*', v, re.I) is not None))
 
 
 def rules_keep_checks(rules):
@@ -1702,7 +1747,7 @@ def gql_value_empties(v, ruleset, depth=0):
     return ''
 
 
-GQL_KEPT = re.compile(r'requiredStatusChecks["\']?\s*:\s*(?:\[\s*[^\]\s]|\$\w)', re.I)   # a list that names a check
+GQL_KEPT = re.compile(r'requiredStatusChecks["\']?\s*:\s*(?:\[[\s,]*[^\]\s,]|\$\w)', re.I)   # a list that names a check
 
 
 def gql_empties(texts, variables=()):
@@ -1732,10 +1777,10 @@ def gql_empties(texts, variables=()):
                                          and not rules_keep_checks(known[var])):
                 return f'sets {m.group(1)} from ${var} to nothing (or to a value the guard cannot read)'
             continue
-        vals = re.findall(r'(?:^|[\s"\'{,])%s["\']?\s*[:=]\s*(false|null|\[\s*\]|[^\s,}]+)' % re.escape(var), joined,
+        vals = re.findall(r'(?:^|[\s"\'{,])%s["\']?\s*[:=]\s*(false|null|\[[\s,]*\]|[^\s,}]+)' % re.escape(var), joined,
                           re.I | re.M)
         vals += ['[]'] if re.search(r'(?:^|\s)%s\[\](?:\s|$)' % re.escape(var), joined, re.M) else []
-        if not vals or any(re.fullmatch(r'false|null|\[\s*\]', v, re.I) for v in vals):
+        if not vals or any(re.fullmatch(r'false|null|\[[\s,]*\]', v, re.I) for v in vals):
             return f'sets {m.group(1)} from ${var} to nothing (or to a value the guard cannot find)'
     # a variable that holds the whole input (input: $input) must be there to read: gh sends null for one it lacks
     for var in dict.fromkeys(re.findall(r'(?<![\w$])\w+\s*:\s*\$(\w+)', joined)):
@@ -3065,7 +3110,7 @@ def sed_reason(args, ctx, own, fed):
             r = decide_text(text, dict(ctx, stdin=None, cmd={}, leak=False, targets=()))
             if r:
                 return r
-    tok = own or fed or next((t for t in (data_token(a, ctx) for a in inputs if a != '-') if t), None)
+    tok = own or fed or next((t for t in (data_token(a, ctx, runs) for a in inputs if a != '-') if t), None)
     if runs:
         flow['ran'] = True
         if tok:
@@ -3076,19 +3121,23 @@ def sed_reason(args, ctx, own, fed):
     return None
 
 
-def data_token(tok, ctx):
+def data_token(tok, ctx, runs=False):
     """The guarded token in a file that cat/cp/.. hand on: its text as read_text() gives it, so data over MAX_FILE or
     that cannot be opened passes unread (lockout care), whatever its name (`cat app.js | gzip`). Only in a run
-    position, where a shell or interpreter runs the text (`cat f | grep x | bash`, `eval "$(cat f)"`), is a file
-    read in pieces and counts when unread (file_token). A copy under a name the text runs is read where it is
+    position, where a shell or interpreter runs the text (`cat f | grep x | bash`, `eval "$(cat f)"`; runs: the
+    command itself runs it, sed e), is a file read in pieces and counts when unread (file_token), and does a line
+    that calls a refuseScripts entry count: piped into a program that reads it as data (`cat msg.md | python3
+    check.py`) the text only mentions it, as with `< msg.md`. A copy under a name the text runs is read where it is
     written (segment_reason)."""
+    runs = runs or ctx.get('feeds_code')
     for d in [] if hidden(tok) else folders(ctx):
         p = resolve_path(tok, d)
         f = facts(p, ctx, ('named',))
-        t = f['named'] if f['text'] else ctx.get('feeds_code') and file_token(p)
+        t = f['named'] if f['text'] else runs and file_token(p)
         if t:
             return t
-        t = f['text'] and refuse_script_named(body(p, ctx))
+        # the whole text is read (the cache holds no text): only where it runs and the machine names a script
+        t = runs and REFUSE_SCRIPTS and f['text'] and refuse_script_named(body(p, ctx))
         if t:
             return t
     return None
@@ -4068,14 +4117,16 @@ def decide_text(text, ctx, scan_raw=True):
         if how in ('shell', 'exec') and not cmd['docs'] and h is not None \
                 and os.path.basename(variants[0][h]) not in ('echo', 'printf'):
             loose = True
-    # Where a command's output is run as code: a pipe into a shell or interpreter that runs its stdin, also through
-    # data filters (cat f | grep -v x | bash), and $(..) <(..) in a text that runs a hidden word as shell or code
-    # (eval "$(cat f)", source <(cat f), bash -c "$(cat f)", bash <<< "$(cat f)")
+    # Where a command's output is run as code: a pipe into a shell or interpreter that runs its stdin, or into a sed
+    # that runs its input (cat f | sed e), also through data filters (cat f | grep -v x | bash), and $(..) <(..) in
+    # a text that runs a hidden word as shell or code (eval "$(cat f)", source <(cat f), bash <<< "$(cat f)")
     feeds_at = [False] * len(runs)
     for k in range(len(runs) - 2, -1, -1):
         if runs[k][0].get('pipe'):
             nxt = runs[k + 1][1][0]
+            h = head(nxt)[0] if nxt else None
             feeds_at[k] = stdin_runs(nxt, hows[k + 1], loose) or \
+                (h is not None and os.path.basename(nxt[h]) == 'sed' and sed_runs_input(nxt[h + 1:])) or \
                 (feeds_at[k + 1] and bool(runs[k + 1][0].get('pipe')) and pure_word(runs[k + 1][1]))
     sub_runs = any(not cmd.get('sub') and runs_hidden(variants[0], cmd) for cmd, variants in runs)
     outs = list(hows)   # cat p.txt | tee ~/.local/bin/ls; ls: the text a pipe carries into such a write

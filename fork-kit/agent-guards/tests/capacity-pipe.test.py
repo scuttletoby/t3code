@@ -89,6 +89,22 @@ REFUSED = [
     'chronic t3-capacity 1 | tail',
     'ionice -c 3 chrt -i 0 t3-capacity 1 | tail',
     'sudo chrt -i 0 t3-capacity 1 | tail',
+    # PR 993 round 2: systemd-run -d (--same-dir) takes no value; doas -a STYLE, runuser -s SHELL / -c TEXT; the
+    # kit's own heavy (--wait S, --kind K, --mb N, --measure K before the command)
+    'systemd-run -P -d t3-capacity 1 | tail',
+    'systemd-run --user -d -p MemoryMax=1G t3-capacity 1 | tail',
+    'doas -a style t3-capacity 1 | tail',
+    'doas -a style -u root t3-capacity 1 | tail',
+    'runuser -s /bin/sh -u someone t3-capacity 1 | tail',
+    "runuser -u someone -s /bin/bash t3-capacity 1 | tail",
+    "runuser someone -c 't3-capacity 1 | tail'",
+    "runuser -l someone -c 't3-capacity 1 | tail -1'",
+    "runuser -c 't3-capacity 1 | tail' someone",
+    'heavy t3-capacity 1 | tail',
+    'heavy --wait 60 t3-capacity 1 | tail',
+    'heavy --kind test --mb 512 -- t3-capacity 1 | tail',
+    'heavy --measure build t3-capacity 1 | tail',
+    'heavy nice t3-capacity 1 | tail',
     # after && ; newline, in if / while / until / for / case, behind !
     'cd /x && t3-capacity 2048 | tail -1 && heavy x',
     'true; t3-capacity 2048 | tail -1',
@@ -211,6 +227,11 @@ ALLOWED = [
     'taskset -c 0 grep t3-capacity x | head',
     'flock t3-capacity ls | tail',                          # the lock file, not the command
     'chrt -p 1234 | tail',
+    'doas -a t3-capacity ls | tail',                        # the values of -a, -s and --kind, not the command
+    'runuser -s t3-capacity -u someone ls | tail',
+    'heavy --kind t3-capacity ls | tail',
+    "runuser someone -c 'grep t3-capacity x | tail'",
+    'heavy sweep --dry-run | tail',
     'taskset -p 1234 | tail',
     'python3 -I scripts/dev/run_tests.py scripts/dev/tests/test_t3_capacity.py 2>&1 | tail -5',
     '# t3-capacity 2048 | tail -1\nls',

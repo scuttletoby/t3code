@@ -18,13 +18,14 @@ attack, this is a mistake):
   - shell text as a shell reads it: quotes, backslashes, comments, redirections, `&& || ; & |` and newlines;
   - the check must be the command word (any path; after NAME=value, `!`, if/while/until/then/do/else, and the
     wrappers sudo, env, command, exec, nohup, nice, ionice, timeout, stdbuf, setsid, time, builtin, chrt, taskset,
-    flock, numactl, doas, runuser, systemd-run, unbuffer, chronic with their flags (and the priority, CPU mask or
-    lock file the first three take before the command),
+    flock, numactl, doas, runuser, systemd-run, unbuffer, chronic and the kit's heavy with their flags (and the
+    priority, CPU mask or lock file the first three take before the command; heavy's --wait, --kind, --mb, --measure),
     read letter by letter so a glued value is a value (`sudo -uroot`, `sudo -iu someone`); `env -S 'TEXT'` and
     `--split-string` run the words of TEXT, which are read as the command; the keyword `time [-p]` before a group);
   - commands inside `$(..)`, backticks, `<(..)`, and a `( .. )` or `{ ..; }` group whose LAST command is the check;
-  - shell text handed on, read again by the same rules: `bash -c '..'` (sh, zsh, dash, ksh, su; also behind another
-    word: `heavy bash -c`, `timeout 60 bash -lc`), `eval ..`, `ssh host '..'`, `watch '..'`, and a heredoc into a shell.
+  - shell text handed on, read again by the same rules: `bash -c '..'` (sh, zsh, dash, ksh, su, runuser; also behind
+    another word: `heavy bash -c`, `timeout 60 bash -lc`), `eval ..`, `ssh host '..'`, `watch '..'`, and a heredoc into
+    a shell.
 Text that only mentions it passes: echo, grep, commit messages, a heredoc into cat/tee/a file (briefs), comments.
 
 Not covered (the check's own stderr line is the second layer when it has one: say "NOT OK .. never pipe it" on
@@ -58,14 +59,15 @@ CHECKS = tuple(SETTINGS['commands'])   # the capacity checks whose output must n
 NAME = 'capacity-pipe-guard'
 HID = '\x00'   # text the guard cannot know ($X, ${..}, the output of $(..)), as part of a word
 MAX_DEPTH = 40
-SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'su'}   # `<shell> .. -c TEXT`; a heredoc into one is commands
+SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'su', 'runuser'}   # `<shell> .. -c TEXT`; a heredoc into one is commands
 TEXT_ARGS = {'ssh', 'watch'}                           # each argument that names the tool is shell text
 TOOLS = {'Bash', 'Monitor'}                            # the tools whose `command` is shell text
 WRAPPERS = {   # a command follows them; value: their one-letter flags that take a value (glued or the next word)
     'sudo': 'ughpCDRTUrt', 'env': 'uCS', 'timeout': 'ks', 'nice': 'n', 'ionice': 'cnp', 'stdbuf': 'ioe', 'exec': 'a',
     'time': 'fo', 'command': '', 'builtin': '', 'nohup': '', 'setsid': '', 'chrt': 'TPD', 'taskset': '',
-    'flock': 'wEc', 'numactl': 'CNmpiu', 'doas': 'uC', 'runuser': 'ugGw', 'systemd-run': 'puEMHd', 'unbuffer': '',
-    'chronic': ''}
+    'flock': 'wEc', 'numactl': 'CNmpiu', 'doas': 'uCa', 'runuser': 'ugGwsc', 'systemd-run': 'puEMH', 'unbuffer': '',
+    'chronic': '', 'heavy': ''}
+LONG_VALUES = {'heavy': {'--wait', '--kind', '--mb', '--measure'}}   # long flags whose value is the next word
 POSITIONAL = {'chrt': 1, 'taskset': 1, 'flock': 1}   # words they take before the command: priority, mask, lock file
 KEYWORDS = {'!', '{', 'if', 'then', 'elif', 'else', 'while', 'until', 'do'}   # a command follows them
 OPENERS = {'{', 'if', 'while', 'until'}        # ... and these open a group that CLOSERS end
@@ -128,8 +130,10 @@ def command_at(ws):
                 return ws, len(ws)   # `command -v x` only looks x up
             split = None   # env -S TEXT / --split-string TEXT: the words env runs are the words of TEXT
             step = 1
-            if w.startswith('--'):   # a long flag with its value as the next word is not read (see "Not covered")
-                if name == 'env' and (w == '--split-string' or w.startswith('--split-string=')):
+            if w.startswith('--'):   # a long flag with its value as the next word: only those in LONG_VALUES
+                if w in LONG_VALUES.get(name, ()):   # (else see "Not covered")
+                    step = 2
+                elif name == 'env' and (w == '--split-string' or w.startswith('--split-string=')):
                     split = ((w.partition('=')[2], ws[i + 1:]) if '=' in w else
                              (ws[i + 1] if i + 1 < len(ws) else '', ws[i + 2:]))
             elif len(w) > 1 and w[0] == '-':
