@@ -587,6 +587,38 @@
         "Effect.catchIf(isServerAuthInternalError, ForkAuthUnavailable.answerUnavailable),"
       ]
     },
+    "apps/server/src/peer/PeerThreadRelay.ts": {
+      "why": "#977: a linked-thread read the peer refuses with 401 ends the link here the way an agent's call does (fork/peerLinkRevokeCheck.ts confirm): only when a fresh MCP session started right after, at the same address with the same token, is refused with 401 too, and only for the linked_at the refused read resolved. A 403 never ends it. Tested in apps/server/src/fork/peerLinkRevoke.reads.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import * as ForkRevokeCheck from \"../fork/peerLinkRevokeCheck.ts\";",
+          "if (response.status === 401) yield* ForkRevokeCheck.confirm(links, httpClient, resolved);"
+        ]
+      }
+    },
+    "apps/server/src/peer/PeerClientPairing.ts": {
+      "why": "#977: a client pairing the peer refuses with 401 (EnvironmentHttpUnauthorizedError) ends the link here as a linked-thread read does (fork/peerLinkRevokeCheck.ts onUnauthorized). The request still answers \"refused\"; the next one finds the link expired. Tested in apps/server/src/fork/peerLinkRevoke.reads.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import * as ForkRevokeCheck from \"../fork/peerLinkRevokeCheck.ts\";",
+          "Effect.tapError(ForkRevokeCheck.onUnauthorized(links, httpClient, peer)),"
+        ]
+      }
+    },
+    "apps/server/src/peer/linkThreadHttp.ts": {
+      "why": "#977: since #964 a session store failure dies with a 503 response (fork/authUnavailable.ts), so the 30 s recheck of an open linked-thread stream ended the stream with an error. It ends it cleanly again, as before #964; the linking environment reconnects. Tested in apps/server/src/fork/peerLinkRevoke.reads.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "Effect.catchDefect(() => Effect.void), // Fork: a store failure ends the stream cleanly"
+        ]
+      }
+    },
     "apps/server/src/provider/Drivers/ClaudeSkills.ts": {
       "why": "#978 (model policy): the hook that checks Claude's Skill tool reads a skill's frontmatter with the skill list's own parser, so the repair of an unquoted \": \" in a value (which Claude Code accepts) is one source. parseSkillFrontmatter is exported, and its parsed result also carries the whole frontmatter record (fork/claudeAgentModelPolicy.ts reads context, model and effort from it). Tested in apps/server/src/fork/claudeAgentModelPolicy.test.ts.",
       "added": [
