@@ -564,12 +564,35 @@ resolved comment still counts. Its ways out are the same as any comment's
 (delete it, `not a lens: ...`, or an override).
 
 The grammar is fixed: a project writes its lens reports this way, it does not
-configure another way. It fails closed. A comment that looks like a lens report
-but is not exactly one valid read counts as a lens that read nothing, so the
-queue never takes a reviewed pull request for an unreviewed one. Looking like a
-report means any of: `lens:`, `read at`, `safe to merge`, a `## ... lens`
-heading near the top, or two `covered:`/`checks:` lines. A comment that is no
-report says so on its first line, `not a lens: ...`. That clears it unless one of
+configure another way. A comment is a lens report only when it carries the lens
+marker: a line (Markdown stripped, in a code block or quote too) that starts
+with the lens field (`lens:`, `lens=`, `lens —` or `lens –`), names a read
+(`read at` and a hex sha), or has a lens field with a hex sha after it anywhere.
+On a lens report the rules fail closed: one that is not exactly one valid read
+counts as a lens that read nothing, so the queue never takes a reviewed pull
+request for an unreviewed one. A comment without the marker is no lens report,
+however much it looks like one (a `## ... lens` heading near the top,
+`safe to merge`, `lens:` in mid-line, or two `covered:`/`checks:` lines): it
+never reads. If it holds no open finding it does not block either: the run log
+names it, and the head check's summary lists it as `not a lens report` (a
+`WARN` row) with the reason (issue 865: such a heading, posted from the owner's
+account, held pull requests with no one seeing why). A lens whose report has no
+marker has therefore posted nothing: a required lens still has no read, and the
+head check fails on that. If it holds an open finding (a `blocker:` or `major:`
+line that is not `none`, or NOT SAFE, as the findings rules below read them,
+with its first two lines read as a heading and its title line, and
+`not safe to merge` on any line outside a fenced code block read as NOT SAFE) it
+is most likely a real report with a broken header, so it blocks like a broken
+lens report, keyed by that comment, whatever an older or newer read of that lens
+says: an older clean read never wins over it. Its reason says to post a NEW
+comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>`
+(editing the marker into the old comment does not count: an edited comment
+reads nothing) and to delete the old one or edit it to start with `not a lens`
+and a colon. It also stops holding once edited so it holds no open finding: the
+same people could delete it, and the gate keeps no history. Lenses check their
+comment with the review kit's `check` before posting (fork-kit/review). A
+comment that is no report but holds a marker says so on its first line,
+`not a lens: ...`. That clears it unless one of
 its lines is a lens header, a lens field with a sha (`lens:`, `lens=`, `lens —`
 or `lens –`, quoted or not), or a `read at` with a hex sha outside a `>` quote
 (a fenced or indented block is no quote). To name a sha a lens read in such a
@@ -600,16 +623,18 @@ character, at least as long and with nothing after it, closes a fence
 (` ```js ` inside an open fence is code), and a backtick line with
 another backtick after it is inline code, not a fence.
 
-A comment that looks like a report but is not one valid read is a lens of its
-own, keyed by that comment. Posting the report again the right way adds a new
+A lens report (a comment with the marker) that is not one valid read, or a
+comment without it that holds an open finding, is a lens of its own, keyed by
+that comment. Posting the report again the right way adds a new
 read and leaves the old comment blocking, and hiding it is not enough either.
 The ways out: delete it, edit its first line to `not a lens: ...` with no lens
 header line left in it and any `read at <sha>` quoted with `>`, or post an
-override for the head.
+override for the head. One without the marker also stops holding once it is
+edited so it holds no open finding (the same people could delete it).
 
 These shapes were measured on this repository's 677 pull request comments by
-people (November 2026): 25 are flagged, before and after the `not a lens:`
-rule above. Of the 25, 7 are real lens reports with a broken header (one of
+people (November 2026, before the lens marker rule): 25 are flagged, before and
+after the `not a lens:` rule above. Of the 25, 7 are real lens reports with a broken header (one of
 them NOT SAFE), caught by the `## ... lens` heading rule (6) or a hex
 `read at` (1); 13 are fix-round comments caught by the same heading rule and 5
 fix-round comments with a `lens:` or `read at` in their text, and
@@ -617,6 +642,8 @@ fix-round comments with a `lens:` or `read at` in their text, and
 valid lens reads (`Verdict: not safe to merge ...`), so the rules stay as they
 are: each one that flags an ordinary comment also catches broken reports that
 read the same way ([issue 76](https://github.com/scuttletoby/t3code/issues/76)).
+Under the lens marker rule 10 of the 25 carry no marker: 9 hold no open finding
+and are only named, and 1 (a real report with an open major) still blocks.
 
 ## The queue
 

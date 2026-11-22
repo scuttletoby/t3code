@@ -364,10 +364,10 @@ FIELDS = {'linear': {'name', 'fn', 'parts', 'expect', 'ms'},
           'reads': {'name', 'posts', 'head', 'same', 'override_authors', 'required', 'expect'},
           'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
           'findings': {'name', 'group', 'body', 'findings', 'section'},
-          'scans': {'name', 'posts', 'history', 'entries'},
+          'scans': {'name', 'posts', 'history', 'entries', 'not_lens'},
           'rounds': {'name', 'config', 'history', 'reports', 'decided', 'changes', 'override_authors', 'findings',
                      'expect'}}
-SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',))
+SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',), log=lambda *_: None)
 
 
 def vector_pr(posts):
@@ -391,8 +391,8 @@ def vector_pr(posts):
 
 
 def scan(posts):
-    found, history = SCAN.lens_scan(vector_pr(posts))
-    return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}
+    found, history, notes, _ = SCAN.scan_posts(vector_pr(posts))
+    return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}, [list(n) for n in notes]
 
 
 def replay_round(v):
@@ -501,7 +501,7 @@ class SharedVectors(unittest.TestCase):
         self.assertGreaterEqual(len(VECTORS['scans']), 31)
         for v in VECTORS['scans']:
             with self.subTest(v['name']):
-                self.assertEqual(scan(v['posts']), (v['history'], v['entries']))
+                self.assertEqual(scan(v['posts']), (v['history'], v['entries'], v.get('not_lens', [])))
 
     def test_every_reads_vector(self):   # lens_start's copy of lens_reads, review_rounds' UNREAD and verdict
         self.assertGreaterEqual(len(VECTORS['reads']), 10)

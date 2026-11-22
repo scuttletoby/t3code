@@ -619,6 +619,19 @@ class Update(Base):
         self.assertIn('checks', why)
         self.assertTrue(needs.startswith('Needs a lens read'), needs)
 
+    def test_a_held_reason_is_posted_readable(self):   # issue #865 round 2: it read "first line is lens-  · reviewer:"
+        f = self.fake()
+        self.q.gh = self.q.gh_write = f
+        r = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',))
+        held = r.lens_problem({'body': '## Lens code, round 2\nblocker: a re-run loses data', 'author': {'login': 'x'}})
+        self.assertIn(lens.REPOST, held)
+        self.assertEqual(run_quiet(self.q.leave_off, 7, f'{lens.NO_HEADER} (url, {held})')[0], 0)
+        why = f.comments[0].split('\n')[0]
+        self.assertIn(lens.REPOST_PLAIN, why)
+        self.assertIn(lens.HELD_WAY_OUT.replace('`', ''), why)
+        self.assertNotIn('lens-  ·', why)
+        self.assertIsNone(r.looks_problem({'body': f.comments[0]}), 'the queue comment never looks like a report')
+
     def test_a_failed_comment_keeps_the_state(self):   # still OFF and silent: the run fails, the next run says it
         f = self.fake('resolved', fail=('comment',))
         self.assertEqual(self.update(f)[0], Q.SILENT)
@@ -3798,12 +3811,21 @@ class InlineReviewComments(Base):
     def test_an_inline_lens_look_alike_blocks_like_any_other(self):
         fence = '`' * 3
         for body in (f'{fence}\n{LENS}: correctness · reviewer: x · read at: {self.c}\n{fence}',
-                     'this one is safe to merge', f'{LENS}: correctness · reviewer: x · read at: {self.c[:7]}'):
+                     f'this one is safe to merge, read at {self.c}',
+                     f'{LENS}: correctness · reviewer: x · read at: {self.c[:7]}'):
             with self.subTest(body=body):
                 f = self.fake(inline=[inline_node(body)])
                 code, out = self.update(f)
                 self.assertOff(f, code, 'unclear')
                 self.assertFalse(f.updated)
+
+    def test_an_inline_look_alike_without_the_lens_marker_holds_nothing(self):   # issue #865
+        for n, body in enumerate(('this one is safe to merge', '## Lens A\nmajor: none'), 2):
+            with self.subTest(body=body):   # each named once in the run log (a Review logs each post once)
+                f = self.fake(inline=[self.lens(self.c), inline_node(body, n=n)])
+                code, out = self.update(f)
+                self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+                self.assertIn(lens.NOT_LENS, out)
 
     def test_an_edited_or_hidden_inline_lens_reads_nothing(self):
         for change, why in (({'edited': True}, lens.EDITED), ({'hidden': True}, lens.HIDDEN)):

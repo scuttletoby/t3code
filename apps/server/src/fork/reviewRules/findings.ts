@@ -45,6 +45,8 @@ const FINDINGS_NONE_RE = re(
   `^(?:findings|issues|problems)${S}*:${S}*(?:none|nothing|no|0|n/?a)${S}*\\.?${S}*$`,
 );
 const NOT_SAFE_RE = re(`${B}not${S}+safe${B}`);
+/** readFindings(unmarked): `not safe to merge` on any line (review_judge.NOT_SAFE_TO_MERGE_RE). */
+const NOT_SAFE_TO_MERGE_RE = re(`${B}not${S}+safe${S}+to${S}+merge${B}`);
 const VERDICT_NOT_SAFE_RE = re(`^verdict${S}*[:${EM}${EN}-]?${S}*not${S}+safe${B}`);
 const RULE_LINE_RE = new RegExp(`^${S}*(?:[-*_]${S}*){3,}$`, "u");
 const HEADING_RE = new RegExp(`^ {0,3}#{1,6}(?:${S}|$)`, "u");
@@ -183,11 +185,14 @@ function read(lines: ReadonlyArray<string>, narrow: boolean): Read {
 }
 
 /**
- * [the report's blocker and major findings as [kind, line] in line order, whether it has a findings section]. Read
- * both ways a lens line is read (narrow or not): a line either way reads as a finding is one. A first line (the header,
- * or the title under it) or a `verdict:` line that says NOT SAFE is a blocker whatever the labels say.
+ * review_judge.read_findings: [[kind, line] of each blocker and major in line order, has a findings section]. A first
+ * line (the header or its title line) or a `verdict:` line saying NOT SAFE is a blocker. unmarked (no lens marker): the
+ * first two lines are read as heading and title, and `not safe to merge` outside a fence is a blocker on any line.
  */
-export function readFindings(body: string): [Array<[FindingKind, string]>, boolean] {
+export function readFindings(
+  body: string,
+  unmarked = false,
+): [Array<[FindingKind, string]>, boolean] {
   pyUnicodeCheck(body);
   const lines = splitlines(body);
   const found = new Map<number, [FindingKind, string]>();
@@ -199,14 +204,18 @@ export function readFindings(body: string): [Array<[FindingKind, string]>, boole
       if (!found.has(i)) found.set(i, [kind, cut(text, SHOW_FINDING)]);
   }
   const top = [...lines.keys()].filter((i) => !isBlank(lines[i]!)).slice(0, 2);
-  const first = new Set(lensHeader(body) ? top : top.slice(0, 1));
+  const first = new Set(unmarked || lensHeader(body) ? top : top.slice(0, 1));
   let fence: string | null = null;
   for (const [i, raw] of lines.entries()) {
     let fenced: boolean;
     [fence, fenced] = fenceStep(fence, raw);
     if (fenced || found.has(i)) continue;
     const line = plain(raw, false);
-    if ((first.has(i) && NOT_SAFE_RE.test(line)) || VERDICT_NOT_SAFE_RE.test(line)) {
+    if (
+      (first.has(i) && NOT_SAFE_RE.test(line)) ||
+      VERDICT_NOT_SAFE_RE.test(line) ||
+      (unmarked && NOT_SAFE_TO_MERGE_RE.test(line))
+    ) {
       found.set(i, ["blocker", cut(`the report says NOT SAFE: ${line}`, SHOW_FINDING)]);
     }
   }
