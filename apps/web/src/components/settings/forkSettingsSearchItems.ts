@@ -249,4 +249,20 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     environmentOnly: true,
     scope: "environment-defaults",
   },
+  {
+    id: "assistant",
+    title: "Assistant",
+    to: FORK_PAGE,
+    searchTerms: ["assistant personal one thread across projects"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
+    id: "assistant-thread",
+    title: "Make assistant",
+    to: FORK_PAGE,
+    searchTerms: ["assistant thread role scratch make"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
 ] as const;

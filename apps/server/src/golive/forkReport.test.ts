@@ -1081,10 +1081,9 @@ describe("__fork-report settings", () => {
       expect(cleared.featuresOn).toEqual(featuresOn);
       expect(Object.values(cleared.featuresWhere).flat()).toEqual(featuresOn.map(() => "server"));
     }
-    // Pinned: playtest with a key this build does not know stays on.
-    expect(settingsReport({ playtest: { ...playtest, laterKey: 1 } }).fork.featuresOn).toEqual([
-      "playtest",
-    ]);
+    // A playtest value with a key this build does not know reads as off, as the load does: the key
+    // may be a newer build's limit, so this build must not run playtest without it.
+    expect(settingsReport({ playtest: { ...playtest, laterKey: 1 } }).fork.featuresOn).toEqual([]);
   });
 
   it("names the model policy by its mode, and reads an invalid one as enforce, as the load does", () => {
@@ -1110,6 +1109,22 @@ describe("__fork-report settings", () => {
     ]);
   });
 
+  it("names the windows each account spends first; old settings burn every window (#969)", () => {
+    const report = settingsReport({
+      usagePacing: {
+        main: { reservePercent: 2 },
+        extra: { burnFirst: true, burnFirstWindows: ["weekly", "monthly"] },
+        old: { burnFirst: true },
+        listOnly: { burnFirstWindows: ["weekly"] },
+      },
+    });
+    expect(report.fork.settings.usagePacingBurnFirstWindows).toEqual({
+      extra: ["weekly", "monthly"],
+      old: ["session", "weekly", "monthly", "other"],
+    });
+    expect(readForkReport(makeHome()).fork.settings.usagePacingBurnFirstWindows).toEqual({});
+  });
+
   // The report lists its features by hand, which once missed three. Each fork setting
   // is either a counted feature or here, with why it switches nothing on by itself.
   const NOT_A_SWITCH: Readonly<Record<string, string>> = {
@@ -1127,6 +1142,7 @@ describe("__fork-report settings", () => {
     placementNeeds:
       "placement: settings only so far; nothing reads them yet (later placement rows)",
     threadRoles: "calm sidebar: settings only so far; nothing reads them yet",
+    assistant: "only offers Make assistant; the assistant is the threadRoles.assistant thread",
   };
 
   it("counts every fork setting as a feature or names why it is not a switch", () => {
@@ -1477,6 +1493,7 @@ describe("__fork-report contract", () => {
         "automaticUpdatesQuietCommandSet",
         "headlessUsageRefreshIntervalMs",
         "usagePacing",
+        "usagePacingBurnFirstWindows",
         "usagePacingGate",
         "usagePacingLowerEffort",
         "waitCheckNames",

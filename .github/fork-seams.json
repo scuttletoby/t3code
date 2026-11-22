@@ -345,6 +345,26 @@
         "...EnvironmentFacts.ResultFields, // Fork (P3): facts out"
       ]
     },
+    "packages/shared/src/agentAwareness.ts": {
+      "why": "A handoff write turn that ends failed (a provider error) is as quiet as one that completes: the fork marks it stop-requested (fork/handoff/handoffShell.ts), and the relay drops it the way it already drops a completed one, so no alert sounds while the fork's handoff follows (fork issue #836).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "if (phase === \"failed\" && thread.latestRunStopRequested === true) return null; // Fork: a quiet handoff write turn (fork/handoff)"
+        ]
+      }
+    },
+    "apps/web/src/components/ThreadNotificationCoordinator.tsx": {
+      "why": "The browser's alert for a failed run skips a run marked stop-requested, as its completion alert already does: a handoff write turn that ends failed stays quiet (fork/handoff/handoffShell.ts marks it; fork issue #836).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "if (status === \"failed\" && rawThread.latestRunStopRequested === true) status = \"ready\"; // Fork: a quiet handoff write turn (fork/handoff)"
+        ]
+      }
+    },
     "apps/web/src/components/threadActionMenu.logic.ts": {
       "why": "The thread menu gets \"Hand off now\" (handoff, HO5): one more menu id, one optional state field the menu's callers fill, and the item spread into the list; the item and its rules are in fork/handoff/handoffMenu.ts. The thread menu gets the MCP profile entry (MCP profile design PR 3): the thread's effective profile and, for a client that may change settings, the owner's pick or clear. One more menu id type, one optional state field the menu's callers fill, and the entry spread into the list before Copy; the entry and its rules are in fork/mcpProfile/threadMcpProfile.logic.ts.",
       "added": [],
@@ -461,6 +481,112 @@
         "assert.ok(settled?.type === \"provider_thread.updated\");",
         "assert.equal(settled.providerThread.status, \"idle\");"
       ]
+    },
+    "packages/contracts/src/orchestratorMcp.ts": {
+      "why": "Usage pacing's note on a delegate_task result and the two refusal codes of the fork's delegation gates (usage pacing, agent slots), from before every upstream file was counted. The linked-child prompt fields (#817, design in #808) come in as one spread of the fork's own struct fields (forkOrchestratorMcp.ts), so later fork fields on this result need no new line here.",
+      "added": [
+        "// Fork: set only on the delegate_task call the usage pacing gate acted on or could not judge.",
+        "usagePacingNote: Schema.optional(Schema.String).annotate({",
+        "description: \"What usage pacing did with this task (moved it, lowered its effort, or why not).\",",
+        "}),",
+        "// Fork: the usage pacing gate held a delegated task; the message says until when.",
+        "\"usage_pacing_hold\",",
+        "// Fork: the agent slot gate refused a new delegated agent; the message names the rule.",
+        "\"slots_full\","
+      ],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import * as ForkOrchestratorMcp from \"./forkOrchestratorMcp.ts\"; // Fork: its result fields",
+          "...ForkOrchestratorMcp.ForkDelegateTaskResultFields,"
+        ]
+      }
+    },
+    "apps/server/src/mcp/OrchestratorMcpService.ts": {
+      "why": "The fork's delegation checks (fork/delegateChecks.ts: usage pacing, agent slots, a child's own options, a linked child's prompts) at their seats in delegate_task, create_threads and a remote task's status, from before every upstream file was counted. A pending secret request of a linked child ends a blocking wait (#817): one call in upstream's endsTaskWait, on the module's existing DelegateChecks import.",
+      "added": [
+        "import * as DelegateChecks from \"../fork/delegateChecks.ts\";",
+        "// Fork: the fork's delegation checks (pacing, slots, a child's own options) at their seats.",
+        "const delegateChecks = yield* DelegateChecks.make({ resolveTarget, scanWorkspace });",
+        "...(yield* delegateChecks.remotePrompts(task, status)), // Fork: reported here (fork/remoteTaskPrompts.ts)",
+        "target: yield* delegateChecks.remoteTarget({ ...input.target, environmentId }), // Fork: its own options",
+        "// Fork: seat 1 of the fork's delegation checks (fork/delegateChecks.ts), before the workspace.",
+        "const { target: pacedTarget, note: usagePacingNote } = yield* delegateChecks.beforeWorkspace({",
+        "isRetry: isRetryOfAcceptedDelegation,",
+        "parent,",
+        "requested: { ...input.target, role: input.role },",
+        "runtimeMode: input.runtimeMode,",
+        "cwd: yield* parentWorkspaceCwd(parent),",
+        "target,",
+        "});",
+        "// Fork: seat 2 of the checks, last before the dispatch (its hold: fork/delegateChecks.ts).",
+        "const forkHold = yield* delegateChecks.afterWorkspace({",
+        "isRetry: isRetryOfAcceptedDelegation,",
+        "callerThreadId: scope.thread.threadId,",
+        "target: pacedTarget,",
+        "});",
+        "modelSelection: pacedTarget.modelSelection,",
+        "if (childThreadId !== null) yield* forkHold.started(childThreadId);",
+        "// Fork: the dispatch is done; a named child keeps counting until its run shows.",
+        "yield* forkHold.release;",
+        "const task = yield* input.mode === \"wait\"",
+        "return usagePacingNote === undefined ? task : { ...task, usagePacingNote };",
+        "}, Effect.scoped), // Fork: closes the hold of a call that stops half-way (fork/delegateChecks.ts)",
+        "const resolvedTarget = yield* resolveTargetRechecking({",
+        "const { target } = yield* delegateChecks.beforeCreateThread({",
+        "isRetry: isRetryOfAcceptedCreation,",
+        "child: { threadId, index, batch: input.threads },",
+        "parent,",
+        "requested: request.target,",
+        "target: resolvedTarget,",
+        "});"
+      ],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "DelegateChecks.promptEndsWait(result) || // Fork: a secret request ends a wait (#817)"
+        ]
+      }
+    },
+    "apps/server/src/peer/PeerLinks.ts": {
+      "why": "#959: a link the peer turned away ends here as an expired one (fork/peerLinkRevoke.ts makeLinkRevokes). recordRevoked moves expires_at to now, only for the linked_at the refused call resolved, so a link made again since keeps its end. A renewal that answers a call made before the refusal (recordExpiry) skips the ended link's linked_at, so it cannot bring that link back; a link made again renews as before. Tested in apps/server/src/fork/peerLinkRevoke.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import * as ForkLinkRevoke from \"../fork/peerLinkRevoke.ts\";",
+          "/** Fork: ends `link` here once the peer turns it away (fork/peerLinkRevoke.ts). */",
+          "readonly recordRevoked: (link: PeerLink) => Effect.Effect<void>;",
+          "const revokes = ForkLinkRevoke.makeLinkRevokes(sql);",
+          "${revokes.notEnded(environmentId)}",
+          "recordRevoked: revokes.record,"
+        ]
+      }
+    },
+    "apps/server/src/peer/PeerMcpClient.ts": {
+      "why": "#959: a 401 from the peer ends the link only when a fresh MCP session started right after it is refused with 401 too (fork/peerLinkRevoke.ts makeRefusals): an older peer answers 401 for its own storage errors as well. A 401 at a session's start starts one more (reopen); a 401 on a kept session makes the call once more on a fresh one (retry; a 401 stops a request before any tool runs, so nothing runs twice). A refusal drops the kept session ids for that environment. Tested in apps/server/src/fork/peerLinkRevoke.test.ts and peerLinkRevoke.requests.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import * as ForkLinkRevoke from \"../fork/peerLinkRevoke.ts\";",
+          "const revokes = ForkLinkRevoke.makeRefusals({ links, post, sessions, recordLinkExpiry });",
+          "if (initialized.status === 401) return yield* revokes.reopen(link, url, token, limitHeader);",
+          "const fresh = openSession(resolved, limitHeader);",
+          "if (response.status === 401) response = yield* revokes.retry(sessionKey, fresh, callOnce);"
+        ]
+      }
+    },
+    "apps/server/src/auth/EnvironmentAuth.ts": {
+      "why": "#959: an internal error while checking an MCP client's credential (the session store failed to read or renew it) answers 503, not the 401 a revoked token gets, since a linked environment ends its link on a 401 (fork/authUnavailable.ts). It dies with the HTTP response, which Effect's HTTP server sends as it is, so /mcp (McpOAuth's authenticator) and the linked-thread routes (linkThreadHttp.ts admitLink) answer it without a line of their own. Tested in apps/server/src/fork/peerLinkRevoke.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import * as ForkAuthUnavailable from \"../fork/authUnavailable.ts\";",
+          "Effect.catchIf(isServerAuthInternalError, ForkAuthUnavailable.answerUnavailable),"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -477,7 +603,6 @@
     "apps/server/src/cloud/selfUpdate.ts": 4,
     "apps/server/src/config.ts": 2,
     "apps/server/src/mcp/McpHttpServer.ts": 10,
-    "apps/server/src/mcp/OrchestratorMcpService.ts": 35,
     "apps/server/src/mcp/toolkits/environment/handlers.test.ts": 63,
     "apps/server/src/mcp/toolkits/project/handlers.test.ts": 48,
     "apps/server/src/orchestration-v2/EffectWorker.ts": 28,
@@ -517,7 +642,6 @@
     "docs/operations/release.md": 1,
     "packages/contracts/package.json": 8,
     "packages/contracts/src/editor.ts": 40,
-    "packages/contracts/src/orchestratorMcp.ts": 8,
     "packages/provider-core/src/server/managedProvider.test.ts": 39,
     "packages/provider-core/src/server/managedProvider.ts": 8,
     "packages/provider-core/src/server/snapshot.ts": 2,

@@ -152,6 +152,7 @@ const unknownPace = (reason: PaceUnknownReason, instanceId = MAIN): InstancePace
   unknownReason: reason,
   reservePercent: 0,
   burnFirst: false,
+  burnFirstWindows: [],
   noLimits: reason === "noLimits",
   checkedAt: null,
   windows: [],
@@ -236,6 +237,49 @@ describe("UsagePacingGate standingOf", () => {
   });
 });
 
+describe("UsagePacingGate burn first on weekly windows only (#969)", () => {
+  const weeklyOnly = {
+    burnFirst: true,
+    reservePercent: 2,
+    burnFirstWindows: ["weekly", "monthly"],
+  } as const;
+
+  it("ahead on its 5-hour window: ahead, clear when the even pace catches up", () => {
+    const standing = standingOf(pace([weekly(80), session(70)], weeklyOnly), NOW_MS);
+    assert.strictEqual(standing.kind, "ahead");
+    if (standing.kind !== "ahead") return;
+    assert.isFalse(standing.hard);
+    assert.deepStrictEqual(
+      standing.windows.map((window) => window.id),
+      ["five_hour"],
+    );
+    // 70% half way through five hours: the even pace plus its band reaches 70 in 45 minutes.
+    assert.strictEqual(standing.notBeforeMs, NOW_MS + 45 * MINUTE + MINUTE);
+  });
+
+  it("behind on its weekly window: room up to 100 − reserve", () => {
+    assert.deepStrictEqual(standingOf(pace([weekly(80), session(20)], weeklyOnly), NOW_MS), {
+      kind: "room",
+      headroomPercent: 18,
+    });
+    assert.deepStrictEqual(standingOf(pace([weekly(97), session(20)], weeklyOnly), NOW_MS), {
+      kind: "room",
+      headroomPercent: 1,
+    });
+    const reserved = standingOf(pace([weekly(98), session(20)], weeklyOnly), NOW_MS);
+    assert.strictEqual(reserved.kind, "ahead");
+    if (reserved.kind === "ahead") assert.isTrue(reserved.hard);
+  });
+
+  it("old settings (burn first, no list) burn the 5-hour window too, as before", () => {
+    const standing = standingOf(
+      pace([weekly(80), session(70)], { burnFirst: true, reservePercent: 2 }),
+      NOW_MS,
+    );
+    assert.deepStrictEqual(standing, { kind: "room", headroomPercent: 18 });
+  });
+});
+
 describe("UsagePacingGate earliest clear time", () => {
   const notBefore = (result: InstancePace) => {
     const standing = standingOf(result, NOW_MS);
@@ -281,12 +325,20 @@ describe("UsagePacingGate earliest clear time", () => {
 
   it("matches the pacer: still ahead two minutes before, not ahead at the time", () => {
     let checked = 0;
-    for (const burnFirst of [false, true]) {
+    // A list that leaves the weekly window out paces it evenly though burnFirst is on.
+    const burnModes = [
+      { burnFirst: false },
+      { burnFirst: true },
+      { burnFirst: true, burnFirstWindows: ["weekly"] },
+      { burnFirst: true, burnFirstWindows: ["session", "monthly"] },
+    ] as const;
+    for (const burnMode of burnModes) {
+      const burnFirst = JSON.stringify(burnMode);
       for (const reservePercent of [0, 10, 30]) {
         for (const resetInMs of [HOUR, 5 * HOUR, 13 * HOUR, 2 * DAY, 3.5 * DAY, 6 * DAY]) {
           for (let used = 3; used <= 100; used += 7) {
             const live = provider(MAIN, [weekly(used, resetInMs)]);
-            const pacing = { reservePercent, burnFirst };
+            const pacing = { reservePercent, ...burnMode };
             const now = paceOfProvider(live, { pacing });
             if (now.verdict !== "ahead") continue;
             const clearsAt = notBefore(now);
@@ -311,7 +363,7 @@ describe("UsagePacingGate earliest clear time", () => {
         }
       }
     }
-    assert.isAbove(checked, 80);
+    assert.isAbove(checked, 160);
   });
 });
 
