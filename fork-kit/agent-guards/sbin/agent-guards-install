@@ -186,12 +186,7 @@ class AgentGuardsInstaller(kit_install.Installer):
     def sessions(self):
         """The running Claude Code sessions: dicts with pid, args, start (epoch seconds, None when unreadable), cwd
         (None when unreadable) and own (an ancestor of this uninstall: it runs inside that session)."""
-        try:
-            boot, tick = self.boot_time(), os.sysconf('SC_CLK_TCK')
-        except (OSError, ValueError) as e:
-            raise self.Refused(f'{self.PROC}/stat cannot be read ({e}): uninstall cannot see which Claude Code '
-                               'sessions run') from None
-        ancestors, pid = set(), os.getpid()
+        ancestors, pid, clock = set(), os.getpid(), []
         while pid > 1 and pid not in ancestors:   # this uninstall and what started it (sudo, a shell, a session)
             ancestors.add(pid)
             try:
@@ -200,7 +195,12 @@ class AgentGuardsInstaller(kit_install.Installer):
             except (OSError, ValueError, IndexError):
                 break
         installed, out = self.installed_claude(), []
-        for name in sorted((n for n in os.listdir(self.PROC) if n.isdigit()), key=int):
+        try:
+            pids = sorted((n for n in os.listdir(self.PROC) if n.isdigit()), key=int)
+        except OSError as e:
+            raise self.Refused(f'{self.PROC} cannot be read ({e.strerror}): uninstall cannot see which Claude Code '
+                               'sessions run') from None
+        for name in pids:
             if int(name) == os.getpid():
                 continue
             try:
@@ -210,9 +210,15 @@ class AgentGuardsInstaller(kit_install.Installer):
                 continue
             if not self.is_claude(name, args, installed):
                 continue
+            if not clock:   # read only when a session runs
+                try:
+                    clock[:] = [self.boot_time(), os.sysconf('SC_CLK_TCK')]
+                except (OSError, ValueError) as e:
+                    raise self.Refused(f'{self.PROC}/stat cannot be read ({e}): uninstall cannot see which Claude '
+                                       'Code sessions are older than the hooks\' removal') from None
             try:
                 with open(f'{self.PROC}/{name}/stat', 'rb') as f:
-                    start = boot + int(f.read().rpartition(b')')[2].split()[19]) / tick
+                    start = clock[0] + int(f.read().rpartition(b')')[2].split()[19]) / clock[1]
             except (OSError, ValueError, IndexError):
                 start = None
             out.append({'pid': int(name), 'args': args, 'start': start, 'cwd': self.proc_link(name, 'cwd'),
