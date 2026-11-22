@@ -2577,6 +2577,97 @@
           "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Lens code, round 2'"
         ]
       ]
+    },
+    {
+      "name": "a header with full-width colons, letters or digits is a lens report that reads (#989)",
+      "posts": [
+        {
+          "body": "lens： code · reviewer： x · read at： aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker： none\nmajor： none"
+        },
+        {
+          "body": "ｌｅｎｓ﹕ data · reviewer﹕ x · ｒｅａｄ ａｔ﹕ ａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａａ\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["data", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      ],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "data": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a header that mixes full-width and plain colons reads (#989)",
+      "posts": [
+        {
+          "body": "lens： code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a full-width read is outvoted by a newer plain one, and reads nothing once edited (#989)",
+      "posts": [
+        {
+          "body": "lens： code · reviewer： x · read at： aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker： none\nmajor： none"
+        },
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lens： data · reviewer： x · read at： aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker： none\nmajor： none",
+          "edited": true
+        }
+      ],
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["data", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      ],
+      "entries": {
+        "code": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null],
+        "data": [null, "edited after posting: post a new comment instead"]
+      }
+    },
+    {
+      "name": "a full-width report below another line blocks as a broken report, never silently (#989)",
+      "posts": [
+        {
+          "body": "Here is my review.\nlens： code · reviewer： x · read at： aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker： none\nmajor： none"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line that is not its first plain line (a later line, a code block, quote or table), starts with 'Here is my review.')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a full-width lens heading without the marker is named as no lens report (#989)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Ｌｅｎｓ code, round 2\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      },
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:01Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Ｌｅｎｓ code, round 2'"
+        ]
+      ]
     }
   ],
   "rounds": [
@@ -3842,6 +3933,25 @@
         },
         {
           "body": "## Lens code, round 2\n\ncovered: x\nchecks: y\n\nThe old code was not safe to run twice; this fixes it."
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "a header with full-width colons reads its head and passes (#989)",
+      "posts": [
+        {
+          "body": "lens： code · reviewer： x · read at： aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker： none\nmajor： none"
         }
       ],
       "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
