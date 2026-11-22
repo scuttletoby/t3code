@@ -306,6 +306,52 @@ def _stamp(s):
     return datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
 
 
+def _meta(f):
+    """A sub-agent transcript's meta file (agent-<id>.meta.json beside it) as a dict, or {}."""
+    try:
+        with open(f[:-len('.jsonl')] + '.meta.json', encoding='utf-8') as fh:
+            m = json.load(fh)
+        return m if isinstance(m, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _own_files(f):
+    """The run's transcript `f` and every sub-agent transcript that is its cost, each once. Claude Code keeps every
+    sub-agent of a session in <session>/subagents/, flat whatever its depth (workflow agents under
+    subagents/workflows/wf_*/), each with agent-<id>.meta.json naming its parentAgentId when a sub-agent started it.
+    A run that is the session: every one of them. A run that is itself a sub-agent: those whose parentAgentId is the
+    run's agent id or one of theirs, at any depth."""
+    if not f.endswith('.jsonl'):
+        return [f]
+    if 'subagents' not in os.path.normpath(f).split(os.sep)[:-1]:   # the session file: <session>.jsonl
+        tree = os.path.join(f[:-len('.jsonl')], 'subagents')
+        return [f, *sorted(glob.glob(os.path.join(glob.escape(tree), '**', '*.jsonl'), recursive=True))]
+    tree = os.path.dirname(f)
+    while os.path.basename(tree) != 'subagents':   # the session's subagents/ folder, above workflows/wf_*/
+        tree = os.path.dirname(tree)
+    agents = {os.path.basename(g)[len('agent-'):-len('.jsonl')]: g
+              for g in sorted(glob.glob(os.path.join(glob.escape(tree), '**', 'agent-*.jsonl'), recursive=True))}
+    own, ids, grew = [f], {os.path.basename(f)[len('agent-'):-len('.jsonl')]}, True
+    while grew:
+        grew = False
+        for aid, g in agents.items():
+            if aid not in ids and _meta(g).get('parentAgentId') in ids:
+                ids.add(aid)
+                own.append(g)
+                grew = True
+    return own
+
+
+def _usage_tokens(u):
+    """One message's usage as the PRICE_KEYS token counts."""
+    cc = u.get('cache_creation') or {}
+    return {'input': u.get('input_tokens', 0), 'output': u.get('output_tokens', 0),
+            'cache_read': u.get('cache_read_input_tokens', 0),
+            'cache_write_5m': cc.get('ephemeral_5m_input_tokens', 0) if cc else u.get('cache_creation_input_tokens', 0),
+            'cache_write_1h': cc.get('ephemeral_1h_input_tokens', 0) if cc else 0}
+
+
 def cost(c, out):
     runs = {r['id']: r for r in read_runs(c)}
     files = {}
@@ -313,13 +359,12 @@ def cost(c, out):
         for f in sorted(glob.glob(pattern)):
             m = RUN_RE.match(_first_user_text(f).lstrip())   # the run's own session starts with its RUN-ID line
             if m and m.group(1) in runs:
-                # ... and the sub-agents it started are its cost too: Claude Code keeps them beside the session file,
-                # in <session>/subagents/*.jsonl. Each file once, however many patterns find it.
-                subs = os.path.join(glob.escape(f[:-len('.jsonl')]), 'subagents', '*.jsonl')
-                for g in [f, *(sorted(glob.glob(subs)) if f.endswith('.jsonl') else [])]:
+                # ... and the sub-agents it started are its cost too (_own_files). Each file once, however many
+                # patterns find it.
+                for g in _own_files(f):
                     if g not in files.setdefault(m.group(1), []):
                         files[m.group(1)].append(g)
-    result = {}
+    result, unpriced = {}, set()
     for rid, fs in sorted(files.items()):
         usage, times, model = {}, [], None
         for f in fs:
@@ -338,32 +383,33 @@ def cost(c, out):
                             pass
                     m = e.get('message')
                     if e.get('type') == 'assistant' and isinstance(m, dict) and isinstance(m.get('usage'), dict):
-                        model = m.get('model') or model
-                        usage[m.get('id') or e.get('requestId') or len(usage)] = m['usage']
-        t = dict.fromkeys(('input', 'output', 'cache_write_5m', 'cache_write_1h', 'cache_read'), 0)
-        for u in usage.values():
-            t['input'] += u.get('input_tokens', 0)
-            t['output'] += u.get('output_tokens', 0)
-            t['cache_read'] += u.get('cache_read_input_tokens', 0)
-            cc = u.get('cache_creation') or {}
-            if cc:
-                t['cache_write_5m'] += cc.get('ephemeral_5m_input_tokens', 0)
-                t['cache_write_1h'] += cc.get('ephemeral_1h_input_tokens', 0)
-            else:
-                t['cache_write_5m'] += u.get('cache_creation_input_tokens', 0)
+                        # the run's own model: from its own file, never a sub-agent's or a <synthetic> message's
+                        if f == fs[0] and any(_usage_tokens(m['usage']).values()):
+                            model = m.get('model') or model
+                        usage[m.get('id') or e.get('requestId') or len(usage)] = (m.get('model'), m['usage'])
+        t, usd = dict.fromkeys(PRICE_KEYS, 0), 0
+        for msg_model, u in usage.values():
+            ut = _usage_tokens(u)
+            for k in PRICE_KEYS:
+                t[k] += ut[k]
+            if not any(ut.values()):
+                continue   # nothing to price (Claude Code's own <synthetic> messages)
+            p = c['prices'].get(msg_model or runs[rid]['model'])   # each message at its own model's price
+            if p and usd is not None:
+                usd += sum(ut[k] * p[k] for k in PRICE_KEYS)
+            elif not p:
+                usd = None
+                unpriced.add(msg_model or runs[rid]['model'])
         times.sort()
         gap = c['idle_gap_seconds']
         active = sum(b - a for a, b in zip(times, times[1:]) if b - a <= gap)
-        p = c['prices'].get(runs[rid]['model'])
-        usd = round(sum(t[k] * p[k] for k in PRICE_KEYS) / 1e6, 3) if p else None
-        result[rid] = {**t, 'usd': usd, 'active_min': round(active / 60, 1), 'calls': len(usage),
-                       'model_seen': model, 'files': len(fs)}
+        result[rid] = {**t, 'usd': None if usd is None else round(usd / 1e6, 3), 'active_min': round(active / 60, 1),
+                       'calls': len(usage), 'model_seen': model, 'files': len(fs)}
     write(gt(c, 'cost.json'), dump(result))
     missing = sorted(set(runs) - set(result))
-    unpriced = sorted({runs[r]['model'] for r in result if result[r]['usd'] is None})
     print(f'{len(result)} runs costed; no transcript: {", ".join(missing) or "none"}', file=out)
     if unpriced:
-        print(f'no price for {", ".join(unpriced)}: add it under prices', file=out)
+        print(f'no price for {", ".join(sorted(unpriced))}: add it under prices', file=out)
 
 
 # --- analyze -----------------------------------------------------------------------------------------------------
