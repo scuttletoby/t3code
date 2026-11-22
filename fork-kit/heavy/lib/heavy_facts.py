@@ -12,8 +12,9 @@ unknownKinds.job. "fits" says for every kind how many more pieces of it the rule
 The ledger comes from the kernel only, so the answer stands with T3 down or not installed. Memory, swap, PSI, cores
 and container limits come from lib/capacity_readings.py (the shared reader's port: the same answers as
 capacityReadings.ts). Pieces: heavy's admitted jobs (its live queue tickets; every ticket is a job, of the rule's
-kind for its name or else unknownKinds.job; demand from the job's scope) and T3's agent scopes (`t3code-*.scope`
-under an `app-t3code*` slice; a scope has no kind label, so it counts as unknownKinds.other: a writer), plus the
+kind for its name or else unknownKinds.job; demand from the job's scope) and T3's agent scopes (any scope right below
+an `app-t3code*` slice, a `t3code-*.scope` elsewhere with a note; a scope has no kind label, so it counts as
+unknownKinds.other: a writer), plus the
 other users' heavy jobs and agent scopes read from their user managers' cgroups (unknownKinds.job and writers).
 Full tier: cgroup v2 and this user's systemd user manager. Machine tier: cgroup v2 and user.slice, but no user
 manager of this user's (a CI runner's user: no lingering, no login session): it has no agent or heavy job scopes of
@@ -24,15 +25,16 @@ agents and other users' work cannot be counted, so the answer is never free (a n
 there but unreadable is "elevated": then only the rule's floors admit, never the budget; facts that cannot be read
 admit nothing.
 
-Reservations: lines `<MB> <folder> [until=YYYY-MM-DD]` in *.conf files of $T3_CAPACITY_RESERVE_DIR, else
+Reservations: lines `<MB or kind> <folder> [until=YYYY-MM-DD] [ttl=DUR] [idle=DUR]` (#861: reservation_files,
+release_idle) in *.conf files of $T3_CAPACITY_RESERVE_DIR, else
 ~/.config/t3-capacity/reserve.d. A folder matches itself and what is below it, never a sibling that shares its
 first letters (`/x/app` is not `/x/app-x`); its real path (links resolved) matches too. Each holds MB less what
 its user's processes working in the folder use (RssAnon + RssShmem + VmSwap), and less what the agents and heavy
 jobs with a process working in it still owe the rule (their cost less their demand: that room is held as their debt
 already, so it is counted once, #923). A process counts toward one reservation only (the deepest folder holding it,
 then the first by name), and a piece's debt is split over its processes by their use, so no debt is taken off two
-reservations (#945). It does not hold back a caller whose working folder is in it; past its until date, or broken,
-it holds nothing (a note says so).
+reservations (#945). It does not hold back a caller whose working folder is in it; past its until date or ttl, or
+broken, it holds nothing (a note says so). Every person's readable reservations count in the full tier too (#800).
 
 Readings are kept 5 seconds in /run/user/<uid>/heavy-facts-v<version>-<hash of the settings>.json, one file per
 version and settings, so callers of one user with other settings (slice, queue, reservations folder) or another
@@ -46,8 +48,9 @@ hysteresis) while the last one is at most 5 minutes old; without a cache folder,
 cannot be used, or with no file of its own yet but another caller's written in the last 5 minutes beside it (another
 version after an update, other settings), nothing can carry, so the level starts "elevated" (it never drops straight
 to ok). Cache files of other settings or versions older than 5 minutes are removed. Learned
-job costs: heavy's peaks (lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost,
-not heavy's own reservation for it (heavy's queue holds that one back itself).
+job costs: heavy's peaks (lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost, or
+heavy's own reservation for it when that is more (its ticket's mb is the piece's declared size, a floor of its cost
+in the rule, #800).
 """
 import datetime, errno, fcntl, fnmatch, hashlib, json, math, os, pwd, re, signal, stat, subprocess, sys, time
 

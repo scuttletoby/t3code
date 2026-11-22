@@ -18,6 +18,7 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 | Command                      | What happens                                                                                 |
 | ---------------------------- | -------------------------------------------------------------------------------------------- |
 | `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends |
+| `heavy --wait S <command>`   | the same; waits at most S seconds (default 7200) for the capacity rule first (below)         |
 | `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)        |
 | `heavy --self-check`         | checks the config, the slice's limit and the installed files; warns on another `t3-capacity` |
 | `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                              |
@@ -87,6 +88,15 @@ terminal's Ctrl-C, a service stop's TERM) and a kill of heavy's process group, h
 scope outlives heavy on purpose) or a nested heavy (the outer one has a guard). Only a kill of the guard too
 (`kill -9` on both, by pid) leaves the scope; the leftover sweep finds it then.
 
+**Capacity first.** Before the command starts, heavy asks the machine's capacity rule itself (`heavy facts
+--fresh`, below: the same answer as `t3-capacity`), so a job started right after a NOT OK (`check ; test`, or a
+check whose exit code nobody read) still waits. A job without `--kind` waits until the rule says free for one job
+of the rule's `unknownKinds.job`; heavy says why every time that changes and once a minute (`heavy: waiting for
+capacity: ...`) and gives up after `--wait` seconds (default 7200) with exit 76 and `heavy: gave up after waiting
+... for capacity`, without running the command. A queued job (`--kind`) asks it in the queue (below). Not asked: a
+nested heavy (the outer one holds the room). Anything but a clear "free" (busy, no answer within 5 s, a broken
+answer, a check that cannot run) is not free. The machine file's `heavy.queue.capacityCheck: false` turns it off.
+
 **Never uncapped.** heavy refuses (exit 1, the reason on stderr, the command not run) when the systemd user
 manager cannot be reached, when the slice has no unit file (systemd would make an empty one up on the fly, with no
 limits), or when the slice has neither `MemoryMax` nor `MemoryHigh`.
@@ -124,6 +134,10 @@ their real use is in the slice's figures).
   one that has is counted once). Not counted: memory other tools have promised but not used yet, and plain `heavy`
   jobs before they grow (their real use is in `used`). A machine that has its own check for that sets
   `admitCommand`.
+- **Capacity rule:** after the queue's own rule says yes, the job must also be free by the machine's capacity rule
+  (`heavy facts --kind <kind> --mb <reservation> --fresh`; a fresh reading, so a job admitted a second ago counts).
+  Not free is not now, as for the admit command (below: the job keeps its place, the jobs behind it keep no room
+  for it). `capacityCheck: false` turns it off.
 - **Admit command (optional):** `admitCommand` is a program and its arguments (`{mb}` becomes the reservation),
   asked after the queue's own rule says yes, under the queue's lock. Exit 0 admits the job; any other exit, or no
   answer within `admitTimeoutSeconds` (its process group is then killed), means not now: the job keeps its place
@@ -180,13 +194,15 @@ The optional `queue` object in the machine file's `heavy` section; without the f
       "budgetMb": 0,
       "swapFreeMinMb": 1024,
       "admitCommand": [],
-      "admitTimeoutSeconds": 20
+      "admitTimeoutSeconds": 20,
+      "capacityCheck": true
     }
   }
 }
 ```
 
-`budgetMb` 0 means the slice's limit; `swapFreeMinMb` 0 turns the swap check off; `admitCommand` `[]` means none
+`budgetMb` 0 means the slice's limit; `swapFreeMinMb` 0 turns the swap check off; `capacityCheck` false: heavy
+does not ask the capacity rule before a job starts; `admitCommand` `[]` means none
 (else a list of strings; the first is an absolute path to a program, for example
 `["/usr/local/bin/my-check", "--need", "{mb}"]`). An unknown key or a bad value is refused (heavy then runs no
 queued job; the message names the key). Install the release with the queue before you add the key: an older sweep
@@ -214,6 +230,9 @@ refuses it.
   works and marks it, and jobs the queue's own rule holds keep waiting. A job that reaches the admit command stops
   with exit 1 and a line naming the program, and does not run: without its check it must not start, and waiting
   `--wait` for a program that may never come back would hide the fault. Fix the program or remove the setting.
+- **The capacity rule gives no answer** (`heavy facts` broken, slow, or the machine file broken): not free, so
+  the job waits and gives up after `--wait` with exit 76, the reason in the last waiting line. Never a start on a
+  missing answer.
 - **The admit command hangs, or its leftover holds its output:** not now after `admitTimeoutSeconds` (or 1 s after
   it exited); its process group is killed and the job asks again on the next look.
 - **One leaky run of a kind:** its peak counts (failed runs too), but the learned value is capped at the budget
@@ -535,11 +554,13 @@ the TypeScript one) on a ledger read from the kernel. Memory, swap, PSI, cores a
 root's `memory.max` and `cpu.max`) come from `lib/capacity_readings.py`, the port of the shared reader that runs the
 same `capacity-readings.json` cases. Pieces: heavy's live queue tickets (admitted jobs with their scope's demand;
 waiting ones are counted only; every ticket is a job: of the rule's kind for its name, `build` is `job-build`,
-else of a kind the rule does not know, `unknownKinds.job`, never an agent), T3's agent scopes (`t3code-*.scope`
-under an `app-t3code*.slice` of the user manager; no kind label yet, so each counts as a writer), and the same two
+else of a kind the rule does not know, `unknownKinds.job`, never an agent), T3's agent scopes (every scope right below an
+`app-t3code*.slice` of the user manager, whatever its name, an escaped label too; a `t3code-*.scope` elsewhere
+below the manager counts as well, with a note; no kind label yet, so each counts as a writer), and the same two
 of every other user, read from their user managers' cgroups (so a CI runner under its own user sees this user's
-work, and the other way round). Learned job costs come from the queue's `peaks.json`; a job owes its kind's cost,
-not heavy's own reservation for it. The object adds `fits` (how many more of each kind would start, one
+work, and the other way round). Learned job costs come from the queue's `peaks.json`; a job owes its kind's cost, or
+heavy's own reservation for it (its `--mb` or learned peak) when that is more (the rule counts a piece's declared
+size as a floor of its cost). The object adds `fits` (how many more of each kind would start, one
 after another, up to the group's ceiling), the memory budget, the queue and notes.
 
 - **--kind K:** does the rule admit one piece of K (`agent-writer`, `job-build`, or heavy's own `build`). **--mb
@@ -569,7 +590,13 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   every kind. A box with no live piece of its own passes no box pressure (as the server's observer). A piece whose
   `memory.stat` is cut short or broken owes its whole cost.
 - **Reservations:** files `~/.config/t3-capacity/reserve.d/*.conf` (or `$T3_CAPACITY_RESERVE_DIR`), lines
-  `<MB> <absolute folder> [until=YYYY-MM-DD]`. The folder matches itself and what is below it, with or without a
+  `<MB or kind> <absolute folder> [until=YYYY-MM-DD] [ttl=DUR] [idle=DUR]` (DUR: `90s`, `30m`, `2h`, `1d`). A kind
+  in place of MB (`build /x/app/`) is sized by the rule's cost of one piece of it, learned from heavy's peaks for a
+  job kind (an unknown name: the job default), so the room kept follows what that work really used. `ttl=` ends the
+  line DUR after its file was last written (the writer touches the file to keep it). `idle=` lets it hold nothing
+  once no process of its user works in its folder and its file was not written for DUR; it applies only where
+  those processes can be seen (the caller's own reservations, or any for root), else the line holds. A bad
+  `ttl=`/`idle=` or another word after the folder is a note and the line holds as without it. The folder matches itself and what is below it, with or without a
   trailing `/`, never a sibling sharing its first letters (`/x/app` is not `/x/app-x`); its real path (links
   resolved) matches too. A reservation holds back its MB less what its user's processes working in that folder
   already use, and less what agents and heavy jobs with a process working there still owe the rule (their cost
@@ -578,8 +605,10 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   reservation only (the deepest folder that holds it, then the first by file name), and a piece's debt is split
   over its processes by their use, so with two or nested reserved folders nothing is taken off twice. A caller working
   inside the folder (its real working folder) is not held back by its own reservation. Ended, broken or unreadable
-  lines hold nothing and give a note. Limit: in the full tier another user's reservations are not seen (the
-  machine tier reads them, above).
+  lines hold nothing and give a note. Every person's reservations count in the full tier too (as in the machine
+  tier, above), so one person's reservation holds against another person's work; in the full tier one that cannot
+  be read (a home closed to others, as most are by default) is a note, not "never free": make
+  `~/.config/t3-capacity/reserve.d` and the folders above it readable to others for it to be seen.
 - **Holds (machine file):** a cgroup outside the user managers, such as a CI runners' slice, is not in the ledger.
   `heavy.capacity.holds` names such cgroups; one that uses more than `inUseFromMb` (anon + shmem + swap) keeps its
   budget (its `memory.max`, or `budgetMb` when it has none) less the RAM it uses (anon + shmem: `memory.max` limits
@@ -607,13 +636,24 @@ Two thin callers come with it:
   from `heavy facts`. MB defaults to 3072. The installer links `/usr/local/bin/t3-capacity` to it, so the command
   has one source, the release in use (a host's own plain copy there only with `--replace-t3-capacity`: Install,
   below); `heavy --self-check` warns when the `t3-capacity` found on PATH is another copy (its readings can differ:
-  an older copy, for one, counts no reservations).
+  an older copy, for one, counts no reservations). **A NOT OK holds 20 s** for the same question (kind and MB): an
+  OK read within that time is `NOT OK: held: ...`, so a check that flips between OK and NOT OK within seconds never
+  lets work start just before it turns NOT OK again (the time starts at each NOT OK read from the machine; a held
+  answer does not extend it). It is kept in `t3-capacity-hold.json` in heavy facts' cache folder; one that cannot
+  be read (broken, another owner's, a link, open to others) holds once more and is written again; a time in the
+  future holds and starts again; no cache folder: no hold, with a note.
 - `bin/agent-slots` (not linked onto PATH: a host wires it in itself): a Claude Code hook (UserPromptSubmit, Stop)
   for orchestrator sessions: free agent slots are the smaller of the process limit and the machine's `fits` for
   its kind.
 
 A `heavy facts` that does not answer within 5 s (it is killed), fails or prints something else is never free for
 either caller.
+
+**Swap trend, per read.** Swap is "filling" when its free MB fell by more than `swapFillingMb` (64) since the last
+read. That limit is per read, not per second: `heavy facts` reads at most every 5 s (its cache) and carries the last
+reading up to 5 minutes, the T3 server reads every 30 s and on each ask, so swap that fills slowly can be "filling"
+for one and not for the other. A machine with the kit from before the swap trend keeps the old swap rule until
+`heavy-install` runs again from a newer source.
 
 ### Facts run again, stop half-way, or meet old or empty state
 
@@ -629,7 +669,8 @@ either caller.
 - **Cost file** (`peaks.json`) missing, empty or broken: the rule's start costs, with the queue's note.
 - **Reservation file cut short** (its writer stopped half-way): its whole lines hold, the cut line is a note.
   A reservation whose processes are all gone still holds all its MB (the room is kept for them), until its
-  `until=` date or until the line is removed.
+  `until=` date, its `ttl=` or `idle=` time, or until the line is removed. A writer that stopped renewing its file
+  (killed, crashed) leaves a line with `ttl=` that ends by itself; one without it holds until it is removed.
 - **Machine file** missing, or without `heavy` or `capacity`: no holds. Broken (not JSON, an unknown key, a wrong
   value, a `user.slice` cgroup, a label twice, a cgroup in or the same as another hold's, more than 8 holds,
   writable by others): `heavy facts` gives no answer, so
@@ -699,6 +740,7 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 |                                                 | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
 | `/run/user/<uid>/heavy-facts-*.json`            | `heavy facts`' 5 s cache (tmpfs), one per version and settings            |
 | `/tmp/heavy-facts-<uid>/heavy-facts-*.json`     | the same, for a user without `/run/user/<uid>` (no user manager)          |
+| `<that folder>/t3-capacity-hold.json`           | `t3-capacity`'s 20 s hold of a NOT OK                                     |
 | `~/.config/t3-capacity/reserve.d/*.conf`        | each user's reservations for `heavy facts` and its callers                |
 
 ## Install (owner, as root)
@@ -794,9 +836,11 @@ treats them.
 
 `python3 -I -B fork-kit/heavy/tests/capacity_rule.test.py`: the kit's evaluator against every vector and format
 case, and its reader against every `capacity-readings.json` case, of `packages/shared/src/capacity` (the files the
-TypeScript tests read); each number of the rule, changed, turns a vector red. `python3 -I -B fork-kit/heavy/tests/facts.test.py`: `heavy facts`, `t3-capacity` and
+TypeScript tests read); each number of the rule, changed by +1 and changed by -1, turns a vector red. `python3 -I -B fork-kit/heavy/tests/facts.test.py`: `heavy facts`, `t3-capacity` and
 `agent-slots` on a fake `/proc` and `/sys` (`HEAVY_FACTS_ROOT`), a temporary queue, home and cache, and fake slow
-or failing `heavy` scripts. Its red checks take out of a copy of `lib/heavy_facts.py` the agent-scope count,
+or failing `heavy` scripts. The test-only settings (`HEAVY_FACTS_ROOT`, `T3_CAPACITY_HEAVY`, `AGENT_SLOTS_HEAVY`,
+`AGENT_SLOTS_ALIVE`) are read only while `HEAVY_TESTING=1` is set too, so one that leaks into a real caller's
+environment changes nothing. Its red checks take out of a copy of `lib/heavy_facts.py` the agent-scope count,
 unknown kinds as jobs and the folder's trailing `/`, and show the test for each then fails.
 
 `python3 -I -B fork-kit/heavy/tests/install.test.py` (the installer on a fake host in a temporary folder, no root)
