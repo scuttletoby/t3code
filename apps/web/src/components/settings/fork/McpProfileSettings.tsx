@@ -274,6 +274,8 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
   const projectSettingsOverrides = useScopedSettings(
     (settings) => settings.projectSettingsOverrides,
   );
+  // The assistant thread never runs wider than `assistant`, so a pick's effect depends on it too.
+  const threadRoles = useScopedSettings((settings) => settings.threadRoles);
   const threadShells = useThreadShells();
   const projects = useProjects();
   const { environment } = useSettingsScope();
@@ -373,7 +375,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
   const pickRows = mcpThreadPickRows(mcpThreadProfiles, labels.threads);
   // The threads of the environment these settings are for: a pick's effect depends on its parent.
   const shells = threadShells.filter((shell) => shell.environmentId === environment?.environmentId);
-  const threadSettings = { ...settings, mcpCarriedProfiles, projectSettingsOverrides };
+  const threadSettings = { ...settings, mcpCarriedProfiles, projectSettingsOverrides, threadRoles };
   const pickEffect = (threadId: string, name: string) =>
     threadPickEffect(threadSettings, threadId, name, shells);
   const draftEffect =

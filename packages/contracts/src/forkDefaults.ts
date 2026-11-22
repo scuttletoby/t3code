@@ -221,6 +221,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     decidedIn: "#138",
   },
   {
+    scope: "server",
+    key: "assistant",
+    default: { enabled: false },
+    off: true,
+    reason: 'Settings offers no "Make assistant"; no thread is made.',
+    decidedIn: "#879",
+  },
+  {
     scope: "projectOverride",
     key: "mcpProfile",
     default: undefined,

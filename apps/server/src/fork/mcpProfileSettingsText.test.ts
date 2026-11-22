@@ -243,3 +243,18 @@ describe("mcpProfileFileKeysOf (#681)", () => {
     );
   });
 });
+
+describe("the assistant pointer counts as an MCP profile key (#953)", () => {
+  it("a file that does not decode still gives threadRoles.assistant, laid over a broken load", () => {
+    // `"theme": 5` makes the full decode fail; the text reader still gives the profile keys.
+    const keys = keysOf(
+      JSON.stringify({ theme: 5, threadRoles: { assistant: "thread:a", orchestrators: 3 } }),
+    );
+    expect(keys.threadRoles).toEqual({ assistant: "thread:a", orchestrators: {} });
+    const laid = withMcpProfileFileKeys(DEFAULT_SERVER_SETTINGS, keys);
+    expect(laid.threadRoles.assistant).toBe("thread:a");
+    // A decoded file gives the same, so the keys last read keep it too.
+    const decoded = { ...DEFAULT_SERVER_SETTINGS, threadRoles: keys.threadRoles } as ServerSettings;
+    expect(mcpProfileFileKeysOf(decoded).threadRoles.assistant).toBe("thread:a");
+  });
+});

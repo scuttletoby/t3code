@@ -79,7 +79,7 @@ describe("MCP profile resolver: old and empty state", () => {
     });
   });
 
-  it.each(["all", "t3-only"])(
+  it.each(["all", "t3-only", "assistant"])(
     "refuses %s when a hand edit put a profile of that name in the file",
     (name) => {
       const file = {
@@ -662,6 +662,19 @@ describe('builtinTools "none" (assistant)', () => {
     );
   });
 
+  it("the built-in assistant: no servers or built-in tools, three groups; a child keeps it", () => {
+    const picked = fromFile({ mcpThreadProfiles: { a1: "assistant" } });
+    const own = resolved(resolveMcpProfile(picked, [top("a1")]));
+    expect([own.name, own.source]).toEqual(["assistant", "thread-pick"]);
+    expect(own.profile).toEqual({
+      servers: [],
+      t3Tools: ["orchestration", "threads", "projects"],
+      builtinTools: "none",
+    });
+    const sub = resolved(resolveMcpProfile(picked, [child("c1"), top("a1")]));
+    expect(sub.profile).toEqual(own.profile);
+  });
+
   it.each([["some"], [false], [["Bash"]]])("refuses, never widens, builtinTools %j", (value) => {
     const broken = fromFile({
       mcpProfiles: { odd: { servers: "all", t3Tools: "all", builtinTools: value } },
@@ -672,5 +685,62 @@ describe('builtinTools "none" (assistant)', () => {
     expect(refused(resolveMcpProfile(fromFile({}), [child("task")], carried)).message).toContain(
       "builtinTools",
     );
+  });
+});
+
+describe("the assistant thread is never wider than the assistant profile (#953)", () => {
+  const ASSISTANT_SET = {
+    servers: [],
+    t3Tools: ["orchestration", "threads", "projects"],
+    builtinTools: "none",
+  };
+  const roles = { assistant: "a1", orchestrators: {} };
+
+  it("a managed policy that drops its pick: the defaults' all is cut down to assistant", () => {
+    // The policy owns mcpThreadProfiles as a whole and leaves the assistant's pick out.
+    const dropped = fromFile({
+      mcpProfiles: PROFILES,
+      threadRoles: roles,
+      mcpThreadProfiles: { other: "docs" },
+    });
+    const own = resolved(resolveMcpProfile(dropped, [top("a1")]));
+    expect([own.name, own.source]).toEqual(["assistant", "assistant-role"]);
+    expect(own.profile).toEqual(ASSISTANT_SET);
+    // A project default and a wider pick are cut too; a child gets no more than its parent.
+    const project = resolved(resolveMcpProfile(dropped, [top("a1", { mcpProfile: "docs" })]));
+    expect(project.profile).toEqual(ASSISTANT_SET);
+    const wide = fromFile({ threadRoles: roles, mcpThreadProfiles: { a1: "all" } });
+    expect(resolved(resolveMcpProfile(wide, [top("a1")])).profile).toEqual(ASSISTANT_SET);
+    expect(resolved(resolveMcpProfile(dropped, [child("c1"), top("a1")])).profile).toEqual(
+      ASSISTANT_SET,
+    );
+  });
+
+  it("its own pick stands when it is within assistant; other threads are not touched", () => {
+    const settings = fromFile({
+      mcpProfiles: { tiny: { servers: [], t3Tools: ["threads"], builtinTools: "none" } },
+      threadRoles: roles,
+      mcpThreadProfiles: { a1: "tiny" },
+    });
+    const own = resolved(resolveMcpProfile(settings, [top("a1")]));
+    expect([own.name, own.source]).toEqual(["tiny", "thread-pick"]);
+    const picked = fromFile({ threadRoles: roles, mcpThreadProfiles: { a1: "assistant" } });
+    expect(resolved(resolveMcpProfile(picked, [top("a1")])).source).toBe("thread-pick");
+    const other = resolved(resolveMcpProfile(settings, [top("t2")]));
+    expect([other.name, isEveryMcpTool(other.profile)]).toEqual(["all", true]);
+    // No role: the thread that held the pick gets what any thread gets.
+    expect(isEveryMcpTool(resolved(resolveMcpProfile(fromFile({}), [top("a1")])).profile)).toBe(
+      true,
+    );
+  });
+
+  it("refuses, never widens, when the built-in assistant cannot be read or the pick is broken", () => {
+    const shadowed = fromFile({
+      mcpProfiles: { assistant: { servers: "all", t3Tools: "all" } },
+      threadRoles: roles,
+    });
+    expect(refused(resolveMcpProfile(shadowed, [top("a1")])).profileName).toBe("assistant");
+    const missing = fromFile({ threadRoles: roles, mcpThreadProfiles: { a1: "gone" } });
+    expect(refused(resolveMcpProfile(missing, [top("a1")])).problem).toBe("missing");
   });
 });
