@@ -113,12 +113,14 @@ A guarded call only in a script 4 or more levels deep (a.sh -> b.sh -> c.sh -> d
 unless other text in the command flows on.
 gh has no request hook, so this hook is the command-text layer; the wall is a token that cannot do it.
 
-Escape hatch (owner only, as root): `sudo agent-guards approve [--hours N]` prints a one-time code and keeps its
-hash in a root-owned file (lib/agent_guards/approval.py); a command that carries
+Escape hatch (owner only, as root): `sudo agent-guards approve [--hours N] --command '<cmd>'` approves ONE command
+run in one folder, once: it prints a code and keeps in a root-owned file (lib/agent_guards/approval.py) only the
+code's hash, the normalised command's hash, the folder and the end time (1 hour by default). That command, ending in
   #owner-approved:actions-disable:<code>
-passes while that file holds the code and its time (1 hour by default) has not run out. An agent cannot write the
-file, so it cannot approve itself, and nothing is inherited: a nested session gets the code only when it is in its
-command. (The old CLAUDE_GUARD_OWNER_ALLOW_ACTIONS_DISABLE variable opens nothing any more: a variable reaches
+passes once, in that folder, before the end time; the use is recorded in the state folder and a second run, or any
+other command with the code, is refused. A code seen in a transcript, the app's database or `ps` opens nothing else.
+An agent cannot write the file, so it cannot approve itself, and nothing is inherited: a nested session gets the
+code only when it is in its command. (The old CLAUDE_GUARD_OWNER_ALLOW_ACTIONS_DISABLE variable opens nothing any more: a variable reaches
 every nested `claude -p` or `codex exec` of the session.) Fails closed: an internal error refuses commands that
 look dangerous.
 
@@ -238,8 +240,9 @@ SELF = os.path.realpath(os.path.abspath(__file__)) if '__file__' in globals() el
 RULE = ('Owner rule (2026-11-13, "guards that refuse, not trust"): no agent disables GitHub Actions workflows, or '
         'Actions itself, on any repo; re-enabling (`gh workflow enable`, PUT .../enable) is fine. If disabling is '
         'really needed, stop and ask the owner: name the repo, the workflow and why. Only the owner can approve '
-        'it: they run `sudo agent-guards approve` and give you a code, and the command then carries '
-        f'{MARK_CMD}<code>. Agents must not make up a code, reuse one they were not given for this, start an agent '
+        'it: they run `sudo agent-guards approve --command \'<the exact command>\'` and give you a code; that '
+        f'one command, ending in {MARK_CMD}<code>, then passes once, in the folder they approved it for. Agents '
+        'must not make up a code, reuse one they were not given for this, start an agent '
         'session without this machine\'s hooks, or route around this guard with scripts, aliases or other HTTP '
         'clients.')
 UNREADABLE = ('If this call is harmless, write it so the guard can read it: the path and the flags spelled out in '
@@ -3082,8 +3085,9 @@ def decide_text(text, ctx, scan_raw=True):
     return None
 
 
-def decide(cmd, cwd, env, budget=None):
-    """None to let the command run, else the deny reason. budget: seconds the reading may take (None: no limit)."""
+def decide(cmd, cwd, env, budget=None, use_id=None):
+    """None to let the command run, else the deny reason. budget: seconds the reading may take (None: no limit).
+    use_id: the tool call's id (an owner approval is used up by one call; the same call's second hook run passes)."""
     if not cmd or (QUICK and quick_pass(cmd)):
         return None
     ctx = {'cwd': cwd or os.getcwd(), 'env': env, 'depth': 0, 'raw': cmd, 'all': cmd, 'memo': {}, 'flow': {},
@@ -3094,7 +3098,7 @@ def decide(cmd, cwd, env, budget=None):
         why = SLOW
         ctx['cache'] = {}   # a reading cut off half-way keeps nothing
     if why:
-        why = owner_marker(why, cmd, cwd, env)
+        why = owner_marker(why, cmd, ctx['cwd'], env, use_id)
     try:   # last, with the answer known: an alarm or a failure in it changes nothing
         cache_save(ctx)
     except BaseException:
@@ -3102,14 +3106,17 @@ def decide(cmd, cwd, env, budget=None):
     return why
 
 
-def owner_marker(why, cmd, cwd, env):
-    """The refusal, or None when the command carries the code of the owner's approval (agent_guards.approval).
-    A code that is wrong, too old, or one with no approval file adds why to the refusal."""
+def owner_marker(why, cmd, cwd, env, use_id=None):
+    """The refusal, or None when the command is the one command the owner approved (agent_guards.approval): it ends
+    with the approval's code, runs in its folder, and the approval was not used before (this use is recorded in the
+    state folder, so it is used up). A code that is wrong, used, for another command or folder, or too old, or one
+    with no approval file, adds why to the refusal."""
     if MARK_CMD not in cmd:
         return why
     try:
         from agent_guards import approval
-        ok, problem = approval.approved(cmd)
+        used = state_dir(env) or state_dir({'HOME': os.path.expanduser('~')})   # where its one use is recorded
+        ok, problem = approval.approved(cmd, cwd, use_id=use_id, used_dir=used)
     except BaseException as e:   # noqa: BLE001 - no approval code: no approval
         ok, problem = False, f'the approval code cannot be loaded ({type(e).__name__})'
     if ok:
@@ -3239,7 +3246,7 @@ def answer():
         left = BUDGET - process_age()
         if left <= 0:
             raise Slow()
-        why = decide(cmd, ev.get('cwd') or os.getcwd(), env, max(left - 1.0, 0.0))
+        why = decide(cmd, ev.get('cwd') or os.getcwd(), env, max(left - 1.0, 0.0), ev.get('tool_use_id'))
         alarm_off()
     except Slow:
         alarm_off()   # first: the handlers below must not be cut off by the alarm (that answers nothing)

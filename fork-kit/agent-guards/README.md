@@ -49,14 +49,23 @@ session (`claude --bare`, `--safe-mode`, `CLAUDE_CODE_SIMPLE`) and Codex (`codex
 so `actions-disable-guard` refuses starting one (`codex login`, `logout`, `help` and `--version` pass). This is a
 command check like the others: it does not see a session started by a program the guard does not read.
 
-**The owner's approval.** Only the owner can let one refused command through, as root:
+**The owner's approval.** Only the owner can let one refused command through, as root, in the folder the command
+will run in (or with `--cwd DIR`):
 
 ```sh
-sudo agent-guards approve --hours 1   # prints a one-time code; keeps only its hash, in a root-owned file
+sudo agent-guards approve --hours 1 --command 'gh workflow disable ci.yml -R owner/repo'
+#   prints a code; keeps only hashes of the code and the command, the folder and the end time, in a root-owned file
 sudo agent-guards approve --revoke    # ends it now
 ```
 
-The command then carries `#owner-approved:actions-disable:<code>`. The file is
+The approval is for that one command (compared after taking the marker off its end; runs of blanks count as one),
+run in that folder, once, before the end time. The agent runs it with `#owner-approved:actions-disable:<code>` at its
+end. The first run records the use in the guard's state folder (`actionsDisable.stateDir`); a second run, or any
+other command carrying the code, is refused. So a code an agent sees in a transcript, the app's database or `ps`
+opens nothing else. A new `approve` replaces the approval before it; an approval file of an earlier draft (version
+1, not bound to a command) is no approval. The use record lives in the agents' user's folder (the hook runs as that
+user): an agent that sets out to can remove it, and then can only repeat the approved command in that folder until
+the end time. The file is
 `/etc/fork-kit/agent-guards-approval.json` (read under the machine file's rules: root-owned, not writable by group or
 others, no link), at most 24 hours. An earlier draft used a session environment variable; every nested session
 inherited it, so it is not read any more. Anyone who can become root without a password (sudo `NOPASSWD`, the

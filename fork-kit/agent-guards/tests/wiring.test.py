@@ -303,24 +303,40 @@ class Command(unittest.TestCase):
         self.assertEqual(self.cli.read_settings(os.path.join(self.tmp, 'w.json')), '{"hooks": {}}')
 
     def test_approve_prints_a_code_that_the_approval_takes(self):
-        code, out, err = self.main('approve', '--hours', '2')
+        code, out, err = self.main('approve', '--hours', '2', '--cwd', self.tmp, '--command', 'gh  x  1')
         self.assertEqual(code, 0, err)
         mark = [w for w in out.split() if w.startswith(self.approval.MARK)]
         self.assertEqual(len(mark), 1, out)
-        self.assertEqual(self.approval.approved(f'gh x {mark[0]}'), (True, None))
+        self.assertIn('once', out)
+        self.assertIn('gh x 1', out)                                     # the command, as it is compared
+        self.assertFalse(self.approval.approved(f'gh y {mark[0]}', self.tmp, used_dir=self.tmp)[0])
         self.assertEqual(oct(os.stat(self.approval.PATH).st_mode & 0o777), '0o644')
         code, out, _ = self.main('approve', '--revoke')
         self.assertEqual((code, os.path.exists(self.approval.PATH)), (0, False))
-        self.assertFalse(self.approval.approved(f'gh x {mark[0]}')[0])
+        self.assertFalse(self.approval.approved(f'gh x 1 {mark[0]}', self.tmp, used_dir=self.tmp)[0])
         self.assertEqual(self.main('approve', '--revoke')[0], 0)          # again: nothing there, still fine
         for hours in ('0', '25', '-1'):
-            self.assertEqual(self.main('approve', '--hours', hours)[0], 1)
+            self.assertEqual(self.main('approve', '--hours', hours, '--command', 'gh x')[0], 1)
         self.assertFalse(os.path.exists(self.approval.PATH))
         self.cli.ROOT_UID = os.geteuid() + 1
-        code, _out, err = self.main('approve')
+        code, _out, err = self.main('approve', '--command', 'gh x')
         self.assertEqual(code, 1)
         self.assertIn('run this as root', err)
         self.assertFalse(os.path.exists(self.approval.PATH))
+
+    # lens B r2 major 2: an approval names the one command it is for
+    def test_r2_major2_approve_needs_the_command_and_the_code_passes_it_once(self):
+        for args in ((), ('--command', ''), ('--command', '   ')):
+            code, _out, err = self.main('approve', *args)
+            self.assertEqual(code, 1, args)
+            self.assertIn('name the one command you approve', err)
+        self.assertFalse(os.path.exists(self.approval.PATH))
+        code, out, err = self.main('approve', '--cwd', self.tmp, '--command', 'gh x 1')
+        self.assertEqual(code, 0, err)
+        mark = [w for w in out.split() if w.startswith(self.approval.MARK)][0]
+        used = os.path.join(self.tmp, 'state')
+        self.assertEqual(self.approval.approved(f'gh x 1 {mark}', self.tmp, used_dir=used), (True, None))
+        self.assertFalse(self.approval.approved(f'gh x 1 {mark}', self.tmp, used_dir=used)[0])   # used up
 
     def test_self_check_names_links_root_ways_and_the_approval(self):
         self.cli.root_ways = lambda user: [f'{user} is in the docker group (a container can write any root file)']
@@ -338,7 +354,7 @@ class Command(unittest.TestCase):
         self.assertIn('docker group', text)
         with open(drop_in, 'w') as f:                                    # wired: the same is a problem
             f.write(wiring.drop_in_text())
-        self.approval.write(self.approval.new_code(), 1)
+        self.approval.write(self.approval.new_code(), 1, 'gh x', self.tmp)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = self.cli.self_check(fx.BIN, drop_in, links)

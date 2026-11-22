@@ -7,8 +7,10 @@
                                        case it must refuse and one it must pass (exit 1 on a problem). As root,
                                        F must be root's and only root may write it (its commands are run)
   agent-guards hooks [--bin DIR]       print the "hooks" settings of every hook of the kit, for a settings file
-  agent-guards approve [--hours N]     as root: approve actions-disable-guard refusals for N hours (default 1, at
-                                       most 24); prints the code the command must carry
+  agent-guards approve [--hours N] [--cwd DIR] --command 'CMD'
+                                       as root: approve ONE command that actions-disable-guard refuses, run in
+                                       DIR (default: this folder), once, within N hours (default 1, at most 24);
+                                       prints the code the command must end with
   agent-guards approve --revoke        as root: end the approval now
 """
 import argparse, grp, json, os, pwd, subprocess, sys
@@ -78,7 +80,8 @@ def self_check(bin_dir, drop_in, links_dir=None):
     if data is not None:
         import time
         left = data['until'] - time.time()
-        notes.append(f'an owner approval for actions-disable-guard is open for {int(left // 60)} more minutes'
+        notes.append(f'an owner approval for actions-disable-guard is open for {int(left // 60)} more minutes '
+                     f'(one command, run once in {data["cwd"]})'
                      if left > 0 else 'an owner approval file is there, its time is over')
     user = os.environ.get('SUDO_USER') or pwd.getpwuid(os.getuid()).pw_name
     if user == 'root':
@@ -112,6 +115,8 @@ def main(argv):
     p = sub.add_parser('approve')
     p.add_argument('--hours', type=float, default=1.0)
     p.add_argument('--revoke', action='store_true')
+    p.add_argument('--command', help='the one command approved (exactly; blanks may differ)')
+    p.add_argument('--cwd', help='the folder it runs in (default: this one)')
     a = ap.parse_args(argv)
     if a.cmd == 'self-check':
         return self_check(os.path.dirname(os.path.realpath(__file__)), wiring.DROP_IN)
@@ -154,18 +159,24 @@ def approve(a):
     if not 0 < a.hours <= approval.MAX_HOURS:
         print(f'{PROG} approve: --hours must be above 0 and at most {approval.MAX_HOURS}', file=sys.stderr)
         return 1
+    if not a.command or not approval.normalise(a.command):
+        print(f'{PROG} approve: name the one command you approve: --command \'<the exact command>\' (the approval '
+              'passes that command only, once)', file=sys.stderr)
+        return 1
+    cwd = os.path.realpath(a.cwd or os.getcwd())
     code = approval.new_code()
     try:
-        data = approval.write(code, a.hours)
-    except OSError as e:
+        data = approval.write(code, a.hours, a.command, cwd)
+    except (OSError, ValueError) as e:
         print(f'{PROG} approve: cannot write {approval.PATH} ({e})', file=sys.stderr)
         return 1
     import time
     until = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(data['until']))
-    print(f'Approved until {until}. Give the agent this marker for the one command you approve:\n'
+    print(f'Approved, once, until {until}: this command, run in {cwd}:\n'
+          f'  {approval.normalise(a.command)}\n'
+          f'Give the agent this marker; the command passes actions-disable-guard with it at its end:\n'
           f'  {approval.MARK}{code}\n'
-          f'Every command carrying it passes actions-disable-guard until then; end it early with '
-          f'`sudo {PROG} approve --revoke`.')
+          f'Any other command, or a second run, is refused. End it early with `sudo {PROG} approve --revoke`.')
     return 0
 
 

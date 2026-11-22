@@ -1229,15 +1229,15 @@ class GuardTest(Case):
 
     # the owner's approval (lens B major): a root-owned file `sudo agent-guards approve` writes, and the code it
     # prints in the command. A session variable reached every nested agent; the old one now opens nothing.
-    def approve(self, hours=1, now=None):
-        """An approval file in this test's folder, owned by the test user (approval.PATH, approval.OWNER_UID);
-        (the approval module, the marker with its code)."""
+    def approve(self, command='gh workflow disable 1 -R a/b', hours=1, now=None, cwd=None):
+        """An approval of `command` run in this test's folder, in a file there owned by the test user
+        (approval.PATH, approval.OWNER_UID); (the approval module, the marker with its code)."""
         from agent_guards import approval
         for name, value in (('PATH', os.path.join(self.dir, 'etc', 'approval.json')), ('OWNER_UID', os.geteuid())):
             self.addCleanup(setattr, approval, name, getattr(approval, name))
             setattr(approval, name, value)
         code = approval.new_code()
-        approval.write(code, hours, now=now)
+        approval.write(code, hours, command, cwd or self.dir, now=now)
         return approval, approval.MARK + code
 
     def test_the_old_variable_and_marker_open_nothing(self):
@@ -1252,8 +1252,6 @@ class GuardTest(Case):
     def test_an_approval_needs_the_owners_file_and_its_code(self):
         approval, mark = self.approve()
         cmd = 'gh workflow disable 1 -R a/b'
-        self.assertIsNone(self.decide(f'{cmd} {mark}'))
-        self.assertIsNone(self.decide(f'{cmd}  {mark} (the owner asked for it in issue 9)'))
         self.assertIsNotNone(self.decide(cmd))                                   # no code: refused
         why = self.decide(f'{cmd} {approval.MARK}{approval.new_code()}')         # a made-up code
         self.assertIn('not the one the owner approved', why)
@@ -1261,15 +1259,84 @@ class GuardTest(Case):
         self.assertIsNotNone(self.decide(f'{cmd} {mark[:-1]}'))                  # not the code: shorter
         with open(approval.PATH) as f:
             self.assertNotIn(mark.rpartition(':')[2], f.read())                  # only its hash is kept
+        self.assertIsNone(self.decide(f'{cmd}   {mark}\n'))                       # blanks may differ
+        approval, mark = self.approve()
         self.assertTrue(approval.revoke())
         self.assertIn('not there', self.decide(f'{cmd} {mark}'))
+
+    # lens B r2 major 2: the code travels in the command (transcript, app database, ps), so it must open only the
+    # one command the owner approved, in its folder, once
+    def test_r2_major2_an_approval_passes_only_the_approved_command(self):
+        approval, mark = self.approve('gh workflow disable 1 -R a/b')
+        for other in ('gh workflow disable 2 -R a/b', 'gh workflow disable 1 -R a/other',
+                      'gh api -X PUT repos/a/b/actions/permissions -F enabled=false',
+                      'gh workflow disable 1 -R a/b; gh workflow disable 2 -R a/b',
+                      'gh workflow disable 1 -R a/b && codex exec x'):
+            with self.subTest(other):
+                why = self.decide(f'{other} {mark}')
+                self.assertIsNotNone(why, other)
+                self.assertIn('approval is for another command', why)
+        why = self.decide(f'gh workflow disable 1 -R a/b {mark} (the owner asked for it)')   # text after the code
+        self.assertIn('the marker must end the command', why)
+        self.assertIsNone(self.decide(f'gh workflow disable 1 -R a/b {mark}'))   # the approved command itself
+
+    def test_r2_major2_an_approval_is_used_up_by_one_run(self):
+        approval, mark = self.approve()
+        cmd = f'gh workflow disable 1 -R a/b {mark}'
+        self.assertIsNone(self.decide(cmd))
+        why = self.decide(cmd)                                                   # the same command again
+        self.assertIsNotNone(why)
+        self.assertIn('used already', why)
+        # the same tool call's hook run twice (a hook wired twice) passes both times; another call does not
+        approval, mark = self.approve()
+        cmd = f'gh workflow disable 1 -R a/b {mark}'
+        state = os.path.join(self.dir, 'state')
+        self.assertEqual(approval.approved(cmd, self.dir, use_id='toolu_1', used_dir=state), (True, None))
+        self.assertEqual(approval.approved(cmd, self.dir, use_id='toolu_1', used_dir=state), (True, None))
+        self.assertFalse(approval.approved(cmd, self.dir, use_id='toolu_2', used_dir=state)[0])
+        self.assertFalse(approval.approved(cmd, self.dir, use_id='toolu_1', used_dir=None)[0])   # nowhere to record
+
+    def test_r2_major2_approving_again_ends_the_approval_before_it(self):
+        approval, first = self.approve()
+        approval, second = self.approve()
+        cmd = 'gh workflow disable 1 -R a/b'
+        self.assertIn('not the one the owner approved', self.decide(f'{cmd} {first}'))
+        self.assertIsNone(self.decide(f'{cmd} {second}'))
+
+    def test_r2_major2_an_approval_is_for_one_folder(self):
+        os.makedirs(os.path.join(self.dir, 'other'))
+        approval, mark = self.approve(cwd=os.path.join(self.dir, 'other'))
+        cmd = f'gh workflow disable 1 -R a/b {mark}'
+        self.assertIn('for a command run in', self.decide(cmd))                 # the test runs in self.dir
+        self.assertIsNone(self.g.decide(cmd, os.path.join(self.dir, 'other'), self.env))
+
+    def test_r2_major2_an_approval_file_in_the_old_format_is_no_approval(self):
+        import json as j, time
+        approval, mark = self.approve()
+        code = mark.rpartition(':')[2]
+        with open(approval.PATH, 'w') as f:    # the version 1 file of the first draft: code hash and time only
+            j.dump({'version': 1, 'sha256': approval._hash(code), 'until': int(time.time() + 3600)}, f)
+        why = self.decide(f'gh workflow disable 1 -R a/b {mark}')
+        self.assertIsNotNone(why)
+        self.assertIn('not an approval file of this kit', why)
+
+    def test_r2_major2_an_approval_killed_half_way_leaves_no_use_record_and_no_half_file(self):
+        approval, mark = self.approve()
+        state = os.path.join(self.dir, 'state')
+        os.makedirs(state)
+        with open(os.path.join(state, '.approval-used.left'), 'w') as f:   # a temp file of a killed run
+            f.write('toolu_9')
+        cmd = f'gh workflow disable 1 -R a/b {mark}'
+        self.assertEqual(approval.approved(cmd, self.dir, use_id='toolu_1', used_dir=state), (True, None))
+        etc = os.path.dirname(approval.PATH)
+        self.assertEqual([n for n in os.listdir(etc) if n.startswith('.')], [])   # written whole, renamed
 
     def test_an_approval_that_is_over_or_not_safe_opens_nothing(self):
         import time
         approval, mark = self.approve(hours=1, now=time.time() - 7200)
-        self.assertIn('the approval is over', self.decide(f'gh workflow disable 1 {mark}'))
+        self.assertIn('the approval is over', self.decide(f'gh workflow disable 1 -R a/b {mark}'))
         approval, mark = self.approve()
-        cmd = f'gh workflow disable 1 {mark}'
+        cmd = f'gh workflow disable 1 -R a/b {mark}'
         os.chmod(approval.PATH, 0o666)                                            # an agent could write it
         self.assertIn('writable by group or others', self.decide(cmd))
         os.chmod(approval.PATH, 0o644)
@@ -1285,7 +1352,9 @@ class GuardTest(Case):
                     f.write(text)
                 self.assertIsNotNone(self.decide(cmd))
         with self.assertRaises(ValueError):
-            approval.write(approval.new_code(), approval.MAX_HOURS + 1)
+            approval.write(approval.new_code(), approval.MAX_HOURS + 1, 'x', self.dir)
+        with self.assertRaises(ValueError):
+            approval.write(approval.new_code(), 1, '  ', self.dir)                 # no command
 
     # nested agent sessions (lens B minor): one without this machine's hooks would run anything
     def test_a_nested_session_without_the_hooks_is_refused(self):
@@ -1312,7 +1381,7 @@ class GuardTest(Case):
                 self.assertIsNone(self.decide(cmd), cmd)
 
     def test_the_owner_can_approve_a_nested_session_too(self):
-        _approval, mark = self.approve()
+        _approval, mark = self.approve('codex exec x')
         self.assertIsNone(self.decide(f'codex exec x {mark}'))
 
     # rulesets: "evaluate" only reports, so it switches the rules off as "disabled" does (lens B minor)
