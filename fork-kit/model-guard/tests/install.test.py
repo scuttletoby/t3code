@@ -288,6 +288,19 @@ class Install(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(versions)), [SHA1, SHA2])
         self.assertEqual(sorted(os.listdir(self.path('/usr/local/libexec/model-guard'))), ['current', 'versions'])
 
+    def test_a_source_without_a_file_is_refused_before_anything_is_written(self):
+        self.assertEqual(self.m.missing_sources(KIT), [])
+        top = tempfile.mkdtemp(prefix='model-guard-source-')   # the kit alone: no fork-kit/common next to it
+        self.addCleanup(shutil.rmtree, top, ignore_errors=True)
+        src = os.path.join(top, 'fork-kit', 'model-guard')
+        shutil.copytree(KIT, src)
+        self.assertEqual(self.m.missing_sources(src), ['common/machine_file.py'])
+        before = self.snapshot()
+        code, _, err = self.install(source=src)
+        self.assertEqual(code, 1, err)
+        self.assertIn('common/machine_file.py is missing', err)
+        self.assertEqual(self.snapshot(), before)
+
     def test_foreign_link_is_refused_before_anything_is_written(self):
         self.turn_on()
         os.makedirs(self.path('/usr/local/bin'))
