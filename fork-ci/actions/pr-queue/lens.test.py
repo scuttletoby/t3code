@@ -7,6 +7,7 @@ committed, with the source's override prefix set to `proj ready --head`. Where t
 purpose, the replay says so (Corpus).
 """
 import copy, json, os, random, re, sys, unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 
@@ -983,6 +984,49 @@ class InlineComments(unittest.TestCase):
         for change in ({'includesCreatedEdit': True}, {'isMinimized': True}, {'authorAssociation': 'MEMBER'},
                        {'when': '2025-12-31T00:00:00Z'}):
             self.assertEqual(self.head([own], [self.inline(ov['body'], **change)], r)[1], SHA_A, change)
+
+
+class UnicodeVersion(unittest.TestCase):
+    """Issue #1005 item 3: the rules (and T3's port, pyText.ts) were checked against one Unicode version only, the shared
+    vectors' py_unicode. A Python with another Unicode refuses text whose code points it assigns otherwise, as T3 does."""
+    VECTORS = json.load(open(os.path.join(HERE, 'review.vectors.json'), encoding='utf-8'))
+
+    def test_the_gate_names_the_unicode_of_the_shared_table(self):
+        self.assertEqual(lens.PY_UNICODE, self.VECTORS['py_unicode']['version'])
+
+    def other_unicode(self, unassigned=()):
+        """This Python as if its Unicode were another one, which assigns the code points `unassigned` that the shared
+        table (the gate's Unicode) does not."""
+        starts, ends = lens.py_assigned()
+        table = ([], [])
+        for a, b in zip(starts, ends):
+            for cp in sorted(c for c in unassigned if a <= c <= b):
+                if a < cp:
+                    table[0].append(a), table[1].append(cp - 1)
+                a = cp + 1
+            if a <= b:
+                table[0].append(a), table[1].append(b)
+        return mock.patch.multiple(lens, UNIDATA='99.0.0', _ASSIGNED=table)
+
+    def test_text_another_unicode_reads_otherwise_is_refused_by_every_rule(self):
+        body = 'l\u0435ns: code \u00b7 reviewer: x \u00b7 read at: ' + SHA_A + '\nmajor: x'
+        review = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',))
+        with self.other_unicode({0x435}):
+            for read in (lens.lens_header, lens.has_marker, lens.lens_key, review_judge.fold, review_judge.read_findings,
+                         lambda b: review.looks_problem({'body': b}), lambda b: review.report_problem({'body': b})):
+                with self.assertRaises(lens.UnicodeDrift) as e:
+                    read(body)
+                self.assertEqual(e.exception.code_points, ['U+0435'])
+
+    def test_text_both_unicodes_read_alike_is_read(self):
+        body = 'lens: code \u00b7 reviewer: x \u00b7 read at: ' + SHA_A + '\nmajor: \u00e9 \U0001f600'
+        with self.other_unicode({0x1F600}):   # a new symbol (an emoji) reads alike: no rule reads it
+            self.assertEqual(lens.lens_header(body), ('code', SHA_A))
+            self.assertEqual(review_judge.read_findings(body)[0], [('major', 'major: \u00e9 \U0001f600')])
+
+    def test_the_same_unicode_reads_any_text(self):
+        with mock.patch.multiple(lens, _ASSIGNED=([], [])):   # the table is never read
+            self.assertEqual(lens.lens_header('lens: c\u0435de \u00b7 read at: ' + SHA_A), ('c\u0435de', SHA_A))
 
 
 class Config(unittest.TestCase):

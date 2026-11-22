@@ -218,7 +218,7 @@ class Findings(unittest.TestCase):
         sizes = {g: len(group(g)) for g in ('finding', 'clean', 'section', 'one-kind', 'one-label', 'mention', 'named',
                                             'python-text')}
         self.assertEqual(sizes, {'finding': 58, 'clean': 37, 'section': 9, 'one-kind': 9, 'one-label': 4,
-                                 'mention': 8, 'named': 8, 'python-text': 10})
+                                 'mention': 8, 'named': 8, 'python-text': 13})
         self.assertEqual(sum(sizes.values()), len(FINDINGS))
 
     def test_each_real_finding_format_counts(self):

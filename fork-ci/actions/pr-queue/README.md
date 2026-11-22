@@ -243,7 +243,11 @@ Owner decisions: issue #99 (findings), issue #100 (rounds).
   the text is folded: NFKC, zero-width and other format characters removed,
   Cyrillic and Greek look-alike letters read as Latin, `0` for `o` in a label,
   HTML entities decoded (`ma&#106;or`) and backslash escapes dropped
-  (`major\:`). Lines inside a fenced code block are never labels, so quote
+  (`major\:`). Each line is then read in NFKC again, after the entities are
+  decoded, so what an entity writes reads as GitHub shows it:
+  `blocker&#65306; x` (an entity for the full-width colon) blocks, an entity
+  for a full-width `ｎｏｎｅ` reads as none, and `none` with a zero-width space
+  and then an accent reads `noné`, which is no none, so it blocks. Lines inside a fenced code block are never labels, so quote
   code and example findings in one; quotes and indented blocks are read (fail
   closed). A title line or `verdict:` line that says
   NOT SAFE is a blocker. `minor:` and `nit:` never block.
@@ -532,6 +536,26 @@ lens's newest comment counts. The reviewed head is the one commit every lens's
 newest read names, or a newer override comment's sha (config `override`). A
 pull request with no lens comments is not reviewed, and the queue then vouches
 only for the head it found.
+
+A header written with look-alikes is no read: a zero-width space, a Cyrillic or
+Greek letter that looks Latin, an HTML reference (`&#108;ens`) or a backslash
+escape in `lens`, `read at` or the sha (issue 1005: such a header silently
+counted for nothing). When the comment, read the way the findings rules fold
+text (as GitHub shows it), names another header or read than it does as
+written, or only folded carries the lens marker of a report that is broken, it
+is a broken lens report: it blocks, keyed by that comment, whatever an older or
+newer read of that lens says, and it never counts as a read. Its reason says to
+post a NEW comment in plain letters. A heading starts with one to six plain `#`
+followed by a space or tab, as GitHub renders it: `＃ Lens code` with the
+full-width number sign is plain text, so it is no heading look-alike.
+
+NFKC reads at most the first 4,096 characters of each line; the rest of a
+longer line is read as written (issue 1005: a 64 KB line of U+FDFA, which NFKC
+writes as 18 characters, took 5.5 s). A header is far shorter. Both sides read
+the same Unicode: the gate's Python names its Unicode version (`PY_UNICODE`,
+the one the shared vectors record) and, on a Python with another Unicode, a
+rule refuses (`UnicodeDrift`) text with a code point that Unicode assigns
+otherwise, as T3 does on its newer Unicode, rather than read it another way.
 
 Only comments, reviews and inline review comments (see below) that GitHub
 records as written by one of `lens_author_associations` count: anyone can
