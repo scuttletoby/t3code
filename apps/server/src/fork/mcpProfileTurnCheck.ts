@@ -60,7 +60,7 @@ const refusalReason = (resolved: McpProfileResolved, instance: ProviderInstance)
   const profile = resolved.narrowedByParent
     ? `("${resolved.name}", cut down to its parent thread's)`
     : `"${resolved.name}"`;
-  return `This thread's MCP profile ${profile} is narrower than "${MCP_PROFILE_ALL}", and ${instance.driverKind} (provider instance ${instance.instanceId}) does not apply MCP profiles (only Claude does), so this turn was not started: it would get every MCP server and T3 tool. Switch the thread to a Claude instance, or pick "${MCP_PROFILE_ALL}" for this thread in Settings.`;
+  return `This thread's MCP profile ${profile} is narrower than "${MCP_PROFILE_ALL}", and ${instance.driverKind} (provider instance ${instance.instanceId}) does not apply MCP profiles (only Claude and Codex do), so this turn was not started: it would get every MCP server and T3 tool. Switch the thread to a Claude or Codex instance, or pick "${MCP_PROFILE_ALL}" for this thread in Settings.`;
 };
 
 /**
