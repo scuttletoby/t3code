@@ -105,7 +105,10 @@ export const kindOfRole = (role: string | undefined): string =>
 
 /** Swap with less free than this (percent of swap) that is also filling trips the fallback. */
 const SWAP_FULL_FREE_PERCENT = 10;
-/** Whole, calm readings for this long end the fallback, and then lower one cost raise each. */
+/**
+ * Whole, calm readings for this long end the fallback; each later calm spell lowers one cost raise
+ * (the spell that ends the fallback lowers none).
+ */
 export const FALLBACK_CALM_MS = 10 * 60 * 1000;
 /**
  * And at least this many of them, each `FALLBACK_READING_GAP_MS` after the last one counted, so a
@@ -113,6 +116,12 @@ export const FALLBACK_CALM_MS = 10 * 60 * 1000;
  */
 export const FALLBACK_CALM_READINGS = 10;
 export const FALLBACK_READING_GAP_MS = 25 * 1000;
+/**
+ * The swap trend compares a reading with a kept one, replaced by a newer reading only once it is at
+ * least this old: a burst of start requests (a reading each) must not hide slow filling by comparing
+ * readings a second apart. A reading just after a replacement compares with that newer one.
+ */
+export const SWAP_TREND_MIN_MS = 25 * 1000;
 /** Each kill in the agents' own slices raises the agent costs by this much (design: 25 % per kill). */
 const RAISE_PERCENT = 125;
 /**
@@ -148,8 +157,10 @@ export interface FallbackState {
   readonly oomKills: number | null;
   /** The OOM kills of each agents' slice last read (`memory.events`), by cgroup path. */
   readonly agentKills: Readonly<Record<string, number>>;
-  /** The swap free of the last reading (MB), for its trend. */
+  /** The swap free of the reading the trend compares with (MB; `SWAP_TREND_MIN_MS`). */
   readonly swapFreeMb: number | null;
+  /** When that reading was taken; `null`: none. */
+  readonly swapAtMs: number | null;
   /** The last reading tripped (one spell logs one trip). */
   readonly tripping: boolean;
   /** Agent cost raises in force: one per kill that matters, one less per calm spell. */
@@ -164,6 +175,7 @@ export const FALLBACK_START: FallbackState = {
   oomKills: null,
   agentKills: {},
   swapFreeMb: null,
+  swapAtMs: null,
   tripping: false,
   raises: 0,
 };
@@ -172,9 +184,10 @@ export interface FallbackReading {
   /** The kernel's OOM kill counter (`/proc/vmstat`); `null` on a system without one. */
   readonly oomKills: number | null | "unreadable";
   /**
-   * The OOM kills of each agents' slice read now (`memory.events`, which counts the kills of its
-   * processes by any OOM killer); `null`: no agent slice could be read, so a kill cannot be told
-   * apart from one in a build box.
+   * The OOM kills of each agents' slice read now (`memory.events`, which counts the kernel's kills of
+   * its processes, for the whole machine or a cgroup's cap; not those of a killer that runs as a
+   * program, such as earlyoom or systemd-oomd); `null`: no agent slice could be read, so a kill
+   * cannot be told apart from one in a build box.
    */
   readonly agentKills: Readonly<Record<string, number>> | null;
   readonly swap: CapacityFacts["swap"];
@@ -186,7 +199,8 @@ export type FallbackEvent = "trip" | "recover" | "lower" | null;
 /**
  * One fallback reading: a new OOM kill or swap nearly full and filling trips it. Only an agent-slice
  * kill raises costs (an untold kill at most `UNTOLD_MAX_RAISES`). Each calm spell (time and readings)
- * ends it and lowers one raise; an unreadable reading or a clock going back restarts the wait.
+ * ends it, each later one lowers one raise; an unreadable reading or a clock going back restarts the
+ * wait. Swap fills when it fell past `swapFillingMb` since the kept reading (`SWAP_TREND_MIN_MS`).
  */
 export function fallbackStep(
   rule: CapacityRule,
@@ -202,13 +216,23 @@ export function fallbackStep(
     return before !== undefined && count > before;
   });
   const swapRead = typeof swap === "object" && swap !== null && swap.totalMb > 0 ? swap : null;
-  const swapFreeMb = swapRead === null ? null : swapRead.freeMb;
   const swapFull =
     swapRead !== null &&
     state.swapFreeMb !== null &&
     swapRead.freeMb * 100 < swapRead.totalMb * SWAP_FULL_FREE_PERCENT &&
     state.swapFreeMb - swapRead.freeMb > rule.pressure.swapFillingMb;
-  const base = { oomKills, agentKills, swapFreeMb };
+  // The reading compared with stays until it is `SWAP_TREND_MIN_MS` old (a clock that went back: now).
+  const keepSwap =
+    swapRead !== null &&
+    state.swapFreeMb !== null &&
+    state.swapAtMs !== null &&
+    nowMs >= state.swapAtMs &&
+    nowMs - state.swapAtMs < SWAP_TREND_MIN_MS;
+  // A fall that trips it is acted on: the next trend starts from this reading (never counted twice).
+  const keep = keepSwap && !swapFull;
+  const swapFreeMb = keep ? state.swapFreeMb : swapRead === null ? null : swapRead.freeMb;
+  const swapAtMs = keep ? state.swapAtMs : swapRead === null ? null : nowMs;
+  const base = { oomKills, agentKills, swapFreeMb, swapAtMs };
   if (killed || agentKilled || swapFull) {
     const raised = agentKilled
       ? state.raises + 1
@@ -256,7 +280,9 @@ export function fallbackStep(
         calmReadings: 1,
         calmCountedMs: nowMs,
         tripping: false,
-        raises: Math.max(0, state.raises - 1),
+        // The calm spell that ends the fallback keeps the raises: only a later one lowers one, so
+        // kills about 11 minutes apart keep their raise (each would else lift it again).
+        raises: state.on ? state.raises : Math.max(0, state.raises - 1),
       },
       event: state.on ? "recover" : "lower",
     };
@@ -339,6 +365,15 @@ export interface EnforceState {
   readonly unreadSinceMs: number | null;
   /** The level was "ok" once since the start: before, an "elevated" refusal says it just started. */
   readonly settled: boolean;
+  /**
+   * The level is "elevated" because a reading could not be read (slow, failed, partly unread), not
+   * because pressure was seen: calm then needs available memory above the margin only, as after a
+   * start, so one bad reading never keeps the gate elevated until 150 % of the margin is free. A
+   * whole reading that is elevated or severe by itself clears it.
+   */
+  readonly afterUnread: boolean;
+  /** When the swap free kept in `pressure` was read (`SWAP_TREND_MIN_MS`); `null`: none. */
+  readonly swapAtMs: number | null;
 }
 
 export const ENFORCE_START: EnforceState = {
@@ -346,6 +381,8 @@ export const ENFORCE_START: EnforceState = {
   fallback: FALLBACK_START,
   unreadSinceMs: null,
   settled: false,
+  afterUnread: false,
+  swapAtMs: null,
 };
 
 /**
@@ -386,17 +423,68 @@ export function enforceStep(
 ): {
   readonly state: EnforceState;
   readonly previous: PressureState;
-  /** Whether the level was "ok" once before this reading (`levelRule`). */
+  /** Whether the level was "ok" once before this reading (the "starting" refusal). */
   readonly settledBefore: boolean;
+  /** Whether calm needs the full 150 % bar for the decisions on this reading (`levelRule`). */
+  readonly strictBefore: boolean;
   readonly event: FallbackEvent;
 } {
-  const level = capacityLevel(levelRule(rule, state.settled), {
-    // The machine alone: whether it reads whole, and its level (the pieces are the decision's).
-    facts: reading.facts === null ? NO_FACTS : { ...reading.facts, pieces: [] },
+  const strictBefore = state.settled && !state.afterUnread;
+  // The machine alone: whether it reads whole, and its level (the pieces are the decision's).
+  const machine = reading.facts === null ? NO_FACTS : { ...reading.facts, pieces: [] };
+  const stepped = capacityLevel(levelRule(rule, strictBefore), {
+    facts: machine,
     previous: state.pressure,
     nowMs: reading.nowMs,
   });
-  const whole = level.marginMb !== null;
+  const whole = stepped.marginMb !== null;
+  // The swap trend compares with a kept reading, replaced once it is `SWAP_TREND_MIN_MS` old: a
+  // burst of asks keeps the older swap free in the state (a clock that went back takes the new one).
+  const keepSwap =
+    whole &&
+    typeof state.pressure.swapFreeMb === "number" &&
+    typeof stepped.pressure.swapFreeMb === "number" &&
+    state.swapAtMs !== null &&
+    reading.nowMs >= state.swapAtMs &&
+    reading.nowMs - state.swapAtMs < SWAP_TREND_MIN_MS;
+  const level = keepSwap
+    ? { ...stepped, pressure: { ...stepped.pressure, swapFreeMb: state.pressure.swapFreeMb } }
+    : stepped;
+  const swapAtMs = keepSwap
+    ? state.swapAtMs
+    : typeof stepped.pressure.swapFreeMb === "number"
+      ? reading.nowMs
+      : null;
+  // Pressure seen by itself in what was read (no hold-down; the parts that could not be read left
+  // out) ends the lenient bar of `afterUnread`. A reading with a part unread starts it only from
+  // "ok": while the level is up from pressure seen, an unread reading keeps the full 150 % bar.
+  const unread = (value: unknown) => (value === "unreadable" ? null : value);
+  const partUnread =
+    machine.psi === "unreadable" ||
+    machine.boxPsi === "unreadable" ||
+    machine.swap === "unreadable" ||
+    machine.osLevel === "unreadable";
+  const raw = whole
+    ? capacityLevel(rule, {
+        facts: {
+          ...machine,
+          psi: unread(machine.psi),
+          boxPsi: unread(machine.boxPsi),
+          swap: unread(machine.swap),
+          osLevel: unread(machine.osLevel),
+        } as CapacityFacts,
+        // "ok" before: the level of this reading alone, with the swap trend the state knows.
+        previous: { level: "ok", calmSinceMs: null, swapFreeMb: state.pressure.swapFreeMb ?? null },
+      }).level
+    : null;
+  const afterUnread =
+    raw !== null && raw !== "ok"
+      ? false
+      : !whole || partUnread
+        ? state.afterUnread || state.pressure.level === "ok"
+        : level.level === "ok"
+          ? false
+          : state.afterUnread;
   const step = fallbackStep(rule, state.fallback, {
     oomKills: reading.oomKills,
     agentKills: reading.agentKills,
@@ -409,9 +497,12 @@ export function enforceStep(
       fallback: step.state,
       unreadSinceMs: whole ? null : (state.unreadSinceMs ?? reading.nowMs),
       settled: state.settled || level.level === "ok",
+      afterUnread,
+      swapAtMs,
     },
     previous: state.pressure,
     settledBefore: state.settled,
+    strictBefore,
     event: step.event,
   };
 }
@@ -438,6 +529,8 @@ export interface EnforceInput {
   readonly previous: PressureState;
   /** `enforceStep`'s `settledBefore`. */
   readonly settledBefore: boolean;
+  /** `enforceStep`'s `strictBefore` (absent: `settledBefore`). */
+  readonly strictBefore?: boolean;
   readonly nowMs: number;
 }
 
@@ -459,7 +552,7 @@ export function enforceDecision(rule: CapacityRule, input: EnforceInput): Capaci
   const facts = input.facts;
   const ceilings = enforceCeilings(rule, facts?.cpuCores, input.state.fallback.on, input.tier);
   const decision = capacityDecision(
-    { ...levelRule(rule, input.settledBefore), ceilings },
+    { ...levelRule(rule, input.strictBefore ?? input.settledBefore), ceilings },
     {
       facts: facts === null ? NO_FACTS : { ...facts, pieces },
       ask: { kind: input.ask },

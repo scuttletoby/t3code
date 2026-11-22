@@ -330,7 +330,15 @@ export function judgeExit(input: {
   if (input.exitCode === 0) return { type: "met", outcome: "met", detail: firstLine(input.stdout) };
   if (input.exitCode === 1) return { type: "notYet" };
   const reason = firstLine(input.stderr);
-  const code = input.exitCode === null ? "killed" : `exit ${input.exitCode}`;
+  // 126 and 127 are how a launcher says a program could not start: on Linux a check runs under
+  // `timeout`, which starts fine and then exits 127 for a missing program (as the handoff
+  // command's wording, fork/handoff/handoffCommand.ts).
+  const code =
+    input.exitCode === null
+      ? "killed"
+      : input.exitCode === 126 || input.exitCode === 127
+        ? `exit ${input.exitCode}, a program could not start`
+        : `exit ${input.exitCode}`;
   return {
     type: "failed",
     message: reason === "" ? `${code}.` : `${code}: ${reason}`,

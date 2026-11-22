@@ -18,6 +18,7 @@ import {
   threadId,
 } from "./handoff.testkit.ts";
 import {
+  HANDOFF_FALLBACK_SUFFIX,
   HANDOFF_LOUD_SUFFIX,
   handoffBlockers,
   handoffThreadFacts,
@@ -80,13 +81,35 @@ describe("parseHandoffWriteMessageId", () => {
     expect(parseHandoffWriteMessageId(threadId, handoffMessageId)).toBeNull();
     expect(parseHandoffMessageId(threadId, ids.messageId)).toBeNull();
     // Loud: the suffix on the message id only, so the command id (the busy check's key) is the same.
-    const loud = handoffWriteIds(threadId, runId, true);
+    const loud = handoffWriteIds(threadId, runId, { loud: true });
     expect(loud).toEqual({
       commandId: ids.commandId,
       messageId: `${ids.messageId}${HANDOFF_LOUD_SUFFIX}`,
     });
-    expect(parseHandoffWrite(threadId, loud.messageId)).toEqual({ runId, loud: true });
-    expect(parseHandoffWrite(threadId, ids.messageId)).toEqual({ runId, loud: false });
+    expect(parseHandoffWrite(threadId, loud.messageId)).toEqual({
+      runId,
+      loud: true,
+      fallback: false,
+    });
+    expect(parseHandoffWrite(threadId, ids.messageId)).toEqual({
+      runId,
+      loud: false,
+      fallback: false,
+    });
+    // The fallback follows its failure (any trigger but idle): before `:loud`, the same command id.
+    const both = handoffWriteIds(threadId, runId, { loud: true, fallback: true });
+    expect(both).toEqual({
+      commandId: ids.commandId,
+      messageId: `${ids.messageId}${HANDOFF_FALLBACK_SUFFIX}${HANDOFF_LOUD_SUFFIX}`,
+    });
+    expect(parseHandoffWrite(threadId, both.messageId)).toEqual({
+      runId,
+      loud: true,
+      fallback: true,
+    });
+    expect(
+      parseHandoffWrite(threadId, handoffWriteIds(threadId, runId, { fallback: true }).messageId),
+    ).toEqual({ runId, loud: false, fallback: true });
     expect(parseHandoffWriteMessageId(threadId, loud.messageId)).toBe(runId);
     expect(
       parseHandoffWrite(threadId, `handoff-write:${threadId}:${HANDOFF_LOUD_SUFFIX}`),

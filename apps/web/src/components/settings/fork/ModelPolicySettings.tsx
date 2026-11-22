@@ -194,7 +194,7 @@ export function ModelPolicySettings() {
   const searchableSetting = useSearchableSetting();
   const updateSettings = useUpdateScopedSettings();
   const shown = useScopedSettings((settings) => settings.modelPolicy);
-  const { targets } = useSettingsScope();
+  const { targets, target } = useSettingsScope();
   const mixed = targetsDiffer(targets, (settings) => settings.modelPolicy);
   const [editing, setEditing] = useState(false);
   const unreadableText = mixed ? null : unreadableModelPolicyText(shown);
@@ -244,7 +244,7 @@ export function ModelPolicySettings() {
   const aliasRows = new Map(
     aliasModelPolicyRows(shown.allow, providers).map(({ row, aliasOf }) => [row, aliasOf]),
   );
-  const marks = personModelPickMarks(shown, picks, providers);
+  const marks = personModelPickMarks(shown, picks, providers, target?.environmentId);
   const byDriver = new Map<string, Array<ModelPolicy["allow"][number]>>();
   for (const row of shown.allow)
     byDriver.set(row.driver, [...(byDriver.get(row.driver) ?? []), row]);

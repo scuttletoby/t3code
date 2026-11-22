@@ -25,6 +25,17 @@
         "added": ["...ForkSettings.ForkClientSettingsPatchFields,"]
       }
     },
+    "apps/web/src/routes/_chat.issues.tsx": {
+      "why": "The Issues page swaps to the fork's owner-question page (Waiting on you, components/fork/ownerQuestions) while the fork setting ownerQuestionsPage is on (fork issue 828). One import and one spread after upstream's component line, so upstream's page files never change; announced with the page, added with the setting.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import { ForkIssuesRoute } from \"../components/fork/ownerQuestions/ForkIssuesRoute\"; // Fork (owner questions)",
+          "...ForkIssuesRoute, // Fork (owner questions): the fork page while ownerQuestionsPage is on"
+        ]
+      }
+    },
     "packages/client-runtime/package.json": {
       "why": "The calm sidebar's shared logic (fork file src/state/threadRoles.ts) is exported for the web and phone lists with one line; it is announced for the sidebar PR that first imports it. One line, since the four-line form's closing brace is a line upstream already has.",
       "added": [],
@@ -270,7 +281,7 @@
       ]
     },
     "apps/server/src/mcp/McpToolExposure.ts": {
-      "why": "MCP profile design PR 4 (T3 tool groups): tool_search leaves out the T3 tools the calling thread's MCP profile leaves out (its t3Tools groups), before it ranks them, so a search never finds or loads a tool the thread cannot call. The filter and the global rule that hides those tools from tools/list and refuses them on tools/call are in fork/mcpT3ToolFilter.ts; the rule is installed in McpHttpServer's production `layer` (a pending file, no new line). A server without the rule (upstream's tests) searches as upstream does. Tested in apps/server/src/fork/mcpT3ToolFilter.test.ts.",
+      "why": "MCP profile design PR 4 (T3 tool groups): tool_search leaves out the T3 tools the calling thread's MCP profile leaves out (its t3Tools groups), before it ranks them, so a search never finds or loads a tool the thread cannot call. The filter is in fork/mcpT3ToolFilter.ts, which imports no toolkit, profile resolver or store (fork issue #812); the global rule that hides those tools from tools/list, refuses them on tools/call and installs the filter's check is in fork/mcpT3ToolRule.ts, installed in McpHttpServer's production `layer` (a pending file, no new line; its import names the rule's module). A server without the rule (upstream's tests) searches as upstream does. Tested in apps/server/src/fork/mcpT3ToolFilter.test.ts.",
       "added": [
         "import { searchableT3Tool } from \"../fork/mcpT3ToolFilter.ts\"; // Fork: MCP profile T3 tool groups",
         ".filter(searchableT3Tool) // Fork: MCP profile T3 tool groups"
@@ -344,6 +355,26 @@
         "import * as EnvironmentFacts from \"../../../fork/environmentFacts.ts\"; // Fork (P3): facts out",
         "...EnvironmentFacts.ResultFields, // Fork (P3): facts out"
       ]
+    },
+    "packages/shared/src/agentAwareness.ts": {
+      "why": "A handoff write turn that ends failed (a provider error) is as quiet as one that completes: the fork marks it stop-requested (fork/handoff/handoffShell.ts), and the relay drops it the way it already drops a completed one, so no alert sounds while the fork's handoff follows (fork issue #836).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "if (phase === \"failed\" && thread.latestRunStopRequested === true) return null; // Fork: a quiet handoff write turn (fork/handoff)"
+        ]
+      }
+    },
+    "apps/web/src/components/ThreadNotificationCoordinator.tsx": {
+      "why": "The browser's alert for a failed run skips a run marked stop-requested, as its completion alert already does: a handoff write turn that ends failed stays quiet (fork/handoff/handoffShell.ts marks it; fork issue #836).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "if (status === \"failed\" && rawThread.latestRunStopRequested === true) status = \"ready\"; // Fork: a quiet handoff write turn (fork/handoff)"
+        ]
+      }
     },
     "apps/web/src/components/threadActionMenu.logic.ts": {
       "why": "The thread menu gets \"Hand off now\" (handoff, HO5): one more menu id, one optional state field the menu's callers fill, and the item spread into the list; the item and its rules are in fork/handoff/handoffMenu.ts. The thread menu gets the MCP profile entry (MCP profile design PR 3): the thread's effective profile and, for a client that may change settings, the owner's pick or clear. One more menu id type, one optional state field the menu's callers fill, and the entry spread into the list before Copy; the entry and its rules are in fork/mcpProfile/threadMcpProfile.logic.ts.",
@@ -527,6 +558,54 @@
           "DelegateChecks.promptEndsWait(result) || // Fork: a secret request ends a wait (#817)"
         ]
       }
+    },
+    "apps/server/src/peer/PeerLinks.ts": {
+      "why": "#959: a link the peer turned away ends here as an expired one (fork/peerLinkRevoke.ts makeLinkRevokes). recordRevoked moves expires_at to now, only for the linked_at the refused call resolved, so a link made again since keeps its end. A renewal that answers a call made before the refusal (recordExpiry) skips the ended link's linked_at, so it cannot bring that link back; a link made again renews as before. Tested in apps/server/src/fork/peerLinkRevoke.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import * as ForkLinkRevoke from \"../fork/peerLinkRevoke.ts\";",
+          "/** Fork: ends `link` here once the peer turns it away (fork/peerLinkRevoke.ts). */",
+          "readonly recordRevoked: (link: PeerLink) => Effect.Effect<void>;",
+          "const revokes = ForkLinkRevoke.makeLinkRevokes(sql);",
+          "${revokes.notEnded(environmentId)}",
+          "recordRevoked: revokes.record,"
+        ]
+      }
+    },
+    "apps/server/src/peer/PeerMcpClient.ts": {
+      "why": "#959: a 401 from the peer ends the link only when a fresh MCP session started right after it is refused with 401 too (fork/peerLinkRevoke.ts makeRefusals): an older peer answers 401 for its own storage errors as well. A 401 at a session's start starts one more (reopen); a 401 on a kept session makes the call once more on a fresh one (retry; a 401 stops a request before any tool runs, so nothing runs twice). A refusal drops the kept session ids for that environment. Tested in apps/server/src/fork/peerLinkRevoke.test.ts and peerLinkRevoke.requests.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import * as ForkLinkRevoke from \"../fork/peerLinkRevoke.ts\";",
+          "const revokes = ForkLinkRevoke.makeRefusals({ links, post, sessions, recordLinkExpiry });",
+          "if (initialized.status === 401) return yield* revokes.reopen(link, url, token, limitHeader);",
+          "const fresh = openSession(resolved, limitHeader);",
+          "if (response.status === 401) response = yield* revokes.retry(sessionKey, fresh, callOnce);"
+        ]
+      }
+    },
+    "apps/server/src/auth/EnvironmentAuth.ts": {
+      "why": "#959: an internal error while checking an MCP client's credential (the session store failed to read or renew it) answers 503, not the 401 a revoked token gets, since a linked environment ends its link on a 401 (fork/authUnavailable.ts). It dies with the HTTP response, which Effect's HTTP server sends as it is, so /mcp (McpOAuth's authenticator) and the linked-thread routes (linkThreadHttp.ts admitLink) answer it without a line of their own. Tested in apps/server/src/fork/peerLinkRevoke.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-22",
+        "added": [
+          "import * as ForkAuthUnavailable from \"../fork/authUnavailable.ts\";",
+          "Effect.catchIf(isServerAuthInternalError, ForkAuthUnavailable.answerUnavailable),"
+        ]
+      }
+    },
+    "apps/server/src/provider/Drivers/ClaudeSkills.ts": {
+      "why": "#978 (model policy): the hook that checks Claude's Skill tool reads a skill's frontmatter with the skill list's own parser, so the repair of an unquoted \": \" in a value (which Claude Code accepts) is one source. parseSkillFrontmatter is exported, and its parsed result also carries the whole frontmatter record (fork/claudeAgentModelPolicy.ts reads context, model and effort from it). Tested in apps/server/src/fork/claudeAgentModelPolicy.test.ts.",
+      "added": [
+        "readonly record: Record<string, unknown>; // Fork: for the model policy's skill check",
+        "record, // Fork: the model policy reads context, model and effort from it",
+        "export { parseSkillFrontmatter }; // Fork: one frontmatter read for skills and the model policy"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -640,6 +719,7 @@
     "scripts/lib/release-repository.ts",
     "scripts/release-repository.test.ts",
     "apps/web/src/routes/_chat.settings.fork.tsx",
+    "apps/web/src/routes/_chat.owner-questions.tsx",
     "apps/web/src/components/settings/ReviewRulesSettings*",
     "apps/web/src/components/settings/reviewRulesSettings*",
     "!scripts/scenarios/fork-title-regenerates-from-inherited-history.e2e.ts",

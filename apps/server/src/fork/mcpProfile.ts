@@ -2,7 +2,7 @@
  * Fork: which MCP profile a thread gets. The pure resolver lives in
  * packages/contracts/src/mcpProfileResolve.ts (re-exported here). This file keeps what only the
  * server needs: each T3 toolkit's group and the drivers that apply a profile's outside servers.
- * The adapters, the turn check and the T3 tool filter (mcpT3ToolFilter.ts) use it.
+ * The adapters, the turn check and the T3 tool filter (mcpT3ToolRule.ts) use it.
  */
 import {
   MCP_BUILTIN_TOOLS_NONE,
@@ -34,7 +34,7 @@ export {
 
 /**
  * Each T3 toolkit's group, by its folder under src/mcp/toolkits; `null` for a toolkit that holds
- * only tools of `MCP_T3_UNGROUPED_TOOLS`. The T3 tool filter (mcpT3ToolFilter.ts) uses it. The test
+ * only tools of `MCP_T3_UNGROUPED_TOOLS`. The T3 tool filter (mcpT3ToolRule.ts) uses it. The test
  * in personOnlySettings.test.ts fails when a toolkit or tool maps to nothing.
  */
 export const MCP_T3_TOOLKIT_GROUPS: Readonly<Record<string, McpT3ToolGroup | null>> = {
@@ -113,7 +113,7 @@ export function mcpT3ToolGroup(
  * The drivers that apply a profile's outside servers: Claude (fork/claudeMcpProfile.ts) and Codex
  * (fork/codexMcpProfile.ts). Any other provider would give a thread every outside MCP server, so a
  * turn there whose profile leaves one out is refused as it starts (fork/mcpProfileTurnCheck.ts).
- * T3 tool groups apply on every driver (mcpT3ToolFilter.ts).
+ * T3 tool groups apply on every driver (mcpT3ToolRule.ts).
  */
 export const MCP_PROFILE_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set([
   ProviderDriverKind.make("claudeAgent"),
