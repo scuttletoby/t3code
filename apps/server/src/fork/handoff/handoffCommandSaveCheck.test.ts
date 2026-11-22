@@ -66,7 +66,9 @@ const layout = Effect.gen(function* () {
     "repo/tool/__main__.py",
     "tree/notes",
     // Stand-ins for the programs, by name: the check reads names and the disk, it runs nothing.
-    ...["python3.12", "sh", "node", "env", "make", "npm"].map((name) => `outside/bin/${name}`),
+    ...["python3.12", "sh", "node", "env", "make", "npm", "bun", "deno", "Rscript", "R"].map(
+      (name) => `outside/bin/${name}`,
+    ),
   ]) {
     yield* fs.writeFileString(at(file), "#!/bin/sh\n");
   }
@@ -197,6 +199,66 @@ describe("handoff command save check (#785)", () => {
         undefined,
       );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("refuses bun and deno, which read their config from the project folder (#973)", () =>
+    Effect.gen(function* () {
+      const at = yield* layout;
+      const [bun, deno, env] = ["bun", "deno", "env"].map((name) => at(`outside/bin/${name}`));
+      // bunfig.toml's `preload` and deno.json's import map run project code before the script,
+      // however safe the script itself is.
+      for (const command of [
+        [bun!, at("outside/handoff")],
+        [bun!, "run", at("outside/handoff")],
+        [deno!, "run", at("outside/handoff")],
+        [deno!, at("outside/handoff")],
+        [env!, "-i", deno!, "run", at("outside/handoff")],
+      ]) {
+        assert.include(
+          yield* problemOf(withCommand(command)),
+          "reads its config (bunfig.toml, deno.json and the like) from the project folder",
+          command.join(" "),
+        );
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "refuses R, and Rscript without --vanilla, which read .Rprofile from the project folder (#973)",
+    () =>
+      Effect.gen(function* () {
+        const at = yield* layout;
+        const [rscript, r, env] = ["Rscript", "R", "env"].map((name) => at(`outside/bin/${name}`));
+        // R sources `.Rprofile` and reads `.Renviron` from its working folder before the script,
+        // unless `--vanilla` comes among its options (after the script it is the script's argument).
+        for (const command of [
+          [rscript!, at("outside/handoff")],
+          [rscript!, "--no-save", at("outside/handoff")],
+          [rscript!, at("outside/handoff"), "--vanilla"],
+          [rscript!, "-e", "cat(1)", "--vanilla"],
+          [env!, "-i", rscript!, at("outside/handoff")],
+          [r!, "--vanilla", "-f", at("outside/handoff")],
+          [r!, "CMD", "BATCH", "--vanilla", at("outside/handoff")],
+        ]) {
+          assert.include(
+            yield* problemOf(withCommand(command)),
+            "reads .Rprofile and .Renviron from the project folder",
+            command.join(" "),
+          );
+        }
+        for (const command of [
+          [rscript!, "--vanilla", at("outside/handoff")],
+          [rscript!, "--verbose", "--vanilla", at("outside/handoff"), "--since", "1h"],
+          [rscript!, "--vanilla", "-e", "cat(1)"],
+        ]) {
+          assert.strictEqual(yield* problemOf(withCommand(command)), undefined, command.join(" "));
+        }
+        // With --vanilla, its script is still checked as any interpreter's.
+        assert.include(
+          yield* problemOf(withCommand([rscript!, "--vanilla", at("repo/scripts/handoff")])),
+          `inside the git checkout ${at("repo")}`,
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("refuses env's -S and -C however they are written, and follows env's -a (#785)", () =>

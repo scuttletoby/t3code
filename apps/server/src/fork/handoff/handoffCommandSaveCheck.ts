@@ -16,7 +16,7 @@ const SCRIPT_ENDING = /\.(?:sh|bash|zsh|fish|py|js|mjs|cjs|ts|mts|cts|rb|pl|php|
  * ending: shells and language runtimes, by file name (a version and `.exe` left off).
  */
 const INTERPRETER =
-  /^(?:(?:ba|z|da|k|c|tc|fi)?sh|fish|python|pypy|node|nodejs|deno|bun|ruby|perl|php|lua|luajit|tclsh|pwsh|powershell|rscript)$/u;
+  /^(?:(?:ba|z|da|k|c|tc|fi)?sh|fish|python|pypy|node|nodejs|ruby|perl|php|lua|luajit|tclsh|pwsh|powershell|rscript)$/u;
 /** Options after which an interpreter runs code given inline, not a file (`sh -c`, `node -e`). */
 const INLINE_CODE = new Set(["-c", "-e", "--eval", "-p", "--print", "-command"]);
 /** Interpreter options that take the next argument as their value, not as the script. */
@@ -33,6 +33,29 @@ const LOADS_MODULE = new Set(["-r", "--require", "--import", "--loader", "--expe
  */
 const PROJECT_RUNNER =
   /^(?:g?make|just|rake|npm|npx|pnpm|pnpx|yarn|cargo|go|gradlew?|mvnw?|ant|task|tox|nox|poetry|pipenv|uv|uvx|composer)$/u;
+
+/**
+ * Runtimes that read their config from their working folder before any script: `bunfig.toml`
+ * (its `preload` runs first), `deno.json` (its import map can swap what a script imports). The
+ * command runs in the project folder, which agents edit, so a safe script does not make them safe.
+ */
+const PROJECT_CONFIG_RUNTIME = /^(?:bun|bunx|deno)$/u;
+
+/**
+ * Whether R reads `.Rprofile` (sourced first) and `.Renviron` from its working folder, the project
+ * folder. `R` itself is refused whatever it is given (its `R CMD` tools read project files of their
+ * own); `Rscript` unless `--vanilla` comes among its options, before its script or `-e` (after
+ * them, it is an argument of the script).
+ */
+const readsRProfile = (name: string, args: ReadonlyArray<string>) => {
+  if (name === "r") return true;
+  if (name !== "rscript") return false;
+  for (const arg of args) {
+    if (arg === "--vanilla") return false;
+    if (!arg.startsWith("-") || arg === "-e") return true;
+  }
+  return true;
+};
 
 /** A program's name as the checks compare it: its last path part, lower case, no `.exe` or version. */
 const programName = (program: string) =>
@@ -133,8 +156,6 @@ function interpreterTarget(
       if (inline === undefined && TAKES_VALUE[name]?.has(arg) === true) index++;
       continue;
     }
-    // `deno run x.ts`, `bun run x.ts`: the word `run` is not the script.
-    if ((name === "deno" || name === "bun") && arg === "run") continue;
     return { kind: "script", file: arg };
   }
   return { kind: "none" };
@@ -213,6 +234,12 @@ const commandProblem = Effect.fn("HandoffCommandSaveCheck.commandProblem")(funct
   }
   if (PROJECT_RUNNER.test(name)) {
     return `${where} runs "${program}", which runs what a file in the project folder (a Makefile, package.json and the like) says, and agents can edit that folder. Give the full path of a program or script outside any repository instead.`;
+  }
+  if (PROJECT_CONFIG_RUNTIME.test(name)) {
+    return `${where} runs "${program}", which reads its config (bunfig.toml, deno.json and the like) from the project folder, and agents can edit that folder: it can run project code before any script. Give the full path of another program or script outside any repository instead.`;
+  }
+  if (readsRProfile(name, args)) {
+    return `${where} runs "${program}", which reads .Rprofile and .Renviron from the project folder, and agents can edit that folder: it can run project code before any script. Give Rscript --vanilla before its script, or the full path of another program or script outside any repository.`;
   }
   const scripts: Array<string> = [];
   if (INTERPRETER.test(name)) {
