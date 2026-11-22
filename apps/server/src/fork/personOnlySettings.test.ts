@@ -19,6 +19,7 @@ import * as Schema from "effect/Schema";
 import { beforeAll, describe, expect, it } from "vite-plus/test";
 
 import { withoutMachineOnlyFields } from "./advertisedMachineFields.ts";
+import { T3_TOOL_GROUPS } from "./mcpT3ToolFilter.ts";
 import {
   MCP_T3_TOOLKIT_GROUPS,
   MCP_T3_TOOL_NOT_ALLOWED,
@@ -391,6 +392,29 @@ describe("MCP profile T3 tool groups", () => {
     expect(mcpT3ToolGroup("orchestrator", "tool_search")).toBe("orchestration");
     expect(mcpT3ToolGroup("message", "request_secret")).toBe(MCP_T3_TOOL_NOT_ALLOWED);
     expect(mcpT3ToolGroup("toolSearch", "send_to_user")).toBe(MCP_T3_TOOL_NOT_ALLOWED);
+  });
+
+  it("gives the T3 tool filter's table exactly the toolkit folders' tools, each in its group", () => {
+    // The filter (mcpT3ToolFilter.ts) lists its toolkits by hand. A toolkit it leaves out would have
+    // every tool refused by any profile but `all`, and no profile setting could fix that.
+    const fromFolders = new Map<string, string>();
+    for (const [folder, names] of toolsByFolder) {
+      for (const name of names) {
+        const group = mcpT3ToolGroup(folder, name);
+        const known = fromFolders.get(name);
+        fromFolders.set(name, known === undefined || known === group ? group : "two groups");
+      }
+    }
+    const sorted = (table: ReadonlyMap<string, string>) =>
+      [...table].toSorted(([a], [b]) => a.localeCompare(b));
+    expect(sorted(T3_TOOL_GROUPS)).toEqual(sorted(fromFolders));
+  });
+
+  it("gives every group of MCP_T3_TOOL_GROUPS a tool in the T3 tool filter's table", () => {
+    // A group added to the contracts (a new toolkit, or tools moved) with no toolkit behind it in the
+    // filter would be offered in Settings and keep nothing.
+    const used = new Set(T3_TOOL_GROUPS.values());
+    expect(MCP_T3_TOOL_GROUPS.filter((group) => !used.has(group))).toEqual([]);
   });
 
   it("does not allow a tool this build does not know", () => {

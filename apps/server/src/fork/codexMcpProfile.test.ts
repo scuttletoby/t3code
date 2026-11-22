@@ -48,6 +48,13 @@ import {
   type ProfileById,
 } from "./codexMcpProfile.ts";
 import type { McpProfileResolved, McpProfileSet } from "./mcpProfile.ts";
+import * as T3ToolSets from "./mcpT3ToolSets.ts";
+
+/** The groups the thread's set holds now, or its tag when it is not a list. */
+const groupsOf = (threadId: string) => {
+  const set = T3ToolSets.t3ToolSetFor(threadId);
+  return set?._tag === "Groups" && set.groups !== "all" ? [...set.groups] : set?._tag;
+};
 
 type Client = CodexClient.CodexAppServerClient["Service"];
 type Json = Record<string, unknown>;
@@ -432,10 +439,18 @@ describe("codexMcpProfile helpers", () => {
     );
   });
 
+  it("a profile that limits T3's tools adds no Codex config: T3's own server cuts them", () => {
+    assert.deepStrictEqual(
+      codexMcpProfileConfig("lean", { servers: "all", t3Tools: ["threads"] }, ["alpha"]),
+      {},
+    );
+    assert.deepStrictEqual(
+      codexMcpProfileConfig("lean", { servers: ["alpha"], t3Tools: [] }, ["alpha", "beta"]),
+      codexMcpProfileConfig("lean", { servers: ["alpha"], t3Tools: "all" }, ["alpha", "beta"]),
+    );
+  });
+
   it("refuses a profile it cannot apply, with the fix", () => {
-    const tools = codexMcpProfileConfig("lean", { servers: "all", t3Tools: ["threads"] }, []);
-    assert.isTrue(isRefusal(tools));
-    assert.include((tools as ClaudeMcpProfileError).reason, 'set its t3Tools to "all"');
     const named = codexMcpProfileConfig("mine", { servers: [], t3Tools: "all" }, ["a.b"]);
     assert.isTrue(isRefusal(named));
     assert.include((named as ClaudeMcpProfileError).reason, '"a.b"');
@@ -604,20 +619,28 @@ describe("withCodexMcpProfiles", () => {
     }),
   );
 
-  it.effect("a profile that limits T3's tools, or a server name Codex cannot take, refuses", () =>
-    Effect.gen(function* () {
-      const fake = makeFakeCodex({ servers: ["alpha", "my server"] });
-      const { profileFor } = makeProfiles({
-        tools: resolved("lean", "all", ["threads"]),
-        named: resolved("none", []),
-      });
-      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
-      assert.include(yield* outcome(start(client, "tools")), 'set its t3Tools to "all"');
-      const named = yield* outcome(start(client, "named"));
-      assert.include(named, '"my server"');
-      assert.include(named, FIX);
-      assert.deepStrictEqual(fake.sent("thread/start"), []);
-    }),
+  it.effect(
+    "a server name Codex cannot take refuses; a profile that limits only T3's tools loads",
+    () =>
+      Effect.gen(function* () {
+        const fake = makeFakeCodex({ servers: ["alpha", "my server"] });
+        const { profileFor } = makeProfiles({
+          tools: resolved("lean", "all", ["threads"]),
+          named: resolved("none", []),
+        });
+        const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+        const named = yield* outcome(start(client, "named"));
+        assert.include(named, '"my server"');
+        assert.include(named, FIX);
+        assert.deepStrictEqual(fake.sent("thread/start"), []);
+        // Every outside server kept: nothing extra is asked of Codex or sent to it.
+        const reads = fake.sent("config/read").length;
+        assert.strictEqual(yield* outcome(start(client, "tools")), "ok");
+        assert.strictEqual(fake.sent("thread/start").length, 1);
+        assert.strictEqual(fake.sent("config/read").length, reads);
+        const sent = fake.sent("thread/start")[0]!.params as { readonly config: Json };
+        assert.deepStrictEqual(offKeys(sent.config), []);
+      }),
   );
 
   it.effect.each([
@@ -847,19 +870,32 @@ describe("withCodexMcpProfiles", () => {
       }),
   );
 
-  it.effect("T3's tools narrowed after the thread loaded on all: its next turn is refused", () =>
-    Effect.gen(function* () {
-      const fake = makeFakeCodex({ servers: ["alpha"] });
-      const { profiles, profileFor } = makeProfiles();
-      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
-      const id = (yield* start(client, "t")).thread.id;
-      // Every server kept, only T3's tools limited: no server is outside the profile.
-      profiles.set("t", resolved("lean", "all", ["threads"]));
-      const message = yield* outcome(turn(client, id));
-      assert.include(message, 'MCP profile "lean" limits T3\'s own tools');
-      assert.include(message, 'set its t3Tools to "all"');
-      assert.deepStrictEqual(fake.sent("turn/start"), []);
-    }),
+  it.effect(
+    "T3's tools narrowed after the thread loaded on all: its next turn runs with exactly that set",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        const fake = makeFakeCodex({ servers: ["alpha"] });
+        const { profiles, profileFor } = makeProfiles();
+        const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+        const id = (yield* start(client, "t")).thread.id;
+        // Every server kept, only T3's tools limited: no server is outside the profile.
+        profiles.set("t", resolved("lean", "all", ["threads"]));
+        assert.strictEqual(yield* outcome(turn(client, id)), "ok");
+        assert.strictEqual(fake.sent("turn/start").length, 1);
+        assert.deepStrictEqual(groupsOf("t"), ["threads"]);
+        // A turn Codex starts on its own (a goal's next turn) fixes the set as it starts too.
+        profiles.set("t", resolved("lean", ["alpha"], ["threads", "waits"]));
+        const reads = fake.sent("mcpServerStatus/list").length;
+        yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+        yield* fake.reached("mcpServerStatus/list", reads + 1);
+        assert.deepStrictEqual(groupsOf("t"), ["threads", "waits"]);
+        assert.deepStrictEqual(fake.sent("turn/interrupt"), []);
+        // A profile that cannot be worked out keeps only the tools every profile keeps.
+        profiles.set("t", new ClaudeMcpProfileError({ reason: "gone" }));
+        assert.include(yield* outcome(turn(client, id)), "gone");
+        assert.strictEqual(T3ToolSets.t3ToolSetFor("t")?._tag, "Refused");
+      }),
   );
 
   it.effect(
