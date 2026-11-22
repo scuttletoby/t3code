@@ -52,8 +52,8 @@ const usageOf = (used: number, freeMemoryMb = 4096): SlotGate.SlotUsage => ({
 interface World {
   /** The slot gate's status read; `"missing"`: no gate on this server. */
   readonly usage?: Effect.Effect<SlotGate.SlotUsage | null> | "missing";
-  /** `"missing"`: no host sampler on this server. */
-  readonly host?: "missing";
+  /** `"missing"`: no host sampler on this server; `"hangs"`: its read never answers. */
+  readonly host?: "missing" | "hangs";
   /**
    * `"unreadable"`: the settings file can no longer be read once upstream's part of the read has
    * read it (upstream's read fails the whole call when its own settings read fails).
@@ -105,7 +105,9 @@ const layerWorld = (world: World) =>
     }),
     world.host === "missing"
       ? Layer.empty
-      : Layer.mock(HostResources.HostResources)({ read: Effect.succeed(host) }),
+      : Layer.mock(HostResources.HostResources)({
+          read: world.host === "hangs" ? Effect.never : Effect.succeed(host),
+        }),
     world.usage === "missing"
       ? Layer.empty
       : Layer.mock(SlotGate.SlotGate)({ usage: world.usage ?? Effect.succeed(usageOf(1)) }),
@@ -236,6 +238,16 @@ it.effect("a full machine, or one below its memory floor, is not available", () 
 it.effect("no host sampler leaves hostResources out; placement still comes", () =>
   Effect.gen(function* () {
     const result = yield* readFacts({ host: "missing" });
+    expect(result).not.toHaveProperty("hostResources");
+    expect(result.placement).toMatchObject({ available: true, slotsFree: 2 });
+  }),
+);
+
+it.effect("a host read that hangs is given up at its own limit; placement still comes", () =>
+  Effect.gen(function* () {
+    const fiber = yield* readFacts({ host: "hangs" }).pipe(Effect.forkChild);
+    yield* TestClock.adjust(EnvironmentFacts.HOST_READ_TIMEOUT);
+    const result = yield* Fiber.join(fiber);
     expect(result).not.toHaveProperty("hostResources");
     expect(result.placement).toMatchObject({ available: true, slotsFree: 2 });
   }),
