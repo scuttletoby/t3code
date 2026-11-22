@@ -2724,6 +2724,10 @@ describe("CursorAdapterV2", () => {
           Effect.map(listed),
         );
         assert.deepStrictEqual(listed(events).at(-1), { tasks: ["7", "8"], sessionScoped: false });
+        // Fork: later shell updates re-send this snapshot, so it must not say busy.
+        const settled = events.findLast((event) => event.type === "provider_thread.updated");
+        assert.ok(settled?.type === "provider_thread.updated");
+        assert.equal(settled.providerThread.status, "idle");
         // Idle release keeps the session while a shell runs.
         assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
 
