@@ -117,6 +117,10 @@ interface Options {
  */
 const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Options = {}) =>
   Effect.gen(function* () {
+    // The gate samples the machine every 30 s from when it is built. Built at the test clock's 0, a
+    // move to START would run every sample in the 56 years between (the test clock runs each sleep
+    // it passes): build it at START, never earlier. A clock already past START stays where it is.
+    if ((yield* Clock.currentTimeMillis) < START) yield* TestClock.setTime(START);
     const started: Array<string> = options.started ?? [];
     const prompts: Array<Prompt> = options.prompts ?? [];
     const bound = options.bound ?? { instanceId: INSTANCE, running: false };
