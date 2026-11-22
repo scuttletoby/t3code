@@ -13,6 +13,14 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue: merges as GitHub's update does; a cancelled re-run no longer hides an old base's red (#924)
+
+The queue's merge check uses `merge.directoryRenames=false` (was `true`), which is how GitHub's update branch merges
+(measured): a pull request that adds a file in a folder its base renamed is re-armed after the update, where it was
+left off with a comment. Two renames of one folder are still left off. With `update_when_base_was_red`, a red that only
+cancelled runs followed is judged by the base its red run tested, not by the cancelled run's job, which may have no
+note: such a pull request is now updated when its base was red and is green now.
+
 ### pr-queue: every unreadable plan is kept and told once; the cache never raises (#934)
 
 An unreadable or untrusted plan no longer replaces an earlier `STATE.bad`: a later one is kept as

@@ -208,8 +208,10 @@ CHECK_NOT_DONE_RE = re.compile(r'required status checks?\b(?:"[^"\n]*"|[^."\n])*
 
 
 def merge_tree(git, p, side):
-    """git's merge of the commits `p` and `side`: exit 0 and the tree's name when clean."""
-    return git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', p, side)
+    """git's merge of the commits `p` and `side`: exit 0 and the tree's name when clean. As GitHub's update branch
+    merges (measured, issue 924): a file added in a folder the other side renamed stays where it was added, so no
+    directory rename follows it (git's default would call it a conflict, `true` would move it)."""
+    return git('-c', 'merge.directoryRenames=false', 'merge-tree', '--write-tree', p, side)
 
 
 def holds(git, head, read, depth=UPDATES, base='refs/queue/base', merge=None):
@@ -1300,10 +1302,11 @@ class Queue:
 
     # --- which armed PRs wait, and why ------------------------------------------------------------------------------
     def red_checks(self, pr):
-        """{name: rollup item of its newest run} of each required check whose newest run really failed. The ruleset
-        takes the newest run of a name, whichever workflow ran it (required_now), and the rollup lists every run on the
-        head: an older red must not outvote a newer run. CANCELLED alone is not a failure (a newer push or update
-        cancels the old run), but a red that only cancelled runs followed still stands: nothing passed since it."""
+        """{name: rollup item of the run that makes it red} of each required check whose newest run really failed. The
+        ruleset takes the newest run of a name, whichever workflow ran it (required_now), and the rollup lists every run
+        on the head: an older red must not outvote a newer run. CANCELLED alone is not a failure (a newer push or update
+        cancels the old run), but a red that only cancelled runs followed still stands: nothing passed since it. Its
+        item is then that red run's, not the cancel's: red_from_old_base reads the base the red tested (issue 924)."""
         rollup = pr.get('statusCheckRollup') or []
         name_of = lambda c: c.get('name') or c.get('context')
         state_of = lambda c: (c.get('conclusion') or c.get('state') or '').upper()
@@ -1318,8 +1321,9 @@ class Queue:
             if state_of(c) == 'CANCELLED':
                 runs = [o for o in rollup if name_of(o) == name]
                 green = max((when(o) for o in runs if lens.check_state(o) == 'ok'), default='')
-                if any(state_of(o) in RED_STATES and when(o) > green for o in runs):
-                    out[name] = c
+                reds = [o for o in runs if state_of(o) in RED_STATES and when(o) > green]
+                if reds:
+                    out[name] = max(reds, key=when)
             elif state_of(c) in RED_STATES:
                 out[name] = c
         return out

@@ -2332,6 +2332,15 @@ class RedOnOldBase(unittest.TestCase):
         code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1), (self.RERUN, 'FAILURE', self.M1)]})
         self.assertEqual((self.updated, self.posted), ([(7, False)], []), out)
 
+    def test_a_cancelled_re_run_after_the_red_names_no_base_the_red_does(self):   # issue 924, item 1
+        # the red still stands (nothing passed since), and its own run tested the red M1: the cancelled re-run never
+        # reached its tested-base step, so it has no note, and must not turn an old main's red into the PR's own
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1), (self.RERUN, 'CANCELLED', None)]})
+        self.assertEqual((self.updated, self.posted), ([(7, False)], []), out)
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M0), (self.RERUN, 'CANCELLED', self.M1)]})
+        self.assertEqual((self.updated, len(self.posted)), ([], 1), out)   # the red's base was green: its own
+        self.assertIn(f'build was not red on the main commit {self.M0[:12]} its run tested (ok)', out)
+
     def test_its_red_after_the_update_is_its_own_and_is_told_no_loop(self):   # a real new merge head
         # the update made head H2; its run merged H2 with the green M2 and still failed: its own red, told once
         code, out = self.sweep([(7, self.H2, {'build': [(self.RERUN, 'FAILURE', self.M2)]})], self.main_of())
@@ -2504,6 +2513,39 @@ class OnlyWhatALensReadIsReArmed(Admin):
         f = QueueGh(self.w, self.p, self.w.merge(self.p, self.m1))
         self.update(f)
         self.assertEqual(f.armed, f.after)
+
+
+class DirectoryRenamesAsGitHubMerges(unittest.TestCase):   # issue 924, item 3
+    """GitHub's update branch, measured once (README.md, "The queue"): main renames folder d to m. A PR that adds
+    d/f3 is updated cleanly with f3 left in d (no directory rename follows it). A PR that renames d to p is updated
+    cleanly too, with both copies, m and p, though git calls that a rename/rename conflict."""
+    F = {'f1.txt': 'one\n' * 3, 'f2.txt': 'two\n' * 3}
+
+    def setUp(self):
+        w = self.w = World()
+        self.addCleanup(w.close)
+        self.q = make_queue(w.dir, remote=w.remote)
+        self.s0 = w.commit({f'd/{k}': v for k, v in self.F.items()})
+        self.s1 = w.commit({f'm/{k}': v for k, v in self.F.items()}, [self.s0])
+        w.set('refs/heads/main', self.s1)
+
+    def update(self, pr, after_files):
+        after = self.w.commit(after_files, [pr, self.s1], msg='Merge main')   # the tree GitHub's update made
+        f = QueueGh(self.w, pr, after)
+        self.q.gh = self.q.gh_write = f
+        code, out = run_quiet(self.q.update, 7)
+        return f, out
+
+    def test_a_file_added_in_a_folder_main_renamed_is_re_armed(self):   # it stays where the read put it
+        pr = self.w.commit({**{f'd/{k}': v for k, v in self.F.items()}, 'd/f3.txt': 'three\n'}, [self.s0])
+        f, out = self.update(pr, {**{f'm/{k}': v for k, v in self.F.items()}, 'd/f3.txt': 'three\n'})
+        self.assertEqual((f.armed, f.comments), (f.after, []), out)
+
+    def test_two_renames_of_one_folder_stay_off(self):   # git's conflict, whatever GitHub merged
+        pr = self.w.commit({f'p/{k}': v for k, v in self.F.items()}, [self.s0])
+        f, out = self.update(pr, {**{f'm/{k}': v for k, v in self.F.items()}, **{f'p/{k}': v for k, v in self.F.items()}})
+        self.assertIsNone(f.armed, out)
+        self.assertEqual(len(f.comments), 1, out)
 
 
 class WhitespaceIsPartOfTheChange(Admin):
