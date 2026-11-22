@@ -1814,7 +1814,10 @@ test("a pull request's own list with a duplicate key is refused", () => {
     // Equal once decoded.
     [`{"files": {}, "pending": {"p.ts": 1, "\\u0070.ts": 1}}`, "p.ts"],
   ]) {
-    assert.equal(ownListProblem(text), `${OWN} is malformed: duplicate key ${JSON.stringify(key)}`);
+    assert.ok(
+      ownListProblem(text).startsWith(`${OWN} is malformed: duplicate key ${JSON.stringify(key)} `),
+      text,
+    );
   }
   // The same key in different objects, and keys inside strings, are not duplicates.
   for (const text of [
@@ -3753,9 +3756,16 @@ test("a seam count the pull request raises without the line, or lowers while the
       pr("step2", withAdded("a.ts", [...SEAM["a.ts"].added, "forkMore();"]), {
         "a.ts": `${SEAMED["a.ts"]}forkMore();\n`,
       }),
-      pr("dropped", withAdded("a.ts", ["import { fork } from './fork';"]), {
-        "a.ts": SEAMED["a.ts"].replace("  ...fork,\n", ""),
-      }),
+      // It keeps main's in-date announcement (a change that drops one is refused).
+      pr(
+        "dropped",
+        {
+          files: {
+            "a.ts": { why: "test", added: ["import { fork } from './fork';"], announced },
+          },
+        },
+        { "a.ts": SEAMED["a.ts"].replace("  ...fork,\n", "") },
+      ),
     ];
     git("checkout", "-q", "-f", "-B", "spare", main);
     const spareMain = commit(
@@ -4146,4 +4156,128 @@ test("fork-checks counts from upstream and fork-tests' shallow run passes --no-u
   const tests = runs(read("fork-tests.yml"));
   assert.equal(tests.length, 1);
   assert.match(tests[0], /fork-seam-check\.cjs --no-upstream HEAD\^1 HEAD$/);
+});
+
+// #796: a pull request's run judged a "pending" file from the merge-base, where swapping an upstream
+// line for a fork line keeps every count it sees (one line out, one in), so it passed while
+// fork-follow's count from upstream refused main. Both forms now count the same lines.
+test("a change that swaps an upstream line in a pending file whose counts are reached is refused by both forms", () => {
+  withRepo(({ git, commit, run, runBare, fromUpstream, publish }) => {
+    const up = commit({ "p.ts": "a();\nb();\nc();\n" }, "upstream");
+    git("checkout", "-q", "-b", "fork");
+    // One fork line where upstream's `b();` was: the ceiling and the "lost" counts are reached.
+    const list = { files: {}, pending: { "p.ts": 1 }, lost: { "p.ts": { lines: 1, gone: 1 } } };
+    const main = commit({ ...seams(list), "p.ts": "a();\nforkB();\nc();\n" }, "main");
+    publish(up);
+    assert.equal(fromUpstream(up, main).status, 0);
+    const swap = commit({ "p.ts": "a();\nforkB();\nforkC();\n" }, "swap upstream's c();");
+    const follow = fromUpstream(up, swap);
+    assert.equal(follow.status, 1, follow.stdout);
+    assert.match(
+      follow.stderr,
+      /p\.ts: 2 upstream lines deleted, moved or re-indented, more than its "lost" lines count of 1/,
+    );
+    assert.match(follow.stderr, /p\.ts: "pending" with 2 fork lines, more than its ceiling of 1/);
+    const pr = run("--config-ref", main, main, swap);
+    assert.equal(pr.status, 1, pr.stdout);
+    assert.match(
+      pr.stderr,
+      /- p\.ts: "pending" with a ceiling of 1 in this change's \.github\/fork-seams\.json, but the fork adds 2 lines over upstream \([0-9a-f]{12}\): set its ceiling to 2/,
+    );
+    assert.match(
+      pr.stderr,
+      /- p\.ts: set in "lost" in this change's \.github\/fork-seams\.json \({"lines": 1, "gone": 1}\), but the fork loses 2 upstream lines over upstream \([0-9a-f]{12}\) .*: set it to {"lines": 2, "gone": 2}/,
+    );
+    // Runs again: the same answer.
+    assert.equal(run("--config-ref", main, main, swap).stderr, pr.stderr);
+    // A change to a fork line only keeps both counts: counted from upstream, it passes both forms.
+    git("checkout", "-q", "-f", "-B", "reword", main);
+    const reword = commit({ "p.ts": "a();\nforkB2();\nc();\n" }, "reword the fork line");
+    const ok = run("--config-ref", main, main, reword);
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.match(
+      ok.stdout,
+      /^Note: p\.ts: this change changes the text of the "pending" file p\.ts.*counted from upstream/m,
+    );
+    assert.equal(fromUpstream(up, reword).status, 0);
+    // With no upstream to count from, the edit is refused, not skipped; fork-tests' run says
+    // --no-upstream (fork-checks counts).
+    const bare = runBare("--config-ref", main, main, reword);
+    assert.equal(bare.status, 1, bare.stdout);
+    assert.match(
+      bare.stderr,
+      /p\.ts: this change changes the text of the "pending" file p\.ts.*cannot be counted/,
+    );
+    assert.equal(run("--no-upstream", "--config-ref", main, main, reword).status, 0);
+    // A change that leaves the pending file alone fetches nothing.
+    git("checkout", "-q", "-f", "-B", "other", main);
+    const other = commit({ "fork-own.ts": "x();\n" }, "a fork file");
+    assert.equal(runBare("--config-ref", main, main, other).status, 0);
+  });
+});
+
+// #813: JSON.parse keeps the last of two equal keys, so the other entry is shown but never applies.
+// A pull request's own list was refused for one; main's list (merged around that check) and the
+// head's list fork-follow reads were not.
+test("a list with a duplicate key is refused wherever it is read: main's, the merge-base's or fork-follow's head", () => {
+  withRepo(({ git, commit, run, fromUpstream }) => {
+    const up = commit({ ...BASE }, "upstream");
+    git("checkout", "-q", "-b", "fork");
+    const entry = (added) => JSON.stringify({ why: "w", added });
+    const dup = `{"files": {"a.ts": ${entry(["import { fork } from './fork';"])}, "a.ts": ${entry(["...fork,"])}}}\n`;
+    const main = commit({ [CONFIG]: dup, ...SEAMED }, "main with a duplicate key");
+    // A malformed list stops the run (exit 3), as any other does: it never runs on half a list.
+    const follow = fromUpstream(up, main);
+    assert.equal(follow.status, 3, follow.stdout);
+    assert.match(
+      follow.stderr,
+      /\.github\/fork-seams\.json at [0-9a-f]{12}: duplicate key "a\.ts"/,
+    );
+    const plain = commit({ "fork-own.ts": "x();\n" }, "a fork file");
+    const pr = run("--config-ref", main, main, plain);
+    assert.equal(pr.status, 3, pr.stdout);
+    assert.match(pr.stderr, /\.github\/fork-seams\.json at [0-9a-f]{12}: duplicate key "a\.ts"/);
+    assert.throws(() => parseConfig(dup), /duplicate key "a\.ts"/);
+  });
+});
+
+// #813: #777's squash merge dropped every line #774 had announced, and nothing noticed. A change
+// that is not list-only keeps each in-date announcement main's list has (and its merge-base had):
+// still announced, or moved to "added".
+test("a change that drops another change's in-date announcement is refused, unless list-only or expired", () => {
+  withRepo(({ git, commit, run }) => {
+    const day = "2026-11-18T12:00:00Z";
+    commit({ ...BASE, "n.ts": UP }, "upstream", day);
+    git("checkout", "-q", "-b", "fork");
+    const main = commit({ ...seams(ANNOUNCED()), ...SEAMED }, "step 1", day);
+    const withList = (files, list = { files: SEAM }) =>
+      commit({ ...files, ...seams(list) }, "change", day);
+    // A code change whose list came from an older copy: refused, naming the line.
+    git("checkout", "-q", "-f", "-B", "drop", main);
+    const drop = withList({ "fork-own.ts": "x();\n" });
+    const refused = run("--config-ref", main, main, drop);
+    assert.equal(refused.status, 1, refused.stdout);
+    assert.match(
+      refused.stderr,
+      /- n\.ts: this change's \.github\/fork-seams\.json drops the announced line `forkNew\(\);` \(main's list announces it since 2026-11-18, in date\)/,
+    );
+    assert.equal(run("--config-ref", main, main, drop).stderr, refused.stderr);
+    // The same drop in a list-only change says so: it passes.
+    git("checkout", "-q", "-f", "-B", "withdraw", main);
+    assert.equal(run("--config-ref", main, main, withList({})).status, 0);
+    // Kept, or still announced with another list edit: passes.
+    git("checkout", "-q", "-f", "-B", "keep", main);
+    const keep = withList({ "fork-own.ts": "x();\n" }, { ...ANNOUNCED(), pending: {} });
+    assert.equal(run("--config-ref", main, main, keep).status, 0);
+    // Expired by main's commit date: may go with any change.
+    git("checkout", "-q", "-f", "-B", "late", main);
+    const lateMain = commit({ "late.txt": "x\n" }, "main, later", "2026-12-10T12:00:00Z");
+    const late = withList({ "fork-own.ts": "x();\n" });
+    assert.equal(run("--config-ref", lateMain, lateMain, late).status, 0);
+    // A branch from before the announcement does not have it yet: not this change's to keep.
+    git("checkout", "-q", "-f", "-B", "behind", main + "~1");
+    const behind = withList({ "fork-own.ts": "x();\n" }, { files: SEAM, pending: {} });
+    const result = run("--config-ref", main, main + "~1", behind);
+    assert.doesNotMatch(result.stderr, /drops the announced line/);
+  });
 });

@@ -741,11 +741,14 @@ function findListedNotFork(
  * `atUpstream` (`name`), as fork-follow counts them: a count set too high lets a later change swap
  * an upstream line for a fork line unseen; too low, or dropped, stops fork-follow.
  */
-function findLostNotUpstream(files, ownLost, { atUpstream, atHead, name }) {
+function findLostNotUpstream(files, ownLost, { atUpstream, atHead, name, wasLost }) {
   const ceilings = [];
   for (const file of files) {
     const own = Object.hasOwn(ownLost, file) ? ownLost[file] : undefined;
-    const where = `${own === undefined ? "dropped from" : "set in"} "lost" in this change's ${CONFIG}`;
+    // `wasLost`: the files main's or the merge-base's list has in "lost" (unknown: all of them).
+    const verb =
+      own !== undefined ? "set in" : wasLost?.has(file) === false ? "not in" : "dropped from";
+    const where = `${verb} "lost" in this change's ${CONFIG}`;
     const head = atHead(file);
     if (head === undefined) {
       if (own !== undefined) {
@@ -1077,6 +1080,35 @@ function findAnnouncementWarnings(ownFiles, baseFiles, today) {
   return warnings;
 }
 
+/**
+ * In-date announcements in main's list (`mainFiles`) that this change's own list (`ownFiles`) drops:
+ * a line neither still announced nor moved to "added". Only lines the merge-base's list
+ * (`baseFiles`; undefined when unreadable: main's) had too: a branch from before the announcement
+ * does not have it yet, and a merge keeps it. A merge that resolved the list from an older copy
+ * dropped another change's step 1 unseen (#813); a list-only change says it withdraws one, and an
+ * announcement expired or dated ahead on `today` (main's commit date) may go with any change.
+ */
+function findDroppedAnnouncements(mainFiles, baseFiles, ownFiles, today) {
+  const reasons = [];
+  const counts = (files, file) =>
+    Object.hasOwn(files, file) ? lineCounts(seamLines(files[file]).join("\n")) : new Map();
+  for (const [file, seam] of Object.entries(mainFiles)) {
+    if (seam.announced === undefined) continue;
+    const { since } = seam.announced;
+    if (isExpired(since, today) || isAhead(since, today)) continue;
+    const before = baseFiles === undefined ? undefined : counts(baseFiles, file);
+    const own = counts(ownFiles, file);
+    for (const [line, count] of lineCounts(seam.announced.added.join("\n"))) {
+      const kept = Math.min(count, before === undefined ? count : (before.get(line) ?? 0));
+      if ((own.get(line) ?? 0) >= kept) continue;
+      reasons.push(
+        `${file}: this change's ${CONFIG} drops the announced line \`${line}\` (main's list announces it since ${since}, in date): keep it under "announced", or move it to "added" in the change that adds it (a list from an older copy drops another change's announcement unseen). To withdraw it on purpose, drop it in a list-only pull request.`,
+      );
+    }
+  }
+  return reasons;
+}
+
 const KINDS = ["files", "pending", "forkFiles", "lost"];
 const SEAM_KEYS = ["why", "added", "announced"];
 const ANNOUNCED_KEYS = ["since", "added"];
@@ -1210,6 +1242,14 @@ function parseConfig(text) {
       throw new Error(`${CONFIG}: "forkFiles": not a repository path pattern: ${pattern}`);
     }
   }
+  // Last: the structure above is JSON.parse's reading, which keeps only the last of two equal keys
+  // (two pull requests that each add an entry for one file, #813): the other is shown but never applies.
+  const duplicate = findDuplicateKey(text);
+  if (duplicate !== undefined) {
+    throw new Error(
+      `${CONFIG}: duplicate key ${JSON.stringify(duplicate)} (JSON keeps only the last, so the other is shown but never applies): merge them into one entry`,
+    );
+  }
   return { files, pending, forkFiles: config.forkFiles ?? [], lost };
 }
 
@@ -1255,11 +1295,11 @@ function ownListProblem(text) {
   if (text === undefined) return `${own}: this change deletes it.`;
   try {
     parseConfig(text);
-    const duplicate = findDuplicateKey(text);
-    if (duplicate === undefined) return undefined;
-    return printable(`${own} is malformed: duplicate key ${JSON.stringify(duplicate)}`);
+    return undefined;
   } catch (error) {
-    return printable(`${own} is malformed: ${error instanceof Error ? error.message : error}`);
+    const message = error instanceof Error ? error.message : String(error);
+    const reason = message.startsWith(`${CONFIG}: `) ? message.slice(CONFIG.length + 2) : message;
+    return printable(`${own} is malformed: ${reason}`);
   }
 }
 
@@ -1380,11 +1420,21 @@ function isAncestor(a, b) {
   }
 }
 
-/** Reads `<rev>:.github/fork-seams.json`; throws when that commit has none. */
+/** Reads `<rev>:.github/fork-seams.json`; throws when that commit has none or it is malformed. */
 function readConfigAt(rev) {
   const text = textAt(rev, CONFIG);
   if (text === undefined) throw new Error(`${rev} has no ${CONFIG}`);
-  return parseConfig(text);
+  try {
+    return parseConfig(text);
+  } catch (error) {
+    // Names the commit: on a pull request main's list, the merge-base's and its own are all read.
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      message.startsWith(`${CONFIG}: `)
+        ? `${CONFIG} at ${rev.slice(0, 12)}: ${message.slice(CONFIG.length + 2)}`
+        : `${CONFIG} at ${rev.slice(0, 12)}: ${message}`,
+    );
+  }
 }
 
 function parseArgs(argv) {
@@ -1525,21 +1575,36 @@ function main(argv) {
     lowered,
   });
   // Counts the own list changes (seam "added", "pending", "lost", "forkFiles", a move to "files")
-  // main's list cannot check: only upstream can. Every way the count cannot run refuses (fail
+  // and the pending files' text changes main's list cannot check: only upstream can. Every way the count cannot run refuses (fail
   // closed); fork-tests' run on the merge commit passes --no-upstream, as fork-checks' run counts.
   const promoted = upstream ? [] : promotedFiles(config, ownFiles, ownPending);
   const edits =
     upstream || ownConfig === undefined
       ? { files: [], pending: [], lost: [], forkFiles: false }
       : { files: listEditedFiles(baseFiles, ownFiles), ...listEditedCounts(baseList, ownConfig) };
-  const toCount = [...new Set([...promoted, ...edits.files, ...edits.pending])].sort();
-  const lostToCount = [...edits.lost].sort();
+  // The "pending" files whose text this change edits. Main's tree cannot tell which line it drops
+  // is upstream's: a swapped upstream line (one out, one in) keeps every count it sees, and
+  // fork-follow then refuses main (#796). Counted from upstream as fork-follow counts them: fork
+  // lines against the own ceiling, lost lines against the own "lost" entry.
+  const changedFiles = new Set(changed);
+  const pendingEdited =
+    upstream || ownConfig === undefined
+      ? []
+      : Object.keys(config.pending).filter((file) => {
+          if (!changedFiles.has(file)) return false;
+          const [before, after] = [atBase(file), atHead(file)];
+          return before !== undefined && after !== undefined && before !== after;
+        });
+  const toCount = [
+    ...new Set([...promoted, ...edits.files, ...edits.pending, ...pendingEdited]),
+  ].sort();
+  const lostToCount = [...new Set([...edits.lost, ...pendingEdited])].sort();
   const countedCeilings = [];
   const cannotCount = [];
   if (toCount.length > 0 || lostToCount.length > 0 || edits.forkFiles) {
     const seamEdited = edits.files.filter((file) => !promoted.includes(file));
     const ceilingEdited = edits.pending.filter((file) => !promoted.includes(file));
-    const does = [
+    const listDoes = [
       ...(promoted.length > 0
         ? [`moves ${promoted.join(", ")} from "pending" to "files"`]
         : seamEdited.length > 0
@@ -1548,11 +1613,19 @@ function main(argv) {
       ...(ceilingEdited.length > 0
         ? [`changes the "pending" ceiling of ${ceilingEdited.join(", ")}`]
         : []),
-      ...(lostToCount.length > 0 ? [`changes the "lost" entry of ${lostToCount.join(", ")}`] : []),
+      ...(edits.lost.length > 0 ? [`changes the "lost" entry of ${edits.lost.join(", ")}`] : []),
       ...(edits.forkFiles ? ['changes "forkFiles"'] : []),
     ];
+    const does = [
+      ...(listDoes.length > 0 ? [`${listDoes.join(", and ")} in its ${CONFIG}`] : []),
+      ...(pendingEdited.length > 0
+        ? [
+            `changes the text of the "pending" file${pendingEdited.length === 1 ? "" : "s"} ${pendingEdited.join(", ")} (a pull request's run cannot tell an upstream line from a fork line there)`,
+          ]
+        : []),
+    ];
     const subjects = [...new Set([...toCount, ...lostToCount])].sort();
-    const what = `${subjects.length > 0 ? subjects.join(", ") : '"forkFiles"'}: this change ${does.join(", and ")} in its ${CONFIG}`;
+    const what = `${subjects.length > 0 ? subjects.join(", ") : '"forkFiles"'}: this change ${does.join(", and ")}`;
     const named = parsed.noUpstream
       ? {}
       : parsed.upstreamUrl === undefined
@@ -1594,7 +1667,15 @@ function main(argv) {
               ...Object.keys(baseList?.pending ?? {}),
             ]),
           }),
-          ...findLostNotUpstream(lostToCount, ownLost, { atUpstream, atHead, name }),
+          ...findLostNotUpstream(lostToCount, ownLost, {
+            atUpstream,
+            atHead,
+            name,
+            wasLost:
+              baseList === undefined
+                ? undefined
+                : new Set([...Object.keys(config.lost), ...Object.keys(baseList.lost)]),
+          }),
           ...(edits.forkFiles
             ? findOwnHiddenFiles(
                 git(["ls-tree", "-r", "-z", "--name-only", found.rev]).split("\0").filter(Boolean),
@@ -1645,6 +1726,12 @@ function main(argv) {
       : []),
   ];
   const expired = upstream ? findExpiredAnnouncements(config.files, commitDay(head)) : [];
+  // A change that edits its list and something else keeps main's in-date announcements (#813).
+  const listOnly = changed.every((file) => file === CONFIG);
+  const dropped =
+    editsList && ownFiles !== undefined && !listOnly
+      ? findDroppedAnnouncements(config.files, baseFiles, ownFiles, today)
+      : [];
   // Upstream added an announced line: pushed, main's tree fails the stale-list test that
   // fork-checks runs for every pull request (the fix's too). Stop before the push.
   const landed = upstream
@@ -1681,7 +1768,7 @@ function main(argv) {
       `Fix the list in this change: merged, it is main's list, and a malformed one stops every later pull request and fork-follow run.`,
     );
   }
-  const refused = [...reasons, ...late, ...rises, ...ceilings, ...expired, ...landed];
+  const refused = [...reasons, ...late, ...rises, ...ceilings, ...expired, ...landed, ...dropped];
   if (cannotCount.length > 0) {
     // Not a seam breach: the count could not run, so nothing in this change is known wrong yet.
     console.error(
@@ -1757,6 +1844,7 @@ module.exports = {
   GENERATED,
   compileForkPattern,
   findAnnouncementWarnings,
+  findDroppedAnnouncements,
   findDuplicateKey,
   findExpiredAnnouncements,
   findHiddenUpstreamFiles,
