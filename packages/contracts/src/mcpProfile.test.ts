@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { ProjectId } from "./baseSchemas.ts";
+import { mcpProfileWiderParts } from "./mcpProfileResolve.ts";
 import { ProjectSettingsOverrides, ServerSettings, ServerSettingsPatch } from "./settings.ts";
 
 const decodeFile = Schema.decodeUnknownSync(ServerSettings);
@@ -208,5 +209,21 @@ describe("mcpCarriedProfiles setting (#640)", () => {
     expect(decodePatch({ mcpCarriedProfiles: "refuse" }).mcpCarriedProfiles).toBe("refuse");
     expect(decodePatch({ mcpCarriedProfiles: "apply" }).mcpCarriedProfiles).toBe("apply");
     expect(() => decodePatch({ mcpCarriedProfiles: "ignore" })).toThrow();
+  });
+});
+
+describe("mcpProfileWiderParts", () => {
+  const all = { servers: "all", t3Tools: "all" } as const;
+  const bare = { ...all, builtinTools: "none" } as const;
+  it("names only what the wider profile really keeps, for a refusal", () => {
+    expect(mcpProfileWiderParts(all, all)).toBe("");
+    expect(mcpProfileWiderParts(bare, all)).toBe("");
+    expect(mcpProfileWiderParts(all, bare)).toBe("built-in tools");
+    expect(mcpProfileWiderParts(all, { servers: ["docs"], t3Tools: "all" })).toBe("MCP servers");
+    expect(mcpProfileWiderParts(all, { servers: "all", t3Tools: ["threads"] })).toBe("T3 tools");
+    expect(mcpProfileWiderParts(all, { servers: [], t3Tools: [] })).toBe("MCP servers or T3 tools");
+    expect(mcpProfileWiderParts(all, { servers: [], t3Tools: [], builtinTools: "none" })).toBe(
+      "MCP servers, T3 tools or built-in tools",
+    );
   });
 });

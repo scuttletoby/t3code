@@ -188,10 +188,12 @@ const resultFrame = (ordinal: number) =>
 /** What the session's PreToolUse hooks answer for a call to this tool. */
 const preToolUse = (
   options: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined,
-  tool: string,
+  tool: unknown,
+  /** Replaces the hook input, for a malformed one. */
+  rawInput?: object,
 ) =>
   Effect.promise(async () => {
-    const input = {
+    const input = (rawInput ?? {
       hook_event_name: "PreToolUse",
       tool_name: tool,
       tool_input: {},
@@ -199,7 +201,7 @@ const preToolUse = (
       session_id: NATIVE_THREAD,
       transcript_path: "/tmp/transcript.jsonl",
       cwd: "/workspace",
-    } as unknown as HookInput;
+    }) as unknown as HookInput;
     const answers = [];
     for (const matcher of options?.hooks?.PreToolUse ?? []) {
       for (const hook of matcher.hooks) {
@@ -304,6 +306,35 @@ describe("ClaudeAdapterV2 MCP profile", () => {
         );
         assert.deepStrictEqual(yield* preToolUse(opened[1], "mcp__t3-code__t3_thread_list"), [{}]);
       }),
+  );
+
+  it.effect('the builtinTools "none" guard refuses a call it cannot read (fails closed)', () =>
+    Effect.gen(function* () {
+      const bare = { servers: "all", t3Tools: "all", builtinTools: "none" } as const;
+      const { opened } = yield* runTurns({ mcpProfile: "bare", mcpProfiles: { bare } }, []);
+      const decision = (answer: unknown) =>
+        (answer as { hookSpecificOutput?: { permissionDecision?: string } } | undefined)
+          ?.hookSpecificOutput?.permissionDecision;
+      // A tool name that is not a string, or none at all.
+      for (const tool of [undefined, 42, null, { name: "mcp__x" }]) {
+        const [answer] = yield* preToolUse(opened[0], tool);
+        assert.strictEqual(decision(answer), "deny", `tool_name ${String(tool)}`);
+      }
+      // An input that throws while it is read: a hook that threw would let the call through.
+      const throwing = {
+        hook_event_name: "PreToolUse",
+        get tool_name(): string {
+          throw new Error("malformed hook input");
+        },
+      };
+      const [answer] = yield* preToolUse(opened[0], undefined, throwing);
+      assert.strictEqual(decision(answer), "deny");
+      assert.include(
+        (answer as { hookSpecificOutput: { permissionDecisionReason: string } }).hookSpecificOutput
+          .permissionDecisionReason,
+        "could not check this tool call, so it refused it",
+      );
+    }),
   );
 
   it.effect("refuses the turn, without opening Claude, when the profile is missing", () =>

@@ -126,19 +126,36 @@ export function claudeMcpProfilePlan(
   };
 }
 
-/** Refuses a call to any tool but an MCP server's; hooks run in every mode and in sub-agents. */
+/**
+ * Refuses a call to any tool but an MCP server's; hooks run in every mode and in sub-agents. Fails
+ * closed: a tool name that is not a string, or any error while checking, refuses the call (a hook
+ * that throws would count as a non-blocking error and let the call through).
+ */
 const claudeBuiltinToolsGuard =
   (name: string): HookCallback =>
   async (input) => {
-    if (input.hook_event_name !== "PreToolUse" || input.tool_name.startsWith("mcp__")) return {};
-    return {
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: `MCP profile "${name}" has builtinTools "${MCP_BUILTIN_TOOLS_NONE}", so T3 refused the built-in tool "${input.tool_name}": this thread has only MCP tools. To use it, ${FIX}.`,
-      },
-    };
+    try {
+      if (input.hook_event_name !== "PreToolUse") return {};
+      const toolName: unknown = input.tool_name;
+      if (typeof toolName === "string" && toolName.startsWith("mcp__")) return {};
+      const shown = typeof toolName === "string" ? `the built-in tool "${toolName}"` : "a tool";
+      return builtinToolDenial(
+        `MCP profile "${name}" has builtinTools "${MCP_BUILTIN_TOOLS_NONE}", so T3 refused ${shown}: this thread has only MCP tools. To use it, ${FIX}.`,
+      );
+    } catch {
+      return builtinToolDenial(
+        `MCP profile "${name}" has builtinTools "${MCP_BUILTIN_TOOLS_NONE}", and T3 could not check this tool call, so it refused it.`,
+      );
+    }
   };
+
+const builtinToolDenial = (reason: string) => ({
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse" as const,
+    permissionDecision: "deny" as const,
+    permissionDecisionReason: reason,
+  },
+});
 
 /**
  * `t3-only` and an empty list ignore every server Claude would load itself; a list keeps those named.

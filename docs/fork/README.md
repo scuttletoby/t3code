@@ -1006,12 +1006,22 @@ that is not an MCP tool is refused at the call, with the reason. A thread whose 
 it starts a fresh Claude process for its next turn, so a process that still has its tools is not
 reused. Every other provider (Codex too) cannot run without its built-in tools, so a turn there is
 not started and says why (switch the thread to a Claude instance, or pick another profile); Codex
-also stops a turn it starts on its own for a goal. A child keeps `none` from its parent (never more
+also stops a turn it starts on its own for a goal, but only soon after that turn starts, so its first
+tool calls may already run. A child keeps `none` from its parent (never more
 than its parent), a delegated task carries it to the other machine, and a delegation refuses, before
 sending, a non-Claude instance there, as for any profile narrower than `all`. A T3 from before this
 field reads a profile or carried task with it as one it cannot read and refuses it, never giving it
-the tools. Any other value makes the profile broken. Not a sandbox: a Claude setting that turns
-hooks off, or launch arguments that add tools, can weaken it on a machine the owner set up so.
+the tools; a machine on such a T3 that takes delegated tasks accepts the task, then refuses its
+turn, so a thread that does nothing is left there (never one with more tools). Any other value makes
+the profile broken.
+
+`builtinTools` removes only the provider's own tools. For a really tool-less (read-only) thread,
+also give `t3Tools` a list of only the groups it needs (leave out `orchestration`, `playtest`,
+`worktree`, `preview` and other groups that act: they can ask another thread to act, run build
+steps, change worktrees or run page script), and `servers` a
+list of read-only servers: an outside MCP server may wrap a shell or write files. Not a sandbox: a
+Claude setting that turns hooks off, or launch arguments that add tools, can weaken it on a machine
+the owner set up so.
 
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }

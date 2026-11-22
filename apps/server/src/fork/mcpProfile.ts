@@ -17,6 +17,7 @@ export {
   carryMcpProfile,
   isEveryMcpTool,
   isWithinMcpProfile,
+  mcpProfileWiderParts,
   readCarried,
   resolveMcpProfile,
   type CarriedLookup,

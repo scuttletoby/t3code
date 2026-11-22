@@ -352,6 +352,22 @@ export function isWithinMcpProfile(child: McpProfileSet, parent: McpProfileSet):
   );
 }
 
+/**
+ * What `child` keeps that `parent` does not, named for a refusal ("MCP servers", "T3 tools",
+ * "built-in tools", joined with "or"); an empty string when `child` is within `parent`.
+ */
+export function mcpProfileWiderParts(child: McpProfileSet, parent: McpProfileSet): string {
+  const cut = cutTo(child, parent);
+  const parts = [
+    ...(sameList(cut.servers, child.servers) ? [] : ["MCP servers"]),
+    ...(sameList(cut.t3Tools, child.t3Tools) ? [] : ["T3 tools"]),
+    ...(cut.builtinTools === child.builtinTools ? [] : ["built-in tools"]),
+  ];
+  return parts.length <= 1
+    ? (parts[0] ?? "")
+    : `${parts.slice(0, -1).join(", ")} or ${parts[parts.length - 1]}`;
+}
+
 const FIX = `pick "${MCP_PROFILE_ALL}" for this thread, or fix the profile in Settings`;
 
 /** ` "name"` for a message, or nothing when the name is empty (a carried value it cannot read). */
