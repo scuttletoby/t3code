@@ -119,6 +119,8 @@ describe("the thread menu's MCP profile entry", () => {
     expect(item!.children!.map((child) => [child.id, child.checked ?? false])).toEqual([
       ["mcp-profile:pick:all", false],
       ["mcp-profile:pick:t3-only", false],
+      // The built-in `assistant` is a choice for every thread: it only narrows and gives no role.
+      ["mcp-profile:pick:assistant", false],
       ["mcp-profile:pick:docs", false],
       ["mcp-profile:pick:narrow", true],
       ["mcp-profile:clear", false],

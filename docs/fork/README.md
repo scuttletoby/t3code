@@ -67,6 +67,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.mcpCarriedProfiles`](#servermcpcarriedprofiles)                     | `"apply"`                               | yes | [#640](https://github.com/scuttletoby/t3code/issues/640) |
 | [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`                        | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`server.threadRoles`](#serverthreadroles)                                   | `{"assistant":null,"orchestrators":{}}` | yes | [#138](https://github.com/scuttletoby/t3code/issues/138) |
+| [`server.assistant`](#serverassistant)                                       | `{"enabled":false}`                     | yes | [#879](https://github.com/scuttletoby/t3code/issues/879) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                                 | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                                 | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                                 | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
@@ -360,9 +361,39 @@ policy too (the link names the agent's thread; a call the owner's client sends t
 so each machine refuses an agent's pick outside its own rows, whatever the sending machine's policy
 says. An agent is
 a caller whose session is bound to a thread; the owner's client has none, and anything that reaches
-the server without such a session counts as a person, so the model guard hook is the backstop. A pick is inside when it
-names a model by its full id (#128; an alias such as `opus` is not read as its model, and the
-refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
+the server without such a session counts as a person, so the model guard hook is the backstop.
+Claude's own Agent tool (Task in older Claude Code) is checked too, as each call is made (#128): T3
+gives every Claude session it opens one PreToolUse hook that reads the policy on each call. The call
+must name a model and, for a row with `efforts`, its `effort`. The Agent tool names only aliases
+(`sonnet`, `opus`, `haiku`, `fable`): the alias is read as the full id this machine's Claude model
+list maps it to, the same id T3 shows for the sub-agent, and a row matches when it names either the
+alias (as `delegate_task` reads a row saved as `opus`) or that full id. The refusal says which alias
+and effort pass, or that none does and the row's model can still run through `delegate_task`. The
+mapping is T3's list for Claude, shared by every Claude instance on the machine; a Claude Code whose
+own mapping differs (an older binary, or an alias override in its environment) runs a model the
+check did not read. A name the list does not map is read as given (so it matches no row). A
+built-in sub-agent type that names no model (one that would run on its own, often smaller, model) is
+refused in `enforce`. A `fork` call is read the same way, as the owner decided for every call and
+as the model guard reads it, although Claude runs a fork on the session's own model and effort and
+ignores the model and effort it names. A skill that starts a sub-agent is checked too, on Claude's
+Skill tool: a skill whose frontmatter says `context: fork`, or names `model` or `effort`, must name a
+model from the rows in `model` (and its effort in `effort`), read like an Agent call (an alias or a
+full id); a skill that runs inline and names neither runs on the session's model and is not checked.
+T3 finds the skill as it lists Claude's skills (managed, the config folder's, the project's, and
+plugin skills; first name wins). A skill it cannot find or read (one bundled with Claude Code, an MCP
+server's, a command, one in another folder or with frontmatter it cannot parse) is refused in
+`enforce` and runs with a note in `advise`. `enforce` refuses with the rows, `advise` runs it with a
+note to the agent, an inside pick gets its row's `useFor`, and each call is logged as "model policy
+pick" with route `Agent` or `Skill`. A check that fails refuses the call; while a policy is on when
+the process opens, so does a hook that times out (`onFailure: "block"`). So while a policy is on,
+in `advise` too, Claude Code 2.1.295 or newer is required: an older one refuses to open every new
+query, with an error that asks to remove `onFailure: "block"` from the hooks (a person cannot; turn
+the policy off or update Claude Code). With the policy off it is left out. The hook is fixed
+when the Claude process opens: a process started before this version runs without it until T3
+opens a new one (a new profile, a restart). Workflow `agent()` calls are not read here (the script
+is code); the model guard reads them. On the MCP routes, a pick is inside when it
+names a model as a row names it (#128; an alias such as `opus` is not read as its model there, and
+the refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
 `efforts`, names one of them (`ultracode` counts as its own effort; a row without `efforts` allows
 none) under the option id that driver reads it from (#780): a built-in driver's own id (`effort` for
 Claude and FX, `reasoningEffort` for Codex, Grok, Kiro and Muse, `variant` for OpenCode, `thinking`
@@ -379,7 +410,11 @@ or `ultracode` (#793): a driver can still apply an option the policy does not re
 checked ones (Kiro's `effortLevel`, Grok's native `thought_level`, an ACP agent's `_t3/session-mode`
 that the list hides because it repeats the thought levels, or a `model` option written after the
 model). Such a pick is refused in `enforce` (pick the model in the model field; the option is not
-allowed while the policy is on) and reported in `advise`, as the model guard does. So a second
+allowed while the policy is on) and reported in `advise`, as the model guard does. An option that
+picks an agent or a mode is refused even when the list describes it (#802), as the model guard's
+`DRIVER_MODEL_OPTION_IDS` does: OpenCode's `agent` (an OpenCode agent can carry its own model),
+Kiro's `mode`, and an ACP `_t3/session-mode` on any driver (each brings its own prompt, tools and
+settings the policy cannot see); without a known driver each of them is refused. So a second
 effort option cannot hide a higher effort, and an option cannot change the model. A pick that leaves the ultracode option out runs at the model's default for it, so a model
 whose catalog default is ultracode reads as ultracode. Without a known driver (a call for a linked machine; a `driverKind` the agent names is its
 own claim and is not read), every row naming the model must allow it (the refusal names the drivers
@@ -387,7 +422,16 @@ whose rows refuse it), and each row's driver needs the effort under its own id a
 for an ACP model this machine's catalog does not describe is refused here), every built-in driver's
 effort option and every control this machine's catalog marks for the model is read too (a decoy
 cannot hide a higher effort), a model this machine's catalog turns ultracode on for by default is
-read both with and without it, and an alias gets the same "name the full id" hint as here. The
+read both with and without it, and an alias gets the same "name the full id" hint as here. This
+machine knows only its own catalog (#802): the machine there may turn ultracode on by default for a
+Claude model where this one does not, so on a Claude row a pick that leaves the ultracode option out
+is read both ways too (name `ultracode: false` or `true`); a control only the agent there has is
+refused here (this machine cannot tell whether it sets the effort; start that agent here once so its
+list describes it). When several instances of one driver here name a model's effort control
+differently (two ACP agents listing the same model), the pick must name the effort under each id,
+as which instance runs it is not known; the refusal names every id and why. This fails closed: an
+instance whose list does not describe one of them refuses it there in turn, so pick a model whose
+driver has a fixed effort id, or start the task where one instance runs it. The
 machine there checks the pick again with its own catalog (#780). In `enforce` a pick outside is refused with the rows; in
 `advise` it runs, and `delegate_task`'s reply says what `enforce` would refuse (the other routes
 only log it). A pick inside gets its row's `useFor` in `delegate_task`'s reply. Each checked pick is
@@ -402,7 +446,9 @@ a policy change a retry is refused even when the first call already started its 
 task runs on, with no record here). Not checked by the server: a project's default model (`t3_project_create`,
 `t3_project_update`) and `schedule_task`'s model, which a later run uses; the model guard hook
 (`fork-kit/model-guard`) refuses an agent's such call in `enforce`. The owner's own picks (in the app, or `t3_thread_launch` from the owner's client)
-are never refused; Settings marks the server's model picks outside the rows ("outside policy").
+are never refused; Settings marks the server's model picks outside the rows ("outside policy"),
+each read on the instance of the machine whose settings hold it (#802; the default `claudeAgent` is
+on every machine, with its own catalog).
 
 Left (#731): a `t3_thread_launch` retry with the same key that names no model is not checked again.
 After a policy change, the retry of an idle launch (one without a message) that adds a message starts
@@ -473,8 +519,12 @@ wiring). Fields, each with its default:
   Linux and macOS; `C:\…` or `\\server\…` on Windows). It is a path, never a command line: a
   space is part of the path, and no shell runs it. A relative path or a control character is not
   valid; a save that sets another OS's path is refused, and placing reads one in the file as `off` (below).
-  Exit 0 means free for work, and each line it prints is one more label; any other exit or a timeout
-  means not available.
+  Exit 0 means free for work, and each line it prints is one more label (trimmed and lower-cased as
+  for `labels`; a line that is not one label is skipped, at most 64); any other exit, a program that
+  cannot start, or no answer within 5 seconds means not available, with the reason. The machine
+  that runs it checks the path again on its own OS first and runs it with no arguments; on Windows
+  only an `.exe` runs, since a `.cmd`, `.bat` or script needs a shell. The runner is in the fork
+  (`apps/server/src/fork/factsCommand.ts`); placement row P4 wires it into the facts read.
 - `never`: `[]`. Label groups that must not meet on one machine, such as
   `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
   lower-casing (`["GPU", "gpu"]` is one label, so not a group).
@@ -496,6 +546,14 @@ save of `placement` on this build drops it. Only a person changes it: no agent t
 managed policy can lock it as a whole value (not one field inside it, as for `modelPolicy`).
 "Person-only" means no T3 tool takes it; an agent with a shell can still edit the settings file or
 call the settings RPC, as for `modelPolicy`.
+
+Threat notes for the rows that act on it (P4 and later). `placement` (and `factsCommand` with it)
+is a guard against mistakes, not against an agent that sets out to get around it: an agent with a
+shell on a machine can change that machine's `placement`, point `factsCommand` at its own program,
+or start work there without `delegate_task`. `factsCommand` runs with the server's own rights, so
+only a program the person put there belongs in it. What a linked machine reports about itself
+(labels, `available`, the counts) is taken as that machine's word; a machine whose answer the
+schemas refuse is refused, never read as busy or free.
 
 ```json
 {
@@ -759,19 +817,32 @@ file (light 384 MB, writer 768 MB), and an agent's kind comes from its task `rol
 `review` and `design` are light, anything else or no role is a writer). A role can be wrong: a
 running agent that uses more than a light cost counts as a writer, and so does one whose memory
 cannot be read, whatever its role (it is taken to use a light cost already, so it is never counted
-twice). The floors (2 agents, 1 job) always start, whatever the readings, unless real readings say
+twice). So where agent memory cannot be read, every agent counts as a writer (768 MB, of which 384
+are taken as in use): on macOS, Windows and Linux without systemd, and for Codex threads, which
+share one scope, that caps writers at about 2 to 4 on a small machine. It is the strict side, by
+design. The floors (2 agents, 1 job) always start, whatever the readings, unless real readings say
 "severe". The agent ceiling is 3 per core, at most 64, only on Linux with cgroup v2, agents in their
 own scopes and the kernel's OOM counter; anywhere else it stays at 10 agents and 4 jobs. After an
-OOM kill (`oom_kill` in `/proc/vmstat` rises) or with swap under 10% free and filling, the gate falls
-back to at most 10 agents and 4 jobs. A kill inside an agents' slice also raises each agent cost by
-25% (a kill elsewhere, such as a build box at its own cap, does not; where the slices cannot be
-read, at most 2 raises). Ten minutes of calm, whole readings lift the fallback and take one raise
-off; each further calm spell takes off one more. The gate reads the machine every 30 seconds as
-well as at each ask. A restarted server starts in the fallback and at "elevated", which lifts
-after about a minute of calm readings (no stall, memory above the margin, swap not filling: swap
-that is full of old pages does not count). Readings that fail count as "elevated": the floors still
-start, and after 2 minutes without a whole reading agents are counted against the fixed 10 until one
-comes back. Settings that cannot be read give the fixed 10 too (with a warning), never no limit.
+OOM kill (`oom_kill` in `/proc/vmstat` rises) or with swap under 10% free and filling, the gate
+falls back to at most 10 agents and 4 jobs. Swap is "filling" when its free MB fell by more than the
+rule's `swapFillingMb` since the reading it compares with: that reading is kept, and replaced by a
+newer one only once it is at least 25 seconds old, so a burst of asks a second apart never hides
+slow filling. Only the kernel's own OOM kills count: a killer that runs as a program (earlyoom,
+systemd-oomd) moves no counter, so its kills trip nothing and raise nothing (the next readings still
+see the memory it freed). A kill inside an agents' slice also raises each agent cost by 25% (a kill
+elsewhere, such as a build box at its own cap, does not; where the slices cannot be read, at most 2
+raises). Ten minutes of calm, whole readings lift the fallback and keep the raises (so kills about
+11 minutes apart keep their raise); each further calm spell takes off one. The gate reads the
+machine every 30 seconds as well as at each ask. A restarted server starts in the fallback and at
+"elevated", which lifts after about a minute of calm readings (no stall, memory above the margin,
+swap not filling: swap that is full of old pages does not count). Readings that fail count as
+"elevated": the floors still start, and after 2 minutes without a whole reading agents are counted
+against the fixed 10 until one comes back. A reading that fails, or one with a part that cannot be
+read (a box's pressure file), after the level was "ok" lifts again like a start (memory above the
+margin, not 150 % of it), so it never keeps the gate "elevated" for good; while the level is up from
+pressure seen, such a reading keeps the 150 % bar. A reading of the 30-second timer that fails or
+crashes is logged and the timer goes on. Settings that cannot be read give the fixed 10 too (with a
+warning), never no limit.
 Typed limits (`maxPerMachine`, ...) still apply while `enabled`. Without `mode`, a
 switched-on gate is `"fixed"` (a file from an older build decides exactly as before) and a
 switched-off one is `"enforce"`; a mode this build does not know (from a newer build) is `"fixed"`.
@@ -788,8 +859,9 @@ Switch off in `settings.json`: `"headlessUsageRefreshInterval": 0`.
 ### `server.mcpProfiles`
 
 Named MCP profiles. A profile says which outside MCP servers (`servers`) and which groups of T3's
-own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Two profiles are built in: `all`
-(everything, today's behaviour) and `t3-only` (no outside servers, every T3 tool); a profile cannot
+own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Three profiles are built in: `all`
+(everything, today's behaviour), `t3-only` (no outside servers, every T3 tool) and `assistant` (see
+[assistant.md](assistant.md): no outside servers or built-in tools, three T3 tool groups); a profile cannot
 take their names, and one written in by hand makes that built-in refuse threads until it is removed
 (a save may send `null` under a built-in name to remove it) or renamed.
 
@@ -819,11 +891,17 @@ Claude thread whose groups changed starts a fresh Claude process for its next tu
 Claude lists T3's tools again; that costs one prompt-cache miss. Another provider may keep the
 list it read before: a tool it still shows is refused when called, and one newly kept is there the
 next time it lists. The sets live in the server's memory, one per thread, not per credential (a
-credential reused after a change gets the thread's new set from its next turn): after a restart, or for a thread
+credential reused after a change gets the thread's new set from its next turn), at most 4096 of
+them: past that, the thread that went longest without a turn loses its set, and its next request
+works it out again from the settings as they are then, so a change made since applies to it within
+its running turn (never wider than the settings). After a restart, or for a thread
 whose session lists its tools before its first turn, the set is worked out from the settings at
 the first request. A thread whose profile cannot be worked out (a missing or broken profile, a
 parent that cannot be read, settings that cannot be read, a thread T3 cannot read because it was
-deleted) keeps only the tools every profile keeps and is told why, never `all`. A delegated child
+deleted) keeps only the tools every profile keeps and is told why, never `all`. Such a refusal
+worked out by a request (not by a turn) is reused for 5 seconds, so a list request reads the
+settings once, and is never kept as the thread's set: once the read works, the next request gets
+the real set. A delegated child
 is cut down to its parent's groups like its servers, so it never gets more. Clients from outside
 a thread (signed in with OAuth) have no profile.
 
@@ -926,7 +1004,9 @@ for the thread's folder (Codex's `config.toml`, a project's `.codex/config.toml`
 by `-c mcp_servers…` in the Codex launch arguments) and gives that thread
 `mcp_servers.<name>.enabled = false` for each one the profile leaves out, and `features.apps = false`
 unless the profile names `codex_apps` (Codex's connectors server, which it adds with a ChatGPT
-sign-in and which that list never shows). T3's own servers stay. Other threads on the same
+sign-in and which that list never shows). T3's own servers stay: the `t3-code` and
+`t3-code-direct` entries T3 sends with the load. A server of the owner's own config that has one of
+those names but that T3 did not send is switched off like any other. Other threads on the same
 app-server keep their own sets. Codex's own sub-agents copy their parent's loaded config, these
 settings included. Before each turn (and before a goal is set running) T3 reads the thread's live
 servers from Codex and does not start the turn, saying why and how to go on (pick `all` for the
@@ -937,7 +1017,8 @@ check when the profile was narrowed while Codex had the thread loaded (Codex rea
 config only as it loads it, so the change counts once it loads the thread again: after it has been
 idle a while, or after T3 restarts) and for a server a Codex plugin adds, which T3 cannot switch off
 this way. A turn is also refused when the profile is missing or broken, Codex's servers cannot be listed, a server's name cannot be written as a config key, the
-thread is not in T3's store, or (once any thread on that app-server has a narrower profile) Codex
+thread is not in T3's store (read 4 times over about 2 seconds first, as a thread T3 has just
+made can reach the store a moment after Codex asks for it), or (once any thread on that app-server has a narrower profile) Codex
 asks to load or run a thread T3 cannot match to one of its own. Codex answers the server list only
 once the thread's servers have started, and T3 waits up to 30 seconds for each read: a kept server
 slower to start than that refuses the turn, which can be sent again once it is up. When a resume is
@@ -947,7 +1028,35 @@ which would lose its history: the turn fails, and sending it again resumes the t
 thread store at each load and turn, so a thread missing from the store refuses there too. A turn already running when the profile is narrowed keeps its servers
 until it ends. A Codex thread's T3 tool groups are cut on T3's own server, as on every provider
 (above); each Codex turn fixes them as it starts, also one Codex starts on its own (a goal's next
-turn, a sub-agent's turn, which uses its parent's T3 thread).
+turn). A sub-agent's turn, and a goal set while a turn may run, are checked but never fix the set:
+the sub-agent uses its parent's T3 thread, and must not change the set of the parent's running
+turn. While a goal's turn has its set fixed, T3's server holds that thread's requests, so the turn's
+first T3 tool call already gets the new set. The hold covers only working out the T3 tool set: the
+check of the thread's outside servers runs after it, so T3's own tools already carry the new set
+while that check runs. A hold lasts 10 seconds at most from when the turn started (a list request
+waits once, not once per tool); one still there then is dropped, and the thread keeps only the T3
+tools every profile keeps, with a "try again" reason, until the late check or the thread's next
+turn fixes its set. A hold is taken only by a check that runs, and released however it ends.
+
+Codex is checked at each call too, where it lets T3 see one
+([#814](https://github.com/scuttletoby/t3code/issues/814)). A request the app sends to one MCP
+server of a thread (`mcpServer/tool/call`, `mcpServer/resource/read`, for MCP Apps) is refused when
+the thread's profile leaves that server out, and an MCP server's elicitation (also Codex's
+approval of an MCP tool call, when its approval policy asks for one) is declined then, with a
+warning in the server log. `mcpServerStatus/list` is not refused: it only reads which servers are
+on. Once any thread on an app-server has a narrower profile, those requests on a Codex thread T3
+cannot match to one of its own are refused too. A Codex sub-agent T3 did not see spawned (for
+example one from before an app-server restart) is matched by asking Codex for its parent, at its
+resume and at its turn; a turn on a thread T3 still cannot match waits up to 5 seconds for the
+spawn to show, then is stopped like a refused turn.
+
+Edges of the Codex turn check. It runs as Codex reports the turn started, so a turn Codex starts on
+its own can run briefly (a model step, possibly a call to an outside MCP server when no approval
+is asked) before it is stopped; T3's own tools already get the turn's set. A turn that ends before
+its check does is not stopped: its goal is still paused, without a message. Requests to T3's server
+that come from no thread get every T3 tool, as above (a known limit, fork issue #918). A server a Codex plugin adds is not switched off: every turn is refused while it
+is on. Switching it off through the plugin's own config key is not done, as a key Codex does not
+accept can make it refuse to load the thread at all.
 
 Only Claude and Codex threads apply a profile's outside servers. A thread on any other provider
 would get every outside MCP server whatever its profile says (T3's own tool groups apply on every
@@ -1047,7 +1156,7 @@ the owner set up so.
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
 ```
 
-In the app: **Settings → Fork**, section MCP profiles. It lists `all` and `t3-only` (read-only)
+In the app: **Settings → Fork**, section MCP profiles. It lists the built-ins (read-only)
 and each named profile, and adds, edits and deletes named ones: `servers` is all or a list of
 names (the editor offers the names other profiles use and takes any other; no list of the
 machine's servers reaches the app yet), `t3Tools` all or a list of groups, and a "No built-in tools" box sets `builtinTools: "none"`. `request_secret`,
@@ -1158,7 +1267,12 @@ existed have no `source` and read as `none`, so they start no write turns until 
 smallest idle thread handed off before its cache expires, and `modelSelection` the new session's
 model (not set: the thread's current one). A save with a bad value, a field T3 does not know (a
 typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
-server log), never as `handoff`.
+server log), never as `handoff`. The server also refuses a save that sets a new `command` (here or
+in a project's `handoff`) whose program is not a full path to a file on the server, or lies inside a
+git checkout an agent could edit; the script it hands a known interpreter, a module by name, a
+program `env` finds on the `PATH`, and runners such as `make` or `npm` are refused too. It guards
+against mistakes, not attacks: [handoff.md](handoff.md) lists what it does not catch. A command
+already stored is not checked again. The command gets a short list of the server's environment.
 
 In the app: **Settings → Fork**, section Handoff: the mode, each thread's own mode (added by thread
 id, shown with its title where this client knows the thread), and under Advanced the sizes, who
@@ -1200,6 +1314,18 @@ file after the next save of any setting, since the save writes the settings as r
   "threadRoles": { "assistant": "<thread id>", "orchestrators": { "<project id>": "<thread id>" } }
 }
 ```
+
+### `server.assistant`
+
+`enabled` offers **Make assistant** in **Settings → Fork**, section Assistant: it makes a thread in
+the Scratch project, picks the built-in MCP profile `assistant` for it and points
+`threadRoles.assistant` at it, in two saves from the person (the pick first, before the thread
+exists). Off (the default): no such button; a
+thread already named the assistant stays as it is. Only the person can change it. Anything but
+`{"enabled": true}` in the file reads as off; a save with a bad value is refused. The thread
+`threadRoles.assistant` names never gets more than the profile `assistant`, whatever its pick (a
+managed policy that owns `mcpThreadProfiles` can drop the pick). More in
+[assistant.md](assistant.md).
 
 ### `projectOverride.waitChecks`
 
@@ -1308,9 +1434,28 @@ upstream's, for this machine and for a linked one (the read is forwarded there a
 When the slot gate cannot be read (its count read fails or takes longer than its own limit, the
 gate is not running, or the settings cannot be read), `placement` says `available: false` with a
 reason and gives no count, so an agent never sees a guessed "slots free". A linked machine on an
-older T3 leaves both fields out, which means "no facts", never a failed read. Nothing is stored:
-each read measures again. The fields are part of the tool's result, not of the tool list an agent
-loads, so the tool context budget is unchanged.
+older T3 leaves both fields out, which means "no facts", never a failed read. The host sample has its
+own limit (2 seconds), and it and the slot count are read at the same time. With agent slots off, a
+slow sampler leaves out `hostResources` without delaying `placement`. With them on, the gate's own
+count reads the same sample for its memory floor, so a hung sampler also gives `placement` "not
+available" (the gate could not count) after 6 seconds, the same answer the gate gives at launch. Facts are never stored: each read measures again.
+The gate's status read does its own clean-up first (it drops used-up slot holds of waits, the same
+step `wait_list` runs); the facts read gives that status read at most 6 seconds (the gate's own
+count limit plus one), so a read can take that long on a busy machine, and it changes nothing but
+those spent holds. `available` and `slotsFree` count the
+machine limit and the memory floor only: the per-account limits of `agentSlots` are not in them, so
+a machine with free slots can still refuse a task for one account; the later placement rows check
+the account at launch (the gate does). The fields are part of the tool's result, not of the tool
+list an agent loads, so the tool context budget is unchanged.
+
+When placement reads a linked machine's answer (`factsFromAnswer` in the same file), it decodes it
+with these schemas: neither field is "no facts", as above; an answer they refuse is "facts not
+valid", and the machine is refused, even when it is named. This machine with no CPU and memory
+sample (no sampler, or one that cannot measure CPU) is still a place for work when every other
+rule passes, ranked last; a linked machine without them is not. Its weight still counts (`manual`
+or an unknown word keeps it out), and so does upstream's 5 % free-memory limit when memory was
+measured. With agent slots on, its gate checks again at launch; with them off, nothing checks,
+as in upstream's own launch on this machine.
 
 ## Install the fork today
 
@@ -1363,6 +1508,7 @@ switch.
 - [host-tools.md](host-tools.md): design for agents on a person's own computer (no code yet).
 - [playtest.md](playtest.md): the playtest adapter contract (steps, environment, exit codes).
 - [handoff.md](handoff.md): handoff instead of compaction (when, the quiet rule, the message).
+- [assistant.md](assistant.md): the assistant thread (setup, its profile, what it cannot do yet).
 - [run-records.md](run-records.md): one record per agent run (usage, time, labels) and the weekly
   summary.
 - [`.github/fork-fleet.md`](../../.github/fork-fleet.md): the fleet runners and `CI_RUNNERS`.

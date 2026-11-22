@@ -13,8 +13,17 @@ import { TrimmedString } from "./baseSchemas.ts";
 export const MCP_PROFILE_ALL = "all";
 /** No outside servers, every T3 tool. */
 export const MCP_PROFILE_T3_ONLY = "t3-only";
-/** The two profiles every build knows; `mcpProfiles` cannot redefine them. */
-const MCP_BUILT_IN_PROFILE_NAMES: ReadonlyArray<string> = [MCP_PROFILE_ALL, MCP_PROFILE_T3_ONLY];
+/**
+ * The assistant's: no outside servers, no built-in tools, and the T3 groups `orchestration`,
+ * `threads` and `projects` (docs/fork/assistant.md lists what they can do).
+ */
+export const MCP_PROFILE_ASSISTANT = "assistant";
+/** The profiles every build knows; `mcpProfiles` cannot redefine them. */
+const MCP_BUILT_IN_PROFILE_NAMES: ReadonlyArray<string> = [
+  MCP_PROFILE_ALL,
+  MCP_PROFILE_T3_ONLY,
+  MCP_PROFILE_ASSISTANT,
+];
 /**
  * A profile's `builtinTools`: `none` starts the thread with no built-in tools of the provider (no
  * shell, files or web; only MCP tools). Only Claude applies it; a turn on any other driver is
@@ -31,7 +40,7 @@ const MCP_PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/u;
 export const McpProfileName = Schema.String.check(Schema.isPattern(MCP_PROFILE_NAME_PATTERN));
 export type McpProfileName = typeof McpProfileName.Type;
 
-/** True for `all` and `t3-only`. */
+/** True for a built-in profile's name: `all`, `t3-only` and `assistant`. */
 export const isBuiltInMcpProfileName = (name: string): boolean =>
   MCP_BUILT_IN_PROFILE_NAMES.includes(name);
 

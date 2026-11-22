@@ -6,8 +6,7 @@
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
 import {
   MCP_BUILTIN_TOOLS_NONE,
-  MCP_PROFILE_ALL,
-  MCP_PROFILE_T3_ONLY,
+  MCP_BUILT_IN_PROFILES,
   MCP_SUBAGENT_INHERIT,
   MCP_T3_TOOL_GROUPS,
   MCP_T3_UNGROUPED_TOOLS,
@@ -41,6 +40,13 @@ export type McpProfilePanelSettings = Pick<
 /** T3 tools every profile keeps, whatever its `t3Tools` says. */
 export const MCP_ALWAYS_KEPT_NOTE = `${MCP_T3_UNGROUPED_TOOLS.map((tool) => `\`${tool}\``).join(", ")} always stay, whatever the profile says.`;
 
+/**
+ * Under the T3 tool groups: only requests from a thread are filtered. The
+ * agent-facing refusal text leaves this out on purpose, so it does not point a refused agent at it.
+ */
+export const MCP_NOT_A_SANDBOX_NOTE =
+  "Profiles are not a sandbox: only requests that come from a thread are filtered. A request with no thread (an OAuth client, the `t3 thread` CLI, a script run from a shell with the owner's access) gets every T3 tool.";
+
 export const MCP_PICK_APPLIES_NOTE = "A change applies from the next message.";
 
 export type McpProfileRow =
@@ -65,11 +71,6 @@ export type McpProfileRow =
       readonly issue: string;
       readonly removable: boolean;
     };
-
-const BUILT_IN_SETS: ReadonlyArray<readonly [string, McpProfileSet]> = [
-  [MCP_PROFILE_ALL, { servers: "all", t3Tools: "all" }],
-  [MCP_PROFILE_T3_ONLY, { servers: [], t3Tools: "all" }],
-];
 
 const entriesOf = (profiles: unknown): ReadonlyArray<readonly [string, unknown]> =>
   typeof profiles === "object" && profiles !== null && !Array.isArray(profiles)
@@ -97,7 +98,7 @@ export function mcpProfileRows(
   knownServers: ReadonlyArray<string> | null,
 ): ReadonlyArray<McpProfileRow> {
   const entries = entriesOf(settings.mcpProfiles);
-  const builtIns = BUILT_IN_SETS.map(([name, profile]): McpProfileRow => {
+  const builtIns = Object.entries(MCP_BUILT_IN_PROFILES).map(([name, profile]): McpProfileRow => {
     // A save never writes one: a hand edit, and the resolver refuses the built-in while it stays.
     if (entries.some(([entryName]) => entryName === name)) {
       return {
@@ -396,6 +397,7 @@ const SOURCE_TEXT = {
   "subagent-rule": "the sub-agent rule",
   project: "the project's default",
   environment: "the default profile",
+  "assistant-role": "the assistant thread's limit",
 } as const;
 
 /** One line on what a thread gets, from the resolver's result. */
