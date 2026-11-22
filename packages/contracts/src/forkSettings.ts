@@ -42,6 +42,7 @@ import {
   ReviewRulesPatch,
   ReviewRulesProjectPatch,
 } from "./reviewRules.ts";
+import { ThreadRolesFromSettingsFile, ThreadRolesPatch } from "./threadRoles.ts";
 import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   UsagePacingGateMode,
@@ -66,6 +67,7 @@ export * from "./modelPolicy.ts";
 export * from "./placement.ts";
 export * from "./playtest.ts";
 export * from "./reviewRules.ts";
+export * from "./threadRoles.ts";
 export * from "./usagePacing.ts";
 
 /** How often usage limits refresh while no client watches; 0 turns it off. */
@@ -134,6 +136,8 @@ export const ForkServerSettingsFields = {
   placementNeeds: PlacementNeedsFromSettingsFile.pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  /** Which thread is the assistant and each project's orchestrator; none. A bad entry drops alone. */
+  threadRoles: ThreadRolesFromSettingsFile,
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -177,19 +181,21 @@ export const ForkServerSettingsPatchFields = {
   placement: Schema.optionalKey(PlacementSettingsPatch),
   /** Strict: a save refuses a bad label; it replaces a kept bad value. */
   placementNeeds: Schema.optionalKey(PlacementNeedsPatch),
+  /** Strict ids; the server also refuses a pointer to a thread that cannot hold the role. */
+  threadRoles: Schema.optionalKey(ThreadRolesPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
- * How a patch field changes the stored value: `replace` whole; `merge-fields` only the named fields.
- * Per entry (`null` removes it): `mergeEntries` merges fields, a new entry starting from its
- * defaults; `replaceEntries` replaces the entry whole and makes it newest. A save that would leave
- * more than `maxEntries` (and more than before) is refused; no entry is dropped to make room.
+ * `replace` whole; `merge-fields` the named fields; `fields` each named field by its own rule. Per
+ * entry (`null` removes): `mergeEntries` merges, starting from defaults; `replaceEntries` replaces
+ * whole, newest last. A save leaving more than `maxEntries` (and more than before) is refused.
  */
 export type ForkPatchRule =
   | "replace"
   | "merge-fields"
   | { readonly mergeEntries: Readonly<Record<string, unknown>> }
-  | { readonly replaceEntries: { readonly maxEntries?: number } };
+  | { readonly replaceEntries: { readonly maxEntries?: number } }
+  | { readonly fields: Readonly<Record<string, ForkPatchRule>> };
 
 /** One rule per fork patch field. */
 export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatchRule } = {
@@ -225,10 +231,20 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   // taken (it replaces the text); the save check refuses a partial one (forkSettingsPatch.ts).
   placement: "merge-fields",
   placementNeeds: "replace",
+  // One orchestrator per project entry, so two people setting different projects keep both; two
+  // saves of the same project, the last one wins.
+  threadRoles: { fields: { assistant: "replace", orchestrators: { replaceEntries: {} } } },
 };
 
-/** The client settings' fork fields (stored in the browser); none yet. */
-export const ForkClientSettingsFields = {};
+/**
+ * The client settings' fork fields (stored on each device, not on the server). Their patch fields
+ * (`ForkClientSettingsPatchFields`, spread into upstream's `ClientSettingsPatch`; the line is
+ * announced in .github/fork-seams.json) come with the first change that saves one.
+ */
+export const ForkClientSettingsFields = {
+  /** Calm sidebar: role threads on top, every other thread folded into one group; off. */
+  calmSidebarEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+};
 
 /** Fork settings a project may override; listed in `PROJECT_SCOPED_SERVER_SETTING_KEYS`. */
 export const FORK_PROJECT_SCOPED_KEYS = [
