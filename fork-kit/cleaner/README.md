@@ -273,7 +273,9 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 
 A pull request closed without a merge finishes its branch's worktree as a merged one does (#982): GitHub keeps
 its head (`refs/pull/<n>/head`), and the branch stays in the clone, so the same checks show nothing is only there.
-A full clone still goes only when GitHub has every commit in it. The [merged branches](#merged-branches) step
+A full clone still goes only when GitHub has every commit in it, and a closed pull request's head counts as on
+GitHub: when its branch was deleted there, the clone's branch lives on GitHub only in `refs/pull/<n>/head`, and the
+clone is removed. The [merged branches](#merged-branches) step
 takes merged pull requests only.
 
 A worktree is removed with `git worktree remove`, never with `--force`: git itself refuses when a file changed

@@ -1531,6 +1531,14 @@ class T3Capacity(Case):
                 self.assertEqual(code, 1, out)
                 self.assertIn('heavy.disk', out.splitlines()[-1])
 
+    def test_a_floor_of_0_is_off_and_reads_no_disk(self):
+        # floorGb 0 turns the floor off: the disk is not read, so a path it cannot read is no NOT OK either
+        missing = os.path.join(self.tmp, 'not-there')
+        self.machine_file({'version': 1, 'heavy': {'disk': {'floorGb': 0, 'path': missing}}})
+        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB='')
+        self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'), out)
+        self.assertTrue(out.splitlines()[0].endswith(' disk=off'), out)
+
     def test_a_disk_setting_is_no_unknown_key_for_the_rest_of_the_kit(self):
         self.machine_file({'version': 1, 'heavy': {'disk': {'floorGb': 25}}})
         self.assertEqual(self.facts('--fresh')[0], 0, 'heavy facts accepts the section with a disk key')

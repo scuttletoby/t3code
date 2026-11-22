@@ -850,6 +850,19 @@ class Clones(Case):
         self.assertEqual(code, 0, lines)
         self.assertFalse(os.path.exists(clone))
 
+    def test_a_closed_pull_request_whose_branch_github_deleted_finishes_the_clone(self):
+        # #982: a pull request closed without a merge keeps its head on GitHub (refs/pull/N/head) after its branch is
+        # deleted there, so that head counts as on GitHub: the clone holds nothing that is only here
+        clone = self.clone('base')
+        self.git(clone, 'checkout', '-q', '-b', 'base-work')
+        self.commit(clone)
+        self.push(clone)
+        self.pr(clone, 20, state='closed')
+        self.git(self.origin(), 'branch', '-q', '-D', 'base-work')
+        item = self.assertDeletes(self.planned(), clone, 'worktrees')
+        self.assertEqual(item.kind, 'clone')
+        self.assertIn('#20 closed 2 days ago', item.why)
+
     def test_a_clone_goes_only_after_its_worktrees(self):
         clone = self.finished_clone()
         tree = self.finished(clone=clone)
@@ -1131,6 +1144,9 @@ MUTATIONS = {
     'clone: a live answer, not tracking refs': ('rules', 'has = sorted(here | present(path, refs.values()))',
                                                 "has = sorted(here | present(path, refs.values())) + ['--remotes']",
                                                 Clones, 'test_a_commit_only_a_stale_tracking_ref_names_keeps_the_clone'),
+    'clone: a closed PR head is on GitHub': ('rules', "for row in prs['merged'] + prs['closed'] + prs['open']]",
+                                             "for row in prs['merged'] + prs['open']]", Clones,
+                                             'test_a_closed_pull_request_whose_branch_github_deleted_finishes_the_clone'),
     'clone: tags': ('rules', 'if missing:', 'if False:', Clones, 'test_tags_github_does_not_have_keep_the_clone'),
     'clone: reflog commits': ('rules', "lonely(path, ['--all', '--reflog'], has)", "lonely(path, ['--all'], has)", Clones, 'test_a_commit_only_a_reflog_still_has_keeps_the_clone'),
     'delete: a worktree still the one the last check judged': ('rules', 'if item.look is None or (st.st_dev, st.st_ino) != item.look.ident:',

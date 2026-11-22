@@ -586,6 +586,25 @@ class LowDisk(Case):
             with self.subTest(bad=bad), self.assertRaises(machine_file.MachineFileError):
                 self.cfg(report=bad)
 
+    def test_a_folder_on_another_disk_or_at_a_mount_point_is_not_walked_or_named(self):
+        # a share mounted in the home folder would otherwise be walked in full, and it is not this disk's space
+        self.big(self.path('home', 'work', 'a.bin'), 1)
+        share, other = self.big(self.path('home', 'share', 'b.bin'), 3), self.big(self.path('home', 'other', 'c.bin'), 2)
+        share, other = os.path.dirname(share), os.path.dirname(other)
+        real = os.lstat
+
+        def lstat(path, *a, **kw):              # `other` is on another disk: another device number
+            st = real(path, *a, **kw)
+            if path != other:
+                return st
+            return types.SimpleNamespace(**{**{k: getattr(st, k) for k in dir(st) if k.startswith('st_')},
+                                            'st_dev': st.st_dev + 1})
+        with mock.patch.object(self.c.report.os, 'lstat', lstat):
+            code, lines = self.report(self.cfg(), disk=(150 * GB, 200 * GB, None, 50 * GB), mounts=lambda: {'/', share})
+        self.assertEqual(code, 0, lines)
+        tail = lines[0].split('; ')[-1]
+        self.assertTrue(tail.endswith(f'largest folders in {self.home}: work 1.0 MB'), tail)
+
     @unittest.skipIf(os.geteuid() == 0, 'root reads every folder')
     def test_a_folder_it_cannot_read_in_full_says_at_least(self):
         self.big(self.path('home', 'locked', 'inner', 'a.bin'), 2)
@@ -618,6 +637,10 @@ class Command(Case):
 
 
 MUTATIONS = {
+    'low disk: another disk is not walked': ('report', ' or st.st_dev != home_dev', '', LowDisk,
+                                             'test_a_folder_on_another_disk_or_at_a_mount_point_is_not_walked_or_named'),
+    'low disk: a mount point is not walked': ('report', ' or path in sizer.mount_points', '', LowDisk,
+                                              'test_a_folder_on_another_disk_or_at_a_mount_point_is_not_walked_or_named'),
     'out: the mark moves only after the line is written': ('report', "            return 1\n    say(line)", "            pass\n    say(line)",
                                                            Freed, 'test_with_out_the_line_is_written_before_the_mark_moves'),
     'out: synced': ('report', '        os.fsync(fd)\n', '', Freed, 'test_with_out_the_line_is_written_before_the_mark_moves'),

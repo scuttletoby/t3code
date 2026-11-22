@@ -568,12 +568,15 @@ def disk_free_mb(folder):
 
 def disk_check(hq):
     """t3-capacity's disk floor (#982): (the token for its first line, why it is NOT OK or None). Free disk below
-    heavy.disk.floorGb on the filesystem of heavy.disk.path is NOT OK; so is a disk or a setting it cannot read."""
+    heavy.disk.floorGb on the filesystem of heavy.disk.path is NOT OK; so is a disk or a setting it cannot read.
+    A floor of 0 is off: the disk is not read at all (`disk=off`)."""
     mf = hq.machine_file
     try:
         s = disk_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None, os.getuid() if ROOT else 0)
     except Exception as e:
         return 'disk=?', f'{e.__class__.__name__}: {e}'
+    if s['floorGb'] == 0:
+        return 'disk=off', None
     folder = os.path.expanduser(s['path'])
     try:
         free = disk_free_mb(folder)
