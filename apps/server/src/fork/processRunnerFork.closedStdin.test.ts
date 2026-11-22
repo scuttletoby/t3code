@@ -11,7 +11,7 @@ import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
-import { ChildProcessSpawner } from "effect/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as ProcessRunner from "../processRunner.ts";
 import { isClosedStdin } from "./processRunnerFork.ts";
@@ -98,8 +98,34 @@ describe("a child that closed its stdin", () => {
     }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer)))),
   );
 
-  it("is told by the broken pipe's code anywhere under the error", () => {
+  it.effect("ends with its own exit code when Node already closed its stdin", () =>
+    Effect.gen(function* () {
+      const result = yield* runOn(
+        exitedChild({ code: 3, stdout: "", stdin: "ERR_STREAM_DESTROYED" }),
+        { command: "program", args: [], stdin: "input" },
+      );
+      assert.strictEqual(result.code, 3);
+    }),
+  );
+
+  it.live("a write after a real child has exited counts as a closed stdin", () =>
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const child = yield* spawner.spawn(
+        ChildProcess.make(process.execPath, ["-e", "process.exit(3)"]),
+      );
+      yield* child.exitCode;
+      const error = yield* Stream.run(Stream.encodeText(Stream.make("late")), child.stdin).pipe(
+        Effect.flip,
+      );
+      assert.isTrue(isClosedStdin(error));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it("is told by the closed pipe's code anywhere under the error", () => {
     assert.isTrue(isClosedStdin(stdinFailure("EPIPE")));
+    assert.isTrue(isClosedStdin(stdinFailure("ERR_STREAM_DESTROYED")));
+    assert.isTrue(isClosedStdin(stdinFailure("ERR_STREAM_PREMATURE_CLOSE")));
     assert.isTrue(isClosedStdin({ code: "EPIPE" }));
     assert.isFalse(isClosedStdin(stdinFailure("EIO")));
     assert.isFalse(isClosedStdin(undefined));
