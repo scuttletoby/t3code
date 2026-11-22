@@ -23,6 +23,7 @@ import { delegatedTask, PARENT } from "../../../fork/delegatedResults/delegatedR
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
+import { Playtest } from "../../../playtest/PlaytestLayer.ts";
 import { ServerSettingsService } from "../../../serverSettings.ts";
 import { Waits } from "../../../waits/WaitWorker.ts";
 import * as McpHttpServer from "../../McpHttpServer.ts";
@@ -137,6 +138,7 @@ const toolsLayer = (world: World) => {
         ),
     }),
     Layer.mock(Waits)({}),
+    Layer.mock(Playtest)({ filePath: "unused" }),
     Layer.mock(RemoteDelegation.RemoteDelegation)({
       // The environment that went away never answers; the other one says the run is going.
       runStatus: (_scope, task) => {

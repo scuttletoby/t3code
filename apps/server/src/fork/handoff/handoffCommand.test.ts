@@ -178,4 +178,22 @@ describe("handoffCommand", () => {
       failedWith((yield* runIn(node("console.log('x')"), { root: null })).result, "project");
     }).pipe(Effect.scoped, Effect.provide(services)),
   );
+
+  it.live("a missing program reads as not started every time, not as unreadable output", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "handoff-command-" });
+      const source = yield* make().pipe(Effect.provide(projectAt(root)));
+      // `timeout` exits 127 at once, often before its closed stdin is written: that write then
+      // failed with EPIPE in a few runs of ten, read as "its output could not be read".
+      for (let run = 0; run < 30; run += 1) {
+        const result = yield* source.run({
+          command: ["/no/such/handoff-program"],
+          threadId,
+          projectId,
+        });
+        failedWith(result, "could not start");
+      }
+    }).pipe(Effect.scoped, Effect.provide(services)),
+  );
 });
