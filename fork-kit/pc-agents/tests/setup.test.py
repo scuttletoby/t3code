@@ -796,6 +796,98 @@ class StaleFirewall(Case):
         self.assertIn('stop t3code-agents.service', self.log())
 
 
+UNIT = '/etc/systemd/system/t3code-agents.service'
+# The unit fake_distro's CONFIG gives, as the kit wrote it before the `gpu` setting existed (#1024): with no setting
+# (or "gpu": false) the unit stays byte for byte this one. Change it only when the unit itself is meant to change.
+DEFAULT_UNIT_SHA = '11263b1dddb775e704fec1371ee56b99965581a35cfee361c3e02f8e8e98142a'
+HIDDEN_WSL = 'InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl -/run/tailscale'
+GPU_LINES = ['InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/run/tailscale', 'TemporaryFileSystem=/usr/lib/wsl:ro',
+             'BindReadOnlyPaths=-/usr/lib/wsl/lib -/usr/lib/wsl/drivers', 'BindPaths=-/dev/dxg',
+             'DeviceAllow=/dev/dxg rw']
+
+
+class Gpu(Case):
+    """`gpu` in the machine file (#1024): off by default, the unit as before; on, /dev/dxg and WSL's GPU driver
+    folders, read-only, and nothing else of /usr/lib/wsl; off again, the unit as before."""
+    def unit_lines(self):
+        return self.read(UNIT).splitlines()
+
+    def test_default_unit_unchanged(self):
+        c = k.config()
+        self.assertIs(c['gpu'], False)
+        self.assertEqual(k.sha(k.render(c)[UNIT][0]), DEFAULT_UNIT_SHA)
+        self.assertIn(HIDDEN_WSL, k.sandbox(c))
+        for line in GPU_LINES:
+            self.assertNotIn(line, k.sandbox(c))
+        self.machine({**CONFIG, 'gpu': False})
+        self.assertEqual(k.render(k.config()), k.render(c))   # "gpu": false is no setting, every file the same
+
+    def test_on_then_run_again_then_off_again(self):
+        self.ready()
+        default = self.read(UNIT)
+        os.unlink(self.path('/log/systemctl'))
+        self.machine({**CONFIG, 'gpu': True})
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        lines = self.unit_lines()
+        for line in GPU_LINES:
+            self.assertIn(line, lines)
+        self.assertNotIn(HIDDEN_WSL, lines)
+        # only those lines changed: the rest of the unit (every other wall) is as it was
+        self.assertEqual([x for x in lines if x not in GPU_LINES], [x for x in default.splitlines() if x != HIDDEN_WSL])
+        self.assertIn('restart t3code-agents.service', self.log())   # T3 runs under the new unit
+        self.assertFalse(os.path.lexists(self.path(k.PENDING)))
+        self.assertIn('PASS  gpu  GPU access is on', self.check()[1])
+        # again with the setting unchanged: nothing changes, no restart
+        before = self.snapshot()
+        os.unlink(self.path('/log/systemctl'))
+        self.assertEqual(self.setup_run()[0], 0)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse([line for line in self.log() if line.startswith('restart')])
+        # off again: the unit is the default one again, byte for byte, and T3 restarts under it
+        self.machine({**CONFIG, 'gpu': False})
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.read(UNIT), default)
+        self.assertEqual(k.sha(default), DEFAULT_UNIT_SHA)
+        self.assertIn('restart t3code-agents.service', self.log())
+        self.assertIn('PASS  gpu  GPU access is off', self.check()[1])
+
+    def test_older_setups_unit_stays_as_it_is(self):
+        """A distro an older kit set up (no setting): its unit is the default one; writing "gpu": false into the
+        machine file, or a setup run of this kit, changes nothing and restarts nothing."""
+        self.ready()
+        self.assertEqual(k.sha(self.read(UNIT)), DEFAULT_UNIT_SHA)
+        before = self.snapshot()
+        for section in (CONFIG, {**CONFIG, 'gpu': False}):
+            with self.subTest(section=section):
+                self.machine(section)
+                os.unlink(self.path('/log/systemctl'))
+                self.assertEqual(self.setup_run()[0], 0)
+                self.assertEqual(self.same_files(skip=('/etc/fork-kit/machine.json',)),
+                                 {p: (v[0], v[1], v[2], v[5]) for p, v in before.items()
+                                  if p != '/etc/fork-kit/machine.json'})
+                self.assertFalse([line for line in self.log() if line.startswith('restart')])
+        self.assertEqual(self.check()[0], 0)
+
+    def test_not_a_boolean_is_refused(self):
+        for bad in ('true', 1, None, {'enabled': True}):
+            with self.subTest(gpu=bad):
+                self.machine({**CONFIG, 'gpu': bad})
+                code, out = self.setup_run()
+                self.assertEqual(code, 2, out)
+                self.assertIn('pc-agents.gpu: must be bool', out)
+
+    def test_as_agent_gets_the_same_walls(self):
+        self.machine({**CONFIG, 'gpu': True})
+        self.ready()
+        self.assertEqual(self.call(cli.main, ['as-agent', '--', 'true'])[0], 0)
+        argv = self.log('systemd-run')
+        for line in GPU_LINES:
+            self.assertIn('--property=' + line, argv)
+        self.assertNotIn('--property=' + HIDDEN_WSL, argv)
+
+
 class AsAgent(Case):
     def test_runs_as_the_agent_under_the_units_walls(self):
         self.ready()

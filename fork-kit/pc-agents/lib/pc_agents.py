@@ -119,6 +119,7 @@ SPEC = {
     'tailscaleTag': (str, machine_file.REQUIRED, lambda v: None if re.fullmatch(r'tag:[a-z0-9-]{1,50}', v) else 'tag:name'),
     'devPorts': (str, '4100-4199', lambda v: None if port_range(v) else 'LOW-HIGH, 1024 to 65535, like 4100-4199'),
     'autoUpdate': (dict, {'enabled': False, 'follow': ''}, lambda v: auto_update_problem(v)),
+    'gpu': (bool, False, None),
 }
 REPO_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.+$)[A-Za-z0-9._-]{1,100}')   # not `.` or `..`
 AUTO_UPDATE = {'enabled': (bool, machine_file.REQUIRED, None),
@@ -239,6 +240,29 @@ def dropin_dirs(unit):
     return [unit + '.d', kind + '.d'] + ['-'.join(parts[:i]) + f'-.{kind}.d' for i in range(1, len(parts))]
 
 
+# What the unit hides of WSL's own paths: Windows' drives, WSL's sockets, X and its GPU driver folders (/usr/lib/wsl).
+HIDDEN = 'InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl -/run/tailscale'
+# `gpu` on (README "GPU access"): those lines instead, in this order, and nothing else changes. /usr/lib/wsl becomes an
+# empty read-only tmpfs with only WSL's GPU libraries (lib: libcuda.so.1, libdxcore.so, nvidia-smi, ...) and the
+# Windows GPU driver store (drivers: NVIDIA's container toolkit needs libcuda.so.1.1, nvcubins.bin and more from it)
+# bound in, read-only. /dev/dxg (WSL's GPU channel to Windows) needs two lines: PrivateDevices=yes leaves it out of
+# the unit's /dev (BindPaths puts the node back) and makes the device policy closed (DeviceAllow opens this one
+# device). A missing path or device is skipped ("-"), so T3 still starts on a PC whose WSL has no GPU.
+GPU = ('InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/run/tailscale',
+       'TemporaryFileSystem=/usr/lib/wsl:ro',
+       'BindReadOnlyPaths=-/usr/lib/wsl/lib -/usr/lib/wsl/drivers',
+       'BindPaths=-/dev/dxg',
+       'DeviceAllow=/dev/dxg rw')
+
+
+def gpu_lines(text):
+    """Whether a unit text has GPU access: True (every GPU line, not HIDDEN), False (HIDDEN, no GPU line) or None
+    (a mix: neither the kit's unit with the setting on nor off)."""
+    lines = set(text.splitlines())
+    has = [g in lines for g in GPU]
+    return True if all(has) and HIDDEN not in lines else False if not any(has) and HIDDEN in lines else None
+
+
 def sandbox(c):
     """The unit's walls, one `Key=value` each: T3's unit runs under them, and so does `pc-agents as-agent`."""
     return [
@@ -253,7 +277,7 @@ def sandbox(c):
         'PrivateDevices=yes',
         'PrivateIPC=yes',
         'ProtectProc=invisible',
-        'InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl -/run/tailscale',
+        *(GPU if c['gpu'] else (HIDDEN,)),
         f'IPAddressDeny={" ".join(BLOCKED4 + BLOCKED6)}',
         f'IPAddressAllow={" ".join(c["peers"] + c["allow"])}',
         'SocketBindDeny=any',

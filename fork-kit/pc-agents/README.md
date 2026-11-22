@@ -7,7 +7,7 @@ so the agent cannot undo it:
 
 | Wall                    | What the kit does                                                                                                                                                                                                                                                                                                                                  |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No Windows files        | `/etc/wsl.conf`: `[automount] enabled=false`, `mountFsTab=false`; the unit also hides `/mnt`, `/run/WSL`, `/tmp/.X11-unix`, `/usr/lib/wsl` and `/run/tailscale` (the Tailscale daemon's socket)                                                                                                                                                    |
+| No Windows files        | `/etc/wsl.conf`: `[automount] enabled=false`, `mountFsTab=false`; the unit also hides `/mnt`, `/run/WSL`, `/tmp/.X11-unix`, `/usr/lib/wsl` (but for its GPU folders, read-only, with `gpu`) and `/run/tailscale` (the Tailscale daemon's socket)                                                                                                   |
 | No Windows programs     | `[interop] enabled=false`, `appendWindowsPath=false`; WSL's binfmt handler masked                                                                                                                                                                                                                                                                  |
 | No way out of the user  | one login user (`agent`), in no group but its own, no sudo rule, login shell `/usr/sbin/nologin`; the distro's default user is `root`, not `agent`; cron, at, ssh and the agent's systemd user manager (`user@<uid>.service`) masked, so no login, linger or user unit of the agent runs anything outside T3's unit                                |
 | A sandboxed unit        | `t3code-agents.service` (system unit, `User=agent`): `ProtectSystem=strict`, only `/home/agent` writable, no `AF_VSOCK` (Hyper-V sockets to Windows), io_uring off, no namespaces, `PrivateDevices`, `MemoryMax`, `CPUQuota`                                                                                                                       |
@@ -32,6 +32,8 @@ so the agent cannot undo it:
   takes, checked against `SHA256SUMS`), unpacks it with no links out of its folder and makes it root's alone, never
   running any of it; it installs again a runtime an older setup left otherwise;
 - no Windows drive is mounted;
+- GPU access is what the machine file's `gpu` says (`check` names it, on or off) and T3's unit says the same (see
+  "GPU access");
 - the loaded firewall table is the one from the kit's `firewall.nft`: `pc-agents load-firewall` saves the file's hash
   and what the kernel then lists, and any later change, or an older file left loaded, differs;
 - the default gateway (the Windows host) is in a blocked range, and no `allow` or `peers` entry lets it through;
@@ -70,22 +72,23 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 }
 ```
 
-| Key                     | What                                                                                                                                        |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `organization`          | the name the managed policy shows in T3's settings                                                                                          |
-| `t3Version`             | the exact T3 version (the linking T3's), 0.1.7 or newer (see below); its release files, as `scripts/install.sh`'s                           |
-| `t3ReleaseBaseUrl`      | where that version's release files are (`T3CODE_RELEASE_BASE_URL` of `scripts/install.sh`)                                                  |
-| `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                                                |
-| `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                                           |
-| `maxRuntimeMode`        | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                                          |
-| `lockedSettings`        | more T3 settings to lock, `{path: value}`, only ones `t3Version` knows (`agentSlots.…`: a fork build), see below                            |
-| `memoryMax`, `cpuQuota` | the unit's `MemoryMax` and `CPUQuota`                                                                                                       |
-| `nameservers`           | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                                             |
-| `allow`                 | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host                                  |
-| `devPorts`              | optional: the TCP ports the agent's dev servers may listen on and be reached on, `LOW-HIGH` (default `4100-4199`)                           |
-| `peers`                 | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to                                   |
-| `tailscaleTag`          | the tag this PC's Tailscale node gets (`tag:name`)                                                                                          |
-| `autoUpdate`            | optional: `{"enabled": true, "follow": "OWNER/NAME"}` installs that fork's new releases by itself (see "Automatic updates"); off by default |
+| Key                     | What                                                                                                                                                                  |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `organization`          | the name the managed policy shows in T3's settings                                                                                                                    |
+| `t3Version`             | the exact T3 version (the linking T3's), 0.1.7 or newer (see below); its release files, as `scripts/install.sh`'s                                                     |
+| `t3ReleaseBaseUrl`      | where that version's release files are (`T3CODE_RELEASE_BASE_URL` of `scripts/install.sh`)                                                                            |
+| `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                                                                          |
+| `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                                                                     |
+| `maxRuntimeMode`        | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                                                                    |
+| `lockedSettings`        | more T3 settings to lock, `{path: value}`, only ones `t3Version` knows (`agentSlots.…`: a fork build), see below                                                      |
+| `memoryMax`, `cpuQuota` | the unit's `MemoryMax` and `CPUQuota`                                                                                                                                 |
+| `nameservers`           | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                                                                       |
+| `allow`                 | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host                                                            |
+| `devPorts`              | optional: the TCP ports the agent's dev servers may listen on and be reached on, `LOW-HIGH` (default `4100-4199`)                                                     |
+| `peers`                 | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to                                                             |
+| `tailscaleTag`          | the tag this PC's Tailscale node gets (`tag:name`)                                                                                                                    |
+| `autoUpdate`            | optional: `{"enabled": true, "follow": "OWNER/NAME"}` installs that fork's new releases by itself (see "Automatic updates"); off by default                           |
+| `gpu`                   | optional: `true` lets the agents use the PC's GPU (CUDA): `/dev/dxg` and, read-only, `/usr/lib/wsl/lib` and `/usr/lib/wsl/drivers` (see "GPU access"); off by default |
 
 `t3Version` must be 0.1.7 or newer: older releases have no managed policy, so they would run with none of the kit's
 locks and with updates on. A 0.1.7 pre-release counts as older (some 0.1.7 nightlies were built before the policy),
@@ -286,6 +289,38 @@ T3 still cannot update itself (`limits.updates` stays off, T3 stays root's): roo
   `t3ReleaseBaseUrl` other than the followed fork's downloads, naming both. With it off, the attestation is not
   checked (the version is yours to pick, step 3), only `SHA256SUMS`.
 
+## GPU access (opt-in)
+
+Off by default: the unit hides `/usr/lib/wsl` (WSL's GPU libraries and the Windows driver store) and its private
+`/dev` has no `/dev/dxg` (WSL2's channel to the Windows GPU driver). For agents that run GPU jobs (local model serving,
+translation, fine-tuning), add to the `pc-agents` section of the machine file (as root)
+
+```json
+"gpu": true
+```
+
+and run step 3 again (setup writes the unit and restarts T3). Then the unit (and so `as-agent`) has, in place
+of `/usr/lib/wsl` in `InaccessiblePaths=`, these lines, and nothing else of it changes:
+
+| Line                                                        | Why                                                                                                                                                                                                                                                                                 |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TemporaryFileSystem=/usr/lib/wsl:ro`                       | an empty read-only folder over `/usr/lib/wsl`: anything else WSL puts there stays hidden                                                                                                                                                                                            |
+| `BindReadOnlyPaths=-/usr/lib/wsl/lib -/usr/lib/wsl/drivers` | read-only: `lib` holds what CUDA programs load (`libcuda.so.1`, `libdxcore.so`, `libd3d12*.so`, `nvidia-smi`; WSL's `/etc/ld.so.conf.d/ld.wsl.conf` names it), `drivers` the Windows GPU driver store, where NVIDIA's driver keeps the rest (`libcuda.so.1.1`, `nvcubins.bin`, ...) |
+| `BindPaths=-/dev/dxg` and `DeviceAllow=/dev/dxg rw`         | `PrivateDevices=yes` stays: it leaves `/dev/dxg` out of the unit's `/dev` (the bind puts this one node back) and closes the device policy (the allow opens this one device); every other device stays out                                                                           |
+
+A `-` path that is missing is skipped, so T3 still starts on a PC whose WSL has no GPU (`check` names each of
+`/dev/dxg`, `/usr/lib/wsl/lib` and `/usr/lib/wsl/drivers` that is missing; GPU jobs fail until it is back). The driver
+store is Windows' driver files (no user files); the agent reads them, it cannot change them. Those reads are not the
+whole of it: `/dev/dxg` is a direct line into the Windows host's GPU kernel driver (`dxgkrnl`), which handles the
+agent's requests in Windows' kernel. So with `gpu` on, a compromised agent can attack more of Windows than the
+read-only driver files: a bug in that driver is reachable from the sandbox. GPU jobs themselves (one at a time, when to
+turn it off) are the owner's rule, not the kit's. To turn it off, set `"gpu": false` (or remove it)
+and run step 3 again: the unit is the default one again, byte for byte, and T3 restarts under it.
+
+`pc-agents check` says `GPU access is on` or `off`, and fails (so the 2-minute check stops T3) when T3's unit says
+otherwise than the machine file (the file was changed and setup not run again) or has only some of the lines.
+To see it work: `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- /usr/lib/wsl/lib/nvidia-smi`.
+
 ## Tailscale tag and ACL
 
 The PC's node is tagged, so it is not you: it gets no access of its own, only what the ACL grants. Grant one thing,
@@ -324,6 +359,10 @@ allowed (connection tracking).
 - **Timeouts and signals:** every program setup runs has a time limit (30 minutes for T3's download, 15 for
   `apt-get`); past it the whole process group is stopped and setup says so. Run it again. Ctrl-C, `SIGTERM` or
   `SIGHUP` (a closed window) stop setup the same way, the running download's whole group too.
+- **GPU access:** setup run again with `gpu` unchanged changes nothing; turned off again, the unit is the default one
+  byte for byte and T3 restarts, so the paths and the device are hidden again; a unit from an older setup (no
+  setting) stays exactly as it is, and so does writing `"gpu": false`. The unit is written whole, so a stop half-way
+  leaves the old unit or the new one, never a mix (and the `restart` wall stops a T3 that still runs under the old).
 - **Start limit:** a rerun within 10 minutes of five failed starts still starts T3 (`systemctl reset-failed` first).
 - **An older kit's distro:** an `agent` made with a login shell gets `/usr/sbin/nologin` (`usermod`), once.
 - **Packages:** setup installs `nftables`, `libatomic1` and `unzip` when `dpkg` does not list one as installed (held
@@ -439,7 +478,9 @@ up in the caller's `PATH`, as the real one does), `nft` and `curl` (a release li
 unit started): every file and mode, a second run changes nothing, a run
 stopped at every write finishes on the next and restarts T3, an upgrade stopped at every write fails `check` until
 setup runs again, `SIGTERM` and `SIGHUP` end the download too, each kind of foreign distro is refused, and each wall
-fails on its own when its part is taken away. The automatic update: off does nothing; only a newer published full
+fails on its own when its part is taken away. `gpu`: off leaves the unit byte for byte as before the setting existed
+(its hash is pinned), on adds only its lines, off again and an older setup's unit change nothing else, and `check`
+refuses a unit that differs from the setting. The automatic update: off does nothing; only a newer published full
 release on the stable track is taken; it waits while T3 runs an agent's process; a version that does not come up is
 rolled back and not tried again; a run again changes nothing; a run stopped before or after the machine file, in
 setup, before the check or in a rollback is finished or rolled back; no journal, a bad one, a bad machine file, an
