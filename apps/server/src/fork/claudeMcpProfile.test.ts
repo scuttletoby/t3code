@@ -23,7 +23,6 @@ import {
   CHECK_SESSION_TIMEOUT,
   ClaudeMcpProfileError,
   EVERY_MCP_SERVER,
-  type ClaudeMcpProfilePlan,
   type FindThread,
   type LineageThread,
   checkClaudeSession,
@@ -35,6 +34,7 @@ import {
   planKeyFor,
 } from "./claudeMcpProfile.ts";
 import { type McpProfileCarried } from "./mcpProfile.ts";
+import * as T3ToolSets from "./mcpT3ToolSets.ts";
 
 const fromFile = Schema.decodeSync(ServerSettings);
 const policyDocument = Schema.decodeUnknownSync(ManagedPolicyDocument);
@@ -54,13 +54,18 @@ const store = (threads: ReadonlyArray<LineageThread>) => (threadId: ThreadId) =>
   Effect.succeed(threads.find((entry) => entry.id === threadId) ?? null);
 const noReads = () => Effect.die("read a parent thread");
 
-const outcome = (result: ClaudeMcpProfilePlan | ClaudeMcpProfileError) =>
-  isRefusal(result) ? result.message : result.options;
-
 describe("claudeMcpProfilePlan", () => {
-  it("refuses a profile that limits T3's own tools, which nothing applies yet", () => {
-    const result = claudeMcpProfilePlan("lean", { servers: [], t3Tools: ["threads"] }, T3);
-    assert.include(String(outcome(result)), 'MCP profile "lean" limits T3\'s own tools');
+  it("takes a profile that limits T3's own tools: no Claude option, T3's server cuts them", () => {
+    const result = claudeMcpProfilePlan("lean", { servers: "all", t3Tools: ["threads"] }, T3);
+    assert.isFalse(isRefusal(result));
+    assert.deepStrictEqual(result, {
+      name: "lean",
+      options: {},
+      servers: "all",
+      t3Tools: ["threads"],
+    });
+    const none = claudeMcpProfilePlan("bare", { servers: [], t3Tools: [] }, T3);
+    assert.deepStrictEqual(isRefusal(none) ? none.message : none.t3Tools, []);
   });
 });
 
@@ -76,7 +81,7 @@ describe("claudeMcpServersOutsidePlan", () => {
     { servers: [], outside: ["docs", "claude.ai Calendar"] },
     { servers: ["docs"], outside: ["claude.ai Calendar"] },
   ])("names what $servers leaves out, at any status but disabled", ({ servers, outside }) => {
-    const plan = { name: "p", options: {}, servers };
+    const plan = { name: "p", options: {}, servers, t3Tools: "all" as const };
     assert.deepStrictEqual(claudeMcpServersOutsidePlan(plan, T3, statuses), outside);
   });
 });
@@ -221,6 +226,93 @@ describe("makeClaudeMcpProfiles", () => {
         ).pipe(Layer.provideMerge(NodeServices.layer)),
       ),
     );
+
+  it.effect(
+    "fixes the thread's T3 tool groups as each query opens; a group change changes the key",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        const lean = (t3Tools: unknown) => ({
+          mcpProfile: "lean",
+          mcpProfiles: { lean: { servers: "all", t3Tools } },
+        });
+        const reads = [lean(["threads"]), lean(["threads"]), lean(["threads", "orchestration"])];
+        const service = yield* ServerSettingsService.ServerSettingsService;
+        let next = 0;
+        const plan = yield* makeClaudeMcpProfiles.pipe(
+          Effect.provideService(ServerSettingsService.ServerSettingsService, {
+            ...service,
+            getSettings: Effect.suspend(() => Effect.succeed(fromFile(reads[next++] ?? {}))),
+          }),
+        );
+        const self = thread("t");
+        const keys: Array<string | undefined> = [];
+        const sets: Array<unknown> = [];
+        for (const _ of reads) {
+          const overrides = {};
+          yield* plan(self, overrides);
+          keys.push(planKeyFor(overrides));
+          const set = T3ToolSets.t3ToolSetFor(self.id);
+          sets.push(set?._tag === "Groups" && set.groups !== "all" ? [...set.groups] : set);
+        }
+        assert.deepStrictEqual(sets, [["threads"], ["threads"], ["threads", "orchestration"]]);
+        // Same groups, same process; changed groups, a fresh process that lists T3's tools again.
+        assert.isDefined(keys[0]);
+        assert.strictEqual(keys[1], keys[0]);
+        assert.notStrictEqual(keys[2], keys[1]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettingsService.ServerSettingsService.layerTest(),
+            ManagedPolicy.layerTest(),
+            Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
+          ).pipe(Layer.provideMerge(NodeServices.layer)),
+        ),
+      ),
+  );
+
+  it.effect("a profile that cannot be worked out fixes no T3 tool but the ungrouped ones", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      T3ToolSets.fixT3ToolSet("t", { _tag: "Groups", name: "all", groups: "all" });
+      // The thread names a profile that is gone: the turn refuses, and the old `all` set is gone.
+      assert.include(
+        (yield* plansFor([{ mcpProfile: "gone" }]))[0],
+        'MCP profile "gone" is not set up',
+      );
+      assert.strictEqual(T3ToolSets.t3ToolSetFor("t")?._tag, "Refused");
+    }),
+  );
+
+  it.effect(
+    "stopped half-way: a query whose profile read is interrupted leaves no T3 tool set",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        T3ToolSets.fixT3ToolSet("t", { _tag: "Groups", name: "all", groups: "all" });
+        const reading = yield* Deferred.make<void>();
+        const service = yield* ServerSettingsService.ServerSettingsService;
+        const plan = yield* makeClaudeMcpProfiles.pipe(
+          Effect.provideService(ServerSettingsService.ServerSettingsService, {
+            ...service,
+            getSettings: Deferred.succeed(reading, undefined).pipe(Effect.andThen(Effect.never)),
+          }),
+        );
+        const fiber = yield* Effect.forkChild(plan(thread("t"), {}));
+        yield* Deferred.await(reading);
+        yield* Fiber.interrupt(fiber);
+        // The next request works the set out again from the settings, rather than the old turn's.
+        assert.isUndefined(T3ToolSets.t3ToolSetFor("t"));
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettingsService.ServerSettingsService.layerTest(),
+            ManagedPolicy.layerTest(),
+            Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
+          ).pipe(Layer.provideMerge(NodeServices.layer)),
+        ),
+      ),
+  );
 
   it.effect("with no profile anywhere, a failed settings read gives all instead of refusing", () =>
     Effect.gen(function* () {
@@ -836,7 +928,7 @@ describe("checkClaudeSession", () => {
   it.effect("refuses and closes a session that does not list its servers in time", () =>
     Effect.gen(function* () {
       let closed = 0;
-      const plan = { name: "t3-only", options: {}, servers: [] };
+      const plan = { name: "t3-only", options: {}, servers: [], t3Tools: "all" as const };
       const check = yield* checkClaudeSession(
         plan,
         {},

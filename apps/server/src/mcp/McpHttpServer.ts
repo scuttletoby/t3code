@@ -119,6 +119,7 @@ import * as HtmlHandlers from "./toolkits/html/handlers.ts";
 import { MessageToolkit } from "./toolkits/message/tools.ts";
 import * as WaitsHandlers from "./toolkits/waits/handlers.ts";
 import { WaitsToolkit } from "./toolkits/waits/tools.ts";
+import * as McpT3ToolFilter from "../fork/mcpT3ToolFilter.ts";
 import * as MessageHandlers from "./toolkits/message/handlers.ts";
 import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
 import { MCP_HTTP_PATH } from "../httpCors.ts";
@@ -1872,14 +1873,17 @@ export const layerMilestoneEvents = Layer.effectDiscard(
   Layer.provide(layerWebhookTransport),
 );
 
-/**
- * Fork: every tool the fork adds. Advertised like `layerTools`, but measured by
- * ForkAgentContextBudget.test.ts, so upstream's budget file stays upstream's.
- */
+// Fork: the fork's tools. ForkAgentContextBudget.test.ts measures them, not upstream's budget.
 export const layerForkTools = Layer.mergeAll(
   toolkitRegistration(WaitsToolkit, WaitsHandlers.layer),
 );
 
 export const layer = layerMcpTransport(
-  Layer.mergeAll(layerTools, layerForkTools, layerToolSearch, layerMilestoneEvents),
+  Layer.mergeAll(
+    layerTools,
+    layerForkTools,
+    layerToolSearch,
+    layerMilestoneEvents,
+    McpT3ToolFilter.layer,
+  ),
 );

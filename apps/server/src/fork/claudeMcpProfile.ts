@@ -1,7 +1,8 @@
 /**
- * Fork: a thread's MCP profile, applied to its Claude session. This applies the outside servers
- * only; T3's own tools are filtered in a later PR. A profile that cannot be applied refuses the
- * turn instead of starting it with every tool: the owner chose refusing over warning.
+ * Fork: a thread's MCP profile, applied to its Claude session. This applies the outside servers;
+ * T3's own tools are filtered on the T3 MCP server for every provider (mcpT3ToolFilter.ts), with
+ * the groups fixed as each query opens. A profile that cannot be applied refuses the turn instead
+ * of starting it with every tool: the owner chose refusing over warning.
  */
 import type {
   HookCallback,
@@ -39,6 +40,7 @@ import {
   type McpProfileThread,
   resolveMcpProfile,
 } from "./mcpProfile.ts";
+import { fixT3ToolSet, forgetT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
 import {
   type McpProfileFileKeys,
   mcpProfileFileKeysOf,
@@ -69,6 +71,8 @@ export interface ClaudeMcpProfilePlan {
     readonly hooks?: Partial<Record<HookEvent, Array<HookCallbackMatcher>>>;
   };
   readonly servers: McpProfileSet["servers"];
+  /** T3's own tool groups; the T3 MCP server applies them (mcpT3ToolFilter.ts). */
+  readonly t3Tools: McpProfileSet["t3Tools"];
 }
 
 export type LineageThread = Pick<
@@ -76,28 +80,32 @@ export type LineageThread = Pick<
   "id" | "projectId" | "lineage" | "delegatedFrom"
 >;
 
-const ALL_PLAN: ClaudeMcpProfilePlan = { name: MCP_PROFILE_ALL, options: {}, servers: "all" };
+const ALL_PLAN: ClaudeMcpProfilePlan = {
+  name: MCP_PROFILE_ALL,
+  options: {},
+  servers: "all",
+  t3Tools: "all",
+};
 const FIX = `pick "${MCP_PROFILE_ALL}" for this thread, or fix the profile in Settings`;
 /** What can make Claude load a server T3's options leave out, at start. */
 const START_LEAKS =
   "A managed Claude policy on this machine or --mcp-config in the Claude launch arguments can add servers T3's list does not drop";
 
-/** `t3-only` and an empty list ignore every server Claude would load itself; a list keeps those named. */
+/**
+ * `t3-only` and an empty list ignore every server Claude would load itself; a list keeps those named.
+ * `t3Tools` adds no option: T3's own server hides and refuses the tools it leaves out.
+ */
 export function claudeMcpProfilePlan(
   name: string,
   profile: McpProfileSet,
   t3ServerNames: ReadonlyArray<string>,
 ): ClaudeMcpProfilePlan | ClaudeMcpProfileError {
-  if (profile.t3Tools !== "all") {
-    return new ClaudeMcpProfileError({
-      reason: `MCP profile "${name}" limits T3's own tools, which this version cannot apply yet, so this thread cannot start: set its t3Tools to "all", or ${FIX}.`,
-    });
-  }
-  if (profile.servers === "all") return { ...ALL_PLAN, name };
+  const t3Tools = profile.t3Tools;
+  if (profile.servers === "all") return { ...ALL_PLAN, name, t3Tools };
   const servers = profile.servers;
   const hooks = { PreToolUse: [{ hooks: [claudeMcpProfileGuard(name, servers, t3ServerNames)] }] };
   if (servers.length === 0) {
-    return { name, options: { strictMcpConfig: true, hooks }, servers };
+    return { name, options: { strictMcpConfig: true, hooks }, servers, t3Tools };
   }
   // T3's own servers are listed too, so the allowlist cannot drop them.
   const allowed = [...new Set([...t3ServerNames, ...servers])];
@@ -108,6 +116,7 @@ export function claudeMcpProfilePlan(
       hooks,
     },
     servers,
+    t3Tools,
   };
 }
 
@@ -324,9 +333,18 @@ const PLAN_KEYS = new WeakMap<object, { readonly key: string | undefined }>();
 export const planKeyFor = (mcpOverrides: object): string | undefined =>
   (PLAN_KEYS.get(mcpOverrides) ?? { key: "unplanned" }).key;
 
-/** The plan's key part, or `undefined` for `all`. NUL keeps the joined names apart. */
+/**
+ * The plan's key part, or `undefined` for `all`. NUL keeps the joined names apart. A change of T3
+ * tool groups changes it too, so the next turn's fresh process lists T3's tools again.
+ */
 const planKey = (plan: ClaudeMcpProfilePlan): string | undefined =>
-  plan.servers === "all" ? undefined : ["mcp", ...plan.servers].join("\u0000");
+  plan.servers === "all" && plan.t3Tools === "all"
+    ? undefined
+    : [
+        "mcp",
+        ...(plan.servers === "all" ? ["*"] : plan.servers),
+        ...(plan.t3Tools === "all" ? [] : ["\u0001t3", ...plan.t3Tools]),
+      ].join("\u0000");
 
 /** settings.json as this read found it. */
 type SettingsFileRead =
@@ -617,7 +635,16 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
     thread: LineageThread,
     overrides: McpOverrides,
   ) {
-    const resolved: McpProfileResolved = yield* profileFor(thread);
+    // The query opens for a turn: its T3 tool groups are fixed here until the next one opens, and
+    // a profile that cannot be worked out keeps only the tools every profile keeps.
+    const resolved: McpProfileResolved = yield* profileFor(thread).pipe(
+      Effect.tapError((refusal) =>
+        Effect.sync(() => fixT3ToolSet(thread.id, refusedT3ToolSet(refusal.reason))),
+      ),
+      // Stopped half-way: no set stands, so the next request works it out again.
+      Effect.onInterrupt(() => Effect.sync(() => forgetT3ToolSet(thread.id))),
+    );
+    fixT3ToolSet(thread.id, t3ToolSetOf(resolved));
     const t3ServerNames = Object.keys(overrides.mcpServers ?? {});
     const plan = claudeMcpProfilePlan(resolved.name, resolved.profile, t3ServerNames);
     return isRefusal(plan) ? yield* plan : plan;
