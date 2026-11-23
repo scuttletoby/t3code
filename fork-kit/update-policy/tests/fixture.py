@@ -114,9 +114,18 @@ class HostCase(unittest.TestCase):
         """A cgroup folder below /sys/fs/cgroup/user.slice with its cgroup.events."""
         self.write(f'/sys/fs/cgroup/user.slice/{path}/cgroup.events', f'populated {int(populated)}\nfrozen 0\n')
 
-    def process(self, pid, *argv, ppid=1, uid=0, comm=None, cgroup='/system.slice/x.service'):
-        """A fake /proc/<pid>: cmdline, stat (comm, ppid), status (uid), cgroup."""
+    def process(self, pid, *argv, ppid=1, uid=0, comm=None, cgroup='/system.slice/x.service', env=(), exe=None,
+                cwd=None):
+        """A fake /proc/<pid>: cmdline, stat (comm, ppid), status (uid), cgroup, environ (NAME=value strings), and
+        the links exe and cwd when given."""
         comm = comm or os.path.basename(argv[0])[:15]
+        self.write(f'/proc/{pid}/environ', ''.join(f'{e}\0' for e in ('PATH=/usr/bin',) + tuple(env)))
+        for name, target in (('exe', exe), ('cwd', cwd)):
+            link = self.root + f'/proc/{pid}/{name}'
+            if os.path.lexists(link):
+                os.unlink(link)
+            if target:
+                os.symlink(target, link)
         self.write(f'/proc/{pid}/cmdline', '\0'.join(argv) + '\0')
         self.write(f'/proc/{pid}/stat', f'{pid} ({comm}) S {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0\n')
         self.write(f'/proc/{pid}/status', f'Name:\t{comm}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n')

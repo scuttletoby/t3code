@@ -254,19 +254,46 @@ class TickOnHost(fx.HostCase):
         self.assertIn(('notice', self.m.log[-1][1]), self.m.log)
         self.assertTrue(self.m.log.text().startswith('restarting now: restart pending since'))
 
-    def test_the_restart_honours_inhibitor_locks_and_a_refusal_is_restart_failed(self):
-        self.pending(SINCE)
+    def machine(self):
         m = tick.Machine(self.host, fx.Logs())
-        m.now = lambda: at('2026-11-24 05:00')
+        m.now = lambda: self.clock
         m.booted = lambda: at('2026-11-20 00:00')
         m.boot_id = lambda: 'boot-1'
-        self.host.answers['systemctl reboot'] = (1, '', 'Operation inhibited by "mutation-tests" (PID 4242 "sleep", '
-                                                        'user agent), reason is "hours left".')
+        return m
+
+    def test_a_lock_taken_after_the_look_stops_the_restart_with_one_alert(self):
+        """The block locks are read again as the last step, after the state is written; systemctl itself is not
+        asked to check them (--check-inhibitors=yes also refuses while another user is logged in)."""
+        self.pending(SINCE)
+        self.clock = at('2026-11-24 05:00')
+        m = self.machine()
+        locks = [json.dumps({'type': 'a(ssssuu)', 'data': [[]]}),
+                 json.dumps({'type': 'a(ssssuu)', 'data': [[['shutdown', 'mutation-tests', 'hours left', 'block',
+                                                            1000, 4242]]]})]
+        self.host.answers['busctl'] = lambda argv: (0, locks.pop(0) if len(locks) > 1 else locks[0], '')
+        self.assertEqual(tick.tick(m, lambda: self.s, lambda _s: fx.idle.look(self.host, _s)), 1)
+        self.assertEqual([c[0] for c in self.host.calls if c[0][:2] == ['systemctl', 'reboot']], [])
+        self.assertIn('the restart failed: not restarted: an inhibitor lock appeared after the look: mutation-tests '
+                      '(uid 1000): hours left', m.log.text())
+        for minutes in (10, 20, 60):                               # one restart-failed in the window, not two
+            self.clock = at('2026-11-24 05:00') + minutes * MIN
+            tick.tick(m, lambda: self.s, lambda _s: [])
+        self.assertEqual(m.log.text().count('alert restart-failed'), 1)
+
+    def test_systemctl_reboot_without_check_inhibitors_and_a_refusal_is_one_alert(self):
+        self.pending(SINCE)
+        self.clock = at('2026-11-24 05:00')
+        m = self.machine()
+        self.host.answers['systemctl reboot'] = (1, '', 'Failed to reboot system via logind: Access denied')
         self.assertEqual(tick.tick(m, lambda: self.s, lambda _s: []), 1)
         argv = [c[0] for c in self.host.calls if c[0][:2] == ['systemctl', 'reboot']][0]
-        self.assertEqual(argv[:3], ['systemctl', 'reboot', '--check-inhibitors=yes'])
-        self.assertIn('the restart failed: Operation inhibited by "mutation-tests"', m.log.text())
-        self.assertIn('alert restart-failed: the restart failed (Operation inhibited', m.log.text())
+        self.assertEqual(argv[:2], ['systemctl', 'reboot'])
+        self.assertNotIn('--check-inhibitors=yes', argv)
+        self.assertIn('alert restart-failed: the restart failed (Failed to reboot system via logind', m.log.text())
+        for minutes in (10, 30):
+            self.clock = at('2026-11-24 05:00') + minutes * MIN
+            tick.tick(m, lambda: self.s, lambda _s: [])
+        self.assertEqual(m.log.text().count('alert restart-failed'), 1)
 
     def test_the_tick_reads_apts_effective_value_every_time(self):
         self.host.answers['apt-config'] = (0, 'Unattended-Upgrade::Automatic-Reboot "false";\n'
@@ -439,9 +466,12 @@ MUTATIONS = {
     'apt restarting by itself is alerted': (
         'tick', "    if apt_problem:\n", "    if False:\n",
         'Decide.test_apt_restarting_by_itself_is_alerted_at_once_then_daily'),
-    'the reboot honours inhibitor locks': (
-        'tick', "'--check-inhibitors=yes',", "",
-        'TickOnHost.test_the_restart_honours_inhibitor_locks_and_a_refusal_is_restart_failed'),
+    'block locks are read again right before the restart': (
+        'tick', "        err = m.last_look()\n", "        err = None\n",
+        'TickOnHost.test_a_lock_taken_after_the_look_stops_the_restart_with_one_alert'),
+    'one restart-failed per window': (
+        'tick', "            st['restartMissed'] = st.get('restartAt')", "            pass",
+        'TickOnHost.test_systemctl_reboot_without_check_inhibitors_and_a_refusal_is_one_alert'),
 }
 
 

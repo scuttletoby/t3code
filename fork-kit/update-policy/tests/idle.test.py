@@ -5,6 +5,7 @@ rule in a copy of the code and shows its test then fails.
   python3 -I -B fork-kit/update-policy/tests/idle.test.py
 """
 import fcntl, json, os, shutil, socket, sys, tempfile, threading, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fixture as fx  # noqa: E402
@@ -65,33 +66,98 @@ class Look(fx.HostCase):
         self.assertTrue(busy[0].startswith('cannot tell: '), busy)
         self.assertIn('app.slice cannot be listed', busy[0])
 
-    def test_a_t3_server_without_agent_scopes_is_busy_while_it_runs_anything(self):
+    def t3_line(self, **over):
+        busy = [b for b in self.look(**over) if b.startswith('T3 runs without agent scopes')]
+        return busy[0] if busy else ''
+
+    def package(self, folder, name='t3'):
+        self.write(f'{folder}/package.json', json.dumps({'name': name, 'type': 'module'}))
+
+    def test_t3_without_agent_scopes_is_busy_whatever_it_runs(self):
         """T3 turns scopes off when it runs without a user manager (a system service): its agents are its plain
-        children. Only its resource monitor does not count."""
+        children and nothing below an app-t3code slice shows them. Then T3 running at all is busy (an idle server
+        too: such a machine rarely restarts by itself, on purpose)."""
         self.process(500, '/opt/t3/runtime/versions/0.1.12/t3', 'serve', uid=1000, comm='node-MainThread',
                      cgroup='/system.slice/t3code-agents.service')
-        self.process(501, '/opt/t3/resource-monitor/linux-x64/t3-resource-monitor', ppid=500, uid=1000)
-        self.assertEqual(self.look(), [])
+        self.assertEqual(self.look(), ['T3 runs without agent scopes (user 1000): 1 process(es): 500 node-MainThread: '
+                                       'the t3 command'])
         self.process(502, '/home/x/.local/bin/claude', '--output-format', 'stream-json', ppid=500, uid=1000)
-        self.process(503, '/bin/sh', '-c', 'git status', ppid=502, uid=1000)
-        self.assertEqual(self.look(), ['T3 server 500 (user 1000) runs agents without scopes: 2 process(es) '
-                                       '(claude, sh)'])
+        self.assertIn('502 claude: an agent CLI below T3 server 500', self.t3_line())
 
-    def test_a_t3_server_under_its_user_manager_with_an_agent_slice_counts_by_scopes(self):
-        self.process(600, '/usr/bin/node', '/usr/lib/node_modules/t3/dist/bin.mjs', uid=1000, cgroup=SCOPED)
-        self.process(601, '/usr/bin/git', 'status', ppid=600, uid=1000)
-        self.assertEqual(self.look(), [])               # a script named bin.mjs is no T3 server by name
-        self.process(600, '/usr/bin/node', '/usr/local/bin/t3', 'serve', uid=1000, cgroup=SCOPED)
-        busy = self.look()                               # no app-t3code slice: scopes are off for this server
-        self.assertEqual(len(busy), 1, busy)
-        self.assertIn('T3 server 600 (user 1000) runs agents without scopes: 1 process(es) (git)', busy[0])
+    def test_every_launch_form_of_a_t3_server(self):
+        """Both round-2 lenses: the fork's documented `node apps/server/dist/bin.mjs`, npm start (`node
+        dist/bin.mjs` in apps/server), npm's install, the desktop app's Electron running as node, relative dev runs,
+        and the t3 binary known by its exe only."""
+        self.package('/w/t3code/apps/server')
+        self.package('/usr/lib/node_modules/t3')
+        self.package('/w/other', name='not-t3')
+        forms = [
+            (('/usr/bin/node', 'apps/server/dist/bin.mjs'), '/w/t3code', 'apps/server/dist/bin.mjs'),
+            (('node', 'dist/bin.mjs'), '/w/t3code/apps/server', 'apps/server/dist/bin.mjs'),
+            (('/usr/bin/node', '/usr/lib/node_modules/t3/dist/bin.mjs', 'serve'), '/', 'node_modules/t3/dist/bin.mjs'),
+            (('/opt/T3 Code/t3code', '--require', '/home/x/.cache/t3/compile-cache.js',
+              '/opt/T3 Code/resources/app.asar/apps/server/dist/bin.mjs', '--bootstrap-fd', '3'), '/',
+             'app.asar/apps/server/dist/bin.mjs'),
+            (('bun', 'run', 'src/bin.ts'), '/w/t3code/apps/server', 'apps/server/src/bin.ts'),
+            (('/usr/bin/node', '--import', 'tsx', 'apps/server/src/bin.ts'), '/w/t3code', 'apps/server/src/bin.ts'),
+            (('node', 'scripts/dev.ts'), '/w/t3code/apps/server', 'apps/server/scripts/dev.ts'),
+            (('npm start',), '/w/t3code/apps/server', 'a package runner starting T3'),
+            (('/usr/bin/node', '/usr/bin/pnpm', 'start'), '/w/t3code/apps/server', 'a package runner starting T3'),
+        ]
+        for argv, cwd, words in forms:
+            with self.subTest(argv=argv):
+                shutil.rmtree(self.root + '/proc')
+                self.process(800, *argv, uid=1000, cwd=cwd, cgroup='/user.slice/user-1000.slice/session-3.scope')
+                self.assertIn(words, self.t3_line())
+        shutil.rmtree(self.root + '/proc')
+        self.process(801, '/usr/lib/t3/node-runtime', 'x', uid=1000, comm='node-MainThread', exe='/opt/t3/bin/t3')
+        self.assertIn('801 node-MainThread: the t3 command', self.t3_line())
+        for argv, cwd in ((('node', 'dist/bin.mjs'), '/w/other'), (('npm', 'start'), '/w/other'),
+                          (('/usr/bin/node', '/srv/app/server.mjs'), '/')):
+            with self.subTest(not_t3=argv):
+                shutil.rmtree(self.root + '/proc')
+                self.process(802, *argv, uid=1000, cwd=cwd)
+                self.assertEqual(self.look(), [])
+
+    def test_t3_environment_markers_count_without_a_known_server(self):
+        self.process(900, '/usr/local/bin/some-wrapper', uid=1000)
+        self.process(901, '/home/x/.local/bin/claude', '-p', ppid=900, uid=1000,
+                     env=('T3CODE_HOME=/home/x/.t3', 'T3CODE_THREAD_ID=thread-1'))
+        self.assertEqual(self.look(), ["T3 runs without agent scopes (user 1000): 1 process(es): 901 claude: T3's "
+                                       'environment'])
+        self.process(901, '/home/x/.local/bin/claude', '-p', ppid=900, uid=1000, env=('NOT_T3CODE_HOME=x',))
+        self.assertEqual(self.look(), [])
+
+    def test_with_scopes_on_t3_is_counted_by_its_scopes(self):
+        self.process(600, '/usr/bin/node', '/usr/local/bin/t3', 'serve', uid=1000, cgroup=SCOPED,
+                     env=('T3CODE_PORT=3773',))
+        self.process(601, '/usr/bin/claude', uid=1000, ppid=600, env=('T3CODE_THREAD_ID=t1',),
+                     cgroup=f'/user.slice/{MANAGER}/app.slice/app-t3code.slice/app-t3code-agents.slice/'
+                            't3code-claude-1.scope')
+        self.assertIn('T3 runs without agent scopes (user 1000): 2 process(es)', self.t3_line())   # no slice yet
         self.cgroup(f'{MANAGER}/app.slice/app-t3code.slice/app-t3code-agents.slice', populated=False)
         self.assertEqual(self.look(), [])                # scopes on: its agents are counted as scopes
+        self.process(600, '/usr/bin/node', '/usr/local/bin/t3', 'serve', uid=1000,
+                     cgroup='/system.slice/t3.service')  # a server outside its manager has no scopes of its own
+        self.assertIn('600 node: the t3 command', self.t3_line())
 
-    def test_the_dev_server_is_a_t3_server_too(self):
-        self.process(700, '/usr/bin/node', '--import', 'x', '/w/t3code/apps/server/src/bin.ts', uid=1000)
-        self.process(701, '/usr/bin/codex', 'app-server', ppid=700, uid=1000)
-        self.assertIn('T3 server 700', self.look()[0])
+    def test_what_it_cannot_read_about_a_process_cannot_tell(self):
+        self.process(700, 'node', 'dist/bin.mjs', uid=1000)
+        os.unlink(self.root + '/proc/700/environ')
+        os.makedirs(self.root + '/proc/700/environ')              # EISDIR, not "gone"
+        self.assertEqual(self.look(), ['cannot tell: process 700 cannot be read (Is a directory)'])
+        os.rmdir(self.root + '/proc/700/environ')
+        self.process(700, 'node', 'dist/bin.mjs', uid=1000)
+        os.symlink('/w', self.root + '/proc/700/cwd')
+        real = os.readlink
+
+        def no_cwd(path, *a, **k):
+            if path.endswith('/proc/700/cwd'):
+                raise PermissionError(13, 'Permission denied')
+            return real(path, *a, **k)
+        with mock.patch.object(idle.os, 'readlink', no_cwd):
+            self.assertEqual(self.look(), ['cannot tell: the folder of process 700 cannot be read (Permission '
+                                           'denied)'])
 
     def test_proc_it_cannot_list_or_read_cannot_tell(self):
         self.process(9, '/usr/bin/sleep', '100')
@@ -180,12 +246,13 @@ class Look(fx.HostCase):
         del self.host.answers['lxc-ls']                       # not installed: nothing to ask
         self.assertNotIn('LXC', ' '.join(self.look()))
 
-    def test_block_shutdown_locks_count_delay_and_sleep_locks_do_not(self):
+    def test_block_locks_on_shutdown_or_sleep_count_delay_and_other_locks_do_not(self):
         rows = [['shutdown', 'Unattended Upgrades Shutdown', 'Stop ongoing upgrades', 'delay', 0, 221],
-                ['sleep', 'GNOME', 'screen locked', 'block', 1000, 5],
-                ['shutdown:sleep:idle', 'mutation-tests', 'hours left', 'block', 1000, 4242]]
+                ['handle-lid-switch', 'GNOME', 'lid', 'block', 1000, 5],
+                ['shutdown:sleep:idle', 'mutation-tests', 'hours left', 'block', 1000, 4242],
+                ['sleep', 'backup', 'copying', 'block', 0, 77]]
         self.host.answers['busctl'] = (0, json.dumps({'type': 'a(ssssuu)', 'data': [rows]}), '')
-        self.assertEqual(self.look(), ['inhibitor lock: mutation-tests (uid 1000): hours left'])
+        self.assertEqual(self.look(), ['inhibitor lock: mutation-tests (uid 1000): hours left; backup (uid 0): copying'])
         self.host.answers['busctl'] = (0, json.dumps({'type': 'a(ssssuu)', 'data': [rows[:2]]}), '')
         self.assertEqual(self.look(), [])
 
@@ -289,12 +356,32 @@ MUTATIONS = {
     'no cgroup v2: cannot tell': (
         'idle', "    if not os.path.exists(host.p(f'{host.CGROUP}/cgroup.controllers')):", "    if False:",
         'Look.test_no_cgroup_v2_cannot_tell'),
-    'a T3 server without scopes counts its children': (
-        'idle', "            if kids:\n", "            if False:\n",
-        'Look.test_a_t3_server_without_agent_scopes_is_busy_while_it_runs_anything'),
-    'scopes are on only with an app-t3code slice under its own manager': (
-        'idle', "            if p.cgroup.startswith(mine) and sliced.get(p.uid):", "            if True:",
-        'Look.test_a_t3_server_under_its_user_manager_with_an_agent_slice_counts_by_scopes'),
+    'T3 without scopes is busy': (
+        'idle', "        if why:\n            found.setdefault", "        if False:\n            found.setdefault",
+        'Look.test_t3_without_agent_scopes_is_busy_whatever_it_runs'),
+    'scopes on only under its own manager with a slice': (
+        'idle', "        if p.cgroup.startswith(f'/user.slice/user-{p.uid}.slice/user@{p.uid}.service/') and sliced.get(p.uid):",
+        "        if sliced.get(p.uid):", 'Look.test_with_scopes_on_t3_is_counted_by_its_scopes'),
+    'any argument is an entry, whatever argv[0]': (
+        'idle', "    for a in p.argv[1:] or p.argv:", "    for a in (p.argv[1:] if len(names) > 1 else []):",
+        'Look.test_every_launch_form_of_a_t3_server'),
+    'relative entries are resolved against the folder': (
+        'idle', "            a = os.path.normpath(os.path.join(cwd, a))", "            pass",
+        'Look.test_every_launch_form_of_a_t3_server'),
+    'the t3 binary by its exe': (
+        'idle', " or os.path.basename(p.exe) in T3_NAMES", "", 'Look.test_every_launch_form_of_a_t3_server'),
+    'only a package named t3': (
+        'idle', "if a.endswith(entry) and _package_name(host, a[:-len(entry)]) == 't3':", "if a.endswith(entry):",
+        'Look.test_every_launch_form_of_a_t3_server'),
+    'package runners starting t3': (
+        'idle', "            return 'a package runner starting T3'", "            return ''",
+        'Look.test_every_launch_form_of_a_t3_server'),
+    "T3's environment markers": (
+        'idle', "        why = form or ('T3\\'s environment' if p.marked else '')", "        why = form",
+        'Look.test_t3_environment_markers_count_without_a_known_server'),
+    'a folder it cannot read is no idle': (
+        'idle', "                    raise CannotTell(f'the folder of process {p.pid} cannot be read ({e.strerror})') from None",
+        "                    continue", 'Look.test_what_it_cannot_read_about_a_process_cannot_tell'),
     'an agent scope is busy': (
         'idle', "        if agents:\n", "        if False:\n",
         'Look.test_a_running_agent_scope_is_busy_an_empty_one_is_not'),
@@ -324,8 +411,9 @@ MUTATIONS = {
     'podman containers count': (
         'idle', "    if conmons:\n", "    if False:\n", 'Look.test_podman_lxc_incus_lxd_and_libvirt'),
     'only block locks on shutdown': (
-        'idle', "if mode == 'block' and 'shutdown' in what.split(':'):", "if 'shutdown' in what.split(':'):",
-        'Look.test_block_shutdown_locks_count_delay_and_sleep_locks_do_not'),
+        'idle', "if mode == 'block' and {'shutdown', 'sleep'} & set(what.split(':')):",
+        "if 'shutdown' in what.split(':'):",
+        'Look.test_block_locks_on_shutdown_or_sleep_count_delay_and_other_locks_do_not'),
     'no busctl is no idle': (
         'idle', "    if code != 0:\n        raise CannotTell(f'the inhibitor locks",
         "    if code is None:\n        return []\n    if code != 0:\n        raise CannotTell(f'the inhibitor locks",

@@ -6,12 +6,14 @@ look(host, settings) returns the reasons it is busy (an empty list: idle). Busy 
 - no cgroup v2 at /sys/fs/cgroup: agents and heavy jobs cannot be counted;
 - a T3 agent scope with a process in it, under any user's systemd manager (the rule of heavy's `heavy facts`: a
   scope right below an `app-t3code*` slice, or a `t3code-*.scope` anywhere below the manager);
-- a T3 server whose agents run without scopes (T3 turns scopes off when it has no user manager: a system service,
-  no XDG_RUNTIME_DIR, a failed systemd-run probe): any process it started, but its resource monitor;
+- T3 running without agent scopes (T3 turns them off when it has no user manager: a system service, no
+  XDG_RUNTIME_DIR, a failed systemd-run probe): any T3 server, whatever started it, and any process with T3's
+  environment markers, unless it runs under its user's manager with an app-t3code slice there (scopes on);
 - a heavy job: a scope with a process in it in a user's heavy slice, or a live ticket in a user's heavy queue;
 - a running container or VM: Docker (system, and the rootless one of each of containerUsers), Podman and CRI-O
   (each running container has a conmon), incus, LXD, classic LXC, libvirt (qemu:///system), less ignoreContainers;
-- a block inhibitor lock on shutdown (`systemd-inhibit --what=shutdown --mode=block CMD`);
+- a block inhibitor lock on shutdown or sleep (`systemd-inhibit --what=shutdown --mode=block CMD`); logged-in
+  sessions do not count;
 - a package manager at work (apt, apt-get, aptitude, dpkg, unattended-upgrade);
 - a busy script of the machine file (free/v1, fork-kit/common/FREE.md) that does not answer "free".
 
@@ -29,7 +31,12 @@ TICKET_RE = re.compile(r'^t-[0-9]{1,15}-[0-9]{1,10}\.json\Z')
 PACKAGE_TOOLS = frozenset({'apt', 'apt-get', 'aptitude', 'dpkg', 'unattended-upgrade'})
 INTERPRETERS = re.compile(r'^(python[0-9.]*|perl|sh|bash|node|bun|deno)\Z')
 T3_NAMES = frozenset({'t3'})                      # the packaged server and npm's `t3` link
-T3_HELPERS = ('t3-resource-mon',)                 # what a T3 server always runs: never an agent
+T3_ENTRIES = ('/apps/server/dist/bin.mjs', '/apps/server/src/bin.ts', '/apps/server/scripts/dev.ts')
+T3_PACKAGE_ENTRIES = ('/dist/bin.mjs', '/src/bin.ts', '/scripts/dev.ts')     # of a package named "t3"
+T3_RUNNERS = frozenset({'npm', 'pnpm', 'bun', 'yarn', 'npx', 'node'})
+T3_ENV = (b'T3CODE_HOME=', b'T3CODE_PORT=', b'T3CODE_THREAD_ID=')            # the server's and its agents'
+AGENT_CLIS = frozenset({'claude', 'codex', 'opencode', 'cursor-agent', 'grok', 'kiro-cli', 'pi', 'gemini', 'amp',
+                        'qwen', 'goose', 'antigravity', 'muse', 'fx'})
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
 DOCKER_LIMIT = 4 << 20
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -150,10 +157,11 @@ def docker_running(sock, timeout=5):
 # -- processes --------------------------------------------------------------------------------------------------------
 
 class Proc:
-    __slots__ = ('pid', 'ppid', 'uid', 'comm', 'argv', 'cgroup')
+    __slots__ = ('pid', 'ppid', 'uid', 'comm', 'argv', 'cgroup', 'exe', 'marked')
 
-    def __init__(self, pid, ppid, uid, comm, argv, cgroup):
+    def __init__(self, pid, ppid, uid, comm, argv, cgroup, exe='', marked=False):
         self.pid, self.ppid, self.uid, self.comm, self.argv, self.cgroup = pid, ppid, uid, comm, argv, cgroup
+        self.exe, self.marked = exe, marked
 
 
 def _read_proc(host, pid, name, limit=65536):
@@ -178,6 +186,11 @@ def processes(host):
                 cgroup = _read_proc(host, pid, 'cgroup').decode('utf-8', 'replace')
             except FileNotFoundError:
                 cgroup = ''
+            environ = b'\0' + _read_proc(host, pid, 'environ', 1 << 20)
+            try:
+                exe = os.readlink(host.p(f'{host.PROC}/{pid}/exe'))
+            except FileNotFoundError:
+                exe = ''                    # a kernel thread
         except OSError as e:
             if e.errno in GONE or (e.errno is None and isinstance(e, FileNotFoundError)):
                 continue
@@ -189,7 +202,8 @@ def processes(host):
         except (ValueError, IndexError, StopIteration):
             raise CannotTell(f'process {pid}: a broken stat or status') from None
         path = next((x[3:] for x in cgroup.splitlines() if x.startswith('0::')), '')
-        out[pid] = Proc(pid, ppid, uid, comm, argv, path)
+        marked = any(b'\0' + m in environ for m in T3_ENV)
+        out[pid] = Proc(pid, ppid, uid, comm, argv, path, exe, marked)
     return out
 
 
@@ -214,12 +228,73 @@ def package_tools(procs):
     return sorted(out)
 
 
-def is_t3_server(p):
+def _package_name(host, folder):
+    try:
+        with open(host.p(os.path.join(folder, 'package.json')), encoding='utf-8') as f:
+            return json.loads(f.read(1 << 16)).get('name')
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def t3_form(host, p):
+    """How `p` is a T3 server ('' when it is none): the `t3` binary or link (by name or by exe), any argument that
+    is T3's server entry (`apps/server/dist/bin.mjs`, `src/bin.ts`, `scripts/dev.ts`, relative ones resolved against
+    the process's folder; in a package named "t3" also `dist/bin.mjs` and the like: npm's install, `npm start`),
+    which covers node, bun and the desktop app's Electron running as node, or a package runner (npm, pnpm, bun,
+    yarn) starting a package named "t3". Raises CannotTell when its folder cannot be read for a relative entry."""
     names = _script_names(p.argv)
-    if any(n in T3_NAMES for n in names):
-        return True
-    return len(names) > 1 and any(a.endswith(('/apps/server/src/bin.ts', '/apps/server/dist/bin.mjs'))
-                                  for a in p.argv[1:])
+    if any(n in T3_NAMES for n in names) or os.path.basename(p.exe) in T3_NAMES:
+        return 'the t3 command'
+    cwd = None
+    for a in p.argv[1:] or p.argv:
+        if not a.endswith(tuple(e[1:] for e in T3_PACKAGE_ENTRIES)):       # 'dist/bin.mjs' as given, too
+            continue
+        if not os.path.isabs(a):
+            if cwd is None:
+                try:
+                    cwd = os.readlink(host.p(f'{host.PROC}/{p.pid}/cwd'))
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    raise CannotTell(f'the folder of process {p.pid} cannot be read ({e.strerror})') from None
+            a = os.path.normpath(os.path.join(cwd, a))
+        if a.endswith(T3_ENTRIES):
+            return f'T3\'s server entry {one_line(a, 120)}'
+        for entry in T3_PACKAGE_ENTRIES:
+            if a.endswith(entry) and _package_name(host, a[:-len(entry)]) == 't3':
+                return f'T3\'s server entry {one_line(a, 120)}'
+    runner = [os.path.basename(x) for x in (p.argv[0].split()[:1] + p.argv[1:2])] if p.argv else []
+    if any(r in T3_RUNNERS for r in runner) and {'start', 'dev', 'serve'} & set(' '.join(p.argv).split()):
+        try:
+            cwd = cwd or os.readlink(host.p(f'{host.PROC}/{p.pid}/cwd'))
+        except OSError:
+            return ''
+        if _package_name(host, cwd) == 't3':
+            return 'a package runner starting T3'
+    return ''
+
+
+def t3_unscoped(host, procs, sliced):
+    """{uid: [(Proc, why)]} of T3's processes that no agent scope holds: T3 servers (any launch form), processes
+    with T3's environment markers (agents inherit them; an agent's turn has T3CODE_THREAD_ID) and agent CLIs below
+    a server. A process under its user's manager with an app-t3code slice there is left out: its scopes are on
+    and counted already."""
+    found = {}
+    servers = set()
+    for p in sorted(procs.values(), key=lambda x: x.pid):
+        if p.cgroup.startswith(f'/user.slice/user-{p.uid}.slice/user@{p.uid}.service/') and sliced.get(p.uid):
+            continue
+        form = t3_form(host, p)
+        if form:
+            servers.add(p.pid)
+        why = form or ('T3\'s environment' if p.marked else '')
+        if why:
+            found.setdefault(p.uid, []).append((p, why))
+    for pid in sorted(servers):
+        for k in descendants(procs, pid):
+            if k.comm in AGENT_CLIS and not k.marked and not any(q is k for q, _ in found.get(k.uid, [])):
+                found.setdefault(k.uid, []).append((k, f'an agent CLI below T3 server {pid}'))
+    return found
 
 
 def descendants(procs, pid):
@@ -350,7 +425,8 @@ def live_tickets(host, uid, slice_name):
 # -- locks ------------------------------------------------------------------------------------------------------------
 
 def inhibitors(host):
-    """Block locks on shutdown: [(who, why, uid)]. Raises CannotTell when they cannot be read (busctl missing too)."""
+    """Block locks on shutdown or sleep: [(who, why, uid)]. Raises CannotTell when they cannot be read (busctl
+    missing too). The tick asks again right before it restarts."""
     code, out, err = host.run(['busctl', '--json=short', 'call', 'org.freedesktop.login1', '/org/freedesktop/login1',
                                'org.freedesktop.login1.Manager', 'ListInhibitors'], timeout=10)
     if code != 0:
@@ -359,7 +435,7 @@ def inhibitors(host):
         rows = json.loads(out)['data'][0]
         found = []
         for what, who, why, mode, uid, _pid in rows:
-            if mode == 'block' and 'shutdown' in what.split(':'):
+            if mode == 'block' and {'shutdown', 'sleep'} & set(what.split(':')):
                 found.append((who, why, uid))
         return found
     except (ValueError, KeyError, IndexError, TypeError, AttributeError):
@@ -452,17 +528,10 @@ def look(host, settings):
         if jobs or tickets:
             busy.append(f'user {uid}: heavy jobs ({len(jobs or [])} running, {tickets or 0} live ticket(s))')
     if procs is not None:
-        for p in sorted(procs.values(), key=lambda x: x.pid):
-            if not is_t3_server(p):
-                continue
-            mine = f'/user.slice/user-{p.uid}.slice/user@{p.uid}.service/'
-            if p.cgroup.startswith(mine) and sliced.get(p.uid):
-                continue                    # its agents run in scopes, counted above
-            kids = [k for k in descendants(procs, p.pid) if not k.comm.startswith(T3_HELPERS)]
-            if kids:
-                names = one_line(', '.join(sorted({k.comm for k in kids})[:5]), 120)
-                busy.append(f'T3 server {p.pid} (user {p.uid}) runs agents without scopes: {len(kids)} process(es) '
-                            f'({names})')
+        unscoped = _part(busy, lambda: t3_unscoped(host, procs, sliced))
+        for uid, found in sorted((unscoped or {}).items()):
+            shown = '; '.join(one_line(f'{p.pid} {p.comm}: {why}', 100) for p, why in found[:4])
+            busy.append(f'T3 runs without agent scopes (user {uid}): {len(found)} process(es): {shown}')
         tools = package_tools(procs)
         if tools:
             busy.append('package manager at work: ' + ', '.join(f'{n} ({pid})' for pid, n in tools[:3]))

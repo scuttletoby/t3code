@@ -11,8 +11,8 @@ and containers that do not come back by themselves are cut off. This kit takes r
   done by hand in a planned window;
 - a **daily baseline check** compares the machine with the policy and prints (and alerts) only what drifted.
 
-Debian or Ubuntu with systemd 248 or later and cgroup v2 (`/run/reboot-required`, `apt-config`, `systemctl reboot
---check-inhibitors`); without cgroup v2 the machine always counts as busy. Plain Python 3 standard library (3.9 or
+Debian or Ubuntu with systemd and cgroup v2 (`/run/reboot-required`, `apt-config`, logind's inhibitor locks);
+without cgroup v2 the machine always counts as busy. Plain Python 3 standard library (3.9 or
 later, for `zoneinfo`); nothing to install but the kit.
 
 ## Commands
@@ -41,18 +41,22 @@ which is the journal under the units (`journalctl -u update-policy`).
    `/run/reboot-required.pkgs`. Never a restart.
 5. Roles `dev` and `personal`: once every `retryMinutes`, it looks at the idle facts (below).
    - **Idle:** it writes why to the journal and to the state file (`restart pending since ... for linux-image-...;
-     idle in the quiet window 05:00-07:00 Europe/London (role dev)`), then `systemctl reboot
-     --check-inhibitors=yes`: a job that took a block lock after the look still stops it (systemd 248 or later; an
-     older systemd refuses the option, which is a failed restart).
+     idle in the quiet window 05:00-07:00 Europe/London (role dev)`). As the very last step it reads the block
+     locks on shutdown or sleep again: one taken since the look (or locks it cannot read) stops the restart, with one
+     `restart-failed` alert. Then `systemctl reboot`. What is left is the time between that read and systemd
+     starting the shutdown, well under a second: a lock taken in it is too late. `--check-inhibitors=yes` is not
+     used: it also refuses while another user is logged in, and logged-in sessions are no reason to wait (they do
+     not count as busy).
    - **Busy:** the reasons go to the journal (`busy, so no restart now (next look in 15 min ...): user 1000: 2 T3
      agent scope(s) running ...`).
 6. The first tick after a window that ended with the restart still pending after a busy look sends one alert
    `restart-pending` (with the last busy reasons and the next window). A window with no look (the machine was off)
    sends none.
 7. At most one restart per window: none when the machine booted inside the window already, or a restart was asked
-   for in it. A restart that systemctl refuses is logged and alerted (`restart-failed`), never tried again in a
-   loop. A restart asked for that did not come (the tick was killed after it wrote the state, or systemctl said yes
-   and nothing happened) is seen 10 minutes later by the boot id, still the same: one `restart-failed` alert.
+   for in it. A restart that is stopped (a new lock) or refused by systemctl is logged and alerted
+   (`restart-failed`) once, never tried again in a loop. A restart asked for that did not come (the tick was killed
+   after it wrote the state, or systemctl said yes and nothing happened) is seen 10 minutes later by the boot id,
+   still the same: one `restart-failed` alert. One such alert per window, never two for the same restart.
 
 After a boot, `update-policy booted` writes `back up: booted ..., N min after the restart asked at ...` to the
 journal when the last restart was the kit's, and alerts `back-up` when `alertOnBoot` is on.
@@ -68,10 +72,24 @@ container names, a script's answer) is escaped to one line, so it cannot forge a
 - **T3 agents:** a scope with a process in it below any user's systemd manager that T3 made for an agent: a scope
   right below an `app-t3code*` slice, or a `t3code-*.scope` anywhere below the manager (the rule of
   [heavy facts](../heavy/README.md)).
-- **T3 agents without scopes:** T3 turns its agent scopes off when it has no systemd user manager (a system
-  service, no `XDG_RUNTIME_DIR`, a failed `systemd-run` probe); its agents are then its plain children. A T3 server
-  (`t3 serve` or `t3`, npm's `t3` link, or the dev server `apps/server/src/bin.ts`) that is not under its user's
-  manager with an `app-t3code*` slice there is busy while it runs any process but its resource monitor.
+- **T3 without agent scopes:** T3 turns its agent scopes off when it has no systemd user manager (a system
+  service, no `XDG_RUNTIME_DIR`, a failed `systemd-run` probe); its agents are then its plain children, and no
+  slice shows them. Then any of these is busy, unless it runs under its user's manager with an `app-t3code*` slice
+  there (scopes on: its agents are counted as scopes):
+  - a T3 server, however it was started: the `t3` binary or npm's `t3` link (by name or by `/proc/<pid>/exe`);
+    any argument that is T3's server entry (`apps/server/dist/bin.mjs`, `apps/server/src/bin.ts`,
+    `apps/server/scripts/dev.ts`, relative ones resolved against the process's own folder; in a package named
+    `t3` also `dist/bin.mjs`), which covers `node apps/server/dist/bin.mjs`, `npm start`, npm's global install,
+    `bun run src/bin.ts` and the desktop app's server (Electron running as node); a package runner (`npm`,
+    `pnpm`, `bun`, `yarn`) starting a package named `t3`;
+  - a process with T3's environment markers (`T3CODE_HOME`, `T3CODE_PORT`, `T3CODE_THREAD_ID` in
+    `/proc/<pid>/environ`: the server's, inherited by its agents);
+  - an agent CLI (`claude`, `codex`, `opencode`, ...) below such a server.
+
+  So a T3 server with scopes off makes the machine busy as long as it runs, idle or not: such a machine rarely
+  restarts by itself and sends `restart-pending` instead. That is intended (a running turn is never cut off);
+  run T3 with a user manager (scopes on) for nightly restarts. A shell that exports `T3CODE_HOME` counts too.
+
 - **heavy jobs:** a scope with a process in it in a user's heavy slice (`heavySlice`), or a live ticket in that
   user's heavy queue (`/run/user/<uid>/heavy-queue/<slice>/`, held by a running or waiting `heavy --kind` job).
 - **Containers and VMs** (less the names `ignoreContainers` matches: `*` and `?`, a database that always runs, say):
@@ -81,14 +99,15 @@ container names, a script's answer) is escaped to one line, so it cannot forge a
   - Podman (rootless and system) and CRI-O: each running container has a `conmon`; its name is read from it;
   - incus and LXD (`incus list` / `lxc list`, while `incusd` / `lxd` runs), classic LXC (`lxc-ls --running`);
   - libvirt (`virsh -c qemu:///system list`, while `libvirtd` or `virtqemud` runs).
-- **Inhibitor locks:** a `block` lock on `shutdown` (logind). This is the one standard way for any job to say "do
-  not restart now":
+- **Inhibitor locks:** a `block` lock on `shutdown` or `sleep` (logind). This is the one standard way for any job
+  to say "do not restart now"; it is read again right before the restart:
 
   ```
   systemd-inhibit --what=shutdown --mode=block --who=mutation-tests --why="hours left" ./run-mutation-tests
   ```
 
-  `delay` locks (`unattended-upgrade-shutdown` holds one all day) do not count.
+  `delay` locks (`unattended-upgrade-shutdown` holds one all day) do not count, and neither do logged-in sessions
+  (a desktop left logged in, an open ssh session).
 
 - **Package manager at work:** `apt`, `apt-get`, `aptitude`, `dpkg` or `unattended-upgrade` running.
 - **Busy scripts:** each of `busyScripts` is a [free/v1 script](../common/FREE.md) (absolute path, root's, no

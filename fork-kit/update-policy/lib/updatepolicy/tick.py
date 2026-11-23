@@ -200,11 +200,25 @@ class Machine:
         with open(self.p(BOOT_ID), encoding='ascii') as f:
             return f.read().strip()
 
+    def last_look(self):
+        """Right before the restart: None, or why not (a block lock on shutdown or sleep taken since the look, or
+        the locks cannot be read)."""
+        from updatepolicy import idle
+        try:
+            locks = idle.inhibitors(self.host)
+        except idle.CannotTell as e:
+            return f'not restarted: {e}'
+        if locks:
+            return 'not restarted: an inhibitor lock appeared after the look: ' + '; '.join(
+                f'{settings_mod.one_line(who, 60)} (uid {uid}): {settings_mod.one_line(why, 120)}'
+                for who, why, uid in locks[:3])
+        return None
+
     def reboot(self, why):
-        """systemctl reboot that honours inhibitor locks (a job that took a block lock after the look stops it:
-        systemd 248 or later; an older one refuses the option, which is a failed restart too)."""
-        code, _out, err = self.host.run(['systemctl', 'reboot', '--check-inhibitors=yes',
-                                         f'--message=update-policy: {why}'[:400]], timeout=60)
+        """systemctl reboot without --check-inhibitors: that also refuses while another user is logged in, and
+        logged-in sessions are no reason to wait. Block locks were read just before (last_look)."""
+        code, _out, err = self.host.run(['systemctl', 'reboot', f'--message=update-policy: {why}'[:400]],
+                                        timeout=60)
         return None if code == 0 else settings_mod.one_line(err.strip() or f'exit {code}', 300)
 
     def alert(self, command, event, text):
@@ -275,10 +289,15 @@ def run_actions(m, s, acts, st):
             restart = act[1]
     m.write_state(st)
     if restart:
-        m.log('notice', f'restarting now: {restart}')
-        err = m.reboot(restart)
+        # the last step: a job that took a block lock after the look stops the restart (what is left is the time
+        # between this read and systemd starting the shutdown, well under a second)
+        err = m.last_look()
+        if not err:
+            m.log('notice', f'restarting now: {restart}')
+            err = m.reboot(restart)
         if err:
             m.log('err', f'the restart failed: {err}')
+            st['restartMissed'] = st.get('restartAt')      # one restart-failed alert per window, not a second one
             st['lastAlertError'] = send_alert(m, s, 'restart-failed', f'the restart failed ({err}): {restart}')
             m.write_state(st)
             code = 1
