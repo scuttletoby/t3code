@@ -159,6 +159,15 @@ class Worktrees(Check):
                                ('worktrees.stale', 'worktree of branch old-work')])
         self.assertTrue(os.path.isdir(os.path.join(trees, 'merged-branch')))      # report only
 
+    def test_a_branch_named_like_another_ref_is_read_by_its_full_name(self):
+        """refname:short writes `heads/x` when a tag or remote has the short name x too; git then reads
+        refs/heads/heads/x, and the whole check failed on a real repository."""
+        self.merged('pr7')
+        self.git(self.root, 'update-ref', 'refs/remotes/pr7', 'HEAD')
+        self.git(self.root, 'tag', 'pr7')
+        found = self.run_check('worktrees')
+        self.assertEqual([(f['id'], f['text'].split(':')[0]) for f in found], [('branches.merged', 'branch pr7')])
+
     def test_fix_prunes_only_records_of_gone_folders(self):
         trees = os.path.join(self.tmp, 'trees')
         self.git(self.root, 'branch', 'gone-tree')
