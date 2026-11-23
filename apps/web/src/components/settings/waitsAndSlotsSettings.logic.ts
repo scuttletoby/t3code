@@ -15,6 +15,7 @@ import {
 import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
+import { defaultIs } from "./fork/forkDefaultText.logic";
 
 type NumberKey<T> = { [K in keyof T]-?: T[K] extends number ? K : never }[keyof T];
 
@@ -31,7 +32,7 @@ export interface NumberFieldSpec<K extends string> {
 export const WAIT_FOR_NUMBER_FIELDS: ReadonlyArray<NumberFieldSpec<NumberKey<WaitForSettings>>> = [
   {
     key: "defaultTimeoutHours",
-    title: "Default time limit",
+    title: "Time limit when the agent sets none",
     description: "A wait ends as timed out after this long when the agent gives no limit.",
     unit: "hours",
     min: 1,
@@ -39,7 +40,7 @@ export const WAIT_FOR_NUMBER_FIELDS: ReadonlyArray<NumberFieldSpec<NumberKey<Wai
   },
   {
     key: "maxTimeoutHours",
-    title: "Longest time limit",
+    title: "Longest wait an agent may ask for",
     description: "The longest limit an agent may ask for.",
     unit: "hours",
     min: 1,
@@ -47,7 +48,7 @@ export const WAIT_FOR_NUMBER_FIELDS: ReadonlyArray<NumberFieldSpec<NumberKey<Wai
   },
   {
     key: "maxPerThread",
-    title: "Open waits per thread",
+    title: "Waits open at once per thread",
     description: "A thread cannot register more waits than this at once.",
     unit: "waits",
     min: 1,
@@ -79,7 +80,7 @@ export const WAIT_FOR_NUMBER_FIELDS: ReadonlyArray<NumberFieldSpec<NumberKey<Wai
   },
   {
     key: "noChecksGraceSeconds",
-    title: "No checks after",
+    title: "Report a pull request with no checks after",
     description: "A pull request head with no checks at all is reported as such after this long.",
     unit: "seconds",
     min: 0,
@@ -96,7 +97,7 @@ export const WAIT_FOR_NUMBER_FIELDS: ReadonlyArray<NumberFieldSpec<NumberKey<Wai
   },
   {
     key: "maxErrorWakesPerSweep",
-    title: "Error wakes per sweep",
+    title: "Threads woken per error sweep",
     description:
       "When a source fails for many threads at once, at most this many threads are woken per sweep; the rest follow.",
     unit: "threads",
@@ -128,7 +129,7 @@ export const AGENT_SLOTS_NUMBER_FIELDS: ReadonlyArray<
 > = [
   {
     key: "maxPerMachine",
-    title: "Agents on this machine",
+    title: "Most agents on this machine",
     description: "Most agents running at once on this server. 0 means no limit.",
     unit: "agents",
     min: 0,
@@ -136,7 +137,7 @@ export const AGENT_SLOTS_NUMBER_FIELDS: ReadonlyArray<
   },
   {
     key: "minFreeMemoryMb",
-    title: "Free memory floor",
+    title: "Keep this much memory free",
     description:
       "Refuse a new agent while less memory than this is free. 0 turns it off. Set it with a count limit.",
     unit: "MB",
@@ -186,8 +187,8 @@ export function waitForSummary(settings: WaitForSettings): string {
  */
 export function waitForDescription(settings: WaitForSettings): string {
   return settings.enabled
-    ? "Agents can wait for a pull request, a file, a service or a named check, end their turn, and get one message when it happens."
-    : "Off: agents cannot register waits and nothing is checked or delivered. Waits already stored are kept; agents can still list and cancel them.";
+    ? `On: an agent can wait for a pull request, a file, a service or a custom check, end its turn, and get one message when it happens. ${defaultIs("waitFor")}`
+    : `On: an agent can wait for a pull request, a file, a service or a custom check, end its turn, and get one message when it happens. Off: agents cannot add waits and nothing is checked; waits already saved are kept and can still be listed and cancelled. ${defaultIs("waitFor")}`;
 }
 
 export function agentSlotsSummary(settings: AgentSlotsSettings): string {
@@ -203,11 +204,11 @@ export function agentSlotsSummary(settings: AgentSlotsSettings): string {
 
 export function agentSlotsDescription(settings: AgentSlotsSettings): string {
   if (!settings.enabled) {
-    return "Off: delegate_task starts every agent it is asked to. Agents already running are not affected by this switch.";
+    return `On: a new sub-agent is refused while a limit below is reached, and the agent can wait for a free slot. Off: every sub-agent starts. Running agents are never stopped. ${defaultIs("agentSlots")}`;
   }
   return agentSlotsSummary(settings) === "On, no limit set"
-    ? "On, but no limit is set, so every agent still starts. Set a limit below."
-    : "delegate_task refuses a new agent while a limit is reached; the agent can wait for a free slot. Agents already running are never stopped.";
+    ? `On, but no limit is set, so every sub-agent still starts. Set a limit below. ${defaultIs("agentSlots")}`
+    : `On: a new sub-agent is refused while a limit is reached, and the agent can wait for a free slot. Running agents are never stopped. ${defaultIs("agentSlots")}`;
 }
 
 /** One row per provider instance on this server, plus limits stored for instances it no longer has. */

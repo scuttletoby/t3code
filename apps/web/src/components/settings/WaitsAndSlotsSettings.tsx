@@ -59,6 +59,7 @@ import {
   withWaitCheck,
   withoutWaitCheck,
 } from "./waitsAndSlotsSettings.logic";
+import { defaultIs } from "./fork/forkDefaultText.logic";
 
 type UpdateSettings = ReturnType<typeof useUpdateScopedSettings>;
 
@@ -103,7 +104,7 @@ function NumberSettingRow({
       serverScoped
       id={`${settingKey}-${field.key}`}
       title={field.title}
-      description={field.description}
+      description={`${field.description} Default: ${defaultValue} ${field.unit}.`}
       settingKeys={[settingKey]}
       mixed={mixed}
       resetAction={
@@ -153,7 +154,7 @@ function WaitForSection({ updateSettings }: { readonly updateSettings: UpdateSet
     ));
 
   return (
-    <SettingsSection id="waits" title="Waits">
+    <SettingsSection id="waits" title="Agent waits">
       <SettingsRow
         serverScoped
         {...searchableSetting("wait-for")}
@@ -378,7 +379,7 @@ function WaitChecksSection({ updateSettings }: { readonly updateSettings: Update
     };
 
   return (
-    <SettingsSection id="wait-checks-section" title="Wait checks">
+    <SettingsSection id="wait-checks-section" title="Custom wait checks">
       <SettingsRow
         serverScoped
         {...searchableSetting("wait-checks")}
@@ -388,7 +389,7 @@ function WaitChecksSection({ updateSettings }: { readonly updateSettings: Update
           mixed
             ? "The selected environments have different checks. Select one environment to edit them."
             : entries.length === 0
-              ? "No checks yet. A check is a command agents can wait on by name, for example a build that writes a file when done."
+              ? "None yet. A custom check is a command agents can wait on by name, for example one that tests whether a build finished. Done when it exits with 0."
               : "Commands agents can wait on by name. A check is done when its command exits with 0."
         }
         control={
@@ -504,7 +505,7 @@ function AgentSlotsSection({ updateSettings }: { readonly updateSettings: Update
   const accounts = agentSlotAccountRows(providers, slots.maxPerAccount);
 
   return (
-    <SettingsSection id="agent-slots-section" title="Agent slots">
+    <SettingsSection id="agent-slots-section" title="Limit on running agents">
       <SettingsRow
         serverScoped
         {...searchableSetting("agent-slots")}
@@ -542,7 +543,7 @@ function AgentSlotsSection({ updateSettings }: { readonly updateSettings: Update
             accountsMixed
               ? "The selected environments have different account limits. Select one environment to edit them."
               : account.known
-                ? "Most agents running at once on this provider account. 0 means no limit."
+                ? `Most agents running at once on this provider account. 0 means no limit. ${defaultIs("agentSlotsPerAccount")}`
                 : "This provider instance is not on this server any more. Set 0 to remove its limit."
           }
           settingKeys={["agentSlots"]}
@@ -585,17 +586,32 @@ function AgentSlotsSection({ updateSettings }: { readonly updateSettings: Update
   );
 }
 
-/**
- * Waits and agent slots are environment-wide, so a project screen shows only its wait checks,
- * which a project may override as a whole map.
- */
-export function WaitsAndSlotsSettings({ isProjectScope }: { readonly isProjectScope: boolean }) {
+/** Agent waits and the server's wait checks; a project screen shows only its wait checks. */
+export function WaitsSettings({ isProjectScope }: { readonly isProjectScope: boolean }) {
   const updateSettings = useUpdateScopedSettings();
   return (
     <>
       {isProjectScope ? null : <WaitForSection updateSettings={updateSettings} />}
       <WaitChecksSection updateSettings={updateSettings} />
-      {isProjectScope ? null : <AgentSlotsSection updateSettings={updateSettings} />}
+    </>
+  );
+}
+
+/** Agent slots are environment-wide, so a project screen does not show them. */
+export function AgentSlotsSettings() {
+  const updateSettings = useUpdateScopedSettings();
+  return <AgentSlotsSection updateSettings={updateSettings} />;
+}
+
+/**
+ * Waits and agent slots are environment-wide, so a project screen shows only its wait checks,
+ * which a project may override as a whole map.
+ */
+export function WaitsAndSlotsSettings({ isProjectScope }: { readonly isProjectScope: boolean }) {
+  return (
+    <>
+      <WaitsSettings isProjectScope={isProjectScope} />
+      {isProjectScope ? null : <AgentSlotsSettings />}
     </>
   );
 }

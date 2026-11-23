@@ -7,7 +7,7 @@ simple tools ([#879](https://github.com/scuttletoby/t3code/issues/879)).
 
 ## Making it
 
-1. **Settings → Fork**, section Assistant: switch on **Offer Make assistant** (`assistant.enabled`).
+1. **Settings → Fork**, section Assistant: switch on **Offer an assistant thread** (`assistant.enabled`).
 2. Press **Make assistant**. T3 first saves the MCP profile pick `assistant` for a new thread id
    (`mcpThreadProfiles`), then makes a thread named "Assistant" with that id in the Scratch project
    (the project with no folder), then names it the assistant (`threadRoles.assistant`). The app

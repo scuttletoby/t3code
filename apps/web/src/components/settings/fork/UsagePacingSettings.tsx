@@ -18,12 +18,13 @@ import { Checkbox } from "../../ui/checkbox";
 import { Input } from "../../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
 import { Switch } from "../../ui/switch";
+import { AdvancedSettings } from "../AdvancedSettings";
 import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
-import { BoundedNumberField, ForkRow, useSelectedProviders } from "./ForkRow";
+import { BoundedNumberField, ForkRow, OptionLines, useSelectedProviders } from "./ForkRow";
 import {
   USAGE_PACING_GATE_OPTIONS,
   USAGE_PACING_WINDOW_KINDS,
@@ -35,6 +36,7 @@ import {
   usagePacingAccountRows,
   usagePacingAccountSummary,
 } from "./usagePacingSettings.logic";
+import { defaultIs } from "./forkDefaultText.logic";
 
 type UpdateSettings = ReturnType<typeof useUpdateScopedSettings>;
 
@@ -43,10 +45,12 @@ const MIXED = "The selected environments have different values. Select one envir
 export function UsagePacingSettings() {
   const updateSettings = useUpdateScopedSettings();
   return (
-    <SettingsSection id="usage-pacing-section" title="Usage pacing">
+    <SettingsSection id="usage-pacing-section" title="Plan usage pacing">
       <GateRow updateSettings={updateSettings} />
-      <LowerEffortRow updateSettings={updateSettings} />
       <AccountRows updateSettings={updateSettings} />
+      <AdvancedSettings targetIds={["usage-pacing-lower-effort"]}>
+        <LowerEffortRow updateSettings={updateSettings} />
+      </AdvancedSettings>
     </SettingsSection>
   );
 }
@@ -66,9 +70,16 @@ function GateRow({ updateSettings }: { readonly updateSettings: UpdateSettings }
       lockPaths={["usagePacingGate"]}
       mixed={mixed}
       description={
-        mixed
-          ? MIXED
-          : `What happens when an agent starts a task with delegate_task. ${option?.description ?? ""}`
+        mixed ? (
+          MIXED
+        ) : (
+          <OptionLines
+            lead="What happens when an agent starts a sub-agent while an account is using its plan faster than an even pace."
+            options={USAGE_PACING_GATE_OPTIONS}
+            selected={gate}
+            tail={defaultIs("usagePacingGate")}
+          />
+        )
       }
       resetAction={
         !mixed && gate !== DEFAULT_SERVER_SETTINGS.usagePacingGate ? (
@@ -136,7 +147,7 @@ function LowerEffortRow({ updateSettings }: { readonly updateSettings: UpdateSet
       description={
         mixed
           ? MIXED
-          : "With the gate on Enforce: the effort a task drops to while its account is ahead of pace, as pairs like high=medium. A level not listed waits instead. Empty never lowers one."
+          : `Only with pacing on Enforce: the effort a task drops to while its account is ahead of pace, as pairs like high=medium. A level not listed waits instead. Empty: effort is never lowered. ${defaultIs("usagePacingLowerEffort")}`
       }
       resetAction={
         !mixed && storedText !== "" ? (
@@ -198,7 +209,7 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
             ? MIXED
             : rows.length === 0
               ? "No provider accounts on this server yet."
-              : "Per account: the share of each usage window kept free for you (released over its last 12 hours), and whether agents spend it first or it has no limits. Only the gate acts on these."
+              : `Per account: how much of each usage window agents leave free for you (handed back over the window's last 12 hours), whether agents should use this account first, and whether it has no limits at all. Only used while pacing is on. ${defaultIs("usagePacingAccount")}`
         }
       />
       {mixed
@@ -215,7 +226,7 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
               status={usagePacingAccountSummary(row.settings)}
               description={
                 row.known
-                  ? "Points of each limit window kept free for you. 0 keeps none."
+                  ? "Percent of each usage window kept free for you. 0 keeps none."
                   : "This account is not on this server any more. Remove its entry, or keep it for when the account comes back."
               }
               resetAction={
@@ -268,7 +279,8 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
                       }
                       aria-label={`Spend ${row.label} first`}
                     />
-                    Spend first (no even pace; only the reserve holds agents back)
+                    Use this account first (no even pace; only the share kept for you holds agents
+                    back)
                   </label>
                   <label className="flex items-center gap-2">
                     <Switch
@@ -279,7 +291,7 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
                       }
                       aria-label={`${row.label} has no usage limits`}
                     />
-                    No usage limits (an API key)
+                    No usage limits (for example an API key)
                   </label>
                   {row.settings.burnFirst ? (
                     <div

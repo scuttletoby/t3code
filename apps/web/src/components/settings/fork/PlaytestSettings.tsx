@@ -40,6 +40,7 @@ import {
   withPlaytestSteps,
 } from "./playtestSettings.logic";
 import { BoundedNumberField, ForkRow, useSubRowReset } from "./ForkRow";
+import { defaultIs } from "./forkDefaultText.logic";
 
 const MIXED =
   "The selected environments or projects have different playtest settings. Select one to edit them.";
@@ -174,7 +175,7 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
 
   if (mixed) {
     return (
-      <SettingsSection id="playtest-section" title="Playtest">
+      <SettingsSection id="playtest-section" title="Playtest sessions">
         <ForkRow
           serverScoped
           {...searchableSetting("playtest")}
@@ -188,7 +189,7 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
   }
 
   return (
-    <SettingsSection id="playtest-section" title="Playtest">
+    <SettingsSection id="playtest-section" title="Playtest sessions">
       <ForkRow
         serverScoped
         {...searchableSetting("playtest")}
@@ -198,7 +199,7 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
         description={`${
           !shown.enabled && missing.length > 0
             ? `Set the steps below first (missing: ${missing.join(", ")}).`
-            : "You try an agent's unfinished work on a test target, round after round. Nothing starts a session yet."
+            : `On: an agent can start a playtest with its playtest tool: T3 claims your test target, sends each round with your steps, and gives the target back at the end, so you can try unfinished work. Off: no playtest starts. ${defaultIs("playtest")}`
         }${scopeNote}`}
         resetAction={
           !isProjectScope && !Equal.equals(shown, DEFAULT_SERVER_SETTINGS.playtest) ? (
@@ -226,7 +227,7 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
           ["claim", "renew", "push", "release"],
           "Reset playtest steps to the environment's",
         )}
-        description="claim takes the target, renew keeps the claim, push sends a round (one or more named steps), release puts the target back. See docs/fork/playtest.md."
+        description="The commands T3 runs: claim takes the target, renew keeps the claim, push sends a round (one or more named steps), release gives the target back. All four are needed before playtests can be turned on."
         control={
           <Button size="xs" variant="outline" onClick={() => setEditing(true)}>
             Edit steps
@@ -259,7 +260,7 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
                 [limit.key],
                 `Reset ${title.toLowerCase()} to the environment's`,
               )}
-              description={limit.description}
+              description={`${limit.description} Default: ${DEFAULT_SERVER_SETTINGS.playtest[limit.key]} ${limit.unit}.`}
               control={
                 <div className="flex items-center gap-2">
                   <BoundedNumberField
