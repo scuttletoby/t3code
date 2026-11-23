@@ -1,0 +1,12 @@
+#!/usr/bin/python3 -IB
+"""update-policy: the update-policy kit (lib/updatepolicy). Restarts only when idle, at the quiet hour, by role;
+a daily baseline check. -I: no environment variable, user site folder or current folder changes what Python loads.
+The code is loaded only from this file's real folder; the shared machine-file loader and free/v1 reader come from
+common/ beside the kit."""
+import os, sys
+kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+common = os.path.join(kit, 'common')
+sys.path[:0] = [os.path.join(kit, 'lib'),
+                common if os.path.isdir(common) else os.path.join(os.path.dirname(kit), 'common')]
+from updatepolicy import cli  # noqa: E402
+sys.exit(cli.main(sys.argv[1:]))

@@ -108,6 +108,28 @@
       ]
     }
   },
+  "update-policy": {
+    "role": "dev",
+    "quietHour": "05:00",
+    "timeZone": "Europe/London",
+    "windowMinutes": 120,
+    "retryMinutes": 15,
+    "alertCommand": ["/srv/example/bin/notify-owner", "--topic", "updates"],
+    "alertOnBoot": false,
+    "containerUsers": ["example-agent"],
+    "systemDocker": true,
+    "ignoreContainers": ["example-dev-db"],
+    "heavySlice": "heavy.slice",
+    "busyScripts": ["/srv/example/bin/busy-while-running"],
+    "baseline": {
+      "ports": ["tcp/22@100.64.0.0/10", "udp/41641", "tcp/3773@100.64.0.0/10"],
+      "ignoreLoopback": true,
+      "diskPercent": 90,
+      "diskPaths": ["/"],
+      "pendingDays": 3,
+      "sshUsers": ["root", "example-agent"]
+    }
+  },
   "desk": {
     "pool": "pc",
     "host": "fleet-host.example",

@@ -1,0 +1,15 @@
+# update-policy kit: written by update-policy-install. Do not edit: run the installer again.
+[Unit]
+Description=update-policy booted: say that a restart this kit made came back (fork-kit/update-policy)
+ConditionPathExists=/usr/local/libexec/update-policy/current/bin/update-policy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/update-policy/current/bin/update-policy booted
+TimeoutStartSec=5min
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target
