@@ -4,7 +4,7 @@ read() returns the checked settings, or raises machine_file.MachineFileError nam
 here has a default for the facts of one machine (its role, its quiet hour and its time zone): a file without them
 is refused, and a refused file never restarts anything.
 """
-import fnmatch, ipaddress, os, re
+import fnmatch, ipaddress, os, re, unicodedata
 import machine_file
 from machine_file import REQUIRED, MachineFileError
 
@@ -15,6 +15,29 @@ HHMM_RE = re.compile(r'^([01][0-9]|2[0-3]):([0-5][0-9])\Z')
 USER_RE = re.compile(r'^[a-z_][a-z0-9_-]{0,31}\Z')
 SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
 PORT_RE = re.compile(r'^(tcp|udp)/([0-9]{1,5})(?:-([0-9]{1,5}))?(?:@(.+))?\Z')
+# values that look like credentials: GitHub, OpenAI-style and Slack tokens, and long hex or base64 runs. A secret in
+# the alert command's argv is readable by every user in /proc while it runs: keep it in a root-only file the
+# command reads (README, Machine file).
+TOKEN_RES = (re.compile(r'(gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}'), re.compile(r'\bsk-[A-Za-z0-9_-]{16,}'),
+             re.compile(r'\bxox[abposr]-[A-Za-z0-9-]{8,}'), re.compile(r'\b[0-9a-fA-F]{32,}\b'),
+             re.compile(r'(?<![/A-Za-z0-9+_=-])(?=[A-Za-z0-9+_=-]*[0-9])(?=[A-Za-z0-9+_=-]*[a-z])'
+                        r'(?=[A-Za-z0-9+_=-]*[A-Z])[A-Za-z0-9+_=-]{32,}(?![/A-Za-z0-9+_=-])'))
+
+
+def one_line(text, limit=300):
+    """Text from elsewhere (a user's inhibitor reason, a container name, a script's answer) made safe for one journal
+    line and the alert text: control and format characters escaped (a newline cannot start a forged record), and
+    cut to `limit` characters."""
+    out = []
+    for c in str(text):
+        if c == '\\':
+            out.append('\\\\')
+        elif unicodedata.category(c)[0] == 'C':
+            out.append(f'\\x{ord(c):02x}' if ord(c) < 0x100 else f'\\u{ord(c):04x}')
+        else:
+            out.append(c)
+    text = ''.join(out)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
 def _role(value):
@@ -43,6 +66,10 @@ def _absolute_command(value):
         return None
     if not all(isinstance(x, str) and x and '\0' not in x for x in value):
         return 'must be a list of strings'
+    for x in value[1:]:
+        if any(r.search(x) for r in TOKEN_RES):
+            return ('an argument looks like a token or key: every user can read the arguments while the command runs; '
+                    'keep the secret in a root-only file the command reads')
     return None if os.path.isabs(value[0]) else 'its first string must be an absolute path to a program'
 
 
@@ -98,6 +125,7 @@ BASELINE = {
     'diskPercent': (int, 90, _between(1, 100)),
     'diskPaths': (list, ['/'], _paths),
     'pendingDays': (int, 3, _between(1, 60)),
+    'sshUsers': (list, ['root'], _users),
 }
 
 SPEC = {
@@ -133,4 +161,5 @@ def ignored_container(settings, name):
     return any(fnmatch.fnmatchcase(name, p) for p in settings['ignoreContainers'])
 
 
-__all__ = ['MachineFileError', 'ROLES', 'RESTARTS', 'SECTION', 'check', 'read', 'parse_port', 'ignored_container']
+__all__ = ['MachineFileError', 'ROLES', 'RESTARTS', 'SECTION', 'check', 'read', 'parse_port', 'ignored_container',
+           'one_line']

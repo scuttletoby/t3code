@@ -30,7 +30,7 @@ def to_journal():
 def log(level, text):
     """One line for the journal: with its priority prefix when stdout is the journal."""
     prefix = f'<{LEVELS[level]}>' if to_journal() else ''
-    print(f'{prefix}update-policy: {text}', flush=True)
+    print(f'{prefix}update-policy: {settings.one_line(text, 4000)}', flush=True)
 
 
 def make(host=None):

@@ -2,46 +2,42 @@
 
 check(host, settings, state, now) returns the drift lines ([]: none):
 
-- unattended-upgrades is installed and on (APT::Periodic), its timers are enabled, and it takes the security
-  pocket (an Allowed-Origins or Origins-Pattern entry that names security);
+- unattended-upgrades is installed and on (APT::Periodic, apt's own booleans), its timers are enabled, and it
+  takes the distribution's own security pocket (`<codename>-security` or Debian-Security; ESM lines alone do not
+  count);
 - the restart policy matches the role: unattended-upgrades never restarts by itself (Automatic-Reboot false: this
-  kit owns restarts), the kit's timer and boot look are enabled, and the last alert went out;
-- no restart pending for more than baseline.pendingDays days;
+  kit owns restarts), the kit's units are enabled and did not fail, and the last alert went out;
+- no restart pending for more than baseline.pendingDays days (since this boot first saw it);
 - no listening port outside baseline.ports (when the list is given);
-- no password login over ssh (PasswordAuthentication, or keyboard-interactive through PAM);
+- no password login over ssh (PasswordAuthentication, or keyboard-interactive through PAM), for a connection
+  from outside and for each of baseline.sshUsers (`sshd -T -C`, so Match blocks count);
 - no disk of baseline.diskPaths fuller than baseline.diskPercent.
 
-A fact it cannot read is drift too ("cannot read ..."), never a pass.
+A fact it cannot read is drift too ("cannot read ..."), never a pass, and one check that breaks never stops the
+others.
 """
 import ipaddress, os, re
 
-from updatepolicy import settings as settings_mod, tick
+from updatepolicy import aptconf, settings as settings_mod, tick
 
-APT_LINE = re.compile(r'^(\S+) "(.*)";$')
-TRUE = ('1', 'true', 'yes', 'on', 'always')
 TIMERS = ('apt-daily.timer', 'apt-daily-upgrade.timer')
-OWN_UNITS = ('update-policy.timer', 'update-policy-boot.service')
+OWN_UNITS = ('update-policy.timer', 'update-policy-baseline.timer', 'update-policy-boot.service')
+WATCHED = ('update-policy.service', 'update-policy-boot.service')   # the baseline's own unit fails on drift
+OUTSIDE = 'host=outside.invalid,addr=203.0.113.1'                   # a connection from a TEST-NET address
+SECURITY_RE = re.compile(r'(^|,)(codename|archive|suite|a|n)=[^,]*-security(,|$)|(^|,)label=debian-security(,|$)')
 TCP_LISTEN, UDP_UNCONNECTED = '0A', '07'
 NET_FILES = (('tcp', '/proc/net/tcp', 4), ('tcp', '/proc/net/tcp6', 6), ('udp', '/proc/net/udp', 4),
              ('udp', '/proc/net/udp6', 6))
 
 
-def apt_config(host):
-    """{key: [values]} from `apt-config dump` (a list key gives one value per item), or a string saying why not."""
-    code, out, err = host.run(['apt-config', 'dump'], timeout=20)
-    if code != 0:
-        return f'cannot read apt\'s settings ({(err.strip() or f"exit {code}")[:160]})'
-    found = {}
-    for line in out.splitlines():
-        m = APT_LINE.match(line.strip())
-        if m:
-            found.setdefault(m.group(1), []).append(m.group(2))
-    return found
-
-
-def _last(cfg, key):
-    values = cfg.get(key) or ['']
-    return values[-1].strip().lower()
+def main_security(value):
+    """An origin line that takes the distribution's own security pocket: `${distro_id}:${distro_codename}-security`,
+    or a pattern with `codename=...-security` or `label=Debian-Security`. ESM's -apps-security and -infra-security
+    are extra pockets, not it."""
+    v = value.strip().lower()
+    if 'esm' in v or v.endswith(('-apps-security', '-infra-security')):
+        return False
+    return bool(re.search(r'^[^:,=]*:[^:,=]*-security$', v) or SECURITY_RE.search(v))
 
 
 def updates_drift(host, cfg):
@@ -50,16 +46,17 @@ def updates_drift(host, cfg):
         out.append('unattended-upgrades is not installed (apt install unattended-upgrades)')
     if isinstance(cfg, str):
         return out + [cfg]
-    if _last(cfg, 'APT::Periodic::Enable') in ('0', 'false', 'no'):
+    if aptconf.last(cfg, 'APT::Periodic::Enable') in aptconf.FALSE:
         out.append('APT::Periodic::Enable is off: no automatic updates at all')
     for key in ('APT::Periodic::Update-Package-Lists', 'APT::Periodic::Unattended-Upgrade'):
-        if _last(cfg, key) in ('', '0'):
+        if aptconf.last(cfg, key) in ('',) + aptconf.FALSE:
             out.append(f'{key} is off: security updates are not installed by themselves '
                        '(dpkg-reconfigure -plow unattended-upgrades)')
     origins = [v for k, vs in cfg.items() for v in vs
                if k in ('Unattended-Upgrade::Allowed-Origins::', 'Unattended-Upgrade::Origins-Pattern::')]
-    if not any('security' in v.lower() for v in origins):
-        out.append('unattended-upgrades takes no security origin (Allowed-Origins / Origins-Pattern)')
+    if not any(main_security(v) for v in origins):
+        out.append('unattended-upgrades does not take the distribution\'s security pocket (no <codename>-security '
+                   'or Debian-Security line in Allowed-Origins / Origins-Pattern; ESM lines alone do not count)')
     for unit in TIMERS:
         state = enabled(host, unit)
         if state != 'enabled':
@@ -77,20 +74,25 @@ def enabled(host, unit):
 
 def policy_drift(host, cfg, s, state):
     out = []
-    if isinstance(cfg, dict) and _last(cfg, 'Unattended-Upgrade::Automatic-Reboot') in TRUE:
-        out.append('unattended-upgrades restarts by itself (Unattended-Upgrade::Automatic-Reboot is true): the '
-                   'restart policy is bypassed; a later apt.conf file overrides the kit\'s (apt-config dump)')
+    problem = aptconf.restart_problem(cfg) if isinstance(cfg, dict) else None
+    if problem:
+        out.append(problem)
     for unit in OWN_UNITS:
         word = enabled(host, unit)
         if word != 'enabled':
-            out.append(f'{unit} is {word}: pending restarts are neither made nor reported '
-                       f'(systemctl enable --now {unit})')
+            out.append(f'{unit} is installed but {word}, not enabled: pending restarts are neither made nor '
+                       f'reported (update-policy-install install ... --timer enables them)')
+    for unit in WATCHED:
+        code, text, _err = host.run(['systemctl', 'is-failed', unit], timeout=10)
+        if (text.strip().splitlines() or [''])[0] == 'failed':
+            out.append(f'{unit} failed its last run (journalctl -u {unit[:-len(".service")]})')
     if state.get('lastAlertError'):
         out.append(f'the last alert failed: {state["lastAlertError"]}')
     return out
 
 
-def pending_drift(pending, s, now):
+def pending_drift(pending, s, now, state=None, boot=''):
+    pending, _seen = tick.first_seen(state or {}, pending, boot)
     if pending is None:
         return []
     days = (now - pending.since).total_seconds() / 86400
@@ -120,7 +122,7 @@ def listeners(host):
             with open(host.p(path), encoding='ascii') as f:
                 lines = f.read().splitlines()[1:]
         except FileNotFoundError:
-            continue
+            continue            # no IPv6 in this kernel: nothing listens there
         for line in lines:
             parts = line.split()
             if len(parts) < 10:
@@ -203,23 +205,35 @@ def ports_drift(host, s):
 
 # -- ssh and disks ----------------------------------------------------------------------------------------------------
 
-def ssh_drift(host):
-    code, out, err = host.run(['sshd', '-T'], timeout=20)
+def _sshd_lines(host, extra, who):
+    code, out, err = host.run(['sshd', '-T'] + extra, timeout=20)
     if code is None and 'not installed' in err:
-        return []
+        return None
     if code != 0:
-        return [f'cannot read sshd\'s settings (sshd -T: {(err.strip() or f"exit {code}")[:160]})']
+        return [f'cannot read sshd\'s settings for {who} (sshd -T: {(err.strip() or f"exit {code}")[:160]})']
     cfg = {}
     for line in out.splitlines():
         key, _, value = line.strip().partition(' ')
         cfg.setdefault(key.lower(), value.strip().lower())
     found = []
     if cfg.get('passwordauthentication') == 'yes':
-        found.append('ssh allows password login (PasswordAuthentication yes)')
+        found.append(f'ssh allows password login for {who} (PasswordAuthentication yes)')
     kbd = cfg.get('kbdinteractiveauthentication', cfg.get('challengeresponseauthentication'))
     if kbd == 'yes' and cfg.get('usepam') == 'yes':
-        found.append('ssh allows password login through PAM (KbdInteractiveAuthentication yes, UsePAM yes)')
+        found.append(f'ssh allows password login through PAM for {who} (KbdInteractiveAuthentication yes, '
+                     'UsePAM yes)')
     return found
+
+
+def ssh_drift(host, s):
+    """sshd's effective settings (`sshd -T`), and with `-C` for each of baseline.sshUsers connecting from outside,
+    so a Match block that turns passwords back on is seen. No sshd: nothing to check."""
+    found = _sshd_lines(host, [], 'every connection')
+    if found is None:
+        return []
+    for user in s['baseline']['sshUsers']:
+        found += _sshd_lines(host, ['-C', f'user={user},{OUTSIDE}'], f'{user} from outside') or []
+    return list(dict.fromkeys(found))
 
 
 def disk_drift(host, s):
@@ -239,10 +253,25 @@ def disk_drift(host, s):
     return out
 
 
+def _guarded(name, fn):
+    """One check; one that breaks is a drift line, and the others still run."""
+    try:
+        return fn()
+    except Exception as e:      # noqa: BLE001 - a baseline that crashes would report nothing at all
+        return [f'cannot read {name} ({type(e).__name__}: {e})']
+
+
 def check(host, m, s, state, now):
-    cfg = apt_config(host)
-    return (updates_drift(host, cfg) + policy_drift(host, cfg, s, state) + pending_drift(m.pending(), s, now)
-            + ports_drift(host, s) + ssh_drift(host) + disk_drift(host, s))
+    cfg = _guarded('apt\'s settings', lambda: [aptconf.dump(host)])[0]     # a string: why it cannot be read
+    lines = []
+    for name, fn in (('the update settings', lambda: updates_drift(host, cfg)),
+                     ('the restart policy', lambda: policy_drift(host, cfg, s, state)),
+                     ('the pending restart', lambda: pending_drift(m.pending(), s, now, state, m.boot_id())),
+                     ('the listening ports', lambda: ports_drift(host, s)),
+                     ('sshd\'s settings', lambda: ssh_drift(host, s)),
+                     ('the disks', lambda: disk_drift(host, s))):
+        lines += _guarded(name, fn)
+    return [settings_mod.one_line(x, 400) for x in lines]
 
 
 def run(host, m, read_settings):

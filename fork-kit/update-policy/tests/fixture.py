@@ -16,6 +16,7 @@ from updatepolicy import baseline, cli, idle, settings, tick, window  # noqa: E4
 
 UTC = datetime.timezone.utc
 NO_INHIBITORS = (0, '{"type":"a(ssssuu)","data":[[]]}', '')
+APT_OFF = (0, 'Unattended-Upgrade::Automatic-Reboot "false";\n', '')
 
 
 def at(text):
@@ -33,7 +34,7 @@ class FakeHost(idle.Host):
     def __init__(self, root):
         self.ROOT = root
         self.calls = []
-        self.answers = {'busctl': NO_INHIBITORS}
+        self.answers = {'busctl': NO_INHIBITORS, 'apt-config': APT_OFF}
         self.dockers = {}           # socket -> names or why not
         self.users = {}             # name -> pwd-like entry
         self.free = {}              # path -> (verdict, reason)
@@ -67,6 +68,7 @@ class FakeMachine(tick.Machine):
         super().__init__(host, Logs())
         self.clock = clock
         self.boot = at('2026-11-20 00:00')
+        self.boot_ids = ['boot-1']
         self.reboots, self.alerts = [], []
         self.reboot_error = None
         self.alert_error = None
@@ -76,6 +78,9 @@ class FakeMachine(tick.Machine):
 
     def booted(self):
         return self.boot
+
+    def boot_id(self):
+        return self.boot_ids[-1]
 
     def reboot(self, why):
         self.reboots.append(why)
@@ -93,6 +98,8 @@ class HostCase(unittest.TestCase):
         self.root = os.path.realpath(tempfile.mkdtemp(prefix='update-policy-test-'))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.host = FakeHost(self.root)
+        self.write('/sys/fs/cgroup/cgroup.controllers', 'cpu memory pids\n')      # cgroup v2
+        os.makedirs(self.root + '/proc')
 
     def write(self, path, text='', mtime=None):
         full = self.root + path
@@ -107,8 +114,13 @@ class HostCase(unittest.TestCase):
         """A cgroup folder below /sys/fs/cgroup/user.slice with its cgroup.events."""
         self.write(f'/sys/fs/cgroup/user.slice/{path}/cgroup.events', f'populated {int(populated)}\nfrozen 0\n')
 
-    def process(self, pid, *argv):
+    def process(self, pid, *argv, ppid=1, uid=0, comm=None, cgroup='/system.slice/x.service'):
+        """A fake /proc/<pid>: cmdline, stat (comm, ppid), status (uid), cgroup."""
+        comm = comm or os.path.basename(argv[0])[:15]
         self.write(f'/proc/{pid}/cmdline', '\0'.join(argv) + '\0')
+        self.write(f'/proc/{pid}/stat', f'{pid} ({comm}) S {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0\n')
+        self.write(f'/proc/{pid}/status', f'Name:\t{comm}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n')
+        self.write(f'/proc/{pid}/cgroup', f'0::{cgroup}\n')
 
     def pending(self, since, pkgs=()):
         self.write(tick.PENDING, '*** System restart required ***\n', mtime=since)

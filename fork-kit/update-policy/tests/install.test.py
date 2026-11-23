@@ -21,7 +21,6 @@ UNITS = tuple(f'{UNIT_DIR}/{n}' for n in ('update-policy.service', 'update-polic
                                           'update-policy-boot.service'))
 APT = '/etc/apt/apt.conf.d/zz-update-policy'
 FILES = UNITS + (APT,)
-WANTS = f'{UNIT_DIR}/timers.target.wants/update-policy.timer'
 FOREIGN = 'Unattended-Upgrade::Automatic-Reboot "true";\n'
 
 
@@ -39,9 +38,17 @@ class Install(fx.FakeHost):
         with open(self.path(path)) as f:
             return f.read()
 
-    def enable(self):
-        os.makedirs(os.path.dirname(self.path(WANTS)), exist_ok=True)
-        os.symlink(f'{UNIT_DIR}/update-policy.timer', self.path(WANTS))
+    def setUp(self):
+        super().setUp()
+        self.calls = []                  # (systemctl args, whether the apt file was there then)
+        self.systemctl_error = {}        # first arg -> error
+        self.apt_value = 'false'
+
+        def systemctl(*args):
+            self.calls.append((args, os.path.exists(self.path(APT))))
+            return self.systemctl_error.get(args[0])
+        self.m.systemctl = systemctl
+        self.m.apt_reboot = lambda: self.apt_value
 
     def test_fresh_install_without_the_timer_writes_nothing_outside_the_kit(self):
         code, out, err = self.install()
@@ -55,8 +62,7 @@ class Install(fx.FakeHost):
         code, out, err = self.install('--timer')
         self.assertEqual(code, 0, err)
         self.assertEqual(self.there(), [True] * 6)
-        self.assertIn('systemctl daemon-reload && systemctl enable --now update-policy.timer '
-                      'update-policy-baseline.timer && systemctl enable update-policy-boot.service', out)
+        self.assertIn('enabled and started update-policy.timer, update-policy-baseline.timer', out)
         self.assertIn('\nUnattended-Upgrade::Automatic-Reboot "false";\n', self.read(APT))
         self.assertTrue(self.read(APT).startswith('// update-policy kit: written by update-policy-install.'))
         service = self.read(UNITS[0])
@@ -99,23 +105,54 @@ class Install(fx.FakeHost):
                 self.assertEqual(self.there(), [True] * 6)
                 self.assertEqual(self.run_main('self-check')[0], 0)
 
-    def test_no_timer_and_uninstall_refuse_while_a_unit_is_enabled(self):
+    def test_the_units_are_on_before_apt_stops_restarting_and_off_after_it_starts_again(self):
+        """No gap: with --timer the units are enabled and started while unattended-upgrades still restarts by
+        itself, and the apt file comes last; --no-timer and uninstall take the apt file away first."""
         self.assertEqual(self.install('--timer')[0], 0)
-        self.enable()
-        for args in (('install', '--no-timer'), ('uninstall',)):
-            with self.subTest(args=args):
-                code, _, err = self.install('--no-timer') if args[0] == 'install' else self.run_main('uninstall')
-                self.assertEqual(code, 1)
-                self.assertIn('systemctl disable --now update-policy.timer update-policy-baseline.timer '
-                              'update-policy-boot.service', err)
-                self.assertEqual(self.there(), [True] * 6)
-        os.unlink(self.path(WANTS))
+        self.assertEqual(self.calls, [(('daemon-reload',), False),
+                                      (('enable', '--now', 'update-policy.timer', 'update-policy-baseline.timer'), False),
+                                      (('enable', 'update-policy-boot.service'), False)])
+        self.calls.clear()
         code, out, _ = self.install('--no-timer')
         self.assertEqual(code, 0)
+        self.assertEqual(self.calls, [(('disable', '--now', 'update-policy.timer', 'update-policy-baseline.timer',
+                                        'update-policy-boot.service'), False), (('daemon-reload',), False)])
         self.assertEqual(self.there(), [False] * 6)
         self.assertIn('unattended-upgrades\' own Automatic-Reboot setting applies', out)
         self.assertEqual(self.install()[0], 0)                           # again without the option: still off
         self.assertEqual(self.there(), [False] * 6)
+        self.assertEqual(self.install('--timer')[0], 0)
+        self.calls.clear()
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertEqual([c[0][0] for c in self.calls], ['disable', 'daemon-reload'])
+        self.assertEqual(self.there(), [False] * 6)
+
+    def test_units_that_cannot_be_enabled_leave_apts_own_restarts_on(self):
+        self.systemctl_error = {'enable': 'Failed to enable unit: Access denied'}
+        code, _, err = self.install('--timer')
+        self.assertEqual(code, 1)
+        self.assertIn('systemctl enable --now update-policy.timer update-policy-baseline.timer failed (Failed to '
+                      'enable unit: Access denied)', err)
+        self.assertFalse(os.path.exists(self.path(APT)))
+        self.systemctl_error = {}
+        self.assertEqual(self.install('--timer')[0], 0)                  # fixed: run again finishes it
+        self.assertEqual(self.there(), [True] * 6)
+
+    def test_apt_still_restarting_by_itself_fails_the_install_unless_forced(self):
+        self.apt_value = 'true'                                           # /etc/apt/apt.conf or a zzz- file wins
+        code, _, err = self.install('--timer')
+        self.assertEqual(code, 1)
+        self.assertIn('apt still says Unattended-Upgrade::Automatic-Reboot "true"', err)
+        self.assertIn('--force', err)
+        self.assertNotEqual(self.run_main('self-check')[0], 0)            # not recorded as installed
+        self.apt_value = None
+        self.assertIn('apt\'s settings cannot be read', self.install('--timer')[2])
+        self.apt_value = 'true'
+        code, out, err = self.install('--timer', '--force')
+        self.assertEqual(code, 0, err)
+        self.assertIn('WARNING (--force): apt still says', out)
+        self.apt_value = 'false'
+        self.assertEqual(self.install('--timer')[0], 0)
 
     def test_uninstall_leaves_nothing_the_state_too(self):
         self.assertEqual(self.install('--timer', sha=SHA1)[0], 0)
@@ -170,8 +207,8 @@ class Install(fx.FakeHost):
 
 MUTATIONS = {
     'files: checked again before they are written': (
-        'installer', '                if os.path.lexists(self.p(path)) and not self.ours_file(path):\n'
-        '                    raise', '                if False:\n                    raise',
+        'installer', '            if os.path.lexists(self.p(path)) and not self.ours_file(path):\n'
+        '                raise', '            if False:\n                raise',
         'test_a_file_someone_writes_during_the_install_is_refused_and_kept'),
     'files: a foreign one is refused before anything is written': (
         'installer', '            if foreign:', '            if False:',
@@ -179,13 +216,17 @@ MUTATIONS = {
     'files: a link is never ours': (
         'installer', '        if os.path.islink(real):\n            return False\n', '',
         'test_files_someone_else_wrote_are_refused_and_kept'),
-    'no-timer: refused while enabled': (
-        'installer', '        elif self.enabled():', '        elif False:',
-        'test_no_timer_and_uninstall_refuse_while_a_unit_is_enabled'),
-    'uninstall: refused while enabled': (
-        'installer', '    def uninstall_guard(self):\n        if self.enabled():',
-        '    def uninstall_guard(self):\n        if False:',
-        'test_no_timer_and_uninstall_refuse_while_a_unit_is_enabled'),
+    'no gap: units on before the apt file': (
+        'installer', "        for path, rel in self.files()[:-1]:\n            self.write_from(path, os.path.join(dest, rel))\n",
+        "        for path, rel in self.files():\n            self.write_from(path, os.path.join(dest, rel))\n",
+        'test_the_units_are_on_before_apt_stops_restarting_and_off_after_it_starts_again'),
+    'no gap: units that cannot be enabled stop the install': (
+        'installer', "            if err:\n                raise self.Refused(f'systemctl {",
+        "            if False:\n                raise self.Refused(f'systemctl {",
+        'test_units_that_cannot_be_enabled_leave_apts_own_restarts_on'),
+    'apt still restarting fails the install': (
+        'installer', "            if not plan['force']:", "            if False:",
+        'test_apt_still_restarting_by_itself_fails_the_install_unless_forced'),
     'timer: kept by a run without the option': (
         'installer', "bool(self.read_config().get('timer'))", 'False',
         'test_uninstall_leaves_nothing_the_state_too'),

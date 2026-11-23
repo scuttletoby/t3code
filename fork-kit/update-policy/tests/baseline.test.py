@@ -63,8 +63,31 @@ class Baseline(fx.HostCase):
             '(dpkg-reconfigure -plow unattended-upgrades)',
             'APT::Periodic::Unattended-Upgrade is off: security updates are not installed by themselves '
             '(dpkg-reconfigure -plow unattended-upgrades)',
-            'unattended-upgrades takes no security origin (Allowed-Origins / Origins-Pattern)',
+            'unattended-upgrades does not take the distribution\'s security pocket (no <codename>-security or '
+            'Debian-Security line in Allowed-Origins / Origins-Pattern; ESM lines alone do not count)',
             'apt-daily-upgrade.timer is disabled: apt does not run on its schedule'])
+
+    def test_esm_lines_alone_are_no_security_pocket(self):
+        """Ubuntu's default keeps the ESM -apps-security and -infra-security lines on: without the main line they
+        pass a plain "security" match."""
+        esm = APT_GOOD.replace('Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";\n',
+                               'Unattended-Upgrade::Allowed-Origins:: "${distro_id}ESMApps:${distro_codename}-apps-security";\n'
+                               'Unattended-Upgrade::Allowed-Origins:: "${distro_id}ESM:${distro_codename}-infra-security";\n')
+        self.host.answers['apt-config'] = (0, esm, '')
+        self.assertIn('does not take the distribution\'s security pocket', self.drift()[0])
+        for line in ('"Debian:bookworm-security"', '"origin=Debian,codename=${distro_codename}-security,'
+                     'label=Debian-Security"'):
+            key = 'Origins-Pattern' if '=' in line else 'Allowed-Origins'
+            self.host.answers['apt-config'] = (0, esm + f'Unattended-Upgrade::{key}:: {line};\n', '')
+            self.assertEqual(self.drift(), [], line)
+
+    def test_apt_booleans_off_and_on(self):
+        for value in ('false', 'no', 'off', 'disable', 'without'):
+            self.host.answers['apt-config'] = (0, APT_GOOD.replace('Unattended-Upgrade "1"', f'Unattended-Upgrade "{value}"'), '')
+            self.assertIn('APT::Periodic::Unattended-Upgrade is off', self.drift()[0], value)
+        for value in ('enable', 'with', 'yes', 'on', 'weird'):
+            self.host.answers['apt-config'] = (0, APT_GOOD + f'Unattended-Upgrade::Automatic-Reboot "{value}";\n', '')
+            self.assertIn(f'Unattended-Upgrade::Automatic-Reboot is "{value}"', self.drift()[0], value)
 
     def test_an_origins_pattern_with_security_counts(self):
         self.host.answers['apt-config'] = (0, APT_GOOD.replace(
@@ -78,18 +101,44 @@ class Baseline(fx.HostCase):
         self.host.answers['systemctl is-enabled'] = lambda argv: (
             (4, 'not-found\n', '') if argv[2].startswith('update-policy') else (0, 'enabled\n', ''))
         lines = self.drift({'lastAlertError': 'exit 7'})
-        self.assertEqual(len(lines), 4, lines)
-        self.assertIn('unattended-upgrades restarts by itself (Unattended-Upgrade::Automatic-Reboot is true)', lines[0])
-        self.assertIn('update-policy.timer is not-found: pending restarts are neither made nor reported', lines[1])
-        self.assertIn('update-policy-boot.service is not-found', lines[2])
-        self.assertEqual(lines[3], 'the last alert failed: exit 7')
+        self.assertEqual(len(lines), 5, lines)
+        self.assertIn('unattended-upgrades restarts by itself (Unattended-Upgrade::Automatic-Reboot is "true")',
+                      lines[0])
+        self.assertIn('update-policy.timer is installed but not-found, not enabled: pending restarts are neither '
+                      'made nor reported', lines[1])
+        self.assertIn('update-policy-baseline.timer is installed but not-found', lines[2])
+        self.assertIn('update-policy-boot.service is installed but not-found', lines[3])
+        self.assertEqual(lines[4], 'the last alert failed: exit 7')
+
+    def test_a_failed_tick_unit_is_drift(self):
+        self.host.answers['systemctl is-failed'] = lambda argv: (
+            (0, 'failed\n', '') if argv[2] == 'update-policy.service' else (1, 'active\n', ''))
+        self.assertEqual(self.drift(), ['update-policy.service failed its last run (journalctl -u update-policy)'])
+
+    def test_a_check_that_breaks_is_drift_and_the_others_still_run(self):
+        self.host.answers['sshd'] = lambda argv: 1 / 0
+        with mock.patch.object(baseline.os, 'statvfs', side_effect=RuntimeError('boom')):
+            lines = self.drift()
+        self.assertEqual(lines, ["cannot read sshd's settings (ZeroDivisionError: division by zero)",
+                                 'cannot read the disks (RuntimeError: boom)'])
+        os.unlink(self.root + '/proc/net/tcp')
+        os.makedirs(self.root + '/proc/net/tcp')                        # EISDIR, not "no such file"
+        self.assertEqual(self.drift(baseline={'ports': []})[0][:39], 'cannot read the listening ports (IsADir')
 
     def test_facts_it_cannot_read_are_drift(self):
         self.host.answers['apt-config'] = (None, '', 'apt-config: not installed')
         self.host.answers['sshd'] = (255, '', 'sshd: no hostkeys available -- exiting.')
         lines = self.drift()
         self.assertIn('cannot read apt\'s settings (apt-config: not installed)', lines)
-        self.assertIn('cannot read sshd\'s settings (sshd -T: sshd: no hostkeys available -- exiting.)', lines)
+        self.assertIn('cannot read sshd\'s settings for every connection (sshd -T: sshd: no hostkeys available -- '
+                      'exiting.)', lines)
+
+    def test_pending_age_is_from_the_first_sight_in_this_boot(self):
+        self.pending(at('2026-11-24 07:00'), ['linux-firmware'])           # rewritten an hour ago
+        state = {'pendingSeen': {'boot': 'boot-1', 'at': '2026-11-19T08:00:00Z'}}
+        self.assertIn('restart pending since 2026-11-19 08:00 UTC (5.0 days) for linux-firmware', self.drift(state)[0])
+        self.m.boot_ids.append('boot-2')                                  # another boot: that record is old
+        self.assertEqual(self.drift(state), [])
 
     def test_a_restart_pending_too_long(self):
         self.pending(at('2026-11-21 08:00'), ['linux-image-6.8.0-50-generic'])
@@ -104,15 +153,28 @@ class Baseline(fx.HostCase):
     def test_ssh_password_login(self):
         self.host.answers['sshd'] = (0, SSHD_GOOD.replace('passwordauthentication no', 'passwordauthentication yes'),
                                      '')
-        self.assertEqual(self.drift(), ['ssh allows password login (PasswordAuthentication yes)'])
+        self.assertEqual(self.drift(), ['ssh allows password login for every connection (PasswordAuthentication yes)',
+                                        'ssh allows password login for root from outside (PasswordAuthentication yes)'])
         self.host.answers['sshd'] = (0, SSHD_GOOD.replace('kbdinteractiveauthentication no',
                                                           'kbdinteractiveauthentication yes'), '')
-        self.assertEqual(self.drift(), ['ssh allows password login through PAM (KbdInteractiveAuthentication yes, '
-                                        'UsePAM yes)'])
+        self.assertIn('ssh allows password login through PAM for every connection (KbdInteractiveAuthentication yes, '
+                      'UsePAM yes)', self.drift())
         self.host.answers['sshd'] = (0, 'usepam no\npasswordauthentication no\nkbdinteractiveauthentication yes\n', '')
         self.assertEqual(self.drift(), [])
         del self.host.answers['sshd']                                       # no sshd: nothing to check
         self.assertEqual(self.drift(), [])
+
+    def test_a_match_block_that_allows_passwords_is_seen(self):
+        def sshd(argv):
+            if argv[2:3] == ['-C'] and 'user=deploy,' in argv[3]:
+                return 0, SSHD_GOOD.replace('passwordauthentication no', 'passwordauthentication yes'), ''
+            return 0, SSHD_GOOD, ''
+        self.host.answers['sshd'] = sshd
+        self.assertEqual(self.drift(), [])
+        self.assertEqual(self.drift(baseline={'sshUsers': ['root', 'deploy']}),
+                         ['ssh allows password login for deploy from outside (PasswordAuthentication yes)'])
+        self.assertIn(['sshd', '-T', '-C', 'user=deploy,host=outside.invalid,addr=203.0.113.1'],
+                      [c[0] for c in self.host.calls])
 
     def test_a_full_disk(self):
         full = os.statvfs_result((4096, 4096, 1000, 50, 40, 0, 0, 0, 0, 255))    # 95% used, rounded up
@@ -193,18 +255,30 @@ class Baseline(fx.HostCase):
 
 
 MUTATIONS = {
-    'Automatic-Reboot true is drift': (
-        'baseline', "    if isinstance(cfg, dict) and _last(cfg, 'Unattended-Upgrade::Automatic-Reboot') in TRUE:",
-        "    if False:", 'Baseline.test_restart_policy_drift'),
+    'Automatic-Reboot not false is drift': (
+        'baseline', "    if problem:\n        out.append(problem)", "    if False:\n        out.append(problem)",
+        'Baseline.test_restart_policy_drift'),
+    'apt booleans': (
+        'aptconf', "FALSE = ('0', 'no', 'false', 'without', 'off', 'disable')", "FALSE = ('0', 'false')",
+        'Baseline.test_apt_booleans_off_and_on'),
     'the last value wins': (
-        'baseline', "    return values[-1].strip().lower()", "    return values[0].strip().lower()",
+        'aptconf', "    return values[-1].strip().lower()", "    return values[0].strip().lower()",
         'Baseline.test_a_machine_on_the_policy_has_no_drift'),
-    'a security origin is needed': (
-        'baseline', "    if not any('security' in v.lower() for v in origins):", "    if False:",
-        'Baseline.test_updates_off_no_security_origin_timers_off_not_installed'),
+    'the main security pocket is needed': (
+        'baseline', "    if 'esm' in v or v.endswith(('-apps-security', '-infra-security')):\n        return False\n", "",
+        'Baseline.test_esm_lines_alone_are_no_security_pocket'),
+    'a failed tick unit is drift': (
+        'baseline', "        if (text.strip().splitlines() or [''])[0] == 'failed':", "        if False:",
+        'Baseline.test_a_failed_tick_unit_is_drift'),
+    'a check that breaks does not stop the others': (
+        'baseline', "    except Exception as e:      # noqa: BLE001", "    except ValueError as e:      # noqa: BLE001",
+        'Baseline.test_a_check_that_breaks_is_drift_and_the_others_still_run'),
     'pending days': (
         'baseline', "    if days <= s['baseline']['pendingDays']:", "    if True:",
         'Baseline.test_a_restart_pending_too_long'),
+    'pending age from the first sight': (
+        'baseline', "    pending, _seen = tick.first_seen(state or {}, pending, boot)", "",
+        'Baseline.test_pending_age_is_from_the_first_sight_in_this_boot'),
     'a wildcard listener needs a wildcard entry': (
         'baseline', "            if net.prefixlen == 0 and net.version == addr.version:", "            if True:",
         'Baseline.test_listening_ports_outside_the_list'),
@@ -217,6 +291,9 @@ MUTATIONS = {
     'password login through PAM': (
         'baseline', "    if kbd == 'yes' and cfg.get('usepam') == 'yes':", "    if False:",
         'Baseline.test_ssh_password_login'),
+    'Match blocks: -C for each user': (
+        'baseline', "    for user in s['baseline']['sshUsers']:", "    for user in []:",
+        'Baseline.test_a_match_block_that_allows_passwords_is_seen'),
     'facts it cannot read are drift': (
         'baseline', "        return out + [cfg]", "        return out",
         'Baseline.test_facts_it_cannot_read_are_drift'),

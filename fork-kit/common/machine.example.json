@@ -126,7 +126,8 @@
       "ignoreLoopback": true,
       "diskPercent": 90,
       "diskPaths": ["/"],
-      "pendingDays": 3
+      "pendingDays": 3,
+      "sshUsers": ["root", "example-agent"]
     }
   },
   "desk": {

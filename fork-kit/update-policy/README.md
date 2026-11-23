@@ -11,7 +11,8 @@ and containers that do not come back by themselves are cut off. This kit takes r
   done by hand in a planned window;
 - a **daily baseline check** compares the machine with the policy and prints (and alerts) only what drifted.
 
-Debian or Ubuntu with systemd (`/run/reboot-required`, `apt-config`). Plain Python 3 standard library (3.9 or
+Debian or Ubuntu with systemd 248 or later and cgroup v2 (`/run/reboot-required`, `apt-config`, `systemctl reboot
+--check-inhibitors`); without cgroup v2 the machine always counts as busy. Plain Python 3 standard library (3.9 or
 later, for `zoneinfo`); nothing to install but the kit.
 
 ## Commands
@@ -29,36 +30,57 @@ which is the journal under the units (`journalctl -u update-policy`).
 
 ## What one tick does
 
-1. Outside the quiet window (`quietHour` for `windowMinutes`, in `timeZone`), or with no `/run/reboot-required`:
-   nothing.
-2. Role `live`: one alert `live-restart-pending` per window, with the packages from
+1. Every tick: apt's effective `Unattended-Upgrade::Automatic-Reboot` (`apt-config dump`) must be false, since the
+   kit owns restarts. Anything else (a later `apt.conf.d` file or `/etc/apt/apt.conf` that wins over the kit's, or
+   apt's settings that cannot be read) is an alert `apt-restarts` at once, then once a day while it stays.
+2. A pending restart (`/run/reboot-required`) is dated by when this boot first saw it, kept in the state: the
+   file's own time is new each time a package that needs a restart rewrites it.
+3. Outside the quiet window (`quietHour` for `windowMinutes`, in `timeZone`), or with no restart pending: nothing
+   more.
+4. Role `live`: one alert `live-restart-pending` per window, with the packages from
    `/run/reboot-required.pkgs`. Never a restart.
-3. Roles `dev` and `personal`: once every `retryMinutes`, it looks at the idle facts (below).
+5. Roles `dev` and `personal`: once every `retryMinutes`, it looks at the idle facts (below).
    - **Idle:** it writes why to the journal and to the state file (`restart pending since ... for linux-image-...;
-     idle in the quiet window 05:00-07:00 Europe/London (role dev)`), then `systemctl reboot`.
+     idle in the quiet window 05:00-07:00 Europe/London (role dev)`), then `systemctl reboot
+     --check-inhibitors=yes`: a job that took a block lock after the look still stops it (systemd 248 or later; an
+     older systemd refuses the option, which is a failed restart).
    - **Busy:** the reasons go to the journal (`busy, so no restart now (next look in 15 min ...): user 1000: 2 T3
      agent scope(s) running ...`).
-4. The first tick after a window that ended with the restart still pending after a busy look sends one alert
+6. The first tick after a window that ended with the restart still pending after a busy look sends one alert
    `restart-pending` (with the last busy reasons and the next window). A window with no look (the machine was off)
    sends none.
-5. At most one restart per window: none when the machine booted inside the window already, or a restart was asked
-   for in it. A restart that fails is logged and alerted (`restart-failed`), never tried again in a loop.
+7. At most one restart per window: none when the machine booted inside the window already, or a restart was asked
+   for in it. A restart that systemctl refuses is logged and alerted (`restart-failed`), never tried again in a
+   loop. A restart asked for that did not come (the tick was killed after it wrote the state, or systemctl said yes
+   and nothing happened) is seen 10 minutes later by the boot id, still the same: one `restart-failed` alert.
 
 After a boot, `update-policy booted` writes `back up: booted ..., N min after the restart asked at ...` to the
 journal when the last restart was the kit's, and alerts `back-up` when `alertOnBoot` is on.
 
 ## Idle
 
-The machine is idle when none of these is true. Anything it cannot read counts as busy ("cannot tell: ...").
+The machine is idle when none of these is true. Anything it cannot read counts as busy ("cannot tell: ..."): a
+folder or process it cannot read, a tool that fails, no `busctl`. Text that comes from users (inhibitor reasons,
+container names, a script's answer) is escaped to one line, so it cannot forge a journal record or an alert line.
 
+- **No cgroup v2** at `/sys/fs/cgroup` (cgroup v1 or hybrid): agents and heavy jobs cannot be counted, so always
+  busy.
 - **T3 agents:** a scope with a process in it below any user's systemd manager that T3 made for an agent: a scope
   right below an `app-t3code*` slice, or a `t3code-*.scope` anywhere below the manager (the rule of
   [heavy facts](../heavy/README.md)).
+- **T3 agents without scopes:** T3 turns its agent scopes off when it has no systemd user manager (a system
+  service, no `XDG_RUNTIME_DIR`, a failed `systemd-run` probe); its agents are then its plain children. A T3 server
+  (`t3 serve` or `t3`, npm's `t3` link, or the dev server `apps/server/src/bin.ts`) that is not under its user's
+  manager with an `app-t3code*` slice there is busy while it runs any process but its resource monitor.
 - **heavy jobs:** a scope with a process in it in a user's heavy slice (`heavySlice`), or a live ticket in that
   user's heavy queue (`/run/user/<uid>/heavy-queue/<slice>/`, held by a running or waiting `heavy --kind` job).
-- **Containers:** a running container of the system Docker (`/run/docker.sock`, unless `systemDocker` is false),
-  or of the rootless Docker of a user in `containerUsers` (`/run/user/<uid>/docker.sock`, asked as that user,
-  never as root), less the names `ignoreContainers` matches (`*` and `?`: a database that always runs, say).
+- **Containers and VMs** (less the names `ignoreContainers` matches: `*` and `?`, a database that always runs, say):
+  - Docker: the system one (unless `systemDocker` is false) and the rootless one of each user in `containerUsers`
+    (`/run/user/<uid>/docker.sock`, asked as that user, never as root); each only while its `dockerd` runs, so a
+    socket-activated `docker.sock` is never woken (that would start containers with `restart: always`);
+  - Podman (rootless and system) and CRI-O: each running container has a `conmon`; its name is read from it;
+  - incus and LXD (`incus list` / `lxc list`, while `incusd` / `lxd` runs), classic LXC (`lxc-ls --running`);
+  - libvirt (`virsh -c qemu:///system list`, while `libvirtd` or `virtqemud` runs).
 - **Inhibitor locks:** a `block` lock on `shutdown` (logind). This is the one standard way for any job to say "do
   not restart now":
 
@@ -127,34 +149,47 @@ restart is pending; `baseline` reports it).
 | `baseline.diskPercent`    | 90              | a disk of `diskPaths` fuller than this is drift                                       |
 | `baseline.diskPaths`      | `["/"]`         | the disks it looks at                                                                 |
 | `baseline.pendingDays`    | 3               | a restart pending longer than this is drift                                           |
+| `baseline.sshUsers`       | `["root"]`      | users whose ssh login from outside is checked with `sshd -T -C` (Match blocks)        |
 
 **The alert command** gets the text on stdin and `UPDATE_POLICY_EVENT` (`restart-pending`,
-`live-restart-pending`, `restart-failed`, `back-up`, `drift`) and `UPDATE_POLICY_HOST` in a plain environment; it
-runs as root from `/`, at most 60 seconds. Exit 0 is sent. A failure goes to the journal, fails the unit, and is
-drift in the next baseline check until an alert goes out again.
+`live-restart-pending`, `restart-failed`, `apt-restarts`, `back-up`, `drift`) and `UPDATE_POLICY_HOST` in a plain
+environment; it runs as root from `/`, at most 60 seconds. Exit 0 is sent. A failure goes to the journal, fails the
+unit, and is drift in the next baseline check until an alert goes out again. **No secrets in its arguments:**
+every user can read a running program's arguments in `/proc`. Put a token in a root-only file (mode 600) that the
+command reads; an argument that looks like one (`ghp_...`, `github_pat_...`, `sk-...`, `xox...-`, a long hex or
+base64 run) is refused. Without a machine file there is no alert command either: a broken file is only logged
+(the tick, hourly while a restart is pending) and reported by `baseline` (exit 1).
 
 **Ports** are `PROTO/PORT`, `PROTO/LOW-HIGH`, either with `@ADDRESS` or `@NETWORK` (`tcp/22`, `udp/32768-60999`,
 `tcp/3773@100.64.0.0/10`, `tcp/8080@127.0.0.1`). Without an address an entry allows the port on every address. A
 listener on every address (`0.0.0.0`, `::`) needs an entry without one (or `@0.0.0.0/0`, `@::/0`). TCP counts when
-it listens, UDP when it is bound and unconnected.
+it listens, UDP when it is bound and unconnected. The check sees the host's own network namespace only: a port
+published into a container through DNAT (Docker with `userland-proxy: false`) or a listener inside another
+namespace is not seen.
 
 ## The daily baseline check
 
 `update-policy baseline` (`update-policy-baseline.timer`, daily around 08:00) prints one line per drift and
 nothing else; exit 1 when there is any, and the alert command gets the lines (`drift`). It checks:
 
-- `unattended-upgrades` is installed; `APT::Periodic::Update-Package-Lists` and `Unattended-Upgrade` are on;
-  `apt-daily.timer` and `apt-daily-upgrade.timer` are enabled; an `Allowed-Origins` or `Origins-Pattern` entry
-  names a security origin;
-- the restart policy is the kit's: apt's effective `Unattended-Upgrade::Automatic-Reboot` is false,
-  `update-policy.timer` and `update-policy-boot.service` are enabled, and the last alert went out;
-- no restart has been pending for more than `pendingDays` days;
+- `unattended-upgrades` is installed; `APT::Periodic::Update-Package-Lists` and `Unattended-Upgrade` are on
+  (apt's own booleans: `false`, `no`, `off`, `disable`, `without` and `0` are off); `apt-daily.timer` and
+  `apt-daily-upgrade.timer` are enabled; an `Allowed-Origins` or `Origins-Pattern` entry takes the distribution's
+  own security pocket (`<codename>-security`, or `label=Debian-Security`): Ubuntu's ESM `-apps-security` and
+  `-infra-security` lines alone do not count;
+- the restart policy is the kit's: apt's effective `Unattended-Upgrade::Automatic-Reboot` is false; the kit's
+  units are installed and enabled (`installed but disabled, not enabled` otherwise); `update-policy.service` and
+  `update-policy-boot.service` did not fail their last run; the last alert went out;
+- no restart has been pending for more than `pendingDays` days (since this boot first saw it);
 - no listening port outside `baseline.ports` (with the program that holds it);
-- ssh allows no password login: `sshd -T` says `passwordauthentication no`, and not keyboard-interactive with PAM
-  (no sshd: nothing checked);
+- ssh allows no password login: `sshd -T` says `passwordauthentication no`, and not keyboard-interactive with PAM,
+  for every connection and, with `sshd -T -C user=USER,host=outside.invalid,addr=203.0.113.1`, for each of
+  `sshUsers` connecting from outside, so a `Match` block that turns passwords back on is seen (no sshd: nothing
+  checked);
 - no disk of `diskPaths` fuller than `diskPercent`.
 
-A fact it cannot read is drift ("cannot read ..."), never a pass.
+A fact it cannot read is drift ("cannot read ..."), never a pass; a check that breaks is one such line, and the
+others still run.
 
 ## Install
 
@@ -166,21 +201,23 @@ As root, from a commit on the fork's protected `ci-release` branch (the shared
 curl -fsSL https://raw.githubusercontent.com/FORK_OWNER/FORK/RELEASE_SHA/fork-kit/common/bootstrap.sh -o /root/fork-kit-bootstrap.sh
 sh /root/fork-kit-bootstrap.sh --kit update-policy --repo FORK_OWNER/FORK --sha RELEASE_SHA --timer
 update-policy status && update-policy idle; update-policy baseline
-systemctl daemon-reload && systemctl enable --now update-policy.timer update-policy-baseline.timer && systemctl enable update-policy-boot.service
 ```
 
-`--timer` writes:
+`--timer` takes restarts over in an order that never leaves the machine with neither policy:
 
-- `/etc/apt/apt.conf.d/zz-update-policy`: `Unattended-Upgrade::Automatic-Reboot "false";`. Its name sorts after
-  the numbered files, so it wins over an `Automatic-Reboot "true"` there (`50unattended-upgrades`, a hand-made
-  `99-reboot`); not over `/etc/apt/apt.conf`, which apt reads last. The installer then reads apt's effective value
-  and warns when it is still true; the baseline check reports it every day. Updates still install as before.
-- the system units `update-policy.service` and `.timer` (every 5 minutes), `update-policy-baseline.service` and
-  `.timer` (daily) and `update-policy-boot.service` (once after each boot), in `/etc/systemd/system/`.
+1. it writes the system units `update-policy.service` and `.timer` (every 5 minutes),
+   `update-policy-baseline.service` and `.timer` (daily) and `update-policy-boot.service` (once after each boot)
+   to `/etc/systemd/system/`, runs `systemctl daemon-reload`, enables and starts both timers and enables the boot
+   unit. If that fails, it stops there: unattended-upgrades' own restarts still apply;
+2. only then it writes `/etc/apt/apt.conf.d/zz-update-policy`: `Unattended-Upgrade::Automatic-Reboot "false";`.
+   Its name sorts after the numbered files, so it wins over an `Automatic-Reboot "true"` there
+   (`50unattended-upgrades`, a hand-made `99-reboot`); not over a later file (`zzz-local`) or `/etc/apt/apt.conf`,
+   which apt reads last. Updates still install as before;
+3. it reads apt's effective value (`apt-config dump`) and **fails** while it is not false, naming the cause; remove
+   that line and run again. `--force` installs anyway (the tick then alerts `apt-restarts` once a day).
 
 A file at one of those paths that the kit did not write (its first line says so) is refused, never overwritten.
-The installer never runs `systemctl`: enabling and disabling are the owner's (the command above). Files:
-`/usr/local/libexec/update-policy/versions/<sha>/` (code, with `MANIFEST.sha256`), the link `current`,
+Files: `/usr/local/libexec/update-policy/versions/<sha>/` (code, with `MANIFEST.sha256`), the link `current`,
 `/usr/local/bin/update-policy`, `/usr/local/sbin/update-policy-install`, `/etc/update-policy/config.json` (only
 whether `--timer` is on) and `installed.tsv`; the tick's state in `/var/lib/update-policy/`.
 `update-policy-install self-check` reports drift of the installed files. Upgrade: the bootstrap with the new sha.
@@ -188,30 +225,34 @@ whether `--timer` is on) and `installed.tsv`; the tick's state in `/var/lib/upda
 ## Turn it off
 
 - **For a while** (no restarts, no alerts): `systemctl disable --now update-policy.timer`. Restarts then stop
-  altogether (unattended-upgrades still does not restart by itself); the baseline check reports the timer off.
-- **Back to unattended-upgrades' own restarts:** `systemctl disable --now update-policy.timer
-  update-policy-baseline.timer update-policy-boot.service && systemctl daemon-reload`, then
-  `update-policy-install install --source /usr/local/libexec/update-policy/current --sha CURRENT_SHA --no-timer`
-  (or the bootstrap with `--no-timer`): the apt file and the units go, and apt's own `Automatic-Reboot` applies
-  again.
-- **Remove:** disable the units as above, then `update-policy-install uninstall`. `--no-timer` and `uninstall`
-  refuse while a unit is still enabled, so no enabled unit is left pointing at nothing.
+  altogether (unattended-upgrades still does not restart by itself); the daily baseline check reports the timer
+  `installed but disabled, not enabled`.
+- **Back to unattended-upgrades' own restarts:** the bootstrap with `--no-timer` (or `update-policy-install install
+  --source /usr/local/libexec/update-policy/current --sha CURRENT_SHA --no-timer`). It removes the apt file first,
+  so unattended-upgrades' own `Automatic-Reboot` applies again, then stops, disables and removes the units.
+- **Remove:** `update-policy-install uninstall`: the same, then the code and the state.
 
 ## Runs again, stops half-way, old or empty state
 
-- **Runs again:** the installer changes nothing when nothing changed. Two ticks at once: the second finds the lock
-  (`/var/lib/update-policy/lock`) held and does nothing. A tick in the same window after a busy look waits for
-  `retryMinutes`; after an alert, no second one for that window.
-- **Stops half-way:** the installer's steps are the shared ones (any step, then run again); the units and the apt
-  file are written only after the release they run is in use. A tick writes its state (whole, through a rename)
-  before it restarts, so a restart is never asked for twice in a window; a tick killed before that only looks
-  again.
+- **Runs again:** the installer changes nothing when nothing changed (it enables the units again, which systemd
+  takes as a no-op). Two ticks at once: the second finds the lock (`/var/lib/update-policy/lock`) held and does
+  nothing. In one window, looks wait `retryMinutes`, and each alert is sent once (`apt-restarts` once a day).
+- **Stops half-way, installer:** the shared steps (any step, then run again). The units are written and enabled
+  before the apt file, so a stop in between leaves unattended-upgrades' own restarts on; a failed `systemctl` or an
+  apt value that is not false fails the run before it is recorded, and the next run finishes it.
+- **Stops half-way, tick:** killed before it writes the state: nothing happened, the next tick looks again. Killed
+  after it (or systemctl said yes and no restart came): no second restart in that window, and 10 minutes later the
+  same boot id is one `restart-failed` alert; the next window tries again.
 - **Old, broken or missing state:** read as empty and said in the journal; the worst it costs is one more look or
-  one more alert. A restart already made in this window is still known from the boot time.
+  one more alert, and a pending restart dated from the file's time once. A restart already made in this window is
+  still known from the boot time.
 - **Existing unattended-upgrades config:** kept as it is; only `Automatic-Reboot` is overridden while `--timer` is
-  on (see Install). The kit never turns updates on or off; the baseline check reports when they are off.
+  on, and checked on every tick. The kit never turns updates on or off; the baseline check reports when they are
+  off.
 - **No machine file, or no section:** the tick restarts nothing and logs the reason (at most once an hour while a
-  restart is pending); `idle`, `status` and `baseline` say so and exit 1.
+  restart is pending); `idle`, `status` and `baseline` say so and exit 1. With `--timer` on, unattended-upgrades
+  does not restart either, and no alert can go out (the alert command is in that file): fix the file, or install
+  with `--no-timer`.
 - **Clock and time zone:** the window is computed in `timeZone` on every tick, so a daylight saving change or a
   machine clock in UTC moves nothing. A start time the clock skips moves later by the gap; one it passes twice is
   the first.

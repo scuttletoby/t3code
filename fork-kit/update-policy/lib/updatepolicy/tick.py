@@ -8,14 +8,20 @@ decide() is the whole policy and is pure (a test hands in the clock, the state a
   goes to the journal first, and the state file says when and why). Busy: the reasons go to the journal;
 - a window that ended with the restart still pending after a busy look: one alert, "restart pending";
 - at most one restart per window: none when the machine booted inside the window already, or a restart was asked
-  for in it (a restart that failed is reported, never tried again in a loop).
+  for in it (a restart that failed is reported, never tried again in a loop). A restart asked for that did not
+  happen (the boot id is still the same 10 minutes later: the tick was killed, or systemctl said yes and nothing
+  came) is one restart-failed alert;
+- every tick: apt's effective Unattended-Upgrade::Automatic-Reboot must be false (this kit owns restarts); else one
+  alert at once, then one a day while it stays;
+- a pending restart is dated by when this boot first saw it (kept in the state), not by the file's time, which
+  each new package that needs a restart rewrites.
 
 State: /var/lib/update-policy/state.json, written whole through a rename. Missing, broken or from another version:
 read as empty (said in the journal); the worst it costs is one more look or one more alert.
 """
 import contextlib, datetime, fcntl, json, os, socket
 
-from updatepolicy import settings as settings_mod, window
+from updatepolicy import aptconf, settings as settings_mod, window
 
 UTC = datetime.timezone.utc
 STATE_DIR = '/var/lib/update-policy'
@@ -23,6 +29,9 @@ STATE_VERSION = 1
 PENDING = '/run/reboot-required'
 PENDING_PKGS = '/run/reboot-required.pkgs'
 CONFIG_NOTE_SECONDS = 3600
+APT_ALERT_SECONDS = 86400
+MISSED_AFTER = datetime.timedelta(minutes=10)
+BOOT_ID = '/proc/sys/kernel/random/boot_id'
 WINDOW_KEYS = ('window', 'windowEnd', 'lastLook', 'busy', 'alerted', 'noted')
 
 
@@ -53,10 +62,42 @@ class Pending:
                 + (f' for {pkgs}' if pkgs else ''))
 
 
-def decide(now, s, state, pending, booted, look):
+def first_seen(state, pending, boot):
+    """(pending dated by when this boot first saw it, the state's pendingSeen to keep). The file's time is only used
+    the first time: notify-reboot-required rewrites the file for every new package. A new boot starts again."""
+    if pending is None:
+        return None, None
+    seen = state.get('pendingSeen')
+    at = parse(seen.get('at')) if isinstance(seen, dict) and seen.get('boot') == boot else None
+    since = min(at, pending.since) if at else pending.since
+    return Pending(since, pending.packages), {'boot': boot, 'at': iso(since)}
+
+
+def decide(now, s, state, pending, booted, look, boot='', apt_problem=None):
     """(actions, new state). actions: ('log', level, text), ('alert', event, text), ('restart', text). `look` is
-    called at most once and returns the busy reasons ([]: idle)."""
+    called at most once and returns the busy reasons ([]: idle). `boot` is this boot's id; `apt_problem` why
+    unattended-upgrades may restart by itself (None: it does not)."""
     acts, st = [], dict(state)
+    pending, seen = first_seen(st, pending, boot)
+    if seen:
+        st['pendingSeen'] = seen
+    else:
+        st.pop('pendingSeen', None)
+    # unattended-upgrades must not restart by itself: at once, then once a day
+    if apt_problem:
+        last = parse(st.get('aptAlertAt'))
+        if last is None or not last <= now < last + datetime.timedelta(seconds=APT_ALERT_SECONDS):
+            acts.append(('alert', 'apt-restarts', apt_problem))
+            st['aptAlertAt'] = iso(now)
+    else:
+        st.pop('aptAlertAt', None)
+    # a restart asked for that did not come: same boot, 10 minutes on
+    asked = parse(st.get('restartAt'))
+    if (asked and st.get('restartBoot') == boot and now >= asked + MISSED_AFTER
+            and st.get('restartMissed') != st.get('restartAt')):
+        acts.append(('alert', 'restart-failed', f'the restart asked for at {st["restartAt"]} did not happen (this '
+                                                f'is still the same boot): {st.get("restartWhy", "")}'))
+        st['restartMissed'] = st['restartAt']
     alerted = list(st.get('alerted') or [])
     # a window that ended with the restart still pending after a busy look: say so once
     end = parse(st.get('windowEnd'))
@@ -99,7 +140,7 @@ def decide(now, s, state, pending, booted, look):
                                     f'{s["retryMinutes"]} min, window {w.text()}): ' + '; '.join(busy)))
         return acts, st
     why = f'{pending.text(now)}; idle in the quiet window {w.text()} (role {s["role"]})'
-    st.update(restartWindow=w.id, restartAt=iso(now), restartWhy=why)
+    st.update(restartWindow=w.id, restartAt=iso(now), restartWhy=why, restartBoot=boot)
     acts.append(('restart', why))
     return acts, st
 
@@ -155,10 +196,16 @@ class Machine:
                     return datetime.datetime.fromtimestamp(int(line.split()[1]), UTC)
         raise OSError('no btime in /proc/stat')
 
+    def boot_id(self):
+        with open(self.p(BOOT_ID), encoding='ascii') as f:
+            return f.read().strip()
+
     def reboot(self, why):
-        code, _out, err = self.host.run(['systemctl', 'reboot', '--message', f'update-policy: {why}'[:400]],
-                                        timeout=60)
-        return None if code == 0 else (err.strip() or f'exit {code}')[:300]
+        """systemctl reboot that honours inhibitor locks (a job that took a block lock after the look stops it:
+        systemd 248 or later; an older one refuses the option, which is a failed restart too)."""
+        code, _out, err = self.host.run(['systemctl', 'reboot', '--check-inhibitors=yes',
+                                         f'--message=update-policy: {why}'[:400]], timeout=60)
+        return None if code == 0 else settings_mod.one_line(err.strip() or f'exit {code}', 300)
 
     def alert(self, command, event, text):
         """Runs the alert command with the text on stdin; None or why it failed."""
@@ -271,7 +318,8 @@ def tick(m, read_settings, look):
                 m.write_state(state)
             return 1
         now = m.now()
-        acts, st = decide(now, s, state, pending, m.booted(), lambda: look(s))
+        apt_problem = aptconf.restart_problem(aptconf.dump(m.host))
+        acts, st = decide(now, s, state, pending, m.booted(), lambda: look(s), m.boot_id(), apt_problem)
         st.pop('configNoteAt', None)
         if acts or st != state:
             return run_actions(m, s, acts, st)

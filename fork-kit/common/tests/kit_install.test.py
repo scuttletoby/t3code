@@ -657,8 +657,13 @@ class Bootstrap(fx.FakeHost):
             with self.subTest(kit=kit, opt=opt):
                 self.assertEqual(self.refused('--kit', kit, opt, '--repo', 'a/b', '--sha', SHA1),
                                  f'fork-kit-bootstrap: {opt} is not an option of --kit {kit}')
+        for kit in ('agent-guards', 'cleaner', 'golive', 'schedule-kick'):     # --force: update-policy's only
+            with self.subTest(kit=kit, opt='--force'):
+                self.assertEqual(self.refused('--kit', kit, '--force', '--repo', 'a/b', '--sha', SHA1),
+                                 f'fork-kit-bootstrap: --force is not an option of --kit {kit}')
         if os.geteuid() != 0:                                    # as root it would go on to download
             for args in (['--kit', 'cleaner', '--timer'], ['--no-timer', '--kit', 'cleaner'], ['--kit', 'golive'],
+                         ['--kit', 'update-policy', '--timer', '--force'],
                          ['--kit', 'schedule-kick', '--timer'], ['--kit', 'update-policy', '--timer'],
                          ['--kit', 'agent-guards', '--settings'],
                          ['--no-settings', '--kit', 'agent-guards']):
@@ -775,6 +780,9 @@ MUTATIONS = {
         'test_the_kit_is_one_it_knows'),
     'bootstrap: --settings is kept, nothing after it passed on': (
         'bootstrap', '    --settings|--no-settings) opt="$1"; shift ;;', '    --settings|--no-settings) break ;;',
+        'test_only_the_kit_options_are_passed_on'),
+    'bootstrap: --force is update-policy\'s only': (
+        'bootstrap', '[ -z "$force" ] || [ "$kit" = update-policy ] || die', '[ -z "$force" ] || true || die',
         'test_only_the_kit_options_are_passed_on'),
     'bootstrap: each kit gets only its own options': (
         'bootstrap', '    die "$opt is not an option of --kit $kit" ;;', '    ;;',

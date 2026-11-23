@@ -31,15 +31,18 @@ class Decide(unittest.TestCase):
     def setUp(self):
         self.s = fx.make_settings()     # dev, 05:00 UTC, 120 min, retry 15
         self.booted = at('2026-11-20 00:00')
+        self.boot = 'boot-1'
+        self.rebooting = True           # a restart asked for happens
 
-    def run_ticks(self, start, end, looks, s=None, pending=PENDING, state=None):
+    def run_ticks(self, start, end, looks, s=None, pending=PENDING, state=None, apt=None):
         """Ticks every 5 minutes from start to end (inclusive); (all actions, last state)."""
         s, state, acts, now = s or self.s, dict(state or {}), [], start
         while now <= end:
-            a, state = tick.decide(now, s, state, pending, self.booted, looks)
+            a, state = tick.decide(now, s, state, pending, self.booted, looks, self.boot, apt)
             acts += [(now.strftime('%H:%M'),) + x for x in a]
-            if any(x[0] == 'restart' for x in a):
-                self.booted = now + 2 * MIN        # the restart happened: /run starts empty
+            if any(x[0] == 'restart' for x in a) and self.rebooting:
+                self.booted = now + 2 * MIN        # the restart happened: /run starts empty, a new boot id
+                self.boot += '+'
                 pending = None
             now += 5 * MIN
         return acts, state
@@ -132,6 +135,46 @@ class Decide(unittest.TestCase):
         w = window.current(at('2026-10-25 00:40'), s)            # 03:00 -> 02:00: 02:30 comes twice
         self.assertEqual(w.start, at('2026-10-25 00:30'))        # the first, still UTC+2
 
+    def test_a_restart_that_did_not_happen_is_one_restart_failed_alert(self):
+        """The tick was killed after it wrote the state, or systemctl said yes and nothing came: the same boot id
+        10 minutes on."""
+        self.rebooting = False
+        acts, state = self.run_ticks(at('2026-11-24 05:00'), at('2026-11-24 09:00'), Looks([]))
+        self.assertEqual([a[:3] for a in acts if a[1] != 'log'],
+                         [('05:00', 'restart', acts[0][2]), ('05:10', 'alert', 'restart-failed')])
+        alert = [a for a in acts if a[1] == 'alert'][0]
+        self.assertIn('the restart asked for at 2026-11-24T05:00:00Z did not happen (this is still the same boot)',
+                      alert[3])
+        self.rebooting = True                                    # the next night it tries again
+        acts, _ = self.run_ticks(at('2026-11-25 05:00'), at('2026-11-25 06:00'), Looks([]), state=state)
+        self.assertEqual([a[:2] for a in acts], [('05:00', 'restart')])
+
+    def test_pending_since_is_when_this_boot_first_saw_it(self):
+        """notify-reboot-required rewrites the file for every new package: its time is no age."""
+        _, state = self.run_ticks(at('2026-11-24 12:00'), at('2026-11-24 12:00'), Looks([]))
+        self.assertEqual(state['pendingSeen'], {'boot': 'boot-1', 'at': '2026-11-23T06:40:00Z'})
+        rewritten = tick.Pending(at('2026-11-26 09:00'), ['linux-firmware'])
+        self.s = fx.make_settings(role='live')
+        acts, state = self.run_ticks(at('2026-11-27 05:00'), at('2026-11-27 05:00'), Looks([]), pending=rewritten,
+                                     state=state)
+        self.assertIn('restart pending since 2026-11-23 06:40 UTC (3.9 days) for linux-firmware', acts[0][3])
+        self.boot = 'boot-2'                                     # a new boot: a new pending restart
+        _, state = self.run_ticks(at('2026-11-27 12:00'), at('2026-11-27 12:00'), Looks([]), pending=rewritten,
+                                  state=state)
+        self.assertEqual(state['pendingSeen'], {'boot': 'boot-2', 'at': '2026-11-26T09:00:00Z'})
+        _, state = self.run_ticks(at('2026-11-27 12:05'), at('2026-11-27 12:05'), Looks([]), pending=None,
+                                  state=state)
+        self.assertNotIn('pendingSeen', state)
+
+    def test_apt_restarting_by_itself_is_alerted_at_once_then_daily(self):
+        apt = 'unattended-upgrades restarts by itself (Unattended-Upgrade::Automatic-Reboot is "true"): ...'
+        acts, state = self.run_ticks(at('2026-11-24 10:00'), at('2026-11-25 10:00'), Looks([]), pending=None,
+                                     apt=apt)
+        self.assertEqual([(a[0], a[2]) for a in acts], [('10:00', 'apt-restarts'), ('10:00', 'apt-restarts')])
+        acts, state = self.run_ticks(at('2026-11-25 10:05'), at('2026-11-25 10:05'), Looks([]), pending=None,
+                                     state=state)
+        self.assertNotIn('aptAlertAt', state)                    # fixed: the next one alerts at once again
+
     def test_retry_after_a_clock_jump_back_looks_again(self):
         looks = Looks(['busy'])
         _, state = self.run_ticks(at('2026-11-24 05:30'), at('2026-11-24 05:30'), looks)
@@ -152,10 +195,21 @@ class Settings(unittest.TestCase):
                                 ('alertCommand', ['notify'], 'absolute path'), ('containerUsers', ['A B'], 'user'),
                                 ('heavySlice', 'heavy', '.slice'), ('busyScripts', ['busy'], 'absolute'),
                                 ('baseline', {'ports': ['22']}, 'PROTO/PORT'), ('baseline', {'x': 1}, 'unknown key'),
-                                ('typo', 1, 'unknown key')):
+                                ('typo', 1, 'unknown key'),
+                                ('alertCommand', ['/usr/bin/notify', '--token', 'ghp_abcdefgh12345678'], 'token'),
+                                ('alertCommand', ['/usr/bin/curl', '-H', 'Authorization: Bearer ' + 'aB3' * 12],
+                                 'root-only file'),
+                                ('alertCommand', ['/usr/bin/notify', 'xoxb-1234-abcdefgh'], 'token'),
+                                ('baseline', {'sshUsers': ['Bad User']}, 'user name')):
             with self.subTest(key=key, bad=bad), self.assertRaises(settings.MachineFileError) as e:
                 fx.make_settings(**{key: bad})
             self.assertIn(words, str(e.exception))
+
+    def test_plain_alert_arguments_are_fine(self):
+        s = fx.make_settings(alertCommand=['/usr/local/bin/notify-owner', '--topic', 'updates',
+                                           '--title=update-policy-on-this-very-long-machine-name-01',
+                                           'https://ntfy.example/updates', '--key-file=/etc/notify/key'])
+        self.assertEqual(len(s['alertCommand']), 6)
 
     def test_the_example_machine_file_section_parses(self):
         with open(os.path.join(fx.COMMON, 'machine.example.json')) as f:
@@ -196,6 +250,31 @@ class TickOnHost(fx.HostCase):
         self.assertIn('linux-image-6.8.0-50-generic', seen[0]['restartWhy'])
         self.assertIn(('notice', self.m.log[-1][1]), self.m.log)
         self.assertTrue(self.m.log.text().startswith('restarting now: restart pending since'))
+
+    def test_the_restart_honours_inhibitor_locks_and_a_refusal_is_restart_failed(self):
+        self.pending(SINCE)
+        m = tick.Machine(self.host, fx.Logs())
+        m.now = lambda: at('2026-11-24 05:00')
+        m.booted = lambda: at('2026-11-20 00:00')
+        m.boot_id = lambda: 'boot-1'
+        self.host.answers['systemctl reboot'] = (1, '', 'Operation inhibited by "mutation-tests" (PID 4242 "sleep", '
+                                                        'user agent), reason is "hours left".')
+        self.assertEqual(tick.tick(m, lambda: self.s, lambda _s: []), 1)
+        argv = [c[0] for c in self.host.calls if c[0][:2] == ['systemctl', 'reboot']][0]
+        self.assertEqual(argv[:3], ['systemctl', 'reboot', '--check-inhibitors=yes'])
+        self.assertIn('the restart failed: Operation inhibited by "mutation-tests"', m.log.text())
+        self.assertIn('alert restart-failed: the restart failed (Operation inhibited', m.log.text())
+
+    def test_the_tick_reads_apts_effective_value_every_time(self):
+        self.host.answers['apt-config'] = (0, 'Unattended-Upgrade::Automatic-Reboot "false";\n'
+                                              'Unattended-Upgrade::Automatic-Reboot "true";\n', '')
+        self.assertEqual(self.tick(), 0)                           # nothing pending: still checked
+        self.assertEqual([e for e, _ in self.m.alerts], ['apt-restarts'])
+        self.assertIn('Automatic-Reboot is "true"', self.m.alerts[0][1])
+        self.host.answers['apt-config'] = (None, '', 'apt-config: not installed')
+        self.m.clock += datetime.timedelta(days=1)
+        self.assertEqual(self.tick(), 0)
+        self.assertIn('cannot tell whether unattended-upgrades restarts by itself', self.m.alerts[-1][1])
 
     def test_a_failed_restart_is_alerted_and_not_tried_again(self):
         self.pending(SINCE)
@@ -345,6 +424,21 @@ MUTATIONS = {
     'the state before the restart': (
         'tick', "    m.write_state(st)\n    if restart:", "    if restart:",
         'TickOnHost.test_the_state_is_written_before_the_restart'),
+    'token-looking alert arguments are refused': (
+        'settings', "        if any(r.search(x) for r in TOKEN_RES):", "        if False:",
+        'Settings.test_role_quiet_hour_and_time_zone_are_required_and_checked'),
+    'a restart that did not come is reported': (
+        'tick', "    if (asked and st.get('restartBoot') == boot", "    if (False and st.get('restartBoot') == boot",
+        'Decide.test_a_restart_that_did_not_happen_is_one_restart_failed_alert'),
+    'pending since: the first sight in this boot': (
+        'tick', "    since = min(at, pending.since) if at else pending.since", "    since = pending.since",
+        'Decide.test_pending_since_is_when_this_boot_first_saw_it'),
+    'apt restarting by itself is alerted': (
+        'tick', "    if apt_problem:\n", "    if False:\n",
+        'Decide.test_apt_restarting_by_itself_is_alerted_at_once_then_daily'),
+    'the reboot honours inhibitor locks': (
+        'tick', "'--check-inhibitors=yes',", "",
+        'TickOnHost.test_the_restart_honours_inhibitor_locks_and_a_refusal_is_restart_failed'),
 }
 
 
