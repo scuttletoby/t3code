@@ -1,5 +1,6 @@
 #!/bin/sh
-# pc-agents bootstrap: runs `pc-agents setup` from one release of this fork. As root, in a fresh WSL2 distro:
+# pc-agents bootstrap: runs `pc-agents setup` from one release of this fork. As root, in a fresh WSL2 distro or
+# on a plain Linux box:
 #
 #   sh pc-agents-bootstrap.sh --repo FORK_OWNER/FORK --sha RELEASE_SHA
 #

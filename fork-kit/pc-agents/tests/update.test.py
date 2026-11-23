@@ -13,7 +13,7 @@ import contextlib, fcntl, json, os, shutil, stat, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fake_distro import CONFIG, SHA1, Case, cli, k  # noqa: E402
+from fake_distro import CONFIG, LINUX_CONFIG, SHA1, Case, cli, k  # noqa: E402
 import fake_sigstore  # noqa: E402
 import machine_file  # noqa: E402
 
@@ -35,7 +35,13 @@ def release(version, draft=False, prerelease=False):
     return {'tag_name': 'v' + version, 'draft': draft, 'prerelease': prerelease, 'name': version}
 
 
-class Update(Case):
+class Updating(Case):
+    """A machine set up with config (the automatic update on), the fork's release 1.2.3 published."""
+    config = AUTO
+
+    def before_setup(self):
+        """What the machine has before its first setup run (a subclass's)."""
+
     def setUp(self):
         super().setUp()
         self.no_watch()
@@ -43,11 +49,12 @@ class Update(Case):
         trust = mock.patch.object(k, 'TRUST', fake_sigstore.ca(self.path('/log/sigstore')))   # the fake Sigstore's
         trust.start()
         self.addCleanup(trust.stop)
-        self.machine(AUTO)
+        self.machine(self.config)
+        self.before_setup()
         self.ready()
         # The fleet's wsl2 walls hold on this machine and no test here changes what they read (a wall that fails an
         # update here is one of the kit's own, which still runs every time): looked at once, then that answer.
-        self.same_wsl2_walls()
+        self.same_fleet_walls()
         self.releases(release('1.2.3'))
 
     def releases(self, *items):
@@ -110,6 +117,9 @@ class Update(Case):
     def installs(self):
         return len(self.log('install'))
 
+
+
+class Update(Updating):
     def test_newer_release_is_downloaded_checked_switched_to_and_checked(self):
         self.write('/etc/fork-kit/machine.json', json.dumps({'version': 1, 'pc-agents': AUTO}, indent=4) + '\n')
         before = self.read('/etc/fork-kit/machine.json')
@@ -813,6 +823,28 @@ class Update(Case):
                 code, out = self.call(cli.main, argv)
                 self.assertEqual(code, 1, out)
                 self.assertIn('another pc-agents setup or automatic update runs', out)
+
+
+class LinuxGpuDriverGone(Updating):
+    """A plain Linux box with gpu on whose NVIDIA driver is gone after setup (a reboot after a kernel update it was
+    not rebuilt for): the automatic update still runs, and the setup and check it runs pass with the note, as does a
+    rollback's (#1038 round 1: the driver's absence failed them, so the machine left the fleet)."""
+    platform = 'linux'
+    config = {**AUTO, 'platform': LINUX_CONFIG['platform'], 'gpu': True}
+    DRIVER = ('/dev/nvidia0', '/dev/nvidiactl', '/dev/nvidia-uvm')
+
+    def before_setup(self):
+        for p in self.DRIVER:
+            self.write(p, '')
+
+    def test_the_update_still_runs(self):
+        for p in self.DRIVER:
+            os.unlink(self.path(p))
+        self.releases(release('1.2.4'), release('1.2.3'))
+        code, out = self.update()
+        self.assertEqual(code, 0, out)
+        self.updated()
+        self.assertIn('no NVIDIA driver', self.check()[1])
 
 
 class MachineFile(Case):
