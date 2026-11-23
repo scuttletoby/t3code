@@ -20,7 +20,7 @@ it started (each one journalled "done") raises Refused: the run ends "refused" a
 A torn last line (killed while writing) is reported and ignored. Damage anywhere else refuses until settle moves
 the journal aside; a journal written by a newer kit refuses with "update the kit".
 """
-import contextlib, datetime, errno, fcntl, hashlib, json, os
+import contextlib, datetime, errno, fcntl, hashlib, json, os, pwd
 
 JOURNAL_VERSION = 1
 SETTLE_HINT = ('look at the T3 home and put it right, then run `t3-golive settle --reason "<what you did>"`')
@@ -28,6 +28,11 @@ SETTLE_HINT = ('look at the T3 home and put it right, then run `t3-golive settle
 
 class Busy(Exception):
     """Another golive command holds the lock."""
+
+
+class WrongUser(Busy):
+    """Root would make the lock or journal in a state folder that is another user's (fork #1047); a Busy, so every
+    command refuses it as it refuses a held lock, and changes nothing."""
 
 
 class Unfinished(Exception):
@@ -58,6 +63,77 @@ def _paths(state_dir):
     return os.path.join(state_dir, 'lock'), os.path.join(state_dir, 'journal.jsonl')
 
 
+_euid = os.geteuid   # the tests stand in for root through this
+
+
+def _name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f'uid {uid}'
+
+
+def _owner_of(path):
+    """The owner of path, or of the nearest folder above it that exists, and that folder."""
+    here = os.path.abspath(path)
+    while not os.path.lexists(here) and here != os.path.dirname(here):
+        here = os.path.dirname(here)
+    return os.lstat(here).st_uid, here
+
+
+def as_root_problem(home, state_dir):
+    """As root: why this golive command must not run (fork #1047), or None. golive acts as the T3 user (the owner of
+    the T3 home): a run as root would leave its state root's (a lock, journal or guard.log the T3 user can then not
+    open), also where stateDir is root's (an earlier root run made it) or is missing under a folder of root's. Only
+    a T3 home of root's runs as root; then stateDir must not be another user's either (_not_roots)."""
+    if _euid() != 0:
+        return None
+    owner, here = _owner_of(home)
+    if owner == 0:
+        return _not_roots(state_dir)
+    name = _name(owner)
+    return (f'golive runs as the T3 user, not as root: the T3 home {here} is {name}\'s, and what a run as root '
+            f'writes in {state_dir} would be root\'s, so {name} could not take the lock again. Run it as {name} '
+            f'(for example `sudo -u {name} t3-golive ...`); nothing was changed')
+
+
+def wrong_owner(state_dir):
+    """Why the kit's own files in the state folder (lock, journal, guard log) or the folder itself are not this
+    user's, with the command that puts them right, or None (fork #1047: a run as root, before the kit refused it,
+    left them root's, and the T3 user could then not open them)."""
+    me = _euid()
+    bad = []
+    for name in ('', 'lock', 'journal.jsonl', 'guard.log'):
+        path = os.path.join(state_dir, name) if name else state_dir
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if st.st_uid != me:
+            bad.append(f'{path} ({_name(st.st_uid)}\'s)')
+    if not bad:
+        return None
+    return (f'not this user\'s ({_name(me)}): {", ".join(bad)}, as a run as another user (root) leaves them; '
+            f'as root: `chown -R {_name(me)}: {state_dir}`, then run this again')
+
+
+def _not_roots(state_dir):
+    """As root: why the state folder (or, while it is missing, the nearest folder above it) is another user's, or
+    None. golive runs as the T3 user: a lock or journal root made there would be root's, and that user could then
+    neither take the lock nor write the journal. Refused rather than made as the folder's owner: every other file a
+    run writes (the journal, guard.log, kept runtimes, the home's own files) would still be root's, so a chown of the
+    lock alone would only move the failure."""
+    if _euid() != 0:
+        return None
+    owner, here = _owner_of(state_dir)
+    if owner == 0:
+        return None
+    name = _name(owner)
+    return (f'golive runs as the T3 user, not as root: {here} is {name}\'s, and a lock or journal root made in '
+            f'{state_dir} would be root\'s, so {name} could not take the lock again. Run it as {name} '
+            f'(for example `sudo -u {name} t3-golive ...`); nothing was changed')
+
+
 def _ensure_dir(state_dir):
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
 
@@ -80,7 +156,14 @@ def lock(state_dir, command, exclusive, wait=False, create=True):
         raise ValueError('a changing run makes its lock file')
     path, _ = _paths(state_dir)
     if create:
-        _ensure_dir(state_dir)
+        if why := _not_roots(state_dir) or wrong_owner(state_dir):
+            raise WrongUser(why)
+        try:
+            _ensure_dir(state_dir)
+        except PermissionError as e:   # missing, under a folder this user may not write (one of root's)
+            me = _name(_euid())
+            raise WrongUser(f'cannot make the state folder {state_dir} ({e.strerror}: {e.filename}); as root: '
+                            f'`mkdir -p {state_dir} && chown {me}: {state_dir}`, then run this again') from None
     try:
         fd = os.open(path, (os.O_RDWR | os.O_CREAT if create else os.O_RDONLY) | os.O_CLOEXEC, 0o600)
     except FileNotFoundError:
