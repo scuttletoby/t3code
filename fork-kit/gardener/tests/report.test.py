@@ -21,13 +21,13 @@ class Publish(unittest.TestCase):
         self.gh = gf.FakeGitHub()
 
     def test_missing_issue_is_created(self):
-        self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART), (1, 'created'))
+        self.assertEqual(report.publish(self.gh, gf.REPO, 'example', PART), (1, 'created'))
         self.assertEqual(self.gh.calls, ['search', 'search', 'create'])        # by title, then by marker
         self.assertEqual(self.gh.issues[1]['title'], 'Gardener report: example')
 
     def test_the_remembered_issue_is_edited_without_a_search(self):
         n = self.gh.add(report.marker('example') + '\nold\n')
-        self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART, known_number=n), (n, 'updated'))
+        self.assertEqual(report.publish(self.gh, gf.REPO, 'example', PART, known_number=n), (n, 'updated'))
         self.assertEqual(self.gh.calls, ['issue', 'edit'])
         self.assertEqual(self.gh.issues[n]['body'], PART)
 
@@ -37,49 +37,49 @@ class Publish(unittest.TestCase):
         self.gh.add('another issue')
         n = self.gh.add('text\n' + report.marker('example') + '\nold\n')
         self.gh.add(report.marker('other-project') + '\n', title='Gardener report: other-project')
-        self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART), (n, 'updated'))
+        self.assertEqual(report.publish(self.gh, gf.REPO, 'example', PART), (n, 'updated'))
         self.assertEqual(self.gh.calls, ['search', 'edit'])
 
     def test_a_forgotten_issue_renamed_by_hand_is_found_by_its_marker(self):
         self.gh.add('another issue')
         n = self.gh.add('text\n' + report.marker('example') + '\nold\n', title='Docs work this week')
-        self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART), (n, 'updated'))
+        self.assertEqual(report.publish(self.gh, gf.REPO, 'example', PART), (n, 'updated'))
         self.assertEqual(self.gh.calls, ['search', 'search', 'edit'])
 
     def test_two_open_report_issues_always_pick_the_oldest(self):
         self.gh.add('x')
         first = self.gh.add(report.marker('example'))
         self.gh.add(report.marker('example'))
-        self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART)[0], first)
+        self.assertEqual(report.publish(self.gh, gf.REPO, 'example', PART)[0], first)
 
     def test_a_closed_report_issue_stays_closed_and_a_new_one_is_opened(self):
         n = self.gh.add(report.marker('example') + '\nold\n', state='closed')
-        number, how = report.publish(self.gh, 'o/r', 'example', PART, known_number=n)
+        number, how = report.publish(self.gh, gf.REPO, 'example', PART, known_number=n)
         self.assertEqual((number, how), (2, 'created'))
         self.assertEqual(self.gh.issues[n]['body'], report.marker('example') + '\nold\n')
         self.assertEqual(self.gh.issues[n]['state'], 'closed')
 
     def test_an_issue_whose_marker_was_removed_by_hand_is_left_alone(self):
         n = self.gh.add('I took this issue over for something else')
-        self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART, known_number=n), (2, 'created'))
+        self.assertEqual(report.publish(self.gh, gf.REPO, 'example', PART, known_number=n), (2, 'created'))
         self.assertEqual(self.gh.issues[n]['body'], 'I took this issue over for something else')
 
     def test_a_deleted_remembered_issue_falls_back_to_the_search(self):
         n = self.gh.add(report.marker('example'))
-        self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART, known_number=99), (n, 'updated'))
+        self.assertEqual(report.publish(self.gh, gf.REPO, 'example', PART, known_number=99), (n, 'updated'))
         self.assertEqual(self.gh.calls, ['issue', 'search', 'edit'])
 
     def test_text_written_above_the_marker_by_hand_is_kept(self):
         n = self.gh.add('Owner note: ignore the docs warnings this week.\n\n' + report.marker('example') +
                         '\nold report\n')
-        report.publish(self.gh, 'o/r', 'example', PART, known_number=n)
+        report.publish(self.gh, gf.REPO, 'example', PART, known_number=n)
         self.assertEqual(self.gh.issues[n]['body'],
                          'Owner note: ignore the docs warnings this week.\n\n' + PART)
 
     def test_a_long_hand_written_text_is_cut_so_the_body_fits(self):
         n = self.gh.add('H' * 70000 + report.marker('example') + '\nold\n')
         part = report.marker('example') + '\n' + 'p' * 40000 + '\n'
-        report.publish(self.gh, 'o/r', 'example', part, known_number=n)
+        report.publish(self.gh, gf.REPO, 'example', part, known_number=n)
         body = self.gh.issues[n]['body']
         self.assertLessEqual(len(body), report.MAX_BODY)
         self.assertTrue(body.endswith(part))                            # the gardener's part is whole
@@ -89,7 +89,7 @@ class Publish(unittest.TestCase):
     def test_a_pull_request_with_the_marker_is_not_the_report(self):
         n = self.gh.add(report.marker('example'))
         self.gh.issues[n]['pull_request'] = {}
-        self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART, known_number=n)[1], 'created')
+        self.assertEqual(report.publish(self.gh, gf.REPO, 'example', PART, known_number=n)[1], 'created')
 
     def test_a_github_error_on_search_or_write_is_raised(self):
         for what in ('search', 'create', 'edit'):
@@ -99,7 +99,7 @@ class Publish(unittest.TestCase):
                     self.gh.add(report.marker('example'))
                 self.gh.fail = what
                 with self.assertRaises(report.GitHubError):
-                    report.publish(self.gh, 'o/r', 'example', PART)
+                    report.publish(self.gh, gf.REPO, 'example', PART)
 
 
 class GhWrapper(gf.Temp):
@@ -147,13 +147,13 @@ class GhWrapper(gf.Temp):
 class Render(unittest.TestCase):
 
     def finding(self, **kw):
-        return dict(GOOD, check='c', **kw)
+        return dict(dict(GOOD, check='c'), **kw)
 
     def test_local_paths_are_redacted(self):
         root, home = '/srv/u/repo', '/srv/u'
         f = self.finding(where='/srv/u/repo/docs/a.md', text='see /srv/u/notes and /srv/u/repo', fix='')
         body = report.render_issue('example', '2026-11-23', [f], ['note about /srv/u/repo/x'], 'judge saw /srv/u/x',
-                                   root=root, home=home)
+                                   root=root, home=home, text_checks={'c'})
         self.assertNotIn('/srv/u', body)
         self.assertIn('| docs/a.md |', body)
         self.assertIn('see <path> and .', body)
@@ -162,7 +162,7 @@ class Render(unittest.TestCase):
 
     def test_table_cells_are_escaped_and_sorted_by_severity(self):
         fs = [self.finding(severity='info', id='i'), self.finding(severity='error', id='e', text='a | b\nc')]
-        for body in (report.render_issue('example', '2026-11-23', fs, []),
+        for body in (report.render_issue('example', '2026-11-23', fs, [], text_checks={'c'}),
                      report.render_local('example', '2026-11-23', fs, [])):
             self.assertLess(body.index('| error |'), body.index('| info |'))
             self.assertIn('a \\| b c', body)
@@ -176,7 +176,7 @@ class Render(unittest.TestCase):
 
     def test_the_body_stays_under_githubs_limit(self):
         fs = [self.finding(id=f'n.{i}', text='x' * 1500) for i in range(200)]
-        body = report.render_issue('example', '2026-11-23', fs, ['a note'], 'j' * 8000)
+        body = report.render_issue('example', '2026-11-23', fs, ['a note'], 'j' * 8000, text_checks={'c'})
         self.assertLess(len(body), report.MAX_PART)
         self.assertIn('more row(s) not shown (the issue is full)', body)
         self.assertIn('### Judgment', body)
@@ -203,18 +203,57 @@ class Render(unittest.TestCase):
         local = report.render_local('example', '2026-11-23', fs, [])
         for secret in ('plans.md', 'b.md', 'private-host', '-srv-u-', '/srv/u'):
             self.assertNotIn(secret, issue)
-        self.assertIn('2 finding(s), in the local report only | <outside repo>', issue)
-        self.assertIn('1 finding(s), in the local report only', issue)
+        self.assertIn('| warn | c | 2 finding(s), in the local report only | <outside repo> |', issue)
+        self.assertIn('| warn | c | 1 finding(s), in the local report only |  |', issue)
+        self.assertNotIn('x.y', issue)                                  # a hidden finding's id is not shown
         self.assertIn('gardener.check-failed: exited with code 1', issue)
         self.assertIn('report.md', issue)                               # where the rest is
         for shown in ('plans.md', 'private-host is down', 'ssh: connect to host private-host'):
             self.assertIn(shown, local)
 
+    def test_the_root_is_replaced_only_as_a_whole_folder(self):
+        for text, want in (('/srv/u/repo2/client-acme-plan.md', '<path>'), ('/srv/u/repo/docs/a.md', './docs/a.md'),
+                           ('in /srv/u/repo.', 'in ..'), ('/srv/u/repo: x', '.: x'), ('/srv/u/repository', '<path>'),
+                           ('a/srv/u/x', 'a<path>')):
+            with self.subTest(text=text):
+                self.assertEqual(report.public_text(text, '/srv/u/repo', '/srv/u'), want)
+
+    def test_a_project_checks_text_is_shown_only_with_public_text(self):
+        fs = [self.finding(check='proj', id='host.box1.down', where='docs/a.md', text='build-box is down',
+                           fix='ssh build-box'),
+              self.finding(check='proj', id='host.box1.down', where='docs/a.md', text='build-box2 is down'),
+              self.finding(check='general', id='g.x', where='docs/b.md', text='budget passed')]
+        issue = report.render_issue('example', '2026-11-23', fs, [], root='/srv/u/repo', home='/srv/u',
+                                    text_checks={'general'})
+        self.assertNotIn('build-box', issue)
+        self.assertIn('| warn | proj | host.box1.down: 2 finding(s), text in the local report only (the check is not '
+                      'set to publicText) | docs/a.md |  |', issue)
+        self.assertIn('g.x: budget passed', issue)
+        shown = report.render_issue('example', '2026-11-23', fs, [], root='/srv/u/repo', home='/srv/u',
+                                    text_checks={'general', 'proj'})
+        self.assertIn('host.box1.down: build-box is down', shown)
+
+    def test_counts_only_shows_no_text_id_where_or_judgment(self):
+        fs = [self.finding(check='general', id='g.x', where='docs/b.md', text='budget passed'),
+              self.finding(check='general', id='g.y', where='docs/c.md', text='other'),
+              dict(GOOD, check='c', id='gardener.check-failed', where='', own=True, text='exited with code 1')]
+        issue = report.render_issue('example', '2026-11-23', fs, ['a note'], 'the model says x', root='/srv/u/repo',
+                                    home='/srv/u', text_checks={'general', 'c'}, counts_only=True)
+        for gone in ('g.x', 'g.y', 'budget', 'docs/', 'the model says', 'exited with code'):
+            self.assertNotIn(gone, issue)
+        self.assertIn('| warn | general | 2 finding(s), in the local report only |  |  |', issue)
+        self.assertIn(report.COUNTS_ONLY, issue)
+        self.assertIn('a note', issue)
+
     def test_masks(self):
         for text, gone in (('see http://100.64.1.2:8080/v1 now', '100.64'), ('mail a.b@example.org', 'a.b@'),
                            ('host 10.0.0.5 down', '10.0.0.5'), ('at fe80::1:2', 'fe80'),
                            ('box nas.local and pc.tail1234.ts.net', 'nas'), ('in ~/secret/x', 'secret'),
-                           ('memory -home-user--proj', 'user'), ('file /opt/x/y', '/opt')):
+                           ('memory -home-user--proj', 'user'), ('file /opt/x/y', '/opt'),
+                           ('ssh admin@build-box failed', 'build-box'), ('ip 2001:db8:a1e0::1 up', '2001'),
+                           ('ip 2001:db8:a1e0::1 up', 'a1e0'), ('bind :: now', '::'), ('lo ::1', '::1'),
+                           (r'C:\Users\alice\secret\plan.txt', 'alice'), ('C:/Users/alice/x', 'alice'),
+                           (r'share \\nas\private\x', 'nas'), ('a/srv/u/x y', '/srv'), ('a~/secret/x', 'secret')):
             with self.subTest(text=text):
                 self.assertNotIn(gone, report.public_text(text, '/srv/u/repo', '/srv/u'))
         for kept in ('origin/main is ahead', 'docs/a.md', 'at 12:30:45', 'std::vector', 'a.b c'):
@@ -359,8 +398,24 @@ MUTATIONS = {
         'report', "        head = old_body[:old_body.index(marker(name))]", "        head = ''",
         'Publish.test_text_written_above_the_marker_by_hand_is_kept'),
     'the root is shown as "."': (
-        'report', "    if root:\n        text = text.replace(", "    if False:\n        text = text.replace(",
+        'report', "            text = re.sub(re.escape(path) + _END, short, text)", '            pass',
         'Render.test_local_paths_are_redacted'),
+    'the root is replaced only as a whole folder': (
+        'report', "            text = re.sub(re.escape(path) + _END, short, text)",
+        '            text = text.replace(path, short)', 'Render.test_the_root_is_replaced_only_as_a_whole_folder'),
+    'a project check shows its text only with publicText': (
+        'report', "        elif not f.get('own') and f['check'] not in text_checks:", '        elif False:',
+        'Render.test_a_project_checks_text_is_shown_only_with_public_text'),
+    'counts only hides everything but counts': (
+        'report', '        if counts_only:\n            key', '        if False:\n            key',
+        'Render.test_counts_only_shows_no_text_id_where_or_judgment'),
+    'counts only drops the judgment': (
+        'report', 'if judgment and not counts_only else None', 'if judgment else None',
+        'Render.test_counts_only_shows_no_text_id_where_or_judgment'),
+    'a hidden finding shows no id': (
+        'report', "            key = (f['severity'], f['check'], '', OUTSIDE if w is None",
+        "            key = (f['severity'], f['check'], f['id'], OUTSIDE if w is None",
+        'Render.test_a_finding_outside_the_repository_is_only_counted'),
     'text in the issue is masked': (
         'report', "    for rx, sub in _MASKS:\n        text = rx.sub(sub, text)\n", '',
         'Render.test_masks'),
@@ -368,8 +423,8 @@ MUTATIONS = {
         'report', "    if w == '..' or w.startswith('../') or not _SAFE_REL.fullmatch(w):\n        return None\n", '',
         'Render.test_only_paths_inside_the_repository_are_shown'),
     'a finding outside the repository is only counted': (
-        'report', "        if w is None or (w == '' and not f.get('own')):",
-        "        if False:", 'Render.test_a_finding_outside_the_repository_is_only_counted'),
+        'report', "        elif w is None or (w == '' and not f.get('own')):",
+        "        elif False:", 'Render.test_a_finding_outside_the_repository_is_only_counted'),
     'judge reads only files inside the root': (
         'judge', 'not full.startswith(real_root + os.sep) or ', '',
         'Judge.test_the_model_gets_findings_and_only_tracked_files_inside_the_root'),

@@ -117,6 +117,7 @@ def check(obj, where):
         'options': (dict, None, None),
         'fix': (bool, False, None),
         'timeoutSeconds': (int, 300, _seconds(1, 3600)),
+        'publicText': (bool, False, None),
     }, where)
     if bool(c['name']) == bool(c['path']):
         raise MachineFileError(f'{where}: give exactly one of "name" (a general check: {", ".join(GENERAL_CHECKS)}) '
@@ -124,6 +125,9 @@ def check(obj, where):
     if c['name'] and c['name'] not in GENERAL_CHECKS:
         raise MachineFileError(f'{where}.name: {c["name"]!r} is not a general check '
                                f'(known: {", ".join(GENERAL_CHECKS)}); a project check is given by "path"')
+    if c['name'] and c['publicText']:
+        raise MachineFileError(f'{where}.publicText: only for a project check ("path"); a general check\'s text is '
+                               'always shown')
     c['options'] = c['options'] or {}
     c['id'] = c['id'] or c['name'] or _name_from_path(c['path'])
     return c

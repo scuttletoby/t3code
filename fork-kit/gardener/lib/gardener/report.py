@@ -3,10 +3,13 @@
 Two reports are written from the same findings:
 - The issue part (render_issue) is built from an allow-list, because the report repository may be public: per
   finding only its severity, check, id, a `where` that is a path inside the project's repository (relative), and
-  its text and fix with what still looks like a local name (a path, URL, address, e-mail) masked. A finding whose
-  `where` is outside the repository, or that has none, is only counted (the gardener's own findings excepted: their
-  words are fixed). Notes are the gardener's own words; the judgment is masked the same way. Nothing a check
-  printed on stderr goes there.
+  its text and fix with what still looks like a local name (a path, URL, address, user@host, e-mail, a Windows or
+  share path) masked. Free text only of the general checks (their words are known), the gardener's own findings
+  and project checks set to "publicText": true; another project check's findings show id, where and a count. A
+  finding whose `where` is outside the repository, or that has none, is only counted per check, without its id
+  (the gardener's own findings excepted: their words are fixed). With counts_only (a private project repository
+  reporting to a public one) every finding is only counted and there is no judgment. Notes are the gardener's own
+  words; the judgment is masked like the text. Nothing a check printed on stderr goes there.
 - The local report (render_local, report.md in the state folder) holds everything, as it is.
 
 The issue is found by a hidden marker line, `<!-- gardener-report:NAME -->`. Everything from the marker down is the
@@ -31,12 +34,15 @@ _SAFE_REL = re.compile(r'[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*')
 _REPO_WHERE = re.compile(r'([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+): (.+)')
 _MASKS = (
     (re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://\S+'), '<url>'),
-    (re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+'), '<email>'),
+    (re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)*'), '<user@host>'),     # e-mail, ssh user@host
     (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b'), '<ip>'),
     (re.compile(r'(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}\b'
-                r'|(?<![\w:])[0-9A-Fa-f]{0,4}::[0-9A-Fa-f:]*[0-9A-Fa-f]'), '<ip>'),
+                r'|(?<![\w:])(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::'
+                r'(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?![\w:])'), '<ip>'),     # IPv6, also with ::
+    (re.compile(r'(?<![\w\\])\\\\[^\s\'"`|),;]+'), '<path>'),        # \\host\share
+    (re.compile(r'(?<![\w])[A-Za-z]:[\\/][^\s\'"`|),;]*'), '<path>'),   # C:\Users\..., C:/...
     (re.compile(r'\S*-home-\S*'), '<path>'),                      # a home folder encoded in a folder name
-    (re.compile(r'(?<![\w.~/-])~[\w.-]*(?:/\S*)?'), '<path>'),
+    (re.compile(r'(?<!~)~[\w.-]*(?:/\S*)?'), '<path>'),
     (re.compile(r'(?<![\w.~-])/[^\s\'"`|),;]+'), '<path>'),
     (re.compile(r'\b[\w-]+(?:\.[\w-]+)*\.(?:local|lan|internal|localdomain|home\.arpa|ts\.net)\b', re.I),
      '<host>'),
@@ -51,12 +57,15 @@ def marker(name):
     return f'<!-- gardener-report:{name} -->'
 
 
+_END = r'(?=/|$|[\s\'"`|),;:]|\.(?:\s|$))'   # a path ends here: not inside a longer folder name
+
+
 def redact(text, root, home):
-    """The project root becomes ".", the home "~"."""
-    if root:
-        text = text.replace(root.rstrip('/') + '/', './').replace(root.rstrip('/'), '.')
-    if home and home != '/':
-        text = text.replace(home.rstrip('/') + '/', '~/').replace(home.rstrip('/'), '~')
+    """The project root becomes ".", the home "~"; each only as a whole folder (/srv/proj2 is not /srv/proj)."""
+    for path, short in ((root, '.'), (home, '~')):
+        path = (path or '').rstrip('/')
+        if path:
+            text = re.sub(re.escape(path) + _END, short, text)
     return text
 
 
@@ -137,33 +146,47 @@ def _document(name, title, today, counts, rows, notes, judgment, cap, more_hint,
     return '\n'.join(lines + tail) + '\n'
 
 
-def public_findings(findings, root, home, report_repo=''):
-    """The allow-listed view of the findings (module doc): [{severity, check, id, text, where, fix}]; the findings
-    outside the repository, or of a check and with no where, folded into one counted entry per severity, check, id
-    and where."""
+def public_findings(findings, root, home, report_repo='', text_checks=(), counts_only=False):
+    """The allow-listed view of the findings (module doc): [{severity, check, id, text, where, fix}]. text_checks:
+    the ids of the checks whose text may be shown (general checks and "publicText" project checks); the gardener's
+    own findings always. Folded into one counted entry: a finding outside the repository or with no where (per
+    severity, check and where; no id: a project check's id may name a local thing), and one whose text may not be
+    shown (per severity, check, id and where). counts_only: every finding, per severity and check."""
     out, hidden = [], {}
     for f in findings:
         w = public_where(f.get('where'), root, report_repo)
-        if w is None or (w == '' and not f.get('own')):
-            key = (f['severity'], f['check'], f['id'], OUTSIDE if w is None else '')
-            hidden[key] = hidden.get(key, 0) + 1
+        if counts_only:
+            key = (f['severity'], f['check'], '', '', 'in the local report only')
+        elif w is None or (w == '' and not f.get('own')):
+            key = (f['severity'], f['check'], '', OUTSIDE if w is None else '', 'in the local report only')
+        elif not f.get('own') and f['check'] not in text_checks:
+            key = (f['severity'], f['check'], f['id'], w, 'text in the local report only (the check is not set to '
+                   'publicText)')
+        else:
+            out.append({'severity': f['severity'], 'check': f['check'], 'id': f['id'], 'where': w,
+                        'text': public_text(f['text'], root, home),
+                        'fix': public_text(f.get('fix') or '', root, home)})
             continue
-        out.append({'severity': f['severity'], 'check': f['check'], 'id': f['id'], 'where': w,
-                    'text': public_text(f['text'], root, home), 'fix': public_text(f.get('fix') or '', root, home)})
-    for (severity, check, id_, where), n in hidden.items():
+        hidden[key] = hidden.get(key, 0) + 1
+    for (severity, check, id_, where, why), n in hidden.items():
         out.append({'severity': severity, 'check': check, 'id': id_, 'where': where,
-                    'text': f'{n} finding(s), in the local report only', 'fix': ''})
+                    'text': f'{n} finding(s), {why}', 'fix': ''})
     return out
 
 
-def render_issue(name, today, findings, notes, judgment=None, root='', home='', report_repo=''):
+COUNTS_ONLY = ('Counts only: the project\'s repository is private (or not set, or its visibility could not be read) '
+               'and this report repository is public.')
+
+
+def render_issue(name, today, findings, notes, judgment=None, root='', home='', report_repo='', text_checks=(),
+                 counts_only=False):
     """The issue part, from the marker down (markdown), from the allow-list (module doc)."""
-    rows = [(f['severity'], f['check'], f'{f["id"]}: {f["text"]}', f['where'], f['fix'])
-            for f in public_findings(findings, root, home, report_repo)]
+    rows = [(f['severity'], f['check'], f'{f["id"]}: {f["text"]}' if f['id'] else f['text'], f['where'], f['fix'])
+            for f in public_findings(findings, root, home, report_repo, text_checks, counts_only)]
     return _document(name, 'Gardener report', today, _counts(findings), rows,
                      [public_text(n, root, home) for n in notes],
-                     public_text(judgment, root, home) if judgment else None, MAX_PART,
-                     'the local report has them all', ('', LOCAL_HINT))
+                     public_text(judgment, root, home) if judgment and not counts_only else None, MAX_PART,
+                     'the local report has them all', ('', LOCAL_HINT) + (('', COUNTS_ONLY) if counts_only else ()))
 
 
 def render_local(name, today, findings, notes, judgment=None):
@@ -216,6 +239,12 @@ class GitHub:
 
     def issue(self, repo, number):
         return self.call('GET', f'repos/{repo}/issues/{number}')
+
+    def private(self, repo):
+        """True, False, or None when GitHub does not say."""
+        got = self.call('GET', f'repos/{repo}')
+        v = got.get('private') if isinstance(got, dict) else None
+        return v if isinstance(v, bool) else None
 
     def search_open(self, repo, text, field='body'):
         q = f'repo:{repo} is:issue is:open in:{field} "{text}"'

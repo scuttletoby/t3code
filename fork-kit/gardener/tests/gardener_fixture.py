@@ -20,16 +20,19 @@ sys.path.insert(0, LIB)
 from gardener import cli, config, contract, judge, report, runner  # noqa: E402,F401
 
 NOW = '2026-11-23T03:30:00+00:00'      # 03:30 in Europe/London in November (UTC+0)
+REPO = 'example-owner/app'      # the test projects' repository and report repository
 
 
 class FakeGitHub:
-    """The four calls report.publish makes, on an in-memory list of issues."""
+    """The calls report.publish and the visibility check make, on an in-memory list of issues (each in a repository;
+    the projects' default is REPO)."""
 
     def __init__(self):
         self.issues = {}
         self.calls = []
         self.fail = None          # a call name that raises GitHubError
         self.body_search_blind = False   # True: a body search finds nothing (search may skip HTML comments)
+        self.visibility = {}      # repository: private True/False; a missing one fails the read
 
     def _maybe_fail(self, what):
         self.calls.append(what)
@@ -37,14 +40,20 @@ class FakeGitHub:
             raise report.GitHubError(f'gh api {what}: HTTP 403: API rate limit exceeded (rate limit: the next run '
                                      'tries again)')
 
-    def add(self, body, state='open', title='Gardener report: example'):
+    def add(self, body, state='open', title='Gardener report: example', repo=REPO):
         n = len(self.issues) + 1
-        self.issues[n] = {'number': n, 'title': title, 'body': body, 'state': state}
+        self.issues[n] = {'number': n, 'title': title, 'body': body, 'state': state, 'repo': repo}
         return n
+
+    def private(self, repo):
+        self._maybe_fail('private')
+        if repo not in self.visibility:
+            raise report.GitHubError(f'gh api GET repos/{repo}: HTTP 404: Not Found')
+        return self.visibility[repo]
 
     def issue(self, repo, number):
         self._maybe_fail('issue')
-        if number not in self.issues:
+        if number not in self.issues or self.issues[number]['repo'] != repo:
             raise report.GitHubError(f'gh api GET repos/{repo}/issues/{number}: HTTP 404: Not Found')
         return dict(self.issues[number])
 
@@ -52,11 +61,12 @@ class FakeGitHub:
         self._maybe_fail('search')
         if field == 'body' and self.body_search_blind:
             return []
-        return [dict(i) for i in self.issues.values() if i['state'] == 'open' and text in (i[field] or '')]
+        return [dict(i) for i in self.issues.values() if i['state'] == 'open' and i['repo'] == repo
+                and text in (i[field] or '')]
 
     def create(self, repo, title, body):
         self._maybe_fail('create')
-        n = self.add(body, title=title)
+        n = self.add(body, title=title, repo=repo)
         return dict(self.issues[n])
 
     def edit(self, repo, number, body):
@@ -98,7 +108,7 @@ class Temp(unittest.TestCase):
         return self.script(name, f'import sys\nsys.stdin.read()\n{lines}\n')
 
     def project(self, checks, **more):
-        p = {'name': 'example', 'repo': 'example-owner/app', 'reportRepo': 'example-owner/app', 'root': self.root,
+        p = {'name': 'example', 'repo': REPO, 'reportRepo': REPO, 'root': self.root,
              'timeZone': 'Europe/London', 'checks': checks}
         p.update(more)
         return p

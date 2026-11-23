@@ -69,7 +69,9 @@ def day_and_window(project, t):
 
 class State:
     """<stateDir>/<project>/state.json: {"version": 1, "doneDay": "YYYY-MM-DD", "issue": N, "lastRun": ISO,
-    "findings": N, "reportPending": bool, "reportTries": N}. Missing, broken or of an older version: read as empty,
+    "findings": N, "reportPending": bool, "reportTries": N, "reportRepo": "OWNER/REPO"}. A reportRepo other
+    than the config's (changed by hand) is not done today: the day runs again for the new repository, so a part
+    rendered for one repository never goes to another. Missing, broken or of an older version: read as empty,
     with a note in the report. Of a NEWER version (a downgraded kit): `newer` is set and a run refuses, so the newer
     state is never overwritten."""
 
@@ -165,7 +167,12 @@ def run_project(cfg, project, args, t, gh_factory):
             say(f'{name}: the state file is of a newer gardener (version {state.newer}); refused, nothing changed: '
                 'upgrade the gardener kit')
             return 1
-        if not args.dry_run and not args.force and state.done_day() == today:
+        moved = (state.data.get('reportRepo') or '') != project['reportRepo']
+        if moved and state.done_day() == today and not args.dry_run:
+            say(f'{name}: the report repository changed today; it runs again for the new one')
+        if moved:
+            state.data.pop('issue', None)      # that number is of the old report repository
+        if not args.dry_run and not args.force and state.done_day() == today and not moved:
             if state.data.get('reportPending') is True and project['reportRepo']:
                 return send_report(cfg, project, state, folder, gh_factory)
             say(f'{name}: ran today already ({today}); nothing to do (--force runs it again)')
@@ -186,11 +193,14 @@ def run_project(cfg, project, args, t, gh_factory):
                                                     + (f' ({got[0]["detail"]})' if got[0].get('detail') else '')))
         root = config.expand(project['root']) if project['root'] else ''
         home = report.home_dir()
-        answer, note = judge.judge(project['model'],
-                                   report.public_findings(findings, root, home, project['reportRepo']), root)
+        text_checks = {c['id'] for c in project['checks'] if c['name'] or c['publicText']}
+        counts = counts_only(cfg, project, gh_factory)
+        public = report.public_findings(findings, root, home, project['reportRepo'], text_checks, counts)
+        answer, note = judge.judge(project['model'], public, root)
         if note:
             notes.append(note)
-        part = report.render_issue(name, today, findings, notes, answer, root, home, project['reportRepo'])
+        part = report.render_issue(name, today, findings, notes, answer, root, home, project['reportRepo'],
+                                   text_checks, counts)
         full = report.render_local(name, today, findings, notes, answer)
         if args.dry_run:
             say(f'{name}: dry run: the report issue would get:')
@@ -206,7 +216,7 @@ def run_project(cfg, project, args, t, gh_factory):
         # The done marker before the issue write: a stop or a GitHub error from here on never runs the checks (and
         # their fixes) again today; the next ticks send the saved issue part alone (send_report).
         state.save(doneDay=today, lastRun=t.isoformat(timespec='seconds'), findings=len(findings),
-                   reportPending=bool(project['reportRepo']), reportTries=0)
+                   reportPending=bool(project['reportRepo']), reportTries=0, reportRepo=project['reportRepo'])
         if not project['reportRepo']:
             say(f'{name}: {len(findings)} finding(s); report {report_path}')
             return 0
@@ -214,6 +224,22 @@ def run_project(cfg, project, args, t, gh_factory):
     finally:
         if held is not None:
             os.close(held)
+
+
+def counts_only(cfg, project, gh_factory):
+    """True when the issue may show counts only: the report repository is public and the project's repository is
+    private, not set, or of a visibility GitHub does not tell (fail closed). Two reads at most; none when the report
+    goes to the project's own repository or to none."""
+    rr, pr = project['reportRepo'], project['repo']
+    if not rr or (pr and pr.lower() == rr.lower()):
+        return False
+    try:
+        gh = gh_factory(cfg['gh'])
+        if gh.private(rr) is True:
+            return False
+        return not pr or gh.private(pr) is not False
+    except report.GitHubError:
+        return True
 
 
 def send_report(cfg, project, state, folder, gh_factory):

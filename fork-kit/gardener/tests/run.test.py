@@ -28,7 +28,7 @@ class State(gf.Temp):
             open({self.ran!r}, 'a').write('x')
             print(json.dumps({GOOD!r}))
         ''')
-        self.write_machine(self.project([{'path': self.check}]))
+        self.write_machine(self.project([{'path': self.check, 'publicText': True}]))
 
     def runs(self):
         """How often the check ran."""
@@ -453,7 +453,8 @@ class Privacy(gf.Temp):
         leaky = self.script('leaky', f'''
             import json, sys
             sys.stdin.read()
-            for f in [{{"id": "p.out", "severity": "warn", "where": "{t}/elsewhere/payroll.md", "text": "payroll"}},
+            for f in [{{"id": "host.payroll-box.down", "severity": "warn", "where": "{t}/elsewhere/payroll.md",
+                        "text": "payroll"}},
                       {{"id": "p.in", "severity": "warn", "where": "docs/a.md:3",
                         "text": "see http://100.64.0.1:8080/v1 and {t}/x and nas.local",
                         "fix": "ssh admin@10.0.0.7 or mail someone@example.org"}}]:
@@ -481,7 +482,7 @@ class Privacy(gf.Temp):
              {'name': 'worktrees'},
              {'name': 'workflows-off', 'options': {'repos': ['example-owner/app', 'someone/private-repo']}},
              {'name': 'install-drift', 'options': {'etc': '/etc'}},
-             {'path': leaky}, {'path': quiet}],
+             {'path': leaky}, {'path': quiet, 'publicText': True}],
             model={'endpoint': f'http://127.0.0.1:{port}/v1', 'model': 'm', 'timeoutSeconds': 5}), gh=gh)
         with mock.patch.dict(os.environ, {'GARDENER_TEST_PREFIX': host}):
             code, out = self.run_cli('run')
@@ -499,8 +500,33 @@ class Privacy(gf.Temp):
             self.assertIn(kept, local)
         for shown in ('| AGENTS.md |', 'facts/STATE.md:5', 'Report kit', 'example-owner/app: .github/workflows/off.yml',
                       'docs/a.md:3', 'gardener.check-failed: exited with code 255', 'judgment: model unreachable',
-                      '<outside repo>', 'in the local report only'):
+                      '<outside repo>', 'in the local report only', 'see <url> and <path> and <host>',
+                      'ssh <user@host> or mail <user@host>'):
             self.assertIn(shown, issue)
+        self.assertNotIn('host.', issue)                                # no hidden finding's id
+
+    def test_a_private_project_reporting_to_a_public_repository_shows_counts_only(self):
+        """Visibility is read once per repository; a private project repository (or one not set, or unreadable)
+        and a public report repository: counts only, no judgment."""
+        demo = self.finding_script('demo', GOOD)
+        cases = (('example-owner/private-app', {'example-owner/reports': False, 'example-owner/private-app': True}, True),
+                 ('example-owner/open-app', {'example-owner/reports': False, 'example-owner/open-app': False}, False),
+                 ('example-owner/unknown-app', {'example-owner/reports': False}, True),
+                 ('', {'example-owner/reports': False}, True),
+                 ('example-owner/private-app', {'example-owner/reports': True}, False))
+        for repo, visibility, counts in cases:
+            with self.subTest(repo=repo, visibility=visibility):
+                self.gh.visibility = visibility
+                self.gh.calls.clear()
+                self.write_machine(self.project([{'path': demo, 'publicText': True}], repo=repo,
+                                                reportRepo='example-owner/reports'))
+                code, out = self.run_cli('run', '--dry-run')
+                self.assertEqual(code, 0, out)
+                issue = out.partition('dry run: the report issue would get:')[2].partition('dry run: the local')[0]
+                self.assertEqual(report.COUNTS_ONLY in issue, counts, issue)
+                self.assertEqual('a thing to look at' in issue, not counts, issue)
+                self.assertEqual(self.gh.writes(), [])
+                self.assertLessEqual(self.gh.calls.count('private'), 2)
 
 
 class Window(gf.Temp):
@@ -577,6 +603,8 @@ class Config(gf.Temp):
         for bad in ({'checks': [{'path': good, 'timeout': 5}]},
                     {'checks': [{'name': 'not-a-general-check'}]},
                     {'checks': [{'name': 'facts', 'path': good}]},
+                    {'checks': [{'name': 'facts', 'publicText': True}]},
+                    {'checks': [{'path': good, 'publicText': 'yes'}]},
                     {'checks': [{'path': 'relative/check'}]},
                     {'checks': [{'path': good}, {'path': good}]},
                     {'checks': [], 'schedule': '25:00'},
@@ -624,6 +652,25 @@ class Config(gf.Temp):
         self.assertIn('first: failed: MemoryError', out)
         self.assertEqual(self.state('second')['doneDay'], '2026-11-23')
 
+    def test_a_report_repository_changed_the_same_day_runs_again_for_the_new_one(self):
+        """A part rendered (and allow-listed) for one report repository never goes to another; the old repository's
+        issue number is not used in the new one."""
+        demo = self.finding_script('demo', GOOD)
+        self.gh.fail = 'create'
+        self.write_machine(self.project([{'path': demo, 'publicText': True}], reportRepo='example-owner/old-reports'))
+        self.assertEqual(self.run_cli('run')[0], 1)
+        self.assertTrue(self.state()['reportPending'])
+        self.gh.fail = None
+        self.gh.visibility = {'example-owner/new-reports': True}
+        self.write_machine(self.project([{'path': demo, 'publicText': True}], reportRepo='example-owner/new-reports'))
+        code, out = self.run_cli('run')
+        self.assertEqual(code, 0, out)
+        self.assertIn('the report repository changed today', out)
+        self.assertEqual([i['repo'] for i in self.gh.issues.values()], ['example-owner/new-reports'])
+        st = self.state()
+        self.assertEqual((st['reportRepo'], st['reportPending'], st['issue']), ('example-owner/new-reports', False, 1))
+        self.assertIn('ran today already', self.run_cli('run')[1])
+
     def test_one_projects_failure_does_not_stop_the_next(self):
         bad = self.project([{'path': self.finding_script('demo', GOOD)}], name='first')
         good = self.project([{'path': self.finding_script('demo2', GOOD)}], name='second')
@@ -649,14 +696,14 @@ class Config(gf.Temp):
 
 MUTATIONS = {
     'the done marker skips a second run': (
-        'cli', 'state.done_day() == today', 'False',
+        'cli', 'not args.force and state.done_day() == today', 'not args.force and False',
         'State.test_second_run_the_same_day_does_nothing_and_force_runs_again'),
     'a pending report is sent alone on the next tick': (
         'cli', "            if state.data.get('reportPending') is True and project['reportRepo']:",
         '            if False:', 'State.test_stopped_after_the_issue_write_finds_the_same_issue_and_sends_it_alone'),
     'the done marker comes before the issue write': (
-        'cli', "                   reportPending=bool(project['reportRepo']), reportTries=0)\n",
-        "                   reportPending=bool(project['reportRepo']), reportTries=0) if False else None\n",
+        'cli', "reportTries=0, reportRepo=project['reportRepo'])\n",
+        "reportTries=0, reportRepo=project['reportRepo']) if False else None\n",
         'State.test_a_github_failure_marks_the_day_and_the_next_tick_sends_the_issue_alone'),
     'the issue is tried at most MAX_REPORT_TRIES a day': (
         'cli', 'reportPending=tries < MAX_REPORT_TRIES)', 'reportPending=True)',
@@ -692,9 +739,25 @@ MUTATIONS = {
         'cli', '        except Exception as e:               # anything', '        except OSError as e:                 #',
         'Config.test_an_error_of_any_kind_in_one_project_does_not_stop_the_next'),
     'the issue is built from the allow-list': (
-        'cli', "        part = report.render_issue(name, today, findings, notes, answer, root, home, project['reportRepo'])",
+        'cli', "        part = report.render_issue(name, today, findings, notes, answer, root, home, project['reportRepo'],\n"
+               "                                   text_checks, counts)",
         "        part = report.render_local(name, today, findings, notes, answer)",
         'Privacy.test_nothing_local_reaches_the_issue'),
+    'a project check\'s text is public only with publicText': (
+        'cli', "        text_checks = {c['id'] for c in project['checks'] if c['name'] or c['publicText']}",
+        "        text_checks = {c['id'] for c in project['checks']}", 'Privacy.test_nothing_local_reaches_the_issue'),
+    'a private project to a public report repository: counts only': (
+        'cli', '        return not pr or gh.private(pr) is not False', '        return False',
+        'Privacy.test_a_private_project_reporting_to_a_public_repository_shows_counts_only'),
+    'an unreadable visibility is counts only': (
+        'cli', '    except report.GitHubError:\n        return True', '    except report.GitHubError:\n        return False',
+        'Privacy.test_a_private_project_reporting_to_a_public_repository_shows_counts_only'),
+    'a changed report repository runs again': (
+        'cli', "        moved = (state.data.get('reportRepo') or '') != project['reportRepo']", '        moved = False',
+        'Config.test_a_report_repository_changed_the_same_day_runs_again_for_the_new_one'),
+    'publicText only for project checks': (
+        'config', "    if c['name'] and c['publicText']:", '    if False:',
+        'Config.test_typos_and_bad_values_are_refused_whole'),
     'the day of a window past midnight is its start': (
         'cli', "    day = (lt - datetime.timedelta(minutes=pos)).date().isoformat()", "    day = lt.date().isoformat()",
         'Window.test_a_window_past_midnight_is_one_day_and_runs_once'),

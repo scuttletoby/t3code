@@ -26,6 +26,11 @@ ignore = list(opt.get('ignore') or [])
 q = shlex.quote
 
 
+def qp(p):
+    """A path quoted for a shell, its leading ~/ left out of the quotes so the shell still expands it."""
+    return '~/' + q(p[2:]) if p.startswith('~/') and len(p) > 2 else q(p)
+
+
 def full(p):
     p = os.path.expanduser(p) if p.startswith('~/') else p
     return p if os.path.isabs(p) else os.path.join(root, p)
@@ -51,10 +56,14 @@ def base_of(repo):
     return None
 
 
-def own_work(repo, branch):
-    """(True, None) when the branch shows work of its own: an upstream (it was pushed), or a reflog entry other
-    than its creation (a commit, a reset, ...). Else (False, days since it was made, or None when unknown)."""
-    if git(repo, 'for-each-ref', '--format=%(upstream)', f'refs/heads/{branch}').stdout.strip():
+def own_work(repo, branch, base_branch):
+    """(True, None) when the branch shows work of its own: an upstream other than the base branch (it was pushed;
+    `git worktree add -b NAME PATH origin/main` sets origin/main as the upstream, and that is no work), or a reflog
+    entry other than its creation (a commit, a reset, ...). Else (False, days since it was made, or None when
+    unknown)."""
+    up = git(repo, 'for-each-ref', '--format=%(upstream)', f'refs/heads/{branch}').stdout.strip()
+    up_branch = re.sub(r'^refs/(?:heads/|remotes/[^/]+/)', '', up)
+    if up and up_branch not in (base_branch, 'HEAD'):
         return True, None
     p = git(repo, 'reflog', 'show', '--date=unix', '--format=%gd%x09%gs', f'refs/heads/{branch}', ok=(0, 128))
     entries = [ln.split('\t', 1) for ln in p.stdout.splitlines() if '\t' in ln]
@@ -66,12 +75,12 @@ def own_work(repo, branch):
     return False, (today - datetime.datetime.fromtimestamp(int(m.group(1)), datetime.timezone.utc).date()).days
 
 
-def status(repo, branch, base, gone):
+def status(repo, branch, base, base_branch, gone):
     """('merged', why), ('empty', days since made or None) or (None, None)."""
     if branch in gone:
         return 'merged', 'its upstream branch is gone'
     if base and git(repo, 'merge-base', '--is-ancestor', f'refs/heads/{branch}', base, ok=(0, 1)).returncode == 0:
-        has, days = own_work(repo, branch)
+        has, days = own_work(repo, branch, base_branch)
         return ('merged', f'merged into {base}') if has else ('empty', days)
     return None, None
 
@@ -115,11 +124,11 @@ for r in opt.get('repos') or [root]:
             continue                                 # the main worktree, a prunable record, a detached head
         if any(fnmatch.fnmatchcase(branch, pat) for pat in ignore):
             continue
-        kind, why = status(repo, branch, base, gone)
+        kind, why = status(repo, branch, base, base_branch, gone)
         lock = ' (locked)' if t.get('locked') else ''
         if kind == 'merged':
             emit('worktrees.merged', 'warn', f'worktree of branch {branch}: {why}{lock}', t['worktree'],
-                 f'git -C {q(r)} worktree remove {q(t["worktree"])} && git -C {q(r)} branch -d {q(branch)}')
+                 f'git -C {qp(r)} worktree remove {q(t["worktree"])} && git -C {qp(r)} branch -d {q(branch)}')
             continue
         if kind == 'empty':
             if no_commits(why):
@@ -140,17 +149,17 @@ for r in opt.get('repos') or [root]:
         else:
             for t in prunable:
                 emit('worktrees.prunable', 'info', 'worktree record whose folder is gone', t['worktree'],
-                     f'git -C {q(r)} worktree prune')
+                     f'git -C {qp(r)} worktree prune')
     for line in git(repo, 'for-each-ref', '--format=%(refname:short)', 'refs/heads').stdout.splitlines():
         branch = line.strip()
         if not branch or branch in in_trees or branch == base_branch:
             continue
         if any(fnmatch.fnmatchcase(branch, pat) for pat in ignore):
             continue
-        kind, why = status(repo, branch, base, gone)
+        kind, why = status(repo, branch, base, base_branch, gone)
         if kind == 'merged':
-            emit('branches.merged', 'info', f'branch {branch}: {why}', r, f'git -C {q(r)} branch -d {q(branch)}')
+            emit('branches.merged', 'info', f'branch {branch}: {why}', r, f'git -C {qp(r)} branch -d {q(branch)}')
         elif kind == 'empty' and no_commits(why):
             emit('branches.no-commits', 'info', f'branch {branch}: no commits of its own'
                  + (f', made {why} days ago' if why is not None else ''), r,
-                 f'git -C {q(r)} branch -d {q(branch)} (if it is not needed)')
+                 f'git -C {qp(r)} branch -d {q(branch)} (if it is not needed)')

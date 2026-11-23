@@ -68,24 +68,25 @@ A key it does not know, or a value it cannot use, refuses the whole section: a t
 }
 ```
 
-| Key                       | Default                    | Meaning                                                                           |
-| ------------------------- | -------------------------- | --------------------------------------------------------------------------------- |
-| `stateDir`                | `~/.local/state/gardener`  | state folder of the user that runs it; one subfolder per project                  |
-| `gh`                      | `gh`                       | the `gh` command (a name on PATH or an absolute path), with that user's login     |
-| `projects[].name`         | required                   | lower case letters, digits, `.`, `_`, `-`; names the state folder and the marker  |
-| `repo`                    | none                       | `OWNER/REPO` the checks look at (workflows-off's default)                         |
-| `reportRepo`              | none                       | `OWNER/REPO` of the report issue; none: `report.md` in the state folder only      |
-| `root`                    | none                       | the project's folder: each check runs in it; relative check options are inside it |
-| `schedule`                | none                       | `HH:MM`: the timer runs the project after this local time; none: any time         |
-| `quietHours`              | none                       | `HH:MM-HH:MM` (may wrap past midnight): the timer runs it only inside them        |
-| `timeZone`                | the machine's              | for the day and the window                                                        |
-| `model`                   | none                       | `{endpoint, model, timeoutSeconds 120, maxFiles 5, maxFileBytes 20000}`           |
-| `checks[].name`           |                            | a general check of this kit (below)                                               |
-| `checks[].path`           |                            | a project's own check: an absolute path or `~/...` (exactly one of the two)       |
-| `checks[].id`             | the name, or the file name | names the check in the report; unique per project                                 |
-| `checks[].options`        | `{}`                       | given to the check as it is                                                       |
-| `checks[].fix`            | `false`                    | the check may make its documented fix                                             |
-| `checks[].timeoutSeconds` | `300`                      | 1 to 3600; then the check and everything it started is stopped                    |
+| Key                       | Default                    | Meaning                                                                                             |
+| ------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------- |
+| `stateDir`                | `~/.local/state/gardener`  | state folder of the user that runs it; one subfolder per project                                    |
+| `gh`                      | `gh`                       | the `gh` command (a name on PATH or an absolute path), with that user's login                       |
+| `projects[].name`         | required                   | lower case letters, digits, `.`, `_`, `-`; names the state folder and the marker                    |
+| `repo`                    | none                       | `OWNER/REPO` the checks look at (workflows-off's default)                                           |
+| `reportRepo`              | none                       | `OWNER/REPO` of the report issue; none: `report.md` in the state folder only                        |
+| `root`                    | none                       | the project's folder: each check runs in it; relative check options are inside it                   |
+| `schedule`                | none                       | `HH:MM`: the timer runs the project after this local time; none: any time                           |
+| `quietHours`              | none                       | `HH:MM-HH:MM` (may wrap past midnight): the timer runs it only inside them                          |
+| `timeZone`                | the machine's              | for the day and the window                                                                          |
+| `model`                   | none                       | `{endpoint, model, timeoutSeconds 120, maxFiles 5, maxFileBytes 20000}`                             |
+| `checks[].name`           |                            | a general check of this kit (below)                                                                 |
+| `checks[].path`           |                            | a project's own check: an absolute path or `~/...` (exactly one of the two)                         |
+| `checks[].id`             | the name, or the file name | names the check in the report; unique per project                                                   |
+| `checks[].options`        | `{}`                       | given to the check as it is                                                                         |
+| `checks[].fix`            | `false`                    | the check may make its documented fix                                                               |
+| `checks[].publicText`     | `false`                    | a project's own check: its text and fix (masked) go to the issue; see [Report issue](#report-issue) |
+| `checks[].timeoutSeconds` | `300`                      | 1 to 3600; then the check and everything it started is stopped                                      |
 
 Paths starting with `~/` are in the home of the user that runs the gardener.
 
@@ -140,8 +141,9 @@ All report only, and none needs root. Options as in each script's header.
 - **worktrees**: git worktrees and local branches (`repos`, default the root) that are merged into the base
   (`base`, default `origin/HEAD`, else `origin/main`, else `main`) or whose upstream is gone, and unmerged worktrees
   whose last commit is older than `staleDays` (14). `ignore`: branch patterns. No fetch: "merged" is as of the
-  last fetch. A branch with no work of its own yet (a worktree just started) is not "merged". Fix hints quote every
-  name. With `fix`, it runs `git worktree prune` (records of worktrees whose folder is gone) and nothing
+  last fetch. A branch with no work of its own yet (a worktree just started, also one whose upstream is the base
+  itself) is not "merged". Fix hints quote every name and keep a leading `~/` expandable. With `fix`, it runs
+  `git worktree prune` (records of worktrees whose folder is gone) and nothing
   else; removing worktrees and branches is the [cleaner](../cleaner/README.md) kit's job, or a person's.
 - **workflows-off**: GitHub Actions workflows of `repos` (default the project's `repo`) that are switched off, by
   hand or for inactivity; `ignore` lists workflow files meant to be off. One API call per repository. Never fixes:
@@ -157,18 +159,28 @@ issue is built from an allow-list and the full report stays on the machine (`rep
 issue says so):
 
 - Per finding: its severity, check, id, and its `where` only when that is a path inside the project's repository
-  (relative) or `OWNER/REPO: path`; its text and fix with what still looks like a local name (a path, URL,
-  address, e-mail, a home folder encoded in a folder name) masked.
-- A finding whose `where` is outside the repository, or that has none, is only counted per check and id
-  (`<outside repo>`). The gardener's own findings are shown, with its fixed words.
+  (relative) or `OWNER/REPO: path`; its text and fix with what still looks like a local name (a path, also a
+  Windows drive or `\\server` path, URL, IPv4 or IPv6 address, e-mail or `user@host`, a home folder encoded in a
+  folder name) masked. The project root and home folder are replaced only as whole folders (`/srv/app` is not
+  part of `/srv/app2`).
+- The text and fix of a project's own check (`path`) are shown only with `"publicText": true`; otherwise the
+  issue shows its id, count and `where`, and the text stays in the local report. General checks are shown.
+- A finding whose `where` is outside the repository, or that has none, is only counted per check
+  (`<outside repo>`), without its id. The gardener's own findings are shown, with its fixed words.
+- **Counts only**: when the report repository is another repository and not known to be private, and the project
+  repository is private (or its visibility cannot be read, or the project has no `repo`), the issue shows only
+  counts per severity and check, and no judgment.
 - A failed check shows its id and why in fixed words (`exited with code 1`); what it printed on stderr goes to the
   local report only.
 - Notes are the gardener's own words; the model's endpoint is never shown (`model reachable` or `unreachable`).
 - The judgment is masked like the rest.
 
-A check must still not print secrets. Its body holds a hidden marker line,
-`<!-- gardener-report:NAME -->`; everything from the marker down is rewritten on each run (a table of findings by
-severity, notes, the judgment), and text a person writes above the marker is kept.
+A check must still not print secrets. Check authors: with `publicText`, everything your check prints in `text`
+and `fix` (host names, user names, paths not masked above) may be published in the issue.
+
+The issue body holds a hidden marker line, `<!-- gardener-report:NAME -->`; everything from the marker down is
+rewritten on each run (a table of findings by severity, notes, the judgment), and text a person writes above the
+marker is kept.
 
 - **Missing** (never made, deleted, moved): a search by the title, then by the marker, finds an open one, or a new
   one is opened.
@@ -181,9 +193,11 @@ are counted, a person's text is cut with a note when it is too long, and `report
 
 API calls per project per run: at most one issue read (the number the state remembers), up to two searches (by
 title, then by marker; only when that read does not give the open report issue) and one write; checks make their
-own (workflows-off: one per repository). A GitHub error, a rate limit too, fails that project's report with exit 1.
-The done marker is already written, so the checks do not run again: the next ticks try the issue alone, at most 3
-times a day; after that, the next day's run. There are no retries inside a run.
+own (workflows-off: one per repository). When the report repository is not the project repository, up to two
+reads of their visibility (`repos/OWNER/REPO`), also in a dry run; a failed read only means counts only. Any other
+GitHub error, a rate limit too, fails that project's report with exit 1. The done marker is already written, so
+the checks do not run again: the next ticks try the issue alone, at most 3 times a day; after that, the next day's
+run. There are no retries inside a run.
 
 ## Judgment
 
@@ -198,10 +212,12 @@ the model never sees the whole repository.
 ## State: runs again, stops half-way, old or empty state
 
 `<stateDir>/<name>/`, mode 700: `state.json` (`doneDay`, the report `issue` number, `lastRun`, the finding count,
-`reportPending` and `reportTries`), `report.md` (the last full report), `issue.md` (the last issue part) and
+`reportPending`, `reportTries` and the `reportRepo` it last reported to), `report.md` (the last full report),
+`issue.md` (the last issue part) and
 `lock`. Each file is written to a temporary file and renamed into place.
 
-- **Runs again** the same day: the done marker; nothing runs and no API call. `--force` runs it again and updates
+- **Runs again** the same day: the done marker; nothing runs and no API call. A changed `reportRepo` runs the
+  day again and writes to the new repository (the old issue number is dropped). `--force` runs it again and updates
   the same issue. Two runs at once: the second finds the lock held and skips the project.
 - **Stopped half-way**: stopped before the done marker, the run starts again on the next tick. Stopped after it,
   the next tick sends the saved `issue.md` alone (`reportPending`). The issue number is saved once the issue is

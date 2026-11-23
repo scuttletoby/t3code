@@ -5,6 +5,7 @@ No network, no root.
   python3 -I -B fork-kit/gardener/tests/checks.test.py
 """
 import hashlib, json, os, subprocess, sys, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gardener_fixture as gf  # noqa: E402
@@ -176,7 +177,7 @@ class Worktrees(Check):
 
     def test_a_fresh_worktree_is_not_merged(self):
         """A branch just made from main (a worktree just started) has its tip in main but no work of its own: not
-        merged. Made longer ago than staleDays it is a note; a pushed one (an upstream) is merged."""
+        merged. Made longer ago than staleDays it is a note."""
         trees = os.path.join(self.tmp, 'trees')
         self.git(self.root, 'worktree', 'add', '-q', '-b', 'just-started', os.path.join(trees, 'just-started'))
         self.git(self.root, 'branch', 'new-branch')
@@ -190,10 +191,37 @@ class Worktrees(Check):
                          [('branches.no-commits', 'branch old-branch: no commits of its own, made 83 days ago'),
                           ('worktrees.no-commits',
                            'worktree of branch old-start: no commits of its own, made 83 days ago')])
-        self.git(self.root, 'config', 'branch.new-branch.remote', '.')
-        self.git(self.root, 'config', 'branch.new-branch.merge', 'refs/heads/main')
-        self.assertIn(('branches.merged', 'branch new-branch: merged into main'),
-                      [(f['id'], f['text']) for f in self.run_check('worktrees')])
+
+    def test_a_worktree_made_from_origin_main_is_not_merged_until_pushed(self):
+        """`git worktree add -b NAME PATH origin/main` (how agents start work) sets origin/main as the branch's
+        upstream: that is not work of its own. Pushed under its own name, it is."""
+        origin = os.path.join(self.tmp, 'origin.git')
+        self.git(self.tmp, 'init', '-q', '--bare', origin)
+        self.git(self.root, 'remote', 'add', 'origin', origin)
+        self.git(self.root, 'push', '-q', 'origin', 'main')
+        self.git(self.root, 'fetch', '-q', 'origin')
+        self.git(self.root, 'worktree', 'add', '-q', '-b', 'fresh', os.path.join(self.tmp, 'trees', 'fresh'),
+                 'origin/main')
+        self.assertEqual(self.git(self.root, 'config', 'branch.fresh.merge').strip(), 'refs/heads/main')
+        self.assertEqual(self.run_check('worktrees'), [])
+        self.git(self.root, 'branch', 'pushed', 'main')
+        self.git(self.root, 'push', '-q', '-u', 'origin', 'pushed')
+        self.assertEqual([(f['id'], f['text']) for f in self.run_check('worktrees')],
+                         [('branches.merged', 'branch pushed: merged into origin/main')])
+
+    def test_a_repos_option_under_home_stays_expandable_in_hints(self):
+        """A repos option given as ~/... is quoted after its ~/, so the hint still works when pasted."""
+        import shlex
+        home = os.path.join(self.tmp, 'home')
+        os.makedirs(home)
+        os.rename(self.root, os.path.join(home, 'my repo'))
+        self.root = os.path.join(home, 'my repo')
+        self.merged('plain')
+        with mock.patch.dict(os.environ, {'HOME': home}):
+            found = {f['id']: f for f in self.run_check('worktrees', {'repos': ['~/my repo']})}
+        fix = found['branches.merged']['fix']
+        self.assertTrue(fix.startswith("git -C ~/'my repo' branch -d plain"), fix)
+        self.assertEqual(shlex.split(fix)[2], '~/my repo')
 
     def test_fix_hints_quote_names(self):
         """Git allows $, ;, ( and quotes in branch names: a hint is a command a person (or later an agent) may run,
@@ -363,6 +391,12 @@ MUTATIONS = {
         "return ('merged', f'merged into {base}')", 'Worktrees.test_a_fresh_worktree_is_not_merged'),
     'worktrees: names in hints are quoted': (
         'checks/worktrees', 'q = shlex.quote\n', 'q = str\n', 'Worktrees.test_fix_hints_quote_names'),
+    'an upstream that is the base branch is no work of its own': (
+        'checks/worktrees', "    if up and up_branch not in (base_branch, 'HEAD'):", '    if up:',
+        'Worktrees.test_a_worktree_made_from_origin_main_is_not_merged_until_pushed'),
+    'worktrees: a ~/ path stays expandable in hints': (
+        'checks/worktrees', "    return '~/' + q(p[2:]) if p.startswith('~/') and len(p) > 2 else q(p)",
+        '    return q(p)', 'Worktrees.test_a_repos_option_under_home_stays_expandable_in_hints'),
     'workflows-off: names in hints are quoted': (
         'checks/workflows-off', "f'gh workflow enable {shlex.quote(name)} -R {shlex.quote(repo)}",
         "f'gh workflow enable {name} -R {repo}", 'WorkflowsOff.test_the_fix_hint_quotes_the_workflow_name'),
