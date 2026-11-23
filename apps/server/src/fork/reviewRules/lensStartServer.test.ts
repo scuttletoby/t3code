@@ -14,13 +14,14 @@ import * as Option from "effect/Option";
 import { TestClock } from "effect/testing";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpInvocationContext from "../../mcp/McpInvocationContext.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ProcessRunner from "../../processRunner.ts";
 import * as ProjectEnrichmentService from "../../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { LensStartChild } from "./lensStart.ts";
-import type { StartAnswer } from "./lensStartRun.ts";
+import { lensStartNamespace, type StartAnswer } from "./lensStartRun.ts";
 import { installLensStartServer, makeLensStartServer } from "./lensStartServer.ts";
 
 const THREAD = ThreadId.make("thread-orchestrator");
@@ -202,6 +203,27 @@ it.layer(NodeServices.layer)("lens_start's server reads", (it) => {
     }),
   );
 
+  it.effect("a review with more than 100 inline comments refuses rather than read part", () =>
+    Effect.gen(function* () {
+      const { server } = make((_, args) =>
+        connectionOf(args) === "comments"
+          ? { stdout: page("comments", []) }
+          : {
+              stdout: page("reviews", [
+                node("review", {
+                  state: "COMMENTED",
+                  submittedAt: "2026-11-02T00:00:00Z",
+                  comments: { totalCount: 101, nodes: [] },
+                }),
+              ]),
+            },
+      );
+      const world = yield* worldOf(yield* server);
+      const capped = yield* world.readPull(7).pipe(Effect.flip);
+      assert.include(capped.message, "more than 100 inline comments: not all read");
+    }),
+  );
+
   it.effect("more than 20 pages refuses rather than read part", () =>
     Effect.gen(function* () {
       let pages = 0;
@@ -288,10 +310,16 @@ it.layer(NodeServices.layer)("lens_start's server reads", (it) => {
         const built = yield* server;
         let calls = 0;
         let runs = 2;
+        /** The request namespace each delegate_task call ran in. */
+        const namespaces: Array<string | undefined> = [];
         yield* installLensStartServer(
           {
             callTool: () =>
-              Effect.sync(() => {
+              Effect.gen(function* () {
+                const scope = yield* Effect.serviceOption(
+                  McpInvocationContext.McpInvocationContext,
+                );
+                namespaces.push(Option.getOrUndefined(scope)?.requestNamespace);
                 calls += 1;
                 return (runs -= 1) >= 0
                   ? {
@@ -331,6 +359,30 @@ it.layer(NodeServices.layer)("lens_start's server reads", (it) => {
         const second = yield* start(child);
         assert.strictEqual(second.type, "refused");
         assert.strictEqual(calls, 1);
+
+        // Both start paths run delegate_task in the thread's own namespace, not the session's: a repeat
+        // from a new session or from the after-CI wait is the same command, so it returns the same task.
+        runs = 0;
+        namespaces.length = 0;
+        const inRequest = yield* built.startInRequest({
+          environmentId: "environment-a" as never,
+          requestNamespace: "provider-session-1",
+          thread: {
+            threadId: THREAD,
+            providerSessionId: "provider-session-1",
+            providerInstanceId: "claude" as never,
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        })(child);
+        assert.strictEqual(inRequest.type, "started");
+        yield* built.startForWait(wait)(child);
+        assert.deepStrictEqual(namespaces, [
+          lensStartNamespace(THREAD),
+          lensStartNamespace(THREAD),
+        ]);
+        assert.strictEqual(lensStartNamespace(THREAD), "lens_start:thread-orchestrator");
       }),
     ),
   );
