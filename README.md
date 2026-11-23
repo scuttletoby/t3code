@@ -4,8 +4,7 @@
 > turn it on, most in **Settings → Fork** (a few only in the settings file). Among what it adds:
 >
 > - **Plan usage pacing and a limit on running agents:** agents leave you part of each plan, and a machine never runs too many.
-> - **Agent waits** instead of polling, **models agents may use**, **tool profiles**, **handoff instead of compaction** and
->   **automatic updates**.
+> - **Agent waits**, **models agents may use**, **tool profiles**, **handoff instead of compaction**, **automatic updates**.
 >
 > About the fork, every feature with where to turn it on, and what is planned: [docs/fork/about.md](docs/fork/about.md).
 > Install and every setting: [docs/fork/README.md](docs/fork/README.md). Every change: [FORK_CHANGES.md](FORK_CHANGES.md).
