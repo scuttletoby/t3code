@@ -203,13 +203,13 @@ export function reviewRulesDescription(
     : "";
   switch (reviewRulesState(value)) {
     case "on":
-      return `${where}On: review lenses run with the values below. Nothing uses them yet; the review runner comes in a later release.`;
+      return `${where}On: review lenses get the values below. Off: nothing is listed, changed or checked. Default: off. Nothing uses the values yet; the review runner comes in a later release.`;
     case "unreadable":
       return `${where}The stored value is not valid, so review rules are off. It is kept as written until it is fixed in the settings file or replaced here.`;
     case "off":
       return handSetFields(value).length > 0
         ? `${where}Off. The fields written out by hand do nothing while the preset is off.`
-        : `${where}Off: nothing is listed, changed or checked.`;
+        : `${where}Off: nothing is listed, changed or checked. On: review lenses get the values of the Recommended preset. Default: off.`;
   }
 }
 

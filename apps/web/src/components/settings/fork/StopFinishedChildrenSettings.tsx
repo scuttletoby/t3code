@@ -7,6 +7,7 @@
 import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
 
 import { Switch } from "../../ui/switch";
+import { AdvancedSettings } from "../AdvancedSettings";
 import { IntervalSecondsField } from "../IntervalSecondsField";
 import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingResetButton, SettingsSection } from "../settingsLayout";
@@ -28,11 +29,11 @@ export function StopFinishedChildrenSettings() {
     (settings) => settings.stopFinishedChildren.graceSeconds,
   );
   return (
-    <SettingsSection id="stop-finished-children-section" title="Finished children">
+    <SettingsSection id="stop-finished-children-section" title="Finished sub-agents">
       <ForkRow
         serverScoped
         {...searchableSetting("stop-finished-children")}
-        description="Stops a finished delegated task's provider process once its thread has been idle for the grace time, so it no longer holds memory. A message to the thread later starts a new process with its history. Never a thread that works, waits or asks."
+        description="On: once a delegated task is finished and its thread has sat idle for a while, its provider process is stopped so it frees memory; a later message starts it again with its history. A thread that works, waits or asks is never stopped. Off: finished sub-agents keep running until T3's own idle stop. Default: off."
         settingKeys={["stopFinishedChildren"]}
         lockPaths={["stopFinishedChildren"]}
         mixed={enabledMixed}
@@ -57,42 +58,44 @@ export function StopFinishedChildrenSettings() {
           />
         }
       />
-      <ForkRow
-        serverScoped
-        {...searchableSetting("stop-finished-children-grace")}
-        description="How long a finished child stays idle before its process is stopped. Any activity in the thread starts the time again."
-        settingKeys={["stopFinishedChildren"]}
-        lockPaths={["stopFinishedChildren"]}
-        mixed={graceMixed}
-        resetAction={
-          !graceMixed && current.graceSeconds !== DEFAULTS.graceSeconds ? (
-            <SettingResetButton
-              ariaLabel="Reset grace time to default"
-              onClick={() =>
-                updateSettings({ stopFinishedChildren: { graceSeconds: DEFAULTS.graceSeconds } })
-              }
-            />
-          ) : null
-        }
-        control={
-          <div className="flex items-center gap-2">
-            <IntervalSecondsField
-              labels={{
-                decrease: "Decrease grace time",
-                input: "Grace time in seconds",
-                increase: "Increase grace time",
-              }}
-              value={current.graceSeconds}
-              min={0}
-              step={10}
-              onCommit={(seconds, options) =>
-                updateSettings({ stopFinishedChildren: { graceSeconds: seconds } }, options)
-              }
-            />
-            <span className="text-xs text-muted-foreground">seconds</span>
-          </div>
-        }
-      />
+      <AdvancedSettings targetIds={["stop-finished-children-grace"]}>
+        <ForkRow
+          serverScoped
+          {...searchableSetting("stop-finished-children-grace")}
+          description={`How long a finished sub-agent stays idle before its process is stopped. Any activity in the thread starts the time again. Default: ${DEFAULTS.graceSeconds} seconds.`}
+          settingKeys={["stopFinishedChildren"]}
+          lockPaths={["stopFinishedChildren"]}
+          mixed={graceMixed}
+          resetAction={
+            !graceMixed && current.graceSeconds !== DEFAULTS.graceSeconds ? (
+              <SettingResetButton
+                ariaLabel="Reset grace time to default"
+                onClick={() =>
+                  updateSettings({ stopFinishedChildren: { graceSeconds: DEFAULTS.graceSeconds } })
+                }
+              />
+            ) : null
+          }
+          control={
+            <div className="flex items-center gap-2">
+              <IntervalSecondsField
+                labels={{
+                  decrease: "Decrease grace time",
+                  input: "Grace time in seconds",
+                  increase: "Increase grace time",
+                }}
+                value={current.graceSeconds}
+                min={0}
+                step={10}
+                onCommit={(seconds, options) =>
+                  updateSettings({ stopFinishedChildren: { graceSeconds: seconds } }, options)
+                }
+              />
+              <span className="text-xs text-muted-foreground">seconds</span>
+            </div>
+          }
+        />
+      </AdvancedSettings>
     </SettingsSection>
   );
 }

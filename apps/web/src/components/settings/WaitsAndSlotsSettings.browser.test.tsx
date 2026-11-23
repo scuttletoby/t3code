@@ -120,8 +120,8 @@ describe("WaitsAndSlotsSettings (#105)", () => {
     await expect.element(screen.getByText("Agents on Claude A")).toBeVisible();
     // The unit beside a field is separate text, so the field's own name has to say it.
     const names = [
-      "Default time limit in hours",
-      "Open waits per thread in waits",
+      "Time limit when the agent sets none in hours",
+      "Waits open at once per thread in waits",
       "Agents on Claude A in agents",
     ];
     const unnamed = names.filter(

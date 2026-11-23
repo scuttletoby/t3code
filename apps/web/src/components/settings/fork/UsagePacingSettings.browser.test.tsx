@@ -163,6 +163,8 @@ describe("UsagePacingSettings", () => {
     await userEvent.click(screen.getByRole("option", { name: "Advise" }));
     expect(state.update.mock.calls[0]![0]).toEqual({ usagePacingGate: "advise" });
 
+    // Lowering effort is a rarely changed option, folded under Advanced.
+    await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     const effort = screen.getByRole("textbox", { name: "Lower effort when ahead of pace" });
     await userEvent.type(effort, "high{Enter}");
     await expect.element(screen.getByRole("alert")).toBeVisible();
@@ -302,7 +304,7 @@ describe("ModelPolicySettings", () => {
     }
     setup({ modelPolicy: { mode: "off", allow }, ...picks });
     await using off = await render(<ModelPolicySettings />);
-    await expect.element(off.getByText("Model policy").first()).toBeVisible();
+    await expect.element(off.getByText("Models agents may use").first()).toBeVisible();
     expect(off.getByText(/^outside policy/).elements()).toHaveLength(0);
   });
 

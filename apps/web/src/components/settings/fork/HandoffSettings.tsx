@@ -126,7 +126,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
 
   if (mixed) {
     return (
-      <SettingsSection id="handoff-section" title="Handoff">
+      <SettingsSection id="handoff-section" title="Handoff instead of compaction">
         <ForkRow
           serverScoped
           {...searchableSetting("handoff")}
@@ -140,14 +140,14 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
   }
 
   return (
-    <SettingsSection id="handoff-section" title="Handoff">
+    <SettingsSection id="handoff-section" title="Handoff instead of compaction">
       <ForkRow
         serverScoped
         {...searchableSetting("handoff")}
         settingKeys={["handoff"]}
         lockPaths={["handoff"]}
         onResetOverride={() => clearScopedSettings(["handoff"])}
-        description={`${option?.description ?? ""}${scopeNote}`}
+        description={`${option?.description ?? ""} Default: Off.${scopeNote}`}
         resetAction={
           !isProjectScope && shown.mode !== DEFAULT_HANDOFF_SETTINGS.mode ? (
             <SettingResetButton
@@ -172,8 +172,8 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
         resetAction={subRowReset(["threads"], "Reset thread modes to the environment's")}
         description={
           rows.length === 0
-            ? "No thread has its own mode. A thread's own mode wins over the mode above."
-            : "A thread's own mode wins over the mode above, also over a project's."
+            ? "No thread has its own choice. A thread's own choice wins over the mode above."
+            : "A thread's own choice wins over the mode above, also over a project's."
         }
       >
         <div className="grid gap-2 pb-2">
@@ -240,7 +240,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
           managedPaths={["handoff"]}
           lockPaths={["handoff"]}
           resetAction={subRowReset(["sizeTokens"], "Reset handoff size to the environment's")}
-          description="A turn that ends with the thread at this size hands off."
+          description={`A turn that ends with the thread at this size hands off. Default: ${DEFAULT_HANDOFF_SETTINGS.sizeTokens.toLocaleString("en")} tokens.`}
           control={
             <div className="flex items-center gap-2">
               <BoundedNumberField
@@ -265,7 +265,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
           managedPaths={["handoff"]}
           lockPaths={["handoff"]}
           resetAction={subRowReset(["idleTokens"], "Reset idle handoff size to the environment's")}
-          description={`The smallest idle thread handed off before its prompt cache runs out. 0: never; otherwise at least ${HANDOFF_MIN_TOKENS.toLocaleString("en")}.`}
+          description={`An idle thread at least this big hands off before its prompt cache runs out. 0: never; otherwise at least ${HANDOFF_MIN_TOKENS.toLocaleString("en")}. Default: ${DEFAULT_HANDOFF_SETTINGS.idleTokens.toLocaleString("en")} tokens.`}
           control={
             <div className="flex items-center gap-2">
               <BoundedNumberField
@@ -293,7 +293,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
             ["source", "command"],
             "Reset the handoff writer to the environment's",
           )}
-          description="Who writes the handoff: no one (T3's state and the recent conversation only), the old session in one turn, or a read-only program (one argument per line, its full path first)."
+          description="Who writes the note: no one (the new session gets T3's state and the recent conversation only), the old session in one last turn, or a read-only program (one argument per line, its full path first)."
           control={
             <Select
               value={shown.source}
@@ -348,7 +348,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
             ["instructions"],
             "Reset handoff instructions to the environment's",
           )}
-          description="What the old session is asked to write, when it writes the handoff. Empty: T3's built-in text."
+          description="What the old session is asked to write, when it writes the note. Empty: T3's built-in text. Default: empty."
         >
           <div className="pb-2">
             <CommitTextField

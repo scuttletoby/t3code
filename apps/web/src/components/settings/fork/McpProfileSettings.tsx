@@ -19,6 +19,7 @@ import { Button } from "../../ui/button";
 import { Checkbox } from "../../ui/checkbox";
 import { Input } from "../../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
+import { AdvancedSettings } from "../AdvancedSettings";
 import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
@@ -311,7 +312,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
 
   if (mixed) {
     return (
-      <SettingsSection id="mcp-profiles-section" title="MCP profiles">
+      <SettingsSection id="mcp-profiles-section" title="Tools each thread gets">
         <ForkRow
           serverScoped
           {...searchableSetting("mcp-profiles")}
@@ -330,7 +331,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
       settingKeys={["mcpProfile"]}
       lockPaths={["mcpProfile"]}
       onResetOverride={() => clearScopedSettings(["mcpProfile"])}
-      description={`The profile a top-level thread gets when nobody picked one for it. ${MCP_PROFILE_ALL}: every outside server and every T3 tool, as without profiles.${
+      description={`The profile a thread gets when nobody picked one for it. ${MCP_PROFILE_ALL}: every outside server and every T3 tool, as in upstream T3 Code. Default: ${MCP_PROFILE_ALL}.${
         isProjectScope && defaultSource === "project" ? " This project's own value." : ""
       } ${MCP_PICK_APPLIES_NOTE}`}
       control={
@@ -350,7 +351,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
       settingKeys={["mcpSubagentProfile"]}
       lockPaths={["mcpSubagentProfile"]}
       onResetOverride={() => clearScopedSettings(["mcpSubagentProfile"])}
-      description={`The profile a delegated child gets when nobody picked one for it. ${MCP_SUBAGENT_INHERIT}: the same as a top-level thread. A child never gets more than its parent.${
+      description={`The profile a sub-agent gets when nobody picked one for it. ${MCP_SUBAGENT_INHERIT}: the same as any other thread. A sub-agent never gets more than its parent. Default: ${MCP_SUBAGENT_INHERIT}.${
         isProjectScope && ruleSource === "project" ? " This project's own value." : ""
       }`}
       control={
@@ -367,7 +368,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
 
   if (isProjectScope) {
     return (
-      <SettingsSection id="mcp-profiles-section" title="MCP profiles">
+      <SettingsSection id="mcp-profiles-section" title="Tools each thread gets">
         {defaultRow}
         {ruleRow}
       </SettingsSection>
@@ -399,12 +400,12 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
   };
 
   return (
-    <SettingsSection id="mcp-profiles-section" title="MCP profiles">
+    <SettingsSection id="mcp-profiles-section" title="Tools each thread gets">
       <ForkRow
         {...searchableSetting("mcp-profiles")}
         settingKeys={["mcpProfiles"]}
         lockPaths={["mcpProfiles"]}
-        description="Which outside MCP servers and T3 tool groups a thread gets. Claude and Codex threads apply a profile narrower than all; other providers refuse a turn whose profile leaves out an outside server."
+        description="A profile is a named set of outside MCP servers and T3 tool groups. Give a thread a smaller profile so it sees only the tools it needs. Claude and Codex threads apply a smaller profile; other providers refuse a turn whose profile leaves out an outside server. Built in: all and t3-only."
       >
         <div className="grid gap-2 pb-2">
           {rows.map((row) => (
@@ -524,124 +525,126 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
       </ForkRow>
       {defaultRow}
       {ruleRow}
-      <ForkRow
-        {...searchableSetting("mcp-thread-picks")}
-        settingKeys={["mcpThreadProfiles"]}
-        lockPaths={["mcpThreadProfiles"]}
-        description={`A thread's own pick wins over every default and is never cut down to its parent's, also for a sub-agent. Pick one from the thread's menu, or here by thread id. ${MCP_PICK_APPLIES_NOTE}`}
-      >
-        <div className="grid gap-2 pb-2">
-          {pickRows.map((row) => {
-            const effect = row.pick === null ? null : pickEffect(row.threadId, row.pick);
-            return (
-              <div key={row.threadId} className="grid gap-1 text-xs">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
-                    <span className={row.title ? "truncate" : "truncate text-muted-foreground"}>
-                      {row.title ?? "Unknown thread"}
+      <AdvancedSettings targetIds={["mcp-thread-picks"]}>
+        <ForkRow
+          {...searchableSetting("mcp-thread-picks")}
+          settingKeys={["mcpThreadProfiles"]}
+          lockPaths={["mcpThreadProfiles"]}
+          description={`A thread's own pick wins over every default and is never cut down to its parent's, also for a sub-agent. Pick one from the thread's menu, or here by thread id. Default: none. ${MCP_PICK_APPLIES_NOTE}`}
+        >
+          <div className="grid gap-2 pb-2">
+            {pickRows.map((row) => {
+              const effect = row.pick === null ? null : pickEffect(row.threadId, row.pick);
+              return (
+                <div key={row.threadId} className="grid gap-1 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
+                      <span className={row.title ? "truncate" : "truncate text-muted-foreground"}>
+                        {row.title ?? "Unknown thread"}
+                      </span>
+                      <span className="shrink-0 text-muted-foreground">{row.threadId}</span>
                     </span>
-                    <span className="shrink-0 text-muted-foreground">{row.threadId}</span>
-                  </span>
-                  <ProfileSelect
-                    value={row.pick}
-                    choices={choices}
-                    label={`MCP profile for thread ${row.threadId}`}
-                    onChange={(name) =>
-                      save(threadPickPatch(mcpThreadProfiles, row.threadId, name))
-                    }
-                  />
-                  <Button
-                    size="xs"
-                    variant="destructive-outline"
-                    aria-label={`Clear the MCP profile pick of thread ${row.threadId}`}
-                    onClick={() => save(threadPickPatch(mcpThreadProfiles, row.threadId, null))}
-                  >
-                    Clear
-                  </Button>
+                    <ProfileSelect
+                      value={row.pick}
+                      choices={choices}
+                      label={`MCP profile for thread ${row.threadId}`}
+                      onChange={(name) =>
+                        save(threadPickPatch(mcpThreadProfiles, row.threadId, name))
+                      }
+                    />
+                    <Button
+                      size="xs"
+                      variant="destructive-outline"
+                      aria-label={`Clear the MCP profile pick of thread ${row.threadId}`}
+                      onClick={() => save(threadPickPatch(mcpThreadProfiles, row.threadId, null))}
+                    >
+                      Clear
+                    </Button>
+                  </div>
+                  {row.pick === null ? (
+                    <p className="text-destructive-foreground">{MCP_BLANK_PICK_ISSUE}</p>
+                  ) : effect?.widerThanParent ? (
+                    <p className="text-warning-foreground">{effect.text}</p>
+                  ) : null}
                 </div>
-                {row.pick === null ? (
-                  <p className="text-destructive-foreground">{MCP_BLANK_PICK_ISSUE}</p>
-                ) : effect?.widerThanParent ? (
-                  <p className="text-warning-foreground">{effect.text}</p>
-                ) : null}
-              </div>
-            );
-          })}
-          {pickDraft === null ? (
-            <div>
-              <Button
-                size="xs"
-                variant="outline"
-                onClick={() => {
-                  setPickError(null);
-                  setPickDraft({ threadId: "", profile: null });
-                }}
-              >
-                Add thread
-              </Button>
-            </div>
-          ) : (
-            <div className="grid gap-2 rounded-lg border border-border/60 p-3 text-xs">
-              <div className="flex flex-wrap items-center gap-2">
-                <Input
-                  size="sm"
-                  className="min-w-0 flex-1"
-                  aria-label="Thread id for an MCP profile pick"
-                  placeholder="Thread id"
-                  value={pickDraft.threadId}
-                  onChange={(event) => {
-                    setPickError(null);
-                    setPickDraft({ ...pickDraft, threadId: event.target.value });
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") addPick();
-                  }}
-                />
-                <ProfileSelect
-                  value={pickDraft.profile}
-                  choices={choices}
-                  label="MCP profile for the new thread pick"
-                  onChange={(name) => {
-                    setPickError(null);
-                    setPickDraft({ ...pickDraft, profile: name });
-                  }}
-                />
-              </div>
-              {draftEffect !== null ? (
-                <p
-                  className={
-                    draftEffect.widerThanParent
-                      ? "text-warning-foreground"
-                      : "text-muted-foreground"
-                  }
-                >
-                  {draftEffect.text}
-                </p>
-              ) : null}
-              {pickError !== null ? (
-                <p role="alert" className="text-destructive-foreground">
-                  {pickError}
-                </p>
-              ) : null}
-              <div className="flex gap-2">
-                <Button size="xs" onClick={addPick}>
-                  Save pick
-                </Button>
+              );
+            })}
+            {pickDraft === null ? (
+              <div>
                 <Button
                   size="xs"
                   variant="outline"
                   onClick={() => {
                     setPickError(null);
-                    setPickDraft(null);
+                    setPickDraft({ threadId: "", profile: null });
                   }}
                 >
-                  Cancel
+                  Add thread
                 </Button>
               </div>
-            </div>
-          )}
-        </div>
-      </ForkRow>
+            ) : (
+              <div className="grid gap-2 rounded-lg border border-border/60 p-3 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Input
+                    size="sm"
+                    className="min-w-0 flex-1"
+                    aria-label="Thread id for an MCP profile pick"
+                    placeholder="Thread id"
+                    value={pickDraft.threadId}
+                    onChange={(event) => {
+                      setPickError(null);
+                      setPickDraft({ ...pickDraft, threadId: event.target.value });
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") addPick();
+                    }}
+                  />
+                  <ProfileSelect
+                    value={pickDraft.profile}
+                    choices={choices}
+                    label="MCP profile for the new thread pick"
+                    onChange={(name) => {
+                      setPickError(null);
+                      setPickDraft({ ...pickDraft, profile: name });
+                    }}
+                  />
+                </div>
+                {draftEffect !== null ? (
+                  <p
+                    className={
+                      draftEffect.widerThanParent
+                        ? "text-warning-foreground"
+                        : "text-muted-foreground"
+                    }
+                  >
+                    {draftEffect.text}
+                  </p>
+                ) : null}
+                {pickError !== null ? (
+                  <p role="alert" className="text-destructive-foreground">
+                    {pickError}
+                  </p>
+                ) : null}
+                <div className="flex gap-2">
+                  <Button size="xs" onClick={addPick}>
+                    Save pick
+                  </Button>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={() => {
+                      setPickError(null);
+                      setPickDraft(null);
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        </ForkRow>
+      </AdvancedSettings>
     </SettingsSection>
   );
 }

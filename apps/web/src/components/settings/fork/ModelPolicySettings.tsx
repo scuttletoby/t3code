@@ -225,7 +225,7 @@ export function ModelPolicySettings() {
 
   if (mixed) {
     return (
-      <SettingsSection id="model-policy-section" title="Model policy">
+      <SettingsSection id="model-policy-section" title="Models agents may use">
         <ForkRow
           serverScoped
           {...searchableSetting("model-policy")}
@@ -249,13 +249,13 @@ export function ModelPolicySettings() {
   for (const row of shown.allow)
     byDriver.set(row.driver, [...(byDriver.get(row.driver) ?? []), row]);
   return (
-    <SettingsSection id="model-policy-section" title="Model policy">
+    <SettingsSection id="model-policy-section" title="Models agents may use">
       <ForkRow
         serverScoped
         {...searchableSetting("model-policy")}
         settingKeys={["modelPolicy"]}
         lockPaths={["modelPolicy"]}
-        description={`Which models agents may pick (delegate_task, create_threads, t3_thread_launch, t3_thread_configure). ${option?.description ?? ""} Your own picks are never refused; below, one outside the rows is marked. While it is on, a child that names its model keeps only the options it names.`}
+        description={`Which models and efforts agents may pick when they start threads or sub-agents. ${option?.description ?? ""} Your own picks are never refused; one outside the list is marked below. While it is on, a sub-agent that names its model keeps only the options it names. Default: Off.`}
         resetAction={
           isDefault ? null : (
             <SettingResetButton

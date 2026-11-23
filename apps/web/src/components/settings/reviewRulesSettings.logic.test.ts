@@ -32,7 +32,7 @@ describe("old, empty and bad settings files", () => {
     expect(reviewRulesState(value)).toBe("off");
     expect(reviewRulesSummary(value)).toBe("Off");
     expect(reviewRulesDescription(value, environment)).toBe(
-      "Off: nothing is listed, changed or checked.",
+      "Off: nothing is listed, changed or checked. On: review lenses get the values of the Recommended preset. Default: off.",
     );
     expect(effectiveReviewRulesRows(value)).toEqual([]);
     // Undefined (a server too old to send the key) reads the same.
