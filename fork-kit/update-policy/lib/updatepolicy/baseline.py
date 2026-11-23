@@ -77,7 +77,7 @@ def policy_drift(host, cfg, s, state):
     problem = aptconf.restart_problem(cfg) if isinstance(cfg, dict) else None
     if problem:
         out.append(problem)
-    for unit in OWN_UNITS:
+    for unit in OWN_UNITS + (('update-policy-exposure.timer',) if s['exposure']['enabled'] else ()):
         word = enabled(host, unit)
         if word != 'enabled':
             out.append(f'{unit} is installed but {word}, not enabled: pending restarts are neither made nor '

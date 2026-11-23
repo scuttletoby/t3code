@@ -128,6 +128,22 @@
       "diskPaths": ["/"],
       "pendingDays": 3,
       "sshUsers": ["root", "example-agent"]
+    },
+    "exposure": {
+      "enabled": true,
+      "epssMin": 0.1,
+      "fixWaitingDays": 3,
+      "staleDays": 3,
+      "maxFeedMb": 64,
+      "maxXmlMb": 1024,
+      "timeoutSeconds": 60,
+      "ignore": [
+        {
+          "cve": "CVE-2021-1789",
+          "reason": "example: the package is not used here",
+          "until": "2026-12-31"
+        }
+      ]
     }
   },
   "desk": {

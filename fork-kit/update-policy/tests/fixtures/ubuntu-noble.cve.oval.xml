@@ -1,0 +1,480 @@
+<oval_definitions xmlns="http://oval.mitre.org/XMLSchema/oval-definitions-5" xmlns:ind-def="http://oval.mitre.org/XMLSchema/oval-definitions-5#independent" xmlns:oval="http://oval.mitre.org/XMLSchema/oval-common-5" xmlns:unix-def="http://oval.mitre.org/XMLSchema/oval-definitions-5#unix" xmlns:linux-def="http://oval.mitre.org/XMLSchema/oval-definitions-5#linux" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://oval.mitre.org/XMLSchema/oval-common-5 oval-common-schema.xsd   http://oval.mitre.org/XMLSchema/oval-definitions-5 oval-definitions-schema.xsd   http://oval.mitre.org/XMLSchema/oval-definitions-5#independent independent-definitions-schema.xsd   http://oval.mitre.org/XMLSchema/oval-definitions-5#unix unix-definitions-schema.xsd  http://oval.mitre.org/XMLSchema/oval-definitions-5#linux linux-definitions-schema.xsd">
+  <generator>
+    <oval:product_name>Canonical OVAL Generator</oval:product_name>
+    <oval:product_version>2</oval:product_version>
+    <oval:schema_version>5.11.1</oval:schema_version>
+    <oval:timestamp>2026-11-19T19:32:07</oval:timestamp>
+  </generator>
+  <definitions>
+    <definition id="oval:com.ubuntu.noble:def:200224390000000" class="vulnerability" version="1">
+      <metadata>
+        <title>CVE-2002-2439 on Ubuntu 24.04 LTS (noble) - low</title>
+        <affected family="unix">
+          <platform>Ubuntu 24.04 LTS</platform>
+        </affected>
+        <reference source="CVE" ref_id="CVE-2002-2439" ref_url="https://www.cve.org/CVERecord?id=CVE-2002-2439" />
+        <description>(cut for the test fixture)</description>
+        <advisory from="security@ubuntu.com">
+          <severity>Low</severity>
+          <rights>Copyright (C) 2026 Canonical Ltd.</rights>
+          <public_date>2019-10-23T18:15:00Z</public_date>
+          <cve href="https://ubuntu.com/security/CVE-2002-2439" priority="low" public="20191023">CVE-2002-2439</cve>
+        </advisory>
+      </metadata>
+      <criteria>
+        <extend_definition applicability_check="true" definition_ref="oval:com.ubuntu.noble:def:100" comment="Ubuntu 24.04 LTS (noble) is installed" />
+        <criteria operator="OR">
+          <criterion test_ref="oval:com.ubuntu.noble:tst:200224390000000" comment="gcc-arm-none-eabi source package in noble, might be affected and may need fixing." />
+          <criterion test_ref="oval:com.ubuntu.noble:tst:200224390000010" comment="gcc-h8300-hms source package in noble, might be affected and may need fixing." />
+          <criterion test_ref="oval:com.ubuntu.noble:tst:200224390000020" comment="gcc-mingw-w64 source package in noble, might be affected and may need fixing." />
+        </criteria>
+      </criteria>
+    </definition>
+    <definition id="oval:com.ubuntu.noble:def:202117890000000" class="vulnerability" version="1">
+      <metadata>
+        <title>CVE-2021-1789 on Ubuntu 24.04 LTS (noble) - medium</title>
+        <affected family="unix">
+          <platform>Ubuntu 24.04 LTS</platform>
+        </affected>
+        <reference source="CVE" ref_id="CVE-2021-1789" ref_url="https://www.cve.org/CVERecord?id=CVE-2021-1789" />
+        <reference source="USN" ref_id="USN-4894-1" ref_url="https://ubuntu.com/security/notices/USN-4894-1" />
+        <description>(cut for the test fixture)</description>
+        <advisory from="security@ubuntu.com">
+          <severity>Medium</severity>
+          <rights>Copyright (C) 2026 Canonical Ltd.</rights>
+          <public_date>2021-03-24T00:00:00Z</public_date>
+          <cve href="https://ubuntu.com/security/CVE-2021-1789" priority="medium" public="20210324" cvss_score="8.8" cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H" cvss_severity="high" usns="4894-1">CVE-2021-1789</cve>
+        </advisory>
+      </metadata>
+      <criteria>
+        <extend_definition applicability_check="true" definition_ref="oval:com.ubuntu.noble:def:100" comment="Ubuntu 24.04 LTS (noble) is installed" />
+        <criterion test_ref="oval:com.ubuntu.noble:tst:201134380000000" comment="qtwebkit-opensource-src source package in noble, might be affected and may need fixing." />
+      </criteria>
+    </definition>
+    <definition id="oval:com.ubuntu.noble:def:202349110000000" class="vulnerability" version="1">
+      <metadata>
+        <title>CVE-2023-4911 on Ubuntu 24.04 LTS (noble) - high</title>
+        <affected family="unix">
+          <platform>Ubuntu 24.04 LTS</platform>
+        </affected>
+        <reference source="CVE" ref_id="CVE-2023-4911" ref_url="https://www.cve.org/CVERecord?id=CVE-2023-4911" />
+        <reference source="USN" ref_id="USN-6409-1" ref_url="https://ubuntu.com/security/notices/USN-6409-1" />
+        <description>(cut for the test fixture)</description>
+        <advisory from="security@ubuntu.com">
+          <severity>High</severity>
+          <rights>Copyright (C) 2026 Canonical Ltd.</rights>
+          <public_date>2023-10-03T17:00:00Z</public_date>
+          <cve href="https://ubuntu.com/security/CVE-2023-4911" priority="high" public="20231003" cvss_score="7.8" cvss_vector="CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H" cvss_severity="high" usns="6409-1">CVE-2023-4911</cve>
+        </advisory>
+      </metadata>
+      <criteria>
+        <extend_definition applicability_check="true" definition_ref="oval:com.ubuntu.noble:def:100" comment="Ubuntu 24.04 LTS (noble) is installed" />
+        <criterion test_ref="oval:com.ubuntu.noble:tst:202349110000000" comment="glibc source package in noble, is affected and has been fixed (note: '2.38-1ubuntu6')." />
+      </criteria>
+    </definition>
+    <definition id="oval:com.ubuntu.noble:def:2024369710000000" class="vulnerability" version="1">
+      <metadata>
+        <title>CVE-2024-36971 on Ubuntu 24.04 LTS (noble) - high</title>
+        <affected family="unix">
+          <platform>Ubuntu 24.04 LTS</platform>
+        </affected>
+        <reference source="CVE" ref_id="CVE-2024-36971" ref_url="https://www.cve.org/CVERecord?id=CVE-2024-36971" />
+        <reference source="USN" ref_id="USN-6951-1" ref_url="https://ubuntu.com/security/notices/USN-6951-1" />
+        <reference source="USN" ref_id="USN-6953-1" ref_url="https://ubuntu.com/security/notices/USN-6953-1" />
+        <reference source="USN" ref_id="USN-6951-2" ref_url="https://ubuntu.com/security/notices/USN-6951-2" />
+        <reference source="USN" ref_id="USN-6951-3" ref_url="https://ubuntu.com/security/notices/USN-6951-3" />
+        <reference source="USN" ref_id="USN-6951-4" ref_url="https://ubuntu.com/security/notices/USN-6951-4" />
+        <reference source="USN" ref_id="USN-6979-1" ref_url="https://ubuntu.com/security/notices/USN-6979-1" />
+        <reference source="USN" ref_id="USN-6999-1" ref_url="https://ubuntu.com/security/notices/USN-6999-1" />
+        <reference source="USN" ref_id="USN-7004-1" ref_url="https://ubuntu.com/security/notices/USN-7004-1" />
+        <reference source="USN" ref_id="USN-7005-1" ref_url="https://ubuntu.com/security/notices/USN-7005-1" />
+        <reference source="USN" ref_id="USN-7007-1" ref_url="https://ubuntu.com/security/notices/USN-7007-1" />
+        <reference source="USN" ref_id="USN-7008-1" ref_url="https://ubuntu.com/security/notices/USN-7008-1" />
+        <reference source="USN" ref_id="USN-7005-2" ref_url="https://ubuntu.com/security/notices/USN-7005-2" />
+        <reference source="USN" ref_id="USN-7009-1" ref_url="https://ubuntu.com/security/notices/USN-7009-1" />
+        <reference source="USN" ref_id="USN-7019-1" ref_url="https://ubuntu.com/security/notices/USN-7019-1" />
+        <reference source="USN" ref_id="USN-7007-2" ref_url="https://ubuntu.com/security/notices/USN-7007-2" />
+        <reference source="USN" ref_id="USN-6999-2" ref_url="https://ubuntu.com/security/notices/USN-6999-2" />
+        <reference source="USN" ref_id="USN-7007-3" ref_url="https://ubuntu.com/security/notices/USN-7007-3" />
+        <reference source="USN" ref_id="USN-7029-1" ref_url="https://ubuntu.com/security/notices/USN-7029-1" />
+        <reference source="USN" ref_id="USN-7009-2" ref_url="https://ubuntu.com/security/notices/USN-7009-2" />
+        <reference source="USN" ref_id="USN-7069-1" ref_url="https://ubuntu.com/security/notices/USN-7069-1" />
+        <reference source="USN" ref_id="USN-7069-2" ref_url="https://ubuntu.com/security/notices/USN-7069-2" />
+        <description>(cut for the test fixture)</description>
+        <advisory from="security@ubuntu.com">
+          <severity>High</severity>
+          <rights>Copyright (C) 2026 Canonical Ltd.</rights>
+          <public_date>2024-06-10T09:15:00Z</public_date>
+          <cve href="https://ubuntu.com/security/CVE-2024-36971" priority="high" public="20240610" cvss_score="7.8" cvss_vector="CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H" cvss_severity="high" usns="6951-1,6953-1,6951-2,6951-3,6951-4,6979-1,6999-1,7004-1,7005-1,7007-1,7008-1,7005-2,7009-1,7019-1,7007-2,6999-2,7007-3,7029-1,7009-2,7069-1,7069-2">CVE-2024-36971</cve>
+        </advisory>
+      </metadata>
+      <criteria>
+        <extend_definition applicability_check="true" definition_ref="oval:com.ubuntu.noble:def:100" comment="Ubuntu 24.04 LTS (noble) is installed" />
+        <criteria operator="OR">
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000000" comment="Is kernel 'linux' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000000" comment="'linux' kernel in noble was vulnerable but has been fixed (note: '6.8.0-44.44')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2020123510000010" comment="Is kernel 'linux-aws' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000010" comment="'linux-aws' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1015.16')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000050" comment="Is kernel 'linux-azure' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000020" comment="'linux-azure' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1014.16')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2020123510000040" comment="Is kernel 'linux-gcp' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000020" comment="'linux-gcp' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1014.16')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2020123510000050" comment="Is kernel 'linux-gke' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000030" comment="'linux-gke' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1010.13')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000270" comment="Is kernel 'linux-ibm' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000040" comment="'linux-ibm' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1012.12')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000290" comment="Is kernel 'linux-lowlatency' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000000" comment="'linux-lowlatency' kernel in noble was vulnerable but has been fixed (note: '6.8.0-44.44.1')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000310" comment="Is kernel 'linux-nvidia' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000050" comment="'linux-nvidia' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1013.14')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000350" comment="Is kernel 'linux-nvidia-lowlatency' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000050" comment="'linux-nvidia-lowlatency' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1013.14.1')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000400" comment="Is kernel 'linux-oem-6.8' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000040" comment="'linux-oem-6.8' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1012.12')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000410" comment="Is kernel 'linux-oracle' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000040" comment="'linux-oracle' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1012.12')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000450" comment="Is kernel 'linux-raspi' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000060" comment="'linux-raspi' kernel in noble was vulnerable but has been fixed (note: '6.8.0-1011.12')." />
+          </criteria>
+          <criteria operator="AND">
+            <criterion test_ref="oval:com.ubuntu.noble:tst:201245420000460" comment="Is kernel 'linux-riscv' running?" />
+            <criterion test_ref="oval:com.ubuntu.noble:tst:2022487720000000" comment="'linux-riscv' kernel in noble was vulnerable but has been fixed (note: '6.8.0-44.44.1')." />
+          </criteria>
+        </criteria>
+      </criteria>
+    </definition>
+    <definition id="oval:com.ubuntu.noble:def:2025543890000000" class="vulnerability" version="1">
+      <metadata>
+        <title>CVE-2025-54389 on Ubuntu 24.04 LTS (noble) - medium</title>
+        <affected family="unix">
+          <platform>Ubuntu 24.04 LTS</platform>
+        </affected>
+        <reference source="CVE" ref_id="CVE-2025-54389" ref_url="https://www.cve.org/CVERecord?id=CVE-2025-54389" />
+        <reference source="USN" ref_id="USN-7697-1" ref_url="https://ubuntu.com/security/notices/USN-7697-1" />
+        <description>(cut for the test fixture)</description>
+        <advisory from="security@ubuntu.com">
+          <severity>Medium</severity>
+          <rights>Copyright (C) 2026 Canonical Ltd.</rights>
+          <public_date>2025-08-14T14:00:00Z</public_date>
+          <cve href="https://ubuntu.com/security/CVE-2025-54389" priority="medium" public="20250814" cvss_score="6.2" cvss_vector="CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N" cvss_severity="medium" usns="7697-1">CVE-2025-54389</cve>
+        </advisory>
+      </metadata>
+      <criteria>
+        <extend_definition applicability_check="true" definition_ref="oval:com.ubuntu.noble:def:100" comment="Ubuntu 24.04 LTS (noble) is installed" />
+        <criterion test_ref="oval:com.ubuntu.noble:tst:2025543890000000" comment="aide source package in noble, is affected and has been fixed (note: '0.18.6-2ubuntu0.1')." />
+      </criteria>
+    </definition>
+  </definitions>
+  <tests>
+    <linux-def:dpkginfo_test id="oval:com.ubuntu.noble:tst:200224390000000" version="1" check="at least one" check_existence="at_least_one_exists" comment="Does the 'gcc-arm-none-eabi' package exist?">
+      <linux-def:object object_ref="oval:com.ubuntu.noble:obj:200224390000000" />
+    </linux-def:dpkginfo_test>
+    <linux-def:dpkginfo_test id="oval:com.ubuntu.noble:tst:200224390000010" version="1" check="at least one" check_existence="at_least_one_exists" comment="Does the 'gcc-h8300-hms' package exist?">
+      <linux-def:object object_ref="oval:com.ubuntu.noble:obj:200224390000010" />
+    </linux-def:dpkginfo_test>
+    <linux-def:dpkginfo_test id="oval:com.ubuntu.noble:tst:200224390000020" version="1" check="at least one" check_existence="at_least_one_exists" comment="Does the 'gcc-mingw-w64' package exist?">
+      <linux-def:object object_ref="oval:com.ubuntu.noble:obj:200224390000020" />
+    </linux-def:dpkginfo_test>
+    <linux-def:dpkginfo_test id="oval:com.ubuntu.noble:tst:201134380000000" version="1" check="at least one" check_existence="at_least_one_exists" comment="Does the 'qtwebkit-opensource-src' package exist?">
+      <linux-def:object object_ref="oval:com.ubuntu.noble:obj:201134380000000" />
+    </linux-def:dpkginfo_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000000" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000000" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000050" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-azure' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000050" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000270" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-ibm' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000270" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000290" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-lowlatency' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000290" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000310" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-nvidia' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000310" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000350" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-nvidia-lowlatency' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000350" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000400" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-oem-6.8' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000400" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000410" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-oracle' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000410" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000450" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-raspi' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000450" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:201245420000460" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-riscv' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:201245420000460" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:2020123510000010" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-aws' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:2020123510000010" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:2020123510000040" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-gcp' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:2020123510000040" />
+    </unix-def:uname_test>
+    <unix-def:uname_test id="oval:com.ubuntu.noble:tst:2020123510000050" version="1" check="at least one" check_existence="at_least_one_exists" comment="Is kernel 'linux-gke' running?">
+      <unix-def:object object_ref="oval:com.ubuntu.noble:obj:200" />
+      <unix-def:state state_ref="oval:com.ubuntu.noble:ste:2020123510000050" />
+    </unix-def:uname_test>
+    <ind-def:variable_test id="oval:com.ubuntu.noble:tst:2022487720000000" version="1" check="all" check_existence="all_exist" comment="kernel 'linux' version comparison">
+      <ind-def:object object_ref="oval:com.ubuntu.noble:obj:210" />
+      <ind-def:state state_ref="oval:com.ubuntu.noble:ste:2022487720000000" />
+    </ind-def:variable_test>
+    <ind-def:variable_test id="oval:com.ubuntu.noble:tst:2022487720000010" version="1" check="all" check_existence="all_exist" comment="kernel 'linux-aws' version comparison">
+      <ind-def:object object_ref="oval:com.ubuntu.noble:obj:210" />
+      <ind-def:state state_ref="oval:com.ubuntu.noble:ste:2022487720000010" />
+    </ind-def:variable_test>
+    <ind-def:variable_test id="oval:com.ubuntu.noble:tst:2022487720000020" version="1" check="all" check_existence="all_exist" comment="kernel 'linux-azure' version comparison">
+      <ind-def:object object_ref="oval:com.ubuntu.noble:obj:210" />
+      <ind-def:state state_ref="oval:com.ubuntu.noble:ste:2022487720000020" />
+    </ind-def:variable_test>
+    <ind-def:variable_test id="oval:com.ubuntu.noble:tst:2022487720000030" version="1" check="all" check_existence="all_exist" comment="kernel 'linux-gke' version comparison">
+      <ind-def:object object_ref="oval:com.ubuntu.noble:obj:210" />
+      <ind-def:state state_ref="oval:com.ubuntu.noble:ste:2022487720000030" />
+    </ind-def:variable_test>
+    <ind-def:variable_test id="oval:com.ubuntu.noble:tst:2022487720000040" version="1" check="all" check_existence="all_exist" comment="kernel 'linux-ibm' version comparison">
+      <ind-def:object object_ref="oval:com.ubuntu.noble:obj:210" />
+      <ind-def:state state_ref="oval:com.ubuntu.noble:ste:2022487720000040" />
+    </ind-def:variable_test>
+    <ind-def:variable_test id="oval:com.ubuntu.noble:tst:2022487720000050" version="1" check="all" check_existence="all_exist" comment="kernel 'linux-nvidia' version comparison">
+      <ind-def:object object_ref="oval:com.ubuntu.noble:obj:210" />
+      <ind-def:state state_ref="oval:com.ubuntu.noble:ste:2022487720000050" />
+    </ind-def:variable_test>
+    <ind-def:variable_test id="oval:com.ubuntu.noble:tst:2022487720000060" version="1" check="all" check_existence="all_exist" comment="kernel 'linux-raspi' version comparison">
+      <ind-def:object object_ref="oval:com.ubuntu.noble:obj:210" />
+      <ind-def:state state_ref="oval:com.ubuntu.noble:ste:2022487720000060" />
+    </ind-def:variable_test>
+    <linux-def:dpkginfo_test id="oval:com.ubuntu.noble:tst:202349110000000" version="1" check="at least one" check_existence="at_least_one_exists" comment="Does the 'glibc' package exist?">
+      <linux-def:object object_ref="oval:com.ubuntu.noble:obj:202349110000000" />
+      <linux-def:state state_ref="oval:com.ubuntu.noble:ste:202349110000000" />
+    </linux-def:dpkginfo_test>
+    <linux-def:dpkginfo_test id="oval:com.ubuntu.noble:tst:2025543890000000" version="1" check="at least one" check_existence="at_least_one_exists" comment="Does the 'aide' package exist?">
+      <linux-def:object object_ref="oval:com.ubuntu.noble:obj:2025543890000000" />
+      <linux-def:state state_ref="oval:com.ubuntu.noble:ste:2025543890000000" />
+    </linux-def:dpkginfo_test>
+  </tests>
+  <objects>
+    <unix-def:uname_object id="oval:com.ubuntu.noble:obj:200" version="1" />
+    <ind-def:variable_object id="oval:com.ubuntu.noble:obj:210" version="1">
+      <ind-def:var_ref>oval:com.ubuntu.noble:var:200</ind-def:var_ref>
+    </ind-def:variable_object>
+    <linux-def:dpkginfo_object id="oval:com.ubuntu.noble:obj:200224390000000" version="1" comment="The 'gcc-arm-none-eabi' package binaries">
+      <linux-def:name var_ref="oval:com.ubuntu.noble:var:200224390000000" var_check="at least one" />
+    </linux-def:dpkginfo_object>
+    <linux-def:dpkginfo_object id="oval:com.ubuntu.noble:obj:200224390000010" version="1" comment="The 'gcc-h8300-hms' package binaries">
+      <linux-def:name var_ref="oval:com.ubuntu.noble:var:200224390000010" var_check="at least one" />
+    </linux-def:dpkginfo_object>
+    <linux-def:dpkginfo_object id="oval:com.ubuntu.noble:obj:200224390000020" version="1" comment="The 'gcc-mingw-w64' package binaries">
+      <linux-def:name var_ref="oval:com.ubuntu.noble:var:200224390000020" var_check="at least one" />
+    </linux-def:dpkginfo_object>
+    <linux-def:dpkginfo_object id="oval:com.ubuntu.noble:obj:201134380000000" version="1" comment="The 'qtwebkit-opensource-src' package binaries">
+      <linux-def:name var_ref="oval:com.ubuntu.noble:var:201134380000000" var_check="at least one" />
+    </linux-def:dpkginfo_object>
+    <linux-def:dpkginfo_object id="oval:com.ubuntu.noble:obj:202349110000000" version="1" comment="The 'glibc' package binaries">
+      <linux-def:name var_ref="oval:com.ubuntu.noble:var:202349110000000" var_check="at least one" />
+    </linux-def:dpkginfo_object>
+    <linux-def:dpkginfo_object id="oval:com.ubuntu.noble:obj:2025543890000000" version="1" comment="The 'aide' package binaries">
+      <linux-def:name var_ref="oval:com.ubuntu.noble:var:2025543890000000" var_check="at least one" />
+    </linux-def:dpkginfo_object>
+  </objects>
+  <states>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000000" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-generic|\-generic\-64k)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000050" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-azure)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000270" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-ibm)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000290" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-lowlatency|\-lowlatency\-64k)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000310" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-nvidia|\-nvidia\-64k)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000350" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-nvidia\-lowlatency|\-nvidia\-lowlatency\-64k)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000400" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-oem)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000410" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-oracle|\-oracle\-64k)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000450" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-raspi)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:201245420000460" version="1">
+      <unix-def:machine_class>riscv64</unix-def:machine_class>
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-generic)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:2020123510000010" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-aws)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:2020123510000040" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-gcp)</unix-def:os_release>
+    </unix-def:uname_state>
+    <unix-def:uname_state id="oval:com.ubuntu.noble:ste:2020123510000050" version="1">
+      <unix-def:os_release operation="pattern match">6\.8\.0\-\d+(\-gke)</unix-def:os_release>
+    </unix-def:uname_state>
+    <ind-def:variable_state id="oval:com.ubuntu.noble:ste:2022487720000000" version="1" comment="'linux' kernel version">
+      <ind-def:value datatype="debian_evr_string" operation="less than">0:6.8.0-44</ind-def:value>
+    </ind-def:variable_state>
+    <ind-def:variable_state id="oval:com.ubuntu.noble:ste:2022487720000010" version="1" comment="'linux-aws' kernel version">
+      <ind-def:value datatype="debian_evr_string" operation="less than">0:6.8.0-1015</ind-def:value>
+    </ind-def:variable_state>
+    <ind-def:variable_state id="oval:com.ubuntu.noble:ste:2022487720000020" version="1" comment="'linux-azure' kernel version">
+      <ind-def:value datatype="debian_evr_string" operation="less than">0:6.8.0-1014</ind-def:value>
+    </ind-def:variable_state>
+    <ind-def:variable_state id="oval:com.ubuntu.noble:ste:2022487720000030" version="1" comment="'linux-gke' kernel version">
+      <ind-def:value datatype="debian_evr_string" operation="less than">0:6.8.0-1010</ind-def:value>
+    </ind-def:variable_state>
+    <ind-def:variable_state id="oval:com.ubuntu.noble:ste:2022487720000040" version="1" comment="'linux-ibm' kernel version">
+      <ind-def:value datatype="debian_evr_string" operation="less than">0:6.8.0-1012</ind-def:value>
+    </ind-def:variable_state>
+    <ind-def:variable_state id="oval:com.ubuntu.noble:ste:2022487720000050" version="1" comment="'linux-nvidia' kernel version">
+      <ind-def:value datatype="debian_evr_string" operation="less than">0:6.8.0-1013</ind-def:value>
+    </ind-def:variable_state>
+    <ind-def:variable_state id="oval:com.ubuntu.noble:ste:2022487720000060" version="1" comment="'linux-raspi' kernel version">
+      <ind-def:value datatype="debian_evr_string" operation="less than">0:6.8.0-1011</ind-def:value>
+    </ind-def:variable_state>
+    <linux-def:dpkginfo_state id="oval:com.ubuntu.noble:ste:202349110000000" version="1" comment="The binary package version is less than '2.38-1ubuntu6'">
+      <linux-def:evr datatype="debian_evr_string" operation="less than">2.38-1ubuntu6</linux-def:evr>
+    </linux-def:dpkginfo_state>
+    <linux-def:dpkginfo_state id="oval:com.ubuntu.noble:ste:2025543890000000" version="1" comment="The binary package version is less than '0.18.6-2ubuntu0.1'">
+      <linux-def:evr datatype="debian_evr_string" operation="less than">0.18.6-2ubuntu0.1</linux-def:evr>
+    </linux-def:dpkginfo_state>
+  </states>
+  <variables>
+    <local_variable id="oval:com.ubuntu.noble:var:200" version="1" datatype="debian_evr_string" comment="kernel version in evr format">
+      <concat>
+        <literal_component>0:</literal_component>
+        <regex_capture pattern="^([\d|\.]+-\d+)[-|\w]+$">
+          <object_component object_ref="oval:com.ubuntu.noble:obj:200" item_field="os_release" />
+        </regex_capture>
+      </concat>
+    </local_variable>
+    <constant_variable id="oval:com.ubuntu.noble:var:200224390000000" version="1" datatype="string" comment="The 'gcc-arm-none-eabi' package binaries">
+      <value>gcc-arm-none-eabi</value>
+      <value>gcc-arm-none-eabi-source</value>
+    </constant_variable>
+    <constant_variable id="oval:com.ubuntu.noble:var:200224390000010" version="1" datatype="string" comment="The 'gcc-h8300-hms' package binaries">
+      <value>gcc-h8300-hms</value>
+    </constant_variable>
+    <constant_variable id="oval:com.ubuntu.noble:var:200224390000020" version="1" datatype="string" comment="The 'gcc-mingw-w64' package binaries">
+      <value>g++-mingw-w64</value>
+      <value>g++-mingw-w64-i686</value>
+      <value>g++-mingw-w64-i686-posix</value>
+      <value>g++-mingw-w64-i686-win32</value>
+      <value>g++-mingw-w64-x86-64</value>
+      <value>g++-mingw-w64-x86-64-posix</value>
+      <value>g++-mingw-w64-x86-64-win32</value>
+      <value>gcc-mingw-w64</value>
+      <value>gcc-mingw-w64-base</value>
+      <value>gcc-mingw-w64-i686</value>
+      <value>gcc-mingw-w64-i686-posix</value>
+      <value>gcc-mingw-w64-i686-posix-runtime</value>
+      <value>gcc-mingw-w64-i686-win32</value>
+      <value>gcc-mingw-w64-i686-win32-runtime</value>
+      <value>gcc-mingw-w64-x86-64</value>
+      <value>gcc-mingw-w64-x86-64-posix</value>
+      <value>gcc-mingw-w64-x86-64-posix-runtime</value>
+      <value>gcc-mingw-w64-x86-64-win32</value>
+      <value>gcc-mingw-w64-x86-64-win32-runtime</value>
+      <value>gfortran-mingw-w64</value>
+      <value>gfortran-mingw-w64-i686</value>
+      <value>gfortran-mingw-w64-i686-posix</value>
+      <value>gfortran-mingw-w64-i686-win32</value>
+      <value>gfortran-mingw-w64-x86-64</value>
+      <value>gfortran-mingw-w64-x86-64-posix</value>
+      <value>gfortran-mingw-w64-x86-64-win32</value>
+      <value>gnat-mingw-w64</value>
+      <value>gnat-mingw-w64-i686</value>
+      <value>gnat-mingw-w64-i686-posix</value>
+      <value>gnat-mingw-w64-i686-win32</value>
+      <value>gnat-mingw-w64-x86-64</value>
+      <value>gnat-mingw-w64-x86-64-posix</value>
+      <value>gnat-mingw-w64-x86-64-win32</value>
+      <value>gobjc++-mingw-w64</value>
+      <value>gobjc++-mingw-w64-i686</value>
+      <value>gobjc++-mingw-w64-i686-posix</value>
+      <value>gobjc++-mingw-w64-i686-win32</value>
+      <value>gobjc++-mingw-w64-x86-64</value>
+      <value>gobjc++-mingw-w64-x86-64-posix</value>
+      <value>gobjc++-mingw-w64-x86-64-win32</value>
+      <value>gobjc-mingw-w64</value>
+      <value>gobjc-mingw-w64-i686</value>
+      <value>gobjc-mingw-w64-i686-posix</value>
+      <value>gobjc-mingw-w64-i686-win32</value>
+      <value>gobjc-mingw-w64-x86-64</value>
+      <value>gobjc-mingw-w64-x86-64-posix</value>
+      <value>gobjc-mingw-w64-x86-64-win32</value>
+    </constant_variable>
+    <constant_variable id="oval:com.ubuntu.noble:var:201134380000000" version="1" datatype="string" comment="The 'qtwebkit-opensource-src' package binaries">
+      <value>libqt5webkit5</value>
+      <value>qml-module-qtwebkit</value>
+    </constant_variable>
+    <constant_variable id="oval:com.ubuntu.noble:var:202349110000000" version="1" datatype="string" comment="The 'glibc' package binaries">
+      <value>glibc-source</value>
+      <value>libc-bin</value>
+      <value>libc-dev-bin</value>
+      <value>libc-devtools</value>
+      <value>libc6</value>
+      <value>libc6-amd64</value>
+      <value>libc6-dev-amd64</value>
+      <value>libc6-dev-i386</value>
+      <value>libc6-dev-s390</value>
+      <value>libc6-dev-x32</value>
+      <value>libc6-i386</value>
+      <value>libc6-prof</value>
+      <value>libc6-s390</value>
+      <value>libc6-x32</value>
+      <value>locales</value>
+      <value>locales-all</value>
+      <value>nscd</value>
+    </constant_variable>
+    <constant_variable id="oval:com.ubuntu.noble:var:2025543890000000" version="1" datatype="string" comment="The 'aide' package binaries">
+      <value>aide</value>
+      <value>aide-common</value>
+      <value>aide-dynamic</value>
+    </constant_variable>
+  </variables>
+</oval_definitions>

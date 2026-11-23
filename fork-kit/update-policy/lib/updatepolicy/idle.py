@@ -97,6 +97,9 @@ class Host:
             pass
         return 'a broken answer'
 
+    def kernel_release(self):
+        return os.uname().release
+
     def free_answer(self, path):
         import free_contract
         verdict, reason, _facts = free_contract.ask(path)
