@@ -15,6 +15,7 @@ SHA1, SHA2 = fx.SHA1, fx.SHA2
 KITS = {
     'agent-guards': os.path.join(fx.FORK_KIT, 'agent-guards', 'sbin', 'agent-guards-install'),
     'cleaner': os.path.join(fx.FORK_KIT, 'cleaner', 'sbin', 'fork-cleaner-install'),
+    'gardener': os.path.join(fx.FORK_KIT, 'gardener', 'sbin', 'gardener-install'),
     'golive': os.path.join(fx.FORK_KIT, 'golive', 'sbin', 't3-golive-install'),
     'schedule-kick': os.path.join(fx.FORK_KIT, 'schedule-kick', 'sbin', 'schedule-kick-install'),
     'update-policy': os.path.join(fx.FORK_KIT, 'update-policy', 'sbin', 'update-policy-install'),
@@ -615,6 +616,10 @@ class Cleaner(Contract, fx.FakeHost):
     KIT_DIR, INSTALLER = os.path.join(fx.FORK_KIT, 'cleaner'), KITS['cleaner']
 
 
+class Gardener(Contract, fx.FakeHost):
+    KIT_DIR, INSTALLER = os.path.join(fx.FORK_KIT, 'gardener'), KITS['gardener']
+
+
 class Golive(Contract, fx.FakeHost):
     KIT_DIR, INSTALLER = os.path.join(fx.FORK_KIT, 'golive'), KITS['golive']
 
@@ -638,7 +643,7 @@ class Bootstrap(fx.FakeHost):
 
     def test_the_kit_is_one_it_knows(self):
         self.assertEqual(self.refused('--repo', 'a/b', '--sha', SHA1), 'fork-kit-bootstrap: --kit must be one of: '
-                         'agent-guards cleaner golive schedule-kick update-policy')
+                         'agent-guards cleaner gardener golive schedule-kick update-policy')
         self.assertIn('--kit must be one of', self.refused('--kit', '../heavy', '--repo', 'a/b', '--sha', SHA1))
         self.assertEqual(self.refused('--repo', 'a/b', '--sha', SHA1, '--kit'),
                          'fork-kit-bootstrap: --kit needs a value')
@@ -646,7 +651,7 @@ class Bootstrap(fx.FakeHost):
     def test_only_the_kit_options_are_passed_on(self):
         """Nothing reaches the installer unchecked: a second --source would install a folder the release check
         never saw."""
-        for kit in ('agent-guards', 'cleaner', 'golive', 'schedule-kick', 'update-policy'):
+        for kit in ('agent-guards', 'cleaner', 'gardener', 'golive', 'schedule-kick', 'update-policy'):
             for extra in (['--source', '/elsewhere'], ['--x']):
                 with self.subTest(kit=kit, extra=extra):
                     err = self.refused('--kit', kit, '--repo', 'a/b', '--sha', SHA1, *extra)
@@ -659,11 +664,12 @@ class Bootstrap(fx.FakeHost):
             self.assertEqual(self.refused(timer, '--kit', 'golive', '--repo', 'a/b', '--sha', SHA1),
                              f'fork-kit-bootstrap: {timer} is not an option of --kit golive')
         for kit, opt in (('agent-guards', '--timer'), ('agent-guards', '--no-timer'), ('cleaner', '--settings'),
-                         ('schedule-kick', '--no-settings'), ('golive', '--settings'), ('update-policy', '--settings')):
+                         ('schedule-kick', '--no-settings'), ('golive', '--settings'), ('update-policy', '--settings'),
+                         ('gardener', '--settings')):
             with self.subTest(kit=kit, opt=opt):
                 self.assertEqual(self.refused('--kit', kit, opt, '--repo', 'a/b', '--sha', SHA1),
                                  f'fork-kit-bootstrap: {opt} is not an option of --kit {kit}')
-        for kit in ('agent-guards', 'cleaner', 'golive', 'schedule-kick'):     # --force: update-policy's only
+        for kit in ('agent-guards', 'cleaner', 'gardener', 'golive', 'schedule-kick'):  # --force: update-policy's only
             with self.subTest(kit=kit, opt='--force'):
                 self.assertEqual(self.refused('--kit', kit, '--force', '--repo', 'a/b', '--sha', SHA1),
                                  f'fork-kit-bootstrap: --force is not an option of --kit {kit}')
@@ -671,6 +677,7 @@ class Bootstrap(fx.FakeHost):
             for args in (['--kit', 'cleaner', '--timer'], ['--no-timer', '--kit', 'cleaner'], ['--kit', 'golive'],
                          ['--kit', 'update-policy', '--timer', '--force'],
                          ['--kit', 'schedule-kick', '--timer'], ['--kit', 'update-policy', '--timer'],
+                         ['--kit', 'gardener', '--timer'],
                          ['--kit', 'agent-guards', '--settings'],
                          ['--no-settings', '--kit', 'agent-guards']):
                 with self.subTest(args=args):
@@ -782,7 +789,7 @@ MUTATIONS = {
         'bootstrap', ' [ -z "$opt" ] || die "$opt is not an option of --kit golive" ;;', ' ;;',
         'test_only_the_kit_options_are_passed_on'),
     'bootstrap: an unknown kit is refused': (
-        'bootstrap', '  *) die "--kit must be one of: agent-guards cleaner golive schedule-kick update-policy" ;;', '  *) installer=x ;;',
+        'bootstrap', '  *) die "--kit must be one of: agent-guards cleaner gardener golive schedule-kick update-policy" ;;', '  *) installer=x ;;',
         'test_the_kit_is_one_it_knows'),
     'bootstrap: --settings is kept, nothing after it passed on': (
         'bootstrap', '    --settings|--no-settings) opt="$1"; shift ;;', '    --settings|--no-settings) break ;;',

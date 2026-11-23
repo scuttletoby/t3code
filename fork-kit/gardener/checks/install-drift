@@ -1,0 +1,80 @@
+#!/usr/bin/python3 -IB
+"""install-drift: the fork kits installed on this machine against their own install records. Report only.
+
+Each kit's installer writes <etc>/<kit>/installed.tsv: one row per installed path, `path<TAB>kind<TAB>want` (a
+link and its target, or a file and its sha256; the gh-apps kit's rows have owner, group and mode in between). This
+check reads every such record it can (as the user the gardener runs as) and reports, per kit, paths that differ from
+it, the way `<kit>-install self-check` does without needing root. It also names the release each kit runs (its
+`current` link) and, with "release" set, each kit on another one.
+
+Options:
+  etc       "/etc": the folder of the kits' etc folders
+  kits      [kit etc folder name] to read (default: every folder with an installed.tsv)
+  release   a release commit (40 hex): kits on another release are reported
+"""
+import glob, hashlib, os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from gardener.contract import emit, read_context  # noqa: E402
+
+ctx = read_context()
+opt = ctx['options']
+etc = opt.get('etc') or '/etc'
+prefix = os.environ.get('GARDENER_TEST_PREFIX', '')   # tests only: every recorded path is read under this folder
+release = opt.get('release') or ''
+kits = opt.get('kits') or sorted(os.path.basename(os.path.dirname(p))
+                                 for p in glob.glob(os.path.join(prefix + etc, '*', 'installed.tsv')))
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+for kit in kits:
+    record = os.path.join(etc, kit, 'installed.tsv')
+    try:
+        with open(prefix + record, encoding='utf-8') as f:
+            rows = [ln.rstrip('\n').split('\t') for ln in f if ln.strip() and not ln.startswith('#')]
+    except OSError as e:
+        emit('install-drift.no-record', 'warn', f'kit {kit}: its install record cannot be read ({e.strerror})',
+             record, f'install the kit again, or drop {kit} from this check\'s "kits"')
+        continue
+    changed, unread, running = [], 0, None
+    for row in rows:
+        if len(row) == 3:
+            path, kind, want = row
+        elif len(row) == 6:
+            path, kind, want = row[0], row[1], row[5]
+        else:
+            changed.append(f'bad row {"/".join(row)[:80]}')
+            continue
+        real = prefix + path
+        try:
+            if kind == 'link':
+                ok = os.readlink(real) == want
+                if path.endswith('/current') and '/versions/' in want:
+                    running = os.path.basename(want)
+            elif kind == 'file':
+                ok = sha256(real) == want
+            else:
+                continue
+        except PermissionError:
+            unread += 1
+            continue
+        except OSError:
+            ok = False
+        if not ok:
+            changed.append(path)
+    if changed:
+        emit('install-drift.changed', 'error', f'kit {kit}: {len(changed)} installed path(s) differ from its install '
+             f'record: {", ".join(changed[:5])}' + (' ...' if len(changed) > 5 else ''), record,
+             f'run its installer\'s self-check as root, then install the release again with the bootstrap')
+    if unread:
+        emit('install-drift.unreadable', 'info', f'kit {kit}: {unread} path(s) could not be read as this user '
+             '(not checked)', record)
+    if release and running and running != release:
+        emit('install-drift.old-release', 'warn', f'kit {kit} runs release {running[:12]}, not {release[:12]}',
+             record, 'install the release with the bootstrap')

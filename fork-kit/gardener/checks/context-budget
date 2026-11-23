@@ -1,0 +1,89 @@
+#!/usr/bin/python3 -IB
+"""context-budget: the text every agent session loads, against its budgets (report only; it never edits).
+
+Options (paths: relative to the project root, absolute, or "~/"):
+  files           {path: byte budget} of instruction files (AGENTS.md, CLAUDE.md, ...); a missing one is a warning
+  memoryIndexes   [path of a memory index (MEMORY.md)]: its size, its long lines, entries whose file is missing,
+                  memory files of its folder that it does not list
+  indexMaxChars   6000      indexMaxLine  160
+  skillDirs       [folder]: each <folder>/*/SKILL.md against skillMaxBytes (8000)
+  warnRatio       0.85: at or over this share of a budget is a note
+"""
+import glob, os, re, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from gardener.contract import emit, read_context  # noqa: E402
+
+ctx = read_context()
+opt = ctx['options']
+root = ctx['project']['root'] or os.getcwd()
+ratio = float(opt.get('warnRatio', 0.85))
+
+
+def full(p):
+    p = os.path.expanduser(p) if p.startswith('~/') else p
+    return p if os.path.isabs(p) else os.path.join(root, p)
+
+
+def size_check(kind, path, size, budget):
+    if size > budget:
+        emit('context-budget.over', 'warn', f'{kind}: {size} bytes, over its budget of {budget}', path,
+             'move what only some tasks need into a skill or a doc, linked by path')
+    elif size >= budget * ratio:
+        emit('context-budget.near', 'info', f'{kind}: {size} bytes, {size * 100 // budget}% of its budget of '
+             f'{budget}', path)
+
+
+for path, budget in sorted((opt.get('files') or {}).items()):
+    p = full(path)
+    try:
+        size = os.path.getsize(p)
+    except OSError:
+        emit('context-budget.missing', 'warn', 'instruction file is missing', path, 'remove it from the options, '
+             'or put it back')
+        continue
+    size_check('instruction file', path, size, int(budget))
+
+max_chars, max_line = int(opt.get('indexMaxChars', 6000)), int(opt.get('indexMaxLine', 160))
+for path in opt.get('memoryIndexes') or []:
+    p = full(path)
+    try:
+        with open(p, encoding='utf-8', errors='replace') as f:
+            text = f.read()
+    except OSError:
+        emit('context-budget.missing', 'warn', 'memory index is missing', path)
+        continue
+    if len(text) > max_chars:
+        emit('context-budget.over', 'warn', f'memory index: {len(text)} characters, over {max_chars}', path,
+             'fold or drop entries; a lesson a tool now enforces is deleted')
+    elif len(text) >= max_chars * ratio:
+        emit('context-budget.near', 'info', f'memory index: {len(text)} of {max_chars} characters', path)
+    long = [i + 1 for i, line in enumerate(text.split('\n')) if len(line) > max_line]
+    if long:
+        emit('context-budget.long-line', 'warn', f'memory index lines over {max_line} characters: '
+             f'{", ".join(map(str, long[:10]))}', path)
+    folder = os.path.dirname(p)
+    linked = set(re.findall(r'\]\(([^)\s]+\.md)\)', text))
+    files = {f for f in os.listdir(folder) if f.endswith('.md') and f != os.path.basename(p)}
+    for f in sorted(x for x in linked - files if '/' not in x):
+        emit('context-budget.missing-memory', 'warn', f'index entry points to a missing file {f}', path,
+             'remove the entry or put the file back')
+    for f in sorted(files - linked):
+        emit('context-budget.orphan-memory', 'info', f'memory file {f} is not in the index',
+             os.path.join(os.path.dirname(path), f), 'add it to the index or delete it')
+
+skill_max = int(opt.get('skillMaxBytes', 8000))
+seen = set()
+for d in opt.get('skillDirs') or []:
+    for s in sorted(glob.glob(os.path.join(full(d), '*', 'SKILL.md'))):
+        real = os.path.realpath(s)
+        if real in seen:
+            continue
+        seen.add(real)
+        rel = os.path.join(d, os.path.basename(os.path.dirname(s)), 'SKILL.md')
+        try:
+            size = os.path.getsize(real)
+        except OSError:                              # a broken link, or gone since the listing
+            emit('context-budget.missing', 'warn', 'skill file cannot be read (a broken link?)', rel,
+                 'fix or remove the skill folder')
+            continue
+        size_check('skill', rel, size, skill_max)
