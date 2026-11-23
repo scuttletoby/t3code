@@ -114,6 +114,19 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''^apps/server/src/waits/Wait(?:Delivery|Service)\.test\.ts$''']
 regexes = ['''^0123456789abcdef$''', '''^1123456789abcdef$''', '''^f123456789abcdef$''']
+
+# A fake GitHub-style token in the update-policy kit's settings test (#1045, PR #1051): the test checks that an
+# alertCommand argument shaped like a token is refused. generic-api-key reads it as a key after `--token`. The first
+# commit of that pull request held it whole (later commits build it at run time); that commit stays public and
+# scanned, so it is allowed by value. Only that rule, only that file, only this exact value (one character written as \x5f so
+# this file does not match itself).
+[[allowlists]]
+description = "update-policy settings test: a fixed fake token (#1045)"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^fork-kit/update-policy/tests/tick\.test\.py$''']
+regexes = ['''^ghp\x5fabcdefgh12345678$''']
+
 # Fake values in old pull request heads (#482): branches that later marked the line with a
 # `gitleaks:allow` comment or changed the value, then were squash-merged or force-pushed. GitHub
 # still serves their old tips by id, so the daily sweep reads them. Only the named rule, only the
