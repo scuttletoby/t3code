@@ -11,6 +11,8 @@ ROOT = os.environ.get('PC_AGENTS_ROOT', '')
 if ROOT and os.geteuid() == 0:
     raise SystemExit('pc-agents: PC_AGENTS_ROOT is for the tests only, never for root; unset it')
 OWNER = os.geteuid() if ROOT else 0   # who must own every file the kit writes
+# The agent user and its home: these defaults, or the machine file's agentUser and agentHome (an existing user a
+# plain Linux box adopts, #1047); config() sets them, before anything reads them.
 HOME, USER = '/home/agent', 'agent'
 NOLOGIN = '/usr/sbin/nologin'   # the agent's login shell: no shell for `wsl -u agent` or su; T3 gets SHELL from its unit
 OPT, STATE = '/opt/pc-agents', '/etc/pc-agents'
@@ -135,6 +137,12 @@ SPEC = {
     'platform': (str, 'wsl2', lambda v: None if v in PLATFORMS else 'wsl2 or linux'),
     'sudoHelpers': (list, [], lambda v: helpers_problem(v)),
     'gpu': (bool, False, None),
+    'agentUser': (str, 'agent', lambda v: None if re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', v) and v != 'root' else
+                  'a user name (lowercase letters, digits, _ and -), not root'),
+    'agentHome': (str, '/home/agent', lambda v: None if re.fullmatch(r'/home/[a-z_][a-z0-9_.-]{0,31}', v) else
+                  '/home/NAME: one folder under /home (the unit hides every other home)'),
+    'sudoRules': (list, [], lambda v: rules_problem(v)),
+    'keepUserManager': (bool, False, None),
 }
 REPO_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.+$)[A-Za-z0-9._-]{1,100}')   # not `.` or `..`
 AUTO_UPDATE = {'enabled': (bool, machine_file.REQUIRED, None),
@@ -148,6 +156,19 @@ def helpers_problem(value):
     bad = next((h for h in value if not isinstance(h, str) or not HELPER.fullmatch(h)), None)
     return None if bad is None else (f'{bad!r}: an absolute path of plain names, then plain arguments (no wildcard, '
                                      'no ALL, no list), as the sudo rule names it')
+
+
+def rules_problem(value):
+    """Why sudoRules is not a list of at most 16 sudoers lines (one line each, not blank), or None."""
+    if len(value) > 16:
+        return 'at most 16 rules'
+    bad = next((r for r in value if not isinstance(r, str) or not r.strip() or '\n' in r or len(r) > 300), None)
+    return None if bad is None else f'{bad!r}: one sudoers line as the file has it, 1 to 300 characters'
+
+
+def sudo_line(text):
+    """A sudoers line as the sudoers wall compares it to sudoRules: comment gone, blanks one space."""
+    return ' '.join(re.sub(r'#(?!include)(?!\d).*', '', text).split())
 
 
 def auto_update_problem(value):
@@ -206,6 +227,11 @@ def config():
             f'{where}.t3ReleaseBaseUrl: is {c["t3ReleaseBaseUrl"]}, but autoUpdate follows the releases of '
             f'{c["autoUpdate"]["follow"]}: set it to {fork_downloads(c)} (an update installs from there what it finds '
             'there), or turn autoUpdate off')
+    if c['keepUserManager'] and c['platform'] != 'linux':
+        raise machine_file.MachineFileError(f'{where}.keepUserManager: only with "platform": "linux" (WSL2 masks '
+                                            'the agent\'s user manager)')
+    global USER, HOME
+    USER, HOME = c['agentUser'], c['agentHome']
     return c
 
 
@@ -254,8 +280,9 @@ def runtime(c):
 def masks(c):
     """Units the kit masks: WSL's binfmt handler, cron, at, ssh (WSL2 only: on linux they are the owner's) and the
     agent's systemd user manager (with it masked, no login of the agent, no linger and no user unit runs anything
-    outside T3's unit)."""
-    return (MASKS if c['platform'] == 'wsl2' else []) + [f'/etc/systemd/system/user@{c["agentUid"]}.service']
+    outside T3's unit), but on linux with keepUserManager (the agent's linger and rootless Docker work)."""
+    return (MASKS if c['platform'] == 'wsl2' else []) + \
+        ([] if c['keepUserManager'] else [f'/etc/systemd/system/user@{c["agentUid"]}.service'])
 
 
 def dropin_dirs(unit):
@@ -327,7 +354,10 @@ def sandbox(c):
         home = ['ProtectHome=read-only', f'ReadWritePaths={HOME}']
         hide = GPU if c['gpu'] else (HIDDEN,)
     else:
-        home = ['ProtectHome=tmpfs', f'BindPaths={HOME}', f'BindReadOnlyPaths={STATE}/resolv.conf:/etc/resolv.conf']
+        # keepUserManager: the agent's runtime folder too (its rootless Docker's socket), when there ("-")
+        run = f' -/run/user/{c["agentUid"]}' if c['keepUserManager'] else ''
+        home = ['ProtectHome=tmpfs', f'BindPaths={HOME}{run}',
+                f'BindReadOnlyPaths={STATE}/resolv.conf:/etc/resolv.conf']
         hide = ('InaccessiblePaths=-/mnt -/media -/run/media -/tmp/.X11-unix -/run/tailscale -/run/docker.sock '
                 '-/run/containerd', *(LINUX_GPU if c['gpu'] else ()))
     return [
@@ -399,6 +429,8 @@ Restart=on-failure
 RestartSec=30
 # 77: T3 cannot apply the managed policy; a restart cannot fix that
 RestartPreventExitStatus=77
+# 130: T3's own exit on SIGTERM (a stop), not a failure (#1047)
+SuccessExitStatus=130
 {walls}
 
 [Install]
@@ -613,9 +645,11 @@ def owned_alone(path):
 def sudo_problem(c):
     """Why sudo could give the agent more (a sudoers line naming it, its group or uid, or every user; Defaults for it
     or for a helper of it), or None. Harmless inside the unit (NoNewPrivileges), but a way out from anywhere else.
-    Only an allow-listed helper's rule passes (helper_rule): the owner's, kept as it is, never widened."""
+    Only an allow-listed helper's rule passes (helper_rule), or a line the machine file's sudoRules names word for
+    word (blanks aside): the owner's, kept as it is, never widened."""
     who = re.compile(rf'(^|[\s,=:!(])(%?{USER}|%?#{c["agentUid"]}|ALL)($|[\s,=:)])')
     helpers = {h.split()[0] for h in c['sudoHelpers']}
+    allowed = {sudo_line(r) for r in c['sudoRules']}
     found = []
     names = ['/etc/sudoers'] + (['/etc/sudoers.d/' + n for n in sorted(os.listdir(ROOT + '/etc/sudoers.d'))]
                                 if os.path.isdir(ROOT + '/etc/sudoers.d') else [])
@@ -627,7 +661,7 @@ def sudo_problem(c):
             continue
         for line in lines:
             line = re.sub(r'#(?!include)(?!\d).*', '', line).strip()
-            if line.startswith(('@include', '#include')):
+            if line.startswith(('@include', '#include')) or line and sudo_line(line) in allowed:
                 continue
             if line.startswith('Defaults'):   # Defaults:agent (a user list), Defaults!helper (a command list)
                 bound = re.match(r'Defaults([:!])\s*(\S+)', line)

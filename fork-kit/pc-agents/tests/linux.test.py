@@ -326,7 +326,10 @@ class OldMachineFile(Case):
 
 # T3's unit on a plain Linux box as fake_distro's LINUX_CONFIG gives it, before the `gpu` setting reached linux
 # (#1027 item 3): with no setting (or "gpu": false) it stays byte for byte this one.
-LINUX_UNIT_SHA = '6cb2a94d01fbb9b59c0b4c614c297a18591e6b236e4e8ee74a9f27e821519141'
+# #1047 changed it on purpose by the exit 130 lines alone (setup.test.py EXIT_130): without them, OLD_LINUX_UNIT_SHA.
+LINUX_UNIT_SHA = '5b3eeebb2e043f7608029aeba8181d9d4fc8e9bd4da96e70df0caba20c669366'
+OLD_LINUX_UNIT_SHA = '6cb2a94d01fbb9b59c0b4c614c297a18591e6b236e4e8ee74a9f27e821519141'
+EXIT_130 = '# 130: T3\'s own exit on SIGTERM (a stop), not a failure (#1047)\nSuccessExitStatus=130\n'
 UNIT = '/etc/systemd/system/t3code-agents.service'
 CARDS = tuple(f'/dev/nvidia{i}' for i in range(16))
 NVIDIA = CARDS + ('/dev/nvidiactl', '/dev/nvidia-modeset', '/dev/nvidia-uvm', '/dev/nvidia-uvm-tools')
@@ -352,6 +355,7 @@ class LinuxGpu(Linux):
         c = k.config()
         self.assertIs(c['gpu'], False)
         self.assertEqual(k.sha(k.render(c)[UNIT][0]), LINUX_UNIT_SHA)
+        self.assertEqual(k.sha(k.render(c)[UNIT][0].replace(EXIT_130, '', 1)), OLD_LINUX_UNIT_SHA)
         self.machine({**LINUX_CONFIG, 'gpu': False})
         self.assertEqual(k.render(k.config()), k.render(c))
         self.assertFalse([x for x in k.sandbox(c) if 'nvidia' in x or 'dxg' in x])
@@ -617,6 +621,125 @@ class Wsl2GpuSeen(Case):
         code, out = self.check()
         self.assertEqual(code, 1, out)
         self.assertIn('only some of the GPU lines', next(x for x in out.splitlines() if x.split()[1:2] == ['gpu']))
+
+
+class Adopt(Linux):
+    """An agent user the box already has (#1047): its name, home and uid from the machine file (agentUser, agentHome,
+    agentUid), extra sudo rules the owner lists word for word (sudoRules), and its user manager kept
+    (keepUserManager: linger and rootless Docker go on working). Without the keys, every file is as before."""
+    ADOPT = {**LINUX_CONFIG, 'agentUser': 'builder', 'agentHome': '/home/builder', 'agentUid': 1200,
+             'keepUserManager': True, 'sudoRules': ['builder ALL=(root) NOPASSWD: /usr/bin/systemctl restart x']}
+
+    def existing(self, groups=''):
+        """The user as the owner made it before the kit: its own group, a login shell, lingering, rootless Docker."""
+        self.write('/etc/passwd', self.read('/etc/passwd') + 'builder:x:1200:1200::/home/builder:/bin/bash\n')
+        self.write('/etc/group', self.read('/etc/group') + f'builder:x:1200:{groups}\n')
+        self.write('/home/builder/.config/systemd/user/docker.service', '[Service]\nExecStart=/usr/bin/dockerd\n')
+        self.write('/var/lib/systemd/linger/builder', '')
+        self.write('/etc/sudoers.d/60-builder', '# the owner\'s\nbuilder  ALL=(root) NOPASSWD: /usr/bin/systemctl '
+                   'restart x\n')
+        self.machine(self.ADOPT)
+
+    def test_defaults_unchanged(self):
+        """The keys at their defaults render every file byte for byte as a machine file without them (both kinds)."""
+        for section in (CONFIG, LINUX_CONFIG):
+            with self.subTest(platform=section.get('platform')):
+                self.machine(section)
+                before = k.render(k.config())
+                self.machine({**section, 'agentUser': 'agent', 'agentHome': '/home/agent', 'agentUid': 1100,
+                              'keepUserManager': False, 'sudoRules': []})
+                self.assertEqual(k.render(k.config()), before)
+                self.assertEqual((k.USER, k.HOME), ('agent', '/home/agent'))
+
+    def test_adopted(self):
+        self.existing()
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('FAIL', out)
+        unit = self.read('/etc/systemd/system/t3code-agents.service')
+        for line in ('User=builder', 'Group=builder', 'BindPaths=/home/builder -/run/user/1200',
+                     'Environment=HOME=/home/builder T3CODE_HOME=/home/builder/.t3 T3CODE_PORT=3800 T3CODE_LAN=true'):
+            self.assertIn('\n' + line + '\n', unit)
+        self.assertIn('meta skuid != 1200 accept', self.read(k.STATE + '/firewall.nft'))
+        self.assertEqual(self.read('/etc/ssh/sshd_config.d/pc-agents.conf'), k.HEAD + 'DenyUsers builder\n')
+        self.assertFalse(os.path.lexists(self.path('/etc/systemd/system/user@1200.service')))   # not masked
+        self.assertFalse(os.path.lexists(self.path('/etc/systemd/system/user@1100.service')))
+        self.assertEqual(self.log('usermod'), ['--shell /usr/sbin/nologin builder'])
+        people = [x.split(':')[0] for x in self.read('/etc/passwd').splitlines()]
+        self.assertEqual((people.count('builder'), people.count('agent')), (1, 0))   # adopted, none made
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn('builder\'s user units run in its user manager (keepUserManager)', out)
+        self.assertEqual(self.setup_run()[0], 0)   # again: nothing to change
+        code, out = self.call(cli.main, ['as-agent', '--', 'docker', 'ps'])
+        self.assertEqual(code, 0, out)
+        argv = self.log('systemd-run')
+        for arg in ('--uid=builder', '--working-directory=/home/builder', '--property=BindPaths=/home/builder '
+                    '-/run/user/1200'):
+            self.assertIn(arg, argv)
+
+    def test_sudo_rules(self):
+        """A listed rule passes as the owner wrote it (blanks and a comment aside); any other line for the agent
+        fails, a Defaults line too unless listed."""
+        self.existing()
+        self.assertEqual(self.setup_run()[0], 0)
+        for text, holds in (('builder ALL=(root) NOPASSWD: /usr/bin/systemctl restart x  # ok', True),
+                            ('builder ALL=(root) NOPASSWD: /usr/bin/systemctl restart y', False),
+                            ('builder ALL=(ALL) NOPASSWD: ALL', False),
+                            ('Defaults:builder !env_reset', False)):
+            with self.subTest(text=text):
+                self.write('/etc/sudoers.d/60-builder', text + '\n')
+                code, out = self.check()
+                self.assertEqual(code, 0 if holds else 1, out)
+                self.assertEqual('FAIL  sudoers' in out, not holds, out)
+        self.machine({**self.ADOPT, 'sudoRules': ['Defaults:builder !env_reset']})
+        self.assertEqual(self.check()[0], 0)
+
+    def test_kept_manager_still_walls_the_rest(self):
+        """keepUserManager allows the agent's own linger and user units, no other user's linger, and no extra group."""
+        self.existing()
+        self.assertEqual(self.setup_run()[0], 0)
+        self.write('/var/lib/systemd/linger/owner', '')
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('lingering: owner', out)
+        os.unlink(self.path('/var/lib/systemd/linger/owner'))
+        self.write('/etc/group', self.read('/etc/group').replace('sudo:x:27:owner', 'sudo:x:27:owner,builder'))
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('other groups (sudo)', out)
+
+    def test_manager_masked_without_the_key(self):
+        """Off (the default), the adopted user's manager is masked and its linger and user units fail, as before;
+        turned on again, setup removes the mask it made."""
+        self.existing()
+        self.machine({**self.ADOPT, 'keepUserManager': False})
+        code, out = self.setup_run()
+        self.assertEqual(code, 3, out)   # a wall does not hold: T3 is not enabled
+        self.assertIn('FAIL  linger', out)
+        self.assertIn('FAIL  user-units', out)
+        self.assertEqual(os.readlink(self.path('/etc/systemd/system/user@1200.service')), '/dev/null')
+        self.machine(self.ADOPT)
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.lexists(self.path('/etc/systemd/system/user@1200.service')))
+
+    def test_refused(self):
+        for change, why in (({'agentUser': 'root'}, 'agentUser: a user name'),
+                            ({'agentUser': 'Agent'}, 'agentUser: a user name'),
+                            ({'agentHome': '/srv/builder'}, 'agentHome: /home/NAME'),
+                            ({'agentHome': '/home/a/b'}, 'agentHome: /home/NAME'),
+                            ({'agentHome': '/home/..'}, 'agentHome: /home/NAME'),
+                            ({'sudoRules': ['a\nb']}, 'sudoRules'),
+                            ({'sudoRules': ['  ']}, 'sudoRules'),
+                            ({'sudoRules': ['x'] * 17}, 'at most 16'),
+                            ({'platform': 'wsl2'}, 'keepUserManager: only with "platform": "linux"')):
+            with self.subTest(change=change):
+                self.machine({**self.ADOPT, **change})
+                code, out = self.setup_run()
+                self.assertEqual(code, 2, out)
+                self.assertIn(why, out)
+        self.assertFalse(os.path.lexists(self.path('/etc/t3code/policy.json')))
 
 
 class BadConfig(Case):

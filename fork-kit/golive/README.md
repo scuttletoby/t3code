@@ -866,6 +866,22 @@ every step it started is done raises `journal.Refused`: the run ends "refused" a
 takes the lock with `wait=True`: it blocks until the run it watches ends. A torn last line is reported and ignored; damage anywhere else refuses, naming the
 file and how to settle it; a line from a newer kit refuses with "update the kit".
 
+golive runs as the T3 user. Run as root where `stateDir` (or, while it is missing, the nearest folder above it) is
+another user's, every command that would make the lock refuses before it makes anything, naming that user (#1047):
+a lock or journal root made there would be root's, and the T3 user could not take the lock again. It refuses
+rather than make the lock as the folder's owner, since a run as root would still leave its other files (the
+journal, `guard.log`, kept runtimes, files in the home) root's. `status`, which writes nothing, still answers.
+
+**Ready, not only listening.** Every wait for T3 after a start (`switch`, `back`, `rehearse`) waits for the
+server's own runtime record (`userdata/server-runtime.json` naming the new pid), which T3 writes once it has
+started (after its HTTP listener and its start-up work), never for the port alone: a request sent between
+"Listening" and "T3 Code server is ready." can wait minutes. Only then is HTTP asked.
+
+**Moving T3 to another machine.** On btrfs, turn compression off for the userdata folder before the database lands
+there (`chattr +m <home>/userdata`, or `btrfs property set <home>/userdata compression none`, while it is empty:
+files made in it after that are not compressed, files already there stay as they are): T3's SQLite database on a
+compressed folder read at about 41 MB/s in a rehearsal.
+
 ## Tests
 
 ```

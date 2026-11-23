@@ -71,6 +71,8 @@ export interface CapacityRule {
   readonly floors: CapacityPerGroup;
   readonly ceilings: CapacityPerGroup;
   readonly pressure: PressureRule;
+  /** The CPU brake for one more job; read by the host kit (fork-kit/heavy) only, not by this evaluator. */
+  readonly cpu?: { readonly pressureSomeAvg10Pct: number; readonly loadPerCorePercent: number };
 }
 
 /** The rule from parsed JSON, or the reasons it cannot be used (shape, then cross-references). */

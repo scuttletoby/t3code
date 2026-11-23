@@ -402,7 +402,7 @@ class Update(Updating):
         self.assertEqual(self.installs(), installs)   # not downloaded twice
 
     def test_a_version_that_does_not_come_up_is_rolled_back_and_not_tried_again(self):
-        for name, value in (('t3-crash-version', '1.2.4'), ('http-mute', '1.2.4')):
+        for name, value in (('t3-crash-version', '1.2.4'), ('http-mute', '1.2.4'), ('t3-not-ready', '1.2.4')):
             with self.subTest(name):
                 self.write('/log/' + name, value)
                 self.releases(release('1.2.4'))
@@ -413,8 +413,11 @@ class Update(Updating):
                 self.assertEqual(state['failed'], '1.2.4')
                 self.assertNotIn('phase', state)
                 self.assertRegex(state['result'], r'^T3 1\.2\.4 did not come up \((setup failed: T3 did not start'
-                                 r'|no answer from T3).*\); not trying it again\. Back on 1\.2\.3, running$')
+                                 r'|no answer from T3|T3 did not say "T3 Code server is ready\.").*\); not trying '
+                                 r'it again\. Back on 1\.2\.3, running$')
                 self.assertIn(state['result'], state['alert'])
+                if name == 't3-not-ready':   # never asked before it said so
+                    self.assertIn('T3 did not say', state['result'])
                 self.assertFalse(os.path.exists(self.path(VERSIONS + '/1.2.4')))   # never reused
                 self.assertEqual(self.check()[0], 0)
                 bak = json.loads(self.read('/etc/fork-kit/machine.json.bak'))   # from before the update, kept

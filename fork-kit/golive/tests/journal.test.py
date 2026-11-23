@@ -110,6 +110,41 @@ class Lock(Base):
         self.assertEqual(os.stat(os.path.join(self.state, 'journal.jsonl')).st_mode & 0o777, 0o600)
 
 
+class AsRoot(Base):
+    """Root never makes the lock (or the journal) in a state folder that is another user's (fork #1047): refused,
+    nothing made, so the T3 user can still take the lock afterwards."""
+    def setUp(self):
+        super().setUp()
+        real = journal._euid
+        journal._euid = lambda: 0
+        self.addCleanup(setattr, journal, '_euid', real)
+
+    def test_refused_in_another_users_folder(self):
+        for state in (self.state, os.path.join(self.state, 'not', 'yet')):   # there, or the folder above it
+            with self.subTest(state=state):
+                with self.assertRaises(journal.WrongUser) as e:
+                    with journal.lock(state, 'copy', exclusive=True):
+                        self.fail('locked as root')
+                self.assertIn('not as root', str(e.exception))
+                self.assertIsInstance(e.exception, journal.Busy)   # every command refuses it as a held lock
+                self.assertFalse(os.path.exists(os.path.join(state, 'lock')))
+                self.assertFalse(os.path.exists(os.path.join(self.state, 'not')))
+        with self.assertRaises(journal.WrongUser):
+            with journal.run(self.state, 'copy'):
+                self.fail('ran as root')
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'journal.jsonl')))
+
+    def test_status_writes_nothing_and_goes_on(self):
+        with journal.lock(self.state, 'status', exclusive=False, create=False):
+            pass
+
+    def test_the_user_itself_goes_on(self):
+        journal._euid = os.geteuid
+        with journal.lock(self.state, 'copy', exclusive=True):
+            pass
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'lock')))
+
+
 class Journal(Base):
     def test_a_finished_run_reads_back_with_its_steps_and_facts(self):
         with journal.run(self.state, 'copy') as r:
