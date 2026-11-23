@@ -22,6 +22,8 @@ Plain Python 3 standard library.
 """
 import datetime, hashlib, os, re, stat, subprocess, time
 
+from .config import _NAME_RE as NAME_RE   # one rule for a project's folder name
+
 TABLE_FILE = 'STATE.md'
 CALL_TO_LOOK = 'check the state table before diagnosing or redoing something: `facts <words>` prints the matching rows'
 MAX_READ = 4 * 1024 * 1024          # a table file is read up to this, the rest is cut (and named)
@@ -247,10 +249,13 @@ def projects_for(cfg, cwd):
 
 def project_name(p):
     """The project's folder under a record repo's projects folder: its "name", else the last part of its remote
-    or folder."""
+    (without .git) or folder; None when that is not a plain folder name ("..", ".", empty)."""
     if p.get('name'):
         return p['name']
-    return os.path.basename(_expand(p['match']).rstrip('/')) or None
+    name = os.path.basename(_expand(p['match']).rstrip('/'))
+    if not p['match'].startswith(('/', '~/')) and name.lower().endswith('.git'):
+        name = name[:-4]
+    return name if NAME_RE.match(name) else None
 
 
 def _same(entry):
@@ -436,12 +441,21 @@ def records(cfg, projects, every=False):
 
 def _record_files(rec, deadline):
     """(path, relative path) of every text file to search in one record repo: its folders, .git and links left
-    out, in a sorted order. Stops at `deadline` (time.monotonic())."""
+    out, in a sorted order. A folder whose real path is outside the repo (a link on the way) is left out. Stops at
+    `deadline` (time.monotonic()), checked for each folder and each file."""
+    try:
+        real_root = os.path.realpath(rec.root)
+    except (OSError, ValueError):
+        return
     for folder in rec.folders:
         top = os.path.join(rec.root, folder)
         if os.path.islink(top) or not os.path.isdir(top):
             continue
+        if not os.path.realpath(top).startswith(real_root.rstrip('/') + '/'):
+            continue
         for d, dirs, files in os.walk(top):
+            if time.monotonic() > deadline:
+                return
             dirs[:] = sorted(x for x in dirs if x != '.git' and not os.path.islink(os.path.join(d, x)))
             for name in sorted(files):
                 if time.monotonic() > deadline:
@@ -451,12 +465,14 @@ def _record_files(rec, deadline):
                     yield path, os.path.relpath(path, rec.root)
 
 
-def search_records(recs, words, skip=(), limit=10, seconds=RECORD_SECONDS):
-    """(lines, notes): the lines of the record repos' text files that hold every word (any case), as
+def search_records(recs, words, skip=None, limit=10, seconds=RECORD_SECONDS):
+    """(lines, notes, copies): the lines of the record repos' text files that hold every word (any case), as
     "path:line: text" under a "Records in <repo>:" line, at most `limit` hits and then "+N more". A file over
-    RECORD_MAX, not a regular file, or the same bytes as a table already shown (sha256 in `skip`) is skipped."""
-    ws = _words(words)
-    lines, out_notes, shown, total = [], [], 0, 0
+    RECORD_MAX, not a regular file, holding a NUL byte (not text), or with the same bytes as a table already read
+    (`skip`: {sha256: table file}) is skipped; copies: [(record file, table file)] for each such copy that holds the
+    words."""
+    ws, skip = _words(words), skip or {}
+    lines, out_notes, copies, shown, total = [], [], [], 0, 0
     deadline = time.monotonic() + seconds
     for rec in recs:
         if rec.note:
@@ -465,13 +481,15 @@ def search_records(recs, words, skip=(), limit=10, seconds=RECORD_SECONDS):
         head = False
         for path, rel in _record_files(rec, deadline):
             data, cut, problem = read_regular(path, RECORD_MAX)
-            if problem or cut or data is None:
+            if problem or cut or data is None or b'\0' in data:
                 continue
-            if hashlib.sha256(data).hexdigest() in skip:
-                continue
+            table = skip.get(hashlib.sha256(data).hexdigest())
             for n, line in enumerate(data.decode('utf-8', errors='replace').split('\n'), 1):
                 low = line.lower()
                 if ws and all(w in low for w in ws):
+                    if table:
+                        copies.append((os.path.join(rec.root, rel), table))
+                        break
                     total += 1
                     if shown < limit:
                         if not head:
@@ -484,7 +502,7 @@ def search_records(recs, words, skip=(), limit=10, seconds=RECORD_SECONDS):
             break
     if total > shown:
         lines.append(f'+{total - shown} more (facts --records {" ".join(words)})')
-    return lines, out_notes
+    return lines, out_notes, copies
 
 
 def record_line(recs):
