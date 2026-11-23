@@ -1,4 +1,4 @@
-# update-policy: restart only when idle, at the quiet hour, by role; and a daily baseline check
+# update-policy: restart only when idle, at the quiet hour, by role; a daily baseline and exposure check
 
 Linux machines install security updates by themselves (`unattended-upgrades`). Some updates (a kernel, libc) need
 a restart. `unattended-upgrades`' own `Automatic-Reboot` restarts at a fixed time whatever runs then: long agent jobs
@@ -9,7 +9,9 @@ and containers that do not come back by themselves are cut off. This kit takes r
   command and try again the next night;
 - **live** machines never restart by themselves: a needed restart raises an alert (once per quiet window) and is
   done by hand in a planned window;
-- a **daily baseline check** compares the machine with the policy and prints (and alerts) only what drifted.
+- a **daily baseline check** compares the machine with the policy and prints (and alerts) only what drifted;
+- a **daily exposure check** (off unless turned on) compares the installed packages with the distribution's
+  security data, CISA's Known Exploited Vulnerabilities list and EPSS, and reports only what needs action.
 
 Debian or Ubuntu with systemd and cgroup v2 (`/run/reboot-required`, `apt-config`, logind's inhibitor locks);
 without cgroup v2 the machine always counts as busy. Plain Python 3 standard library (3.9 or
@@ -24,6 +26,7 @@ later, for `zoneinfo`); nothing to install but the kit.
 | `update-policy baseline` | the daily check: prints only drift and alerts with it; exit 0 none, 1 drift             |
 | `update-policy booted`   | after a boot (`update-policy-boot.service`): says once that the kit's restart came back |
 | `update-policy status`   | the role, the window, a pending restart and what the last ticks saw                     |
+| `update-policy exposure` | the daily exposure check (below): prints only what needs action; exit 0 none, 1 any     |
 
 Run them as root: they read every user's cgroups, containers and sockets. Everything they say goes to stdout,
 which is the journal under the units (`journalctl -u update-policy`).
@@ -169,6 +172,7 @@ restart is pending; `baseline` reports it).
 | `baseline.diskPaths`      | `["/"]`         | the disks it looks at                                                                 |
 | `baseline.pendingDays`    | 3               | a restart pending longer than this is drift                                           |
 | `baseline.sshUsers`       | `["root"]`      | users whose ssh login from outside is checked with `sshd -T -C` (Match blocks)        |
+| `exposure.*`              |                 | the exposure check: see its section                                                   |
 
 **The alert command** gets the text on stdin and `UPDATE_POLICY_EVENT` (`restart-pending`,
 `live-restart-pending`, `restart-failed`, `apt-restarts`, `back-up`, `drift`) and `UPDATE_POLICY_HOST` in a plain
@@ -210,6 +214,67 @@ nothing else; exit 1 when there is any, and the alert command gets the lines (`d
 A fact it cannot read is drift ("cannot read ..."), never a pass; a check that breaks is one such line, and the
 others still run.
 
+## The daily exposure check
+
+`update-policy exposure` (`update-policy-exposure.timer`, daily around 07:00; on with `exposure.enabled`) answers
+"is anything installed here exploited in the wild, or waiting for a security fix?" It prints one line per thing that
+needs action and nothing else; exit 1 when there is any line, and the alert command gets the lines (`exposure`).
+
+| Line                                                               | When                                                                                                                           | Action                |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ | --------------------- |
+| `KEV CVE-…: PKG VERSION is exploited in the wild; update to FIXED` | a CVE on CISA's KEV list affects an installed version and a fixed version is out                                               | update                |
+| `KEV CVE-…: SOURCE … has no fix yet: mitigate or watch`            | the same, with no fixed version                                                                                                | mitigate, watch       |
+| `security fix waiting N day(s): PKG VERSION -> FIXED: CVE-…`       | a security fix is out for an installed package and its EPSS is at least `epssMin`, or it has waited more than `fixWaitingDays` | update                |
+| `cannot check: …`                                                  | a feed that could not be downloaded or read, a distribution without a data source, packages that cannot be listed, EPSS down   | look; never all clear |
+| `drift: …`                                                         | a cached feed older than `staleDays`; an ignore entry past its date                                                            | look                  |
+
+Lines are ranked: KEV first, then by EPSS. A fix that needs Ubuntu Pro (an `esm` version) says so. A CVE without a
+fix that is not on KEV is not shown (Ubuntu lists thousands as "might be affected"); neither is a waiting fix below
+the thresholds (unattended-upgrades installs it the next night).
+
+**Data**, each downloaded at most once a day into `/var/cache/update-policy-exposure/`, with a size cap
+(`maxFeedMb`), a timeout (`timeoutSeconds`), the server's ETag / Last-Modified (an unchanged feed is not downloaded
+again) and a sha256 of the stored copy (a copy that does not match is no copy):
+
+- the distribution's OVAL file: Ubuntu's `com.ubuntu.<codename>.cve.oval.xml.bz2` (security-metadata.canonical.com)
+  or Debian's `oval-definitions-<codename>.xml.bz2` (debian.org), by `/etc/os-release` (`ovalUrl` to use another
+  copy). It says, per CVE, which binary (Ubuntu) or source (Debian) packages it affects and the fixed version.
+  Installed versions come from `dpkg-query` and are compared in dpkg's own order. The kernel's CVEs are judged by
+  Ubuntu with tests of the running kernel, which this check does not read: a new kernel is the restart policy's
+  business;
+- CISA's KEV JSON (`kevUrl` to use another copy);
+- EPSS from FIRST.org's API, asked only for the CVEs found here (at most 100 per request), kept a day. These CVE ids
+  are all that leaves the machine.
+
+Other package systems (rpm, apk) fit in as one more entry of `ECOSYSTEMS` in `lib/updatepolicy/exposure.py`: their
+installed list, version order and data source.
+
+**It runs as no one in particular:** the unit uses systemd's `DynamicUser=` (a user made for the run, the cache
+folder its only writable place); only the alert step after it (`update-policy exposure-alert`, `ExecStopPost=+`)
+runs as root, so the alert command can read a root-only file. It needs no secret.
+
+| Key                       | Default | What                                                                                            |
+| ------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `exposure.enabled`        | `false` | run the check (the timer runs either way; off, it does nothing)                                 |
+| `exposure.epssMin`        | 0.1     | a waiting fix with a CVE at this EPSS or above is shown at once                                 |
+| `exposure.fixWaitingDays` | 3       | a waiting fix is shown once it has waited longer than this (as this check first saw it)         |
+| `exposure.staleDays`      | 3       | a cached feed older than this is drift                                                          |
+| `exposure.maxFeedMb`      | 64      | the size cap of one download                                                                    |
+| `exposure.timeoutSeconds` | 60      | the timeout of one request                                                                      |
+| `exposure.ovalUrl`        | `""`    | another `https://` copy of the distribution's OVAL file                                         |
+| `exposure.kevUrl`         | `""`    | another `https://` copy of the KEV JSON                                                         |
+| `exposure.ignore`         | `[]`    | `{"cve": "CVE-…", "reason": "…", "until": "YYYY-MM-DD"}`: not shown until that date, then drift |
+
+**Runs again, stops half-way, old or empty cache, a feed format change:**
+
+- runs again the same day: no download (once a day), the same lines; the next day only a changed feed is downloaded;
+- stops half-way: a download goes to a temporary file, is read by its own reader, and only then replaces the copy;
+  the meta and the state are written whole through a rename. A stop leaves the old copy or none;
+- old or empty cache: no copy is `cannot check` (never all clear); a broken meta, state or EPSS file starts again
+  from empty (a waiting fix is then dated from today); a copy older than `staleDays` is still read and is drift;
+- a feed format change: a download the reader does not understand (no `vulnerabilities` list, no OVAL definitions
+  or dpkg tests, not XML) never replaces the good copy and is a `cannot check` line naming the feed.
+
 ## Install
 
 As root, from a commit on the fork's protected `ci-release` branch (the shared
@@ -225,8 +290,9 @@ update-policy status && update-policy idle; update-policy baseline
 `--timer` takes restarts over in an order that never leaves the machine with neither policy:
 
 1. it writes the system units `update-policy.service` and `.timer` (every 5 minutes),
-   `update-policy-baseline.service` and `.timer` (daily) and `update-policy-boot.service` (once after each boot)
-   to `/etc/systemd/system/`, runs `systemctl daemon-reload`, enables and starts both timers and enables the boot
+   `update-policy-baseline.service` and `.timer` (daily), `update-policy-exposure.service` and `.timer` (daily) and
+   `update-policy-boot.service` (once after each boot)
+   to `/etc/systemd/system/`, runs `systemctl daemon-reload`, enables and starts the three timers and enables the boot
    unit. If that fails, it stops there: unattended-upgrades' own restarts still apply;
 2. only then it writes `/etc/apt/apt.conf.d/zz-update-policy`: `Unattended-Upgrade::Automatic-Reboot "false";`.
    Its name sorts after the numbered files, so it wins over an `Automatic-Reboot "true"` there
@@ -249,7 +315,7 @@ whether `--timer` is on) and `installed.tsv`; the tick's state in `/var/lib/upda
 - **Back to unattended-upgrades' own restarts:** the bootstrap with `--no-timer` (or `update-policy-install install
   --source /usr/local/libexec/update-policy/current --sha CURRENT_SHA --no-timer`). It removes the apt file first,
   so unattended-upgrades' own `Automatic-Reboot` applies again, then stops, disables and removes the units.
-- **Remove:** `update-policy-install uninstall`: the same, then the code and the state.
+- **Remove:** `update-policy-install uninstall`: the same, then the code, the state and the exposure cache.
 
 ## Runs again, stops half-way, old or empty state
 
@@ -279,7 +345,8 @@ whether `--timer` is on) and `installed.tsv`; the tick's state in `/var/lib/upda
 ## Tests
 
 `tests/*.test.py`, run with `python3 -I -B fork-kit/update-policy/tests/NAME.test.py` from the repository root:
-fake cgroups, `/proc`, sockets and programs in a temporary folder, a fixed clock. No root, no systemd, no network.
-Each file ends with a red check that breaks each rule in a copy of the code (or the installer) and shows its test
-then fails. What every kit's installer does is tested in
+fake cgroups, `/proc`, sockets and programs in a temporary folder, a fixed clock; `exposure.test.py` reads small
+recorded cuts of Ubuntu's and Debian's OVAL files and of the KEV list (`tests/fixtures/`) through a fake web. No root,
+no systemd, no network. Each file ends with a red check that breaks each rule in a copy of the code (or the
+installer) and shows its test then fails. What every kit's installer does is tested in
 [kit_install.test.py](../common/tests/kit_install.test.py); `install.test.py` covers this kit's own files.

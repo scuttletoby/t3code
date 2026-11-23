@@ -163,6 +163,7 @@ fork-kit/schedule-kick/tests/install.test.py unittest
 fork-kit/schedule-kick/tests/kick.test.py unittest
 fork-kit/schedule-kick/tests/late.test.py unittest
 fork-kit/update-policy/tests/baseline.test.py unittest
+fork-kit/update-policy/tests/exposure.test.py unittest
 fork-kit/update-policy/tests/idle.test.py unittest
 fork-kit/update-policy/tests/install.test.py unittest
 fork-kit/update-policy/tests/tick.test.py unittest
