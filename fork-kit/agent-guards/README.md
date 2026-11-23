@@ -104,7 +104,7 @@ These are the values the hooks had before. The file is `/etc/fork-kit/machine.js
 ([common/machine_file.py](../common/machine_file.py): owned by root, not writable by others, so an agent cannot
 change a guard's facts). Each hook reads only its own part (`actionsDisable`, `capacityPipe`, ...). A key in it that
 is broken (a wrong type, a bad path) keeps its default; an unknown key is ignored; a bad `refuseScripts` row is
-dropped and the good rows kept (the same for a bad `facts.projects` row). The hook says so to the agent (a `systemMessage`, and context for PreToolUse) and on
+dropped and the good rows kept (the same for a bad `facts.projects` or `facts.records` row). The hook says so to the agent (a `systemMessage`, and context for PreToolUse) and on
 stderr, on every call it handles, until the file is fixed: loud on purpose. A Bash call can carry the note more than
 once, once from each hook that has a problem in its part (`actionsDisable` and `capacityPipe` before it,
 `memoryIndex` after it). A broken or unknown part of another hook changes nothing for it. `agent-guards self-check`
@@ -128,10 +128,12 @@ checks the whole section strictly and names every problem.
 | `agentSlots.processName`       | `"claude"`                             | The process name that is counted                                                                                                                      |
 | `agentSlots.note`              | `""`                                   | Extra text for the context line (a build-agent limit, say)                                                                                            |
 | `facts.dirs`                   | `[]`                                   | State tables for every session: a table file, or a folder whose `STATE.md` is the table ([FACTS.md](FACTS.md))                                        |
-| `facts.projects`               | `[]`                                   | `{"match", "dirs", "text"}`: more tables for one project (`match`: its remote as `host/owner/repo`, or a folder)                                      |
+| `facts.projects`               | `[]`                                   | `{"match", "dirs", "text", "name"}`: more tables for one project (`match`: its remote as `host/owner/repo`, or a folder; `name`: its record folder)   |
 | `facts.staleDays`              | `30`                                   | `facts --check` reports a row whose `Updated` is older                                                                                                |
 | `facts.maxRows`                | `60`                                   | `facts --check` reports a table with more rows                                                                                                        |
 | `facts.indexLines`             | `40`                                   | Things the session-start context shows at most                                                                                                        |
+| `facts.indexChars`             | `4000`                                 | Characters of the whole session-start context at most                                                                                                 |
+| `facts.records`                | `[]`                                   | `{"path", "projectsDir", "shared"}`: record repos that `facts <words>` searches after the tables ([FACTS.md](FACTS.md))                               |
 
 Paths are absolute or start with `~/` (the home of the user the hook runs as). An example is in
 [machine.example.json](../common/machine.example.json).
@@ -153,7 +155,8 @@ sh fork-kit-bootstrap.sh --kit agent-guards --repo OWNER/FORK --sha RELEASE_SHA 
 The installer ([sbin/agent-guards-install](sbin/agent-guards-install), on the shared
 [kit_install.py](../common/kit_install.py)) copies the release to `/usr/local/libexec/agent-guards/versions/<sha>/`,
 self-tests the copy, and links `/usr/local/bin/<hook>`, `/usr/local/bin/agent-guards` and `/usr/local/bin/facts` to it. It is safe to run
-again and to stop at any step.
+again and to stop at any step. `facts` is a common name: when `/usr/local/bin/facts` is something other than the kit's
+link, the installer leaves it alone and says so (a warning; the install goes on, and uninstall does not remove it).
 
 `--settings` also writes the hooks' entries as a Claude Code **managed settings drop-in**,
 `/etc/claude-code/managed-settings.d/agent-guards.json`. Every Claude Code session of every user on the machine

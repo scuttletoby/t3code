@@ -5,7 +5,9 @@ section; the table format and the `facts` command: FACTS.md there).
 
 SessionStart (startup, resume, clear and after compaction): adds context: the Thing column of every state table
 configured for this session (the machine's, and the project's the session's folder belongs to), at most indexLines
-things, and "check the state table before diagnosing or redoing something".
+things, "check the state table before diagnosing or redoing something", the project's text, and one line naming the
+record repo when one is configured and there ("Records: <path> (facts <words> searches it)"; never its content).
+All of it in at most indexChars characters ("+N more: run facts --index" when cut).
 PreCompact: prints the compaction instructions' part: keep the things' names, not their rows.
 Every other event, or no table with a row: nothing. Read only: it writes nothing, so two at once need no lock.
 
@@ -14,8 +16,11 @@ General (any project, any Claude config dir). Project facts come from the machin
   projects       [{"match": "host/owner/repo" or a folder, "dirs": [...], "text": "..."}]: more tables and text for
                  the sessions of one project, matched by the checkout's origin remote or the folder, never a glob
   indexLines     things shown at most (default 40)
-Never fails a call because of its own error. A broken machine file section: the defaults (so it does nothing) and
-one line on stderr. Tests: fork-kit/agent-guards/tests/facts.test.py
+  indexChars     characters of the whole answer at most (default 4000)
+  records        [{"path": ..., "projectsDir": "projects", "shared": [...]}]: record repos (only named here)
+Never fails a call because of its own error: every error is caught, git is asked once with a 2 s timeout, and
+the record repo is only checked to be there (no walk). A broken machine file section: the defaults (so it does
+nothing) and one line on stderr. Tests: fork-kit/agent-guards/tests/facts.test.py
 """
 import json, os, sys
 
@@ -29,7 +34,8 @@ def _settings():
         from agent_guards import config
         return config.load('facts')
     except BaseException as e:   # noqa: BLE001
-        return ({'dirs': [], 'staleDays': 30, 'maxRows': 60, 'indexLines': 40, 'projects': []},
+        return ({'dirs': [], 'staleDays': 30, 'maxRows': 60, 'indexLines': 40, 'indexChars': 4000, 'projects': [],
+                 'records': []},
                 f'cannot load the kit\'s config code ({type(e).__name__}: {e})')
 
 
@@ -41,12 +47,13 @@ def decide(data, c):
         return None, None
     from agent_guards import facts
     cwd = data.get('cwd') if isinstance(data.get('cwd'), str) else ''
-    found = facts.places(c, cwd)
+    projects = facts.projects_for(c, cwd)       # git at most once
+    found = facts.places(c, cwd, projects=projects)
     if event == 'SessionStart':
-        text = facts.session_text(found, c, cwd, c['indexLines'])
+        text = facts.session_text(found, projects, c['indexLines'], c['indexChars'], facts.records(c, projects))
         return ({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': text}} if text
                 else None), None
-    return None, facts.compact_text(found, c, cwd) or None
+    return None, facts.compact_text(found, projects, c['indexChars']) or None
 
 
 def _notice(problem, event, out):

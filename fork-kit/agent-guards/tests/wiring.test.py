@@ -189,6 +189,22 @@ class Check(unittest.TestCase):
         # written in the caller's HOME
         self.assertEqual(os.listdir(self.home), [])
 
+    def test_facts_hook_with_a_home_folder_table_wants_and_gets_context(self):
+        # review round 1: the wanted answer and the hook read "~/" under the same HOME (a false FAIL before)
+        os.makedirs(os.path.join(self.home, 'facts'))
+        with open(os.path.join(self.home, 'facts', 'STATE.md'), 'w') as f:
+            f.write('| Thing | State now | Updated |\n|---|---|---|\n| Example thing | on | 11-23 |\n')
+        machine = fx.machine_file(self.tmp, {'facts': {'dirs': ['~/facts']}})
+        fx.use_machine(machine)
+        with open(os.path.join(self.bin, 'facts-hook'), 'w') as f:
+            f.write(STAND_IN.format(lib=fx.LIB, machine=machine, uid=os.geteuid(),
+                                    hook=os.path.join(fx.BIN, 'facts-hook')))
+        code, lines = self.run_check(self.settings)
+        self.assertEqual(code, 0, '\n'.join(lines))
+        self.assertEqual([ln.split(':')[0] for ln in lines if 'facts-hook' in ln],
+                         ['PASS facts-hook (SessionStart) a new session'])
+        self.assertIn('context', [ln for ln in lines if 'facts-hook' in ln][0])
+
     def test_a_hook_not_wired_is_missing(self):
         s = json.loads(json.dumps(self.settings))
         s['hooks']['Stop'] = [{'hooks': [h for h in s['hooks']['Stop'][0]['hooks'] if 'bg-guard' not in h['command']]}]

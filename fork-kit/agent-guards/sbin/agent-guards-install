@@ -51,6 +51,7 @@ class AgentGuardsInstaller(kit_install.Installer):
     LIBEXEC = '/usr/local/libexec/agent-guards'
     LINKS = dict({f'{wiring.BIN}/{h}': f'bin/{h}' for h in HOOKS + COMMANDS},
                  **{'/usr/local/sbin/agent-guards-install': 'sbin/agent-guards-install'})
+    OPTIONAL_LINKS = (f'{wiring.BIN}/facts',)   # a common name: another program called facts is left alone
     SOURCE_FILES = tuple(f'bin/{h}' for h in HOOKS + COMMANDS) + (
         'sbin/agent-guards-install', 'README.md', 'FACTS.md', 'common/machine_file.py', 'common/kit_install.py')
     EXECUTABLE = frozenset([f'bin/{h}' for h in HOOKS + COMMANDS] + ['sbin/agent-guards-install'])
