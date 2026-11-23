@@ -626,7 +626,8 @@ function lensPrompt(
   const batch = reads.length > 1;
   const lines = [
     `You are the \`${lens}\` review lens for ${batch ? "these pull requests" : "pull request"} of ${repo}. ` +
-      "Read only: change no file, commit, push or comment by hand.",
+      "Read only: change no file, and never commit or push. Your report comment (below) is the only thing " +
+      "you post; never edit or delete a comment.",
     "",
     ...reads.map((r) => {
       const said = `- #${r.number} at head ${r.head}: review round ${r.round}.`;
@@ -649,9 +650,11 @@ function lensPrompt(
     "## Your report",
     "",
     batch
-      ? "Post one report per pull request with `lens_report`, each for that pull request's head above. " +
-        "Never one report for several."
-      : "Post your report with `lens_report`, for the head above.",
+      ? "Post one report per pull request, each a new comment on that pull request for its head above " +
+        `(\`gh pr comment <number> --repo ${repo} --body-file <file>\`). Never one report for several.`
+      : `Post your report as one new comment on the pull request, for the head above ` +
+        `(\`gh pr comment ${reads[0]!.number} --repo ${repo} --body-file <file>\`).`,
+    `Its first line is exactly \`lens: ${lens} · reviewer: <your model> · read at: <the full head sha>\`.`,
     "Write one line per finding, starting `blocker:`, `major:` or `minor:`; write `blocker: none` and " +
       "`major: none` when there is none.",
     `Keep each report under ${rules.reportMaxChars} characters.`,

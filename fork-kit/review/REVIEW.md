@@ -72,11 +72,11 @@ the file under another name gives it with `--settings <file>` to every `plan` an
 finds no queue config names any `.github/*review-kit*.json` it sees as the likely missing `--settings`.
 
 **This file or T3's review rules setting:** T3 has a per-machine setting for the same runners (`server.reviewRules`
-and `projectOverride.reviewRules`, docs/fork/README.md). Nothing in T3 reads it yet, so today this file decides. Once
-T3 starts lenses itself, each decides what it starts: T3's setting the lenses T3 starts on that machine (the
-machine's half: which provider and model it has), this file every lens an agent starts by hand from the skill and
-what `plan` prints. Keep the two the same; the gate does not read either, so a difference changes cost and recall,
-never what passes.
+and `projectOverride.reviewRules`, docs/fork/README.md). While it is on, T3's `lens_start` tool reads it, and each
+decides what it starts: T3's setting the runner of every lens `lens_start` starts on that machine (at once, or with
+`afterCi` once the head's CI passes; it starts lenses only for a `review` block in `enforce` mode, and refuses
+otherwise), this file every lens an agent starts by hand from the skill and what `plan` prints. Keep the two the
+same; the gate does not read either, so a difference changes cost and recall, never what passes.
 
 ## 5. Enforce
 

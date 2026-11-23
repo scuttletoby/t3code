@@ -1,7 +1,7 @@
 /**
  * Fork: review rules, how this machine runs a review lens; the repo's config says what a pull
  * request needs and its CI gate enforces it. Off by default; `{"preset": "recommended"}` turns the
- * fork's defaults on. Nothing reads it yet; wired in only through forkSettings.ts.
+ * fork's defaults on. The `lens_start` tool reads it; wired in only through forkSettings.ts.
  */
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";

@@ -180,6 +180,15 @@ export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
       seen: seenByPr.get(key)?.seen ?? null,
       now: context.now,
       settings: settings.value.waitFor,
+      // Fork (review rules): a lens_start {afterCi} wait reads only the config's checks at its head.
+      ...(spec.checks === undefined && spec.head === undefined
+        ? {}
+        : {
+            only: {
+              ...(spec.checks === undefined ? {} : { checks: spec.checks }),
+              ...(spec.head === undefined ? {} : { head: spec.head }),
+            },
+          }),
     });
     // Only a checks read says anything about the head's checks; a `merged` wait leaves it be.
     if (spec.until === "checks") {
