@@ -402,7 +402,8 @@ class Update(Updating):
         self.assertEqual(self.installs(), installs)   # not downloaded twice
 
     def test_a_version_that_does_not_come_up_is_rolled_back_and_not_tried_again(self):
-        for name, value in (('t3-crash-version', '1.2.4'), ('http-mute', '1.2.4')):
+        for name, value in (('t3-crash-version', '1.2.4'), ('http-mute', '1.2.4'), ('t3-not-ready', '1.2.4'),
+                            ('t3-silent', '1.2.4')):   # started (systemd's entry), nothing printed: held, not asked
             with self.subTest(name):
                 self.write('/log/' + name, value)
                 self.releases(release('1.2.4'))
@@ -413,8 +414,11 @@ class Update(Updating):
                 self.assertEqual(state['failed'], '1.2.4')
                 self.assertNotIn('phase', state)
                 self.assertRegex(state['result'], r'^T3 1\.2\.4 did not come up \((setup failed: T3 did not start'
-                                 r'|no answer from T3).*\); not trying it again\. Back on 1\.2\.3, running$')
+                                 r'|no answer from T3|T3 did not say "T3 Code server is ready\.").*\); not trying '
+                                 r'it again\. Back on 1\.2\.3, running$')
                 self.assertIn(state['result'], state['alert'])
+                if name in ('t3-not-ready', 't3-silent'):   # never asked before it said so
+                    self.assertIn('T3 did not say', state['result'])
                 self.assertFalse(os.path.exists(self.path(VERSIONS + '/1.2.4')))   # never reused
                 self.assertEqual(self.check()[0], 0)
                 bak = json.loads(self.read('/etc/fork-kit/machine.json.bak'))   # from before the update, kept
@@ -434,6 +438,22 @@ class Update(Updating):
         self.assertEqual(code, 0, out)
         self.updated('1.2.5')
         self.assertEqual(self.state()['failed'], '1.2.4')
+
+    def test_a_journal_that_cannot_tell_does_not_fail_the_update(self):
+        """#1047: the ready line is waited for where the journal can tell. A journal that keeps nothing of this run
+        (Storage=none, output elsewhere, rotated away with the run's start) or cannot be read is no failure of T3:
+        its answer decides."""
+        for name in ('journal-none', 'journal-fail', 'journal-rotated'):
+            with self.subTest(name):
+                self.write('/log/' + name, '')
+                self.releases(release('1.2.4'))
+                code, out = self.update()
+                self.assertEqual(code, 0, out)
+                self.updated('1.2.4')
+                self.assertNotIn('failed', self.state())
+                os.unlink(self.path('/log/' + name))
+                shutil.rmtree(self.root)
+                self.setUp()
 
     def test_other_failures_are_tried_again_a_few_times(self):
         self.releases(release('1.2.4'))

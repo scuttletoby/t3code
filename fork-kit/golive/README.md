@@ -866,6 +866,26 @@ every step it started is done raises `journal.Refused`: the run ends "refused" a
 takes the lock with `wait=True`: it blocks until the run it watches ends. A torn last line is reported and ignored; damage anywhere else refuses, naming the
 file and how to settle it; a line from a newer kit refuses with "update the kit".
 
+golive runs as the T3 user, the owner of the T3 home. Run as root where the home is another user's, every command
+but `status` (which writes nothing) refuses before it makes anything, naming that user (#1047): what a root run
+writes in `stateDir` (the lock, the journal, `guard.log`) would be root's, and the T3 user could not take the lock
+again. This holds also where `stateDir` is root's (an earlier root run made it) or is missing under a folder of
+root's. It refuses rather than make the files as the home's owner, since a run as root would still leave its
+other files (kept runtimes, files in the home) root's. The lock, and the guards' `guard.log` (written before the
+lock), also refuse as root where `stateDir` is another user's. State another user left (a root run before this
+rule) is named with the command that fixes it (`chown -R <T3 user>: <stateDir>`), instead of a permission error, and
+so is a missing `stateDir` the T3 user may not make (under a folder of root's: `mkdir -p` and `chown` it as root).
+
+**Ready, not only listening.** Every wait for T3 after a start (`switch`, `back`, `rehearse`) waits for the
+server's own runtime record (`userdata/server-runtime.json` naming the new pid), which T3 writes once it has
+started (after its HTTP listener and its start-up work), never for the port alone: a request sent between
+"Listening" and "T3 Code server is ready." can wait minutes. Only then is HTTP asked.
+
+**Moving T3 to another machine.** On btrfs, turn compression off for the userdata folder before the database lands
+there (`chattr +m <home>/userdata`, or `btrfs property set <home>/userdata compression none`, while it is empty:
+files made in it after that are not compressed, files already there stay as they are): T3's SQLite database on a
+compressed folder read at about 41 MB/s in a rehearsal.
+
 ## Tests
 
 ```
