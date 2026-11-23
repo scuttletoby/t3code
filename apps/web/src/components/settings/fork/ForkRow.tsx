@@ -6,7 +6,7 @@
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
 import { isManagedSettingPath, type ServerSettings } from "@t3tools/contracts";
-import { type ComponentProps, useState } from "react";
+import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { useEnvironmentProviders } from "../../../state/environments";
 import { EMPTY_SERVER_PROVIDERS } from "../../../state/server";
@@ -137,4 +137,35 @@ export function useSubRowReset<K extends "handoff" | "playtest">(
       />
     );
   };
+}
+
+/**
+ * A dropdown row's help: a lead line, then one line for every option (the chosen one stands out),
+ * then a closing line. Upstream's select items hold only a label, so the choices are explained here.
+ */
+export function OptionLines({
+  lead,
+  options,
+  selected,
+  tail,
+}: {
+  readonly lead?: ReactNode;
+  readonly options: ReadonlyArray<{ readonly value: string; readonly description: string }>;
+  readonly selected?: string | null | undefined;
+  readonly tail: ReactNode;
+}) {
+  return (
+    <>
+      {lead ? <span className="block">{lead}</span> : null}
+      {options.map((option) => (
+        <span
+          key={option.value}
+          className={option.value === selected ? "block font-medium text-foreground" : "block"}
+        >
+          {option.description}
+        </span>
+      ))}
+      <span className="block">{tail}</span>
+    </>
+  );
 }

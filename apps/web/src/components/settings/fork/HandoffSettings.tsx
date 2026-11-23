@@ -28,7 +28,7 @@ import {
   useUpdateScopedSettings,
 } from "../useScopedSettings";
 import { CommitTextField } from "./CommitTextField";
-import { BoundedNumberField, ForkRow, useSubRowReset } from "./ForkRow";
+import { BoundedNumberField, ForkRow, OptionLines, useSubRowReset } from "./ForkRow";
 import {
   HANDOFF_MODE_OPTIONS,
   boundHandoffTokens,
@@ -103,7 +103,6 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
     isProjectScope && source === "project",
     save,
   );
-  const option = HANDOFF_MODE_OPTIONS.find((candidate) => candidate.value === shown.mode);
   const scopeNote = !isProjectScope
     ? ""
     : source === "project"
@@ -147,7 +146,13 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
         settingKeys={["handoff"]}
         lockPaths={["handoff"]}
         onResetOverride={() => clearScopedSettings(["handoff"])}
-        description={`${option?.description ?? ""} Default: Off.${scopeNote}`}
+        description={
+          <OptionLines
+            options={HANDOFF_MODE_OPTIONS}
+            selected={shown.mode}
+            tail={`Default: Off.${scopeNote}`}
+          />
+        }
         resetAction={
           !isProjectScope && shown.mode !== DEFAULT_HANDOFF_SETTINGS.mode ? (
             <SettingResetButton

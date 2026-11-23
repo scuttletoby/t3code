@@ -30,7 +30,7 @@ import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
-import { ForkRow, useSelectedProvidersByEnvironment } from "./ForkRow";
+import { ForkRow, OptionLines, useSelectedProvidersByEnvironment } from "./ForkRow";
 import {
   aliasModelPolicyRows,
   MODEL_POLICY_MODE_OPTIONS,
@@ -255,7 +255,14 @@ export function ModelPolicySettings() {
         {...searchableSetting("model-policy")}
         settingKeys={["modelPolicy"]}
         lockPaths={["modelPolicy"]}
-        description={`Which models and efforts agents may pick when they start threads or sub-agents. ${option?.description ?? ""} Your own picks are never refused; one outside the list is marked below. While it is on, a sub-agent that names its model keeps only the options it names. Default: Off.`}
+        description={
+          <OptionLines
+            lead="Which models and efforts agents may pick when they start threads or sub-agents."
+            options={MODEL_POLICY_MODE_OPTIONS}
+            selected={shown.mode}
+            tail="Your own picks are never refused; one outside the list is marked below. While it is on, a sub-agent that names its model keeps only the options it names. Default: Off."
+          />
+        }
         resetAction={
           isDefault ? null : (
             <SettingResetButton

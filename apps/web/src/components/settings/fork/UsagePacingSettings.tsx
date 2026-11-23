@@ -24,7 +24,7 @@ import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
-import { BoundedNumberField, ForkRow, useSelectedProviders } from "./ForkRow";
+import { BoundedNumberField, ForkRow, OptionLines, useSelectedProviders } from "./ForkRow";
 import {
   USAGE_PACING_GATE_OPTIONS,
   USAGE_PACING_WINDOW_KINDS,
@@ -69,9 +69,16 @@ function GateRow({ updateSettings }: { readonly updateSettings: UpdateSettings }
       lockPaths={["usagePacingGate"]}
       mixed={mixed}
       description={
-        mixed
-          ? MIXED
-          : `What happens when an agent hands a task to a sub-agent (delegate_task) while an account is using its plan faster than an even pace. ${option?.description ?? ""} Default: Off.`
+        mixed ? (
+          MIXED
+        ) : (
+          <OptionLines
+            lead="What happens when an agent hands a task to a sub-agent (delegate_task) while an account is using its plan faster than an even pace."
+            options={USAGE_PACING_GATE_OPTIONS}
+            selected={gate}
+            tail="Default: Off."
+          />
+        )
       }
       resetAction={
         !mixed && gate !== DEFAULT_SERVER_SETTINGS.usagePacingGate ? (
