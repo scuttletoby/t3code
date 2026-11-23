@@ -158,11 +158,17 @@ describe("UsagePacingSettings", () => {
   it("writes the gate and the lower effort map, and refuses effort text it cannot read", async () => {
     setup({});
     await using screen = await render(<UsagePacingSettings />);
+    // The chosen option is named in text too, not by colour alone.
+    await expect
+      .element(screen.getByText("Off: tasks start as asked and usage is not checked. (chosen)"))
+      .toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("combobox", { name: "Usage pacing gate" }));
     await userEvent.click(screen.getByRole("option", { name: "Advise" }));
     expect(state.update.mock.calls[0]![0]).toEqual({ usagePacingGate: "advise" });
 
+    // Lowering effort is a rarely changed option, folded under Advanced.
+    await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     const effort = screen.getByRole("textbox", { name: "Lower effort when ahead of pace" });
     await userEvent.type(effort, "high{Enter}");
     await expect.element(screen.getByRole("alert")).toBeVisible();
@@ -216,7 +222,7 @@ describe("ModelPolicySettings", () => {
     await using screen = await render(<ModelPolicySettings />);
 
     await expect.element(screen.getByText("gpt-mini")).toBeVisible();
-    await userEvent.click(screen.getByRole("combobox", { name: "Model policy mode" }));
+    await userEvent.click(screen.getByRole("combobox", { name: "Models agents may use: mode" }));
     await userEvent.click(page.getByRole("option", { name: "Enforce" }));
     expect(state.update.mock.calls[0]![0]).toEqual({
       modelPolicy: { mode: "enforce", allow: [row] },
@@ -242,7 +248,7 @@ describe("ModelPolicySettings", () => {
     await expect.element(screen.getByRole("alert")).toMatchTextContent("cannot be read");
     await expect.element(screen.getByText('{"mode":"always"}')).toBeVisible();
     await expect
-      .element(screen.getByRole("combobox", { name: "Model policy mode" }))
+      .element(screen.getByRole("combobox", { name: "Models agents may use: mode" }))
       .toMatchTextContent("Enforce");
     await userEvent.click(screen.getByRole("button", { name: "Reset model policy to default" }));
     expect(state.update.mock.calls[0]![0]).toEqual({ modelPolicy: { mode: "off", allow: [] } });
@@ -302,7 +308,7 @@ describe("ModelPolicySettings", () => {
     }
     setup({ modelPolicy: { mode: "off", allow }, ...picks });
     await using off = await render(<ModelPolicySettings />);
-    await expect.element(off.getByText("Model policy").first()).toBeVisible();
+    await expect.element(off.getByText("Models agents may use").first()).toBeVisible();
     expect(off.getByText(/^outside policy/).elements()).toHaveLength(0);
   });
 

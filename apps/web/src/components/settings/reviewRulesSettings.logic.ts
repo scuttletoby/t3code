@@ -10,6 +10,7 @@ import {
   effectiveReviewRules,
 } from "@t3tools/contracts";
 import * as Equal from "effect/Equal";
+import { defaultIs } from "./fork/forkDefaultText.logic";
 
 export type ReviewRulesPresetChoice = "recommended" | "off";
 
@@ -203,13 +204,13 @@ export function reviewRulesDescription(
     : "";
   switch (reviewRulesState(value)) {
     case "on":
-      return `${where}On: review lenses run with the values below. Nothing uses them yet; the review runner comes in a later release.`;
+      return `${where}On: agents can start the review lenses a pull request still needs (lens_start), with the values below. Off: agents get no way to start them here and nothing is checked. ${defaultIs("reviewRules")}`;
     case "unreadable":
       return `${where}The stored value is not valid, so review rules are off. It is kept as written until it is fixed in the settings file or replaced here.`;
     case "off":
       return handSetFields(value).length > 0
         ? `${where}Off. The fields written out by hand do nothing while the preset is off.`
-        : `${where}Off: nothing is listed, changed or checked.`;
+        : `${where}Off: agents get no way to start review lenses here and nothing is checked. On: they can start the lenses a pull request still needs (lens_start), with the Recommended values. ${defaultIs("reviewRules")}`;
   }
 }
 

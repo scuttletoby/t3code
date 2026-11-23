@@ -38,6 +38,7 @@ import {
   assistantThreadText,
   makeAssistantThread,
 } from "./assistantSetup.logic";
+import { defaultIs } from "./forkDefaultText.logic";
 
 /** True once this client holds no thread `ref` (deleted, or never made); false after 5 seconds. */
 const waitForThreadShellGone = (ref: ScopedThreadRef) =>
@@ -144,7 +145,7 @@ export function AssistantSettings() {
         {...searchableSetting("assistant")}
         settingKeys={["assistant"]}
         lockPaths={["assistant"]}
-        description="One thread you talk to across projects, Claude only. Its profile `assistant` has no shell, files, web or outside servers, but its T3 tools do more than read, start and message threads, and it uses them without asking you: it can also change another thread's model and settings, interrupt threads, stop workflows, link and unlink environments, create projects, clone a repository onto disk, and delete projects (a forced delete also deletes all of that project's threads, archived ones too). Splitting these tools is fork issue #954. Off: Settings offers no Make assistant."
+        description={`On: Settings offers Make assistant, one Claude thread you talk to that works across all your projects. Off: no assistant is offered. ${defaultIs("assistant")} Know before you turn it on: its profile \`assistant\` has no shell, files, web or outside servers, but its T3 tools do more than read, start and message threads, and it uses them without asking you: it can also change another thread's model and settings, interrupt threads, stop workflows, link and unlink environments, create projects, clone a repository onto disk, and delete projects (a forced delete also deletes all of that project's threads, archived ones too). Splitting these tools into smaller sets is planned.`}
         control={
           <Switch
             checked={enabled}

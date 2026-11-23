@@ -7,12 +7,14 @@
 import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
 
 import { Switch } from "../../ui/switch";
+import { AdvancedSettings } from "../AdvancedSettings";
 import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingResetButton, SettingsRow, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
 import { CommitTextField } from "./CommitTextField";
+import { defaultIs } from "./forkDefaultText.logic";
 
 const MIXED = "The selected environments have different values. Select one environment to edit it.";
 
@@ -26,7 +28,7 @@ export function UpdatesSettings() {
   const quietMixed = targetsDiffer(targets, (settings) => settings.automaticUpdatesQuietCommand);
 
   return (
-    <SettingsSection id="updates-section" title="Updates">
+    <SettingsSection id="updates-section" title="Automatic updates">
       <SettingsRow
         serverScoped
         {...searchableSetting("automatic-updates")}
@@ -35,7 +37,7 @@ export function UpdatesSettings() {
         description={
           automaticMixed
             ? MIXED
-            : "A server installed as a boot service (t3 service install) updates itself to the newest fork release once no thread is working. Off: only t3 update or Update does it."
+            : `On: a server that starts with the computer (a boot service) updates itself to the newest fork release once no thread is working. Off: it updates only when you run t3 update or press Update. ${defaultIs("automaticUpdates")}`
         }
         resetAction={
           !automaticMixed && automatic !== DEFAULT_SERVER_SETTINGS.automaticUpdates ? (
@@ -56,38 +58,43 @@ export function UpdatesSettings() {
           />
         }
       />
-      <SettingsRow
-        serverScoped
-        {...searchableSetting("automatic-updates-quiet-command")}
-        settingKeys={["automaticUpdatesQuietCommand"]}
-        mixed={quietMixed}
-        description={
-          quietMixed
-            ? MIXED
-            : "Optional: a program asked before each automatic update, by its full path. A non-zero exit means not now. Empty: none is asked."
-        }
-        resetAction={
-          !quietMixed && quietCommand !== "" ? (
-            <SettingResetButton
-              ariaLabel="Reset quiet check to default"
-              onClick={() => updateSettings({ automaticUpdatesQuietCommand: "" })}
-            />
-          ) : null
-        }
-        control={
-          quietMixed ? null : (
-            <CommitTextField
-              value={quietCommand}
-              ariaLabel="Quiet check before an update"
-              placeholder="/usr/local/bin/quiet-check"
-              onCommit={(text, revert) => {
-                updateSettings({ automaticUpdatesQuietCommand: text.trim() }, { onFailed: revert });
-                return null;
-              }}
-            />
-          )
-        }
-      />
+      <AdvancedSettings targetIds={["automatic-updates-quiet-command"]}>
+        <SettingsRow
+          serverScoped
+          {...searchableSetting("automatic-updates-quiet-command")}
+          settingKeys={["automaticUpdatesQuietCommand"]}
+          mixed={quietMixed}
+          description={
+            quietMixed
+              ? MIXED
+              : `A program (its full path) asked before each automatic update; a non-zero exit means not now, so the update waits. Empty: no program is asked. ${defaultIs("automaticUpdatesQuietCommand")}`
+          }
+          resetAction={
+            !quietMixed && quietCommand !== "" ? (
+              <SettingResetButton
+                ariaLabel="Reset quiet check to default"
+                onClick={() => updateSettings({ automaticUpdatesQuietCommand: "" })}
+              />
+            ) : null
+          }
+          control={
+            quietMixed ? null : (
+              <CommitTextField
+                value={quietCommand}
+                ariaLabel="Quiet check before an update"
+                placeholder="/usr/local/bin/quiet-check"
+                onCommit={(text, revert) => {
+                  updateSettings(
+                    { automaticUpdatesQuietCommand: text.trim() },
+                    { onFailed: revert },
+                  );
+                  return null;
+                }}
+              />
+            )
+          }
+        />
+      </AdvancedSettings>
     </SettingsSection>
   );
 }

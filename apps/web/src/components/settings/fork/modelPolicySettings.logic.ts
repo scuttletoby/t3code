@@ -24,16 +24,20 @@ export const MODEL_POLICY_MODE_OPTIONS: ReadonlyArray<{
   readonly label: string;
   readonly description: string;
 }> = [
-  { value: "off", label: "Off", description: "Agents pick any model, as upstream's do." },
+  {
+    value: "off",
+    label: "Off",
+    description: "Off: agents pick any model, as in upstream T3 Code.",
+  },
   {
     value: "advise",
     label: "Advise",
-    description: "An agent is told when its pick is off the list; the pick still runs.",
+    description: "Advise: an agent is told when its pick is not on the list; the pick still runs.",
   },
   {
     value: "enforce",
     label: "Enforce",
-    description: "An agent's pick off the list, or one that names no model, is refused.",
+    description: "Enforce: a pick not on the list, or one that names no model, is refused.",
   },
 ];
 
