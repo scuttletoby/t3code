@@ -5,10 +5,10 @@
   agent-guards-install uninstall
   agent-guards-install self-check
 
-install copies bin/ (the five hooks and agent-guards), sbin/agent-guards-install, lib/agent_guards/, README.md and
+install copies bin/ (the six hooks, agent-guards and facts), sbin/agent-guards-install, lib/agent_guards/, README.md, FACTS.md and
 fork-kit/common/{machine_file,kit_install}.py of one release into /usr/local/libexec/agent-guards/versions/<sha>/
 (with MANIFEST.sha256), checks the copy, switches the link `current` to it and links /usr/local/bin/<hook> and
-/usr/local/bin/agent-guards to it. With --settings it also writes the hooks' Claude Code managed settings drop-in
+/usr/local/bin/{agent-guards,facts} to it. With --settings it also writes the hooks' Claude Code managed settings drop-in
 (/etc/claude-code/managed-settings.d/agent-guards.json), which every session of every user on the machine reads
 and only root can change; --no-settings removes it. The choice is kept in /etc/agent-guards/config.json, so a run
 without either option keeps it (the first install: no drop-in). The drop-in is written only after the links, so a
@@ -40,6 +40,7 @@ except ImportError as e:     # a copy with a part missing: the bootstrap makes i
              '(fork-kit/agent-guards/README.md, Install)')
 
 HOOKS = wiring.HOOKS
+COMMANDS = ('agent-guards', 'facts')   # commands people and agents run, linked beside the hooks
 
 
 class AgentGuardsInstaller(kit_install.Installer):
@@ -48,13 +49,14 @@ class AgentGuardsInstaller(kit_install.Installer):
     KIT = 'agent-guards'
     ETC = '/etc/agent-guards'
     LIBEXEC = '/usr/local/libexec/agent-guards'
-    LINKS = dict({f'{wiring.BIN}/{h}': f'bin/{h}' for h in HOOKS + ('agent-guards',)},
+    LINKS = dict({f'{wiring.BIN}/{h}': f'bin/{h}' for h in HOOKS + COMMANDS},
                  **{'/usr/local/sbin/agent-guards-install': 'sbin/agent-guards-install'})
-    SOURCE_FILES = tuple(f'bin/{h}' for h in HOOKS + ('agent-guards',)) + (
-        'sbin/agent-guards-install', 'README.md', 'common/machine_file.py', 'common/kit_install.py')
-    EXECUTABLE = frozenset([f'bin/{h}' for h in HOOKS + ('agent-guards',)] + ['sbin/agent-guards-install'])
+    OPTIONAL_LINKS = (f'{wiring.BIN}/facts',)   # a common name: another program called facts is left alone
+    SOURCE_FILES = tuple(f'bin/{h}' for h in HOOKS + COMMANDS) + (
+        'sbin/agent-guards-install', 'README.md', 'FACTS.md', 'common/machine_file.py', 'common/kit_install.py')
+    EXECUTABLE = frozenset([f'bin/{h}' for h in HOOKS + COMMANDS] + ['sbin/agent-guards-install'])
     PACKAGE = 'agent_guards'
-    MODULES = ('__init__', 'approval', 'check', 'config', 'wiring')
+    MODULES = ('__init__', 'approval', 'check', 'config', 'facts', 'wiring')
     HELP = ('bin/agent-guards', 'agent-guards check')
     HAS_CONFIG = True
     CONFIG_KEYS = ('version', 'settings', 'settingsOff')   # other keys of config.json (added by hand) are kept

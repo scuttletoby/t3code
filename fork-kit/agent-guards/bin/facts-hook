@@ -1,0 +1,102 @@
+#!/usr/bin/python3 -IB
+"""Claude Code hook: show the state tables' things at session start, and keep them out of compaction summaries.
+Part of fork-kit/agent-guards (README.md there: install, settings entries, the machine file's "agent-guards"
+section; the table format and the `facts` command: FACTS.md there).
+
+SessionStart (startup, resume, clear and after compaction): adds context: the Thing column of every state table
+configured for this session (the machine's, and the project's the session's folder belongs to), at most indexLines
+things, "check the state table before diagnosing or redoing something", the project's text, and one line naming the
+record repo when one is configured and there ("Records: <path> (facts <words> searches it)"; never its content).
+All of it in at most indexChars characters ("+N more: run facts --index" when cut).
+PreCompact: prints the compaction instructions' part: keep the things' names, not their rows.
+Every other event, or no table with a row: nothing. Read only: it writes nothing, so two at once need no lock.
+
+General (any project, any Claude config dir). Project facts come from the machine file (facts):
+  dirs           table files or folders holding STATE.md, for every session (default []: the hook does nothing)
+  projects       [{"match": "host/owner/repo" or a folder, "dirs": [...], "text": "..."}]: more tables and text for
+                 the sessions of one project, matched by the checkout's origin remote or the folder, never a glob
+  indexLines     things shown at most (default 40)
+  indexChars     characters of the whole answer at most (default 4000)
+  records        [{"path": ..., "projectsDir": "projects", "shared": [...]}]: record repos (only named here)
+Never fails a call because of its own error: every error is caught, git is asked once with a 2 s timeout, and
+the record repo is only checked to be there (no walk). A broken machine file section: the defaults (so it does
+nothing) and one line on stderr. Tests: fork-kit/agent-guards/tests/facts.test.py
+"""
+import json, os, sys
+
+NAME = 'facts-hook'
+
+
+def _settings():
+    """(facts settings, problem or None); a copy without the kit's lib keeps the defaults and says so."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        return config.load('facts')
+    except BaseException as e:   # noqa: BLE001
+        return ({'dirs': [], 'staleDays': 30, 'maxRows': 60, 'indexLines': 40, 'indexChars': 4000, 'projects': [],
+                 'records': []},
+                f'cannot load the kit\'s config code ({type(e).__name__}: {e})')
+
+
+def decide(data, c):
+    if not isinstance(data, dict):
+        return None, None
+    event = data.get('hook_event_name', '')
+    if event not in ('SessionStart', 'PreCompact'):
+        return None, None
+    from agent_guards import facts
+    cwd = data.get('cwd') if isinstance(data.get('cwd'), str) else ''
+    projects = facts.projects_for(c, cwd)       # git at most once
+    found = facts.places(c, cwd, projects=projects)
+    if event == 'SessionStart':
+        text = facts.session_text(found, projects, c['indexLines'], c['indexChars'], facts.records(c, projects))
+        return ({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': text}} if text
+                else None), None
+    return None, facts.compact_text(found, projects, c['indexChars']) or None
+
+
+def _notice(problem, event, out):
+    """`out` with a config problem added where the agent and the owner see it (and one line on stderr)."""
+    if not problem:
+        return out
+    try:
+        from agent_guards import config
+        config.warn(NAME, problem)
+        return config.notice(NAME, problem, event, out)
+    except BaseException:   # noqa: BLE001 - no lib: say it plainly
+        text = f'{NAME}: {problem}; built-in defaults used. Tell the owner.'
+        try:
+            sys.stderr.write(text + '\n')
+        except Exception:  # noqa: BLE001
+            pass
+        return dict(out or {}, systemMessage=text)
+
+
+def main():
+    if sys.argv[1:]:
+        sys.stderr.write('usage: facts-hook (hook: SessionStart or PreCompact JSON on stdin)\n')
+        return 1
+    event, problem, out, text = None, None, None, None
+    try:
+        c, problem = _settings()
+        event = json.load(sys.stdin)
+        out, text = decide(event, c)
+    except Exception:  # never break a session because of this hook
+        out, text = None, None
+    if text:            # PreCompact: plain text, which Claude Code adds to the compaction instructions
+        if problem:
+            _notice(problem, event, None)
+        print(text)
+        return 0
+    try:
+        out = _notice(problem, event, out)
+    except Exception:  # noqa: BLE001
+        pass
+    if out:
+        print(json.dumps(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
