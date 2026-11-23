@@ -654,7 +654,7 @@
     "apps/server/vite.config.ts": 2,
     "apps/web/src/cloud/linkEnvironment.test.ts": 34,
     "apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx": 277,
-    "apps/web/src/components/ChatMarkdown.tsx": 39,
+    "apps/web/src/components/ChatMarkdown.tsx": 32,
     "apps/web/src/components/chat/MarkdownFileLink.tsx": 32,
     "apps/web/src/components/media/mediaContent.ts": 8,
     "apps/web/src/components/settings/scopedSettings.test.ts": 153,
