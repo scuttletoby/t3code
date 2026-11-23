@@ -1,0 +1,5 @@
+// update-policy kit: written by update-policy-install. Do not edit: run the installer again.
+// The kit owns restarts (fork-kit/update-policy): unattended-upgrades installs updates but never restarts the
+// machine by itself; update-policy.timer restarts it at the quiet hour, only when idle, and never on a live role.
+// The file name sorts after the numbered files, so this value wins over theirs (not over /etc/apt/apt.conf).
+Unattended-Upgrade::Automatic-Reboot "false";
