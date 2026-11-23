@@ -324,6 +324,239 @@ class OldMachineFile(Case):
         self.assertNotIn('file:pc-agents.conf', walls)
 
 
+# T3's unit on a plain Linux box as fake_distro's LINUX_CONFIG gives it, before the `gpu` setting reached linux
+# (#1027 item 3): with no setting (or "gpu": false) it stays byte for byte this one.
+LINUX_UNIT_SHA = '6cb2a94d01fbb9b59c0b4c614c297a18591e6b236e4e8ee74a9f27e821519141'
+UNIT = '/etc/systemd/system/t3code-agents.service'
+CARDS = tuple(f'/dev/nvidia{i}' for i in range(16))
+NVIDIA = CARDS + ('/dev/nvidiactl', '/dev/nvidia-modeset', '/dev/nvidia-uvm', '/dev/nvidia-uvm-tools')
+# What `gpu` on adds to the linux unit, and nothing else: NVIDIA's device nodes, each skipped when missing ("-")
+LINUX_GPU = ['BindPaths=' + ' '.join('-' + p for p in NVIDIA + ('/dev/nvidia-caps',)),
+             *(f'DeviceAllow={p} rw' for p in NVIDIA), 'DeviceAllow=char-nvidia-caps rw']
+DRIVER = ('/dev/nvidia0', '/dev/nvidiactl', '/dev/nvidia-uvm', '/dev/nvidia-uvm-tools', '/dev/nvidia-modeset',
+          '/dev/nvidia-caps/nvidia-cap1')   # what a box with one card and NVIDIA's driver loaded has
+
+
+class LinuxGpu(Linux):
+    """`gpu` on a plain Linux box (#1027 item 3): on, NVIDIA's device nodes that exist and nothing else (never
+    /dev/dxg or /usr/lib/wsl); off, the unit as before. No NVIDIA driver with gpu on: a clear check failure."""
+    def driver(self, nodes=DRIVER):
+        for p in nodes:
+            self.write(p, '')
+
+    def gpu_line(self, out):
+        return next(line for line in out.splitlines() if line.split()[1:2] == ['gpu'])
+
+    def test_off_unit_unchanged(self):
+        c = k.config()
+        self.assertIs(c['gpu'], False)
+        self.assertEqual(k.sha(k.render(c)[UNIT][0]), LINUX_UNIT_SHA)
+        self.machine({**LINUX_CONFIG, 'gpu': False})
+        self.assertEqual(k.render(k.config()), k.render(c))
+        self.assertFalse([x for x in k.sandbox(c) if 'nvidia' in x or 'dxg' in x])
+
+    def test_on_adds_nvidia_nodes_only(self):
+        off = k.sandbox(k.config())
+        self.machine({**LINUX_CONFIG, 'gpu': True})
+        on = k.sandbox(k.config())
+        self.assertEqual([x for x in on if x not in LINUX_GPU], off)   # every other wall as it was
+        self.assertEqual([x for x in on if x not in off], LINUX_GPU)
+        unit = k.render(k.config())[UNIT][0]
+        for wsl in ('dxg', '/usr/lib/wsl', 'TemporaryFileSystem'):
+            self.assertNotIn(wsl, unit)
+        # the same with no driver at all: what the unit says does not depend on what /dev has now
+        self.driver()
+        self.assertEqual(k.render(k.config())[UNIT][0], unit)
+
+    def test_on_with_the_driver(self):
+        self.driver()
+        self.machine({**LINUX_CONFIG, 'gpu': True})
+        self.ready()
+        for line in LINUX_GPU:
+            self.assertIn('\n' + line + '\n', self.read(UNIT))
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        line = self.gpu_line(out)
+        self.assertTrue(line.startswith('PASS  gpu  GPU access is on'), out)
+        for p in DRIVER:
+            self.assertIn(p, line)
+        self.assertNotIn('dxg', line)
+        self.assertEqual(self.call(cli.main, ['as-agent', '--', 'nvidia-smi'])[0], 0)
+        argv = self.log('systemd-run')
+        for line in LINUX_GPU:
+            self.assertIn('--property=' + line, argv)
+        self.assertFalse([a for a in argv if 'dxg' in a or '/usr/lib/wsl' in a])
+
+    def test_no_driver_fails_clearly(self):
+        """gpu on, but no NVIDIA driver loaded (no /dev/nvidiactl, or no card node): setup does not enable T3 and
+        check fails, naming the fix; no crash."""
+        for nodes in ((), ('/dev/nvidiactl',), ('/dev/nvidia0', '/dev/nvidia-uvm')):
+            with self.subTest(nodes=nodes):
+                shutil.rmtree(self.root)
+                self.setUp()
+                self.driver(nodes)
+                self.machine({**LINUX_CONFIG, 'gpu': True})
+                code, out = self.setup_run()
+                self.assertEqual(code, 3, out)
+                self.assertNotIn('Traceback', out)
+                self.assertIn('disable --now t3code-agents.service', '\n'.join(self.log()))
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                # units: setup disabled T3 (above), so that wall fails too; nothing else does
+                self.assertEqual({x.split()[1] for x in out.splitlines() if x.startswith('FAIL')}, {'gpu', 'units'},
+                                 out)
+                self.assertIn('no NVIDIA driver', self.gpu_line(out))
+                self.assertNotIn('nvidia-uvm (', self.gpu_line(out))   # no driver: no note about one of its nodes
+                self.assertIn('"gpu": false', self.gpu_line(out))
+
+    def test_driver_added_later(self):
+        """gpu on before the driver: setup stops at the check; with the driver loaded, the next run finishes, and
+        the unit it writes is the one the first run wrote (it lists the nodes, it does not read /dev)."""
+        self.machine({**LINUX_CONFIG, 'gpu': True})
+        self.assertEqual(self.setup_run()[0], 3)
+        unit = self.read(UNIT)
+        self.driver()
+        self.write('/log/systemctl', '')
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.read(UNIT), unit)
+        self.assertIn(UNITS, self.log())
+        self.assertEqual(self.check()[0], 0)
+
+    def test_uvm_missing_is_a_note(self):
+        """The driver makes /dev/nvidia-uvm on first use: missing, T3 still runs (CUDA jobs fail): a note."""
+        self.driver([p for p in DRIVER if not p.startswith('/dev/nvidia-uvm')])
+        self.machine({**LINUX_CONFIG, 'gpu': True})
+        self.ready()
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn('no /dev/nvidia-uvm', self.gpu_line(out))
+
+    def test_on_then_again_then_off(self):
+        self.driver()
+        self.ready()
+        default = self.read(UNIT)
+        self.machine({**LINUX_CONFIG, 'gpu': True})
+        self.write('/log/systemctl', '')
+        self.assertEqual(self.setup_run()[0], 0)
+        self.assertIn('restart t3code-agents.service', self.log())
+        before = self.same_files()
+        self.write('/log/systemctl', '')
+        self.assertEqual(self.setup_run()[0], 0)
+        self.assertEqual(self.same_files(), before)
+        self.assertNotIn('restart t3code-agents.service', self.log())
+        self.machine({**LINUX_CONFIG, 'gpu': False})
+        self.write('/log/systemctl', '')
+        self.assertEqual(self.setup_run()[0], 0)
+        self.assertEqual(self.read(UNIT), default)
+        self.assertEqual(k.sha(default), LINUX_UNIT_SHA)
+        self.assertIn('restart t3code-agents.service', self.log())
+        self.assertIn('PASS  gpu  GPU access is off', self.check()[1])
+
+    def test_unit_differs_from_the_setting(self):
+        for written, now in ((False, True), (True, False)):
+            with self.subTest(unit_written_with=written, machine_file_says=now):
+                shutil.rmtree(self.root)
+                self.setUp()
+                self.driver()
+                self.machine({**LINUX_CONFIG, 'gpu': written})
+                self.walled()
+                self.machine({**LINUX_CONFIG, 'gpu': now})
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn(f'the unit has GPU access {"on" if written else "off"}', self.gpu_line(out))
+
+    def test_wsl_lines_on_linux_fail(self):
+        """WSL's GPU lines (an edit, or a unit from the wrong kind) are not linux's: the gpu wall fails."""
+        self.driver()
+        self.machine({**LINUX_CONFIG, 'gpu': True})
+        self.walled()
+        self.write(UNIT, self.read(UNIT).replace(LINUX_GPU[0], LINUX_GPU[0] + '\nBindPaths=-/dev/dxg'))
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('only some of the GPU lines', self.gpu_line(out))
+
+    def seen(self, *nodes):
+        """The running T3's own /dev (what /proc/PID/root shows root) holds these nodes."""
+        pid = self.read('/log/units/t3code-agents.service.pid').strip()
+        self.write(f'/proc/{pid}/root/dev/', '')
+        for p in nodes:
+            self.write(f'/proc/{pid}/root{p}', '')
+
+    def test_what_t3_sees(self):
+        """check looks into the running T3's /dev: with gpu on, NVIDIA's nodes and nothing more; with it off, none."""
+        self.driver()
+        self.machine({**LINUX_CONFIG, 'gpu': True})
+        self.walled()
+        self.seen('/dev/null', *DRIVER)
+        self.assertEqual(self.check()[0], 0)
+        self.seen('/dev/dxg')
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('T3 sees /dev/dxg', self.gpu_line(out))
+
+    def test_off_t3_sees_none(self):
+        self.driver()
+        self.walled()
+        self.seen('/dev/null')
+        self.assertEqual(self.check()[0], 0)
+        self.seen('/dev/nvidia0')
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('T3 sees /dev/nvidia0', self.gpu_line(out))
+
+    def test_turned_off_while_t3_sees_them(self):
+        """gpu on, T3 running with NVIDIA's nodes; turned off: setup's own check does not fail on that T3 (it is about
+        to restart: the restart wall's job), so setup finishes and T3 restarts without them."""
+        self.driver()
+        self.machine({**LINUX_CONFIG, 'gpu': True})
+        self.ready()
+        self.seen(*DRIVER)
+        self.machine({**LINUX_CONFIG, 'gpu': False})
+        self.write('/log/systemctl', '')
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertIn('restart t3code-agents.service', self.log())
+        self.assertFalse(os.path.lexists(self.path(k.PENDING)))
+
+    def test_started_before_a_node_is_a_note(self):
+        """A node the host has that the running T3 does not (made after T3 started: nvidia-uvm on first use)."""
+        self.driver()
+        self.machine({**LINUX_CONFIG, 'gpu': True})
+        self.walled()
+        self.seen(*[p for p in DRIVER if p != '/dev/nvidia-uvm'])
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn('T3 started before /dev/nvidia-uvm', self.gpu_line(out))
+
+
+class Wsl2GpuSeen(Case):
+    """The same look into T3's /dev on WSL2: off, no /dev/dxg; on, /dev/dxg and no NVIDIA node."""
+    def seen(self, *nodes):
+        pid = self.read('/log/units/t3code-agents.service.pid').strip()
+        for p in nodes:
+            self.write(f'/proc/{pid}/root{p}', '')
+
+    def test_off(self):
+        self.walled()
+        self.seen('/dev/null')
+        self.assertEqual(self.check()[0], 0)
+        self.seen('/dev/dxg')
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('T3 sees /dev/dxg', out)
+
+    def test_on(self):
+        self.machine({**CONFIG, 'gpu': True})
+        self.walled()
+        self.seen('/dev/dxg')
+        self.assertEqual(self.check()[0], 0)
+        self.seen('/dev/nvidia0')
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('T3 sees /dev/nvidia0', out)
+
+
 class BadConfig(Case):
     def test_refused(self):
         for change, why in (({'platform': 'windows'}, 'platform: wsl2 or linux'),

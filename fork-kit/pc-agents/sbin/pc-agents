@@ -687,26 +687,87 @@ def sshd_problem():
             '`Include /etc/ssh/sshd_config.d/*.conf` at its top (as Debian and Ubuntu ship it)')
 
 
+def gpu_seen():
+    """The GPU device nodes (k.GPU_NODE) in the running T3's own /dev, as root sees it through /proc/PID/root; None
+    when no T3 runs (stopped, or still in its ExecStartPre check) or its /dev cannot be read (it just ended)."""
+    r = k.run(['/usr/bin/systemctl', 'show', '-p', 'MainPID', k.UNIT])
+    pid = k.props(r.stdout).get('MainPID', '')
+    if r.returncode or not pid.isdigit() or pid == '0':
+        return None
+    dev = f'{k.ROOT}/proc/{pid}/root/dev'
+    try:
+        names = ['/dev/' + n for n in os.listdir(dev)]
+        if os.path.isdir(dev + '/nvidia-caps') and not os.path.islink(dev + '/nvidia-caps'):
+            names += [k.NVIDIA_CAPS + '/' + n for n in os.listdir(dev + '/nvidia-caps')]
+    except OSError:
+        return None
+    return sorted(p for p in names if k.GPU_NODE.fullmatch(p) and p != k.NVIDIA_CAPS)
+
+
 def gpu_wall(c):
-    """(wall, what, why or None): whether the machine file's `gpu` turns GPU access on, and whether T3's unit on disk
-    says the same (systemd runs it as on disk: the units wall; T3 restarted since: the restart wall)."""
-    on = c['gpu']
-    # The unit skips ("-") whichever is missing, so T3 still runs: a note naming each, not a failure. No /dev/dxg:
-    # WSL gives this distro no GPU; no lib or drivers folder (a WSL update moved them, say): CUDA cannot load.
-    missing = [p for p in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers') if not k.lstat(p)]
-    what = ('GPU access is on (machine file "gpu": true): /dev/dxg, and /usr/lib/wsl/lib and /usr/lib/wsl/drivers '
-            'read-only' + (missing and ' (this distro has no ' + ', no '.join(missing) +
-                           ': the unit skips what is missing, so GPU jobs fail)' or '')
-            if on else 'GPU access is off (no "gpu": true in the machine file): no /dev/dxg, /usr/lib/wsl hidden')
+    """(wall, what, why or None): whether the machine file's `gpu` turns GPU access on, whether T3's unit on disk
+    says the same (systemd runs it as on disk: the units wall; T3 restarted since: the restart wall), and whether the
+    running T3 sees GPU device nodes the setting does not give (its own /dev)."""
+    on, wsl2 = c['gpu'], c['platform'] == 'wsl2'
+    driver = None
+    if wsl2:
+        # The unit skips ("-") whichever is missing, so T3 still runs: a note naming each, not a failure. No
+        # /dev/dxg: WSL gives this distro no GPU; no lib or drivers folder (a WSL update moved them, say): CUDA
+        # cannot load.
+        missing = [p for p in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers') if not k.lstat(p)]
+        what = ('GPU access is on (machine file "gpu": true): /dev/dxg, and /usr/lib/wsl/lib and /usr/lib/wsl/drivers '
+                'read-only' + (missing and ' (this distro has no ' + ', no '.join(missing) +
+                               ': the unit skips what is missing, so GPU jobs fail)' or '')
+                if on else 'GPU access is off (no "gpu": true in the machine file): no /dev/dxg, /usr/lib/wsl hidden')
+    else:
+        # The NVIDIA nodes this box has (the unit gives those; it skips the others). No control node or no card node:
+        # no NVIDIA driver is loaded, so GPU jobs cannot run: with gpu on, a failure that names the two ways out.
+        # No nvidia-uvm (the driver makes it on first use) or more cards than the unit lists: a note.
+        caps = k.NVIDIA_CAPS
+        have = [p for p in k.NVIDIA if k.lstat(p)] + \
+            ([f'{caps}/{n}' for n in sorted(os.listdir(k.ROOT + caps))] if os.path.isdir(k.ROOT + caps) else [])
+        more = sorted(n for n in (os.listdir(k.ROOT + '/dev') if os.path.isdir(k.ROOT + '/dev') else [])
+                      if re.fullmatch(r'nvidia\d+', n) and '/dev/' + n not in k.NVIDIA)
+        absent = [w for w, there in (('/dev/nvidiactl', '/dev/nvidiactl' in have),
+                                     ('a card node (/dev/nvidia0 ...)', set(have) & set(k.NVIDIA[:k.NVIDIA_CARDS])))
+                  if not there]
+        notes = [] if absent else \
+            (['no /dev/nvidia-uvm (the driver makes it on first use; CUDA needs it, and T3 gets it at its next start '
+              'after it is there: README "GPU access")'] if '/dev/nvidia-uvm' not in have else []) + \
+            ([f'the unit gives only the first {k.NVIDIA_CARDS} cards, not /dev/' + ', /dev/'.join(more[:3])]
+             if more else [])
+        what = ('GPU access is on (machine file "gpu": true): NVIDIA\'s device nodes, here ' +
+                (', '.join(have) or 'none') + ', and nothing else' + (notes and ' (' + '; '.join(notes) + ')' or '')
+                if on else 'GPU access is off (no "gpu": true in the machine file): no NVIDIA device node')
+        if on and absent:
+            # T3's own start check fails too, so the nodes must be there at boot: nvidia-persistenced makes them.
+            driver = ('no NVIDIA driver is loaded, or it has not made its nodes (no ' + ' and no '.join(absent) +
+                      '): install NVIDIA\'s driver and reboot, and enable nvidia-persistenced so they are there at '
+                      'boot, then run pc-agents setup again; or set "gpu": false in the machine file and run setup')
     try:
         with open(k.ROOT + k.UNIT_DIRS[0] + '/' + k.UNIT, encoding='utf-8', errors='replace') as f:
-            has = k.gpu_lines(f.read())
+            has = k.gpu_lines(f.read(), c['platform'])
     except OSError as e:
         return 'gpu', what, f'cannot read the unit ({e.strerror})'
     word = {True: 'on', False: 'off'}
-    return 'gpu', what, None if has is on else \
-        'the unit has only some of the GPU lines, neither on nor off: run pc-agents setup' if has is None else \
-        f'the unit has GPU access {word[has]}, the machine file says {word[on]}: run pc-agents setup'
+    if has is None:
+        return 'gpu', what, 'the unit has only some of the GPU lines, neither on nor off: run pc-agents setup'
+    if has is not on:
+        return 'gpu', what, \
+            f'the unit has GPU access {word[has]}, the machine file says {word[on]}: run pc-agents setup'
+    # While setup's restart is pending, the running T3 is the one from before setup's last change (the setting
+    # turned off, say): it is about to restart, and the restart wall judges it, not this.
+    seen = None if k.lstat(k.PENDING) else gpu_seen()
+    if seen is not None:
+        extra = [p for p in seen if not k.gpu_granted(c, p)]
+        if extra:
+            return 'gpu', what, (f'T3 sees {", ".join(extra[:3])}, which GPU access {word[on]} does not give: '
+                                 f'systemctl restart {k.UNIT}')
+        late = [p for p in ((k.NVIDIA if not wsl2 else ('/dev/dxg',)) if on else ())
+                if k.lstat(p) and p not in seen]
+        if late:
+            what += f' (T3 started before {", ".join(late[:3])} was there: it gets it at its next start)'
+    return 'gpu', what, driver
 
 
 def own_walls(c, before_enable=False):

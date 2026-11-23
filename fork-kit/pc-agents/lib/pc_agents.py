@@ -280,12 +280,43 @@ GPU = ('InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/run/tailscale',
        'DeviceAllow=/dev/dxg rw')
 
 
-def gpu_lines(text):
-    """Whether a unit text has GPU access: True (every GPU line, not HIDDEN), False (HIDDEN, no GPU line) or None
-    (a mix: neither the kit's unit with the setting on nor off)."""
+# linux, `gpu` on (#1027): NVIDIA's device nodes instead, and nothing else (a plain box has no /dev/dxg and no
+# /usr/lib/wsl; its driver's libraries are in /usr, which the unit already reads). Same two lines per node as /dev/dxg
+# (BindPaths puts the node in the unit's private /dev, DeviceAllow opens it), each skipped when missing ("-"). The list
+# is fixed, not read from /dev by setup: the driver makes some nodes only on first use (nvidia-uvm, nvidia-caps), and
+# a unit that changed with /dev would fail its file wall (and so stop T3) each time one appears. Cards: the first
+# NVIDIA_CARDS. /dev/nvidia-caps (MIG access files, root's alone by default) is bound as a folder, so it is opened by
+# its device class (the driver's "nvidia-caps" in /proc/devices), which holds just those files.
+NVIDIA_CARDS = 16
+NVIDIA = tuple(f'/dev/nvidia{i}' for i in range(NVIDIA_CARDS)) + \
+    ('/dev/nvidiactl', '/dev/nvidia-modeset', '/dev/nvidia-uvm', '/dev/nvidia-uvm-tools')
+NVIDIA_CAPS = '/dev/nvidia-caps'
+LINUX_GPU = ('BindPaths=' + ' '.join('-' + p for p in NVIDIA + (NVIDIA_CAPS,)),
+             *(f'DeviceAllow={p} rw' for p in NVIDIA),
+             'DeviceAllow=char-nvidia-caps rw')
+GPU_NODE = re.compile(r'/dev/(dxg|nvidia[^/]*|nvidia-caps/[^/]+)')   # a GPU device node, of either kind
+
+
+def gpu_lines(text, platform='wsl2'):
+    """Whether a unit text has GPU access: True (every GPU line of platform: wsl2's not HIDDEN), False (no GPU line;
+    wsl2: HIDDEN) or None (a mix, or the other kind's lines: neither the kit's unit with the setting on nor off)."""
     lines = set(text.splitlines())
-    has = [g in lines for g in GPU]
-    return True if all(has) and HIDDEN not in lines else False if not any(has) and HIDDEN in lines else None
+    if platform == 'wsl2':
+        has = [g in lines for g in GPU]
+        if any(g in lines for g in LINUX_GPU):
+            return None
+        return True if all(has) and HIDDEN not in lines else False if not any(has) and HIDDEN in lines else None
+    has = [g in lines for g in LINUX_GPU]
+    return None if any(g in lines for g in GPU[1:]) or any(has) and not all(has) else all(has)
+
+
+def gpu_granted(c, path):
+    """Whether T3's unit gives path (a GPU_NODE) with the machine file's `gpu` setting as it is."""
+    if not c['gpu']:
+        return False
+    if c['platform'] == 'wsl2':
+        return path == '/dev/dxg'
+    return path in NVIDIA or path.startswith(NVIDIA_CAPS + '/')
 
 
 def sandbox(c):
@@ -298,7 +329,7 @@ def sandbox(c):
     else:
         home = ['ProtectHome=tmpfs', f'BindPaths={HOME}', f'BindReadOnlyPaths={STATE}/resolv.conf:/etc/resolv.conf']
         hide = ('InaccessiblePaths=-/mnt -/media -/run/media -/tmp/.X11-unix -/run/tailscale -/run/docker.sock '
-                '-/run/containerd',)
+                '-/run/containerd', *(LINUX_GPU if c['gpu'] else ()))
     return [
         'UMask=0077',
         f'MemoryMax={c["memoryMax"]}',
