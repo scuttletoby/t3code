@@ -58,14 +58,17 @@ vi.mock(import("../media/mediaContent"), async (original) => ({
 }));
 
 import ChatMarkdown from "../ChatMarkdown";
+import { toastManager } from "../ui/toast";
 
 const HERE = EnvironmentId.make("env-here");
 
 function setup(connected: ReadonlyArray<string>) {
   state.connected = new Set(connected);
-  state.createAssetUrl.mockReset().mockResolvedValue(
-    AsyncResult.success({ relativeUrl: "/api/assets/token/app.log", expiresAt: 0 }),
-  );
+  state.createAssetUrl
+    .mockReset()
+    .mockResolvedValue(
+      AsyncResult.success({ relativeUrl: "/api/assets/token/app.log", expiresAt: 0 }),
+    );
   state.metadata.mockReset().mockResolvedValue(AsyncResult.success({ entries: [null] }));
   state.search.mockReset().mockResolvedValue(AsyncResult.success({ entries: [] }));
   state.download.mockReset().mockResolvedValue(undefined);
@@ -106,13 +109,19 @@ it("downloads a file on another environment through that environment's connectio
 
 it("asks nothing of an environment this device is not connected to", async () => {
   setup([]);
+  const toast = vi.spyOn(toastManager, "add");
   await using screen = await renderText("[app.log](/t3-environment/env-there/srv/app.log)");
   await act(async () => chips(screen.container)[0]!.click());
   await vi.waitFor(() =>
-    expect(document.body.textContent).toContain(
-      "This file is on env-there, which this device is not connected to.",
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: expect.stringContaining(
+          "This file is on env-there, which this device is not connected to.",
+        ),
+      }),
     ),
   );
+  toast.mockRestore();
   expect(state.createAssetUrl).not.toHaveBeenCalled();
   expect(state.download).not.toHaveBeenCalled();
 });

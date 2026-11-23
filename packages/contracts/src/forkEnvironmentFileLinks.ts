@@ -6,7 +6,7 @@ import * as Schema from "effect/Schema";
 
 import { EnvironmentId } from "./baseSchemas.ts";
 
-export const ENVIRONMENT_FILE_LINK_PREFIX = "/t3-environment/";
+const ENVIRONMENT_FILE_LINK_PREFIX = "/t3-environment/";
 
 /** What `t3_environment_read` tells an agent, so it can link a file on that environment. */
 export const ENVIRONMENT_FILE_LINK_AGENT_HINT = `To link a file on this environment in a reply on another environment, write \`[name](${ENVIRONMENT_FILE_LINK_PREFIX}<environmentId>/<absolute path>)\` with this result's environmentId; the user can then download it from here. Files on the reply's own environment keep plain absolute paths.`;

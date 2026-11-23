@@ -1,6 +1,5 @@
 // Fork: a chat file link under `/t3-environment/<environmentId>/` downloads through that
 // environment's own connection, with the same `assets.createUrl` and file-read scope there.
-/* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own messages are English only; upstream's translation catalogs hold no fork keys. */
 import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import {
   squashAtomCommandFailure,
