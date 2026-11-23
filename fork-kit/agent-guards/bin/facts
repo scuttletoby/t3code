@@ -65,6 +65,9 @@ def main(argv):
     projects = facts.projects_for(c, cwd) if not every else c['projects']
     found = facts.places(c, cwd, every=every, projects=projects)   # --records: only to skip their copies
     recs = [] if no_records or mode == '--check' else facts.records(c, projects, every)
+    if mode == '--records' and not recs:
+        print('note: no record repo is configured (machine file "agent-guards" part "facts": records)')
+        return 0
     if not found and not recs:
         print(f'{PROG}: no state table is configured for this folder (machine file "agent-guards" part "facts": '
               'dirs, projects, records; or FACTS_DIRS)')
@@ -93,9 +96,15 @@ def main(argv):
         lines = []
     rec_notes = []
     if recs and mode != '--index':
-        skip = {p.digest for p in found if p.digest}
-        more, rec_notes = facts.search_records(recs, words, skip, limit=50 if mode == '--records' else 10)
-        lines += more or ([f'Records: no line holds all of: {" ".join(words)}'] if not rec_notes else [])
+        skip = {p.digest: p.file for p in found if p.digest}
+        more, rec_notes, copies = facts.search_records(recs, words, skip, limit=50 if mode == '--records' else 10)
+        if more:
+            lines += more
+        elif copies:
+            lines += [f'Records: only copies of state tables hold all of: {" ".join(words)}; their rows: '
+                      f'`{PROG} --no-records {" ".join(words)}`'] + [f'  {c} (a copy of {t})' for c, t in copies]
+        elif not rec_notes:
+            lines.append(f'Records: no line holds all of: {" ".join(words)}')
     for line in lines:
         print(line)
     for n in (facts.notes(found) if mode != '--records' else []) + rec_notes:
