@@ -66,8 +66,10 @@ SSHD_CONF = '/etc/ssh/sshd_config.d/pc-agents.conf'   # linux: sshd refuses the 
 ROOT_SOCKETS = ('/run/docker.sock', '/var/run/docker.sock', '/run/containerd/containerd.sock',
                 '/run/podman/podman.sock')
 # A helper the agent may run through sudo (sudoHelpers): an absolute plain path, each folder named, then plain
-# arguments (or "" for none: sudo's own way to say no arguments). No wildcard, no ALL, no `..`, no list.
-HELPER = re.compile(r'(/(?!\.\.?(?:/| |$))[A-Za-z0-9._+-]+)+( (""|(?!ALL( |$))[A-Za-z0-9._=:/@+-]+))*')
+# arguments (or "" for none: sudo's own way to say no arguments). No wildcard, no ALL, no `..`, no list, and none of
+# sudoers' special characters in an argument (#1047): an unescaped `:` starts another `Host = Cmnd` spec on the same
+# line (`/usr/bin/id x:ALL=NOPASSWD:ALL` grants ALL), and `=`, `,`, `\`, `!` are its other separators and escapes.
+HELPER = re.compile(r'(/(?!\.\.?(?:/| |$))[A-Za-z0-9._+-]+)+( (""|(?!ALL( |$))[A-Za-z0-9._/@+-]+))*')
 # Every folder systemd reads system units and drop-ins from (systemd.unit(5)); the kit's units live in the first.
 UNIT_DIRS = ('/etc/systemd/system', '/etc/systemd/system.control', '/run/systemd/system.control',
              '/run/systemd/transient', '/run/systemd/generator.early', '/etc/systemd/system.attached',
@@ -684,7 +686,10 @@ def sudo_problem(c):
     Only an allow-listed helper's rule passes (helper_rule), or a line the machine file's sudoRules names word for
     word (blanks aside): the owner's, kept as it is, never widened."""
     who = re.compile(rf'(^|[\s,=:!(])(%?{USER}|%?#{c["agentUid"]}|ALL)($|[\s,=:)])')
-    helpers = {h.split()[0] for h in c['sudoHelpers']}
+    # Defaults!<command> lines are checked for the commands of helpers and of listed rules alike (setenv and the like
+    # would widen either)
+    helpers = {h.split()[0] for h in c['sudoHelpers']} | \
+        {x.split()[0] for r in c['sudoRules'] for x in rule_commands(USER, r) or ()}
     # a listed rule passes only while each of its commands is root's alone, as a helper's must be
     allowed = {sudo_line(r) for r in c['sudoRules']
                if all(owned_alone(x.split()[0]) for x in rule_commands(USER, r) or ['/'])}

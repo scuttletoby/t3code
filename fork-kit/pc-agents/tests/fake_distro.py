@@ -32,11 +32,15 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                            'case "$cmd" in */*) [ -x "$R$cmd" ] || [ -x "$cmd" ];; *) command -v "$cmd" >/dev/null;; esac'
                            ' || { echo "Failed to find executable $cmd: No such file or directory" >&2; exit 1; }\n',
     # journalctl: prints what the test put in /log/journal (none: an empty journal); with _SYSTEMD_INVOCATION_ID=ID,
-    # that run's lines only (/log/journal.ID: a started T3 says it is ready there, unless it is of the version
-    # in /log/t3-not-ready)
+    # that run's own lines (/log/journal.ID), with INVOCATION_ID=ID systemd's entries about the run
+    # (/log/journal.ID.start). A started T3 (systemctl's run below) writes both: its start, and T3 saying it is ready.
+    # Of the version in /log/t3-not-ready T3 says only "Listening"; of the version in /log/t3-silent nothing yet.
+    # /log/journal-none: the journal keeps nothing of a run; /log/journal-rotated: only a later line of T3's, the
+    # run's start and its ready line rotated away; /log/journal-fail: journalctl fails.
     'usr/bin/journalctl': 'R="${0%/usr/bin/journalctl}"; echo "$*" >>"$R/log/journalctl"\n'
                           '[ -e "$R/log/journal-fail" ] && { echo "Failed to open journal (test)" >&2; exit 1; }\n'
-                          'case "$1" in _SYSTEMD_INVOCATION_ID=*) cat "$R/log/journal.${1#*=}";; *) cat "$R/log/journal";; '
+                          'case "$1" in _SYSTEMD_INVOCATION_ID=*) cat "$R/log/journal.${1#*=}";; '
+                          'INVOCATION_ID=*) cat "$R/log/journal.${1#*=}.start";; *) cat "$R/log/journal";; '
                           'esac 2>/dev/null; :\n',
     'usr/bin/systemctl': 'R="${0%/usr/bin/systemctl}"; echo "$*" >>"$R/log/systemctl"; S="$R/log/units"; mkdir -p "$S"\n'
                          '[ -e "$R/log/systemctl-fail" ] && { echo "systemctl: failed (test)" >&2; exit 1; }\n'
@@ -55,11 +59,15 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '*) echo 1 >"$S/$1.code";; esac; echo "${c:-1}" >"$S/$1.status"; return; }\n'
                          '{ grep "^ExecStart=" "$R/etc/systemd/system/$1"; '
                          'cat "$R/etc/t3code/policy.json"; } >"$S/$1.active" 2>/dev/null || :\n'
-                         'i=$(printf %032x $$); echo $i >"$S/$1.invocation"; [ "$1" != t3code-agents.service ] || '
-                         '{ [ -e "$R/log/t3-not-ready" ] && grep -qF "/versions/$(cat "$R/log/t3-not-ready")/" '
-                         '"$R/etc/systemd/system/$1"; } || [ -e "$R/log/journal-none" ] || '
-                         'printf "Listening\\nT3 Code server is ready.\\n" >"$R/log/journal.$i"\n'
-                         '[ ! -e "$R/log/t3-not-ready" ] || [ -e "$R/log/journal.$i" ] || echo Listening >"$R/log/journal.$i"\n'
+                         'i=$(printf %032x $$); echo $i >"$S/$1.invocation"\n'
+                         'if [ "$1" = t3code-agents.service ] && [ ! -e "$R/log/journal-none" ]; then\n'
+                         '  of() { [ -e "$R/log/$1" ] && grep -qF "/versions/$(cat "$R/log/$1")/" '
+                         '"$R/etc/systemd/system/t3code-agents.service"; }\n'
+                         '  if [ -e "$R/log/journal-rotated" ]; then echo "a later line" >"$R/log/journal.$i"\n'
+                         '  else echo "Started t3code-agents.service" >"$R/log/journal.$i.start"\n'
+                         '    if of t3-not-ready; then echo Listening >"$R/log/journal.$i"\n'
+                         '    elif ! of t3-silent; then printf "Listening\\nT3 Code server is ready.\\n" '
+                         '>"$R/log/journal.$i"; fi; fi; fi\n'
                          'echo $$ >"$S/$1.pid"; g="$R/sys/fs/cgroup/system.slice/$1"; rm -rf "$g"; mkdir -p "$g"; '
                          'echo $$ >"$g/cgroup.procs"; python3 -I -c "import time; print(time.monotonic_ns() // 1000)" '
                          '>"$S/$1.start"; }\n'

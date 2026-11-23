@@ -873,7 +873,8 @@ again. This holds also where `stateDir` is root's (an earlier root run made it) 
 root's. It refuses rather than make the files as the home's owner, since a run as root would still leave its
 other files (kept runtimes, files in the home) root's. The lock, and the guards' `guard.log` (written before the
 lock), also refuse as root where `stateDir` is another user's. State another user left (a root run before this
-rule) is named with the command that fixes it (`chown -R <T3 user>: <stateDir>`), instead of a permission error.
+rule) is named with the command that fixes it (`chown -R <T3 user>: <stateDir>`), instead of a permission error, and
+so is a missing `stateDir` the T3 user may not make (under a folder of root's: `mkdir -p` and `chown` it as root).
 
 **Ready, not only listening.** Every wait for T3 after a start (`switch`, `back`, `rehearse`) waits for the
 server's own runtime record (`userdata/server-runtime.json` naming the new pid), which T3 writes once it has

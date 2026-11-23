@@ -402,7 +402,8 @@ class Update(Updating):
         self.assertEqual(self.installs(), installs)   # not downloaded twice
 
     def test_a_version_that_does_not_come_up_is_rolled_back_and_not_tried_again(self):
-        for name, value in (('t3-crash-version', '1.2.4'), ('http-mute', '1.2.4'), ('t3-not-ready', '1.2.4')):
+        for name, value in (('t3-crash-version', '1.2.4'), ('http-mute', '1.2.4'), ('t3-not-ready', '1.2.4'),
+                            ('t3-silent', '1.2.4')):   # started (systemd's entry), nothing printed: held, not asked
             with self.subTest(name):
                 self.write('/log/' + name, value)
                 self.releases(release('1.2.4'))
@@ -416,7 +417,7 @@ class Update(Updating):
                                  r'|no answer from T3|T3 did not say "T3 Code server is ready\.").*\); not trying '
                                  r'it again\. Back on 1\.2\.3, running$')
                 self.assertIn(state['result'], state['alert'])
-                if name == 't3-not-ready':   # never asked before it said so
+                if name in ('t3-not-ready', 't3-silent'):   # never asked before it said so
                     self.assertIn('T3 did not say', state['result'])
                 self.assertFalse(os.path.exists(self.path(VERSIONS + '/1.2.4')))   # never reused
                 self.assertEqual(self.check()[0], 0)
@@ -440,8 +441,9 @@ class Update(Updating):
 
     def test_a_journal_that_cannot_tell_does_not_fail_the_update(self):
         """#1047: the ready line is waited for where the journal can tell. A journal that keeps nothing of this run
-        (Storage=none, output elsewhere, rotated away) or cannot be read is no failure of T3: its answer decides."""
-        for name in ('journal-none', 'journal-fail'):
+        (Storage=none, output elsewhere, rotated away with the run's start) or cannot be read is no failure of T3:
+        its answer decides."""
+        for name in ('journal-none', 'journal-fail', 'journal-rotated'):
             with self.subTest(name):
                 self.write('/log/' + name, '')
                 self.releases(release('1.2.4'))

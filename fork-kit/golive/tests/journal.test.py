@@ -186,6 +186,24 @@ class LeftByAnotherUser(Base):
             self.assertIn(os.path.join(self.state, 'lock'), str(e.exception))
 
 
+class StateDirNotMakeable(Base):
+    def test_a_missing_state_folder_it_may_not_make_names_the_fix(self):
+        """#1047: a stateDir missing under a folder the T3 user may not write (one of root's) is a clear refusal with
+        the commands that fix it, not an unhandled PermissionError."""
+        parent = os.path.join(self.m.root, 'not-mine')
+        os.makedirs(parent)
+        os.chmod(parent, 0o555)
+        self.addCleanup(os.chmod, parent, 0o755)
+        state = os.path.join(parent, 'kit-state')
+        if os.access(parent, os.W_OK):
+            self.skipTest('this user may write any folder (root)')
+        with self.assertRaises(journal.WrongUser) as e:
+            with journal.lock(state, 'copy', exclusive=True):
+                self.fail('made a folder it may not')
+        self.assertIn(f'mkdir -p {state} && chown ', str(e.exception))
+        self.assertFalse(os.path.exists(state))
+
+
 class Journal(Base):
     def test_a_finished_run_reads_back_with_its_steps_and_facts(self):
         with journal.run(self.state, 'copy') as r:

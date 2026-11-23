@@ -274,8 +274,9 @@ T3 still cannot update itself (`limits.updates` stays off, T3 stays root's): roo
   downloaded: kit updates stay yours), and checks that T3 says it is ready (`T3 Code server is ready.` in this run of
   its unit's journal; a request sent before that can wait minutes for an answer), then answers on its port as the
   new version (`/.well-known/t3/environment`), within 3 minutes, and that every wall holds. Where the journal cannot
-  tell (nothing of this run in it: journald keeps nothing or rotated it away; or `journalctl` fails), T3's answer
-  alone decides, as before.
+  tell (systemd's own entry for this run's start is not in it: journald keeps nothing, or rotated it away; or
+  `journalctl` fails), T3's answer alone decides, as before. While the run's start is there and T3 has printed
+  nothing yet, no request goes out.
 - **Rollback:** when the new version does not come up, `t3Version` goes back (the `.bak` from before the switch is
   kept); if T3's unit ran the new version, T3 is stopped, the database as it is then (with its `-wal` and `-shm`) is
   copied to `/var/lib/pc-agents/db-replaced-<UTC time>-<version>` (root's alone, named in the alert, never removed
@@ -402,7 +403,9 @@ the box as it is. Same kit, same files and walls, but for these:
 **Sudo helpers.** A sudo rule for the agent fails the `sudoers` wall, on both kinds, but for one exact form: the
 line `agent ALL=(root) NOPASSWD: <command>[, <command>]` in `/etc/sudoers` or `/etc/sudoers.d`, every command named
 word for word in `sudoHelpers`, and each helper's file and every folder above it root's alone. No other user, group,
-uid, alias, run-as or tag on the line, no wildcard, no `ALL`, and no `Defaults` line for the agent or for a helper.
+uid, alias, run-as or tag on the line, no wildcard, no `ALL`, none of sudoers' special characters in an argument
+(`:` `=` `,` `\` `!`: an unescaped `:` starts another host spec on the same line), and no `Defaults` line for the
+agent or for a helper.
 sudo lets a command named without arguments run with any, so list the arguments too (`"/usr/local/sbin/agent-gpu on"`),
 or `""` for none (`"/usr/local/sbin/agent-gpu \"\""`). A rule the kit finds is kept as it is, never widened; one
 wider than this is a failed wall, which you fix (the kit never edits a sudo rule). Inside T3's unit sudo does not run
@@ -424,7 +427,8 @@ and only on the owner's word:
 - `sudoRules`: sudoers lines the `sudoers` wall passes as they are (blanks and a trailing comment aside), in one
   form only: `<agentUser> HOST=(RUNAS) [TAG:]... COMMAND[, COMMAND]`, HOST `ALL` or a host name, RUNAS `ALL` or
   user names, tags that keep sudo's environment (no `SETENV`), each COMMAND an absolute path with plain arguments
-  (no wildcard, no `ALL`). No alias of any kind and no `Defaults` line: an alias is defined somewhere the wall does
+  (no wildcard, no `ALL`, none of sudoers' special characters, as for helpers). No alias of any kind and no
+  `Defaults` line (a `Defaults!` line for a listed command fails the wall, as for a helper): an alias is defined somewhere the wall does
   not compare (a `User_Alias` for the agent still fails, and with it the rules written for it). Like a helper, a
   listed rule passes only while each command's file and every folder above it are root's alone. Every other line
   that names the agent still fails, as does any line once it differs from the list.
@@ -436,7 +440,10 @@ and only on the owner's word:
   containers), and through what its user manager reads from its home (user units, `environment.d`, Docker's own
   configuration), which the agent writes. There the agent is walled only as an ordinary unprivileged user of the
   box and by the agent firewall (it matches the uid); the unit's other walls (`NoNewPrivileges`, hidden paths,
-  `MemoryMax`, `CPUQuota`, `IPAddressAllow`) do not hold. So no sudo rule may name the agent with this key (setup
+  `MemoryMax`, `CPUQuota`, `IPAddressAllow`) do not hold. The agent firewall stops only new outgoing connections
+  (it lets established ones through), so a listener the agent opens there (a user unit, a published Docker port)
+  answers anyone who can reach the box on the LAN or the tailnet; inside the unit `SocketBindDeny` and
+  `IPAddressAllow` stop that. So no sudo rule may name the agent with this key (setup
   refuses `sudoHelpers` and `sudoRules` with it), and the `masks` wall says so on every check. Docker restarted
   (or started after T3) makes a new socket that T3's unit sees only after T3's next restart.
 

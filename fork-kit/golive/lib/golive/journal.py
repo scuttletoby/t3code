@@ -158,7 +158,12 @@ def lock(state_dir, command, exclusive, wait=False, create=True):
     if create:
         if why := _not_roots(state_dir) or wrong_owner(state_dir):
             raise WrongUser(why)
-        _ensure_dir(state_dir)
+        try:
+            _ensure_dir(state_dir)
+        except PermissionError as e:   # missing, under a folder this user may not write (one of root's)
+            me = _name(_euid())
+            raise WrongUser(f'cannot make the state folder {state_dir} ({e.strerror}: {e.filename}); as root: '
+                            f'`mkdir -p {state_dir} && chown {me}: {state_dir}`, then run this again') from None
     try:
         fd = os.open(path, (os.O_RDWR | os.O_CREAT if create else os.O_RDONLY) | os.O_CLOEXEC, 0o600)
     except FileNotFoundError:

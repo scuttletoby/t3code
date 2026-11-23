@@ -1104,16 +1104,21 @@ READY = 'T3 Code server is ready.'
 
 
 def t3_ready():
-    """Whether the T3 that runs now said READY in this run of its unit's journal (its InvocationID): True, False, or
-    None when the journal cannot tell: the run cannot be named, journalctl fails, or the run has no line there at all
-    (journald keeps nothing, sends the unit's output elsewhere, or rotated an older run's lines away)."""
+    """Whether the T3 that runs now said READY in this run of its unit's journal (its InvocationID): True; False
+    while the journal holds this run from its start (systemd's own entry about it, INVOCATION_ID=) but no READY yet,
+    T3 having printed nothing or not that line; None when the journal cannot tell: the run cannot be named,
+    journalctl fails, or the run's start is not there (journald keeps nothing, or rotated it away with, maybe, the
+    ready line of a run that started long ago)."""
     got = k.props(k.run(['/usr/bin/systemctl', 'show', '-p', 'InvocationID', k.UNIT]).stdout).get('InvocationID', '')
     if not re.fullmatch(r'[0-9a-f]{32}', got):
         return None
-    r = k.run(['/usr/bin/journalctl', f'_SYSTEMD_INVOCATION_ID={got}', '-o', 'cat', '--no-pager'], timeout=60)
-    if r.returncode or not r.stdout.strip():
+    said, start = (k.run(['/usr/bin/journalctl', f'{field}={got}', '-o', 'cat', '--no-pager'], timeout=60)
+                   for field in ('_SYSTEMD_INVOCATION_ID', 'INVOCATION_ID'))
+    if said.returncode or start.returncode:
         return None
-    return READY in r.stdout.splitlines()
+    if READY in said.stdout.splitlines():
+        return True
+    return False if start.stdout.strip() else None
 
 
 def serves(c, version):

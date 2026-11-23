@@ -815,7 +815,12 @@ class SudoRules(Linux):
                      'agent ALL=(RA) NOPASSWD: /usr/bin/id', 'agent HOSTS=(root) NOPASSWD: /usr/bin/id',
                      'agent ALL=(root) SETENV: /usr/bin/id', 'agent ALL=(root) NOPASSWD: /usr/bin/id *',
                      'agent ALL=(root) NOPASSWD: ALL', 'bob ALL=(root) NOPASSWD: /usr/bin/id',
-                     'agent ALL=(root) NOPASSWD: /usr/bin/id : box=(root) /bin/sh'):
+                     'agent ALL=(root) NOPASSWD: /usr/bin/id : box=(root) /bin/sh',
+                     # an unescaped ':' starts a second host spec: these two grant NOPASSWD: ALL
+                     'agent ALL=(root) NOPASSWD: /usr/bin/id x:ALL=NOPASSWD:ALL',
+                     'agent ALL=(root) NOPASSWD: /usr/local/sbin/agent-restart x : ALL = NOPASSWD: ALL',
+                     'agent ALL=(root) NOPASSWD: /usr/bin/id a,b', 'agent ALL=(root) NOPASSWD: /usr/bin/id a\\,b',
+                     'agent ALL=(root) NOPASSWD: /usr/bin/id !x'):
             with self.subTest(line=line):
                 self.machine({**LINUX_CONFIG, 'sudoRules': [line]})
                 code, out = self.setup_run()
@@ -824,6 +829,12 @@ class SudoRules(Linux):
                 code, out = self.check()
                 self.assertEqual(code, 1, out)
                 self.assertIn('sudoRules', out)
+
+    def test_a_defaults_line_for_a_listed_command_fails(self):
+        """A Defaults!<command> line (setenv lets the agent hand LD_PRELOAD to a root command) widens a listed rule
+        as it would a helper."""
+        self.rule(self.RULE, True)
+        self.rule(f'{self.RULE}\nDefaults!{self.CMD} setenv', False)
 
     def test_an_alias_defined_elsewhere_still_fails(self):
         """A User_Alias naming the agent is never listed, so it fails, and with it the rules written for it."""
@@ -840,6 +851,8 @@ class BadConfig(Case):
                             ({'sudoHelpers': ['/usr/bin/../bin/sh']}, 'an absolute path'),
                             ({'sudoHelpers': [HELPER + ' ALL']}, 'an absolute path'),
                             ({'sudoHelpers': [HELPER + ', /bin/sh']}, 'an absolute path'),
+                            ({'sudoHelpers': ['/usr/bin/id x:ALL=NOPASSWD:ALL']}, 'an absolute path'),
+                            ({'sudoHelpers': [HELPER + ' a=b']}, 'an absolute path'),
                             ({'sudoHelpers': [f'/usr/local/sbin/h{i}' for i in range(9)]}, 'at most 8')):
             with self.subTest(change=change):
                 self.machine({**CONFIG, **change})
