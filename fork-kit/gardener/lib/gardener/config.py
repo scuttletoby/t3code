@@ -31,7 +31,7 @@ REQ = machine_file.REQUIRED
 MachineFileError = machine_file.MachineFileError
 
 CHECKS_DIR = os.path.join(_kit, 'checks')
-GENERAL_CHECKS = ('context-budget', 'facts', 'install-drift', 'workflows-off', 'worktrees')
+GENERAL_CHECKS = ('context-budget', 'facts', 'install-drift', 'review-tiers', 'workflows-off', 'worktrees')
 NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]{0,63}$')
 REPO_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$')
 TIME_RE = re.compile(r'^([01][0-9]|2[0-3]):([0-5][0-9])$')

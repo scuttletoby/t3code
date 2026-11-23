@@ -1,10 +1,10 @@
 """The general checks shipped with the kit, each run the way the runner runs it (the contract context on stdin) on
-fixture files, temporary git repositories, a fake `gh` and a fake `facts`. Every line they print must be a finding.
+fixture files, temporary git repositories, a fake `gh` (the GitHub API, GraphQL search too) and a fake `facts`. Every line they print must be a finding.
 No network, no root.
 
   python3 -I -B fork-kit/gardener/tests/checks.test.py
 """
-import hashlib, json, os, subprocess, sys, unittest
+import hashlib, json, os, shutil, subprocess, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -19,10 +19,11 @@ class Check(gf.Temp):
 
     env = {}
 
-    def run_check(self, name, options=None, fix=False, repo='example-owner/app', gh='gh', code=0):
+    def run_check(self, name, options=None, fix=False, repo='example-owner/app', gh='gh', code=0, script=None,
+                  **more):
         ctx = {'version': contract.VERSION, 'project': {'name': 'example', 'repo': repo, 'root': self.root},
-               'check': name, 'options': options or {}, 'fix': fix, 'today': '2026-11-23', 'gh': gh}
-        r = subprocess.run([sys.executable, '-I', '-B', os.path.join(gf.CHECKS, name)], input=json.dumps(ctx),
+               'check': name, 'options': options or {}, 'fix': fix, 'today': '2026-11-23', 'gh': gh, **more}
+        r = subprocess.run([sys.executable, '-I', '-B', script or os.path.join(gf.CHECKS, name)], input=json.dumps(ctx),
                            capture_output=True, text=True, cwd=self.root, timeout=120,
                            env=dict(os.environ, **self.env))
         self.assertEqual(r.returncode, code, r.stderr)
@@ -158,6 +159,15 @@ class Worktrees(Check):
                                ('worktrees.prunable', 'worktree record whose folder is gone'),
                                ('worktrees.stale', 'worktree of branch old-work')])
         self.assertTrue(os.path.isdir(os.path.join(trees, 'merged-branch')))      # report only
+
+    def test_a_branch_named_like_another_ref_is_read_by_its_full_name(self):
+        """refname:short writes `heads/x` when a tag or remote has the short name x too; git then reads
+        refs/heads/heads/x, and the whole check failed on a real repository."""
+        self.merged('pr7')
+        self.git(self.root, 'update-ref', 'refs/remotes/pr7', 'HEAD')
+        self.git(self.root, 'tag', 'pr7')
+        found = self.run_check('worktrees')
+        self.assertEqual([(f['id'], f['text'].split(':')[0]) for f in found], [('branches.merged', 'branch pr7')])
 
     def test_fix_prunes_only_records_of_gone_folders(self):
         trees = os.path.join(self.tmp, 'trees')
@@ -362,6 +372,484 @@ class InstallDrift(Check):
         found = self.run_check('install-drift', self.opts())
         self.assertEqual(self.ids(found), ['install-drift.unreadable'])
 
+SHA = 'a' * 40
+QUEUE = {'required_checks': ['ci', 'head_check'], 'merge_method': 'squash', 'bot_logins': ['helper-bot'],
+         'lens_author_associations': ['OWNER', 'MEMBER'],
+         'override': {'prefix': 'override for head', 'author_association': 'OWNER'},
+         'ready_command': 'gh pr merge {pr} --auto --squash', 'push_command': 'git push',
+         'lens_format_doc': 'README.md', 'head_check': 'head_check'}
+REVIEW = {'version': 1, 'mode': 'enforce',
+          'rules': [{'name': 'gate', 'weight': 'critical', 'paths': ['ci/**'], 'lenses': ['merge-path', 'state']},
+                    {'name': 'code', 'weight': 'normal', 'paths': ['**'], 'lenses': ['code']}],
+          'lenses': {'merge-path': {'prompt': 'l/merge-path.md'}, 'state': {'prompt': 'l/state.md'},
+                     'code': {'prompt': 'l/code.md'}},
+          'min_lenses': {'critical': 2, 'normal': 1, 'light': 0}, 'findings': True, 'state_line': False,
+          'rounds': {'approach_at': 3, 'max': 4, 'approach_lens': 'code'}}
+TIERS = {'rules': [{'paths': ['**/*.md'], 'tier': 0}],
+         'registry': {'file': 'modules.json', 'rows': 'modules', 'paths': 'paths', 'tier': 'tier', 'default': 2},
+         'unmatched': 0,
+         'requires': {'2': {'minLenses': 2, 'lenses': [{'name': 'correctness', 'match': 'correct'}]},
+                      '3': {'minLenses': 3, 'lenses': [{'name': 'data integrity', 'match': 'data.?integrity',
+                                                        'count': 2}]}}}
+MODULES = {'modules': [{'id': 'shop', 'paths': ['mods/shop'], 'tier': 3}, {'id': 'chat', 'paths': ['mods/chat']},
+                       {'id': 'web', 'paths': 'mods/web', 'tier': 1}]}
+MERGED = '2026-11-20T12:00:00Z'
+
+
+def post(body, when='2026-11-20T11:00:00Z', assoc='OWNER', login='owner-one', kind='User', edited=False,
+         hidden=False):
+    return {'body': body, 'createdAt': when, 'authorAssociation': assoc, 'includesCreatedEdit': edited,
+            'isMinimized': hidden, 'url': 'https://example.invalid/c', 'author': {'login': login, '__typename': kind}}
+
+
+def lens_post(name, **kw):
+    return post(f'Lens: {name} · read at {SHA}\n\nNo findings.', **kw)
+
+
+def approval(when='2026-11-20T11:00:00Z', assoc='OWNER', rid='r1'):
+    return {'id': rid, 'body': '', 'submittedAt': when, 'state': 'APPROVED', 'authorAssociation': assoc,
+            'includesCreatedEdit': False, 'isMinimized': False, 'url': 'https://example.invalid/r',
+            'author': {'login': 'owner-one', '__typename': 'User'}}
+
+
+def pr(number, paths, comments=(), reviews=(), merged=MERGED, labels=(), author='dev-one', files_total=None,
+       comments_total=None, updated='2026-11-20T12:30:00Z'):
+    return {'number': number, 'mergedAt': merged, 'updatedAt': updated, 'author': {'login': author, '__typename': 'User'},
+            'labels': {'nodes': [{'name': n} for n in labels]},
+            'files': {'totalCount': len(paths) if files_total is None else files_total,
+                      'nodes': [{'path': p} for p in paths]},
+            'comments': {'totalCount': len(comments) if comments_total is None else comments_total,
+                         'nodes': list(comments)},
+            'reviews': {'totalCount': len(reviews), 'nodes': list(reviews)}}
+
+
+class ReviewTiers(Check):
+    """review-tiers against a fake gh: `api rate_limit` and paged `api graphql` searches, every call logged."""
+
+    def setUp(self):
+        super().setUp()
+        self.cache = os.path.join(self.tmp, 'cache', 'review-tiers')
+        self.log = os.path.join(self.tmp, 'gh-calls.jsonl')
+        self.repo(queue=dict(QUEUE), modules=MODULES)
+
+    def repo(self, queue=None, modules=None):
+        os.makedirs(self.root, exist_ok=True)
+        if not os.path.isdir(os.path.join(self.root, '.git')):
+            self.git(self.root, 'init', '-q', '-b', 'main')
+        if queue is not None:
+            self.write('.github/pr-queue.json', json.dumps(queue))
+        if modules is not None:
+            self.write('modules.json', json.dumps(modules))
+        self.git(self.root, 'add', '-A')
+        self.git(self.root, 'commit', '-q', '--allow-empty', '-m', 'files')
+
+    def fake_gh(self, pages, remaining=4000, fail_page=None, fail_first=()):
+        """pages: lists of pull request nodes, one per search page. fail_page: that page fails (1 = the first).
+        fail_first: pages of these sizes get a GraphQL error. A query with an "updated" range (a resumed search) gets
+        only the nodes in it, paged again at the same size (the search is newest first, like GitHub's)."""
+        data = os.path.join(self.tmp, 'gh-pages.json')
+        with open(data, 'w') as f:
+            json.dump(pages, f)
+        return self.script('gh', f"""
+            import json, re, sys
+            a = sys.argv[1:]
+            with open({self.log!r}, 'a') as log:
+                log.write(json.dumps(a) + '\\n')
+            if a == ['api', 'rate_limit']:
+                print(json.dumps({{'resources': {{'graphql': {{'remaining': {remaining}}}}}}}))
+                sys.exit(0)
+            assert a[:2] == ['api', 'graphql'], a
+            opts = dict(x.split('=', 1) for x in a[2:] if '=' in x)
+            page = int(opts.get('after', 'c0')[1:])
+            if page + 1 == {fail_page!r}:
+                sys.stderr.write('HTTP 502: Bad Gateway\\n')
+                sys.exit(1)
+            if int(opts['first']) in {tuple(fail_first)!r}:
+                print(json.dumps({{'errors': [{{'message': 'Something went wrong while executing your query.'}}]}}))
+                sys.exit(0)
+            pages = json.load(open({data!r}))
+            m = re.search(r'updated:(?:<=|(\\S+)\\.\\.)(\\S+)', opts['q'])
+            if m:
+                lo, hi = [x and x.replace('+00:00', 'Z') for x in m.groups()]
+                size = max([len(p) for p in pages] + [1])
+                keep = [n for p in pages for n in p if n['updatedAt'] <= hi and (not lo or n['updatedAt'] >= lo)]
+                pages = [keep[i:i + size] for i in range(0, len(keep), size)] or [[]]
+            more = page + 1 < len(pages)
+            print(json.dumps({{'data': {{'rateLimit': {{'cost': 1, 'remaining': {remaining} - page}},
+                              'search': {{'pageInfo': {{'hasNextPage': more, 'endCursor': 'c%d' % (page + 1)}},
+                                         'nodes': pages[page] if pages else []}}}}}}))
+        """)
+
+    def calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return [json.loads(ln) for ln in f]
+
+    def queries(self):
+        return [dict(x.split('=', 1) for x in c[2:] if '=' in x and x.startswith('q='))['q']
+                for c in self.calls() if c[:2] == ['api', 'graphql']]
+
+    def check(self, gh, options=None, code=0, **more):
+        opts = {'tiers': TIERS} if options is None else options
+        more.setdefault('cacheDir', self.cache)
+        return self.run_check('review-tiers', opts, gh=gh, code=code, **more)
+
+    def by_pr(self, found):
+        return {f['where']: f for f in found if f['id'] in ('review-tiers.skipped', 'review-tiers.short')}
+
+    # --- verdicts --------------------------------------------------------------------------------------------------
+
+    def test_each_tier_asks_for_its_lenses(self):
+        gh = self.fake_gh([[
+            pr(1, ['docs/a.md', 'mods/chat/README.md']),                                    # tier 0: nothing needed
+            pr(2, ['mods/chat/Chat.java'], [lens_post('correctness')]),                     # tier 2, one lens
+            pr(3, ['mods/chat/Chat.java'], [lens_post('correctness-ops'), lens_post('design-tests')]),   # enough
+            pr(4, ['mods/shop/Shop.java'], [lens_post(n) for n in ('correctness', 'design', 'tests',
+                                                                    'data-integrity-1')]),  # tier 3: one DI
+            pr(5, ['mods/shop/Shop.java'], [lens_post(n) for n in ('correctness', 'data-integrity-1',
+                                                                    'data integrity 2')]),  # tier 3: enough
+            pr(6, ['tools/x.sh']),                                                          # unmatched: tier 0
+            pr(7, ['mods/web/a.js']),                                                       # tier 1: asks nothing
+            pr(8, ['mods/chat/Chat.java'], [lens_post('design'), lens_post('tests')]),      # no correctness
+            pr(9, ['mods/chatter/x.java', 'mods/chat'], [lens_post('correctness'), lens_post('design')]),
+        ]])
+        found = self.check(gh)
+        got = self.by_pr(found)
+        self.assertEqual(sorted(got), ['#2', '#4', '#8'])
+        self.assertIn('tier 2 asks: needs 2 lens(es), found 1 (lenses before the merge: correctness)', got['#2']['text'])
+        self.assertIn('tier 3 asks: needs 2 data integrity lens(es), found 1', got['#4']['text'])
+        self.assertIn('needs 1 correctness lens(es), found 0', got['#8']['text'])
+        self.assertEqual({w: (f['id'], f['severity']) for w, f in got.items()},     # a kind missing: warn at the top
+                         {'#2': ('review-tiers.short', 'info'), '#4': ('review-tiers.short', 'warn'),
+                          '#8': ('review-tiers.short', 'info')})
+
+    def test_only_counted_authors_and_comments_before_the_merge_count(self):
+        gh = self.fake_gh([[
+            pr(1, ['mods/chat/C.java'], [lens_post('correctness'), lens_post('design', assoc='NONE')]),
+            pr(2, ['mods/chat/C.java'], [lens_post('correctness'), lens_post('design', login='helper-bot')]),
+            pr(3, ['mods/chat/C.java'], [lens_post('correctness'), lens_post('design', when='2026-11-21T09:00:00Z')]),
+            pr(4, ['mods/chat/C.java'], [lens_post('correctness'), lens_post('design', assoc='MEMBER')]),
+        ]])
+        found = self.check(gh)
+        self.assertEqual(sorted(self.by_pr(found)), ['#1', '#2'])
+        late = [f for f in found if f['id'] == 'review-tiers.late']           # #3: enough only with the late lens
+        self.assertEqual([(f['where'], f['severity']) for f in late], [('#3', 'info')])
+        self.assertIn('lenses after the merge: design', late[0]['text'])
+
+    def test_a_review_after_the_merge_settles_the_warning_as_the_hint_says(self):
+        late = dict(when='2026-11-21T09:00:00Z')
+        gh = self.fake_gh([[
+            pr(1, ['mods/chat/C.java'], [lens_post('correctness', **late), lens_post('design', **late)]),   # enough
+            pr(2, ['mods/chat/C.java'], [lens_post('design', **late)]),                    # still not enough
+            pr(3, ['mods/shop/S.java'], [lens_post(n, **late) for n in ('correctness', 'data integrity 1',
+                                                                        'data-integrity-2')]),
+        ]])
+        found = self.check(gh, {'tiers': TIERS, 'waivers': ['Retro waiver']})
+        self.assertEqual([(f['id'], f['where'], f['severity']) for f in found],
+                         [('review-tiers.late', '#1', 'info'), ('review-tiers.skipped', '#2', 'warn'),
+                          ('review-tiers.late', '#3', 'info')])
+        self.assertIn('lens after the merge: design', found[1]['text'])
+        self.assertEqual(found[1]['fix'], 'review it now: lens comments on the pull request settle this, even after '
+                                          'the merge; if it needed no (more) review, a comment starting "Retro '
+                                          'waiver: why"')
+
+    def test_no_lens_at_all_is_told_apart_from_a_kind_missing(self):
+        gh = self.fake_gh([[
+            pr(1, ['mods/chat/C.java']),
+            pr(2, ['mods/chat/C.java'], [lens_post('design')]),
+            pr(3, ['mods/shop/S.java']),
+            pr(4, ['mods/chat/C.java'], reviews=[approval()]),
+        ]])
+        got = {f['where']: (f['id'], f['severity']) for f in self.check(gh)}
+        self.assertEqual(got, {'#1': ('review-tiers.skipped', 'warn'), '#2': ('review-tiers.short', 'info'),
+                               '#3': ('review-tiers.skipped', 'warn'), '#4': ('review-tiers.skipped', 'warn')})
+        os.remove(self.log)
+        got = {f['where']: f['id'] for f in self.check(gh, {'tiers': dict(TIERS, approvalsCount=True)}, cacheDir='')}
+        self.assertEqual(got['#4'], 'review-tiers.short')                 # a counted approval is some review
+
+    def test_approvals_count_only_when_asked(self):
+        node = pr(1, ['mods/chat/C.java'], [lens_post('correctness')], [approval()])
+        self.assertEqual(sorted(self.by_pr(self.check(self.fake_gh([[node]])))), ['#1'])
+        tiers = dict(TIERS, approvalsCount=True)
+        os.remove(self.log)
+        self.assertEqual(self.by_pr(self.check(self.fake_gh([[node]]), {'tiers': tiers}, cacheDir='')), {})
+
+    def test_too_many_files_is_judged_at_the_top_tier(self):
+        gh = self.fake_gh([[pr(1, ['docs/a.md'], [lens_post('correctness'), lens_post('design')], files_total=300,
+                               comments_total=150)]])
+        got = self.by_pr(self.check(gh))
+        self.assertIn('tier 3 asks', got['#1']['text'])
+        self.assertIn('it changed more than 100 files', got['#1']['text'])
+        self.assertIn('only its last 100 comments and 50 reviews were read', got['#1']['text'])
+
+    def test_override_waiver_and_exemptions_settle_a_pull_request(self):
+        gh = self.fake_gh([[
+            pr(1, ['mods/chat/C.java'], [post(f'override for head {SHA}: urgent fix')]),
+            pr(2, ['mods/chat/C.java'], [post(f'override for head {SHA}: urgent fix', edited=True)]),
+            pr(3, ['mods/chat/C.java'], [post(f'override for head {SHA}: urgent fix', assoc='MEMBER')]),
+            pr(4, ['mods/chat/C.java'], [post('Retro waiver: a version bump only\nmore',
+                                              when='2026-11-22T08:00:00Z')]),
+            pr(5, ['mods/chat/C.java'], [post('Retro waiver: a version bump only', assoc='NONE')]),
+            pr(6, ['mods/chat/C.java'], [post('see the retro waiver: below')]),       # not the first words
+            pr(7, ['mods/chat/C.java'], labels=['no-review']),
+            pr(8, ['mods/chat/C.java'], author='Release-Bot'),
+            pr(9, ['mods/chat/C.java'], [post(f'override for head {SHA}: late', when='2026-11-21T09:00:00Z')]),
+        ]])
+        got = self.by_pr(self.check(gh, {'tiers': TIERS, 'waivers': ['retro waiver'], 'exemptLabels': ['no-review'],
+                                         'exemptAuthors': ['release-bot']}))
+        self.assertEqual(sorted(got), ['#2', '#3', '#5', '#6', '#9'])
+
+    def test_the_gate_review_block_judges_without_tiers(self):
+        self.repo(queue=dict(QUEUE, review=REVIEW))
+        gh = self.fake_gh([[
+            pr(1, ['ci/run.sh'], [lens_post('merge-path')]),
+            pr(2, ['ci/run.sh'], [lens_post('merge-path'), lens_post('state')]),
+            pr(3, ['src/a.ts'], [lens_post('code')]),
+            pr(4, ['src/a.ts']),
+        ]])
+        got = self.by_pr(self.check(gh, {}))
+        self.assertEqual(sorted(got), ['#1', '#4'])
+        self.assertIn('less review than critical asks: needs lens state; 2 lens(es), found 1', got['#1']['text'])
+        self.assertEqual(got['#4']['text'], 'merged with no review: needs lens code; 1 lens(es), found 0 (normal)')
+
+    def test_too_many_files_is_judged_critical_by_the_review_block_too(self):
+        self.repo(queue=dict(QUEUE, review=REVIEW))
+        got = self.by_pr(self.check(self.fake_gh([[pr(1, ['src/a.ts'], [lens_post('code')], files_total=300)]]), {}))
+        self.assertIn('less review than critical asks: needs 2 lens(es), found 1', got['#1']['text'])
+        self.assertEqual(got['#1']['severity'], 'warn')
+
+    def test_the_registry_and_queue_config_come_from_git_not_the_working_tree(self):
+        self.write('modules.json', json.dumps({'modules': [{'id': 'chat', 'paths': ['mods/chat'], 'tier': 0}]}))
+        self.write('.github/pr-queue.json', json.dumps(dict(QUEUE, lens_author_associations=['NONE'])))
+        gh = self.fake_gh([[pr(1, ['mods/chat/C.java'], [lens_post('correctness')])]])
+        got = self.by_pr(self.check(gh))
+        self.assertIn('found 1', got['#1']['text'])                 # tier 2 from git; OWNER counted, as in git
+
+    def test_no_rules_no_repo_and_bad_options(self):
+        gh = self.fake_gh([[]])
+        self.assertEqual(self.ids(self.check(gh, {})), ['review-tiers.no-rules'])
+        self.assertEqual(self.ids(self.check(gh, repo='')), ['review-tiers.no-repo'])
+        self.assertEqual(self.calls(), [])                           # neither asked GitHub anything
+        for opts, why in (({'tiers': dict(TIERS, colour=1)}, "unknown key 'colour'"),
+                          ({'tiers': dict(TIERS, requires={})}, 'must name at least one tier'),
+                          ({'tiers': TIERS, 'days': 0}, 'days must be'),
+                          ({'tiers': TIERS, 'repo': 'other-owner/secret'}, 'there is no "repo" option'),
+                          ({'tiers': TIERS, 'repo': 'example-owner/app'}, 'there is no "repo" option'),
+                          ({'tiers': TIERS, 'queueConfig': 'gone.json'}, 'not in the project root'),
+                          ({'tiers': dict(TIERS, registry=dict(TIERS['registry'], file='gone.json'))},
+                           'not in the project root')):
+            with self.subTest(why=why):
+                self.check(gh, opts, code=1)
+                self.assertIn(why, self.last_stderr)
+
+    def test_a_comment_the_lens_rules_cannot_read_is_a_warning(self):
+        bad = post('x')
+        bad['body'] = 5                                              # not text: the lens rules raise
+        got = self.check(self.fake_gh([[pr(1, ['mods/chat/C.java'], [bad])]]))
+        self.assertEqual(self.ids(got), ['review-tiers.unread'])
+        self.assertEqual(got[0]['where'], '#1')
+
+    # --- the GitHub budget -------------------------------------------------------------------------------------------
+
+    def test_one_search_and_the_query(self):
+        self.check(self.fake_gh([[pr(1, ['docs/a.md'])], [pr(2, ['docs/b.md'])]]))
+        self.assertEqual([c[:2] for c in self.calls()], [['api', 'rate_limit'], ['api', 'graphql'], ['api', 'graphql']])
+        self.assertEqual(self.queries()[0],
+                         'repo:example-owner/app is:pr is:merged base:main merged:>=2026-11-17 sort:updated-desc')
+
+    def test_a_low_budget_searches_nothing_and_judges_the_cache(self):
+        self.check(self.fake_gh([[pr(1, ['mods/chat/C.java'])]]))
+        os.remove(self.log)
+        found = self.check(self.fake_gh([[]], remaining=500))
+        self.assertEqual(self.ids(found), ['review-tiers.budget', 'review-tiers.skipped'])
+        self.assertEqual(self.queries(), [])
+
+    def test_a_cut_off_search_goes_on_where_it_stopped_until_every_pull_request_is_judged(self):
+        """Newest first, one page a run: three runs read three pages (each run reads its cut-off second again), then the
+        next day searches only what changed."""
+        nodes = [pr(i, ['mods/chat/C.java'], updated=f'2026-11-22T{20 - i}:00:00Z') for i in range(1, 8)]
+        pages = [nodes[:3], nodes[3:6], nodes[6:]]
+        opts = {'tiers': TIERS, 'maxPages': 1}
+        seen = []
+        for run in range(3):
+            if os.path.exists(self.log):
+                os.remove(self.log)
+            found = self.check(self.fake_gh(pages), opts)
+            seen.append((sorted(self.by_pr(found)), [f['severity'] for f in found if f['id'] == 'review-tiers.partial'],
+                         self.queries()))
+        base = 'repo:example-owner/app is:pr is:merged base:main merged:>=2026-11-17 sort:updated-desc'
+        self.assertEqual(seen, [
+            (['#1', '#2', '#3'], ['warn'], [base]),
+            (['#1', '#2', '#3', '#4', '#5'], ['warn'], [base + ' updated:<=2026-11-22T17:00:00+00:00']),
+            ([f'#{i}' for i in range(1, 8)], [], [base + ' updated:<=2026-11-22T15:00:00+00:00'])])
+        with open(self.cache_file()) as f:
+            data = json.load(f)
+        self.assertEqual((data['searchedDay'], 'resume' in data), ('2026-11-23', False))
+        os.remove(self.log)
+        self.check(self.fake_gh([[]]), opts, today='2026-11-24')
+        self.assertEqual(self.queries(), [base.replace('11-17', '11-18') + ' updated:>=2026-11-22'])
+
+    def test_a_resumed_search_keeps_its_lower_day_and_a_finished_one_searches_on_in_the_same_run(self):
+        self.check(self.fake_gh([[pr(1, ['docs/a.md'])]]), today='2026-11-20')       # search day 11-20
+        os.remove(self.log)
+        pages = [[pr(i, ['docs/a.md'], updated=f'2026-11-2{3 - i}T10:00:00Z')] for i in range(1, 3)]
+        self.check(self.fake_gh(pages), {'tiers': TIERS, 'maxPages': 1})
+        with open(self.cache_file()) as f:
+            self.assertEqual(json.load(f)['resume'], {'day': '2026-11-23', 'since': '2026-11-19',
+                                                      'before': '2026-11-22T10:00:00Z'})
+        os.remove(self.log)
+        self.check(self.fake_gh(pages), {'tiers': TIERS, 'maxPages': 3})
+        self.assertEqual([q.split('sort:updated-desc ')[1] for q in self.queries()],
+                         ['updated:2026-11-19T00:00:00+00:00..2026-11-22T10:00:00+00:00'] * 2
+                         + ['updated:>=2026-11-22'])
+
+    def test_a_page_of_one_second_does_not_stop_the_search_for_ever(self):
+        same = '2026-11-22T10:00:00Z'
+        pages = [[pr(1, ['docs/a.md'], updated=same), pr(2, ['docs/a.md'], updated=same)],
+                 [pr(3, ['docs/a.md'], updated='2026-11-21T10:00:00Z')]]
+        for run in range(2):
+            self.check(self.fake_gh(pages), {'tiers': TIERS, 'maxPages': 1})
+        with open(self.cache_file()) as f:
+            self.assertEqual(json.load(f)['resume']['before'], '2026-11-22T09:59:59Z')
+        self.check(self.fake_gh(pages), {'tiers': TIERS, 'maxPages': 1})
+        with open(self.cache_file()) as f:
+            self.assertEqual(sorted(json.load(f)['prs']), ['1', '2', '3'])
+
+    def test_a_broken_resume_point_is_dropped(self):
+        self.check(self.fake_gh([[]]))
+        with open(self.cache_file()) as f:
+            data = json.load(f)
+        for bad in ({'day': '2026-11-23', 'since': '', 'before': 'yesterday'}, {'day': '2026-11-23'}, [],
+                    {'day': '2026-12-30', 'since': '', 'before': '2026-11-22T10:00:00Z'}):
+            with self.subTest(bad=bad):
+                with open(self.cache_file(), 'w') as f:
+                    json.dump(dict(data, resume=bad), f)
+                os.remove(self.log)
+                self.check(self.fake_gh([[]]))
+                self.assertIn('resume point in the cache is broken', self.last_stderr)
+                self.assertEqual([q.split('sort:updated-desc')[1] for q in self.queries()], [' updated:>=2026-11-22'])
+
+    def test_a_page_github_cannot_answer_is_asked_again_smaller(self):
+        found = self.check(self.fake_gh([[pr(1, ['mods/chat/C.java'])]], fail_first=[20]))
+        self.assertEqual(sorted(self.by_pr(found)), ['#1'])
+        firsts = [dict(x.split('=', 1) for x in c[2:] if '=' in x)['first'] for c in self.calls() if c[1] == 'graphql']
+        self.assertEqual(firsts, ['20', '5'])
+        self.check(self.fake_gh([[]], fail_first=[20, 5]), code=1)
+        self.assertIn('Something went wrong', self.last_stderr)
+
+    def test_the_budget_falling_while_searching_stops_the_search(self):
+        pages = [[pr(i, ['docs/a.md'])] for i in range(1, 4)]
+        found = self.check(self.fake_gh(pages, remaining=1000))   # 999 left after page 1
+        self.assertIn('review-tiers.partial', self.ids(found))
+        self.assertEqual(len(self.queries()), 2)
+
+    # --- state: runs again, stops half-way, old or empty state ------------------------------------------------------
+
+    def cache_file(self):
+        return os.path.join(self.cache, 'cache.json')
+
+    def test_runs_again_the_same_day_and_the_next_day_search_only_what_changed(self):
+        self.check(self.fake_gh([[pr(1, ['mods/chat/C.java']), pr(2, ['docs/a.md'])]]))
+        os.remove(self.log)
+        found = self.check(self.fake_gh([[pr(2, ['mods/chat/C.java'])]]))   # #2 updated; #1 from the cache
+        self.assertIn('updated:>=2026-11-22', self.queries()[0])
+        self.assertEqual(sorted(self.by_pr(found)), ['#1', '#2'])
+        os.remove(self.log)
+        found = self.check(self.fake_gh([[]]), today='2026-11-24')
+        self.assertIn('merged:>=2026-11-18 sort:updated-desc updated:>=2026-11-22', self.queries()[0])
+        self.assertEqual(sorted(self.by_pr(found)), ['#1', '#2'])
+        os.remove(self.log)
+        found = self.check(self.fake_gh([[]]), today='2026-11-28')          # #1 and #2 fell out of the window
+        self.assertEqual(self.by_pr(found), {})
+        with open(self.cache_file()) as f:
+            self.assertEqual(json.load(f)['prs'], {})
+
+    def test_a_wider_window_searches_all_of_it(self):
+        self.check(self.fake_gh([[]]))
+        os.remove(self.log)
+        self.check(self.fake_gh([[]]), {'tiers': TIERS, 'days': 30})
+        self.assertEqual(self.queries()[0], 'repo:example-owner/app is:pr is:merged base:main merged:>=2026-10-25 '
+                                            'sort:updated-desc')
+
+    def test_stopped_half_way_leaves_the_cache_as_it_was(self):
+        self.check(self.fake_gh([[pr(1, ['mods/chat/C.java'])]]))
+        with open(self.cache_file(), 'rb') as f:
+            before = f.read()
+        self.check(self.fake_gh([[pr(2, ['docs/a.md'])], [pr(3, ['docs/a.md'])]], fail_page=2), code=1)
+        self.assertIn('HTTP 502', self.last_stderr)
+        with open(self.cache_file(), 'rb') as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual([n for n in os.listdir(self.cache) if n != 'cache.json'], [])    # no temporary file left
+
+    def test_old_broken_empty_or_other_caches_are_read_as_empty(self):
+        good = {'mergedAt': MERGED, 'author': 'a', 'labels': [], 'paths': ['mods/chat/C.java'],
+                'pathsComplete': True, 'commentsComplete': True}
+        self.check(self.fake_gh([[]]))
+        with open(self.cache_file()) as f:
+            key = json.load(f)['key']
+        cases = {'empty file': '', 'not JSON': '{', 'a list': '[]', 'no version': {'prs': {}},
+                 'an older version': {'version': 0, 'key': key, 'prs': {}, 'from': '2026-11-17',
+                                      'searchedDay': '2026-11-23'},
+                 'an entry without the new keys': {'version': 1, 'key': key, 'prs': {'1': good}, 'from': '2026-11-17',
+                                                   'searchedDay': '2026-11-23'},
+                 'another key': {'version': 1, 'key': 'x', 'prs': {}, 'from': '2026-11-17',
+                                 'searchedDay': '2026-11-23'},
+                 'no search day': {'version': 1, 'key': key, 'prs': {}, 'from': '2026-11-17'},
+                 'a day in the future': {'version': 1, 'key': key, 'prs': {}, 'from': '2026-11-17',
+                                         'searchedDay': '2026-12-01'}}
+        for why, data in cases.items():
+            with self.subTest(why=why):
+                with open(self.cache_file(), 'w') as f:
+                    f.write(data if isinstance(data, str) else json.dumps(data))
+                os.remove(self.log)
+                found = self.check(self.fake_gh([[pr(5, ['mods/chat/C.java'])]]))
+                self.assertNotIn('updated:', self.queries()[0])        # the whole window
+                self.assertEqual(sorted(self.by_pr(found)), ['#5'])     # nothing from the bad cache
+                with open(self.cache_file()) as f:
+                    fresh = json.load(f)
+                self.assertEqual((fresh['version'], fresh['key'], fresh['searchedDay'], sorted(fresh['prs'])),
+                                 (1, key, '2026-11-23', ['5']))
+
+    def test_a_newer_cache_is_not_used_and_not_overwritten(self):
+        os.makedirs(self.cache)
+        with open(self.cache_file(), 'w') as f:
+            f.write('{"version": 9, "prs": {"1": {}}}')
+        found = self.check(self.fake_gh([[pr(5, ['mods/chat/C.java'])]]))
+        self.assertEqual(sorted(self.by_pr(found)), ['#5'])
+        self.assertNotIn('updated:', self.queries()[0])
+        with open(self.cache_file()) as f:
+            self.assertEqual(f.read(), '{"version": 9, "prs": {"1": {}}}')
+
+    def test_a_change_to_the_gate_code_starts_the_cache_afresh(self):
+        """The cache keeps lens names the gate's code read: other code may read other names."""
+        kit = os.path.join(self.tmp, 'kit')
+        shutil.copytree(gf.CHECKS, os.path.join(kit, 'checks'))
+        shutil.copytree(gf.LIB, os.path.join(kit, 'lib'), ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(os.path.join(os.path.dirname(os.path.dirname(gf.KIT)), 'fork-ci', 'actions', 'pr-queue'),
+                        os.path.join(kit, 'gate'), ignore=shutil.ignore_patterns('__pycache__'))
+        script = os.path.join(kit, 'checks', 'review-tiers')
+        self.check(self.fake_gh([[]]), script=script)
+        os.remove(self.log)
+        self.check(self.fake_gh([[]]), script=script)
+        self.assertIn('updated:>=', self.queries()[0])                       # same code: the cache is used
+        with open(os.path.join(kit, 'gate', 'lens.py'), 'a') as f:
+            f.write('\n# a new release\n')
+        os.remove(self.log)
+        self.check(self.fake_gh([[]]), script=script)
+        self.assertNotIn('updated:', self.queries()[0])                      # the whole window
+
+    def test_a_dry_run_and_no_cache_folder_write_nothing(self):
+        self.check(self.fake_gh([[pr(1, ['mods/chat/C.java'])]]), dryRun=True)
+        self.assertFalse(os.path.exists(self.cache))
+        self.check(self.fake_gh([[pr(1, ['mods/chat/C.java'])]]), cacheDir='')
+        self.assertFalse(os.path.exists(self.cache))
+
+    def test_the_cache_keeps_no_comment_text(self):
+        self.check(self.fake_gh([[pr(1, ['mods/chat/C.java'], [post('Lens: correctness\nsecret words here')])]]))
+        with open(self.cache_file()) as f:
+            self.assertNotIn('secret words', f.read())
+
 
 class Contract(unittest.TestCase):
 
@@ -384,6 +872,65 @@ class Contract(unittest.TestCase):
 
 
 MUTATIONS = {
+    'review-tiers: only lens comments from before the merge count': (
+        'checks/review-tiers', "        keep = [c for c in comments if ((c.get('createdAt') or '') <= merged) == before]",
+        "        keep = comments if before else []",
+        'ReviewTiers.test_only_counted_authors_and_comments_before_the_merge_count'),
+    'review-tiers: an override counts only before the merge': (
+        'checks/review-tiers', "        posts = [p for _, _, p in review.lens_posts(before)]", "        posts = comments",
+        'ReviewTiers.test_override_waiver_and_exemptions_settle_a_pull_request'),
+    'review-tiers: a waiver counts only from a counted author': (
+        'checks/review-tiers', "    return review.counts(post) and not review.is_bot(post)",
+        "    return not review.is_bot(post)", 'ReviewTiers.test_override_waiver_and_exemptions_settle_a_pull_request'),
+    'review-tiers: too many files is the top tier': (
+        'checks/review-tiers', "        tier = max(tier, tiers['top'])\n", "        pass\n",
+        'ReviewTiers.test_too_many_files_is_judged_at_the_top_tier'),
+    'review-tiers: a cut-off search does not move the search day': (
+        'checks/review-tiers', "            if got['complete']:\n                searched = ctx['today']",
+        "            if True:\n                searched = ctx['today']", 'ReviewTiers.test_a_cut_off_search_goes_on_where_it_stopped_until_every_pull_request_is_judged'),
+    'review-tiers: a cut-off search goes on where it stopped': (
+        'checks/review-tiers', '        if resume:    # first go on', '        if False:    # first go on', 'ReviewTiers.test_a_cut_off_search_goes_on_where_it_stopped_until_every_pull_request_is_judged'),
+    'review-tiers: a cut-off search is a warning': (
+        'checks/review-tiers', "emit('review-tiers.partial', 'warn'", "emit('review-tiers.partial', 'info'", 'ReviewTiers.test_a_cut_off_search_goes_on_where_it_stopped_until_every_pull_request_is_judged'),
+    'review-tiers: a page of one second is stepped past': (
+        'checks/review-tiers', "else second_before(resume['before']))", "else resume['before'])",
+        'ReviewTiers.test_a_page_of_one_second_does_not_stop_the_search_for_ever'),
+    'review-tiers: a broken resume point is dropped': (
+        'checks/review-tiers', "    if resume is not None and not good_resume(resume, ctx['today']):",
+        '    if False:', 'ReviewTiers.test_a_broken_resume_point_is_dropped'),
+    'review-tiers: a page GitHub cannot answer is asked again smaller': (
+        'checks/review-tiers', '        if err is not None and first == PAGE:', '        if False:',
+        'ReviewTiers.test_a_page_github_cannot_answer_is_asked_again_smaller'),
+    'review-tiers: a review after the merge settles it': (
+        'checks/review-tiers', "        if f['lensesAfter'] and not verdict(", "        if False and not verdict(",
+        'ReviewTiers.test_a_review_after_the_merge_settles_the_warning_as_the_hint_says'),
+    'review-tiers: no lens at all is told apart': (
+        'checks/review-tiers', "emit('review-tiers.skipped' if none else 'review-tiers.short',",
+        "emit('review-tiers.short',", 'ReviewTiers.test_no_lens_at_all_is_told_apart_from_a_kind_missing'),
+    'review-tiers: there is no repo option': (
+        'checks/review-tiers', "    if 'repo' in opt:   #", '    if False:   #',
+        'ReviewTiers.test_no_rules_no_repo_and_bad_options'),
+    'review-tiers: the gate code is part of the cache key': (
+        'checks/review-tiers', '                                     gate_hash()]).encode()',
+        '                                     ]).encode()', 'ReviewTiers.test_a_change_to_the_gate_code_starts_the_cache_afresh'),
+    'review-tiers: too many files is critical by the review block too': (
+        'checks/review-tiers', "    if not f['pathsComplete']:   # the paths past", '    if False:   # the paths past',
+        'ReviewTiers.test_too_many_files_is_judged_critical_by_the_review_block_too'),
+    'review-tiers: a wider window searches all of it': (
+        'checks/review-tiers', "and good_day(cache.get('from'), start)", 'and True',
+        'ReviewTiers.test_a_wider_window_searches_all_of_it'),
+    'review-tiers: a dry run writes no cache': (
+        'checks/review-tiers', 'if path and not dry and not newer:', 'if path and not newer:',
+        'ReviewTiers.test_a_dry_run_and_no_cache_folder_write_nothing'),
+    'review-tiers: a newer cache is not overwritten': (
+        'checks/review-tiers', 'if path and not dry and not newer:', 'if path and not dry:',
+        'ReviewTiers.test_a_newer_cache_is_not_used_and_not_overwritten'),
+    'review-tiers: a cache entry of another shape is not used': (
+        'checks/review-tiers', "and good_fact(f) for k, f in data['prs'].items()", "for k, f in data['prs'].items()",
+        'ReviewTiers.test_old_broken_empty_or_other_caches_are_read_as_empty'),
+    'review-tiers: a low budget does not search': (
+        'checks/review-tiers', '    if left < min_left:\n        emit(', '    if False:\n        emit(',
+        'ReviewTiers.test_a_low_budget_searches_nothing_and_judges_the_cache'),
     'a finding id is a dotted name': (
         'contract', "    if not ID.fullmatch(obj['id']):", "    if False:", 'Contract.test_parse_finding'),
     'a branch with no work of its own is not merged': (

@@ -349,7 +349,7 @@ class Contract:
                 shutil.rmtree(self.root)
                 os.makedirs(self.root)
                 src = self.copy_kit()
-                with open(os.path.join(src if rel.startswith('sbin/') else self.root, rel), 'a') as f:
+                with open(os.path.join(src if rel.startswith('sbin/') else os.path.dirname(src), rel), 'a') as f:
                     f.write('# as a newer release has it\n')
                 code, _, err = self.install(source=src)
                 self.assertEqual(code, 1)

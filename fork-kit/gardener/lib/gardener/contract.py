@@ -4,7 +4,12 @@ A check is a small program. The runner starts it in the project's root folder (w
 process group of its own, and writes one JSON object to its stdin:
 
   {"version": 1, "project": {"name": "...", "repo": "OWNER/REPO" or "", "root": "/path" or ""},
-   "check": "<id>", "options": {...}, "fix": false, "today": "YYYY-MM-DD", "gh": "gh"}
+   "check": "<id>", "options": {...}, "fix": false, "today": "YYYY-MM-DD", "gh": "gh",
+   "cacheDir": "/state/<project>/cache/<id>", "dryRun": false}
+
+cacheDir (added in version 1, so a check reads it with .get()) is a folder only this check of this project uses,
+kept between runs, in the private state folder; the check makes it when it needs it. dryRun: the run is a dry run,
+and the check writes nothing there.
 
 It prints its findings to stdout, one JSON object per line, and exits 0 (with or without findings):
 

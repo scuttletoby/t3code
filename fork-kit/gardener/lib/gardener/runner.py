@@ -24,11 +24,14 @@ def command(check):
     return [config.expand(check['path'])]
 
 
-def context(project, check, today, gh):
+def context(project, check, today, gh, cache_dir='', dry_run=False):
+    """The contract's context. cacheDir: a folder the check may keep files in between runs (it makes it; empty when
+    there is none); dryRun: true in `gardener run --dry-run`, when a check writes nothing, its cache neither."""
     return {'version': contract.VERSION,
             'project': {'name': project['name'], 'repo': project['repo'],
                         'root': config.expand(project['root']) if project['root'] else ''},
-            'check': check['id'], 'options': check['options'], 'fix': check['fix'], 'today': today, 'gh': gh}
+            'check': check['id'], 'options': check['options'], 'fix': check['fix'], 'today': today, 'gh': gh,
+            'cacheDir': cache_dir, 'dryRun': dry_run}
 
 
 def failed(check, text, detail='', fix=''):
@@ -104,9 +107,9 @@ def _talk(proc, data, deadline):
         sel.close()
 
 
-def run(project, check, today, gh):
+def run(project, check, today, gh, cache_dir='', dry_run=False):
     """(findings, ok): the check's findings with "check" set to its id; ok is False when it failed."""
-    ctx = json.dumps(context(project, check, today, gh)).encode()
+    ctx = json.dumps(context(project, check, today, gh, cache_dir, dry_run)).encode()
     root = config.expand(project['root']) if project['root'] else None
     if root and not os.path.isdir(root):
         return [failed(check, 'the project root is not a folder', f'root {project["root"]}',

@@ -393,9 +393,15 @@ class Checks(gf.Temp):
         self.assertEqual(self.run_cli('run')[0], 0)
         with open(os.path.join(self.tmp, 'ctx.json')) as f:
             ctx = json.load(f)
+        cache = os.path.join(self.state_dir, 'example', 'cache', 'spy')
         self.assertEqual(ctx, {'version': contract.VERSION, 'check': 'spy', 'options': {'a': 1}, 'fix': False,
-                               'today': '2026-11-23', 'gh': 'gh', 'cwd': self.root,
+                               'today': '2026-11-23', 'gh': 'gh', 'cwd': self.root, 'cacheDir': cache,
+                               'dryRun': False,
                                'project': {'name': 'example', 'repo': 'example-owner/app', 'root': self.root}})
+        self.assertFalse(os.path.exists(cache))                        # the check makes it when it needs it
+        self.assertEqual(self.run_cli('run', '--dry-run')[0], 0)
+        with open(os.path.join(self.tmp, 'ctx.json')) as f:
+            self.assertIs(json.load(f)['dryRun'], True)
 
 
 class Privacy(gf.Temp):
@@ -740,7 +746,7 @@ MUTATIONS = {
         'Config.test_an_error_of_any_kind_in_one_project_does_not_stop_the_next'),
     'the issue is built from the allow-list': (
         'cli', "        part = report.render_issue(name, today, findings, notes, answer, root, home, project['reportRepo'],\n"
-               "                                   text_checks, counts)",
+               "                                   text_checks, counts, project['repo'])",
         "        part = report.render_local(name, today, findings, notes, answer)",
         'Privacy.test_nothing_local_reaches_the_issue'),
     'a project check\'s text is public only with publicText': (
