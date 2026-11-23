@@ -162,6 +162,10 @@ fork-kit/schedule-kick/tests/cron.test.py unittest
 fork-kit/schedule-kick/tests/install.test.py unittest
 fork-kit/schedule-kick/tests/kick.test.py unittest
 fork-kit/schedule-kick/tests/late.test.py unittest
+fork-kit/update-policy/tests/baseline.test.py unittest
+fork-kit/update-policy/tests/idle.test.py unittest
+fork-kit/update-policy/tests/install.test.py unittest
+fork-kit/update-policy/tests/tick.test.py unittest
 
 # Upstream's tests, run where fork-tests.yml follows upstream's ci.yml.
 .github/scripts/check-nightly-release.test.cjs run by .github/workflows/fork-tests.yml

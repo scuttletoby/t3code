@@ -1,0 +1,202 @@
+#!/usr/bin/python3 -IB
+"""update-policy-install: install, uninstall or check the update-policy kit, as root (fork-kit/update-policy/README.md).
+
+  update-policy-install install --source KIT_FOLDER --sha RELEASE_SHA [--timer | --no-timer] [--force]
+  update-policy-install uninstall
+  update-policy-install self-check
+
+install copies bin/update-policy, sbin/update-policy-install, lib/updatepolicy/, systemd/, apt/, README.md and
+fork-kit/common/{machine_file,free_contract,kit_install}.py of one release into
+/usr/local/libexec/update-policy/versions/<sha>/ (with MANIFEST.sha256), checks the copy, switches the link `current`
+to it and links /usr/local/bin/update-policy and /usr/local/sbin/update-policy-install to it. With --timer the kit
+takes over restarts, in this order, so there is never a time with neither restart policy: it writes the system
+units update-policy.{service,timer} (the restart policy, every 5 minutes), update-policy-baseline.{service,timer}
+(the daily baseline check) and update-policy-boot.service (the look after a boot) to /etc/systemd/system/,
+enables and starts them, and only then writes /etc/apt/apt.conf.d/zz-update-policy (unattended-upgrades never
+restarts by itself). It then reads apt's effective Automatic-Reboot and fails while it is not false (a file apt reads
+later wins), unless --force. --no-timer undoes it in the other order: the apt file first (unattended-upgrades'
+own setting applies again), then the units are stopped, disabled and removed; uninstall does the same. The choice
+is kept in /etc/update-policy/config.json, so a run without either option keeps it. Safe to run again, and to stop
+at any step; one installer at a time. The steps every kit shares are in fork-kit/common/kit_install.py.
+"""
+import os, re, shutil, subprocess, sys
+_kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_common = os.path.join(_kit, 'common')
+sys.path[:0] = [_common if os.path.isdir(_common) else os.path.join(os.path.dirname(_kit), 'common')]
+try:
+    import kit_install  # noqa: E402
+except ImportError as e:     # a copy without common/kit_install.py (changed or partly removed by hand)
+    sys.exit(f'update-policy-install: cannot load its installer code ({e}): install again with the bootstrap, as '
+             'root (fork-kit/update-policy/README.md, Install)')
+
+UNIT_DIR = '/etc/systemd/system'
+UNITS = ('update-policy.service', 'update-policy.timer', 'update-policy-baseline.service',
+         'update-policy-baseline.timer', 'update-policy-boot.service')
+APT_FILE = '/etc/apt/apt.conf.d/zz-update-policy'
+STATE_DIR = '/var/lib/update-policy'
+HEADERS = ('# update-policy kit: written by update-policy-install.',
+           '// update-policy kit: written by update-policy-install.')
+STARTED = ('update-policy.timer', 'update-policy-baseline.timer')
+ENABLED = STARTED + ('update-policy-boot.service',)
+APT_LINE = re.compile(r'^Unattended-Upgrade::Automatic-Reboot "(.*)";$')
+APT_FALSE = ('', '0', 'no', 'false', 'without', 'off', 'disable')
+
+
+class UpdatePolicyInstaller(kit_install.Installer):
+    PROG = 'update-policy-install'
+    PROGRAM = __file__
+    KIT = 'update-policy'
+    ETC = '/etc/update-policy'
+    LIBEXEC = '/usr/local/libexec/update-policy'
+    LINKS = {'/usr/local/bin/update-policy': 'bin/update-policy',
+             '/usr/local/sbin/update-policy-install': 'sbin/update-policy-install'}
+    SOURCE_FILES = ('bin/update-policy', 'sbin/update-policy-install', 'README.md', 'common/machine_file.py',
+                    'common/free_contract.py', 'common/kit_install.py', 'apt/zz-update-policy') \
+        + tuple(f'systemd/{name}' for name in UNITS)
+    EXECUTABLE = frozenset({'bin/update-policy', 'sbin/update-policy-install'})
+    PACKAGE = 'updatepolicy'
+    MODULES = ('__init__', 'aptconf', 'baseline', 'cli', 'idle', 'settings', 'tick', 'window')
+    HELP = ('bin/update-policy', 'update-policy tick')
+    HAS_CONFIG = True
+    KIT_STEPS = ('policy-files',)
+
+    def add_install_options(self, parser):
+        parser.add_argument('--timer', dest='timer', action='store_true', default=None)
+        parser.add_argument('--no-timer', dest='timer', action='store_false')
+        parser.add_argument('--force', action='store_true',
+                            help='install even while apt\'s effective Automatic-Reboot is not false')
+
+    def systemctl(self, *args):
+        """Runs systemctl on the real host; None, or why it failed. Under a test PREFIX it only records the call."""
+        if self.PREFIX:
+            self.calls = getattr(self, 'calls', []) + [args]
+            return None
+        try:
+            r = subprocess.run(['systemctl', *args], capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return str(e)
+        return None if r.returncode == 0 else (r.stderr.strip() or f'exit {r.returncode}')[:300]
+
+    def apt_reboot(self):
+        """apt's effective Unattended-Upgrade::Automatic-Reboot (lower case; '' when unset), or None when it cannot be
+        read. Under a test PREFIX: '' (tests replace it)."""
+        if self.PREFIX:
+            return ''
+        try:
+            out = subprocess.run(['apt-config', 'dump'], capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        values = [m.group(1).strip().lower() for m in map(APT_LINE.match, out.splitlines()) if m]
+        return values[-1] if values else ''
+
+    def files(self):
+        """[(host path, file of the release)] the timer choice writes: the units, then the apt file."""
+        return [(f'{UNIT_DIR}/{name}', f'systemd/{name}') for name in UNITS] + [(APT_FILE, 'apt/zz-update-policy')]
+
+    def ours_file(self, path):
+        """A file this kit wrote (its first line says so), and no link."""
+        real = self.p(path)
+        if os.path.islink(real):
+            return False
+        try:
+            with open(real, encoding='utf-8') as f:
+                return f.readline().startswith(HEADERS)
+        except (OSError, UnicodeDecodeError):
+            return False
+
+    def plan(self, a):
+        timer = a.timer if a.timer is not None else bool(self.read_config().get('timer'))
+        if timer:
+            foreign = [path for path, _ in self.files() if os.path.lexists(self.p(path)) and not self.ours_file(path)]
+            if foreign:
+                raise self.Refused(f'{foreign[0]} exists and was not written by this kit: remove it and run again, '
+                                   'or run with --no-timer to leave it alone')
+        return {'timer': timer, 'force': bool(getattr(a, 'force', False))}
+
+    def config(self, a, plan):
+        return {'version': 1, 'timer': plan['timer']}
+
+    def kit_step(self, step, a, plan, dest):
+        # after the links: the units run the release in use. With the timer: units, enabled and started, then the
+        # apt file; without: the apt file goes first, then the units. Either way one restart policy is always on.
+        if not plan['timer']:
+            self.take_off()
+            self.say('no timer: unattended-upgrades\' own Automatic-Reboot setting applies')
+            return
+        for path, rel in self.files():
+            if os.path.lexists(self.p(path)) and not self.ours_file(path):
+                raise self.Refused(f'{path} exists and was not written by this kit: remove it and run again, '
+                                   'or run with --no-timer to leave it alone')
+        for path, rel in self.files()[:-1]:
+            self.write_from(path, os.path.join(dest, rel))
+        for args in (('daemon-reload',), ('enable', '--now') + STARTED, ('enable', 'update-policy-boot.service')):
+            err = self.systemctl(*args)
+            if err:
+                raise self.Refused(f'systemctl {" ".join(args)} failed ({err}): the units are written but not on, '
+                                   f'and {APT_FILE} is not written, so unattended-upgrades\' own restarts still '
+                                   'apply; fix it and run again')
+        self.say(f'enabled and started {", ".join(STARTED)}; enabled update-policy-boot.service')
+        path, rel = self.files()[-1]
+        self.write_from(path, os.path.join(dest, rel))
+        value = self.apt_reboot()
+        if value is None or value not in APT_FALSE:
+            why = ('apt\'s settings cannot be read (apt-config dump)' if value is None else
+                   f'apt still says Unattended-Upgrade::Automatic-Reboot "{value}": a file apt reads after {APT_FILE} '
+                   '(a later apt.conf.d file, or /etc/apt/apt.conf) wins, and unattended-upgrades would restart this '
+                   'machine by itself')
+            if not plan['force']:
+                raise self.Refused(f'{why}. Remove that line and run again (or run with --force; the tick then '
+                                   'alerts every day)')
+            self.say(f'WARNING (--force): {why}')
+        self.say('restarts are the kit\'s now (unattended-upgrades installs updates but never restarts by itself)')
+
+    def write_from(self, path, source):
+        self.ensure_dir(os.path.dirname(path))
+        with open(source, encoding='utf-8') as f:
+            if self.write_file(path, f.read()):
+                self.say(f'wrote {path}')
+
+    def take_off(self):
+        """The apt file first (unattended-upgrades' own setting applies again), then the units: stopped, disabled,
+        removed."""
+        path = self.files()[-1][0]
+        if self.ours_file(path):
+            os.unlink(self.p(path))
+            self.say(f'removed {path}')
+        units = [path for path, _ in self.files()[:-1] if self.ours_file(path)]
+        if not units:
+            return
+        err = self.systemctl('disable', '--now', *ENABLED)
+        if err:
+            raise self.Refused(f'systemctl disable --now failed ({err}): the units stay; fix it and run again')
+        for path in units:
+            os.unlink(self.p(path))
+            self.say(f'removed {path}')
+        self.systemctl('daemon-reload')
+
+    def kit_rows(self, plan):
+        if not plan['timer']:
+            return []
+        return [(path, 'file', kit_install.sha256_file(self.p(path))) for path, _ in self.files()]
+
+    def kit_uninstall(self):
+        self.take_off()
+        state = self.p(STATE_DIR)
+        if os.path.isdir(state) and not os.path.islink(state):
+            shutil.rmtree(state)
+            self.say(f'removed {STATE_DIR}')
+        self.say('unattended-upgrades\' own Automatic-Reboot setting applies again')
+
+    def installed_summary(self, plan):
+        return ', units on and the apt file written (restarts are the kit\'s)' if plan['timer'] else ', no timer'
+
+
+INSTALLER = UpdatePolicyInstaller()
+
+
+def main(argv, stop_after=None):
+    return INSTALLER.main(argv, stop_after, doc=__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
