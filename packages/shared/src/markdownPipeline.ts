@@ -10,6 +10,7 @@ import type {
   Text,
 } from "mdast";
 import { remarkKeepWindowsPaths } from "./markdownWindowsPaths.ts";
+import { ENVIRONMENT_FILE_LINK_PROTOCOL } from "./forkEnvironmentFileLinks.ts"; // Fork
 import { type PluggableList, type Processor, type Transformer, unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkRehype from "remark-rehype";
@@ -239,6 +240,7 @@ const CHAT_MARKDOWN_SANITIZE_SCHEMA = {
       "t3-citation",
       "t3-context",
       THREAD_LINK_PROTOCOL,
+      ENVIRONMENT_FILE_LINK_PROTOCOL, // Fork: a file link that names its environment.
       // Scheme only: the renderer's URL transform checks the rest of the link shape.
       ...LOCAL_FILE_LINK_SCHEMES,
     ],

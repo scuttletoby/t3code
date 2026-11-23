@@ -700,6 +700,8 @@ export const OrchestratorMcpEnvironmentLinksResult = Schema.Struct({
   links: Schema.Array(OrchestratorMcpEnvironmentLink),
   /** What to do when the machine the user means is not among `links`. */
   notListed: Schema.String,
+  /** Fork: how to link a file on one of `links` in a reply. */
+  fileLinks: Schema.optional(Schema.String),
 });
 export type OrchestratorMcpEnvironmentLinksResult =
   typeof OrchestratorMcpEnvironmentLinksResult.Type;
