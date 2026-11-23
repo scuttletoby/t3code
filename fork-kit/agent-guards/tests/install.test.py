@@ -125,7 +125,9 @@ class Install(fx.FakeHost):
         self.assertTrue(self.is_file('/usr/local/bin/facts-hook'))
         self.assertEqual(self.run_main('self-check')[0], 0)
         self.assertEqual(self.install(sha=SHA2)[0], 0)
-        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.process(4242, '/bin/sh', '/usr/local/bin/facts', 'x')    # the other program running: not our code
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
         with open(self.path('/usr/local/bin/facts')) as f:
             self.assertEqual(f.read(), '#!/bin/sh\necho another program\n')
         os.unlink(self.path('/usr/local/bin/facts'))
@@ -136,6 +138,10 @@ class Install(fx.FakeHost):
         self.assertEqual(self.install(sha=SHA2)[0], 0)
         self.assertTrue(os.path.islink(self.path('/usr/local/bin/facts')))
         self.assertTrue(self.is_file('/usr/local/bin/facts'))
+        self.process(4243, '/usr/bin/python3', '/usr/local/bin/facts', 'x')   # our link running: uninstall waits
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1)
+        self.assertIn('code of this kit is in use', err)
 
     def test_runs_again_and_changes_nothing(self):
         self.assertEqual(self.install('--settings')[0], 0)
