@@ -413,8 +413,6 @@ it.effect("an agent here works on a linked environment's threads within its own 
         links: [
           { environmentId: box.environmentId, label: "Box", status: "reachable", access: "auto" },
         ],
-        // Fork: agents learn here how to link a file on a linked environment.
-        fileLinks: expect.stringContaining("t3-file://v1/<environmentId>/<absolute path>"),
       });
 
       const threads = yield* a.call("thread:laptop-full", "t3_thread_list", {

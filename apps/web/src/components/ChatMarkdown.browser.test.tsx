@@ -1128,47 +1128,6 @@ describe("ChatMarkdown Windows file links", () => {
   });
 });
 
-// Fork: a file link can name the environment that holds the file.
-describe("ChatMarkdown environment file links", () => {
-  const environmentId = EnvironmentId.make("env-here");
-  const chips = (container: HTMLElement) =>
-    [...container.querySelectorAll(".chat-markdown-file-link")].map((chip) => ({
-      tag: chip.tagName,
-      href: chip.getAttribute("href"),
-      text: chip.textContent,
-    }));
-
-  it("opens a file on the message's own environment like a path link", async () => {
-    setup();
-    await using named = await renderText("[a.ts](t3-file://v1/env-here/tmp/project/a.ts:3)", {
-      environmentId,
-    });
-    await using plain = await renderText("[a.ts](/tmp/project/a.ts:3)", { environmentId });
-    expect(chips(named.container)).toHaveLength(1);
-    expect(chips(named.container)).toEqual(chips(plain.container));
-  });
-
-  it("shows a file on another environment as a file chip, not a web link", async () => {
-    setup();
-    await using screen = await renderText(
-      "See [app.log](t3-file://v1/env-there/srv/app.log) and <t3-file://v1/env-there/srv/b.txt>",
-      { environmentId },
-    );
-    expect(chips(screen.container).map(({ text }) => text)).toEqual(["app.log", "b.txt"]);
-    expect(screen.container.querySelector("a[href^='t3-file']")).toBeNull();
-    expect(screen.container.textContent).not.toContain("t3-file");
-  });
-
-  it("drops a link in an unknown version", async () => {
-    setup();
-    await using screen = await renderText("[x](t3-file://v2/env-there/srv/x.txt)", {
-      environmentId,
-    });
-    expect(chips(screen.container)).toEqual([]);
-    expect(screen.container.innerHTML).not.toContain("t3-file");
-  });
-});
-
 describe("ChatMarkdown host media", () => {
   it("explains a host video the connection cannot read instead of offering a retry", async () => {
     setup();

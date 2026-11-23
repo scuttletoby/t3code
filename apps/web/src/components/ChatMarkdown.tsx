@@ -65,7 +65,6 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
-import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import type {
   CodexArtifactTemplate,
   CodexArtifactTemplateKind,
@@ -124,19 +123,6 @@ import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { markdownImageGallery } from "./chat/markdownImageGallery";
 import { type MediaActionSource } from "./media/MediaActions";
 import { resolveProtocolRelativeMediaUrl } from "./media/mediaContent";
-import { downloadFile } from "./media/mediaContent"; // Fork
-import {
-  environmentFileAccess,
-  environmentFileDownloadUrl,
-  environmentFileErrorMessage,
-  environmentFileLinkTarget,
-  type EnvironmentFileAccessReaders,
-} from "./chat/forkEnvironmentFileLink"; // Fork
-import {
-  parseEnvironmentFileLinkHref,
-  type EnvironmentFileLink,
-} from "@t3tools/shared/forkEnvironmentFileLinks"; // Fork
-import { readEnvironment } from "../state/environments"; // Fork
 import {
   revealInFileExplorerLabelForKind,
   revealInFileExplorerLabelForOs,
@@ -244,7 +230,10 @@ import {
 import { MarkdownExternalLinkContent } from "./chat/MarkdownExternalLink";
 import { MarkdownFileLink } from "./chat/MarkdownFileLink";
 import { canUseMarkdownFileShellActions } from "./chat/MarkdownFileLink.logic";
-import { useForkMarkdownFileRemoteEditor } from "./chat/forkMarkdownFileLinkActions"; // Fork
+import {
+  forkFetchMarkdownFile,
+  useForkMarkdownFileRemoteEditor,
+} from "./chat/forkMarkdownFileLinkActions"; // Fork
 import { rehypeChipPunctuation } from "./chat/markdownChipPunctuation";
 import { handleMarkdownFragmentClick, rehypeHeadingIds } from "./chat/markdownFragments";
 import { rehypeTextDirection } from "./chat/markdownTextDirection";
@@ -456,7 +445,6 @@ function markdownUrlTransform(href: string) {
   if (parseAssistantCitationHref(href)) return href;
   if (parseComposerContextHref(href)) return href;
   if (parseThreadLinkHref(href)) return href;
-  if (parseEnvironmentFileLinkHref(href)) return href; // Fork
   if (isWindowsDrivePathHref(href)) return href;
   if (isLocalEditorFileHref(href)) return href;
   return rewriteMarkdownFileUriHref(href) ?? defaultUrlTransform(href);
@@ -911,117 +899,6 @@ function useChatMarkdownState({
     }
     return findAgentDirectoryMatch(workspaceRelativePath, agentRoots, searchRoot);
   };
-  const downloadMarkdownFile = async (path: string, fileName: string) => {
-    if (!threadRef) return;
-    const { environmentId: fileEnvironmentId, threadId } = threadRef;
-    const result = await createAssetUrl({
-      environmentId: fileEnvironmentId,
-      input: { resource: { _tag: "media-file", threadId, path, disposition: "attachment" } },
-    });
-    if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-    const connection = readPreparedConnection(fileEnvironmentId);
-    const url = connection && resolveAssetUrl(connection.httpBaseUrl, result.value.relativeUrl);
-    if (!url) throw new Error("Reconnect to the environment and try again.");
-    await downloadFile(url, fileName);
-  };
-  // Fork: a file on another environment goes through that environment's own connection.
-  const forkEnvironmentFileReaders: EnvironmentFileAccessReaders = {
-    httpBaseUrl: (id) => readPreparedConnection(id)?.httpBaseUrl ?? null,
-    canReadFiles: (id) => readEnvironmentScope(id, AuthFilesystemReadScope),
-    label: (id) => readEnvironment(id)?.entry.target.label ?? null,
-  };
-  const forkEnvironmentFileLinkChip = (
-    link: EnvironmentFileLink,
-    fileLinkMeta: MarkdownFileLinkMeta,
-    copyMarkdown: string,
-  ) => {
-    const { environmentId: fileEnvironmentId } = link;
-    const path = fileLinkMeta.filePath;
-    const canPreviewMedia =
-      mediaMimeTypeFromExtension(
-        fileLinkMeta.basename.slice(fileLinkMeta.basename.lastIndexOf(".")),
-      ) !== null;
-    const openMedia = () => {
-      if (!threadRef) return;
-      const requestId = ++mediaRequestId.current;
-      const access = environmentFileAccess(fileEnvironmentId, forkEnvironmentFileReaders);
-      void (
-        "unavailable" in access
-          ? Promise.reject(new Error(access.unavailable))
-          : resolveMarkdownMediaPreview({
-              source: path,
-              resolvedFilePath: path,
-              threadRef: { environmentId: fileEnvironmentId, threadId: threadRef.threadId },
-              httpBaseUrl: access.httpBaseUrl,
-              createAssetUrl,
-            })
-      ).then(
-        (preview) => {
-          if (preview && mediaRequestId.current === requestId) expandMedia(preview);
-        },
-        (error: unknown) => {
-          if (mediaRequestId.current !== requestId) return;
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: gt("Media unavailable"),
-              description: environmentFileErrorMessage(
-                error,
-                fileEnvironmentId,
-                path,
-                forkEnvironmentFileReaders.label,
-              ),
-            }),
-          );
-        },
-      );
-    };
-    return (
-      <MarkdownFileLink
-        environmentId={fileEnvironmentId}
-        href={fileLinkMeta.targetPath}
-        targetPath={fileLinkMeta.targetPath}
-        iconPath={path}
-        workspaceRelativePath={null}
-        panelPath={null}
-        line={fileLinkMeta.line}
-        label={fileLinkLabel(
-          {
-            path,
-            ...(fileLinkMeta.line !== undefined ? { line: fileLinkMeta.line } : {}),
-            ...(fileLinkMeta.column !== undefined ? { column: fileLinkMeta.column } : {}),
-            ...(fileLinkMeta.endLine !== undefined ? { endLine: fileLinkMeta.endLine } : {}),
-          },
-          fileLinkParentSuffixByPath,
-        )}
-        copyMarkdown={copyMarkdown}
-        theme={resolvedTheme}
-        threadRef={threadRef}
-        onOpenInPanel={() => undefined}
-        resolveDragPath={async () => path}
-        resolveCopyPaths={async () =>
-          markdownFileCopyPaths(fileLinkMeta, { absolutePath: path, matched: true }, undefined)
-        }
-        onDownload={
-          threadRef
-            ? async () =>
-                downloadFile(
-                  await environmentFileDownloadUrl({
-                    environmentId: fileEnvironmentId,
-                    path,
-                    threadId: threadRef.threadId,
-                    readers: forkEnvironmentFileReaders,
-                    createAssetUrl,
-                  }),
-                  fileLinkMeta.basename,
-                )
-            : undefined
-        }
-        onOpenMedia={threadRef && canPreviewMedia ? openMedia : undefined}
-        openInEditorMenuLabel={preferredEditorMenuLabel}
-      />
-    );
-  };
   const openFileInPanel = (fileLinkMeta: MarkdownFileLinkMeta, panelPath: string) => {
     if (!threadRef) return;
     const openAt = (path: string) =>
@@ -1133,7 +1010,12 @@ function useChatMarkdownState({
         onDownload={
           threadRef && canReadFiles && !isAppBundle
             ? async () =>
-                downloadMarkdownFile((await resolveHostPath()).absolutePath, fileLinkMeta.basename)
+                forkFetchMarkdownFile({
+                  threadRef,
+                  path: (await resolveHostPath()).absolutePath,
+                  fileName: fileLinkMeta.basename,
+                  createAssetUrl,
+                })
             : undefined
         }
         onOpenMedia={
@@ -1142,13 +1024,6 @@ function useChatMarkdownState({
             : undefined
         }
         openInEditorMenuLabel={canOpenApp ? gt("Open app") : preferredEditorMenuLabel}
-        // Fork: over SSH the viewing device's editor opens the file, and the menu names it.
-        {...forkRemoteEditor?.linkProps({
-          canOpenApp,
-          canUseShellActions,
-          fileLinkMeta,
-          resolveAbsolutePath: async () => (await resolveHostPath()).absolutePath,
-        })}
         onReveal={
           canUseShellActions && revealInFileManagerLabel !== undefined
             ? async () => revealFileInFileManager((await resolveHostPath()).absolutePath)
@@ -1163,6 +1038,13 @@ function useChatMarkdownState({
             ? () => openMarkdownFileInPreview(fileLinkMeta.filePath)
             : undefined
         }
+        // Fork: a link naming an environment downloads from it; over SSH, this device's editor.
+        {...forkRemoteEditor.linkProps({
+          canOpenApp,
+          canUseShellActions,
+          fileLinkMeta,
+          resolveAbsolutePath: async () => (await resolveHostPath()).absolutePath,
+        })}
       />
     );
   };
@@ -1175,7 +1057,6 @@ function useChatMarkdownState({
     environmentId,
     expandMedia,
     fileLinkChip,
-    forkEnvironmentFileLinkChip, // Fork
     sourceControlMedia,
     sourceControlMediaRepository,
     renderContextReference,
@@ -1377,7 +1258,6 @@ const CHAT_MARKDOWN_COMPONENTS = {
       issuesEnabled,
       updateThreadPullRequestLink,
       fileLinkChip,
-      forkEnvironmentFileLinkChip, // Fork
       renderContextReference,
     } = use(ChatMarkdownRendererContext);
     const text = use(ChatMarkdownTextContext);
@@ -1414,40 +1294,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
         <span>{label}</span>
       );
     }
-    // Fork: `t3-file://v1/<environmentId>/<path>` names the environment holding the file.
-    const environmentFile = href
-      ? environmentFileLinkTarget(normalizeMarkdownLinkDestination(href), environmentId)
-      : null;
-    const normalizedHref =
-      environmentFile?.kind === "local"
-        ? environmentFile.pathHref
-        : href
-          ? normalizeMarkdownLinkHrefKey(href)
-          : "";
-    if (environmentFile?.kind === "remote") {
-      const remoteMeta = resolveMarkdownFileLinkMeta(environmentFile.link.pathHref);
-      if (remoteMeta) {
-        const label = nodeToPlainText(children);
-        const start = node?.position?.start.offset;
-        const end = node?.position?.end.offset;
-        const source = start !== undefined && end !== undefined ? text.slice(start, end) : "";
-        const copyMarkdown =
-          source.startsWith("[") && source.includes("](")
-            ? source
-            : `[${(label || remoteMeta.basename).replace(/[\\[\]]/g, "\\$&")}](${href})`;
-        const chip = forkEnvironmentFileLinkChip(environmentFile.link, remoteMeta, copyMarkdown);
-        return !label ||
-          label === href ||
-          isMarkdownFileLinkLabel(label, environmentFile.link.pathHref) ? (
-          chip
-        ) : (
-          <span data-markdown-copy={copyMarkdown}>
-            <span className="whitespace-normal">{children} </span>
-            {chip}
-          </span>
-        );
-      }
-    }
+    const normalizedHref = href ? normalizeMarkdownLinkHrefKey(href) : "";
     const fileLinkMeta = normalizedHref
       ? (markdownFileLinkMetaByHref.get(normalizedHref) ??
         resolveMarkdownFileLinkMeta(normalizedHref, cwd, imageBaseDir ?? cwd))
@@ -1708,8 +1555,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
         ? source
         : `[${(label || fileLinkMeta.basename).replace(/[\\[\]]/g, "\\$&")}](${normalizedHref})`;
     const chip = fileLinkChip(fileLinkMeta, copyMarkdown, normalizedHref);
-    return isMarkdownFileLinkLabel(label, normalizedHref) ||
-      (environmentFile !== null && label === href) /* Fork: an autolink */ ? (
+    return isMarkdownFileLinkLabel(label, normalizedHref) ? (
       chip
     ) : (
       <span data-markdown-copy={copyMarkdown}>

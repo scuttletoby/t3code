@@ -20,7 +20,6 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as Tool from "effect/ai/Tool";
-import { ENVIRONMENT_FILE_LINK_AGENT_HINT } from "@t3tools/shared/forkEnvironmentFileLinks"; // Fork
 
 import { runtimeModeRank } from "../mcp/delegatedTaskModes.ts";
 import { assertNotLinked } from "../mcp/linkOrigin.ts";
@@ -308,7 +307,6 @@ const make = Effect.gen(function* () {
           lastError: link.lastError,
         })),
         notListed: NOT_LISTED,
-        fileLinks: ENVIRONMENT_FILE_LINK_AGENT_HINT, // Fork: in the result, not the tool text sent every turn
       };
     },
   );

@@ -1,27 +1,20 @@
 // Fork: file links that name the environment holding the file.
-import {
-  AssetWorkspaceAssetNotFoundError,
-  EnvironmentId,
-  ThreadId,
-  type AssetResource,
-} from "@t3tools/contracts";
+import { AssetWorkspaceAssetNotFoundError, EnvironmentId, ThreadId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import { parseEnvironmentFileLinkHref } from "@t3tools/shared/forkEnvironmentFileLinks";
-
 import { resolveMarkdownFileLinkMeta } from "../../markdown-links";
 import {
+  DOWNLOAD_LABEL,
   environmentFileAccess,
   environmentFileDownloadUrl,
-  environmentFileLinkTarget,
+  environmentFileLinkProps,
+  type CreateAssetUrl,
   type EnvironmentFileAccessReaders,
 } from "./forkEnvironmentFileLink";
 
-const HERE = EnvironmentId.make("env-here");
 const THERE = EnvironmentId.make("env-there");
-const THREAD = ThreadId.make("thread-1");
 
 const readers = (
   overrides: Partial<EnvironmentFileAccessReaders> = {},
@@ -32,64 +25,10 @@ const readers = (
   ...overrides,
 });
 
-describe("parseEnvironmentFileLinkHref", () => {
-  it.each([
-    ["t3-file://v1/env-there/home/a/app.log", "/home/a/app.log"],
-    ["t3-file://v1/env-there//home/a/app.log:12", "/home/a/app.log:12"],
-    ["t3-file://v1/env-there/C:/Users/a/notes.txt", "/C:/Users/a/notes.txt"],
-    ["T3-FILE://v1/env-there/srv/My%20File.md#L4", "/srv/My%20File.md#L4"],
-  ])("%s names %s on its environment", (href, pathHref) => {
-    expect(parseEnvironmentFileLinkHref(href)).toEqual({ environmentId: THERE, pathHref });
-  });
-
-  it.each([
-    "/home/a/app.log",
-    "file:///home/a/app.log",
-    "t3-thread://v2/env-there/thread-1",
-    "t3-file://v1/env-there",
-    "t3-file://v1/env-there/",
-    "t3-file://v1//home/a/app.log",
-    "t3-file://v2/env-there/home/a/app.log",
-  ])("%s is not an environment file link", (href) => {
-    expect(parseEnvironmentFileLinkHref(href)).toBeNull();
-  });
-
-  it("never turns a doubled slash into a network path", () => {
-    const link = parseEnvironmentFileLinkHref("t3-file://v1/env-there///server/share/a.txt");
-    expect(link?.pathHref).toBe("/server/share/a.txt");
-    expect(resolveMarkdownFileLinkMeta(link!.pathHref)?.filePath).toBe("/server/share/a.txt");
-  });
-
-  it("resolves to the same file link meta as the plain path", () => {
-    const link = parseEnvironmentFileLinkHref("t3-file://v1/env-there/home/a/src/app.ts:42");
-    expect(resolveMarkdownFileLinkMeta(link!.pathHref)).toEqual(
-      resolveMarkdownFileLinkMeta("/home/a/src/app.ts:42"),
-    );
-  });
-});
-
-describe("environmentFileLinkTarget", () => {
-  it("opens a file on the message's own environment like a path link", () => {
-    expect(environmentFileLinkTarget("t3-file://v1/env-here/home/a/x.ts", HERE)).toEqual({
-      kind: "local",
-      pathHref: "/home/a/x.ts",
-    });
-  });
-
-  it("keeps a file on another environment there", () => {
-    expect(environmentFileLinkTarget("t3-file://v1/env-there/home/a/x.ts", HERE)).toEqual({
-      kind: "remote",
-      link: { environmentId: THERE, pathHref: "/home/a/x.ts" },
-    });
-    expect(environmentFileLinkTarget("t3-file://v1/env-there/home/a/x.ts", null)?.kind).toBe(
-      "remote",
-    );
-  });
-
-  it("leaves links without an environment alone", () => {
-    expect(environmentFileLinkTarget("/home/a/x.ts", HERE)).toBeNull();
-  });
-});
+const signed = () =>
+  vi.fn<CreateAssetUrl>(async () =>
+    AsyncResult.success({ relativeUrl: "/api/assets/token123/app.log", expiresAt: 0 }),
+  );
 
 describe("environmentFileAccess", () => {
   it("uses the named environment's own connection", () => {
@@ -103,8 +42,7 @@ describe("environmentFileAccess", () => {
       unavailable:
         "This file is on Build box, which this device is not connected to. Connect to Build box in Settings > Connections, then try again.",
     });
-    const unknown = EnvironmentId.make("env-unknown");
-    expect(environmentFileAccess(unknown, readers())).toEqual({
+    expect(environmentFileAccess(EnvironmentId.make("env-unknown"), readers())).toEqual({
       unavailable:
         "This file is on env-unknown, which this device is not connected to. Connect to env-unknown in Settings > Connections, then try again.",
     });
@@ -117,8 +55,6 @@ describe("environmentFileAccess", () => {
   });
 });
 
-type CreateAssetUrl = Parameters<typeof environmentFileDownloadUrl>[0]["createAssetUrl"];
-
 describe("environmentFileDownloadUrl", () => {
   const download = (
     createAssetUrl: CreateAssetUrl,
@@ -127,28 +63,26 @@ describe("environmentFileDownloadUrl", () => {
     environmentFileDownloadUrl({
       environmentId: THERE,
       path: "/home/a/app.log",
-      threadId: THREAD,
       readers: readers(overrides),
       createAssetUrl,
     });
 
-  it("asks the file's environment for a download URL and resolves it against that connection", async () => {
-    const createAssetUrl = vi.fn<CreateAssetUrl>(async () =>
-      AsyncResult.success({
-        relativeUrl: "/api/assets/token123/app.log",
-        expiresAt: 0,
-      }),
-    );
+  it("asks the file's environment and resolves the URL against that connection", async () => {
+    const createAssetUrl = signed();
     await expect(download(createAssetUrl)).resolves.toBe(
       "https://there.example:3773/api/assets/token123/app.log",
     );
-    const resource: AssetResource = {
-      _tag: "media-file",
-      threadId: THREAD,
-      path: "/home/a/app.log",
-      disposition: "attachment",
-    };
-    expect(createAssetUrl).toHaveBeenCalledWith({ environmentId: THERE, input: { resource } });
+    expect(createAssetUrl).toHaveBeenCalledWith({
+      environmentId: THERE,
+      input: {
+        resource: {
+          _tag: "media-file",
+          threadId: ThreadId.make("environment-file-link"),
+          path: "/home/a/app.log",
+          disposition: "attachment",
+        },
+      },
+    });
   });
 
   it("asks nothing when the environment is not connected", async () => {
@@ -164,7 +98,11 @@ describe("environmentFileDownloadUrl", () => {
       AsyncResult.failure(
         Cause.fail(
           new AssetWorkspaceAssetNotFoundError({
-            resource: { _tag: "media-file", threadId: THREAD, path: "/home/a/app.log" },
+            resource: {
+              _tag: "media-file",
+              threadId: ThreadId.make("t"),
+              path: "/home/a/app.log",
+            },
             checkedPath: "/home/a/app.log",
           }),
         ),
@@ -173,5 +111,50 @@ describe("environmentFileDownloadUrl", () => {
     await expect(download(createAssetUrl)).rejects.toThrow(
       "The file was not found on Build box at /home/a/app.log.",
     );
+  });
+});
+
+describe("environmentFileLinkProps", () => {
+  const deps = (createAssetUrl = signed()) => ({
+    readers: readers(),
+    createAssetUrl,
+    downloadFile: vi.fn(async () => undefined),
+  });
+
+  it("is null for a link that names no environment", () => {
+    expect(environmentFileLinkProps(resolveMarkdownFileLinkMeta("/srv/app.log")!, deps())).toBe(
+      null,
+    );
+  });
+
+  it("downloads from the named environment and drops this device's actions", async () => {
+    const meta = resolveMarkdownFileLinkMeta("/t3-environment/env-there/srv/app.log:12")!;
+    const linkDeps = deps();
+    const props = environmentFileLinkProps(meta, linkDeps)!;
+    expect(props).toMatchObject({
+      environmentId: null,
+      href: "/srv/app.log",
+      targetPath: "/srv/app.log",
+      panelPath: null,
+      workspaceRelativePath: null,
+      openInEditorMenuLabel: DOWNLOAD_LABEL,
+      onDownload: undefined,
+      onOpenMedia: undefined,
+      onOpenInBrowser: undefined,
+      onReveal: undefined,
+    });
+    expect((await props.onOpen())._tag).toBe("Success");
+    expect(linkDeps.downloadFile).toHaveBeenCalledWith(
+      "https://there.example:3773/api/assets/token123/app.log",
+      "app.log",
+    );
+    expect((await props.resolveCopyPaths()).pathOnly).toBe("/srv/app.log");
+    expect(await props.resolveDragPath()).toBe("/srv/app.log");
+  });
+
+  it("reports a failure through the link's own open result", async () => {
+    const meta = resolveMarkdownFileLinkMeta("/t3-environment/env-gone/srv/app.log")!;
+    const result = await environmentFileLinkProps(meta, deps())!.onOpen();
+    expect(result._tag).toBe("Failure");
   });
 });

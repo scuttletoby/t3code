@@ -1,8 +1,20 @@
 // Fork: what a chat file link does beyond upstream's (#17): a long press opens its menu on touch
-// devices, a file downloads to the viewing device, and a file on another machine opens in the
-// viewing device's editor over SSH. MarkdownFileLink.tsx and ChatMarkdown.tsx only call these.
+// devices, a file downloads to the viewing device, a file on another machine opens in the viewing
+// device's editor over SSH, and a link naming an environment downloads from it.
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own messages are English only; upstream's translation catalogs hold no fork keys. */
-import type { ContextMenuSource } from "@t3tools/contracts";
+import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
+import {
+  squashAtomCommandFailure,
+  type AtomCommandResult,
+} from "@t3tools/client-runtime/state/runtime";
+import {
+  AuthFilesystemReadScope,
+  type AssetCreateUrlResult,
+  type AssetResource,
+  type ContextMenuSource,
+  type EnvironmentId,
+  type ScopedThreadRef,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import {
@@ -18,10 +30,23 @@ import type { MessageResolver } from "../../i18n/messages";
 import type { MarkdownFileLinkMeta } from "../../markdown-links";
 import {
   openRemoteEditorUrl,
+  resolveRemoteOpenState,
   useRemoteCapableEditors,
   type RemoteOpenState,
 } from "../../remoteOpen";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
+import { assetEnvironment } from "../../state/assets";
+import { readEnvironment } from "../../state/environments";
+import { hostEnvironmentIdAtom } from "../../state/primaryEnvironment";
+import { readEnvironmentScope, readPreparedConnection } from "../../state/session";
+import { useAtomQueryRunner } from "../../state/use-atom-query-runner";
+import { downloadFile } from "../media/mediaContent";
 import { stackedThreadToast, toastManager } from "../ui/toast";
+import {
+  environmentFileLinkProps,
+  type EnvironmentFileAccessReaders,
+} from "./forkEnvironmentFileLink";
+import { forkMarkdownDownloadError } from "./forkMarkdownFileDownload";
 import { markdownFileRemoteEditorUrl } from "./forkMarkdownFileLinkMenu";
 import { reportMarkdownActionFailure } from "./markdownActionFailure";
 
@@ -119,6 +144,47 @@ function swallowLateContextMenu(chip: HTMLElement): () => void {
   return release;
 }
 
+/**
+ * Fetches a file from the environment's machine to this device. A file the machine does not have
+ * fails naming the machine and the path it checked, as upstream's media preview does.
+ */
+export async function forkFetchMarkdownFile(input: {
+  threadRef: ScopedThreadRef;
+  path: string;
+  fileName: string;
+  createAssetUrl: (request: {
+    environmentId: EnvironmentId;
+    input: { resource: AssetResource };
+  }) => Promise<AtomCommandResult<AssetCreateUrlResult, unknown>>;
+}): Promise<void> {
+  const { environmentId, threadId } = input.threadRef;
+  const { path } = input;
+  const result = await input.createAssetUrl({
+    environmentId,
+    input: { resource: { _tag: "media-file", threadId, path, disposition: "attachment" } },
+  });
+  if (result._tag === "Failure") {
+    const target = readPreparedConnection(environmentId)?.target ?? null;
+    const isRemote =
+      target !== null &&
+      resolveRemoteOpenState({
+        target,
+        sshTarget: null,
+        remoteOpenTargets: undefined,
+        isDesktopRenderer: window.desktopBridge !== undefined,
+        hostEnvironmentId: appAtomRegistry.get(hostEnvironmentIdAtom),
+      }).mode !== "local-exec";
+    throw forkMarkdownDownloadError(squashAtomCommandFailure(result), {
+      requestedPath: path,
+      machine: isRemote ? target.label : null,
+    });
+  }
+  const connection = readPreparedConnection(environmentId);
+  const url = connection && resolveAssetUrl(connection.httpBaseUrl, result.value.relativeUrl);
+  if (!url) throw new Error("Reconnect to the environment and try again.");
+  await downloadFile(url, input.fileName);
+}
+
 /** Downloads the linked file; a failure is reported the way the link's other actions report one. */
 export function forkDownloadMarkdownFile(
   onDownload: (() => Promise<void>) | undefined,
@@ -138,9 +204,15 @@ export function forkDownloadMarkdownFile(
   });
 }
 
+const environmentFileReaders: EnvironmentFileAccessReaders = {
+  httpBaseUrl: (id) => readPreparedConnection(id)?.httpBaseUrl ?? null,
+  canReadFiles: (id) => readEnvironmentScope(id, AuthFilesystemReadScope),
+  label: (id) => readEnvironment(id)?.entry.target.label ?? null,
+};
+
 /**
- * The editor on the viewing device that reaches the environment's files over SSH, or null when
- * links open another way. `linkProps` are the props a file link takes after upstream's own.
+ * The props a file link takes after upstream's own: a link naming an environment downloads from
+ * it, and over SSH the viewing device's editor opens the file.
  */
 export function useForkMarkdownFileRemoteEditor(
   remoteOpenState: RemoteOpenState,
@@ -149,18 +221,26 @@ export function useForkMarkdownFileRemoteEditor(
 ) {
   const remoteCapableEditors = useRemoteCapableEditors();
   const [editor] = usePreferredEditor(remoteCapableEditors);
-  if (remoteOpenState.mode !== "remote-links" || editor === null) return null;
-  const { host } = remoteOpenState;
+  const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
+    reportFailure: false,
+    refresh: true,
+  });
+  const remoteEditor =
+    remoteOpenState.mode === "remote-links" && editor !== null
+      ? { editor, host: remoteOpenState.host }
+      : null;
   const open = async (fileLinkMeta: MarkdownFileLinkMeta, path: string) => {
-    const url = markdownFileRemoteEditorUrl({
-      editor,
-      host,
-      path,
-      cwd,
-      line: fileLinkMeta.line,
-      column: fileLinkMeta.column,
-    });
-    if (url !== undefined && (await openRemoteEditorUrl(url))) {
+    const url =
+      remoteEditor &&
+      markdownFileRemoteEditorUrl({
+        editor: remoteEditor.editor,
+        host: remoteEditor.host,
+        path,
+        cwd,
+        line: fileLinkMeta.line,
+        column: fileLinkMeta.column,
+      });
+    if (url && (await openRemoteEditorUrl(url))) {
       return AsyncResult.success<void>(undefined);
     }
     return AsyncResult.failure<void, Error>(
@@ -170,21 +250,31 @@ export function useForkMarkdownFileRemoteEditor(
   return {
     /**
      * Upstream's link opens an app bundle, or a file through the environment's own shell, itself;
-     * otherwise the link opens the file in this editor. The menu names this editor unless the
-     * link is an app bundle.
+     * otherwise over SSH the link opens the file in this editor, and the menu names this editor
+     * unless the link is an app bundle. A link naming an environment replaces all of that.
      */
     linkProps: (input: {
       canOpenApp: boolean;
       canUseShellActions: boolean;
       fileLinkMeta: MarkdownFileLinkMeta;
       resolveAbsolutePath: () => Promise<string>;
-    }) => ({
-      ...(input.canOpenApp
+    }) =>
+      environmentFileLinkProps(input.fileLinkMeta, {
+        readers: environmentFileReaders,
+        createAssetUrl,
+        downloadFile,
+      }) ??
+      (remoteEditor === null
         ? {}
-        : { openInEditorMenuLabel: openInEditorMenuLabel(editor, messages) }),
-      ...(input.canOpenApp || input.canUseShellActions
-        ? {}
-        : { onOpen: async () => open(input.fileLinkMeta, await input.resolveAbsolutePath()) }),
-    }),
+        : {
+            ...(input.canOpenApp
+              ? {}
+              : { openInEditorMenuLabel: openInEditorMenuLabel(remoteEditor.editor, messages) }),
+            ...(input.canOpenApp || input.canUseShellActions
+              ? {}
+              : {
+                  onOpen: async () => open(input.fileLinkMeta, await input.resolveAbsolutePath()),
+                }),
+          }),
   };
 }
