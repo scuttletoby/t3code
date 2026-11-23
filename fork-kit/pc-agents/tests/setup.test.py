@@ -119,7 +119,7 @@ class Setup(Case):
     def test_stopped_half_way_then_run_again(self):
         self.no_watch()
         self.terminate()
-        self.same_wsl2_walls()   # all pass, as `wsl --terminate` left them: this test is about the writes
+        self.same_fleet_walls()   # all pass, as `wsl --terminate` left them: this test is about the writes
         self.assertEqual(self.setup_run()[0], 0)
         whole = self.same_files()
         real_put, writes = cli.put, []
@@ -648,7 +648,7 @@ class RestartPending(Case):
         self.addCleanup(setattr, cli, 'put', real_put)
         self.no_watch()
         self.ready()
-        self.same_wsl2_walls()   # all pass, as on the machine set up all the way: this test is about the writes
+        self.same_fleet_walls()   # all pass, as on the machine set up all the way: this test is about the writes
         self.machine(upgrade)
         upgradable = self.keep()   # a machine set up all the way, its config just changed
         cli.put = lambda *a, **kw: writes.append(a[0]) or real_put(*a, **kw)

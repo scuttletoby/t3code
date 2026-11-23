@@ -1,7 +1,9 @@
 #!/usr/bin/python3 -I
-"""pc-agents: wall a WSL2 distro in, then run T3 Code in it as an unprivileged user (fork-kit/pc-agents/README.md).
+"""pc-agents: wall a WSL2 distro (or a plain Linux box: the machine file's "platform") in, then run T3 Code in it as
+an unprivileged user (fork-kit/pc-agents/README.md).
 
-  pc-agents setup --source DIR --sha SHA   as root, in a fresh distro: make or repair everything; safe to run again
+  pc-agents setup --source DIR --sha SHA   as root, in a fresh distro (or on the box): make or repair everything;
+                                           safe to run again
   pc-agents check [--enforce]              every wall, PASS or FAIL; exit 0 only when all hold. --enforce also
                                            stops T3 and every as-agent unit when one fails (the timer, every 2
                                            minutes). T3's unit runs it before every start, so T3 never starts on
@@ -103,7 +105,8 @@ def preflight(c, files):
     if why := k.user_problem(c, False):
         bad.append(why + '. A first launch that asked for a user name made one: remove it as root (userdel -r '
                    'NAME) or start again from a fresh distro (README step 2)' if 'login users' in why else why)
-    for d in ('/', '/opt', k.OPT, '/etc', '/etc/systemd', '/etc/systemd/system', k.STATE, '/etc/t3code'):
+    for d in ('/', '/opt', k.OPT, '/etc', '/etc/systemd', '/etc/systemd/system', k.STATE, '/etc/t3code') + \
+            (() if c['platform'] == 'wsl2' else ('/etc/ssh', os.path.dirname(k.SSHD_CONF))):
         st = k.lstat(d)
         if st and (why := k.safe(d, st, stat.S_ISDIR)) or st is None and d in ('/', '/opt', '/etc', '/etc/systemd'):
             bad.append(why or f'{d} is missing')
@@ -436,7 +439,8 @@ def install_packages():
         if r.returncode:
             return (f'cannot install {" ".join(missing)}: apt-get {argv[len(apt)]} failed ({r.stderr.strip()[-300:]}).'
                     + (busy if LOCKED.search(r.stderr) else
-                       ' Fix the distro\'s network (the machine file\'s nameservers are in /etc/resolv.conf now) or '
+                       ' Fix the machine\'s network (in WSL2 the machine file\'s nameservers are in /etc/resolv.conf '
+                       'now) or '
                        f'package sources, run `apt-get update && apt-get install -y {" ".join(missing)}` as root, '
                        'then setup again'))
     return None
@@ -503,6 +507,8 @@ def setup(source, sha):
     if why:
         return say(why) or 1
     k.run(['/usr/bin/systemctl', 'daemon-reload'])   # systemd reads the units as written, even if the install fails
+    if c['platform'] == 'linux':   # every run (one stopped after the write too): a running sshd reads the kit's file
+        k.run(['/usr/bin/systemctl', 'try-reload-or-restart', 'ssh.service'])   # none running: nothing to do
     for path in k.masks(c):
         put(path, '/dev/null', None, link=True)
     why, _ = install_t3(c, done)
@@ -511,8 +517,9 @@ def setup(source, sha):
     units = [k.UNIT, *k.TIMERS]
     if check(False, before_enable=True) != 0:
         k.run(['/usr/bin/systemctl', 'disable', '--now'] + units)
-        return say('a wall does not hold, so T3 is not enabled. After a first run: wsl --terminate <this distro> '
-                   'from Windows, then run setup again') or 3
+        return say('a wall does not hold, so T3 is not enabled. ' + (
+            'After a first run: wsl --terminate <this distro> from Windows, then run setup again'
+            if c['platform'] == 'wsl2' else 'Fix each FAIL above, then run setup again')) or 3
     since = int(time.time()) - 1   # T3's journal from here on is this run's, not an earlier crash's
     k.run(['/usr/bin/systemctl', 'reset-failed', k.UNIT])   # a rerun within the start limit's 10 minutes still starts
     ran = k.run(['/usr/bin/systemctl', 'is-active', k.UNIT]).returncode == 0
@@ -630,31 +637,143 @@ def tree(top, inside=None):
     return bad[:3] and '; '.join(bad[:3])
 
 
+def windows_drives():
+    """Why a Windows drive (9p, drvfs, virtiofs; not WSL's own under /usr/lib/wsl) is mounted, or None."""
+    mounts = []
+    try:
+        with open(k.ROOT + '/proc/self/mountinfo', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                fields = line.split(' - ')
+                where, fstype = fields[0].split()[4], (fields[1].split() or [''])[0] if len(fields) > 1 else ''
+                if fstype in ('9p', 'drvfs', 'virtiofs') and not (where + '/').startswith('/usr/lib/wsl/'):
+                    mounts.append(f'{where} ({fstype})')
+    except (OSError, IndexError) as e:
+        mounts.append(f'cannot read /proc/self/mountinfo ({e})')
+    return mounts and 'mounted: ' + ', '.join(mounts[:3])
+
+
+def socket_problem(c):
+    """Why the agent could reach a container engine's root socket (ROOT_SOCKETS: its own, its group's, or anyone's
+    to read or write), or None. None there: nothing to reach."""
+    bad = []
+    for path in k.ROOT_SOCKETS:
+        try:
+            st = os.stat(k.ROOT + path)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            bad.append(f'{path}: cannot tell ({e})')
+            continue
+        if st.st_uid == c['agentUid'] or st.st_gid == k.gid(k.USER) or st.st_mode & 0o006:
+            bad.append(f'{path} (uid {st.st_uid}, gid {st.st_gid}, mode {stat.S_IMODE(st.st_mode):o})')
+    return bad and 'the agent could use ' + ', '.join(bad[:3]) + ': make it root\'s and its group\'s alone (0660)'
+
+
+def sshd_problem():
+    """Why sshd may not read the kit's DenyUsers file for every login (its config does not include
+    sshd_config.d/*.conf before any Match block), or None. No sshd_config: no sshd to log in through."""
+    try:
+        with open(k.ROOT + '/etc/ssh/sshd_config', encoding='utf-8', errors='replace') as f:
+            lines = [line.split('#', 1)[0].split() for line in f]
+    except FileNotFoundError:
+        return None
+    for words in lines:
+        if words and words[0].lower() == 'match':
+            break
+        if words and words[0].lower() == 'include' and \
+                {'/etc/ssh/sshd_config.d/*.conf', 'sshd_config.d/*.conf'} & set(words[1:]):
+            return None
+    return ('/etc/ssh/sshd_config does not include /etc/ssh/sshd_config.d/*.conf before its first Match block: add '
+            '`Include /etc/ssh/sshd_config.d/*.conf` at its top (as Debian and Ubuntu ship it)')
+
+
+def gpu_seen():
+    """The GPU device nodes (k.GPU_NODE) in the running T3's own /dev, as root sees it through /proc/PID/root; None
+    when no T3 runs (stopped, or still in its ExecStartPre check) or its /dev cannot be read (it just ended)."""
+    r = k.run(['/usr/bin/systemctl', 'show', '-p', 'MainPID', k.UNIT])
+    pid = k.props(r.stdout).get('MainPID', '')
+    if r.returncode or not pid.isdigit() or pid == '0':
+        return None
+    dev = f'{k.ROOT}/proc/{pid}/root/dev'
+    try:
+        names = ['/dev/' + n for n in os.listdir(dev)]
+        if os.path.isdir(dev + '/nvidia-caps') and not os.path.islink(dev + '/nvidia-caps'):
+            names += [k.NVIDIA_CAPS + '/' + n for n in os.listdir(dev + '/nvidia-caps')]
+    except OSError:
+        return None
+    return sorted(p for p in names if k.GPU_NODE.fullmatch(p) and p != k.NVIDIA_CAPS)
+
+
 def gpu_wall(c):
-    """(wall, what, why or None): whether the machine file's `gpu` turns GPU access on, and whether T3's unit on disk
-    says the same (systemd runs it as on disk: the units wall; T3 restarted since: the restart wall)."""
-    on = c['gpu']
-    # The unit skips ("-") whichever is missing, so T3 still runs: a note naming each, not a failure. No /dev/dxg:
-    # WSL gives this distro no GPU; no lib or drivers folder (a WSL update moved them, say): CUDA cannot load.
-    missing = [p for p in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers') if not k.lstat(p)]
-    what = ('GPU access is on (machine file "gpu": true): /dev/dxg, and /usr/lib/wsl/lib and /usr/lib/wsl/drivers '
-            'read-only' + (missing and ' (this distro has no ' + ', no '.join(missing) +
-                           ': the unit skips what is missing, so GPU jobs fail)' or '')
-            if on else 'GPU access is off (no "gpu": true in the machine file): no /dev/dxg, /usr/lib/wsl hidden')
+    """(wall, what, why or None): whether the machine file's `gpu` turns GPU access on, whether T3's unit on disk
+    says the same (systemd runs it as on disk: the units wall; T3 restarted since: the restart wall), and whether the
+    running T3 sees GPU device nodes the setting does not give (its own /dev)."""
+    on, wsl2 = c['gpu'], c['platform'] == 'wsl2'
+    if wsl2:
+        # The unit skips ("-") whichever is missing, so T3 still runs: a note naming each, not a failure. No
+        # /dev/dxg: WSL gives this distro no GPU; no lib or drivers folder (a WSL update moved them, say): CUDA
+        # cannot load.
+        missing = [p for p in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers') if not k.lstat(p)]
+        what = ('GPU access is on (machine file "gpu": true): /dev/dxg, and /usr/lib/wsl/lib and /usr/lib/wsl/drivers '
+                'read-only' + (missing and ' (this distro has no ' + ', no '.join(missing) +
+                               ': the unit skips what is missing, so GPU jobs fail)' or '')
+                if on else 'GPU access is off (no "gpu": true in the machine file): no /dev/dxg, /usr/lib/wsl hidden')
+    else:
+        # The NVIDIA nodes this box has (the unit gives those; it skips the others). No control node or no card node:
+        # no NVIDIA driver is loaded (a reboot after a kernel update it was not rebuilt for, say), so GPU jobs cannot
+        # run; T3 gets nothing with no nodes, and the rest of the machine still serves: a note that names the two ways
+        # out, not a failure (it would stop T3's own start, setup and the automatic update). No nvidia-uvm (the driver
+        # makes it on first use) or more cards than the unit lists: a note too.
+        caps = k.NVIDIA_CAPS
+        have = [p for p in k.NVIDIA if k.lstat(p)] + \
+            ([f'{caps}/{n}' for n in sorted(os.listdir(k.ROOT + caps))] if os.path.isdir(k.ROOT + caps) else [])
+        more = sorted(n for n in (os.listdir(k.ROOT + '/dev') if os.path.isdir(k.ROOT + '/dev') else [])
+                      if re.fullmatch(r'nvidia\d+', n) and '/dev/' + n not in k.NVIDIA)
+        absent = [w for w, there in (('/dev/nvidiactl', '/dev/nvidiactl' in have),
+                                     ('a card node (/dev/nvidia0 ...)', set(have) & set(k.NVIDIA[:k.NVIDIA_CARDS])))
+                  if not there]
+        notes = ([f'no NVIDIA driver is loaded, or it has not made its nodes (no {" and no ".join(absent)}): GPU jobs '
+                  'fail until it is; install NVIDIA\'s driver and reboot (enable nvidia-persistenced, so its nodes are '
+                  'there when T3 starts), or set "gpu": false in the machine file and run pc-agents setup']
+                 if absent else
+                 (['no /dev/nvidia-uvm (the driver makes it on first use; CUDA needs it, and T3 gets it at its next '
+                   'start after it is there: README "GPU access")'] if '/dev/nvidia-uvm' not in have else []) +
+                 ([f'the unit gives only the first {k.NVIDIA_CARDS} cards, not /dev/' + ', /dev/'.join(more[:3])]
+                  if more else []))
+        what = ('GPU access is on (machine file "gpu": true): NVIDIA\'s device nodes, here ' +
+                (', '.join(have) or 'none') + ', and nothing else' + (notes and ' (' + '; '.join(notes) + ')' or '')
+                if on else 'GPU access is off (no "gpu": true in the machine file): no NVIDIA device node')
     try:
         with open(k.ROOT + k.UNIT_DIRS[0] + '/' + k.UNIT, encoding='utf-8', errors='replace') as f:
-            has = k.gpu_lines(f.read())
+            has = k.gpu_lines(f.read(), c['platform'])
     except OSError as e:
         return 'gpu', what, f'cannot read the unit ({e.strerror})'
     word = {True: 'on', False: 'off'}
-    return 'gpu', what, None if has is on else \
-        'the unit has only some of the GPU lines, neither on nor off: run pc-agents setup' if has is None else \
-        f'the unit has GPU access {word[has]}, the machine file says {word[on]}: run pc-agents setup'
+    if has is None:
+        return 'gpu', what, 'the unit has only some of the GPU lines, neither on nor off: run pc-agents setup'
+    if has is not on:
+        return 'gpu', what, \
+            f'the unit has GPU access {word[has]}, the machine file says {word[on]}: run pc-agents setup'
+    # While the running T3 is from before setup's last change (the setting turned off, say), it is about to restart,
+    # and the restart wall judges it, not this. Only then: a marker left by a setup stopped half-way before a reboot
+    # is older than any T3 now, so it does not turn this look off.
+    seen = None if k.restart_problem() else gpu_seen()
+    if seen is not None:
+        extra = [p for p in seen if not k.gpu_granted(c, p)]
+        if extra:
+            return 'gpu', what, (f'T3 sees {", ".join(extra[:3])}, which GPU access {word[on]} does not give: '
+                                 f'systemctl restart {k.UNIT}')
+        late = [p for p in ((k.NVIDIA if not wsl2 else ('/dev/dxg',)) if on else ())
+                if k.lstat(p) and p not in seen]
+        if late:
+            what += f' (T3 started before {", ".join(late[:3])} was there: it gets it at its next start)'
+    return 'gpu', what, None
 
 
 def own_walls(c, before_enable=False):
-    """(wall, what, why or None) for the walls this kit adds to fork-fleet-walls/wsl2. before_enable: setup asks
-    before it enables T3 and the timer, so they need not be enabled yet."""
+    """(wall, what, why or None) for the walls this kit adds to the fleet's (fork-fleet-walls/wsl2 or /linux).
+    before_enable: setup asks before it enables T3 and the timer, so they need not be enabled yet."""
+    wsl2 = c['platform'] == 'wsl2'
     out, done = [], k.record()
     for path, (text, mode) in k.render(c).items():
         st = k.lstat(path)
@@ -667,7 +786,8 @@ def own_walls(c, before_enable=False):
     out.append(('record', f'{k.RECORD} is root-owned', k.safe(k.RECORD, k.lstat(k.RECORD), stat.S_ISREG)))
     masks = [p for p in k.masks(c) if not (k.lstat(p) and os.path.islink(k.ROOT + p)
                                            and os.readlink(k.ROOT + p) == '/dev/null')]
-    out.append(('masks', 'WSL interop, cron, at, ssh and the agent\'s user manager are masked',
+    out.append(('masks', 'WSL interop, cron, at, ssh and the agent\'s user manager are masked' if wsl2 else
+                'the agent\'s user manager is masked',
                 masks and 'not masked: ' + ', '.join(masks)))
     linger = sorted(os.listdir(k.ROOT + '/var/lib/systemd/linger')) if k.lstat('/var/lib/systemd/linger') else []
     out.append(('linger', 'no user lingers', linger and 'lingering: ' + ', '.join(linger[:5])))
@@ -692,10 +812,15 @@ def own_walls(c, before_enable=False):
     out.append(('units', 'systemd runs the kit\'s units as written, enabled, the timers running',
                 seen and '; '.join(seen[:3])))
     shell = k.login_shell(k.USER)
-    out.append(('agent', f'one login user, {k.USER}, in no group but its own, with no login shell',
+    out.append(('agent', f'one login user, {k.USER}, in no group but its own, with no login shell' if wsl2 else
+                f'{k.USER} is the kit\'s: its uid, home and own group only, with no login shell',
                 k.user_problem(c, True) or (None if shell == k.NOLOGIN else
                                             f'{k.USER}\'s login shell is {shell}, not {k.NOLOGIN}')))
-    out.append(('sudoers', f'no sudo rule covers {k.USER}', k.sudo_problem(c)))
+    out.append(('sudoers', f'no sudo rule covers {k.USER}' + (', but for allow-listed helpers (sudoHelpers)'
+                                                              if c['sudoHelpers'] else ''), k.sudo_problem(c)))
+    out.append(('docker', f'{k.USER} cannot reach a container engine\'s root socket', socket_problem(c)))
+    if not wsl2:
+        out.append(('ssh', f'sshd reads {k.SSHD_CONF} (DenyUsers {k.USER}) for every login', sshd_problem()))
     if not before_enable:   # setup asks before its own restart, while the marker is there by design
         out.append(('restart', 'no T3 runs that started before setup\'s last change', k.restart_problem()))
     current = k.lstat(k.OPT + '/current')
@@ -713,17 +838,8 @@ def own_walls(c, before_enable=False):
             rt = [f'{folder}/t3 is not the one pc-agents setup installed']
     out.append(('runtime', f'T3 {c["t3Version"]} is root\'s alone, as installed', rt and '; '.join(rt)))
     out.append(gpu_wall(c))
-    mounts = []
-    try:
-        with open(k.ROOT + '/proc/self/mountinfo', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                fields = line.split(' - ')
-                where, fstype = fields[0].split()[4], (fields[1].split() or [''])[0] if len(fields) > 1 else ''
-                if fstype in ('9p', 'drvfs', 'virtiofs') and not (where + '/').startswith('/usr/lib/wsl/'):
-                    mounts.append(f'{where} ({fstype})')
-    except (OSError, IndexError) as e:
-        mounts.append(f'cannot read /proc/self/mountinfo ({e})')
-    out.append(('automount', 'no Windows drive is mounted', mounts and 'mounted: ' + ', '.join(mounts[:3])))
+    if wsl2:   # a plain Linux box's own mounts are the owner's: there the unit hides /mnt and /media
+        out.append(('automount', 'no Windows drive is mounted', windows_drives()))
     saved = None
     if k.safe(k.LOADED, k.lstat(k.LOADED), stat.S_ISREG) is None:
         with open(k.ROOT + k.LOADED, encoding='utf-8', errors='replace') as f:
@@ -744,32 +860,44 @@ def own_walls(c, before_enable=False):
     def nets(names):
         return [n for n in names if isinstance(gateway, k.ipaddress.IPv4Address) and gateway in k.ipaddress.ip_network(n)]
     opened = nets(c['allow'] + c['peers'])
-    out.append(('gateway', 'the Windows host (the default gateway) is in a blocked range and not let through',
+    out.append(('gateway', f'the {"Windows host" if wsl2 else "router"} (the default gateway) is in a blocked range '
+                'and not let through',
                 f'allow or peers let the gateway {gateway} through: {", ".join(opened)}' if opened else
                 None if nets(k.BLOCKED4) else f'the gateway is {gateway}, not in a blocked range'))
     return out
 
 
-def wsl2_walls():
-    """(wall, what, why or None) of the fleet's wsl2 walls (fork-fleet-walls.py, its contract enforced there)."""
+def fleet_walls(c):
+    """(wall, what, why or None) of the fleet's walls for this OS (fork-fleet-walls.py, its contract enforced there:
+    it tells the OS itself, wsl2 or linux), prefixed with its name, and whether that is the machine file's platform."""
     env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}
     if k.ROOT:
         env['FORK_FLEET_WALLS_ROOT'] = k.ROOT
+
+    def walls(verb):
+        return k.subprocess.run([k.ROOT + k.WALLS_PY, verb], env=env, stdin=k.subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=120, cwd='/')
+    want = c['platform']
     try:
-        p = k.subprocess.run([k.ROOT + k.WALLS_PY, 'describe'], env=env, stdin=k.subprocess.DEVNULL,
-                             capture_output=True, text=True, timeout=120, cwd='/')
+        name = walls('os')
+        p = walls('describe') if name.returncode == 0 else name
     except (OSError, k.subprocess.TimeoutExpired) as e:
-        return [('wsl2', 'the fleet\'s wsl2 walls ran', f'cannot run them ({e})')]
+        return [(want, f'the fleet\'s {want} walls ran', f'cannot run them ({e})')]
+    got = name.stdout.strip() if name.returncode == 0 else f'unknown (exit {name.returncode})'
+    platform = ('platform', f'the machine file\'s platform ({want}) is this machine\'s',
+                None if got == want else f'this machine is {got}: set "platform" in the machine file to the kind of '
+                'machine it is (fork-kit/pc-agents/README.md)')
     lines = [m.groups() for m in re.finditer(r'^(PASS|FAIL)  (\S+)  (.*)$', p.stdout, re.M)]
     if p.returncode not in (0, 1) or not lines:
-        return [('wsl2', 'the fleet\'s wsl2 walls ran', f'exit {p.returncode}: {p.stderr.strip()[-300:]}')]
-    return [(f'wsl2:{w}', what, None if mark == 'PASS' else what) for mark, w, what in lines if w not in k.UNIT_WALLS]
+        return [platform, (got, f'the fleet\'s {got} walls ran', f'exit {p.returncode}: {p.stderr.strip()[-300:]}')]
+    return [platform] + [(f'{got}:{w}', what, None if mark == 'PASS' else what) for mark, w, what in lines
+                         if w not in k.UNIT_WALLS]
 
 
 def check(enforce, before_enable=False):
     try:
         c = k.config()
-        results = wsl2_walls() + own_walls(c, before_enable)
+        results = fleet_walls(c) + own_walls(c, before_enable)
     except Exception as e:   # a wall that cannot be told does not hold
         results = [('check', 'the walls can be read', f'{e.__class__.__name__}: {e}')]
     for wall, what, why in results:
