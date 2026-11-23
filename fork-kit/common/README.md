@@ -72,7 +72,7 @@ standard library.
 
 ## The installer
 
-`kit_install.py` is the installer of the agent-guards, cleaner, golive, schedule-kick and update-policy kits; each kit's `sbin/<kit>-install` is a small
+`kit_install.py` is the installer of the agent-guards, cleaner, gardener, golive, schedule-kick and update-policy kits; each kit's `sbin/<kit>-install` is a small
 subclass that names its paths, links, files and modules, and adds its own steps. `install --source FOLDER --sha
 SHA`, as root:
 
@@ -108,7 +108,7 @@ root's `uninstall` can then wait there forever, with both locks held (as it can 
 process whose memory is FUSE-backed). It fails safe: nothing is removed yet, and Ctrl-C ends it and frees the
 locks. Updates go through the bootstrap.
 
-`bootstrap.sh --kit agent-guards|cleaner|golive|schedule-kick|update-policy --repo OWNER/REPO --sha SHA [kit options]` checks the commit is on the protected
+`bootstrap.sh --kit agent-guards|cleaner|gardener|golive|schedule-kick|update-policy --repo OWNER/REPO --sha SHA [kit options]` checks the commit is on the protected
 release branch, downloads exactly that commit and runs the kit's installer; it passes on only the kit's own options.
 
 ## Tests

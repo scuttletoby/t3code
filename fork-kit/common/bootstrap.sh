@@ -7,6 +7,7 @@
 # KIT and its options (each kit's sbin/*-install says what they do):
 #   agent-guards  fork-kit/agent-guards/sbin/agent-guards-install  [--settings | --no-settings]
 #   cleaner   fork-kit/cleaner/sbin/fork-cleaner-install   [--timer | --no-timer]
+#   gardener  fork-kit/gardener/sbin/gardener-install      [--timer | --no-timer]
 #   golive    fork-kit/golive/sbin/t3-golive-install       (none)
 #   schedule-kick  fork-kit/schedule-kick/sbin/schedule-kick-install  [--timer | --no-timer]
 #   update-policy  fork-kit/update-policy/sbin/update-policy-install  [--timer | --no-timer] [--force]
@@ -39,14 +40,15 @@ done
 case "$kit" in
   agent-guards) installer='sbin/agent-guards-install' ;;
   cleaner) installer='sbin/fork-cleaner-install' ;;
+  gardener) installer='sbin/gardener-install' ;;
   golive) installer='sbin/t3-golive-install'; [ -z "$opt" ] || die "$opt is not an option of --kit golive" ;;
   schedule-kick) installer='sbin/schedule-kick-install' ;;
   update-policy) installer='sbin/update-policy-install' ;;
-  *) die "--kit must be one of: agent-guards cleaner golive schedule-kick update-policy" ;;
+  *) die "--kit must be one of: agent-guards cleaner gardener golive schedule-kick update-policy" ;;
 esac
 [ -z "$force" ] || [ "$kit" = update-policy ] || die "--force is not an option of --kit $kit"
 case "$kit:$opt" in
-  agent-guards:--timer|agent-guards:--no-timer|cleaner:--*settings|schedule-kick:--*settings|update-policy:--*settings)
+  agent-guards:--timer|agent-guards:--no-timer|cleaner:--*settings|gardener:--*settings|schedule-kick:--*settings|update-policy:--*settings)
     die "$opt is not an option of --kit $kit" ;;
 esac
 printf '%s\n' "$repo" | grep -Eqx '[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}' || die "--repo must be OWNER/NAME"

@@ -1,0 +1,12 @@
+# gardener kit: written by gardener-install. Do not edit: run the installer again.
+[Unit]
+Description=gardener tick every hour; each project runs once a day, in its own window (fork-kit/gardener)
+
+[Timer]
+OnStartupSec=10min
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

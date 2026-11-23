@@ -549,8 +549,8 @@ NOT_GATE = ('.github/fork-ci-tests.txt',)
 # report must say to count), gh-apps keeps the gate App's key and mints its tokens (the gate-trust design). The
 # other kits run machines and agents, and the merge gate reads none of them.
 GATE_KITS = ('gh-apps', 'review')
-OTHER_KITS = ('.gitignore', 'README.md', 'agent-guards', 'cleaner', 'common', 'desk', 'golive', 'heavy', 'model-guard',
-              'pc-agents', 'schedule-kick', 'update-policy')
+OTHER_KITS = ('.gitignore', 'README.md', 'agent-guards', 'cleaner', 'common', 'desk', 'gardener', 'golive', 'heavy',
+              'model-guard', 'pc-agents', 'schedule-kick', 'update-policy')
 
 
 class ForkConfig(unittest.TestCase):

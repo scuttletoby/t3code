@@ -1,0 +1,32 @@
+#!/usr/bin/python3 -IB
+"""workflows-off: GitHub Actions workflows that are switched off (by hand or for inactivity). One `gh api` call per
+repository. Report only, even with "fix": a workflow someone switched off on purpose is never switched on by a tool.
+
+Options:
+  repos    [OWNER/REPO] (default: the project's repo)
+  ignore   [workflow file name, e.g. "old-deploy.yml"] that are meant to be off
+"""
+import json, os, shlex, subprocess, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from gardener.contract import emit, read_context  # noqa: E402
+
+ctx = read_context()
+opt = ctx['options']
+repos = opt.get('repos') or ([ctx['project']['repo']] if ctx['project']['repo'] else [])
+ignore = set(opt.get('ignore') or [])
+if not repos:
+    emit('workflows.no-repo', 'info', 'no repository to read: the project has no "repo" and the check no "repos"',
+         '')
+for repo in repos:
+    p = subprocess.run([ctx['gh'], 'api', f'repos/{repo}/actions/workflows?per_page=100'], capture_output=True,
+                       text=True, timeout=60, stdin=subprocess.DEVNULL)
+    if p.returncode != 0:
+        sys.exit(f'gh api repos/{repo}/actions/workflows: {(p.stderr or p.stdout).strip()[-200:]}')
+    for w in json.loads(p.stdout).get('workflows') or []:
+        state, path = w.get('state'), w.get('path') or ''
+        name = os.path.basename(path)
+        if state == 'active' or name in ignore or not path.startswith('.github/workflows/'):
+            continue
+        emit('workflows.off', 'warn', f'workflow {w.get("name") or name} is {state}', f'{repo}: {path}',
+             f'gh workflow enable {shlex.quote(name)} -R {shlex.quote(repo)} (or add it to this check\'s "ignore" '
+             'if it is meant to be off)')

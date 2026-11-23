@@ -1,0 +1,8 @@
+#!/usr/bin/python3 -IB
+"""gardener: the gardener kit (lib/gardener). Runs each project's checks once a day and keeps one report issue.
+-I: no environment variable, user site folder or current folder changes what Python loads. The code is loaded
+only from this file's real folder."""
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from gardener import cli  # noqa: E402
+sys.exit(cli.main(sys.argv[1:]))

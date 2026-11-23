@@ -425,7 +425,7 @@ def load(rel, name):
     loader.exec_module(mod)
     return mod
 failed = []
-if how == 'kit_install':        # agent-guards, cleaner, golive, schedule-kick, update-policy: check_options' file part
+if how == 'kit_install':        # agent-guards, cleaner, gardener, golive, schedule-kick, update-policy: check_options' file part
     m = load(installer, 'kit_installer')
     inst, missing = m.INSTALLER, []
     for rel in inst.source_files():
@@ -469,6 +469,7 @@ print(json.dumps({'missing': missing, 'failed': failed}))
 # passes: the kit's folder or the release's top folder)
 KITS = {"agent-guards": ("kit_install", "sbin/agent-guards-install", "kit"),
         "cleaner": ("kit_install", "sbin/fork-cleaner-install", "kit"),
+        "gardener": ("kit_install", "sbin/gardener-install", "kit"),
         "golive": ("kit_install", "sbin/t3-golive-install", "kit"),
         "schedule-kick": ("kit_install", "sbin/schedule-kick-install", "kit"),
         "update-policy": ("kit_install", "sbin/update-policy-install", "kit"),
