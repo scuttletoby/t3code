@@ -77,28 +77,28 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 }
 ```
 
-| Key                      | What                                                                                                                                                                                                              |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `organization`           | the name the managed policy shows in T3's settings                                                                                                                                                                |
-| `t3Version`              | the exact T3 version (the linking T3's), 0.1.7 or newer (see below); its release files, as `scripts/install.sh`'s                                                                                                 |
-| `t3ReleaseBaseUrl`       | where that version's release files are (`T3CODE_RELEASE_BASE_URL` of `scripts/install.sh`)                                                                                                                        |
-| `port`                   | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                                                                                                                      |
-| `agentUid`               | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                                                                                                                 |
-| `maxRuntimeMode`         | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                                                                                                                |
-| `lockedSettings`         | more T3 settings to lock, `{path: value}`, only ones `t3Version` knows (`agentSlots.…`: a fork build), see below                                                                                                  |
-| `memoryMax`, `cpuQuota`  | the unit's `MemoryMax` and `CPUQuota`                                                                                                                                                                             |
-| `nameservers`            | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                                                                                                                   |
-| `allow`                  | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host                                                                                                        |
-| `devPorts`               | optional: the TCP ports the agent's dev servers may listen on and be reached on, `LOW-HIGH` (default `4100-4199`)                                                                                                 |
-| `peers`                  | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to                                                                                                         |
-| `tailscaleTag`           | the tag this PC's Tailscale node gets (`tag:name`)                                                                                                                                                                |
-| `autoUpdate`             | optional: `{"enabled": true, "follow": "OWNER/NAME"}` installs that fork's new releases by itself (see "Automatic updates"); off by default                                                                       |
-| `gpu`                    | optional: `true` lets the agents use the PC's GPU (CUDA): `/dev/dxg` and, read-only, `/usr/lib/wsl/lib` and `/usr/lib/wsl/drivers`; on a plain Linux box NVIDIA's device nodes (see "GPU access"); off by default |
-| `platform`               | optional: `wsl2` (the default, so a machine file from before the key reads as before) or `linux` (a plain Linux box, see below)                                                                                   |
-| `sudoHelpers`            | optional: up to 8 commands the agent may run through sudo, as the sudo rule names them (see "Plain Linux box"); none by default                                                                                   |
-| `agentUser`, `agentHome` | optional: the agent user's name and home (default `agent` and `/home/agent`; the home is `/home/NAME`), to adopt a user the box already has (see "Adopting an existing user")                                     |
-| `sudoRules`              | optional: up to 16 more sudoers lines that may name the agent, each word for word as the file has it (see "Adopting an existing user"); none by default                                                           |
-| `keepUserManager`        | optional, `linux` only: `true` leaves the agent's systemd user manager unmasked, so its linger and rootless Docker keep working (see "Adopting an existing user"); off by default                                 |
+| Key                      | What                                                                                                                                                                                                                                                          |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `organization`           | the name the managed policy shows in T3's settings                                                                                                                                                                                                            |
+| `t3Version`              | the exact T3 version (the linking T3's), 0.1.7 or newer (see below); its release files, as `scripts/install.sh`'s                                                                                                                                             |
+| `t3ReleaseBaseUrl`       | where that version's release files are (`T3CODE_RELEASE_BASE_URL` of `scripts/install.sh`)                                                                                                                                                                    |
+| `port`                   | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                                                                                                                                                                  |
+| `agentUid`               | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                                                                                                                                                             |
+| `maxRuntimeMode`         | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                                                                                                                                                            |
+| `lockedSettings`         | more T3 settings to lock, `{path: value}`, only ones `t3Version` knows (`agentSlots.…`: a fork build), see below                                                                                                                                              |
+| `memoryMax`, `cpuQuota`  | the unit's `MemoryMax` and `CPUQuota`                                                                                                                                                                                                                         |
+| `nameservers`            | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                                                                                                                                                               |
+| `allow`                  | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host                                                                                                                                                    |
+| `devPorts`               | optional: the TCP ports the agent's dev servers may listen on and be reached on, `LOW-HIGH` (default `4100-4199`)                                                                                                                                             |
+| `peers`                  | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to                                                                                                                                                     |
+| `tailscaleTag`           | the tag this PC's Tailscale node gets (`tag:name`)                                                                                                                                                                                                            |
+| `autoUpdate`             | optional: `{"enabled": true, "follow": "OWNER/NAME"}` installs that fork's new releases by itself (see "Automatic updates"); off by default                                                                                                                   |
+| `gpu`                    | optional: `true` lets the agents use the PC's GPU (CUDA): `/dev/dxg` and, read-only, `/usr/lib/wsl/lib` and `/usr/lib/wsl/drivers`; on a plain Linux box NVIDIA's device nodes (see "GPU access"); off by default                                             |
+| `platform`               | optional: `wsl2` (the default, so a machine file from before the key reads as before) or `linux` (a plain Linux box, see below)                                                                                                                               |
+| `sudoHelpers`            | optional: up to 8 commands the agent may run through sudo, as the sudo rule names them (see "Plain Linux box"); none by default                                                                                                                               |
+| `agentUser`, `agentHome` | optional: the agent user's name and home (default `agent` and `/home/agent`; the home is `/home/NAME`), to adopt a user the box already has (see "Adopting an existing user")                                                                                 |
+| `sudoRules`              | optional: up to 16 more sudoers lines that may name the agent, each word for word as the file has it (see "Adopting an existing user"); none by default                                                                                                       |
+| `keepUserManager`        | optional, `linux` only: `true` leaves the agent's systemd user manager unmasked, so its linger and rootless Docker keep working; the agent can then run code outside the unit, and no sudo rule may name it (see "Adopting an existing user"); off by default |
 
 `t3Version` must be 0.1.7 or newer: older releases have no managed policy, so they would run with none of the kit's
 locks and with updates on. A 0.1.7 pre-release counts as older (some 0.1.7 nightlies were built before the policy),
@@ -119,7 +119,9 @@ policy may name only settings the installed `t3Version` knows: T3 does not start
 settings (`agentSlots`, ...) need a fork build, and `automaticUpdates` a version that has it (the kit turns updates
 off through `limits.updates` on every version). Releases that exit 77 on a policy they cannot apply are not restarted
 (`RestartPreventExitStatus=77`); T3's own exit on `SIGTERM` (130, a stop) is not a failure
-(`SuccessExitStatus=130`; a kit from before it changes the unit once, so the next setup restarts T3 once); on any
+(`SuccessExitStatus=130`), and T3 still comes back after one that was not systemd's stop, an agent's `kill` or `pkill`
+in the unit (`RestartForceExitStatus=130`; systemd never restarts after `systemctl stop`). A kit from before these
+lines changes the unit once, so the next setup restarts T3 once. On any
 other exit the unit gives up after 5 starts in 10 minutes (`StartLimitBurst=5`). Setup clears that count
 (`systemctl reset-failed`) before it starts T3, so running it again within the 10 minutes still starts T3.
 
@@ -271,7 +273,9 @@ T3 still cannot update itself (`limits.updates` stays off, T3 stays root's): roo
   one rename; only that value changes), runs the same setup as step 3 from the installed kit (no new kit code is
   downloaded: kit updates stay yours), and checks that T3 says it is ready (`T3 Code server is ready.` in this run of
   its unit's journal; a request sent before that can wait minutes for an answer), then answers on its port as the
-  new version (`/.well-known/t3/environment`), within 3 minutes, and that every wall holds.
+  new version (`/.well-known/t3/environment`), within 3 minutes, and that every wall holds. Where the journal cannot
+  tell (nothing of this run in it: journald keeps nothing or rotated it away; or `journalctl` fails), T3's answer
+  alone decides, as before.
 - **Rollback:** when the new version does not come up, `t3Version` goes back (the `.bak` from before the switch is
   kept); if T3's unit ran the new version, T3 is stopped, the database as it is then (with its `-wal` and `-shm`) is
   copied to `/var/lib/pc-agents/db-replaced-<UTC time>-<version>` (root's alone, named in the alert, never removed
@@ -402,23 +406,39 @@ uid, alias, run-as or tag on the line, no wildcard, no `ALL`, and no `Defaults` 
 sudo lets a command named without arguments run with any, so list the arguments too (`"/usr/local/sbin/agent-gpu on"`),
 or `""` for none (`"/usr/local/sbin/agent-gpu \"\""`). A rule the kit finds is kept as it is, never widened; one
 wider than this is a failed wall, which you fix (the kit never edits a sudo rule). Inside T3's unit sudo does not run
-at all (`NoNewPrivileges`), and the agent has no login, so the helper is yours to run for it, not the agent's.
+at all (`NoNewPrivileges`), and the agent has no login, so the helper is yours to run for it, not the agent's. That
+holds only while the agent has no way to run code outside the unit: with `keepUserManager` it has one, so setup
+refuses `sudoHelpers` and `sudoRules` together with it, and any sudo rule for the agent then fails the wall.
 
 **Adopting an existing user.** A box whose agent user already exists under another name, home or uid (one that
 ran T3 or rootless Docker before the kit) is adopted with `agentUser`, `agentHome` (`/home/NAME`) and `agentUid`.
 The user must still be the kit's in every other way (its own group as its primary group and no other, a home of
-its own); setup keeps it and takes its login shell away, as for an `agent` made by hand. Two more keys open what
-the walls would otherwise fail, and only on the owner's word:
+its own: a folder of its uid that no other user has as home, since `useradd` keeps the owner of a home that is
+already there and T3's unit binds it read-write); setup keeps it and takes its login shell away, as for an `agent`
+made by hand, and refuses anything else before it writes. Set these keys before the first setup: changed later,
+setup starts T3 on the new user's home, while the database stays in the old home and the old user stays. To move
+an agent that is set up, stop T3 (`systemctl stop t3code-agents.service`), copy `<old home>/.t3` into the new home
+(owned by the new user), change the keys, and run setup. Two more keys open what the walls would otherwise fail,
+and only on the owner's word:
 
-- `sudoRules`: sudoers lines (a `Defaults:` line too) the `sudoers` wall passes as they are, compared with
-  blanks and a trailing comment aside. The kit trusts each one as written: list only what you would give the agent
-  anyway. Every other line that names the agent still fails, as does any line once it differs from the list.
+- `sudoRules`: sudoers lines the `sudoers` wall passes as they are (blanks and a trailing comment aside), in one
+  form only: `<agentUser> HOST=(RUNAS) [TAG:]... COMMAND[, COMMAND]`, HOST `ALL` or a host name, RUNAS `ALL` or
+  user names, tags that keep sudo's environment (no `SETENV`), each COMMAND an absolute path with plain arguments
+  (no wildcard, no `ALL`). No alias of any kind and no `Defaults` line: an alias is defined somewhere the wall does
+  not compare (a `User_Alias` for the agent still fails, and with it the rules written for it). Like a helper, a
+  listed rule passes only while each command's file and every folder above it are root's alone. Every other line
+  that names the agent still fails, as does any line once it differs from the list.
 - `keepUserManager: true` (`linux` only): `user@<agentUid>.service` is not masked (setup removes a mask an earlier
   run made), the agent's own linger file and user units pass the `linger` and `user-units` walls (another user's
-  linger still fails), and T3's unit binds the agent's `/run/user/<agentUid>` too, so the agent's rootless Docker
-  socket is reachable from it. What the user manager runs (rootless Docker's daemon and its containers) runs
-  outside T3's unit walls, under the agent's uid: the agent firewall still applies to it (it matches the uid), the
-  unit's other walls do not.
+  linger still fails), and T3's unit binds rootless Docker's socket (`/run/user/<agentUid>/docker.sock`) and
+  starts after the agent's user manager. Only the socket: the rest of that folder holds the user manager's own
+  sockets. **What it opens:** the agent can then run code outside T3's unit, as its own uid: through Docker (its
+  containers), and through what its user manager reads from its home (user units, `environment.d`, Docker's own
+  configuration), which the agent writes. There the agent is walled only as an ordinary unprivileged user of the
+  box and by the agent firewall (it matches the uid); the unit's other walls (`NoNewPrivileges`, hidden paths,
+  `MemoryMax`, `CPUQuota`, `IPAddressAllow`) do not hold. So no sudo rule may name the agent with this key (setup
+  refuses `sudoHelpers` and `sudoRules` with it), and the `masks` wall says so on every check. Docker restarted
+  (or started after T3) makes a new socket that T3's unit sees only after T3's next restart.
 
 Without these keys every file is as before, byte for byte, on both kinds of machine.
 

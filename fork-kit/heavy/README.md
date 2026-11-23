@@ -694,8 +694,11 @@ either caller.
 
 **CPU brake (#1047).** Memory alone admitted a build on a machine whose every core was taken by work outside heavy
 (containers its user had started). The rule's `cpu` (`capacity-rule.json`) brakes one more job: busy when the
-machine's CPU pressure (`/proc/pressure/cpu`, `some avg10`) is at least `pressureSomeAvg10Pct` (80) or the 1-minute
-load is at least `loadPerCorePercent` (150) of the cores (the rule's cores, a container's `cpu.max` too). It brakes
+CPU pressure (`some avg10`) is at least `pressureSomeAvg10Pct` (80). The pressure is the machine's
+(`/proc/pressure/cpu`), or in a container with a CPU limit (the cgroup root's `cpu.max`) the container's own
+(`cpu.pressure` there): the host can be busy while the container's share is free. Only where no pressure is read
+does the 1-minute load decide, at `loadPerCorePercent` (150) of the host's online CPUs (the load is the host's; it
+counts tasks waiting for I/O too, so it never overrides a pressure reading). It brakes
 jobs and MB alone (which asks for a job), never agents, which mostly wait on their model; the job kinds' `fits` are
 then 0, and the reason names the reading (`NOT OK: cpu pressure 93% (some avg10; the brake is 80%)`). A missing or
 broken CPU PSI or load brakes nothing (the memory rule still decides). The shared TypeScript evaluator does not read

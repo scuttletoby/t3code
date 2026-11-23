@@ -792,7 +792,9 @@ def own_walls(c, before_enable=False):
                                            and os.readlink(k.ROOT + p) == '/dev/null')]
     kept = c['keepUserManager']   # linux only: the agent's user manager runs (linger, rootless Docker), unmasked
     out.append(('masks', 'WSL interop, cron, at, ssh and the agent\'s user manager are masked' if wsl2 else
-                'the agent\'s user manager is kept (keepUserManager)' if kept else
+                'the agent\'s user manager is kept (keepUserManager): the agent can run code outside T3\'s unit '
+                '(its user units, rootless Docker), walled there only as an unprivileged user and by the firewall'
+                if kept else
                 'the agent\'s user manager is masked',
                 masks and 'not masked: ' + ', '.join(masks)))
     linger = sorted(os.listdir(k.ROOT + '/var/lib/systemd/linger')) if k.lstat('/var/lib/systemd/linger') else []
@@ -1102,25 +1104,30 @@ READY = 'T3 Code server is ready.'
 
 
 def t3_ready():
-    """Whether the T3 that runs now said READY: this run of its unit's journal only (its InvocationID)."""
+    """Whether the T3 that runs now said READY in this run of its unit's journal (its InvocationID): True, False, or
+    None when the journal cannot tell: the run cannot be named, journalctl fails, or the run has no line there at all
+    (journald keeps nothing, sends the unit's output elsewhere, or rotated an older run's lines away)."""
     got = k.props(k.run(['/usr/bin/systemctl', 'show', '-p', 'InvocationID', k.UNIT]).stdout).get('InvocationID', '')
     if not re.fullmatch(r'[0-9a-f]{32}', got):
-        return False
+        return None
     r = k.run(['/usr/bin/journalctl', f'_SYSTEMD_INVOCATION_ID={got}', '-o', 'cat', '--no-pager'], timeout=60)
-    return r.returncode == 0 and READY in r.stdout.splitlines()
+    if r.returncode or not r.stdout.strip():
+        return None
+    return READY in r.stdout.splitlines()
 
 
 def serves(c, version):
-    """Why T3 does not say it is ready (READY) and then answer as version on its port (its environment descriptor's
-    serverVersion, no sign-in needed) within k.HTTP_WAIT seconds, or None."""
+    """Why T3 does not answer as version on its port (its environment descriptor's serverVersion, no sign-in
+    needed) within k.HTTP_WAIT seconds, or None. No request goes out before T3 says it is ready (READY) where the
+    journal can tell; where it cannot (t3_ready None: nothing of this run there, or journalctl fails), the answer
+    alone decides, as before, so a journal that keeps nothing never fails a T3 that serves."""
     url = f'http://127.0.0.1:{c["port"]}/.well-known/t3/environment'
     end = time.monotonic() + k.HTTP_WAIT
+    while (ready := t3_ready()) is False:
+        if time.monotonic() >= end:
+            return f'T3 did not say "{READY}" (journalctl -u {k.UNIT})'
+        time.sleep(k.HTTP_STEP)
     while True:
-        if not t3_ready():
-            if time.monotonic() >= end:
-                return f'T3 did not say "{READY}" (journalctl -u {k.UNIT})'
-            time.sleep(k.HTTP_STEP)
-            continue
         r = k.run(['/usr/bin/curl', '-q', '-fsS', '--proto', '=http', '--noproxy', '*', '--max-time', '10', url],
                   timeout=30)
         try:

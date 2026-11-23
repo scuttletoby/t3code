@@ -1963,9 +1963,34 @@ class CpuBrake(Case):
 
     def test_a_rule_without_cpu_brakes_nothing(self):
         rule = {k: v for k, v in RULE.items() if k != 'cpu'}
-        self.assertIsNone(hf.cpu_busy(rule, 8, 99.0, 100.0))
-        self.assertIsNotNone(hf.cpu_busy(RULE, 8, 99.0, None))
-        self.assertIsNone(hf.cpu_busy(RULE, None, 99.0, None))   # cores unread: memory decides (nothing admitted)
+        self.assertIsNone(hf.cpu_busy(rule, {'pressureSome10': 100.0, 'hostCores': 8}, 99.0))
+        self.assertIsNotNone(hf.cpu_busy(RULE, {'pressureSome10': None, 'hostCores': 8}, 99.0))
+        self.assertIsNone(hf.cpu_busy(RULE, {'pressureSome10': None, 'hostCores': None}, 99.0))   # nothing to compare
+        self.assertIsNone(hf.cpu_busy(RULE, None, 99.0))
+
+    def test_pressure_decides_over_load(self):
+        """Load counts tasks waiting for I/O (a slow disk, a hung network mount): where CPU pressure is read, a calm
+        one is not braked by a high load."""
+        self.cpu(1)
+        self.m.write('/proc/loadavg', '64.00 1.00 0.50 2/300 4000\n')
+        code, d = self.facts('--kind', 'job-build')
+        self.assertEqual(code, 0, d)
+
+    def test_a_container_reads_its_own_cpu(self):
+        """In a container with a CPU limit, its own cgroup's pressure decides, not the host's; without one, the
+        host's load is compared with the host's CPUs, not the container's share of them."""
+        self.m.write('/sys/fs/cgroup/cpu.max', '200000 100000\n')   # 2 of the host's 8 CPUs
+        self.cpu(100)                                                 # the host is busy
+        self.m.write('/sys/fs/cgroup/cpu.pressure', 'some avg10=3.00 avg60=0.00 avg300=0.00 total=0\n')
+        code, d = self.facts('--kind', 'job-build')
+        self.assertEqual(code, 0, d)
+        self.assertEqual(d['cpu']['pressureSome10'], 3.0)
+        self.m.write('/sys/fs/cgroup/cpu.pressure', 'some avg10=95.00 avg60=0.00 avg300=0.00 total=0\n')
+        code, d = self.facts('--kind', 'job-build', '--fresh')
+        self.assertEqual(code, hf.EXIT_BUSY, d)
+        os.unlink(self.m.root + '/sys/fs/cgroup/cpu.pressure')        # no PSI of its own: the host's load
+        self.m.write('/proc/loadavg', '6.00 1.00 0.50 2/300 4000\n')  # 6 on 8 host CPUs: under 150%
+        self.assertEqual(self.facts('--kind', 'job-build', '--fresh')[0], 0)
 
 
 class AgentSlots(Case):

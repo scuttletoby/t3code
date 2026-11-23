@@ -8,6 +8,7 @@ file (no "platform") is read as wsl2, as before.
   python3 -I -B fork-kit/pc-agents/tests/linux.test.py
 """
 import os, shutil, sys, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_distro import CONFIG, LINUX_CONFIG, SHA1, Case, cli, k  # noqa: E402
@@ -327,9 +328,11 @@ class OldMachineFile(Case):
 # T3's unit on a plain Linux box as fake_distro's LINUX_CONFIG gives it, before the `gpu` setting reached linux
 # (#1027 item 3): with no setting (or "gpu": false) it stays byte for byte this one.
 # #1047 changed it on purpose by the exit 130 lines alone (setup.test.py EXIT_130): without them, OLD_LINUX_UNIT_SHA.
-LINUX_UNIT_SHA = '5b3eeebb2e043f7608029aeba8181d9d4fc8e9bd4da96e70df0caba20c669366'
+LINUX_UNIT_SHA = '537093869000c3344819ea49606b0dbc36c28e8ebc4553d6ed4d4318ffb790f3'
 OLD_LINUX_UNIT_SHA = '6cb2a94d01fbb9b59c0b4c614c297a18591e6b236e4e8ee74a9f27e821519141'
-EXIT_130 = '# 130: T3\'s own exit on SIGTERM (a stop), not a failure (#1047)\nSuccessExitStatus=130\n'
+EXIT_130 = ("# 130: T3's own exit on SIGTERM (a stop), not a failure (#1047); restarted all the same when the SIGTERM "
+            "was not\n# systemd's stop (an agent's kill or pkill in the unit): systemd never restarts after `systemctl "
+            "stop`\nSuccessExitStatus=130\nRestartForceExitStatus=130\n")
 UNIT = '/etc/systemd/system/t3code-agents.service'
 CARDS = tuple(f'/dev/nvidia{i}' for i in range(16))
 NVIDIA = CARDS + ('/dev/nvidiactl', '/dev/nvidia-modeset', '/dev/nvidia-uvm', '/dev/nvidia-uvm-tools')
@@ -625,10 +628,10 @@ class Wsl2GpuSeen(Case):
 
 class Adopt(Linux):
     """An agent user the box already has (#1047): its name, home and uid from the machine file (agentUser, agentHome,
-    agentUid), extra sudo rules the owner lists word for word (sudoRules), and its user manager kept
-    (keepUserManager: linger and rootless Docker go on working). Without the keys, every file is as before."""
+    agentUid), and its user manager kept (keepUserManager: linger and rootless Docker go on working, with only
+    Docker's socket in T3's unit). Without the keys, every file is as before."""
     ADOPT = {**LINUX_CONFIG, 'agentUser': 'builder', 'agentHome': '/home/builder', 'agentUid': 1200,
-             'keepUserManager': True, 'sudoRules': ['builder ALL=(root) NOPASSWD: /usr/bin/systemctl restart x']}
+             'keepUserManager': True}
 
     def existing(self, groups=''):
         """The user as the owner made it before the kit: its own group, a login shell, lingering, rootless Docker."""
@@ -636,8 +639,6 @@ class Adopt(Linux):
         self.write('/etc/group', self.read('/etc/group') + f'builder:x:1200:{groups}\n')
         self.write('/home/builder/.config/systemd/user/docker.service', '[Service]\nExecStart=/usr/bin/dockerd\n')
         self.write('/var/lib/systemd/linger/builder', '')
-        self.write('/etc/sudoers.d/60-builder', '# the owner\'s\nbuilder  ALL=(root) NOPASSWD: /usr/bin/systemctl '
-                   'restart x\n')
         self.machine(self.ADOPT)
 
     def test_defaults_unchanged(self):
@@ -657,9 +658,12 @@ class Adopt(Linux):
         self.assertEqual(code, 0, out)
         self.assertNotIn('FAIL', out)
         unit = self.read('/etc/systemd/system/t3code-agents.service')
-        for line in ('User=builder', 'Group=builder', 'BindPaths=/home/builder -/run/user/1200',
+        for line in ('User=builder', 'Group=builder', 'After=user@1200.service',
+                     'BindPaths=/home/builder -/run/user/1200/docker.sock',
                      'Environment=HOME=/home/builder T3CODE_HOME=/home/builder/.t3 T3CODE_PORT=3800 T3CODE_LAN=true'):
             self.assertIn('\n' + line + '\n', unit)
+        # never the runtime folder: it holds the user manager's bus and private socket
+        self.assertNotRegex(unit, r'BindPaths=.* -/run/user/1200(\s|$)')
         self.assertIn('meta skuid != 1200 accept', self.read(k.STATE + '/firewall.nft'))
         self.assertEqual(self.read('/etc/ssh/sshd_config.d/pc-agents.conf'), k.HEAD + 'DenyUsers builder\n')
         self.assertFalse(os.path.lexists(self.path('/etc/systemd/system/user@1200.service')))   # not masked
@@ -669,31 +673,32 @@ class Adopt(Linux):
         self.assertEqual((people.count('builder'), people.count('agent')), (1, 0))   # adopted, none made
         code, out = self.check()
         self.assertEqual(code, 0, out)
-        self.assertIn('builder\'s user units run in its user manager (keepUserManager)', out)
+        self.assertIn('can run code outside T3\'s unit', out)   # the check says what the key opens
         self.assertEqual(self.setup_run()[0], 0)   # again: nothing to change
         code, out = self.call(cli.main, ['as-agent', '--', 'docker', 'ps'])
         self.assertEqual(code, 0, out)
         argv = self.log('systemd-run')
         for arg in ('--uid=builder', '--working-directory=/home/builder', '--property=BindPaths=/home/builder '
-                    '-/run/user/1200'):
+                    '-/run/user/1200/docker.sock'):
             self.assertIn(arg, argv)
 
-    def test_sudo_rules(self):
-        """A listed rule passes as the owner wrote it (blanks and a comment aside); any other line for the agent
-        fails, a Defaults line too unless listed."""
+    def test_no_sudo_rule_with_the_user_manager(self):
+        """The agent can run code outside the unit (its user manager, rootless Docker), where NoNewPrivileges does
+        not hold: setup refuses sudo helpers or rules with the key, and the sudoers wall fails any rule then."""
         self.existing()
+        for change in ({'sudoHelpers': ['/usr/local/sbin/agent-helper']},
+                       {'sudoRules': ['builder ALL=(root) NOPASSWD: /usr/bin/systemctl restart x']}):
+            with self.subTest(change=change):
+                self.machine({**self.ADOPT, **change})
+                code, out = self.setup_run()
+                self.assertEqual(code, 2, out)
+                self.assertIn('keepUserManager: not with sudoHelpers or sudoRules', out)
+        self.machine(self.ADOPT)
         self.assertEqual(self.setup_run()[0], 0)
-        for text, holds in (('builder ALL=(root) NOPASSWD: /usr/bin/systemctl restart x  # ok', True),
-                            ('builder ALL=(root) NOPASSWD: /usr/bin/systemctl restart y', False),
-                            ('builder ALL=(ALL) NOPASSWD: ALL', False),
-                            ('Defaults:builder !env_reset', False)):
-            with self.subTest(text=text):
-                self.write('/etc/sudoers.d/60-builder', text + '\n')
-                code, out = self.check()
-                self.assertEqual(code, 0 if holds else 1, out)
-                self.assertEqual('FAIL  sudoers' in out, not holds, out)
-        self.machine({**self.ADOPT, 'sudoRules': ['Defaults:builder !env_reset']})
-        self.assertEqual(self.check()[0], 0)
+        self.write('/etc/sudoers.d/60-builder', 'builder ALL=(root) NOPASSWD: /usr/bin/systemctl restart x\n')
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAIL  sudoers', out)
 
     def test_kept_manager_still_walls_the_rest(self):
         """keepUserManager allows the agent's own linger and user units, no other user's linger, and no extra group."""
@@ -724,15 +729,41 @@ class Adopt(Linux):
         self.assertEqual(code, 0, out)
         self.assertFalse(os.path.lexists(self.path('/etc/systemd/system/user@1200.service')))
 
+    def test_a_home_that_is_not_the_agents(self):
+        """useradd keeps the owner of a home that is there, and T3's unit binds the home read-write: a home that is
+        another user's (in passwd, or by its owner) or no folder is refused before anything is written."""
+        real = k.lstat
+
+        def owned_by_another(path):
+            st = real(path)
+            if path == '/home/builder' and st is not None:
+                st = os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1) + tuple(st[5:10]))
+            return st
+        for name, setup, why in (
+                ('another passwd entry', lambda: self.write('/etc/passwd', self.read('/etc/passwd') +
+                                                           'web:x:1300:1300::/home/builder:/bin/sh\n'),
+                 'is also the home of web'),
+                ('not a folder', lambda: self.write('/home/builder', 'x'), 'is not a folder of uid 1200'),
+                ('another owner', lambda: (os.makedirs(self.path('/home/builder')),
+                                           self.enterContext(mock.patch.object(k, 'lstat', owned_by_another))),
+                 'is not a folder of uid 1200')):
+            with self.subTest(name):
+                shutil.rmtree(self.root)
+                self.setUp()
+                self.machine({**self.ADOPT, 'keepUserManager': False})
+                setup()
+                before = self.same_files(('/run/pc-agents', k.LOCK))
+                code, out = self.setup_run()
+                self.assertEqual(code, 1, out)
+                self.assertIn(why, out)
+                self.assertEqual(self.same_files(('/run/pc-agents', k.LOCK)), before)
+
     def test_refused(self):
         for change, why in (({'agentUser': 'root'}, 'agentUser: a user name'),
                             ({'agentUser': 'Agent'}, 'agentUser: a user name'),
                             ({'agentHome': '/srv/builder'}, 'agentHome: /home/NAME'),
                             ({'agentHome': '/home/a/b'}, 'agentHome: /home/NAME'),
                             ({'agentHome': '/home/..'}, 'agentHome: /home/NAME'),
-                            ({'sudoRules': ['a\nb']}, 'sudoRules'),
-                            ({'sudoRules': ['  ']}, 'sudoRules'),
-                            ({'sudoRules': ['x'] * 17}, 'at most 16'),
                             ({'platform': 'wsl2'}, 'keepUserManager: only with "platform": "linux"')):
             with self.subTest(change=change):
                 self.machine({**self.ADOPT, **change})
@@ -740,6 +771,63 @@ class Adopt(Linux):
                 self.assertEqual(code, 2, out)
                 self.assertIn(why, out)
         self.assertFalse(os.path.lexists(self.path('/etc/t3code/policy.json')))
+
+
+class SudoRules(Linux):
+    """sudoRules (#1047): lines the sudoers wall passes, only in one strict form (the agent, a host, a run-as, plain
+    commands) and only while each command is root's alone, as a helper's: no alias (a User_Alias would hide the
+    rules written for it, a Cmnd_Alias widen a command), no SETENV, no Defaults."""
+    CMD = '/usr/local/sbin/agent-restart'
+    RULE = f'agent ALL=(root) NOPASSWD: {CMD} x'
+
+    def setUp(self):
+        super().setUp()
+        self.walled()
+        self.write(self.CMD, {'text': '#!/bin/sh\n', 'mode': '755'})
+        self.machine({**LINUX_CONFIG, 'sudoRules': [self.RULE, f'agent ALL=(ALL:ALL) PASSWD: {self.CMD} y']})
+
+    def rule(self, text, holds):
+        self.write('/etc/sudoers.d/60-agent', text + '\n')
+        code, out = self.check()
+        self.assertEqual(code, 0 if holds else 1, out)
+        self.assertEqual('FAIL  sudoers' in out, not holds, out)
+
+    def test_listed_lines_pass_as_written(self):
+        for text, holds in ((self.RULE + '  # the owner\'s', True), (f'agent  ALL = (ALL:ALL) PASSWD: {self.CMD}  y',
+                                                                      True),
+                            (f'agent ALL=(root) NOPASSWD: {self.CMD} z', False),
+                            ('agent ALL=(ALL) NOPASSWD: ALL', False)):
+            with self.subTest(text=text):
+                self.rule(text, holds)
+
+    def test_a_command_the_agent_could_change_fails(self):
+        for change in (lambda: os.chmod(self.path(self.CMD), 0o777), lambda: os.unlink(self.path(self.CMD)),
+                       lambda: os.chmod(self.path('/usr/local/sbin'), 0o777)):
+            with self.subTest(change=change):
+                os.chmod(self.path('/usr/local/sbin'), 0o755)
+                self.write(self.CMD, {'text': '#!/bin/sh\n', 'mode': '755'})
+                change()
+                self.rule(self.RULE, False)
+
+    def test_aliases_setenv_and_other_forms_are_refused(self):
+        for line in ('User_Alias AG = agent', 'Cmnd_Alias C = /bin/sh', 'Defaults:agent !env_reset',
+                     'agent ALL=(root) NOPASSWD: CMDS', 'AG ALL=(root) NOPASSWD: /usr/bin/id',
+                     'agent ALL=(RA) NOPASSWD: /usr/bin/id', 'agent HOSTS=(root) NOPASSWD: /usr/bin/id',
+                     'agent ALL=(root) SETENV: /usr/bin/id', 'agent ALL=(root) NOPASSWD: /usr/bin/id *',
+                     'agent ALL=(root) NOPASSWD: ALL', 'bob ALL=(root) NOPASSWD: /usr/bin/id',
+                     'agent ALL=(root) NOPASSWD: /usr/bin/id : box=(root) /bin/sh'):
+            with self.subTest(line=line):
+                self.machine({**LINUX_CONFIG, 'sudoRules': [line]})
+                code, out = self.setup_run()
+                self.assertEqual(code, 2, out)
+                self.assertIn('sudoRules', out)
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn('sudoRules', out)
+
+    def test_an_alias_defined_elsewhere_still_fails(self):
+        """A User_Alias naming the agent is never listed, so it fails, and with it the rules written for it."""
+        self.rule(f'User_Alias AG = agent\nAG ALL=(ALL) NOPASSWD: /bin/sh\n{self.RULE}', False)
 
 
 class BadConfig(Case):

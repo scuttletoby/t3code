@@ -438,6 +438,21 @@ class Update(Updating):
         self.updated('1.2.5')
         self.assertEqual(self.state()['failed'], '1.2.4')
 
+    def test_a_journal_that_cannot_tell_does_not_fail_the_update(self):
+        """#1047: the ready line is waited for where the journal can tell. A journal that keeps nothing of this run
+        (Storage=none, output elsewhere, rotated away) or cannot be read is no failure of T3: its answer decides."""
+        for name in ('journal-none', 'journal-fail'):
+            with self.subTest(name):
+                self.write('/log/' + name, '')
+                self.releases(release('1.2.4'))
+                code, out = self.update()
+                self.assertEqual(code, 0, out)
+                self.updated('1.2.4')
+                self.assertNotIn('failed', self.state())
+                os.unlink(self.path('/log/' + name))
+                shutil.rmtree(self.root)
+                self.setUp()
+
     def test_other_failures_are_tried_again_a_few_times(self):
         self.releases(release('1.2.4'))
         real = cli.setup

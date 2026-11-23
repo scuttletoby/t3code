@@ -35,6 +35,7 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
     # that run's lines only (/log/journal.ID: a started T3 says it is ready there, unless it is of the version
     # in /log/t3-not-ready)
     'usr/bin/journalctl': 'R="${0%/usr/bin/journalctl}"; echo "$*" >>"$R/log/journalctl"\n'
+                          '[ -e "$R/log/journal-fail" ] && { echo "Failed to open journal (test)" >&2; exit 1; }\n'
                           'case "$1" in _SYSTEMD_INVOCATION_ID=*) cat "$R/log/journal.${1#*=}";; *) cat "$R/log/journal";; '
                           'esac 2>/dev/null; :\n',
     'usr/bin/systemctl': 'R="${0%/usr/bin/systemctl}"; echo "$*" >>"$R/log/systemctl"; S="$R/log/units"; mkdir -p "$S"\n'
@@ -56,7 +57,9 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          'cat "$R/etc/t3code/policy.json"; } >"$S/$1.active" 2>/dev/null || :\n'
                          'i=$(printf %032x $$); echo $i >"$S/$1.invocation"; [ "$1" != t3code-agents.service ] || '
                          '{ [ -e "$R/log/t3-not-ready" ] && grep -qF "/versions/$(cat "$R/log/t3-not-ready")/" '
-                         '"$R/etc/systemd/system/$1"; } || echo "T3 Code server is ready." >"$R/log/journal.$i"\n'
+                         '"$R/etc/systemd/system/$1"; } || [ -e "$R/log/journal-none" ] || '
+                         'printf "Listening\\nT3 Code server is ready.\\n" >"$R/log/journal.$i"\n'
+                         '[ ! -e "$R/log/t3-not-ready" ] || [ -e "$R/log/journal.$i" ] || echo Listening >"$R/log/journal.$i"\n'
                          'echo $$ >"$S/$1.pid"; g="$R/sys/fs/cgroup/system.slice/$1"; rm -rf "$g"; mkdir -p "$g"; '
                          'echo $$ >"$g/cgroup.procs"; python3 -I -c "import time; print(time.monotonic_ns() // 1000)" '
                          '>"$S/$1.start"; }\n'

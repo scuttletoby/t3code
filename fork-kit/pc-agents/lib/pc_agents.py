@@ -158,8 +158,27 @@ def helpers_problem(value):
                                      'no ALL, no list), as the sudo rule names it')
 
 
+# A sudoRules line (#1047): `USER HOST=(RUNAS) [TAG:]... COMMAND[, COMMAND]...` with the agent as USER, ALL or a
+# lower-case host name as HOST, RUNAS ALL or lower-case user names (an upper-case word is an alias, defined
+# somewhere the wall does not look), tags that keep sudo's environment as it is (no SETENV), and each COMMAND a
+# helper's form (HELPER: an absolute path of plain names, plain arguments, no wildcard, no ALL, no alias).
+RULE_RUNAS = r'(ALL|[a-z_][a-z0-9_-]*)(:(ALL|[a-z_][a-z0-9_-]*))?'
+RULE_TAGS = r'((NOPASSWD|PASSWD|NOEXEC|EXEC|NOSETENV)\s*:\s*)*'
+
+
+def rule_commands(user, line):
+    """The commands of a sudoRules line in the form above for user (blanks as one), or None when it is not one."""
+    m = re.fullmatch(rf'{re.escape(user)}\s+(ALL|[a-z0-9][a-z0-9.-]*)\s*=\s*\({RULE_RUNAS}\)\s*{RULE_TAGS}(.+)',
+                     sudo_line(line))
+    if not m:
+        return None
+    commands = [' '.join(x.split()) for x in m[m.lastindex].split(',')]
+    return commands if all(HELPER.fullmatch(x) for x in commands) else None
+
+
 def rules_problem(value):
-    """Why sudoRules is not a list of at most 16 sudoers lines (one line each, not blank), or None."""
+    """Why sudoRules is not a list of at most 16 sudoers lines (one line each, not blank), or None. Their form
+    (rule_commands) needs agentUser: config() checks it."""
     if len(value) > 16:
         return 'at most 16 rules'
     bad = next((r for r in value if not isinstance(r, str) or not r.strip() or '\n' in r or len(r) > 300), None)
@@ -167,8 +186,9 @@ def rules_problem(value):
 
 
 def sudo_line(text):
-    """A sudoers line as the sudoers wall compares it to sudoRules: comment gone, blanks one space."""
-    return ' '.join(re.sub(r'#(?!include)(?!\d).*', '', text).split())
+    """A sudoers line as the sudoers wall compares it to sudoRules: comment gone, blanks one space, none around
+    = ( ) : and , (sudo reads `agent ALL = (root)` as `agent ALL=(root)`)."""
+    return re.sub(r' ?([=():,]) ?', r'\1', ' '.join(re.sub(r'#(?!include)(?!\d).*', '', text).split()))
 
 
 def auto_update_problem(value):
@@ -230,6 +250,17 @@ def config():
     if c['keepUserManager'] and c['platform'] != 'linux':
         raise machine_file.MachineFileError(f'{where}.keepUserManager: only with "platform": "linux" (WSL2 masks '
                                             'the agent\'s user manager)')
+    if c['keepUserManager'] and (c['sudoHelpers'] or c['sudoRules']):
+        raise machine_file.MachineFileError(
+            f'{where}.keepUserManager: not with sudoHelpers or sudoRules. With its user manager (and rootless '
+            'Docker) the agent can run code outside T3\'s unit, where NoNewPrivileges does not hold, so a sudo rule '
+            'would be its own to use: drop the sudo rules, or keepUserManager')
+    bad = next((r for r in c['sudoRules'] if rule_commands(c['agentUser'], r) is None), None)
+    if bad is not None:
+        raise machine_file.MachineFileError(
+            f'{where}.sudoRules: {bad!r} is not `{c["agentUser"]} HOST=(RUNAS) [TAG:] COMMAND[, COMMAND]`: HOST ALL '
+            'or a host name, RUNAS ALL or user names, no alias, no SETENV, each COMMAND an absolute path with plain '
+            'arguments (no wildcard, no ALL)')
     global USER, HOME
     USER, HOME = c['agentUser'], c['agentHome']
     return c
@@ -354,8 +385,9 @@ def sandbox(c):
         home = ['ProtectHome=read-only', f'ReadWritePaths={HOME}']
         hide = GPU if c['gpu'] else (HIDDEN,)
     else:
-        # keepUserManager: the agent's runtime folder too (its rootless Docker's socket), when there ("-")
-        run = f' -/run/user/{c["agentUid"]}' if c['keepUserManager'] else ''
+        # keepUserManager: its rootless Docker's socket alone, when there ("-"); never the runtime folder, which
+        # holds the user manager's own sockets (bus, systemd/private: a way to start anything outside the unit)
+        run = f' -/run/user/{c["agentUid"]}/docker.sock' if c['keepUserManager'] else ''
         home = ['ProtectHome=tmpfs', f'BindPaths={HOME}{run}',
                 f'BindReadOnlyPaths={STATE}/resolv.conf:/etc/resolv.conf']
         hide = ('InaccessiblePaths=-/mnt -/media -/run/media -/tmp/.X11-unix -/run/tailscale -/run/docker.sock '
@@ -409,11 +441,13 @@ def render(c):
         (f'\t\tip6 daddr {{ {", ".join(allow6)} }} accept\n' if allow6 else '') + \
         f'\t\tip daddr {{ {", ".join(BLOCKED4)} }} drop\n\t\tip6 daddr {{ {", ".join(BLOCKED6)} }} drop\n\t}}\n}}\n'
     walls = '\n'.join(sandbox(c))
+    # keepUserManager: after the agent's user manager, whose runtime folder holds the Docker socket the unit binds
+    after = f'After=user@{c["agentUid"]}.service\n' if c['keepUserManager'] else ''
     unit = HEAD + f'''[Unit]
 Description=T3 Code for agents, walled (pc-agents kit)
 Wants=network-online.target
 After=network-online.target
-# any failure but a policy T3 cannot apply (77, below): give up after 5 starts in 10 minutes
+{after}# any failure but a policy T3 cannot apply (77, below): give up after 5 starts in 10 minutes
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
@@ -429,8 +463,10 @@ Restart=on-failure
 RestartSec=30
 # 77: T3 cannot apply the managed policy; a restart cannot fix that
 RestartPreventExitStatus=77
-# 130: T3's own exit on SIGTERM (a stop), not a failure (#1047)
+# 130: T3's own exit on SIGTERM (a stop), not a failure (#1047); restarted all the same when the SIGTERM was not
+# systemd's stop (an agent's kill or pkill in the unit): systemd never restarts after `systemctl stop`
 SuccessExitStatus=130
+RestartForceExitStatus=130
 {walls}
 
 [Install]
@@ -649,7 +685,9 @@ def sudo_problem(c):
     word (blanks aside): the owner's, kept as it is, never widened."""
     who = re.compile(rf'(^|[\s,=:!(])(%?{USER}|%?#{c["agentUid"]}|ALL)($|[\s,=:)])')
     helpers = {h.split()[0] for h in c['sudoHelpers']}
-    allowed = {sudo_line(r) for r in c['sudoRules']}
+    # a listed rule passes only while each of its commands is root's alone, as a helper's must be
+    allowed = {sudo_line(r) for r in c['sudoRules']
+               if all(owned_alone(x.split()[0]) for x in rule_commands(USER, r) or ['/'])}
     found = []
     names = ['/etc/sudoers'] + (['/etc/sudoers.d/' + n for n in sorted(os.listdir(ROOT + '/etc/sudoers.d'))]
                                 if os.path.isdir(ROOT + '/etc/sudoers.d') else [])
@@ -685,15 +723,37 @@ def user_problem(c, need_agent):
     if others and c['platform'] == 'wsl2':
         return f'this distro already has login users ({", ".join(others)}): use a fresh distro for pc-agents'
     if USER not in people:
-        return f'no user {USER}' if need_agent else None
+        return f'no user {USER}' if need_agent else home_problem(c)
     if people[USER][0] != c['agentUid']:
         return f'user {USER} has uid {people[USER][0]}, not {c["agentUid"]}: not the kit\'s'
     if (home := passwd_field(USER, 5)) != HOME:
         return f'user {USER}\'s home is {home}, not {HOME}: not the kit\'s'
+    if why := home_problem(c):
+        return why
     if people[USER][1] != gid(USER):
         return f'user {USER}\'s primary group is gid {people[USER][1]}, not its own group {USER}: not the kit\'s'
     extra = sorted(g for g, members in groups.items() if USER in members)
     return f'user {USER} is in other groups ({", ".join(extra)}): it must have none' if extra else None
+
+
+def home_problem(c):
+    """Why the agent's home is not its own (#1047), or None: another user's home too (in the passwd file), or there
+    and not a folder of the agent's uid (useradd keeps the owner of a home that is already there, and T3's unit
+    binds it read-write). In the tests the agent's uid is the test user's."""
+    try:
+        with open(ROOT + '/etc/passwd', encoding='utf-8') as f:
+            others = sorted(r[0] for r in (line.rstrip('\n').split(':') for line in f)
+                            if len(r) > 5 and r[5].rstrip('/') == HOME and r[0] != USER)
+    except FileNotFoundError:
+        others = []
+    if others:
+        return f'{HOME} is also the home of {", ".join(others)}: the agent needs a home of its own'
+    st = lstat(HOME)
+    uid = OWNER if ROOT else c['agentUid']
+    if st is not None and (not stat.S_ISDIR(st.st_mode) or st.st_uid != uid):
+        return f'{HOME} is not a folder of uid {c["agentUid"]}\'s: the agent needs a home of its own (chown it, or ' \
+            'another agentHome)'
+    return None
 
 
 def gid(group):

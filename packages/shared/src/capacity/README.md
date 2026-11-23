@@ -55,7 +55,8 @@ reads, one per box it asks for (the level includes that box's PSI); no previous 
 clock means no step down; a clock that went back restarts the wait.
 
 **CPU brake (`cpu`, optional).** `pressureSomeAvg10Pct` and `loadPerCorePercent`: one more job is refused while
-the machine's CPU pressure (`some avg10`) or its 1-minute load per core reaches them. Only the host kit reads it
+the CPU pressure (`some avg10`) reaches the first, or, where no pressure is read, the 1-minute load per CPU
+reaches the second. Only the host kit reads it
 for now (`fork-kit/heavy`, README "CPU brake"); this evaluator and its vectors do not, so no vector holds its
 numbers. A rule without it has no brake.
 
