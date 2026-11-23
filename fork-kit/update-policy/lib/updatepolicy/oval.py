@@ -52,8 +52,11 @@ class Kernel:
 
 
 class Data:
-    def __init__(self, advisories, kernels, count):
-        self.advisories, self.kernels, self.count = advisories, kernels, count
+    """advisories; kernels: the kernel entries that can match the running release (all when none was given);
+    counts: {'packages': N, 'kernels': M} of the whole file (M counts every kernel entry, kept or not)."""
+
+    def __init__(self, advisories, kernels, counts):
+        self.advisories, self.kernels, self.counts = advisories, kernels, counts
 
 
 class _Capped(io.RawIOBase):
@@ -97,8 +100,9 @@ def no_fix(version):
         return False
 
 
-def read(path, max_bytes=1 << 30):
-    """Data of the OVAL file at `path`. Raises FormatError (or OSError)."""
+def read(path, max_bytes=1 << 30, release=None):
+    """Data of the OVAL file at `path`. With `release` (`uname -r`), only the kernel entries whose pattern matches it
+    are kept (jammy's file has 887k kernel entries over 60 flavours). Raises FormatError (or OSError)."""
     tests, objects, states, variables, locals_, defs = {}, {}, {}, {}, {}, []
     try:
         with _open(path) as raw:
@@ -128,7 +132,7 @@ def read(path, max_bytes=1 << 30):
         raise FormatError(f'not readable OVAL ({type(e).__name__}: {e})') from None
     if not defs or not any(t[0] == 'dpkginfo_test' for t in tests.values()):
         raise FormatError(f'no {"definitions" if not defs else "dpkginfo tests"}: a format this check does not know')
-    return _resolve(tests, objects, states, variables, locals_, defs)
+    return _resolve(tests, objects, states, variables, locals_, defs, release)
 
 
 def _entry(el, tests, objects, states, variables, locals_, defs):
@@ -191,7 +195,7 @@ def _source(comment):
     return m.group(1) if m else ''
 
 
-def _resolve(tests, objects, states, variables, locals_, defs):
+def _resolve(tests, objects, states, variables, locals_, defs, release=None):
     def test(ref):
         t = tests.get(ref)
         if t is None:
@@ -200,8 +204,8 @@ def _resolve(tests, objects, states, variables, locals_, defs):
             raise FormatError(f'a test kind this check does not read ({t[0]})')
         return t
 
-    resolved = total = 0
-    out, kernels = [], []
+    resolved = total = kernel_total = 0
+    out, kernels, checked = [], [], set()
     for cves, priority, groups, title in defs:
         for group in groups:
             kinds = [(ref, comment, test(ref)) for ref, comment in group]
@@ -227,6 +231,17 @@ def _resolve(tests, objects, states, variables, locals_, defs):
                             or not locals_[obj[1]][1]:
                         raise FormatError('a kernel version test this check does not read')
                     fixed, version = value, locals_[obj[1]]
+                    if (fixed, version) not in checked:     # a broken entry: cannot check, never a traceback
+                        try:
+                            debver.split(fixed)
+                            if re.compile(version[1]).groups < 1:
+                                raise ValueError('its version pattern captures nothing')
+                        except (ValueError, re.error) as e:
+                            raise FormatError(f'a kernel version this check cannot read ({e})') from None
+                        checked.add((fixed, version))
+                kernel_total += len(cves)
+                if release is not None and not compiled.search(release):
+                    continue                                # another kernel than the running one
                 for cve in cves:
                     kernels.append(Kernel(cve, flavour, compiled, fixed, priority, version))
             for ref, comment, t in kinds:
@@ -257,9 +272,6 @@ def _resolve(tests, objects, states, variables, locals_, defs):
                     out.append(Advisory(cve, source, names, fixed, priority, note))
     if total and resolved < RESOLVED * total:
         raise FormatError(f'only {resolved} of {total} package tests name a package')
-    return Data(out, kernels, len(out) + len(kernels))
+    return Data(out, kernels, {'packages': len(out), 'kernels': kernel_total})
 
 
-def count(path, max_bytes=1 << 30):
-    """How many advisories the file holds (the feed's check: raises FormatError)."""
-    return read(path, max_bytes).count

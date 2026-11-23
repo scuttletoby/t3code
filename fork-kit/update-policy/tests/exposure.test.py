@@ -55,6 +55,11 @@ def mini_oval(*advisories):
             f'<objects>{"".join(objs)}</objects><states>{"".join(states)}</states></oval_definitions>')
 
 
+def re_error():
+    import re
+    return re.error('bad pattern')
+
+
 def write_tmp(case, text, name='f'):
     tmp = tempfile.mkdtemp()
     case.addCleanup(shutil.rmtree, tmp)
@@ -179,6 +184,35 @@ class Oval(unittest.TestCase):
         with mock.patch.object(oval, 'MAX_ENTRY', 1000), self.assertRaisesRegex(oval.FormatError, 'more than 1000'):
             oval.read(write_tmp(self, big + '</definitions></oval_definitions>'))
 
+    def test_a_broken_kernel_entry_is_a_format_error(self):
+        for replace in ((r'pattern="^([\d|\.]+-\d+)[-|\w]+$"', r'pattern="^[\d|\.]+$"'),
+                        (r'pattern="^([\d|\.]+-\d+)[-|\w]+$"', r'pattern="^([\d+$"'),
+                        ('>0:6.8.0-44<', '>0:6.8.0 44 beta<')):
+            with self.subTest(replace=replace), self.assertRaisesRegex(oval.FormatError, 'a kernel version'):
+                self.read('ubuntu-noble.cve.oval.xml', (replace,))
+
+    def test_only_the_running_kernels_entries_are_kept_and_all_are_counted(self):
+        everything = self.read('ubuntu-noble.cve.oval.xml')
+        mine = self.read('ubuntu-noble.cve.oval.xml', release='6.8.0-31-generic')
+        self.assertEqual(mine.counts, everything.counts)
+        self.assertEqual(everything.counts['kernels'], len(everything.kernels))
+        self.assertLess(len(mine.kernels), len(everything.kernels))
+        self.assertTrue(mine.kernels and all(k.pattern.search('6.8.0-31-generic') for k in mine.kernels))
+        self.assertEqual(self.read('ubuntu-noble.cve.oval.xml', release='6.6.87.2-microsoft-standard-WSL2').kernels,
+                         [])
+
+    def test_finished_entries_and_sections_are_dropped_as_it_reads(self):
+        roots, real = [], oval.ET.iterparse
+
+        def spy(source, events):
+            for event, el in real(source, events):
+                if not roots:
+                    roots.append(el)
+                yield event, el
+        with mock.patch.object(oval.ET, 'iterparse', spy):
+            self.read('ubuntu-noble.cve.oval.xml')
+        self.assertEqual(list(roots[0]), [])                    # nothing kept under the root
+
     def test_a_less_than_state_is_the_fix(self):
         data = oval.read(write_tmp(self, mini_oval(('CVE-2024-0001', 'a', '1.2-1'), ('CVE-2024-0002', 'a', '0:0'))))
         self.assertEqual([(a.cve, a.fixed) for a in data.advisories], [('CVE-2024-0001', '1.2-1'),
@@ -226,9 +260,37 @@ class Feeds(unittest.TestCase):
         small['vulnerabilities'] = small['vulnerabilities'][:2]
         self.web.pages[self.url] = (200, {'etag': '"v2"'}, json.dumps(small).encode())
         got = self.fetch(NOW + datetime.timedelta(days=1))
-        self.assertEqual(got.problem, "kev: the download holds 2 entries, under half of the kept copy's 6: kept the "
-                                      'old copy')
+        self.assertEqual(got.problem, 'kev: the download holds entries 2 under half of 6 of the kept copy: kept the '
+                                      'old copy (day 1 of 3; the same smaller feed 3 days in a row is accepted)')
         self.assertEqual(len(exposure.read_kev(got.path)), 6)
+
+    def test_a_lasting_shrink_is_accepted_on_the_third_day_in_a_row_and_said(self):
+        self.fetch()
+        small = json.loads(fixture_bytes('kev.json'))
+        small['vulnerabilities'] = small['vulnerabilities'][:2]
+        self.web.pages[self.url] = (200, {'etag': '"v2"'}, json.dumps(small).encode())
+        for day in (1, 2):                                             # refused, counted
+            got = self.fetch(NOW + datetime.timedelta(days=day))
+            self.assertIn(f'(day {day} of 3;', got.problem)
+        self.fetch(NOW + datetime.timedelta(days=2, hours=3))           # again the same day: still day 2
+        small['vulnerabilities'] = small['vulnerabilities'][:1]          # changed again: starts over
+        self.web.pages[self.url] = (200, {}, json.dumps(small).encode())
+        self.assertIn('(day 1 of 3;', self.fetch(NOW + datetime.timedelta(days=3)).problem)
+        for day in (4, 5):
+            got = self.fetch(NOW + datetime.timedelta(days=day))
+        self.assertIsNone(got.problem)
+        self.assertEqual(got.notice, 'kev: the feed shrank (entries 1 under half of 6) and stayed so 3 days in a '
+                                     'row: accepted, the smaller copy is in use')
+        self.assertEqual(len(exposure.read_kev(got.path)), 1)
+
+    def test_package_and_kernel_counts_are_floored_apart(self):
+        self.url = 'https://feeds.example/oval.xml'
+        self.web.pages[self.url] = (200, {}, b'x')
+        counts = [{'packages': 100, 'kernels': 1000}, {'packages': 10, 'kernels': 1090}]
+        feeds.fetch(self.cache, 'oval', self.url, lambda p: counts[0], NOW, 1 << 20, 10, self.web)
+        got = feeds.fetch(self.cache, 'oval', self.url, lambda p: counts[1], NOW + datetime.timedelta(days=1),
+                          1 << 20, 10, self.web)
+        self.assertIn('the download holds packages 10 under half of 100 of the kept copy', got.problem)
 
     def test_the_size_cap(self):
         got = self.fetch(cap=1000)
@@ -358,6 +420,40 @@ class Check(Base):
         self.assertEqual(lines, ['security fix waiting 4 day(s): aide 0.18.6-2 (aide) -> 0.18.6-2ubuntu0.2: '
                                  'CVE-2025-54389 (EPSS 0.00)'])
 
+    def test_a_source_waits_since_its_oldest_first_sight(self):
+        self.web.pages[UBUNTU_OVAL] = (200, {}, mini_oval(('CVE-2024-0001', 'a', '1.2-1')).encode())
+        self.packages = [dpkg_line('a', '1.0-1')]
+        self.check()
+        self.web.pages[UBUNTU_OVAL] = (200, {}, mini_oval(('CVE-2024-0001', 'a', '1.2-1'),
+                                                          ('CVE-2024-0002', 'a', '1.3-1')).encode())
+        self.check(NOW + datetime.timedelta(days=3))                   # a second CVE, first seen on day 3
+        lines = self.check(NOW + datetime.timedelta(days=4))[0]
+        self.assertEqual(lines, ['security fix waiting 4 day(s): a 1.0-1 (a) -> 1.3-1: CVE-2024-0001, CVE-2024-0002 '
+                                 '(EPSS 0.00)'])
+
+    def test_the_kernels_waiting_clock_survives_a_reboot_into_a_newer_kernel_still_behind(self):
+        kev = json.loads(fixture_bytes('kev.json'))
+        kev['vulnerabilities'] = [v for v in kev['vulnerabilities'] if v['cveID'] != 'CVE-2024-36971']
+        self.web.pages[exposure.KEV_URL] = (200, {}, json.dumps(kev).encode())
+        self.host.release = '6.8.0-31-generic'
+        self.packages[-2] = dpkg_line('linux-modules-6.8.0-31-generic', '6.8.0-31.31', 'linux')
+        self.check()
+        self.host.release = '6.8.0-40-generic'                         # rebooted; 44 is the fix
+        self.packages[-2] = dpkg_line('linux-modules-6.8.0-40-generic', '6.8.0-40.40', 'linux')
+        lines = self.check(NOW + datetime.timedelta(days=4))[0]
+        self.assertIn('security fix waiting 4 day(s): kernel linux 6.8.0-40-generic (kernel 6.8.0-40-generic) -> '
+                      '6.8.0-44 and restart: CVE-2024-36971', '\n'.join(lines))
+
+    def test_the_first_cache_format_is_cleaned_up_and_its_clocks_kept(self):
+        self.packages = [dpkg_line('aide', '0.18.6-2', 'aide')]
+        with open(os.path.join(self.cache, 'epss.json'), 'w') as f:
+            json.dump({'CVE-2025-54389': [0.1, NOW.isoformat()]}, f)
+        with open(os.path.join(self.cache, 'state.json'), 'w') as f:       # "BINARY FIXED" keys
+            json.dump({'fixSeen': {'aide 0.18.6-2ubuntu0.1': (NOW - datetime.timedelta(days=5)).isoformat()}}, f)
+        self.assertEqual(self.check()[0], ['security fix waiting 5 day(s): aide 0.18.6-2 (aide) -> 0.18.6-2ubuntu0.1: '
+                                           'CVE-2025-54389 (EPSS 0.00)'])
+        self.assertFalse(os.path.exists(os.path.join(self.cache, 'epss.json')))
+
     def test_one_line_per_source_with_its_highest_fix(self):
         mini = mini_oval(('CVE-2024-0001', 'a', '1.2-1'), ('CVE-2024-0002', 'a', '1.3-1'),
                          ('CVE-2024-0003', 'b', '2-1'))
@@ -402,10 +498,11 @@ class Check(Base):
         self.assertEqual(lines, [
             'KEV CVE-2023-4863 is exploited in the wild: libwebp 1.2.4-0.2 (libwebp7): update to 0:1.2.4-0.2+deb12u1 '
             '(EPSS 1.00; CISA due 2023-10-04; Google Chromium WebP)',
-            'KEV CVE-2022-22965 is exploited in the wild and has no fix yet: mitigate or watch: libspring-java '
-            '4.3.30-2 (libspring-java) (EPSS 1.00; CISA due 2022-04-25; VMware Spring Framework)',
-            'KEV CVE-2024-36971 is exploited in the wild: linux 6.1.90-1 (linux-image-6.1.0-21-amd64): update to '
-            '0:6.1.94-1 (EPSS 0.03; CISA due 2024-08-28; Android Kernel)'])
+            'KEV CVE-2022-22965 is exploited in the wild and has no fixed version listed by Debian: mitigate or watch '
+            '(or, if Debian judged it not to apply, add an ignore entry): libspring-java 4.3.30-2 (libspring-java) '
+            '(EPSS 1.00; CISA due 2022-04-25; VMware Spring Framework)',
+            'KEV CVE-2024-36971 is exploited in the wild: kernel linux 6.1.90-1 (linux-image-6.1.0-21-amd64): update '
+            'to 6.1.94-1 and restart (EPSS 0.03; CISA due 2024-08-28; Android Kernel)'])
         self.assertEqual(notes, [])
         self.packages = self.packages[:2]
         _, notes, _ = self.check()
@@ -533,6 +630,31 @@ class Commands(Base):
         self.assertEqual((code, printed), (0, ["update-policy exposure: another run holds the cache's lock: nothing "
                                                'to do']))
 
+    def test_a_fault_is_a_cannot_check_report_never_a_traceback(self):
+        with mock.patch.object(exposure, 'check', side_effect=re_error()):
+            code, printed, _ = self.run_cmd()
+        self.assertEqual((code, printed), (1, ['cannot check: the check failed (error: bad pattern)']))
+        with open(os.path.join(self.cache, exposure.REPORT)) as f:
+            self.assertEqual(json.load(f)['lines'], printed)
+
+    def test_the_report_is_written_while_the_lock_is_held(self):
+        held, real = [], exposure._write_json
+
+        def spy(cache, name, data):
+            if name == exposure.REPORT:
+                fd = os.open(os.path.join(cache, 'lock'), os.O_RDWR)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held.append(False)
+                except BlockingIOError:
+                    held.append(True)
+                finally:
+                    os.close(fd)
+            return real(cache, name, data)
+        with mock.patch.object(exposure, '_write_json', spy):
+            self.run_cmd()
+        self.assertEqual(held, [True])
+
     def test_as_root_on_the_units_cache_it_refuses(self):
         s = fx.make_settings(exposure={'enabled': True})
         with mock.patch.object(exposure.os, 'geteuid', return_value=0), mock.patch('builtins.print') as out:
@@ -580,6 +702,15 @@ MUTATIONS = {
     'oval: package tests must resolve': (
         'oval', "    if total and resolved < RESOLVED * total:", "    if False:",
         'Oval.test_package_tests_that_name_nothing_are_a_format_error'),
+    'oval: a broken kernel version is a format error': (
+        'oval', "                            if re.compile(version[1]).groups < 1:",
+        "                            if False:", 'Oval.test_a_broken_kernel_entry_is_a_format_error'),
+    'oval: only the running kernel\'s entries are kept': (
+        'oval', "                if release is not None and not compiled.search(release):",
+        "                if False:", 'Oval.test_only_the_running_kernels_entries_are_kept_and_all_are_counted'),
+    'oval: finished entries are dropped': (
+        'oval', "                    stack[-1].remove(el)            # finished entries and sections are dropped",
+        "                    pass", 'Oval.test_finished_entries_and_sections_are_dropped_as_it_reads'),
     'oval: kernel tests are read': (
         'oval', "                for cve in cves:\n                    kernels.append(",
         "                for cve in []:\n                    kernels.append(",
@@ -588,11 +719,18 @@ MUTATIONS = {
         'feeds', "        return Fetched(copy, None, fetched_at)          # once a day", "        pass",
         'Feeds.test_once_a_day_then_etag'),
     'feeds: a download is checked before it replaces the copy': (
-        'feeds', "            entries = int(check(tmp))", "            entries = 10 ** 9",
+        'feeds', "            entries = _counts(check(tmp))", "            entries = {'entries': 10 ** 9}",
         'Feeds.test_a_download_it_does_not_understand_never_replaces_a_good_copy'),
     'feeds: the floor against the kept copy': (
-        'feeds', "        if isinstance(kept, int) and entries < FLOOR * kept:", "        if False:",
+        'feeds', "        shrunk = _shrunk(entries, meta.get('count')) if copy else []", "        shrunk = []",
         'Feeds.test_a_download_far_smaller_than_the_kept_copy_never_replaces_it'),
+    'feeds: each part is floored': (
+        'feeds', "    return [(k, new.get(k, 0), v) for k, v in sorted(kept.items()) if new.get(k, 0) < FLOOR * v]",
+        "    return [(k, sum(new.values()), sum(kept.values())) for k in ['all'] if sum(new.values()) < FLOOR * "
+        "sum(kept.values())]", 'Feeds.test_package_and_kernel_counts_are_floored_apart'),
+    'feeds: a lasting shrink needs days in a row': (
+        'feeds', "            if days < SHRINK_DAYS:", "            if days < 2:",
+        'Feeds.test_a_lasting_shrink_is_accepted_on_the_third_day_in_a_row_and_said'),
     'feeds: the size cap while reading': (
         'feeds', "                if size > max_bytes:", "                if False:", 'Feeds.test_the_size_cap'),
     'feeds: the checksum': (
@@ -629,7 +767,7 @@ MUTATIONS = {
         'exposure', "            if KERNEL_PKG.match(binary):\n                continue\n", "",
         'Check.test_debian_source_names_no_fix_kev_and_the_running_image'),
     'check: the running kernel': (
-        'exposure', "        found, note = kernel_affected(data, host.kernel_release(), binaries, distro)",
+        'exposure', "        found, note = kernel_affected(data, release, binaries, distro)",
         "        found, note = [], None", 'Check.test_the_running_kernel_by_its_flavour'),
     'check: an unplaced kernel is a note': (
         'exposure', "        if note:\n            notes.append(", "        if False:\n            notes.append(",
@@ -646,6 +784,23 @@ MUTATIONS = {
     'check: lines are one line': (
         'exposure', "    lines = [one_line(x, 400) for x in lines + found + drift]",
         "    lines = lines + found + drift", 'Check.test_server_text_reaches_the_lines_as_one_line'),
+    'run: a fault is a cannot-check report': (
+        'exposure', "        except Exception as e:      # noqa: BLE001 - a fault is a cannot-check report",
+        "        except OSError as e:      # noqa: BLE001 - a fault is a cannot-check report",
+        'Commands.test_a_fault_is_a_cannot_check_report_never_a_traceback'),
+    'run: the report under the lock': (
+        'exposure', "            _write_json(cache, REPORT, report)              # under the lock",
+        "            pass              # under the lock", 'Commands.test_the_report_is_written_while_the_lock_is_held'),
+    'check: a source waits since its oldest first sight': (
+        'exposure', "        w['since'] = min(w['since'], first)", "        w['since'] = first",
+        'Check.test_a_source_waits_since_its_oldest_first_sight'),
+    'check: the kernel clock is per flavour': (
+        'exposure', "    return f'{cve} {source}' if source.startswith('kernel ') else f'{cve} {binary}'",
+        "    return f'{cve} {binary}'",
+        'Check.test_the_kernels_waiting_clock_survives_a_reboot_into_a_newer_kernel_still_behind'),
+    'check: the first format\'s clocks carry over': (
+        'exposure', "or older.get(binary) or now.isoformat()", "or now.isoformat()",
+        'Check.test_the_first_cache_format_is_cleaned_up_and_its_clocks_kept'),
     "run: not as root on the unit's cache": (
         'exposure', "    if os.geteuid() == 0 and os.path.abspath(cache) == CACHE:", "    if False:",
         'Commands.test_as_root_on_the_units_cache_it_refuses'),

@@ -249,7 +249,11 @@ installed:
   is the source package of the running kernel's `linux-modules-<release>`; a release that no flavour matches (a WSL,
   mainline or custom kernel), or several match and the packages do not say which, is the note `kernel: not checked`;
 - Debian: the running kernel's `linux-image-<release>` (from `linux-signed-*`) is matched as the source `linux` the
-  OVAL file names; none installed is the note. Livepatch is not looked at.
+  OVAL file names; none installed is the note.
+
+A kernel line says `and restart`, and its waiting days count per kernel flavour, so booting a newer kernel that is
+still behind keeps them. Livepatch is not read: a kernel CVE that a live patch already covers still shows until the
+restart (the restart policy's planned window on a live machine).
 
 **Data**, each downloaded at most once a day into `/var/cache/update-policy-exposure/`, with a size cap
 (`maxFeedMb`), a timeout (`timeoutSeconds`), the server's ETag / Last-Modified, https only (a redirect to anything
@@ -257,8 +261,9 @@ else is refused) and a sha256 of the stored copy (a copy that does not match is 
 
 - the distribution's OVAL file: Ubuntu's `com.ubuntu.<codename>.cve.oval.xml.bz2` (security-metadata.canonical.com)
   or Debian's `oval-definitions-<codename>.xml.bz2` (debian.org), by `/etc/os-release` (`ovalUrl` to use another
-  copy). Debian writes "no fix yet" as "less than 0:0", which is read as no fixed version (Debian uses the same form
-  for some entries it judges not to affect the release; those may then show as "no fix yet" if on KEV);
+  copy). Debian writes "no fixed version" as "less than 0:0", and uses the same form for some entries it judged not
+  to affect the release, which the file cannot tell apart: such a KEV line says "has no fixed version listed by
+  Debian" and that an ignore entry is the way out when it does not apply;
 - CISA's KEV JSON (`kevUrl`);
 - FIRST.org's daily EPSS file (`epssUrl`, about 3 MB): every CVE's score, so nothing about this machine is sent
   anywhere. The OVAL URL names the release codename; that is all a server learns.
@@ -268,11 +273,17 @@ before it replaces the kept copy; it is refused, the old copy kept and the reaso
 
 - it is not the format (an OVAL test kind, state operation, object or variable the reader does not know; fewer than
   90% of its package tests naming a package; no `vulnerabilities` list; no `cve,epss,percentile` header);
-- it holds fewer entries than an absolute floor (OVAL 1,000, KEV 500, EPSS 100,000) or under half the kept copy's;
+- it holds fewer entries than an absolute floor (OVAL 1,000 package advisories, KEV 500, EPSS 100,000), or under half
+  the kept copy's (the OVAL file's package advisories and kernel entries each on their own, so a big loss of one is
+  not hidden by the other). A feed that really shrank for good is accepted once it reads cleanly with the same
+  smaller counts on 3 days in a row; that day says `drift: … the feed shrank … accepted`;
 - it is larger than `maxFeedMb`, or than `maxXmlMb` once decompressed, or one entry holds over 500,000 elements.
 
-The OVAL file is read as a stream and every finished entry is dropped (a real noble file: about 350 MB). The unit has
-`MemoryHigh=768M`, `MemoryMax=1G` and low CPU and IO weights, so a hostile feed cannot take the machine's memory.
+The OVAL file is read as a stream, every finished entry is dropped, and of the kernel entries only those of the
+running kernel are kept (a real file: about 265 MB for noble, 375 MB for jammy). A kernel entry it cannot read (its
+version or the pattern that reads `uname -r`) is a format error too. The unit has `MemoryHigh=768M`, `MemoryMax=1G`
+and low CPU and IO weights, so a hostile feed cannot take the machine's memory. A fault in the check itself is a
+`cannot check` report, never a missing one.
 
 Other package systems (rpm, apk) fit in as one more entry of `ECOSYSTEMS` in `lib/updatepolicy/exposure.py`: their
 installed list, version order and data source.
@@ -298,12 +309,14 @@ runs as root, so the alert command can read a root-only file. It needs no secret
 **Runs again, stops half-way, old or empty cache, a feed format change:**
 
 - runs again the same day: no download (once a day), the same lines; the next day only a changed feed is
-  downloaded. Two runs at once: the second finds the cache's lock held and does nothing;
+  downloaded. Two runs at once: the second finds the cache's lock held and does nothing; the report is written
+  before the lock is let go;
 - stops half-way (a timeout's SIGTERM runs no cleanup): every write goes to a temporary file and is renamed whole;
   the next run first removes temporary files a killed run left. A stop between a copy and its meta leaves a copy that
   does not match its checksum: no copy, so `cannot check` until the next download;
 - old or empty cache: no copy is `cannot check` (never all clear); a broken meta or state starts again from empty (a
-  waiting fix is then dated from today); a copy older than `staleDays` is still read and is drift;
+  waiting fix is then dated from today); a copy older than `staleDays` is still read and is drift. A cache of the
+  first format is taken over: its per-CVE EPSS file is removed and its waiting days are kept;
 - a feed format change: see "A feed that changed": the old copy stays and the line names the feed.
 
 ## Install

@@ -46,8 +46,8 @@ class Dpkg:
     """Debian and Ubuntu: dpkg's database, dpkg's version order, the distribution's OVAL file."""
     compare = staticmethod(debver.compare)
 
-    def __init__(self, oval_url):
-        self.oval_url = oval_url
+    def __init__(self, oval_url, no_fix='has no fix yet: mitigate or watch'):
+        self.oval_url, self.no_fix = oval_url, no_fix
 
     def installed(self, host):
         """({name: [(binary, version)]}, {binary: (source, version)}). Every installed binary under its own name and
@@ -85,7 +85,10 @@ class Dpkg:
 
 ECOSYSTEMS = {
     'ubuntu': lambda codename: Dpkg(f'https://security-metadata.canonical.com/oval/com.ubuntu.{codename}.cve.oval.xml.bz2'),
-    'debian': lambda codename: Dpkg(f'https://www.debian.org/security/oval/oval-definitions-{codename}.xml.bz2'),
+    # Debian writes "no fixed version" and some "does not apply" entries alike (less than 0:0)
+    'debian': lambda codename: Dpkg(f'https://www.debian.org/security/oval/oval-definitions-{codename}.xml.bz2',
+                                    'has no fixed version listed by Debian: mitigate or watch (or, if Debian judged it '
+                                    'not to apply, add an ignore entry)'),
 }
 
 
@@ -191,7 +194,7 @@ def kernel_flavour(release, binaries):
 
 def kernel_affected(data, release, binaries, distro):
     """([(cve, source, binary, version, fixed, note, priority)], note or None) of the running kernel."""
-    if data.kernels:                                    # Ubuntu: the running kernel's own tests
+    if data.counts['kernels']:                          # Ubuntu: the running kernel's own tests
         candidates = [k for k in data.kernels if k.pattern.search(release)]
         flavours = sorted({k.flavour for k in candidates})
         if not flavours:
@@ -225,8 +228,15 @@ def kernel_affected(data, release, binaries, distro):
         if 'linux' in adv.binaries:
             version = binaries[image][1]
             if adv.fixed is None or debver.compare(version, adv.fixed) < 0:
-                out.append((adv.cve, 'linux', image, version, adv.fixed, adv.note, adv.priority))
+                fixed = adv.fixed[2:] if adv.fixed and adv.fixed.startswith('0:') else adv.fixed
+                out.append((adv.cve, 'kernel linux', image, version, fixed, adv.note, adv.priority))
     return out, None
+
+
+def _seen_key(cve, source, binary):
+    """The waiting clock's key: per CVE and package; for the kernel per flavour, so booting a newer kernel that is
+    still behind keeps the days."""
+    return f'{cve} {source}' if source.startswith('kernel ') else f'{cve} {binary}'
 
 
 def _names(binaries):
@@ -241,6 +251,10 @@ def check(host, s, cache, now, opener=feeds.urlopen):
     if not ex['enabled']:
         return [], [], {'v': 2, 'at': now.isoformat(), 'enabled': False, 'lines': [], 'notes': []}
     feeds.sweep(cache)
+    try:
+        os.unlink(os.path.join(cache, 'epss.json'))     # the first format's per-CVE EPSS answers: not used
+    except FileNotFoundError:
+        pass
     today = now.date()
     ignored, drift = _ignores(ex, today)
     notes = []
@@ -256,22 +270,24 @@ def check(host, s, cache, now, opener=feeds.urlopen):
         lines = [one_line(f'cannot check: {e}', 400)] + drift
         return lines, notes, {'v': 2, 'at': now.isoformat(), 'enabled': True, 'lines': lines, 'notes': notes}
     cap, timeout, problems, parsed = ex['maxFeedMb'] << 20, ex['timeoutSeconds'], [], {}
+    release = host.kernel_release()
     xml_cap = ex['maxXmlMb'] << 20
 
     def check_oval(path):                           # a new download is read once: to check it and to use it
-        parsed[path] = oval.read(path, xml_cap)
-        return _floor('oval', parsed[path].count)
+        parsed[path] = oval.read(path, xml_cap, release)
+        return dict(parsed[path].counts, packages=_floor('oval', parsed[path].counts['packages']))
     got = {'oval': feeds.fetch(cache, 'oval', ex['ovalUrl'] or eco.oval_url, check_oval, now, cap, timeout, opener),
            'kev': feeds.fetch(cache, 'kev', ex['kevUrl'] or KEV_URL, lambda p: _floor('kev', len(read_kev(p))), now,
                               cap, timeout, opener),
            'epss': feeds.fetch(cache, 'epss', ex['epssUrl'] or EPSS_URL, lambda p: _floor('epss', read_epss(p)), now,
                                cap, timeout, opener)}
     problems += [f.problem for f in got.values() if f.problem]
+    drift += [f'drift: {f.notice}' for f in got.values() if f.notice]
     data = kev = None
     if got['oval'].path:
         try:
             fresh = [d for p, d in parsed.items() if not got['oval'].problem]
-            data = fresh[0] if fresh else oval.read(got['oval'].path, xml_cap)
+            data = fresh[0] if fresh else oval.read(got['oval'].path, xml_cap, release)
         except (oval.FormatError, OSError) as e:
             problems.append(f'oval: the kept copy cannot be read ({e})')
     if got['kev'].path:
@@ -300,7 +316,7 @@ def check(host, s, cache, now, opener=feeds.urlopen):
                 except ValueError:
                     continue
     if data is not None:
-        found, note = kernel_affected(data, host.kernel_release(), binaries, distro)
+        found, note = kernel_affected(data, release, binaries, distro)
         affected += found
         if note:
             notes.append(one_line(note, 300))
@@ -308,10 +324,12 @@ def check(host, s, cache, now, opener=feeds.urlopen):
     kev = kev or {}
     state = _read_state(cache)
     seen = dict(state['fixSeen']) if data is None else {}      # no usable data: keep every first sight
-    for cve, _s, binary, _v, fixed, _n, _p in affected:
+    # the first cache format keyed "BINARY FIXED": its first sights carry over (per binary)
+    older = {k.split(' ', 1)[0]: v for k, v in state['fixSeen'].items() if not k.startswith('CVE-')}
+    for cve, source, binary, _v, fixed, _n, _p in affected:
         if fixed is not None:
-            key = f'{cve} {binary}'
-            seen[key] = state['fixSeen'].get(key) or now.isoformat()
+            key = _seen_key(cve, source, binary)
+            seen[key] = state['fixSeen'].get(key) or older.get(binary) or now.isoformat()
     scores = {}
     if got['epss'].path:
         want = {a[0] for a in affected}
@@ -351,7 +369,7 @@ def check(host, s, cache, now, opener=feeds.urlopen):
             if unfixed:
                 text += '; no fix yet: ' + '; '.join(unfixed)
         else:
-            text = f'KEV {cve} is exploited in the wild and has no fix yet: mitigate or watch: ' + '; '.join(unfixed)
+            text = f'KEV {cve} is exploited in the wild and {eco.no_fix}: ' + '; '.join(unfixed)
         rows.append((0, -top, one_line(f'{text} {info}', 400), {'cve': cve, 'kev': True, 'epss': top,
                                                                 'action': 'update' if parts else 'mitigate',
                                                                 'sources': sorted(sources)}))
@@ -366,7 +384,7 @@ def check(host, s, cache, now, opener=feeds.urlopen):
         if eco.compare(fixed, w['fixed']) > 0:
             w['fixed'] = fixed
         w['note'] = w['note'] or note
-        first = feeds._parse_time(seen.get(f'{cve} {binary}')) or now
+        first = feeds._parse_time(seen.get(_seen_key(cve, source, binary))) or now
         w['since'] = min(w['since'], first)
     for source, w in waiting.items():
         top = max((scores.get(c, 0.0) for c in w['cves']), default=0.0)
@@ -419,19 +437,22 @@ def run(host, read_settings, cache, now=None, opener=feeds.urlopen):
         except BlockingIOError:
             print('update-policy exposure: another run holds the cache\'s lock: nothing to do')
             return 0
-        lines, notes, report = check(host, s, cache, now, opener)
+        try:
+            lines, notes, report = check(host, s, cache, now, opener)
+        except Exception as e:      # noqa: BLE001 - a fault is a cannot-check report, never a missing one
+            lines = [one_line(f'cannot check: the check failed ({type(e).__name__}: {e})', 300)]
+            notes, report = [], {'v': 2, 'at': now.isoformat(), 'enabled': True, 'lines': lines, 'notes': []}
+        try:
+            _write_json(cache, REPORT, report)              # under the lock: no other run sweeps its temporary file
+        except OSError:
+            pass
     except OSError as e:
         lines, notes = [one_line(f'cannot check: the cache folder {cache} cannot be used ({e.strerror or e})', 300)], []
-        report = {'v': 2, 'at': now.isoformat(), 'enabled': True, 'lines': lines, 'notes': notes}
     finally:
         if lock is not None:
             os.close(lock)
     for line in lines + notes:
         print(one_line(line, 400))
-    try:
-        _write_json(cache, REPORT, report)
-    except OSError:
-        pass
     return 1 if lines else 0
 
 
