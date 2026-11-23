@@ -1,11 +1,11 @@
 """The report issue (missing, closed, edited by hand, its marker removed, a GitHub error), what goes into it (the
 allow-list: nothing local reaches the issue; the size cap) and the judgment step (a fake local model over HTTP, one
-that is not there and one that does not speak HTTP).
+that is not there, one that does not speak HTTP and one that trickles its answer).
 GitHub is a fake (gardener_fixture.FakeGitHub); the `gh api` wrapper is run against a fake gh script.
 
   python3 -I -B fork-kit/gardener/tests/report.test.py
 """
-import http.server, json, os, socket, subprocess, sys, threading, unittest
+import http.server, json, os, socket, subprocess, sys, threading, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gardener_fixture as gf  # noqa: E402
@@ -193,6 +193,22 @@ class Render(unittest.TestCase):
             with self.subTest(where=where):
                 self.assertEqual(report.public_where(where, root, 'example-owner/app'), want)
 
+    def test_a_pull_request_number_is_shown_and_linked_to_the_right_repository(self):
+        root = '/srv/u/repo'
+        cases = [('#12', 'example-owner/app', 'example-owner/app', '#12'),
+                 ('#12', 'example-owner/app', 'Example-Owner/App', '#12'),
+                 ('#12', 'example-owner/app', 'example-owner/reports', 'example-owner/app#12'),
+                 ('#12', 'example-owner/app', '', '#12'),
+                 ('#12', '', 'example-owner/reports', None),                # whose #12? not shown
+                 ('#0', 'example-owner/app', 'example-owner/app', None), ('#1x', 'example-owner/app', '', None),
+                 ('#12 and more', 'example-owner/app', '', None)]
+        for where, repo, report_repo, want in cases:
+            with self.subTest(where=where, repo=repo, report_repo=report_repo):
+                self.assertEqual(report.public_where(where, root, report_repo, repo), want)
+        body = report.render_issue('example', '2026-11-23', [self.finding(where='#7')], [], root=root,
+                                   report_repo='example-owner/reports', text_checks={'c'}, repo='example-owner/app')
+        self.assertIn('| example-owner/app#7 |', body)
+
     def test_a_finding_outside_the_repository_is_only_counted(self):
         fs = [self.finding(where='/srv/u/.claude/projects/-srv-u--repo/memory/plans.md', text='orphan plans.md'),
               self.finding(where='/srv/u/.claude/projects/-srv-u--repo/memory/b.md', text='orphan b.md'),
@@ -253,7 +269,12 @@ class Render(unittest.TestCase):
                            ('ssh admin@build-box failed', 'build-box'), ('ip 2001:db8:a1e0::1 up', '2001'),
                            ('ip 2001:db8:a1e0::1 up', 'a1e0'), ('bind :: now', '::'), ('lo ::1', '::1'),
                            (r'C:\Users\alice\secret\plan.txt', 'alice'), ('C:/Users/alice/x', 'alice'),
-                           (r'share \\nas\private\x', 'nas'), ('a/srv/u/x y', '/srv'), ('a~/secret/x', 'secret')):
+                           (r'share \\nas\private\x', 'nas'), ('a/srv/u/x y', '/srv'), ('a~/secret/x', 'secret'),
+                           *((f'token {t} here', t[6:]) for t in ('ghp_' + 'Ab1' * 12, 'github_pat_' + 'x1' * 20,
+                                                                  'sk-' + 'q' * 30, 'xoxb-' + '12-ab' * 4,
+                                                                  'AKIA' + 'B7' * 8)),
+                           ('-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----',
+                            'b3BlbnNz')):
             with self.subTest(text=text):
                 self.assertNotIn(gone, report.public_text(text, '/srv/u/repo', '/srv/u'))
         for kept in ('origin/main is ahead', 'docs/a.md', 'at 12:30:45', 'std::vector', 'a.b c'):
@@ -364,6 +385,83 @@ class Judge(gf.Temp):
                 self.assertIsNone(got)
                 self.assertIn('model unreachable', note)
 
+    def trickle_server(self, gap):
+        """An HTTP server that sends its headers at once and then one byte of the body every gap seconds: each read
+        is quick (gap is under the 0.05 s the last reads may wait), the whole answer is not."""
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(4)
+        self.addCleanup(srv.close)
+        body = json.dumps({'choices': [{'message': {'content': 'late' + ' ' * 300}}]}).encode()
+
+        def serve():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(65536)
+                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
+                                 b'Content-Length: %d\r\n\r\n' % len(body))
+                    for i in range(len(body)):
+                        conn.sendall(body[i:i + 1])
+                        time.sleep(gap)
+                except OSError:
+                    return
+        threading.Thread(target=serve, daemon=True).start()
+        return f'http://127.0.0.1:{srv.getsockname()[1]}/v1'
+
+    def test_a_slow_model_is_cut_off_at_the_timeout_in_all(self):
+        started = time.monotonic()
+        got, note = judge.judge(self.model(self.trickle_server(0.02), timeoutSeconds=1), [dict(GOOD, check='c')],
+                                self.root)
+        self.assertLess(time.monotonic() - started, 4)                 # not len(body) * 0.02 = 7 seconds
+        self.assertIsNone(got)
+        self.assertIn('model unreachable or no usable answer (TimeoutError)', note)
+
+    def test_a_model_that_stalls_near_the_deadline_is_cut_off_at_the_deadline(self):
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(4)
+        self.addCleanup(srv.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def serve():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(65536)
+                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n')
+                    time.sleep(0.8)
+                    conn.sendall(b'{')                                  # one byte, then nothing
+                    stop.wait(10)
+                except OSError:
+                    return
+        threading.Thread(target=serve, daemon=True).start()
+        started = time.monotonic()
+        got, note = judge.judge(self.model(f'http://127.0.0.1:{srv.getsockname()[1]}/v1', timeoutSeconds=1),
+                                [dict(GOOD, check='c')], self.root)
+        self.assertLess(time.monotonic() - started, 1.5)               # not 0.8 + another whole second
+        self.assertIsNone(got)
+        self.assertIn('model unreachable', note)
+
+    def test_a_model_that_never_answers_is_cut_off(self):
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(4)                                                   # accepts, reads nothing, says nothing
+        self.addCleanup(srv.close)
+        started = time.monotonic()
+        got, note = judge.judge(self.model(f'http://127.0.0.1:{srv.getsockname()[1]}/v1', timeoutSeconds=1),
+                                [dict(GOOD, check='c')], self.root)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIsNone(got)
+        self.assertIn('model unreachable', note)
+
     def test_an_unreachable_model_is_a_note_and_the_run_goes_on(self):
         s = socket.socket()
         s.bind(('127.0.0.1', 0))
@@ -384,7 +482,20 @@ class Judge(gf.Temp):
         self.write_machine(self.project([{'path': self.finding_script('demo', GOOD)}],
                                         model={'endpoint': endpoint, 'model': 'm'}))
         self.assertEqual(self.run_cli('run')[0], 0)
-        self.assertIn('### Judgment (local model)\n\ndemo.thing: real; fix the doc first', self.gh.issues[1]['body'])
+        body = self.gh.issues[1]['body']
+        self.assertIn('### Judgment (model draft)\n\n<sub>A model wrote this; nobody checked it.', body)
+        self.assertIn('\n\ndemo.thing: real; fix the doc first', body)
+
+    def test_the_judgment_is_masked_like_check_text(self):
+        answer = f'see {self.root}/docs/a.md and token ghp_' + 'a' * 36
+        endpoint, _ = self.serve({'choices': [{'message': {'content': answer}}]})
+        self.write_machine(self.project([{'path': self.finding_script('demo', GOOD)}],
+                                        model={'endpoint': endpoint, 'model': 'm'}))
+        self.assertEqual(self.run_cli('run')[0], 0)
+        body = self.gh.issues[1]['body']
+        self.assertIn('### Judgment (model draft)', body)
+        self.assertNotIn(self.root, body)
+        self.assertNotIn('ghp_' + 'a' * 36, body)
 
 
 MUTATIONS = {
@@ -431,6 +542,15 @@ MUTATIONS = {
     'judge reads only tracked files': (
         'judge', '        if not tracked(real_root, rel):\n            continue\n', '',
         'Judge.test_the_model_gets_findings_and_only_tracked_files_inside_the_root'),
+    'judge: the timeout bounds the whole answer': (
+        'judge', "        if left <= 0:\n            raise TimeoutError('the answer took too long')\n", '',
+        'Judge.test_a_slow_model_is_cut_off_at_the_timeout_in_all'),
+    'judge: a stalled read ends at the deadline': (
+        'judge', '        cut_read_at(resp, left)\n', '',
+        'Judge.test_a_model_that_stalls_near_the_deadline_is_cut_off_at_the_deadline'),
+    'a #N where is linked to the project repository': (
+        'report', "            return f'{repo}{w}' if repo else None", "            return w",
+        'Render.test_a_pull_request_number_is_shown_and_linked_to_the_right_repository'),
     'judge: any failure is a note': (
         'judge', '    except Exception as e:', '    except (OSError, ValueError, KeyError, IndexError, TypeError) as e:',
         'Judge.test_an_endpoint_that_does_not_speak_http_is_a_note'),

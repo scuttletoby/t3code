@@ -12,6 +12,8 @@ from unittest import mock
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(KIT), 'common', 'tests'))
 import install_fixture as fx  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gardener_fixture as gf  # noqa: E402
 
 SHA1, SHA2 = fx.SHA1, fx.SHA2
 UNITS = ('/etc/systemd/user/gardener.service', '/etc/systemd/user/gardener.timer')
@@ -92,18 +94,22 @@ class Install(fx.FakeHost):
         self.assertEqual(self.run_main('self-check')[0], 0)
 
     def test_the_installed_checks_run_from_the_release(self):
-        """Each general check in the installed copy finds the kit's lib beside it (no source tree needed)."""
+        """Each general check in the installed copy finds the kit's lib beside it, and review-tiers the merge gate's
+        code in gate/ (no source tree needed)."""
         import subprocess
         self.assertEqual(self.install()[0], 0)
         release = self.path(os.readlink(self.path('/usr/local/libexec/gardener/current')))
-        ctx = json.dumps({'version': 1, 'project': {'name': 'x', 'repo': '', 'root': self.root}, 'check': 'c',
-                          'options': {'files': {}}, 'fix': False, 'today': '2026-11-23', 'gh': 'gh'})
-        for name in ('context-budget', 'worktrees'):
+        self.assertEqual(sorted(os.listdir(os.path.join(release, 'gate'))), sorted(gf.GATE_FILES))
+        for name, options in (('context-budget', {'files': {}}), ('worktrees', {}), ('review-tiers', {})):
+            ctx = json.dumps({'version': 1, 'project': {'name': 'x', 'repo': '', 'root': self.root}, 'check': 'c',
+                              'options': options, 'fix': False, 'today': '2026-11-23', 'gh': 'gh'})
             path = os.path.join(release, 'checks', name)
             self.assertTrue(os.access(path, os.X_OK), name)
             r = subprocess.run([sys.executable, '-I', '-B', path], input=ctx, capture_output=True, text=True,
                                cwd=self.root, timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
+            if name == 'review-tiers':
+                self.assertIn('review-tiers.no-repo', r.stdout)
 
     def assert_disable_said_first(self, out):
         """Users are told to disable the timer before the units go, not after (no dangling wants link)."""

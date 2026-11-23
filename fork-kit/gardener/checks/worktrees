@@ -100,7 +100,7 @@ for r in opt.get('repos') or [root]:
     base = base_of(repo)
     base_branch = base.split('/', 1)[1] if base and base.startswith('origin/') else base
     gone = set()
-    for line in git(repo, 'for-each-ref', '--format=%(refname:short)\t%(upstream:track)', 'refs/heads').stdout \
+    for line in git(repo, 'for-each-ref', '--format=%(refname:lstrip=2)\t%(upstream:track)', 'refs/heads').stdout \
             .splitlines():
         name, _, track = line.partition('\t')
         if track.strip() == '[gone]':
@@ -150,7 +150,7 @@ for r in opt.get('repos') or [root]:
             for t in prunable:
                 emit('worktrees.prunable', 'info', 'worktree record whose folder is gone', t['worktree'],
                      f'git -C {qp(r)} worktree prune')
-    for line in git(repo, 'for-each-ref', '--format=%(refname:short)', 'refs/heads').stdout.splitlines():
+    for line in git(repo, 'for-each-ref', '--format=%(refname:lstrip=2)', 'refs/heads').stdout.splitlines():
         branch = line.strip()
         if not branch or branch in in_trees or branch == base_branch:
             continue

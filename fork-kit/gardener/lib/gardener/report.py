@@ -2,9 +2,10 @@
 
 Two reports are written from the same findings:
 - The issue part (render_issue) is built from an allow-list, because the report repository may be public: per
-  finding only its severity, check, id, a `where` that is a path inside the project's repository (relative), and
+  finding only its severity, check, id, a `where` that is a path inside the project's repository (relative) or a
+  pull request or issue of it (`#N`, written `OWNER/REPO#N` when the report goes to another repository), and
   its text and fix with what still looks like a local name (a path, URL, address, user@host, e-mail, a Windows or
-  share path) masked. Free text only of the general checks (their words are known), the gardener's own findings
+  share path) or a well-known token shape masked. Free text only of the general checks (their words are known), the gardener's own findings
   and project checks set to "publicText": true; another project check's findings show id, where and a count. A
   finding whose `where` is outside the repository, or that has none, is only counted per check, without its id
   (the gardener's own findings excepted: their words are fixed). With counts_only (a private project repository
@@ -32,7 +33,11 @@ LOCAL_HINT = ('Full text, notes and paths outside the repository: `report.md` in
 
 _SAFE_REL = re.compile(r'[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*')
 _REPO_WHERE = re.compile(r'([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+): (.+)')
+_NUMBER = re.compile(r'#[1-9][0-9]{0,8}')
 _MASKS = (
+    (re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)', re.S), '<key>'),
+    (re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|glpat-[\w-]{20,}|xox[abposr]-[\w-]{10,}'
+                r'|sk-[\w-]{20,}|AKIA[0-9A-Z]{16})\b'), '<token>'),      # well-known token shapes
     (re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://\S+'), '<url>'),
     (re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)*'), '<user@host>'),     # e-mail, ssh user@host
     (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b'), '<ip>'),
@@ -78,12 +83,18 @@ def public_text(text, root, home):
     return text
 
 
-def public_where(where, root, report_repo=''):
+def public_where(where, root, report_repo='', repo=''):
     """Where to show in the issue: a path inside the repository, relative (":LINE" kept), "OWNER/REPO: path" of the
-    report repository, or '' for none. None: outside the repository, or not a plain path."""
+    report repository, a pull request or issue of the project's repository ("#N"; "OWNER/REPO#N" when the report
+    repository is another one, so the link is not to its own #N), or '' for none. None: outside the repository, or
+    not a plain path."""
     w = (where or '').strip()
     if not w:
         return ''
+    if _NUMBER.fullmatch(w):
+        if not repo or (report_repo and repo.lower() != report_repo.lower()):
+            return f'{repo}{w}' if repo else None
+        return w
     m = _REPO_WHERE.fullmatch(w)
     if m:
         if report_repo and m.group(1).lower() == report_repo.lower():
@@ -125,7 +136,9 @@ def _document(name, title, today, counts, rows, notes, judgment, cap, more_hint,
     if notes:
         tail += ['### Notes', ''] + [f'- {_cell(n)}' for n in notes]
     if judgment:
-        tail += ['', '### Judgment (local model)', '', judgment.strip()]
+        tail += ['', '### Judgment (model draft)', '',
+                 '<sub>A model wrote this; nobody checked it. Use it as a hint, not as a finding.</sub>', '',
+                 judgment.strip()]
     tail += ['', f'<sub>Written by the gardener (fork-kit/gardener) on {today}; it rewrites everything below the '
                  'marker on each run.</sub>']
     if rows:
@@ -146,15 +159,16 @@ def _document(name, title, today, counts, rows, notes, judgment, cap, more_hint,
     return '\n'.join(lines + tail) + '\n'
 
 
-def public_findings(findings, root, home, report_repo='', text_checks=(), counts_only=False):
+def public_findings(findings, root, home, report_repo='', text_checks=(), counts_only=False, repo=''):
     """The allow-listed view of the findings (module doc): [{severity, check, id, text, where, fix}]. text_checks:
     the ids of the checks whose text may be shown (general checks and "publicText" project checks); the gardener's
     own findings always. Folded into one counted entry: a finding outside the repository or with no where (per
     severity, check and where; no id: a project check's id may name a local thing), and one whose text may not be
-    shown (per severity, check, id and where). counts_only: every finding, per severity and check."""
+    shown (per severity, check, id and where). counts_only: every finding, per severity and check. repo: the
+    project's repository (a "#N" where is one of its pull requests or issues)."""
     out, hidden = [], {}
     for f in findings:
-        w = public_where(f.get('where'), root, report_repo)
+        w = public_where(f.get('where'), root, report_repo, repo)
         if counts_only:
             key = (f['severity'], f['check'], '', '', 'in the local report only')
         elif w is None or (w == '' and not f.get('own')):
@@ -179,10 +193,10 @@ COUNTS_ONLY = ('Counts only: the project\'s repository is private (or not set, o
 
 
 def render_issue(name, today, findings, notes, judgment=None, root='', home='', report_repo='', text_checks=(),
-                 counts_only=False):
+                 counts_only=False, repo=''):
     """The issue part, from the marker down (markdown), from the allow-list (module doc)."""
     rows = [(f['severity'], f['check'], f'{f["id"]}: {f["text"]}' if f['id'] else f['text'], f['where'], f['fix'])
-            for f in public_findings(findings, root, home, report_repo, text_checks, counts_only)]
+            for f in public_findings(findings, root, home, report_repo, text_checks, counts_only, repo)]
     return _document(name, 'Gardener report', today, _counts(findings), rows,
                      [public_text(n, root, home) for n in notes],
                      public_text(judgment, root, home) if judgment and not counts_only else None, MAX_PART,

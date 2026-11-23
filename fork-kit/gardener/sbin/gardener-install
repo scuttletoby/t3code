@@ -5,8 +5,9 @@
   gardener-install uninstall
   gardener-install self-check
 
-install copies bin/gardener, sbin/gardener-install, lib/gardener/, checks/, systemd/, README.md and
-fork-kit/common/{machine_file,kit_install}.py of one release into /usr/local/libexec/gardener/versions/<sha>/ (with
+install copies bin/gardener, sbin/gardener-install, lib/gardener/, checks/, systemd/, README.md,
+fork-kit/common/{machine_file,kit_install}.py and the merge gate's lens and review rules (fork-ci/actions/pr-queue:
+the review-tiers check imports them, into gate/) of one release into /usr/local/libexec/gardener/versions/<sha>/ (with
 MANIFEST.sha256), checks the copy, switches the link `current` to it and links /usr/local/bin/gardener and
 /usr/local/sbin/gardener-install to it. With --timer it also writes the kit's one timer: the user units
 gardener.service and gardener.timer in /etc/systemd/user/, which run `gardener run --timer` every hour for each
@@ -40,16 +41,28 @@ class GardenerInstaller(kit_install.Installer):
     LIBEXEC = '/usr/local/libexec/gardener'
     LINKS = {'/usr/local/bin/gardener': 'bin/gardener',
              '/usr/local/sbin/gardener-install': 'sbin/gardener-install'}
-    CHECKS = ('checks/context-budget', 'checks/facts', 'checks/install-drift', 'checks/workflows-off',
-              'checks/worktrees')
+    CHECKS = ('checks/context-budget', 'checks/facts', 'checks/install-drift', 'checks/review-tiers',
+              'checks/workflows-off', 'checks/worktrees')
+    # the gate's own code, imported by review-tiers, never copied into the kit's source (GATE_SOURCE)
+    GATE = ('gate/config.py', 'gate/lens.py', 'gate/review_config.py', 'gate/review_glob.py', 'gate/review_judge.py',
+            'gate/review.vectors.json')
     SOURCE_FILES = ('bin/gardener', 'sbin/gardener-install', 'README.md', 'common/machine_file.py',
-                    'common/kit_install.py', 'systemd/gardener.service', 'systemd/gardener.timer') + CHECKS
+                    'common/kit_install.py', 'systemd/gardener.service', 'systemd/gardener.timer') + CHECKS + GATE
     EXECUTABLE = frozenset({'bin/gardener', 'sbin/gardener-install'} | set(CHECKS))
     PACKAGE = 'gardener'
     MODULES = ('__init__', 'cli', 'config', 'contract', 'judge', 'report', 'runner')
     HELP = ('bin/gardener', 'gardener run')
     HAS_CONFIG = True
     KIT_STEPS = ('timer-units',)
+
+    def read_source(self, source, rel):
+        """gate/... comes from the fork's fork-ci/actions/pr-queue (next to fork-kit), unless the source folder has its
+        own gate/ (an installed copy)."""
+        if rel.startswith('gate/') and not os.path.lexists(os.path.join(source, 'gate')):
+            gate = os.path.join(os.path.dirname(os.path.dirname(os.path.normpath(source))), 'fork-ci', 'actions',
+                                'pr-queue')
+            return super().read_source(gate, rel[len('gate/'):])
+        return super().read_source(source, rel)
 
     def add_install_options(self, parser):
         parser.add_argument('--timer', dest='timer', action='store_true', default=None)

@@ -1,0 +1,664 @@
+#!/usr/bin/python3 -IB
+"""review-tiers: merged pull requests that had less review than their tier asks for. Report only, even with "fix":
+a review is done by people, never by a tool.
+
+A pull request's tier comes from the paths it changed, and the review it had from its lens comments, read by the
+merge gate's own code (fork-ci/actions/pr-queue: lens.py, config.py, review_config.py, review_judge.py), imported,
+never copied: a lens comment counts here exactly when the gate would read it as one. The check only adds what the gate
+does not judge: it looks back at pull requests that are already merged (merged past the gate, by an admin or before
+the rules existed), and at tiers that the project keeps outside the gate config.
+
+Options (the repository is always the project's own "repo": the report masks and links `#N` against it):
+  branch        the base branch of the merged pull requests (default: the root's origin/HEAD branch, else main)
+  days          how far back, in days (default 7, at most 90)
+  base          the git ref the project files below are read from (default origin/HEAD, else origin/main, else main)
+  queueConfig   the gate's queue config, a path in the repository (default .github/pr-queue.json): its bot_logins,
+                lens_author_associations and override decide whose comments count; without the file: OWNER, MEMBER and
+                COLLABORATOR, no bots, no override
+  tiers         the project's tiers (below); without it, the queue config's "review" block (the gate's own rules)
+  exemptLabels  [label]: pull requests with one of these labels are not judged
+  exemptAuthors [login]: pull requests of these authors are not judged
+  waivers       [text]: a comment whose first line starts with one of these (any case), by an author the queue config
+                counts for lenses and posted at any time, even after the merge, settles the pull request: a person
+                decided it needed no (more) review. Anyone the queue config counts for lenses can waive, the pull
+                request's own author included (an agent that posts as such an account too)
+  maxPages      search pages of 20 pull requests per run (default 8, at most 25); a page takes up to about 10 s, so
+                the check's timeoutSeconds must cover maxPages x 10 s
+  minRemaining  the GraphQL budget left this hour below which the check does not search (default 1000)
+
+  "tiers": {
+    "rules": [{"paths": ["**/*.md"], "tier": 0}],         first rule whose glob (the gate's dialect) matches a path
+    "registry": {"file": "path/rows.json", "rows": "items", "paths": "paths", "tier": "tier", "default": 2},
+                                                         else every row whose "paths" equal or are a folder of the path
+                                                         (the highest tier of them; a row without a tier: default)
+    "unmatched": 0,                                      else this tier
+    "approvalsCount": false,                             an approving review counts as one more lens
+    "requires": {"2": {"minLenses": 1},
+                 "3": {"minLenses": 3, "lenses": [{"name": "data integrity", "match": "data.?integrity", "count": 2}]}}
+  }
+
+A pull request's tier is the highest tier of its changed paths. It passes when it has at least minLenses different lens
+names (the gate's lens_key) and, per "lenses" entry, at least "count" names that match "match" (a regex, any case),
+or when a valid override comment of the queue config (its prefix, by its author association, unedited) was posted
+before it merged. With the review block instead: the gate's review_judge gives its weight and the lens names its
+rules require, and min_lenses its count. A pull request with more paths than one page shows (100) is judged at the
+top tier (critical) for the lens count. A lens report that the gate would not take as a read (edited, hidden, a
+short sha) still counts here, since it shows the review was done. Inline review comments are not read. A tier no
+"requires" entry names asks for nothing.
+
+Findings: `review-tiers.skipped` (warn): no lens at all before the merge; `review-tiers.short` (warn at the top tier
+or critical, else info): lenses before the merge, but not the ones its tier asks for; `review-tiers.late` (info):
+the lenses it asks for came only after the merge (the review was done, late). A review after the merge settles the
+warning, as the fix hint says.
+
+GitHub: one `gh api rate_limit` (free) and one GraphQL search per run (paged), cached in the check's cache folder
+(the context's "cacheDir"): a run searches only pull requests updated since the day before the last search, so the
+next day's run costs a page or two. The facts of each merged pull request are cached, and the verdicts are worked out
+again each run with the current tiers. A search cut off by maxPages or minRemaining remembers where it stopped (the
+oldest "updated" time it read: the search is newest first) and the next run goes on from there (that second
+included, so the pull requests updated in it are read again) before it searches anything newer, so a busy window is
+read in full over a few runs (`review-tiers.partial`, warn, until then); only when a whole page shares one second does
+it step one second past it. A run
+that fails (a GitHub error) writes nothing, so the next run repeats it. Old, broken or other-version cache files are
+read as empty, a broken resume point is dropped (the whole window is searched again); a newer cache is never
+overwritten. The cache is keyed by the gate's code too, so a kit upgrade that reads lenses otherwise starts afresh.
+A dry run reads the cache but writes nothing.
+"""
+import datetime, hashlib, json, os, re, subprocess, sys
+
+KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(KIT, 'lib'))
+from gardener.contract import emit, read_context  # noqa: E402
+
+_GATE = os.path.join(KIT, 'gate')   # the installed copy; in a fork checkout, the gate itself
+GATE = _GATE if os.path.isdir(_GATE) else os.path.join(os.path.dirname(os.path.dirname(KIT)), 'fork-ci', 'actions',
+                                                       'pr-queue')
+sys.path.insert(0, GATE)
+import config as gate_config  # noqa: E402
+import lens  # noqa: E402
+import review_config  # noqa: E402
+import review_glob  # noqa: E402
+import review_judge  # noqa: E402
+
+CACHE_VERSION = 1
+GATE_FILES = ('config.py', 'lens.py', 'review_config.py', 'review_glob.py', 'review_judge.py')
+PAGE = 20
+MAX_FILES = 100
+MAX_COMMENTS = 100
+MAX_REVIEWS = 50
+DEFAULT_ASSOCIATIONS = ('OWNER', 'MEMBER', 'COLLABORATOR')
+NEVER = '\x00'      # an override prefix no comment can start with: the project has no override
+SHOW = 5            # lens names shown in a finding
+
+QUERY = '''query($q: String!, $first: Int!, $after: String) {
+  rateLimit { cost remaining }
+  search(query: $q, type: ISSUE, first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {
+      number mergedAt updatedAt
+      author { login __typename }
+      labels(first: 50) { nodes { name } }
+      files(first: %d) { totalCount nodes { path } }
+      comments(last: %d) { totalCount nodes { body createdAt authorAssociation includesCreatedEdit isMinimized url
+                                              author { login __typename } } }
+      reviews(last: %d) { totalCount nodes { id body submittedAt state authorAssociation includesCreatedEdit
+                                             isMinimized url author { login __typename } } }
+    } }
+  }
+}''' % (MAX_FILES, MAX_COMMENTS, MAX_REVIEWS)
+
+
+def fail(msg):
+    sys.exit(f'review-tiers: {msg}')
+
+
+def note(msg):
+    print(f'review-tiers: {msg}', file=sys.stderr, flush=True)
+
+
+def git(root, *args):
+    try:
+        p = subprocess.run(['git', '-C', root, *args], capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+                           env=dict(os.environ, GIT_TERMINAL_PROMPT='0'))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def base_ref(root, wanted):
+    if not root:
+        return None
+    for ref in ([wanted] if wanted else ['origin/HEAD', 'origin/main', 'main']):
+        if git(root, 'rev-parse', '--verify', '-q', f'{ref}^{{commit}}') is not None:
+            return ref
+    if wanted:
+        fail(f'"base" {wanted!r} is not a commit in the project root')
+    return None
+
+
+def default_branch(root):
+    out = git(root, 'symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD') if root else None
+    name = out.decode('utf-8', 'replace').strip() if out else ''
+    return name.split('/', 1)[1] if name.startswith('origin/') else 'main'
+
+
+def read_file(root, ref, rel):
+    """The bytes of rel at ref, or None when it is not there."""
+    if not ref:
+        return None
+    return git(root, 'show', f'{ref}:{rel}')
+
+
+# --- options -------------------------------------------------------------------------------------------------------
+
+def _int(v, lo, hi, what):
+    if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
+        fail(f'{what} must be a whole number {lo}-{hi}')
+    return v
+
+
+def _strings(v, what):
+    if not isinstance(v, list) or not all(isinstance(s, str) and s for s in v):
+        fail(f'{what} must be a list of non-empty strings')
+    return v
+
+
+def _known(obj, keys, what):
+    if not isinstance(obj, dict):
+        fail(f'{what} must be an object')
+    unknown = sorted(set(obj) - set(keys))
+    if unknown:
+        fail(f'{what}: unknown key {unknown[0]!r} (known: {", ".join(keys)})')
+
+
+def parse_tiers(t):
+    _known(t, ('rules', 'registry', 'unmatched', 'approvalsCount', 'requires'), 'tiers')
+    rules = []
+    for i, r in enumerate(t.get('rules') or []):
+        _known(r, ('paths', 'tier'), f'tiers.rules[{i}]')
+        globs = _strings(r.get('paths'), f'tiers.rules[{i}].paths')
+        for g in globs:
+            why = review_config.glob_problem(g)
+            if why:
+                fail(f'tiers.rules[{i}].paths: {g!r}: {why}')
+        rules.append((tuple(globs), _int(r.get('tier'), 0, 9, f'tiers.rules[{i}].tier')))
+    reg = t.get('registry')
+    if reg is not None:
+        _known(reg, ('file', 'rows', 'paths', 'tier', 'default'), 'tiers.registry')
+        if not isinstance(reg.get('file'), str) or not reg['file']:
+            fail('tiers.registry.file must be a path in the repository')
+        for k in ('rows', 'paths', 'tier'):
+            if not isinstance(reg.get(k, ''), str):
+                fail(f'tiers.registry.{k} must be a key name')
+        reg = {'file': reg['file'], 'rows': reg.get('rows', ''), 'paths': reg.get('paths') or 'paths',
+               'tier': reg.get('tier') or 'tier', 'default': _int(reg.get('default', 0), 0, 9,
+                                                                    'tiers.registry.default')}
+    requires = {}
+    raw = t.get('requires')
+    if not isinstance(raw, dict) or not raw:
+        fail('tiers.requires must name at least one tier: {"2": {"minLenses": 1}}')
+    for key, req in raw.items():
+        if not re.fullmatch(r'[0-9]', key):
+            fail(f'tiers.requires: {key!r} is not a tier 0-9')
+        where = f'tiers.requires.{key}'
+        _known(req, ('minLenses', 'lenses'), where)
+        named = []
+        for i, n in enumerate(req.get('lenses') or []):
+            _known(n, ('name', 'match', 'count'), f'{where}.lenses[{i}]')
+            if not isinstance(n.get('match'), str) or not n['match']:
+                fail(f'{where}.lenses[{i}].match must be a regex')
+            try:
+                rx = re.compile(n['match'], re.I)
+            except re.error as e:
+                fail(f'{where}.lenses[{i}].match: {e}')
+            name = n.get('name') or n['match']
+            if not isinstance(name, str):
+                fail(f'{where}.lenses[{i}].name must be text')
+            named.append((name, rx, _int(n.get('count', 1), 1, 9, f'{where}.lenses[{i}].count')))
+        requires[int(key)] = (_int(req.get('minLenses', 0), 0, 20, f'{where}.minLenses'), tuple(named))
+    if not isinstance(t.get('approvalsCount', False), bool):
+        fail('tiers.approvalsCount must be true or false')
+    return {'rules': tuple(rules), 'registry': reg, 'unmatched': _int(t.get('unmatched', 0), 0, 9, 'tiers.unmatched'),
+            'approvals': t.get('approvalsCount', False), 'requires': requires, 'top': max(requires)}
+
+
+def load_registry(root, ref, reg):
+    data = read_file(root, ref, reg['file'])
+    if data is None:
+        fail(f'tiers.registry.file {reg["file"]!r} is not in the project root at {ref or "(no git ref)"}')
+    try:
+        obj = json.loads(data)
+        rows = obj[reg['rows']] if reg['rows'] else obj
+        if not isinstance(rows, list):
+            raise ValueError('not a list')
+    except (ValueError, KeyError, TypeError) as e:
+        fail(f'tiers.registry.file {reg["file"]!r}: no list of rows ({type(e).__name__})')
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        paths = row.get(reg['paths'])
+        paths = [paths] if isinstance(paths, str) else paths if isinstance(paths, list) else []
+        tier = row.get(reg['tier'], reg['default'])
+        tier = tier if isinstance(tier, int) and not isinstance(tier, bool) and 0 <= tier <= 9 else reg['default']
+        out.append(([p.strip('/') for p in paths if isinstance(p, str) and p.strip('/')], tier))
+    return out
+
+
+def path_tier(tiers, registry, path):
+    for globs, tier in tiers['rules']:
+        if review_glob.matches_any(globs, path):
+            return tier
+    hits = [tier for paths, tier in registry if any(path == p or path.startswith(p + '/') for p in paths)]
+    return max(hits) if hits else tiers['unmatched']
+
+
+# --- cache ---------------------------------------------------------------------------------------------------------
+
+def read_cache(path, key):
+    """(cache dict or None, newer). Missing, broken, of another key or an older version: None."""
+    if not path:
+        return None, False
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, False
+    except (OSError, ValueError) as e:
+        note(f'the cache could not be read ({type(e).__name__}): searching the whole window')
+        return None, False
+    v = data.get('version') if isinstance(data, dict) else None
+    if isinstance(v, int) and not isinstance(v, bool) and v > CACHE_VERSION:
+        note(f'the cache is of a newer gardener (version {v}): not used, and not overwritten')
+        return None, True
+    if v != CACHE_VERSION or data.get('key') != key or not isinstance(data.get('prs'), dict) \
+            or not all(re.fullmatch(r'[1-9][0-9]{0,8}', k) and good_fact(f) for k, f in data['prs'].items()):
+        note('the cache is of an older version or another repository or queue config: searching the whole window')
+        return None, False
+    return data, False
+
+
+FACT_KEYS = {'mergedAt': str, 'author': str, 'labels': list, 'paths': list, 'pathsComplete': bool,
+             'commentsComplete': bool}
+READ_KEYS = {'lenses': list, 'lensesAfter': list, 'override': bool, 'waived': bool, 'approvals': int}
+
+
+def good_fact(f):
+    """A cached pull request entry this version wrote: every key, of its type."""
+    if not isinstance(f, dict) or not all(isinstance(f.get(k), t) for k, t in FACT_KEYS.items()):
+        return False
+    if 'unread' in f:
+        return isinstance(f['unread'], str)
+    return all(isinstance(f.get(k), t) for k, t in READ_KEYS.items()) and \
+        all(isinstance(x, str) for k in ('labels', 'paths', 'lenses', 'lensesAfter') for x in f[k])
+
+
+def good_day(day, upto):
+    """day is a date (YYYY-MM-DD) no later than upto."""
+    try:
+        return isinstance(day, str) and datetime.date.fromisoformat(day).isoformat() == day and day <= upto
+    except ValueError:
+        return False
+
+
+STAMP = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z')
+
+
+def good_resume(r, upto):
+    """Where a cut-off search stopped: {"day": the day it began, "since": its lower "updated" day or "", "before":
+    the oldest "updated" time it read}."""
+    return isinstance(r, dict) and set(r) == {'day', 'since', 'before'} and good_day(r['day'], upto) \
+        and (r['since'] == '' or good_day(r['since'], r['day'])) and isinstance(r['before'], str) \
+        and bool(STAMP.fullmatch(r['before'])) and r['before'][:10] <= upto
+
+
+def second_before(stamp):
+    t = datetime.datetime.strptime(stamp, '%Y-%m-%dT%H:%M:%SZ') - datetime.timedelta(seconds=1)
+    return t.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def gate_hash():
+    h = hashlib.sha256()
+    for name in GATE_FILES:
+        try:
+            with open(os.path.join(GATE, name), 'rb') as f:
+                h.update(name.encode() + b'\0' + f.read() + b'\0')
+        except OSError:
+            h.update(name.encode() + b'\0missing\0')
+    return h.hexdigest()
+
+
+def write_cache(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f'{path}.tmp-{os.getpid()}'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# --- GitHub --------------------------------------------------------------------------------------------------------
+
+def gh_json(gh, args):
+    try:
+        p = subprocess.run([gh, 'api', *args], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        fail(f'gh api {args[0]}: {type(e).__name__}')
+    if p.returncode != 0:
+        fail(f'gh api {args[0]}: {(p.stderr or p.stdout).strip()[-200:]}')
+    try:
+        return json.loads(p.stdout)
+    except ValueError:
+        fail(f'gh api {args[0]}: the answer is not JSON')
+
+
+def graphql_left(gh):
+    got = gh_json(gh, ['rate_limit'])
+    try:
+        n = got['resources']['graphql']['remaining']
+    except (KeyError, TypeError):
+        fail('gh api rate_limit: no GraphQL budget in the answer')
+    if not isinstance(n, int):
+        fail('gh api rate_limit: no GraphQL budget in the answer')
+    return n
+
+
+def waived(post, review, waivers):
+    first = ((post.get('body') or '').lstrip().splitlines() or [''])[0].strip().lower()
+    return review.counts(post) and not review.is_bot(post) and not review.hidden(post) \
+        and any(first.startswith(w) for w in waivers)
+
+
+def facts(pr, review, override, waivers):
+    """What the cache keeps of one merged pull request: no comment text, only what the verdict needs."""
+    merged = pr.get('mergedAt') or ''
+    author = pr.get('author') or {}
+    comments = [c for c in (pr.get('comments') or {}).get('nodes') or [] if c]
+    reviews = [r for r in (pr.get('reviews') or {}).get('nodes') or [] if r]
+
+    def view(before):
+        keep = [c for c in comments if ((c.get('createdAt') or '') <= merged) == before]
+        rs = [r for r in reviews if ((r.get('submittedAt') or '') <= merged) == before]
+        flags = {r['id']: {'includesCreatedEdit': r.get('includesCreatedEdit'), 'isMinimized': r.get('isMinimized'),
+                           'url': r.get('url'), 'author': {'__typename': (r.get('author') or {}).get('__typename')}}
+                 for r in rs if isinstance(r.get('id'), str)}
+        return {'comments': keep, 'reviews': rs, lens.REVIEW_FLAGS: flags}
+
+    out = {'mergedAt': merged, 'author': author.get('login') or '',
+           'labels': sorted({(n or {}).get('name') or '' for n in (pr.get('labels') or {}).get('nodes') or []} - {''}),
+           'paths': [n['path'] for n in (pr.get('files') or {}).get('nodes') or [] if (n or {}).get('path')],
+           'pathsComplete': ((pr.get('files') or {}).get('totalCount') or 0)
+                            <= len((pr.get('files') or {}).get('nodes') or []),
+           'commentsComplete': ((pr.get('comments') or {}).get('totalCount') or 0) <= len(comments)
+                               and ((pr.get('reviews') or {}).get('totalCount') or 0) <= len(reviews)}
+    try:
+        before, after = view(True), view(False)
+        out['lenses'] = sorted(k for k in review.lens_scan(before)[0] if not k.startswith(lens.NO_HEADER))
+        out['lensesAfter'] = sorted(k for k in review.lens_scan(after)[0] if not k.startswith(lens.NO_HEADER))
+        posts = [p for _, _, p in review.lens_posts(before)]
+        out['override'] = override and any(review.override_sha(p) for p in posts)
+        out['waived'] = any(waived(p, review, waivers) for p in comments + reviews)
+        out['approvals'] = sum(1 for r in before['reviews'] if r.get('state') == 'APPROVED' and review.counts(r)
+                               and not review.is_bot(r))
+    except Exception as e:   # a comment this Python reads otherwise (lens.UnicodeDrift) or any other surprise
+        out['unread'] = type(e).__name__
+    return out
+
+
+def graphql_page(gh, query, first, after):
+    args = ['graphql', '-f', f'query={QUERY}', '-f', f'q={query}', '-F', f'first={first}']
+    if after:
+        args += ['-f', f'after={after}']
+    got = gh_json(gh, args)
+    if not isinstance(got, dict) or got.get('errors') or not isinstance(got.get('data'), dict):
+        msgs = [e.get('message', '') for e in got.get('errors') or [] if isinstance(e, dict)] \
+            if isinstance(got, dict) else []
+        return None, '; '.join(msgs)[:200] or 'no data in the answer'
+    return got['data'], None
+
+
+def search(gh, query, pages, min_left):
+    """A dict: nodes, complete, why (not complete), used (pages), oldest (the oldest "updated" time read, or None).
+    complete is False when the pages ran out or the budget fell too low. A page GitHub cannot answer (too much
+    comment text for one query: "timeout", "something went wrong") is asked again once with fewer pull requests."""
+    out = {'nodes': [], 'complete': False, 'why': None, 'used': 0, 'oldest': None}
+    after, first = None, PAGE
+    while out['used'] < pages:
+        data, err = graphql_page(gh, query, first, after)
+        if err is not None and first == PAGE:
+            note(f'gh api graphql: {err}: asking again for {PAGE // 4} pull requests a page')
+            first = PAGE // 4
+            data, err = graphql_page(gh, query, first, after)
+        if err is not None:
+            fail(f'gh api graphql: {err}')
+        out['used'] += 1
+        s = data.get('search') or {}
+        got = [n for n in s.get('nodes') or [] if isinstance(n, dict) and isinstance(n.get('number'), int)]
+        out['nodes'] += got
+        stamps = [n['updatedAt'] for n in got if isinstance(n.get('updatedAt'), str) and STAMP.fullmatch(n['updatedAt'])]
+        if stamps:
+            out['oldest'] = min(stamps + ([out['oldest']] if out['oldest'] else []))
+        page = s.get('pageInfo') or {}
+        if not page.get('hasNextPage'):
+            out['complete'] = True
+            return out
+        after = page.get('endCursor')
+        left = (data.get('rateLimit') or {}).get('remaining')
+        if isinstance(left, int) and left < min_left:
+            out['why'] = f'the GraphQL budget fell to {left} (under minRemaining {min_left}) while searching'
+            return out
+    out['why'] = f'more than {pages} page(s) of pull requests left for this run (maxPages)'
+    return out
+
+
+# --- verdicts ------------------------------------------------------------------------------------------------------
+
+def some(names):
+    names = list(names)
+    return ', '.join(names[:SHOW]) + (f' and {len(names) - SHOW} more' if len(names) > SHOW else '') if names \
+        else 'none'
+
+
+def verdict_tiers(f, lenses, tiers, registry):
+    """None when lenses (names) and its approvals are enough review, else (what it needed, what was missing, top:
+    the highest level)."""
+    paths = f['paths']
+    tier = max([path_tier(tiers, registry, p) for p in paths] or [tiers['unmatched']])
+    if not f['pathsComplete']:
+        tier = max(tier, tiers['top'])
+    need = tiers['requires'].get(tier)
+    if not need:
+        return None
+    min_lenses, named = need
+    have = len(lenses) + (f['approvals'] if tiers['approvals'] else 0)
+    missing = []
+    if have < min_lenses:
+        missing.append(f'{min_lenses} lens(es), found {have}')
+    for name, rx, count in named:
+        n = sum(1 for k in lenses if rx.search(k))
+        if n < count:
+            missing.append(f'{count} {name} lens(es), found {n}')
+    return (f'tier {tier}', missing, tier == tiers['top']) if missing else None
+
+
+def verdict_rules(f, lenses, rules, config_path):
+    try:
+        j = review_judge.judge(rules, [('M', (p,)) for p in f['paths']], config_path)
+    except review_judge.JudgeError as e:
+        return 'the review rules', [f'its paths cannot be judged ({e})'[:300]], True
+    weight, need = j.weight, getattr(rules.min_lenses, j.weight)
+    if not f['pathsComplete']:   # the paths past the first page may ask for more: the heaviest count
+        weight, need = 'critical', max(need, rules.min_lenses.critical)
+    have = set(lenses)
+    missing = [name for name in j.lenses if lens.lens_key(name) not in have]
+    out = [f'lens {some(missing)}'] if missing else []
+    if len(have) < need:
+        out.append(f'{need} lens(es), found {len(have)}')
+    return (weight, out, weight == 'critical') if out else None
+
+
+def main():
+    ctx = read_context()
+    opt = ctx['options']
+    if 'repo' in opt:   # the report masks and links `#N` against the project's repo: another one would leak
+        fail('there is no "repo" option: the check reads the project\'s own repository (its "repo")')
+    _known(opt, ('branch', 'days', 'base', 'queueConfig', 'tiers', 'exemptLabels', 'exemptAuthors',
+                 'waivers', 'maxPages', 'minRemaining'), 'options')
+    repo = ctx['project']['repo']
+    if not repo:
+        emit('review-tiers.no-repo', 'info', 'no repository to read: the project has no "repo"')
+        return
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+', repo):
+        fail('repo must be OWNER/REPO')
+    root = ctx['project']['root']
+    days = _int(opt.get('days', 7), 1, 90, 'days')
+    max_pages = _int(opt.get('maxPages', 8), 1, 25, 'maxPages')
+    min_left = _int(opt.get('minRemaining', 1000), 0, 5000, 'minRemaining')
+    exempt_labels = set(_strings(opt.get('exemptLabels', []), 'exemptLabels'))
+    exempt_authors = {a.lower() for a in _strings(opt.get('exemptAuthors', []), 'exemptAuthors')}
+    waivers = tuple(w.strip().lower() for w in _strings(opt.get('waivers', []), 'waivers'))
+    if not all(waivers):
+        fail('waivers must not be blank')
+    ref = base_ref(root, opt.get('base'))
+    branch = opt.get('branch') or default_branch(root)
+    if not re.fullmatch(r'[A-Za-z0-9._/-]+', branch):
+        fail('branch must be a branch name')
+    qpath = opt.get('queueConfig') or '.github/pr-queue.json'
+    qtext = read_file(root, ref, qpath)
+    if qtext is None and opt.get('queueConfig'):
+        fail(f'queueConfig {qpath!r} is not in the project root at {ref or "(no git ref)"}')
+    cfg = None
+    if qtext is not None:
+        try:
+            cfg = gate_config.parse(qtext, qpath)
+        except gate_config.ConfigError as e:
+            fail(f'the gate refuses the queue config: {e}'[:500])
+    tiers = parse_tiers(opt['tiers']) if 'tiers' in opt else None
+    if tiers is None and (cfg is None or cfg.review is None):
+        emit('review-tiers.no-rules', 'info', 'no review tiers to judge by: give the check a "tiers" option, or the '
+             'queue config a "review" block', '', 'see the review-tiers check in the gardener README')
+        return
+    registry = load_registry(root, ref, tiers['registry']) if tiers and tiers['registry'] else []
+    review = lens.Review(cfg.bot_logins if cfg else (), (cfg.override_prefix if cfg else '') or NEVER,
+                         cfg.override_association if cfg else '',
+                         cfg.lens_author_associations if cfg else DEFAULT_ASSOCIATIONS, log=note)
+    has_override = bool(cfg and cfg.override_prefix)
+
+    today = datetime.date.fromisoformat(ctx['today'])
+    start = (today - datetime.timedelta(days=days - 1)).isoformat()
+    # what decides the cached facts: whose comments count, the waivers (the verdicts are worked out again each run)
+    # and the gate's code that read them (a kit upgrade that reads lens comments otherwise starts afresh)
+    key = hashlib.sha256(json.dumps([repo.lower(), branch, list(review.bots), list(review.lens_associations),
+                                     review.override_re.pattern, review.override_association, list(waivers),
+                                     gate_hash()]).encode()).hexdigest()
+    cache_dir = ctx.get('cacheDir') or ''
+    dry = ctx.get('dryRun') is True
+    path = os.path.join(cache_dir, 'cache.json') if cache_dir else ''
+    cache, newer = read_cache(path, key)
+    usable = bool(cache) and good_day(cache.get('searchedDay'), ctx['today']) \
+        and good_day(cache.get('from'), start)   # a wider window than the cache's: search all of it
+    prs = dict(cache['prs']) if usable else {}
+    searched = cache['searchedDay'] if usable else None
+    resume = cache.get('resume') if usable else None
+    if resume is not None and not good_resume(resume, ctx['today']):
+        note('the resume point in the cache is broken: dropped')
+        resume = None
+
+    def since_day():
+        if not searched:
+            return start
+        return max(start, (datetime.date.fromisoformat(searched) - datetime.timedelta(days=1)).isoformat())
+
+    base_q = f'repo:{repo} is:pr is:merged base:{branch} merged:>={start} sort:updated-desc'
+    left = graphql_left(ctx['gh'])
+    if left < min_left:
+        emit('review-tiers.budget', 'info', f'not searched today: the GraphQL budget left this hour is {left}, under '
+             f'minRemaining {min_left}; judged from the cache only', '', 'nothing to do: the next run searches')
+    else:
+        pages, why = max_pages, None
+        if resume:    # first go on where a cut-off search stopped: the older pull requests it did not reach
+            before = resume['before'][:-1] + '+00:00'
+            lower = resume['since'] if resume['since'] > start else ''
+            q = base_q + (f' updated:{lower}T00:00:00+00:00..{before}' if lower else f' updated:<={before}')
+            got = search(ctx['gh'], q, pages, min_left)
+            for n in got['nodes']:
+                prs[str(n['number'])] = facts(n, review, has_override, waivers)
+            pages -= got['used']
+            if got['complete']:
+                searched, resume = resume['day'], None
+            else:
+                why = got['why']
+                resume = dict(resume, before=got['oldest'] if got['oldest'] and got['oldest'] < resume['before']
+                              else second_before(resume['before']))   # a whole page in one second: step past it
+        if resume is None and pages > 0:
+            since = since_day()
+            got = search(ctx['gh'], base_q + (f' updated:>={since}' if since > start else ''), pages, min_left)
+            for n in got['nodes']:
+                prs[str(n['number'])] = facts(n, review, has_override, waivers)
+            if got['complete']:
+                searched = ctx['today']
+            else:
+                why = got['why']
+                if got['oldest']:
+                    resume = {'day': ctx['today'], 'since': since if since > start else '', 'before': got['oldest']}
+        if why:
+            emit('review-tiers.partial', 'warn', f'the search stopped early: {why}; pull requests it did not reach '
+                 'are not judged yet, the next run goes on where this one stopped', '',
+                 'nothing to do if it clears in a run or two; else raise maxPages (and the timeout) or lower days')
+    prs = {k: v for k, v in prs.items() if isinstance(v, dict) and (v.get('mergedAt') or '')[:10] >= start}
+    if path and not dry and not newer:
+        data = {'version': CACHE_VERSION, 'key': key, 'prs': prs, 'from': start,
+                'searchedDay': searched or '1970-01-01'}
+        if resume:
+            data['resume'] = resume
+        write_cache(path, data)
+
+    for number in sorted(prs, key=int):
+        f = prs[number]
+        if exempt_labels & set(f.get('labels') or []) or (f.get('author') or '').lower() in exempt_authors:
+            continue
+        if f.get('unread'):
+            emit('review-tiers.unread', 'warn', f'its comments could not be read by the lens rules ({f["unread"]})',
+                 f'#{number}', 'look at its review by hand')
+            continue
+        if f.get('override') or f.get('waived'):
+            continue
+
+        def verdict(names):
+            return verdict_tiers(f, names, tiers, registry) if tiers else verdict_rules(f, names, cfg.review, qpath)
+        got = verdict(f['lenses'])
+        if not got:
+            continue
+        level, missing, top = got
+        if f['lensesAfter'] and not verdict(sorted(set(f['lenses']) | set(f['lensesAfter']))):
+            emit('review-tiers.late', 'info', f'reviewed only after the merge: {level} asked for {"; ".join(missing)} '
+                 f'before it (lenses after the merge: {some(f["lensesAfter"])})', f'#{number}',
+                 'nothing to do for it: the review is done')
+            continue
+        extra = []
+        if not f.get('pathsComplete', True):
+            extra.append(f'it changed more than {MAX_FILES} files')
+        if not f.get('commentsComplete', True):
+            extra.append(f'only its last {MAX_COMMENTS} comments and {MAX_REVIEWS} reviews were read')
+        if f.get('lensesAfter'):
+            extra.append(f'lens after the merge: {some(f["lensesAfter"])}')
+        none = not f['lenses'] and not (tiers and tiers['approvals'] and f['approvals'])
+        hint = 'review it now: lens comments on the pull request settle this, even after the merge'
+        if waivers:
+            hint += f'; if it needed no (more) review, a comment starting "{opt["waivers"][0].strip()}: why"'
+        emit('review-tiers.skipped' if none else 'review-tiers.short', 'warn' if none or top else 'info',
+             f'merged with {"no review" if none else "less review than " + level + " asks"}: needs '
+             f'{"; ".join(missing)}' + ('' if none else f' (lenses before the merge: {some(f["lenses"])})')
+             + (f' ({level})' if none else '') + (f'; {"; ".join(extra)}' if extra else ''), f'#{number}', hint)
+
+
+if __name__ == '__main__':
+    main()

@@ -132,6 +132,9 @@ class Temp(unittest.TestCase):
             return json.load(f)
 
 
+GATE_FILES = ('config.py', 'lens.py', 'review_config.py', 'review_glob.py', 'review_judge.py', 'review.vectors.json')
+
+
 def red_check(case, test_file, mutations):
     """mutations: {rule: (module, text, broken text, 'Class.test_name')}."""
     for rule, (module, text, broken, test) in mutations.items():
@@ -146,6 +149,10 @@ def red_check(case, test_file, mutations):
                 env = {LIB_ENV: lib}
                 if module.startswith('checks/'):
                     shutil.copytree(os.path.join(KIT, 'checks'), os.path.join(tmp, 'checks'), symlinks=True)
+                    gate = os.path.join(os.path.dirname(os.path.dirname(KIT)), 'fork-ci', 'actions', 'pr-queue')
+                    os.makedirs(os.path.join(tmp, 'gate'))     # where review-tiers finds it in an installed copy
+                    for name in GATE_FILES:
+                        shutil.copy(os.path.join(gate, name), os.path.join(tmp, 'gate'))
                     path = env[CHECKS_ENV] = os.path.join(tmp, module)
                 else:
                     path = os.path.join(lib, 'gardener', f'{module}.py')
