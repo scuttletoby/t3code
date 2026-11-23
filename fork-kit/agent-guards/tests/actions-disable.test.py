@@ -3609,7 +3609,10 @@ class Pr1041Round1Test(Case):
                      "awk '{print | \"sort\" \";sh\"}' q.txt", 'bash -c "$(cat < q.txt)"', 'parallel -a d.txt',
                      'parallel :::: d.txt', 'parallel -aq.txt', 'cat q.txt | parallel',
                      'while read -r l; do $l; done < d.txt', 'while read l; do eval "$l"; done < d.txt',
-                     'while read l; do bash -c "$l"; done < q.txt', env=env)
+                     'while read l; do bash -c "$l"; done < q.txt',
+                     # round 2: `$(< f 2>/dev/null)` reads f like `$(< f)` (other redirects next to the `<`)
+                     'bash -c "$(< d.txt 2>/dev/null)"', 'x=$(< d.txt 2>/dev/null); $x', '$(< d.txt 2>/dev/null)',
+                     'bash -c "$(< q.txt 2>&1)"', '$(2>/dev/null < q.txt)', env=env)
         self.refused(f"awk '{{print > \"{D}/b/\" \"ls\"}}' p.txt; ls", f"awk -v d={D}/b/ '{{print > d \"ls\"}}' p.txt; ls",
                      env=env)
         self.passes("awk '{print > \"out.txt\"}' p.txt", "awk '{print | \"sort\"}' p.txt", "perl -i -pe 's/a/b/' notes.md",
@@ -3643,7 +3646,8 @@ class Pr1041Round1Test(Case):
         self.write('json.py', '', 0o644)
         self.refused('cat q.txt | python3 -m json.tool', env=env)
         os.remove(os.path.join(self.dir, 'json.py'))
-        self.passes('touch out.txt; cat msg.md | python3 -m json.tool', 'mkdir -p out; python3 tools/check.py < msg.md',
+        # (round 2: `mkdir -p out; python3 tools/check.py < msg.md` is refused now, Pr1041Round2Test test_3)
+        self.passes('touch out.txt; cat msg.md | python3 -m json.tool', 'mkdir -p out; python3 tools/check.py < notes.md',
                     'cat msg.md | python3 -m json.tool', env=env)
 
     def test_7_the_new_checks_answer_the_same_twice(self):
@@ -3652,10 +3656,127 @@ class Pr1041Round1Test(Case):
         env = self.files()
         for cmd in ('cat qpy.txt | python3 /dev/./stdin', 'cat q.txt | gzip > y.gz; gunzip y.gz; bash y',
                     'awk 1 d.txt | bash', 'cp run.awk ids.txt; awk -f ids.txt q.txt', 'cat msg.md | python3 -m json.tool',
-                    'awk -f ok.awk q.txt'):
+                    'awk -f ok.awk q.txt', 'x=$(< notes.md 2>/dev/null)'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.decide(cmd, env) is None, self.decide(cmd, env) is None)
         self.assertIsNone(self.decide('', env))
+        # round 2: a harmless `$(< f 2>/dev/null)` decides without an exception, and passes
+        self.assertIsNone(self.decide('x=$(< notes.md 2>/dev/null)', env))
+
+
+class Pr1041Round2Test(Case):
+    """The lens findings of PR 1041 round 2: each is red on the round-1 head (c94b1d35)."""
+    refused = Issue930Test.refused
+    passes = Issue930Test.passes
+    T = Issue930Test.T
+    pipe = GuardTest.pipe
+    event = GuardTest.event
+
+    def files(self):
+        env = Pr1041Round1Test.files(self)
+        self.write('evil.py', 'import sys; exec(sys.stdin.read())\n', 0o644)
+        self.write('tools/cj.py', 'import json, sys\nprint(len(sys.stdin.read()))\n', 0o644)
+        self.write('tools/imp.py', 'import helper, sys\nprint(len(sys.stdin.read()))\n', 0o644)
+        self.write('pre/argparse.py', 'x = 1\n', 0o644)
+        self.write('mk/json.py', 'x = 1\n', 0o644)
+        self.write('sub/keep.txt', 'x\n', 0o644)
+        return env
+
+    def test_1_a_part_with_no_words_does_not_crash(self):
+        """Blocker (both lenses): `( bash ) < f` and `$(< f 2>/dev/null)` crashed the check of a bare shell, and a
+        crash passed when the text held no gh or HTTP words."""
+        env = self.files()
+        self.refused('( bash ) < d.txt', '(sh)<d.txt', '( . /dev/stdin ) < d.txt', '( bash -s ) < run.sh',
+                     '( bash ) <<< "$(cat d.txt)"', 'cd . && (bash < /dev/stdin) < d.txt',
+                     'eval "$(< d.txt 2>/dev/null)"', 'eval "$(< q.txt 2>/dev/null)"', '( bash ) < q.txt', env=env)
+        self.passes('( cat ) < notes.md', '< notes.md', 'x=$(< notes.md 2>/dev/null); echo "$x"', env=env)
+
+    def test_2_a_crash_fails_closed_when_the_command_may_run_hidden_text(self):
+        """Root cause of the blocker: after a crash only a plain call of a known system program passes (no `<`,
+        `$`, backtick or backslash, no shell, interpreter, wrapper or script word)."""
+        crash = {'ACTIONS_DISABLE_GUARD_TEST_CRASH': '1'}
+        for cmd in ('( bash ) < d.txt', 'cat x | python3 -', './run.sh', 'x=$(cat f)', 'eval "$y"', 'b=1 sh x',
+                    'ls; source x', 'make -f x.mk', 'hash -p run.sh ls; ls'):
+            with self.subTest(cmd=cmd):
+                r = self.pipe(self.event(cmd), crash)
+                self.assertEqual(json.loads(r.stdout)['hookSpecificOutput']['permissionDecision'], 'deny', r.stderr)
+        for cmd in ('ls -la', 'echo hi', 'wc -l notes.md'):
+            with self.subTest(cmd=cmd):
+                r = self.pipe(self.event(cmd), crash)
+                self.assertEqual((r.returncode, r.stdout), (0, ''), r.stderr)
+
+    def test_3_no_command_of_the_tests_crashes_in_a_group_redirect_or_substitution(self):
+        """Every string of this file and capacity-pipe.test.py, wrapped as the lens did (a group fed a file, a
+        `$(< f 2>/dev/null)` in front, a { } group fed a file, a subshell, eval, bash -c), decides without an
+        exception."""
+        import ast
+        env = self.files()
+        here = os.path.dirname(os.path.abspath(__file__))
+        seen = {}
+        for name in ('actions-disable.test.py', 'capacity-pipe.test.py'):
+            with open(os.path.join(here, name)) as f:
+                for node in ast.walk(ast.parse(f.read())):
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str) and 0 < len(node.value) < 400:
+                        seen.setdefault(node.value, None)
+        bad = []
+        for s in seen:
+            for w in ('( {} ) < d.txt', '$(< d.txt 2>/dev/null) {}', '{{ {}; }} < d.txt', '( {} )', 'eval "{}"',
+                      'bash -c "{}"'):
+                try:
+                    self.decide(w.format(s), env)
+                except Exception as e:   # noqa: BLE001 - the test counts every kind
+                    bad.append((w.format(s)[:80], type(e).__name__))
+        self.assertEqual(bad[:10], [], f'{len(bad)} commands crash')
+
+    def test_4_stderr_redirects_in_a_file_substitution(self):
+        """Code lens: `$(< f 2>/dev/null)` reads f like `$(< f)`."""
+        env = self.files()
+        self.refused('bash -c "$(< d.txt 2>/dev/null)"', 'x=$(< d.txt 2>/dev/null); $x', '$(< d.txt 2>/dev/null)',
+                     'bash -c "$(< q.txt 2>&1)"', '$(2>/dev/null < q.txt)', env=env)
+        self.passes('x=$(< notes.md 2>/dev/null)', 'echo "$(< notes.md 2>/dev/null)"', env=env)
+
+    def test_5_a_data_reader_after_a_python_module_is_planted(self):
+        """Merge-path major: python loads a module from the script's folder (or cwd for -m) before the stdlib, so
+        a command that writes a code file or makes a folder, or a folder that already holds a stdlib name, makes it
+        no data reader; -I (or -P) does not look there."""
+        env = self.files()
+        self.refused('cp evil.py argparse.py; cat qpy.txt | python3 -m json.tool',
+                     'cp evil.py re.py; cat qpy.txt | python3 -m json.tool',
+                     'cp evil.py tools/json.py; cat qpy.txt | python3 tools/cj.py',
+                     'cp evil.py tools/helper.py; cat qpy.txt | python3 tools/imp.py',
+                     'cd pre && cat qpy.txt | python3 -m json.tool',
+                     'cp evil.py argparse.pyc; cat qpy.txt | python3 -m json.tool',
+                     'cp -r pre re; cat qpy.txt | python3 -m json.tool',
+                     'cp evil.py tools/json.py; python3 tools/cj.py < qpy.txt',
+                     'cp evil.py argparse.py; python3 -m json.tool < qpy.txt',
+                     'cp evil.py pre/re.py; cd pre && python3 -m json.tool < q.txt',
+                     # item 5 of the round: a pipe into a group feeds the whole group, and mk holds json.py
+                     'cat q.txt | (cd mk && python3 -m json.tool)',
+                     # the stricter rule: also a folder made, or another program that may write files
+                     'mkdir -p out; python3 tools/check.py < msg.md', 'git status; python3 tools/check.py < msg.md',
+                     env=env)
+        self.passes('cat q.txt | python3 -I -m json.tool', 'cd pre && cat q.txt | python3 -I -m json.tool',
+                    'cd sub && cat q.txt | python3 -m json.tool', 'cat q.txt | python3 tools/check.py',
+                    'python3 -I tools/check.py < q.txt', 'touch out.txt; cat q.txt | python3 tools/check.py', env=env)
+
+    def test_6_the_minors(self):
+        """An alias for the data reader, stdin through a group, `exec <` or `xargs -a`, a line read into a variable
+        and run, perl do/require and ruby load/instance_eval of a line, a pipe into a group."""
+        env = self.files()
+        self.refused('alias python3=bash; cat q.txt | python3 tools/check.py',
+                     'alias python3=bash\ncat q.txt | python3 tools/check.py',
+                     'alias python3=bash; python3 tools/check.py < q.txt',
+                     '{ python3 -; } < qpy.txt', 'exec 0< qpy.txt; python3 -', 'exec < qpy.txt; python3 -',
+                     'xargs -0 -a qpy.txt python3 -c', 'read -r x < d.txt; $x', 'read -r x < q.txt; $x',
+                     'mapfile -t a < q.txt; "${a[@]}"', "perl -ne 'do+$_' q.txt", "perl -ne 'require+$_' q.txt",
+                     "ruby -ne 'load $_' q.txt", "ruby -ne 'instance_eval $_' q.txt",
+                     'cat qpy.txt | (cd sub && python3 -)', 'cat q.txt | (cd sub && bash)',
+                     'cat d.txt | { cd sub; bash; }', 'cat q.txt | (true; bash)', 'cat q.txt | { true; bash; }',
+                     '{ python3 tools/check.py; } < msg.md', env=env)
+        self.passes("perl -ne 'print' msg.md", "ruby -ne 'print' msg.md", 'read -r x < notes.md; echo "$x"',
+                    'mapfile -t a < notes.md; echo "${a[@]}"', '{ cat; } < notes.md',
+                    '{ python3 tools/check.py; } < notes.md', 'python3 tools/check.py < msg.md',
+                    "python3 -c 'import sys; print(open(sys.argv[1]).read())' msg.md", env=env)
 
 
 if __name__ == '__main__':
