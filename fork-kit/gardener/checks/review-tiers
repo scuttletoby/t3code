@@ -8,8 +8,7 @@ never copied: a lens comment counts here exactly when the gate would read it as 
 does not judge: it looks back at pull requests that are already merged (merged past the gate, by an admin or before
 the rules existed), and at tiers that the project keeps outside the gate config.
 
-Options:
-  repo          OWNER/REPO (default: the project's repo)
+Options (the repository is always the project's own "repo": the report masks and links `#N` against it):
   branch        the base branch of the merged pull requests (default: the root's origin/HEAD branch, else main)
   days          how far back, in days (default 7, at most 90)
   base          the git ref the project files below are read from (default origin/HEAD, else origin/main, else main)
@@ -21,8 +20,10 @@ Options:
   exemptAuthors [login]: pull requests of these authors are not judged
   waivers       [text]: a comment whose first line starts with one of these (any case), by an author the queue config
                 counts for lenses and posted at any time, even after the merge, settles the pull request: a person
-                decided it needed no (more) review
-  maxPages      search pages of 20 pull requests (default 8, at most 25)
+                decided it needed no (more) review. Anyone the queue config counts for lenses can waive, the pull
+                request's own author included (an agent that posts as such an account too)
+  maxPages      search pages of 20 pull requests per run (default 8, at most 25); a page takes up to about 10 s, so
+                the check's timeoutSeconds must cover maxPages x 10 s
   minRemaining  the GraphQL budget left this hour below which the check does not search (default 1000)
 
   "tiers": {
@@ -40,16 +41,28 @@ A pull request's tier is the highest tier of its changed paths. It passes when i
 names (the gate's lens_key) and, per "lenses" entry, at least "count" names that match "match" (a regex, any case),
 or when a valid override comment of the queue config (its prefix, by its author association, unedited) was posted
 before it merged. With the review block instead: the gate's review_judge gives its weight and the lens names its
-rules require, and min_lenses its count. Only comments and reviews posted before the merge count; a lens report
-that the gate would not take as a read (edited, hidden, a short sha) still counts here, since it shows the review
-was done. Inline review comments are not read. A tier no "requires" entry names asks for nothing.
+rules require, and min_lenses its count. A pull request with more paths than one page shows (100) is judged at the
+top tier (critical) for the lens count. A lens report that the gate would not take as a read (edited, hidden, a
+short sha) still counts here, since it shows the review was done. Inline review comments are not read. A tier no
+"requires" entry names asks for nothing.
+
+Findings: `review-tiers.skipped` (warn): no lens at all before the merge; `review-tiers.short` (warn at the top tier
+or critical, else info): lenses before the merge, but not the ones its tier asks for; `review-tiers.late` (info):
+the lenses it asks for came only after the merge (the review was done, late). A review after the merge settles the
+warning, as the fix hint says.
 
 GitHub: one `gh api rate_limit` (free) and one GraphQL search per run (paged), cached in the check's cache folder
 (the context's "cacheDir"): a run searches only pull requests updated since the day before the last search, so the
 next day's run costs a page or two. The facts of each merged pull request are cached, and the verdicts are worked out
-again each run with the current tiers. A run that stops half-way (a GitHub error, a page past minRemaining) writes
-no new search day, so the next run searches the same days again. Old, broken or other-version cache files are read
-as empty; a newer one is never overwritten. A dry run reads the cache but writes nothing.
+again each run with the current tiers. A search cut off by maxPages or minRemaining remembers where it stopped (the
+oldest "updated" time it read: the search is newest first) and the next run goes on from there (that second
+included, so the pull requests updated in it are read again) before it searches anything newer, so a busy window is
+read in full over a few runs (`review-tiers.partial`, warn, until then); only when a whole page shares one second does
+it step one second past it. A run
+that fails (a GitHub error) writes nothing, so the next run repeats it. Old, broken or other-version cache files are
+read as empty, a broken resume point is dropped (the whole window is searched again); a newer cache is never
+overwritten. The cache is keyed by the gate's code too, so a kit upgrade that reads lenses otherwise starts afresh.
+A dry run reads the cache but writes nothing.
 """
 import datetime, hashlib, json, os, re, subprocess, sys
 
@@ -68,6 +81,7 @@ import review_glob  # noqa: E402
 import review_judge  # noqa: E402
 
 CACHE_VERSION = 1
+GATE_FILES = ('config.py', 'lens.py', 'review_config.py', 'review_glob.py', 'review_judge.py')
 PAGE = 20
 MAX_FILES = 100
 MAX_COMMENTS = 100
@@ -81,7 +95,7 @@ QUERY = '''query($q: String!, $first: Int!, $after: String) {
   search(query: $q, type: ISSUE, first: $first, after: $after) {
     pageInfo { hasNextPage endCursor }
     nodes { ... on PullRequest {
-      number mergedAt
+      number mergedAt updatedAt
       author { login __typename }
       labels(first: 50) { nodes { name } }
       files(first: %d) { totalCount nodes { path } }
@@ -264,7 +278,7 @@ def read_cache(path, key):
     return data, False
 
 
-FACT_KEYS = {'mergedAt': str, 'author': str, 'bot': bool, 'labels': list, 'paths': list, 'pathsComplete': bool,
+FACT_KEYS = {'mergedAt': str, 'author': str, 'labels': list, 'paths': list, 'pathsComplete': bool,
              'commentsComplete': bool}
 READ_KEYS = {'lenses': list, 'lensesAfter': list, 'override': bool, 'waived': bool, 'approvals': int}
 
@@ -285,6 +299,33 @@ def good_day(day, upto):
         return isinstance(day, str) and datetime.date.fromisoformat(day).isoformat() == day and day <= upto
     except ValueError:
         return False
+
+
+STAMP = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z')
+
+
+def good_resume(r, upto):
+    """Where a cut-off search stopped: {"day": the day it began, "since": its lower "updated" day or "", "before":
+    the oldest "updated" time it read}."""
+    return isinstance(r, dict) and set(r) == {'day', 'since', 'before'} and good_day(r['day'], upto) \
+        and (r['since'] == '' or good_day(r['since'], r['day'])) and isinstance(r['before'], str) \
+        and bool(STAMP.fullmatch(r['before'])) and r['before'][:10] <= upto
+
+
+def second_before(stamp):
+    t = datetime.datetime.strptime(stamp, '%Y-%m-%dT%H:%M:%SZ') - datetime.timedelta(seconds=1)
+    return t.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def gate_hash():
+    h = hashlib.sha256()
+    for name in GATE_FILES:
+        try:
+            with open(os.path.join(GATE, name), 'rb') as f:
+                h.update(name.encode() + b'\0' + f.read() + b'\0')
+        except OSError:
+            h.update(name.encode() + b'\0missing\0')
+    return h.hexdigest()
 
 
 def write_cache(path, data):
@@ -352,7 +393,6 @@ def facts(pr, review, override, waivers):
         return {'comments': keep, 'reviews': rs, lens.REVIEW_FLAGS: flags}
 
     out = {'mergedAt': merged, 'author': author.get('login') or '',
-           'bot': author.get('__typename') == 'Bot',
            'labels': sorted({(n or {}).get('name') or '' for n in (pr.get('labels') or {}).get('nodes') or []} - {''}),
            'paths': [n['path'] for n in (pr.get('files') or {}).get('nodes') or [] if (n or {}).get('path')],
            'pathsComplete': ((pr.get('files') or {}).get('totalCount') or 0)
@@ -373,29 +413,50 @@ def facts(pr, review, override, waivers):
     return out
 
 
-def search(gh, query, max_pages, min_left):
-    """([pull request nodes], complete, why not complete). complete is False when the pages ran out or the budget fell
-    too low."""
-    nodes, after = [], None
-    for _ in range(max_pages):
-        args = ['graphql', '-f', f'query={QUERY}', '-f', f'q={query}', '-F', f'first={PAGE}']
-        if after:
-            args += ['-f', f'after={after}']
-        got = gh_json(gh, args)
-        if not isinstance(got, dict) or got.get('errors') or not isinstance(got.get('data'), dict):
-            msgs = [e.get('message', '') for e in got.get('errors') or [] if isinstance(e, dict)] \
-                if isinstance(got, dict) else []
-            fail(f'gh api graphql: {"; ".join(msgs)[:200] or "no data in the answer"}')
-        s = got['data'].get('search') or {}
-        nodes += [n for n in s.get('nodes') or [] if isinstance(n, dict) and isinstance(n.get('number'), int)]
+def graphql_page(gh, query, first, after):
+    args = ['graphql', '-f', f'query={QUERY}', '-f', f'q={query}', '-F', f'first={first}']
+    if after:
+        args += ['-f', f'after={after}']
+    got = gh_json(gh, args)
+    if not isinstance(got, dict) or got.get('errors') or not isinstance(got.get('data'), dict):
+        msgs = [e.get('message', '') for e in got.get('errors') or [] if isinstance(e, dict)] \
+            if isinstance(got, dict) else []
+        return None, '; '.join(msgs)[:200] or 'no data in the answer'
+    return got['data'], None
+
+
+def search(gh, query, pages, min_left):
+    """A dict: nodes, complete, why (not complete), used (pages), oldest (the oldest "updated" time read, or None).
+    complete is False when the pages ran out or the budget fell too low. A page GitHub cannot answer (too much
+    comment text for one query: "timeout", "something went wrong") is asked again once with fewer pull requests."""
+    out = {'nodes': [], 'complete': False, 'why': None, 'used': 0, 'oldest': None}
+    after, first = None, PAGE
+    while out['used'] < pages:
+        data, err = graphql_page(gh, query, first, after)
+        if err is not None and first == PAGE:
+            note(f'gh api graphql: {err}: asking again for {PAGE // 4} pull requests a page')
+            first = PAGE // 4
+            data, err = graphql_page(gh, query, first, after)
+        if err is not None:
+            fail(f'gh api graphql: {err}')
+        out['used'] += 1
+        s = data.get('search') or {}
+        got = [n for n in s.get('nodes') or [] if isinstance(n, dict) and isinstance(n.get('number'), int)]
+        out['nodes'] += got
+        stamps = [n['updatedAt'] for n in got if isinstance(n.get('updatedAt'), str) and STAMP.fullmatch(n['updatedAt'])]
+        if stamps:
+            out['oldest'] = min(stamps + ([out['oldest']] if out['oldest'] else []))
         page = s.get('pageInfo') or {}
         if not page.get('hasNextPage'):
-            return nodes, True, None
+            out['complete'] = True
+            return out
         after = page.get('endCursor')
-        left = (got['data'].get('rateLimit') or {}).get('remaining')
+        left = (data.get('rateLimit') or {}).get('remaining')
         if isinstance(left, int) and left < min_left:
-            return nodes, False, f'the GraphQL budget fell to {left} (under minRemaining {min_left}) while searching'
-    return nodes, False, f'more than {max_pages} pages of pull requests (maxPages)'
+            out['why'] = f'the GraphQL budget fell to {left} (under minRemaining {min_left}) while searching'
+            return out
+    out['why'] = f'more than {pages} page(s) of pull requests left for this run (maxPages)'
+    return out
 
 
 # --- verdicts ------------------------------------------------------------------------------------------------------
@@ -406,8 +467,9 @@ def some(names):
         else 'none'
 
 
-def verdict_tiers(f, tiers, registry):
-    """None when it had enough review, else (what it needed, what was missing)."""
+def verdict_tiers(f, lenses, tiers, registry):
+    """None when lenses (names) and its approvals are enough review, else (what it needed, what was missing, top:
+    the highest level)."""
     paths = f['paths']
     tier = max([path_tier(tiers, registry, p) for p in paths] or [tiers['unmatched']])
     if not f['pathsComplete']:
@@ -416,40 +478,43 @@ def verdict_tiers(f, tiers, registry):
     if not need:
         return None
     min_lenses, named = need
-    have = len(f['lenses']) + (f['approvals'] if tiers['approvals'] else 0)
+    have = len(lenses) + (f['approvals'] if tiers['approvals'] else 0)
     missing = []
     if have < min_lenses:
         missing.append(f'{min_lenses} lens(es), found {have}')
     for name, rx, count in named:
-        n = sum(1 for k in f['lenses'] if rx.search(k))
+        n = sum(1 for k in lenses if rx.search(k))
         if n < count:
             missing.append(f'{count} {name} lens(es), found {n}')
-    return (f'tier {tier}', missing) if missing else None
+    return (f'tier {tier}', missing, tier == tiers['top']) if missing else None
 
 
-def verdict_rules(f, rules, config_path):
+def verdict_rules(f, lenses, rules, config_path):
     try:
         j = review_judge.judge(rules, [('M', (p,)) for p in f['paths']], config_path)
     except review_judge.JudgeError as e:
-        return 'the review rules', [f'its paths cannot be judged ({e})'[:300]]
-    have = set(f['lenses'])
+        return 'the review rules', [f'its paths cannot be judged ({e})'[:300]], True
+    weight, need = j.weight, getattr(rules.min_lenses, j.weight)
+    if not f['pathsComplete']:   # the paths past the first page may ask for more: the heaviest count
+        weight, need = 'critical', max(need, rules.min_lenses.critical)
+    have = set(lenses)
     missing = [name for name in j.lenses if lens.lens_key(name) not in have]
-    need = getattr(rules.min_lenses, j.weight)
     out = [f'lens {some(missing)}'] if missing else []
     if len(have) < need:
         out.append(f'{need} lens(es), found {len(have)}')
-    return (j.weight, out) if out else None
+    return (weight, out, weight == 'critical') if out else None
 
 
 def main():
     ctx = read_context()
     opt = ctx['options']
-    _known(opt, ('repo', 'branch', 'days', 'base', 'queueConfig', 'tiers', 'exemptLabels', 'exemptAuthors',
+    if 'repo' in opt:   # the report masks and links `#N` against the project's repo: another one would leak
+        fail('there is no "repo" option: the check reads the project\'s own repository (its "repo")')
+    _known(opt, ('branch', 'days', 'base', 'queueConfig', 'tiers', 'exemptLabels', 'exemptAuthors',
                  'waivers', 'maxPages', 'minRemaining'), 'options')
-    repo = opt.get('repo') or ctx['project']['repo']
+    repo = ctx['project']['repo']
     if not repo:
-        emit('review-tiers.no-repo', 'info', 'no repository to read: the project has no "repo" and the check no '
-             '"repo"')
+        emit('review-tiers.no-repo', 'info', 'no repository to read: the project has no "repo"')
         return
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+', repo):
         fail('repo must be OWNER/REPO')
@@ -490,9 +555,10 @@ def main():
     today = datetime.date.fromisoformat(ctx['today'])
     start = (today - datetime.timedelta(days=days - 1)).isoformat()
     # what decides the cached facts: whose comments count, the waivers (the verdicts are worked out again each run)
+    # and the gate's code that read them (a kit upgrade that reads lens comments otherwise starts afresh)
     key = hashlib.sha256(json.dumps([repo.lower(), branch, list(review.bots), list(review.lens_associations),
-                                     review.override_re.pattern, review.override_association, list(waivers)])
-                         .encode()).hexdigest()
+                                     review.override_re.pattern, review.override_association, list(waivers),
+                                     gate_hash()]).encode()).hexdigest()
     cache_dir = ctx.get('cacheDir') or ''
     dry = ctx.get('dryRun') is True
     path = os.path.join(cache_dir, 'cache.json') if cache_dir else ''
@@ -500,31 +566,60 @@ def main():
     usable = bool(cache) and good_day(cache.get('searchedDay'), ctx['today']) \
         and good_day(cache.get('from'), start)   # a wider window than the cache's: search all of it
     prs = dict(cache['prs']) if usable else {}
-    since, searched = start, None
-    if usable:
-        last = (datetime.date.fromisoformat(cache['searchedDay']) - datetime.timedelta(days=1)).isoformat()
-        since, searched = max(start, last), cache['searchedDay']
+    searched = cache['searchedDay'] if usable else None
+    resume = cache.get('resume') if usable else None
+    if resume is not None and not good_resume(resume, ctx['today']):
+        note('the resume point in the cache is broken: dropped')
+        resume = None
 
+    def since_day():
+        if not searched:
+            return start
+        return max(start, (datetime.date.fromisoformat(searched) - datetime.timedelta(days=1)).isoformat())
+
+    base_q = f'repo:{repo} is:pr is:merged base:{branch} merged:>={start} sort:updated-desc'
     left = graphql_left(ctx['gh'])
     if left < min_left:
         emit('review-tiers.budget', 'info', f'not searched today: the GraphQL budget left this hour is {left}, under '
              f'minRemaining {min_left}; judged from the cache only', '', 'nothing to do: the next run searches')
     else:
-        q = f'repo:{repo} is:pr is:merged base:{branch} merged:>={start} sort:updated-desc'
-        if since > start:
-            q += f' updated:>={since}'
-        nodes, complete, why = search(ctx['gh'], q, max_pages, min_left)
-        for n in nodes:
-            prs[str(n['number'])] = facts(n, review, has_override, waivers)
-        if complete:
-            searched = ctx['today']
-        else:
-            emit('review-tiers.partial', 'info', f'the search stopped early: {why}; the next run searches the same '
-                 'days again', '', 'raise maxPages or lower days if this repeats')
+        pages, why = max_pages, None
+        if resume:    # first go on where a cut-off search stopped: the older pull requests it did not reach
+            before = resume['before'][:-1] + '+00:00'
+            lower = resume['since'] if resume['since'] > start else ''
+            q = base_q + (f' updated:{lower}T00:00:00+00:00..{before}' if lower else f' updated:<={before}')
+            got = search(ctx['gh'], q, pages, min_left)
+            for n in got['nodes']:
+                prs[str(n['number'])] = facts(n, review, has_override, waivers)
+            pages -= got['used']
+            if got['complete']:
+                searched, resume = resume['day'], None
+            else:
+                why = got['why']
+                resume = dict(resume, before=got['oldest'] if got['oldest'] and got['oldest'] < resume['before']
+                              else second_before(resume['before']))   # a whole page in one second: step past it
+        if resume is None and pages > 0:
+            since = since_day()
+            got = search(ctx['gh'], base_q + (f' updated:>={since}' if since > start else ''), pages, min_left)
+            for n in got['nodes']:
+                prs[str(n['number'])] = facts(n, review, has_override, waivers)
+            if got['complete']:
+                searched = ctx['today']
+            else:
+                why = got['why']
+                if got['oldest']:
+                    resume = {'day': ctx['today'], 'since': since if since > start else '', 'before': got['oldest']}
+        if why:
+            emit('review-tiers.partial', 'warn', f'the search stopped early: {why}; pull requests it did not reach '
+                 'are not judged yet, the next run goes on where this one stopped', '',
+                 'nothing to do if it clears in a run or two; else raise maxPages (and the timeout) or lower days')
     prs = {k: v for k, v in prs.items() if isinstance(v, dict) and (v.get('mergedAt') or '')[:10] >= start}
     if path and not dry and not newer:
-        write_cache(path, {'version': CACHE_VERSION, 'key': key, 'prs': prs, 'from': start,
-                           'searchedDay': searched or '1970-01-01'})
+        data = {'version': CACHE_VERSION, 'key': key, 'prs': prs, 'from': start,
+                'searchedDay': searched or '1970-01-01'}
+        if resume:
+            data['resume'] = resume
+        write_cache(path, data)
 
     for number in sorted(prs, key=int):
         f = prs[number]
@@ -536,10 +631,18 @@ def main():
             continue
         if f.get('override') or f.get('waived'):
             continue
-        got = verdict_tiers(f, tiers, registry) if tiers else verdict_rules(f, cfg.review, qpath)
+
+        def verdict(names):
+            return verdict_tiers(f, names, tiers, registry) if tiers else verdict_rules(f, names, cfg.review, qpath)
+        got = verdict(f['lenses'])
         if not got:
             continue
-        level, missing = got
+        level, missing, top = got
+        if f['lensesAfter'] and not verdict(sorted(set(f['lenses']) | set(f['lensesAfter']))):
+            emit('review-tiers.late', 'info', f'reviewed only after the merge: {level} asked for {"; ".join(missing)} '
+                 f'before it (lenses after the merge: {some(f["lensesAfter"])})', f'#{number}',
+                 'nothing to do for it: the review is done')
+            continue
         extra = []
         if not f.get('pathsComplete', True):
             extra.append(f'it changed more than {MAX_FILES} files')
@@ -547,10 +650,14 @@ def main():
             extra.append(f'only its last {MAX_COMMENTS} comments and {MAX_REVIEWS} reviews were read')
         if f.get('lensesAfter'):
             extra.append(f'lens after the merge: {some(f["lensesAfter"])}')
-        emit('review-tiers.skipped', 'warn',
-             f'merged with less review than {level} asks: needs {"; ".join(missing)} (lenses before the merge: '
-             f'{some(f.get("lenses") or [])})' + (f'; {"; ".join(extra)}' if extra else ''),
-             f'#{number}', 'review it now (a lens comment on the pull request), or note on it why it needed none')
+        none = not f['lenses'] and not (tiers and tiers['approvals'] and f['approvals'])
+        hint = 'review it now: lens comments on the pull request settle this, even after the merge'
+        if waivers:
+            hint += f'; if it needed no (more) review, a comment starting "{opt["waivers"][0].strip()}: why"'
+        emit('review-tiers.skipped' if none else 'review-tiers.short', 'warn' if none or top else 'info',
+             f'merged with {"no review" if none else "less review than " + level + " asks"}: needs '
+             f'{"; ".join(missing)}' + ('' if none else f' (lenses before the merge: {some(f["lenses"])})')
+             + (f' ({level})' if none else '') + (f'; {"; ".join(extra)}' if extra else ''), f'#{number}', hint)
 
 
 if __name__ == '__main__':

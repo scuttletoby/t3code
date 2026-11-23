@@ -387,12 +387,12 @@ class Judge(gf.Temp):
 
     def trickle_server(self, gap):
         """An HTTP server that sends its headers at once and then one byte of the body every gap seconds: each read
-        is quick, the whole answer is not."""
+        is quick (gap is under the 0.05 s the last reads may wait), the whole answer is not."""
         srv = socket.socket()
         srv.bind(('127.0.0.1', 0))
         srv.listen(4)
         self.addCleanup(srv.close)
-        body = json.dumps({'choices': [{'message': {'content': 'late'}}]}).encode()
+        body = json.dumps({'choices': [{'message': {'content': 'late' + ' ' * 300}}]}).encode()
 
         def serve():
             try:
@@ -414,11 +414,41 @@ class Judge(gf.Temp):
 
     def test_a_slow_model_is_cut_off_at_the_timeout_in_all(self):
         started = time.monotonic()
-        got, note = judge.judge(self.model(self.trickle_server(0.2), timeoutSeconds=1), [dict(GOOD, check='c')],
+        got, note = judge.judge(self.model(self.trickle_server(0.02), timeoutSeconds=1), [dict(GOOD, check='c')],
                                 self.root)
-        self.assertLess(time.monotonic() - started, 4)                 # not len(body) * 0.2 seconds
+        self.assertLess(time.monotonic() - started, 4)                 # not len(body) * 0.02 = 7 seconds
         self.assertIsNone(got)
         self.assertIn('model unreachable or no usable answer (TimeoutError)', note)
+
+    def test_a_model_that_stalls_near_the_deadline_is_cut_off_at_the_deadline(self):
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(4)
+        self.addCleanup(srv.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def serve():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(65536)
+                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n')
+                    time.sleep(0.8)
+                    conn.sendall(b'{')                                  # one byte, then nothing
+                    stop.wait(10)
+                except OSError:
+                    return
+        threading.Thread(target=serve, daemon=True).start()
+        started = time.monotonic()
+        got, note = judge.judge(self.model(f'http://127.0.0.1:{srv.getsockname()[1]}/v1', timeoutSeconds=1),
+                                [dict(GOOD, check='c')], self.root)
+        self.assertLess(time.monotonic() - started, 1.5)               # not 0.8 + another whole second
+        self.assertIsNone(got)
+        self.assertIn('model unreachable', note)
 
     def test_a_model_that_never_answers_is_cut_off(self):
         srv = socket.socket()
@@ -513,8 +543,11 @@ MUTATIONS = {
         'judge', '        if not tracked(real_root, rel):\n            continue\n', '',
         'Judge.test_the_model_gets_findings_and_only_tracked_files_inside_the_root'),
     'judge: the timeout bounds the whole answer': (
-        'judge', "        if time.monotonic() > deadline:\n            raise TimeoutError('the answer took too long')\n"
-                 "        chunk", '        chunk', 'Judge.test_a_slow_model_is_cut_off_at_the_timeout_in_all'),
+        'judge', "        if left <= 0:\n            raise TimeoutError('the answer took too long')\n", '',
+        'Judge.test_a_slow_model_is_cut_off_at_the_timeout_in_all'),
+    'judge: a stalled read ends at the deadline': (
+        'judge', '        cut_read_at(resp, left)\n', '',
+        'Judge.test_a_model_that_stalls_near_the_deadline_is_cut_off_at_the_deadline'),
     'a #N where is linked to the project repository': (
         'report', "            return f'{repo}{w}' if repo else None", "            return w",
         'Render.test_a_pull_request_number_is_shown_and_linked_to_the_right_repository'),

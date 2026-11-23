@@ -21,13 +21,26 @@ MAX_ANSWER = 8000
 MAX_RESPONSE = 1 << 20                         # bytes of the HTTP answer read at most
 
 
+def cut_read_at(resp, left):
+    """Let the next read of resp wait at most left seconds: the socket timeout set when the call started would let
+    one stalled read run on that long again after the deadline."""
+    sock = getattr(getattr(getattr(resp, 'fp', None), 'raw', None), '_sock', None)
+    if sock is not None:
+        try:
+            sock.settimeout(max(0.05, left))
+        except OSError:
+            pass
+
+
 def read_all(resp, deadline):
     """The response body (at most MAX_RESPONSE bytes), or TimeoutError once the monotonic deadline passes: the
     socket timeout alone bounds each read, not a server that trickles bytes."""
     body = b''
     while len(body) < MAX_RESPONSE:
-        if time.monotonic() > deadline:
+        left = deadline - time.monotonic()
+        if left <= 0:
             raise TimeoutError('the answer took too long')
+        cut_read_at(resp, left)
         chunk = resp.read1(min(65536, MAX_RESPONSE - len(body)))
         if not chunk:
             break

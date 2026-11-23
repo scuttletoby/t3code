@@ -157,23 +157,33 @@ All report only, and none needs root. Options as in each script's header.
 - **install-drift**: each fork kit's install record (`/etc/<kit>/installed.tsv`) against the files and links on
   the machine, as the user that runs it (paths it cannot read are one note, not drift). With `release` (a commit),
   kits on another release.
-- **review-tiers**: merged pull requests (last `days`, 7) that had less review than their tier asks for. Without
-  options it judges by the merge gate's own `review` block in the queue config (`queueConfig`, default
-  `.github/pr-queue.json`, read from git at `base`); with `tiers` by the project's tiers: `rules` (globs to a
-  tier), a `registry` file in the repository (rows of paths with a tier, for example a list of modules),
-  `unmatched`, and per tier `requires` {`minLenses`, `lenses`: [{`name`, `match` (a regex on lens names), `count`}]}.
+- **review-tiers**: merged pull requests (last `days`, 7) of the project's own repository (`repo`; there is no
+  option for another one) that had less review than their tier asks for. Without options it judges by the merge
+  gate's own `review` block in the queue config (`queueConfig`, default `.github/pr-queue.json`, read from git at
+  `base`); with `tiers` by the project's tiers: `rules` (globs to a tier), a `registry` file in the repository (rows
+  of paths with a tier, for example a list of modules), `unmatched`, and per tier `requires` {`minLenses`,
+  `lenses`: [{`name`, `match` (a regex on lens names), `count`}]}.
   Lens comments are read by the gate's own code (`fork-ci/actions/pr-queue`, copied into the install as `gate/`),
-  so a comment counts exactly when the gate would take it as a lens, and only those posted before the merge by
-  the queue config's lens authors; a valid override comment before the merge settles a pull request, and so does a
-  comment of a counted author whose first line starts with one of `waivers` (a person decided, at any time).
-  `exemptLabels`, `exemptAuthors`. Inline review comments are not read; a pull request with more than 100 files is
-  judged at the top tier. GitHub: `gh api rate_limit` (free) and one paged GraphQL search per run; below
-  `minRemaining` (1000) points left this hour it does not search and judges from its cache. The cache (in
-  `cacheDir`) keeps per pull request only what the verdict needs (paths, lens names, no comment text), so the next
-  run searches only pull requests updated since the day before: a page or two. A search stopped half-way (a GitHub
-  error, `maxPages`, the budget) keeps the old search day, so the next run searches those days again; an old, broken
-  or other-repository cache is read as empty and a newer one is never overwritten. Its findings name the pull
-  request (`#N`). Never fixes: a review is done by people.
+  so a comment counts exactly when the gate would take it as a lens, and only those posted by the queue config's
+  lens authors; a valid override comment before the merge settles a pull request, and so does a comment of a
+  counted author whose first line starts with one of `waivers` (a person decided, at any time; anyone the queue
+  counts for lenses can waive, the pull request's own author too). `exemptLabels`, `exemptAuthors`. Inline review
+  comments are not read; a pull request with more than 100 files is judged at the top tier (with the gate's
+  `review` block: as critical).
+  Findings: `review-tiers.skipped` (warn) no lens at all before the merge; `review-tiers.short` lenses before the
+  merge, but not the ones its tier asks for (warn at the top tier or critical, else info); `review-tiers.late`
+  (info) the lenses before and after the merge together are enough: reviewing a pull request after its merge
+  clears the warning and leaves this note.
+  GitHub: `gh api rate_limit` (free) and one paged GraphQL search per run (`maxPages`, 8; give the check about 10
+  seconds a page in its `timeoutSeconds`); below `minRemaining` (1000) points left this hour it does not search and
+  judges from its cache. The cache (in `cacheDir`) keeps per pull request only what the verdict needs (paths, lens
+  names, no comment text), so the next run searches only pull requests updated since the day before: a page or two.
+  A search cut off half-way (`maxPages`, the budget) is a `review-tiers.partial` warning; the cache keeps where it
+  stopped, and the next runs go on from there (older pull requests first) until every pull request in the window was
+  read, then search from the new day. A GitHub error fails the check and writes nothing; a page GitHub cannot answer
+  is asked again once with fewer pull requests. An old, broken or other-repository cache, or one written by other
+  gate code (a kit upgrade), is read as empty, a broken resume point is dropped, and a newer cache is never
+  overwritten. Its findings name the pull request (`#N`). Never fixes: a review is done by people.
 
 ## Report issue
 
