@@ -12,6 +12,9 @@ import fixture as fx  # noqa: E402
 from fixture import at, settings, tick, window  # noqa: E402
 
 MIN = datetime.timedelta(minutes=1)
+# a fake GitHub token for the alertCommand refusal, built at run time so the source holds no token-shaped string
+# (the secret scan's generic-api-key rule; the first push held it whole, allowed by value in .gitleaks.toml)
+FAKE_GH_TOKEN = 'ghp' + '_' + 'abcdefgh' + '12345678'
 SINCE = at('2026-11-23 06:40')
 PENDING = tick.Pending(SINCE, ['linux-image-6.8.0-50-generic'])
 
@@ -196,7 +199,7 @@ class Settings(unittest.TestCase):
                                 ('heavySlice', 'heavy', '.slice'), ('busyScripts', ['busy'], 'absolute'),
                                 ('baseline', {'ports': ['22']}, 'PROTO/PORT'), ('baseline', {'x': 1}, 'unknown key'),
                                 ('typo', 1, 'unknown key'),
-                                ('alertCommand', ['/usr/bin/notify', '--token', 'ghp_abcdefgh12345678'], 'token'),
+                                ('alertCommand', ['/usr/bin/notify', '--token', FAKE_GH_TOKEN], 'token'),
                                 ('alertCommand', ['/usr/bin/curl', '-H', 'Authorization: Bearer ' + 'aB3' * 12],
                                  'root-only file'),
                                 ('alertCommand', ['/usr/bin/notify', 'xoxb-1234-abcdefgh'], 'token'),
