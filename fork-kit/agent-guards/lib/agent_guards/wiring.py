@@ -10,7 +10,8 @@ first checks that the hook file is there, so a missing hook fails the way its ki
                          "onFailure": "block" refuses the call (without it a timed-out hook lets the call run).
   capacity-pipe-guard,   fail OPEN: exit 1, which Claude Code shows as a hook error and then runs the call. These
   memory-index-guard,    guard mistakes, not attacks; refusing every call because a helper is gone would stop all
-  bg-guard, agent-slots  work on the machine.
+  bg-guard, agent-slots, work on the machine.
+  facts-hook
 
 The same entries go in the managed settings drop-in the installer writes (--settings) or, by hand, in any settings
 file (`agent-guards hooks`). Monitor runs shell text like Bash, so every hook that reads a command reads it for
@@ -23,7 +24,8 @@ DROP_IN_NAME = 'agent-guards.json'
 MANAGED_DIR = '/etc/claude-code'                  # Claude Code's managed settings folder on Linux
 DROP_IN = f'{MANAGED_DIR}/managed-settings.d/{DROP_IN_NAME}'
 
-HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard', 'bg-guard', 'agent-slots')
+HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard', 'bg-guard', 'agent-slots',
+         'facts-hook')
 CLOSED = {'actions-disable-guard'}               # a missing or failed hook refuses
 WHAT_IS_LOST = {
     'actions-disable-guard': 'every Bash and Monitor command is refused until it is back',
@@ -31,6 +33,7 @@ WHAT_IS_LOST = {
     'memory-index-guard': 'hook skipped, the memory index is NOT checked',
     'bg-guard': 'hook skipped, background commands are NOT checked',
     'agent-slots': 'hook skipped, agent slots are NOT counted',
+    'facts-hook': 'hook skipped, the state tables are NOT shown',
 }
 # (event, matcher or None, [(hook, timeout)]): one settings entry each, in this order
 ENTRIES = (
@@ -40,6 +43,8 @@ ENTRIES = (
     ('PostToolUse', 'Write|Edit|MultiEdit|Bash|Monitor', [('memory-index-guard', 5)]),
     ('UserPromptSubmit', None, [('agent-slots', 5)]),
     ('Stop', None, [('agent-slots', 5), ('bg-guard', 5)]),
+    ('SessionStart', None, [('facts-hook', 5)]),
+    ('PreCompact', None, [('facts-hook', 5)]),
 )
 
 
