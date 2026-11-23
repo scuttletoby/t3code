@@ -1,0 +1,11 @@
+# update-policy kit: written by update-policy-install. Do not edit: run the installer again.
+[Unit]
+Description=update-policy exposure once a day (fork-kit/update-policy)
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

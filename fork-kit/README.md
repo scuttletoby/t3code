@@ -25,7 +25,7 @@ Every kit follows the same pattern:
 | [pc-agents](pc-agents/README.md)         | Run T3's agents on a Windows PC in a walled WSL2 distro, checked before every start (WSL2)                                                                                                                                 |
 | [review](review/README.md)               | A review skill for the merge gate: lenses picked by changed paths, the state question, a comment format checked against the gate's parser, a model eval; no installer, used from a checkout                                |
 | [schedule-kick](schedule-kick/README.md) | `schedule-kick`: start scheduled GitHub workflows on time by `workflow_dispatch` when no run exists for the slot; timer every 5 minutes (Linux, systemd)                                                                   |
-| [update-policy](update-policy/README.md) | Restart only when idle at the quiet hour (dev, personal), alert only (live); a daily baseline check that reports drift (Linux, Debian/Ubuntu, systemd)                                                                     |
+| [update-policy](update-policy/README.md) | Restart only when idle at the quiet hour (dev, personal), alert only (live); daily baseline and exposure (KEV, EPSS) checks that report only drift and what needs action (Linux, Debian/Ubuntu, systemd)                   |
 
 [common](common/README.md) is code the kits share, copied into each kit's version folder: the loader of the one
 private machine file (`/etc/fork-kit/machine.json`) where the facts of one machine live, and the installer and

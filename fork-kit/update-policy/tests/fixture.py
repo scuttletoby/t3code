@@ -38,6 +38,10 @@ class FakeHost(idle.Host):
         self.dockers = {}           # socket -> names or why not
         self.users = {}             # name -> pwd-like entry
         self.free = {}              # path -> (verdict, reason)
+        self.release = '6.8.0-31-generic'
+
+    def kernel_release(self):
+        return self.release
 
     def run(self, argv, timeout=20, user=None, stdin=None, env=None):
         self.calls.append((list(argv), stdin, dict(env or {})))

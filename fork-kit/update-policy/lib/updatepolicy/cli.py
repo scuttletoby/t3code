@@ -6,13 +6,16 @@
   update-policy baseline    the daily check: prints only drift, alerts with it; exit 0 none, 1 drift
   update-policy booted      after a boot: says once that a restart this kit made came back (update-policy-boot)
   update-policy status      the role, the window, a pending restart and what the last ticks saw
+  update-policy exposure    the daily exposure check: KEV, security fixes waiting, ranked by EPSS; exit 0 none, 1 any
+                            (update-policy-exposure.service runs it as an unprivileged user; --cache DIR)
+  update-policy exposure-alert   sends the last exposure report through the alert command (as root, after it)
 
 The facts of the machine (role, quiet hour, time zone, alert command, ...) are in the "update-policy" section of
 /etc/fork-kit/machine.json. Run it as root: it reads every user's cgroups, containers and sockets.
 """
 import argparse, datetime, json, os, sys
 
-from updatepolicy import baseline, idle, settings, tick, window
+from updatepolicy import baseline, exposure, idle, settings, tick, window
 
 LEVELS = {'err': 3, 'warning': 4, 'notice': 5, 'info': 6}
 EXIT_IDLE, EXIT_BUSY = 0, 75
@@ -73,6 +76,10 @@ def main(argv, host=None, read_settings=None):
     sub.add_parser('baseline')
     sub.add_parser('booted')
     sub.add_parser('status')
+    e = sub.add_parser('exposure')
+    e.add_argument('--cache', default=exposure.CACHE)
+    e2 = sub.add_parser('exposure-alert')
+    e2.add_argument('--cache', default=exposure.CACHE)
     d = sub.add_parser('docker-ps')
     d.add_argument('socket')
     a = ap.parse_args(argv)
@@ -85,6 +92,10 @@ def main(argv, host=None, read_settings=None):
             return 1
         print(json.dumps(names))
         return 0
+    if a.cmd == 'exposure':
+        return exposure.run(host, read_settings, a.cache)
+    if a.cmd == 'exposure-alert':
+        return exposure.alert(m, read_settings, a.cache)
     if a.cmd == 'tick':
         return tick.tick(m, read_settings, lambda s: idle.look(host, s))
     if a.cmd == 'booted':

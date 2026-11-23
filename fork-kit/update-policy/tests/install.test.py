@@ -18,7 +18,8 @@ SHA1, SHA2 = fx.SHA1, fx.SHA2
 UNIT_DIR = '/etc/systemd/system'
 UNITS = tuple(f'{UNIT_DIR}/{n}' for n in ('update-policy.service', 'update-policy.timer',
                                           'update-policy-baseline.service', 'update-policy-baseline.timer',
-                                          'update-policy-boot.service'))
+                                          'update-policy-boot.service', 'update-policy-exposure.service',
+                                          'update-policy-exposure.timer'))
 APT = '/etc/apt/apt.conf.d/zz-update-policy'
 FILES = UNITS + (APT,)
 FOREIGN = 'Unattended-Upgrade::Automatic-Reboot "true";\n'
@@ -54,14 +55,14 @@ class Install(fx.FakeHost):
         code, out, err = self.install()
         self.assertEqual(code, 0, err)
         self.assertEqual(self.config(), {'version': 1, 'timer': False})
-        self.assertEqual(self.there(), [False] * 6)
+        self.assertEqual(self.there(), [False] * len(FILES))
         self.assertIn(', no timer', out)
         self.assertEqual(self.run_main('self-check')[0], 0)
 
     def test_the_timer_writes_the_units_and_turns_apts_own_restarts_off(self):
         code, out, err = self.install('--timer')
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.there(), [True] * 6)
+        self.assertEqual(self.there(), [True] * len(FILES))
         self.assertIn('enabled and started update-policy.timer, update-policy-baseline.timer', out)
         self.assertIn('\nUnattended-Upgrade::Automatic-Reboot "false";\n', self.read(APT))
         self.assertTrue(self.read(APT).startswith('// update-policy kit: written by update-policy-install.'))
@@ -73,6 +74,11 @@ class Install(fx.FakeHost):
         self.assertIn('update-policy baseline\n', self.read(UNITS[2]))
         self.assertIn('Persistent=true\n', self.read(UNITS[3]))
         self.assertIn('update-policy booted\n', self.read(UNITS[4]))
+        exposure = self.read(UNITS[5])
+        self.assertIn('\nDynamicUser=yes\n', exposure)                      # the check runs unprivileged,
+        self.assertIn('\nExecStopPost=+/usr/bin/python3 -I -B /usr/local/libexec/update-policy/current/bin/'
+                      'update-policy exposure-alert', exposure)               # the alert as root
+        self.assertIn('Persistent=true\n', self.read(UNITS[6]))
         self.assertIn('WantedBy=multi-user.target\n', self.read(UNITS[4]))
         self.assertTrue(self.config()['timer'])
         self.assertEqual(self.run_main('self-check')[0], 0)
@@ -102,7 +108,7 @@ class Install(fx.FakeHost):
                     self.assertTrue(os.path.islink(self.path('/usr/local/bin/update-policy')))
                 code, _, err = self.install('--timer')
                 self.assertEqual(code, 0, err)
-                self.assertEqual(self.there(), [True] * 6)
+                self.assertEqual(self.there(), [True] * len(FILES))
                 self.assertEqual(self.run_main('self-check')[0], 0)
 
     def test_the_units_are_on_before_apt_stops_restarting_and_off_after_it_starts_again(self):
@@ -110,33 +116,36 @@ class Install(fx.FakeHost):
         itself, and the apt file comes last; --no-timer and uninstall take the apt file away first."""
         self.assertEqual(self.install('--timer')[0], 0)
         self.assertEqual(self.calls, [(('daemon-reload',), False),
-                                      (('enable', '--now', 'update-policy.timer', 'update-policy-baseline.timer'), False),
+                                      (('enable', '--now', 'update-policy.timer', 'update-policy-baseline.timer',
+                                        'update-policy-exposure.timer'), False),
                                       (('enable', 'update-policy-boot.service'), False)])
         self.calls.clear()
         code, out, _ = self.install('--no-timer')
         self.assertEqual(code, 0)
         self.assertEqual(self.calls, [(('disable', '--now', 'update-policy.timer', 'update-policy-baseline.timer',
-                                        'update-policy-boot.service'), False), (('daemon-reload',), False)])
-        self.assertEqual(self.there(), [False] * 6)
+                                        'update-policy-exposure.timer', 'update-policy-boot.service'), False),
+                                      (('daemon-reload',), False)])
+        self.assertEqual(self.there(), [False] * len(FILES))
         self.assertIn('unattended-upgrades\' own Automatic-Reboot setting applies', out)
         self.assertEqual(self.install()[0], 0)                           # again without the option: still off
-        self.assertEqual(self.there(), [False] * 6)
+        self.assertEqual(self.there(), [False] * len(FILES))
         self.assertEqual(self.install('--timer')[0], 0)
         self.calls.clear()
         self.assertEqual(self.run_main('uninstall')[0], 0)
         self.assertEqual([c[0][0] for c in self.calls], ['disable', 'daemon-reload'])
-        self.assertEqual(self.there(), [False] * 6)
+        self.assertEqual(self.there(), [False] * len(FILES))
 
     def test_units_that_cannot_be_enabled_leave_apts_own_restarts_on(self):
         self.systemctl_error = {'enable': 'Failed to enable unit: Access denied'}
         code, _, err = self.install('--timer')
         self.assertEqual(code, 1)
-        self.assertIn('systemctl enable --now update-policy.timer update-policy-baseline.timer failed (Failed to '
+        self.assertIn('systemctl enable --now update-policy.timer update-policy-baseline.timer '
+                      'update-policy-exposure.timer failed (Failed to '
                       'enable unit: Access denied)', err)
         self.assertFalse(os.path.exists(self.path(APT)))
         self.systemctl_error = {}
         self.assertEqual(self.install('--timer')[0], 0)                  # fixed: run again finishes it
-        self.assertEqual(self.there(), [True] * 6)
+        self.assertEqual(self.there(), [True] * len(FILES))
 
     def test_apt_still_restarting_by_itself_fails_the_install_unless_forced(self):
         self.apt_value = 'true'                                           # /etc/apt/apt.conf or a zzz- file wins
@@ -157,15 +166,18 @@ class Install(fx.FakeHost):
     def test_uninstall_leaves_nothing_the_state_too(self):
         self.assertEqual(self.install('--timer', sha=SHA1)[0], 0)
         self.assertEqual(self.install(sha=SHA2)[0], 0)                   # upgrade without the option: kept
-        self.assertEqual(self.there(), [True] * 6)
+        self.assertEqual(self.there(), [True] * len(FILES))
+        os.makedirs(self.path('/var/cache/private/update-policy-exposure'))
+        os.symlink('private/update-policy-exposure', self.path('/var/cache/update-policy-exposure'))
         os.makedirs(self.path('/var/lib/update-policy'))
         with open(self.path('/var/lib/update-policy/state.json'), 'w') as f:
             f.write('{}')
         code, out, _ = self.run_main('uninstall')
         self.assertEqual(code, 0)
-        self.assertEqual(self.there(), [False] * 6)
+        self.assertEqual(self.there(), [False] * len(FILES))
         for gone in ('/usr/local/libexec/update-policy', '/etc/update-policy', '/usr/local/bin/update-policy',
-                     '/usr/local/sbin/update-policy-install', '/var/lib/update-policy'):
+                     '/usr/local/sbin/update-policy-install', '/var/lib/update-policy',
+                     '/var/cache/update-policy-exposure', '/var/cache/private/update-policy-exposure'):
             self.assertFalse(os.path.lexists(self.path(gone)), gone)
         self.assertEqual(self.run_main('uninstall')[0], 0)              # again: nothing left, still fine
 

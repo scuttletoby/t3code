@@ -11,7 +11,8 @@ fork-kit/common/{machine_file,free_contract,kit_install}.py of one release into
 to it and links /usr/local/bin/update-policy and /usr/local/sbin/update-policy-install to it. With --timer the kit
 takes over restarts, in this order, so there is never a time with neither restart policy: it writes the system
 units update-policy.{service,timer} (the restart policy, every 5 minutes), update-policy-baseline.{service,timer}
-(the daily baseline check) and update-policy-boot.service (the look after a boot) to /etc/systemd/system/,
+(the daily baseline check), update-policy-exposure.{service,timer} (the daily exposure check) and
+update-policy-boot.service (the look after a boot) to /etc/systemd/system/,
 enables and starts them, and only then writes /etc/apt/apt.conf.d/zz-update-policy (unattended-upgrades never
 restarts by itself). It then reads apt's effective Automatic-Reboot and fails while it is not false (a file apt reads
 later wins), unless --force. --no-timer undoes it in the other order: the apt file first (unattended-upgrades'
@@ -31,12 +32,15 @@ except ImportError as e:     # a copy without common/kit_install.py (changed or 
 
 UNIT_DIR = '/etc/systemd/system'
 UNITS = ('update-policy.service', 'update-policy.timer', 'update-policy-baseline.service',
-         'update-policy-baseline.timer', 'update-policy-boot.service')
+         'update-policy-baseline.timer', 'update-policy-boot.service', 'update-policy-exposure.service',
+         'update-policy-exposure.timer')
 APT_FILE = '/etc/apt/apt.conf.d/zz-update-policy'
 STATE_DIR = '/var/lib/update-policy'
+# the exposure check's cache: systemd's DynamicUser keeps it in private/ and links it
+CACHE_DIRS = ('/var/cache/update-policy-exposure', '/var/cache/private/update-policy-exposure')
 HEADERS = ('# update-policy kit: written by update-policy-install.',
            '// update-policy kit: written by update-policy-install.')
-STARTED = ('update-policy.timer', 'update-policy-baseline.timer')
+STARTED = ('update-policy.timer', 'update-policy-baseline.timer', 'update-policy-exposure.timer')
 ENABLED = STARTED + ('update-policy-boot.service',)
 APT_LINE = re.compile(r'^Unattended-Upgrade::Automatic-Reboot "(.*)";$')
 APT_FALSE = ('', '0', 'no', 'false', 'without', 'off', 'disable')
@@ -55,7 +59,8 @@ class UpdatePolicyInstaller(kit_install.Installer):
         + tuple(f'systemd/{name}' for name in UNITS)
     EXECUTABLE = frozenset({'bin/update-policy', 'sbin/update-policy-install'})
     PACKAGE = 'updatepolicy'
-    MODULES = ('__init__', 'aptconf', 'baseline', 'cli', 'idle', 'settings', 'tick', 'window')
+    MODULES = ('__init__', 'aptconf', 'baseline', 'cli', 'debver', 'exposure', 'feeds', 'idle', 'oval', 'settings',
+               'tick', 'window')
     HELP = ('bin/update-policy', 'update-policy tick')
     HAS_CONFIG = True
     KIT_STEPS = ('policy-files',)
@@ -181,10 +186,14 @@ class UpdatePolicyInstaller(kit_install.Installer):
 
     def kit_uninstall(self):
         self.take_off()
-        state = self.p(STATE_DIR)
-        if os.path.isdir(state) and not os.path.islink(state):
-            shutil.rmtree(state)
-            self.say(f'removed {STATE_DIR}')
+        for folder in (STATE_DIR,) + CACHE_DIRS:
+            real = self.p(folder)
+            if os.path.islink(real):
+                os.unlink(real)
+                self.say(f'removed {folder}')
+            elif os.path.isdir(real):
+                shutil.rmtree(real)
+                self.say(f'removed {folder}')
         self.say('unattended-upgrades\' own Automatic-Reboot setting applies again')
 
     def installed_summary(self, plan):

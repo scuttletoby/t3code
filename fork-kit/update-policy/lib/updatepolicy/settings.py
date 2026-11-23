@@ -128,6 +128,41 @@ BASELINE = {
     'sshUsers': (list, ['root'], _users),
 }
 
+def _ignore(value):
+    for e in value:
+        if not isinstance(e, dict) or set(e) != {'cve', 'reason', 'until'}:
+            return 'each entry is {"cve": "CVE-...", "reason": "...", "until": "YYYY-MM-DD"}'
+        if not isinstance(e['cve'], str) or not re.match(r'^CVE-[0-9]{4}-[0-9]{4,}\Z', e['cve']):
+            return f'{e["cve"]!r} is not a CVE id'
+        if not isinstance(e['reason'], str) or not e['reason'].strip():
+            return f'{e["cve"]}: a reason is needed'
+        if not isinstance(e['until'], str) or not re.match(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z', e['until']):
+            return f'{e["cve"]}: "until" must be YYYY-MM-DD'
+    return None
+
+
+def _https(value):
+    return None if value == '' or re.match(r'^https://[^\s]+\Z', value) else 'must be an https:// URL (or "")'
+
+
+def _share(value):
+    return None if 0 <= value <= 1 else 'must be from 0 to 1'
+
+
+EXPOSURE = {
+    'enabled': (bool, False, None),
+    'epssMin': ((int, float), 0.1, _share),
+    'fixWaitingDays': (int, 3, _between(0, 60)),
+    'staleDays': (int, 3, _between(1, 60)),
+    'maxFeedMb': (int, 64, _between(1, 1024)),
+    'maxXmlMb': (int, 1024, _between(16, 4096)),
+    'timeoutSeconds': (int, 60, _between(5, 600)),
+    'ovalUrl': (str, '', _https),
+    'kevUrl': (str, '', _https),
+    'epssUrl': (str, '', _https),
+    'ignore': (list, [], _ignore),
+}
+
 SPEC = {
     'role': (str, REQUIRED, _role),
     'quietHour': (str, REQUIRED, _quiet_hour),
@@ -142,6 +177,7 @@ SPEC = {
     'heavySlice': (str, 'heavy.slice', _slice),
     'busyScripts': (list, [], _paths),
     'baseline': (dict, {}, None),
+    'exposure': (dict, {}, None),
 }
 
 
@@ -149,6 +185,7 @@ def check(section, where):
     """The section as a dict with every default filled in (baseline too)."""
     out = machine_file.fields(section, SPEC, where)
     out['baseline'] = machine_file.fields(out['baseline'], BASELINE, f'{where}.baseline')
+    out['exposure'] = machine_file.fields(out['exposure'], EXPOSURE, f'{where}.exposure')
     return out
 
 
