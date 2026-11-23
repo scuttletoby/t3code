@@ -4,7 +4,13 @@
  * environment handlers. A linked machine's read is in `environmentFacts.linked.test.ts`.
  */
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ServerSettings, ThreadId } from "@t3tools/contracts";
+import {
+  ENVIRONMENT_FILE_LINK_AGENT_HINT,
+  EnvironmentId,
+  ProviderInstanceId,
+  ServerSettings,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -125,6 +131,7 @@ const readFacts = (world: World) =>
     return last.encodedResult as {
       readonly hostResources?: unknown;
       readonly placement?: Record<string, unknown>;
+      readonly fileLinks?: unknown;
     };
   }).pipe(
     Effect.provide(
@@ -284,5 +291,13 @@ it.effect("a read stopped half-way leaves nothing behind: the next one reads afr
     const next = yield* readFacts({ usage });
     expect(calls).toBe(2);
     expect(next.placement).toMatchObject({ available: true, runningAgents: 2, slotsFree: 1 });
+  }),
+);
+
+it.effect("this machine's read says how to link a file on it from another environment", () =>
+  Effect.gen(function* () {
+    const result = yield* readFacts({});
+    expect(result.fileLinks).toBe(ENVIRONMENT_FILE_LINK_AGENT_HINT);
+    expect(result.fileLinks).toContain("/t3-environment/<environmentId>/<absolute path>");
   }),
 );

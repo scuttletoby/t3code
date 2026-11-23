@@ -3,7 +3,11 @@
  * optional ("Machine facts on t3_environment_read" in docs/fork/README.md). Slot facts come only
  * from the gate's status read; a gate that cannot be read gives a reason, never a count.
  */
-import { HostResourcesSnapshot, NonNegativeInt } from "@t3tools/contracts";
+import {
+  ENVIRONMENT_FILE_LINK_AGENT_HINT,
+  HostResourcesSnapshot,
+  NonNegativeInt,
+} from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -45,6 +49,8 @@ export type Placement = typeof Placement.Type;
 export const ResultFields = {
   hostResources: Schema.optionalKey(HostResourcesSnapshot),
   placement: Schema.optionalKey(Placement),
+  /** How to link a file on this environment in a reply on another one. */
+  fileLinks: Schema.optionalKey(Schema.String),
 };
 
 /** The gate's own read waits up to `COUNT_READ_TIMEOUT`; one second more, then it is unread. */
@@ -119,6 +125,7 @@ export const read = Effect.gen(function* () {
   return {
     ...(Option.isSome(hostResources) ? { hostResources: hostResources.value } : {}),
     placement,
+    fileLinks: ENVIRONMENT_FILE_LINK_AGENT_HINT,
   };
 }).pipe(Effect.withSpan("EnvironmentFacts.read"));
 
