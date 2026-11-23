@@ -243,7 +243,11 @@ Owner decisions: issue #99 (findings), issue #100 (rounds).
   the text is folded: NFKC, zero-width and other format characters removed,
   Cyrillic and Greek look-alike letters read as Latin, `0` for `o` in a label,
   HTML entities decoded (`ma&#106;or`) and backslash escapes dropped
-  (`major\:`). Lines inside a fenced code block are never labels, so quote
+  (`major\:`). Each line is then read in NFKC again, after the entities are
+  decoded, so what an entity writes reads as GitHub shows it:
+  `blocker&#65306; x` (an entity for the full-width colon) blocks, an entity
+  for a full-width `ｎｏｎｅ` reads as none, and `none` with a zero-width space
+  and then an accent reads `noné`, which is no none, so it blocks. Lines inside a fenced code block are never labels, so quote
   code and example findings in one; quotes and indented blocks are read (fail
   closed). A title line or `verdict:` line that says
   NOT SAFE is a blocker. `minor:` and `nit:` never block.
@@ -532,6 +536,38 @@ lens's newest comment counts. The reviewed head is the one commit every lens's
 newest read names, or a newer override comment's sha (config `override`). A
 pull request with no lens comments is not reviewed, and the queue then vouches
 only for the head it found.
+
+A header written with look-alikes is no read: a zero-width space, a Cyrillic or
+Greek letter that looks Latin, an HTML reference (`&#108;ens`) or a backslash
+escape in `lens`, `read at` or the sha (issue 1005: such a header silently
+counted for nothing). When the comment, read the way the findings rules fold
+text (as GitHub shows it), has a first-line lens header and as written has
+none, or one that names another read sha, or only folded carries the lens
+marker of a report that is broken, it is a broken lens report: it blocks, keyed
+by that comment, whatever an older or newer read of that lens says, and it
+never counts as a read. Its reason says to post a NEW comment in plain letters
+and to delete the old one or edit it to start with `not a lens` and a colon (a
+new comment alone does not clear it). A look-alike letter in the lens name
+alone is not flagged: `cоde` with a Cyrillic `о` is read as written, as a
+different lens than `code`, so it can never stand in for the real lens's read
+(and its findings are still judged). Folding reads a line end an HTML reference
+writes (`&#10;`, `&#13;`, `&#x2028;`) as a space, as GitHub shows it, never as
+a new line. A heading starts with one to six plain `#`
+followed by a space or tab, as GitHub renders it: `＃ Lens code` with the
+full-width number sign is plain text, so it is no heading look-alike.
+
+NFKC reads at most the first 4,096 characters of each line; the rest of a
+longer line is read as written (issue 1005: a 64 KB line of U+FDFA, which NFKC
+writes as 18 characters, took 5.5 s). A header is far shorter. Both sides read
+the same Unicode: the gate's Python names its Unicode version (`PY_UNICODE`,
+the one the shared vectors record) and, on a Python with another Unicode, a
+rule refuses (`UnicodeDrift`) text with a code point that Unicode assigns
+otherwise, as T3 does on its newer Unicode, rather than read it another way.
+The head check then fails and says why. A post whose author does not count is
+only logged, never refused: it neither reads nor blocks on any Python. The
+queue passes over a PR whose review it cannot read and tells that PR once per
+head; a PR a stopped run left OFF is left OFF with a comment, and the queue
+goes on.
 
 Only comments, reviews and inline review comments (see below) that GitHub
 records as written by one of `lens_author_associations` count: anyone can
@@ -962,7 +998,7 @@ section "The queue"), with six arguments after the ones in the config:
 | `repo`   | `owner/name`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `pr`     | The pull request number; `0` for `bad-plan` (which pull request the lost plan named is not known).                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `head`   | The full 40-hex head sha the notice is for; empty for `bad-plan`.                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `kind`   | `conflict` (merge state `DIRTY`), `red` (a required check failed), `stuck` (one ended without passing, or never reported), `base-red` (it failed as on its base, and the queue updates it by itself once the base is green) or `bad-plan` (an unreadable plan was kept beside `STATE`: a pull request may still have auto-merge off).                                                                                                                                                              |
+| `kind`   | `conflict` (merge state `DIRTY`), `red` (a required check failed), `stuck` (one ended without passing, or never reported), `base-red` (it failed as on its base, and the queue updates it by itself once the base is green), `unicode` (its lens comments hold code points the runner's Python reads otherwise than the review rules) or `bad-plan` (an unreadable plan was kept beside `STATE`: a pull request may still have auto-merge off).                                                    |
 | `reason` | The notice's own words, such as `required check build is red`.                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `link`   | The repository's pull request list (`https://github.com/<repo>/pulls`) for `bad-plan`. Otherwise the page of the check's newest run, or the pull request's page when there is none (a conflict, a check that never reported) or it is not plainly a page of the repository on `https://github.com/` (a status can link any host): printable ASCII only, and no backslash, `.` or `..` path segment (also percent-encoded) or encoded `/` or `\` that a browser would follow to another repository. |
 
