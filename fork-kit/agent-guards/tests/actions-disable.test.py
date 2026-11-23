@@ -2309,13 +2309,26 @@ class FastExitTest(Case):
         self.assertLessEqual(self.g.QUICK_GIT, self.g.GIT_SAFE)
 
 
-RACY = 0.05
+# The cache tests check what the cache keeps, not the racy window (test_a_file_written_just_now_is_not_cached sets
+# the hook's own 2 s): here a file is old enough to cache unless its time is more than CLOCK_SWING seconds ahead of
+# the wall clock. The guard compares file times with the wall clock, and some VMs step it (PR #993 saw swings of up to
+# 12 s every few seconds); a wait on the monotonic clock (the old settle()) then does not make a file older by the
+# wall clock, the cache kept nothing, and CacheTest/SlowBackendTest failed at random (issue 999). No wait is needed.
+CLOCK_SWING = 30.0
+RACY = -CLOCK_SWING
 
 
-def settle():
-    """Wait until the files written so far are old enough to cache."""
-    import time
-    time.sleep(RACY + 0.03)
+def next_tick(path):
+    """Until the file clock has moved on from path's change time: a same-size rewrite of path then shows in its
+    stat. With RACY the window no longer keeps such a rewrite out (the hook's 2 s does), and a write in the same tick
+    (a few ms) as the one before changes no stat field. This waits on the clock the guard reads (file times), one
+    tick at most; a step of the wall clock only makes the times differ sooner."""
+    probe, old = path + '.tick', os.stat(path).st_ctime_ns
+    with open(probe, 'w'):
+        pass
+    while os.stat(probe).st_ctime_ns == old:
+        os.utime(probe)
+    os.unlink(probe)
 
 
 class CacheCase(Case):
@@ -2329,11 +2342,10 @@ class CacheCase(Case):
         self.evil = self.write('evil.py', 'x = "actions/permissions/' + 'a' * 10 + '"\n', 0o644)
         self.assertEqual(os.path.getsize(self.ok), os.path.getsize(self.evil))
         # A file is cached only when it was last changed CACHE_RACY seconds ago (a change in the same clock tick as
-        # the read would not show in the times). Tests use a short wait instead of the hook's 2 s.
+        # the read would not show in the times). Tests use RACY (see CLOCK_SWING) instead of the hook's 2 s.
         p = mock.patch.object(self.g, 'CACHE_RACY', RACY)
         p.start()
         self.addCleanup(p.stop)
-        settle()
 
     def cache_path(self):
         return os.path.join(self.dir, '.local', 'state', 'actions-disable-guard', 'cache-v1.json')
@@ -2378,12 +2390,12 @@ class CacheTest(CacheCase):
         st = os.stat(self.ok)
         with open(self.evil) as f:
             evil = f.read()
+        next_tick(self.ok)
         with open(self.ok, 'w') as f:   # same size, same mtime: only the change time tells
             f.write(evil)
         os.utime(self.ok, ns=(st.st_atime_ns, st.st_mtime_ns))
         self.assertIsNotNone(self.decide('python3 ok.py'))
         self.write('ok2.py', 'x = "' + 'a' * 30 + '"\n', 0o644)
-        settle()
         self.assertIsNone(self.decide('python3 ok2.py'))
         os.replace(self.evil, os.path.join(self.dir, 'ok2.py'))   # another file under the cached name
         self.assertIsNotNone(self.decide('python3 ok2.py'))
@@ -2398,6 +2410,21 @@ class CacheTest(CacheCase):
         c = self.cache() if os.path.exists(self.cache_path()) else {}
         self.assertNotIn(self.ok, c.get('files', {}))
         self.assertFalse(any(cfg in k for k in c.get('gh', {})), c.get('gh'))
+
+    def test_a_stepped_wall_clock_changes_nothing_here(self):
+        """Issue 999: these tests ran red at random where the VM steps its wall clock, which the guard's file times
+        follow. A file written just before a step back looks newer than the clock: with a racy window of a few ms
+        it was never cached. With RACY (see CLOCK_SWING) the tests see the same cache whatever the step."""
+        real = self.g.time
+        stepped = type('T', (), {k: staticmethod(getattr(real, k))
+                                 for k in ('monotonic', 'sleep', 'gmtime', 'strftime', 'localtime', 'perf_counter')})
+        stepped.time = staticmethod(lambda: real.time() - 12.0)   # the largest swing #993 saw
+        with mock.patch.object(self.g, 'time', stepped):
+            first, seen = self.reads('python3 evil.py')
+            self.assertIn(self.evil, seen)
+            again, seen = self.reads('python3 evil.py')
+        self.assertNotIn(self.evil, seen, 'a file written before the step was not cached')
+        self.assertEqual(first, again)
 
     def test_an_entry_lives_60_s(self):
         self.assertIsNotNone(self.decide('python3 evil.py'))
@@ -2522,8 +2549,9 @@ class CacheTest(CacheCase):
 
     def test_a_file_that_changes_while_it_is_read_is_not_cached(self):
         # read the harmless text, then the file becomes the evil one: the facts of the old text must not be kept
-        # under the new file's stat
-        import time
+        # under the new file's stat. A rewrite of the same size in the same clock tick as the last write changes no
+        # stat field: only the racy window keeps it out, so this test uses the hook's own 2 s (with RACY it was kept
+        # whenever setUp's write and the swap shared a tick: red at random, issue 999).
         real, done = self.g.read_text, []
         def swap(p):
             text = real(p)
@@ -2531,12 +2559,17 @@ class CacheTest(CacheCase):
                 done.append(p)
                 with open(self.evil) as f, open(self.ok, 'w') as g:
                     g.write(f.read())
-                time.sleep(RACY * 3)   # old enough to cache by the time the reading ends
             return text
-        with mock.patch.object(self.g, 'read_text', swap):
-            self.assertIsNone(self.decide('python3 ok.py'))
-        settle()
-        self.assertIsNotNone(self.decide('python3 ok.py'))
+        with mock.patch.object(self.g, 'CACHE_RACY', 2.0):
+            with mock.patch.object(self.g, 'read_text', swap):
+                self.assertIsNone(self.decide('python3 ok.py'))
+            self.assertIsNotNone(self.decide('python3 ok.py'))
+            now = self.g.time.time()   # and it is the window that kept it out: 3 s on, the same file is cached
+            with mock.patch.object(self.g.time, 'time', lambda: now + 3):
+                self.reads('python3 ok.py')
+                again, seen = self.reads('python3 ok.py')
+        self.assertIsNotNone(again)
+        self.assertNotIn(self.ok, seen)
 
     def test_no_cache_without_an_absolute_home(self):
         here = os.getcwd()
@@ -2577,7 +2610,6 @@ class CacheTest(CacheCase):
     def test_a_reading_cut_off_keeps_nothing(self):
         for i in range(3):
             self.write(f'ok{i}.py', f'x = {i}\n', 0o644)
-        settle()
         real, done = self.g.read_text, []
         def alarm(p):   # the hook's alarm going off in the third read, after two files were read in full
             done.append(p)
@@ -2634,10 +2666,10 @@ class CacheTest(CacheCase):
 
     def test_the_gh_config_is_cached_and_read_again_when_it_changes(self):
         cfg = self.write('.config/gh/config.yml', 'aliases:\n    wd: workflow disable\n', 0o644)
-        settle()
         self.assertIsNotNone(self.decide('gh wd 1'))
         _, seen = self.reads('gh wd 1')
         self.assertNotIn(cfg, seen)
+        next_tick(cfg)
         self.write('.config/gh/config.yml', 'aliases:\n    wd: workflow list   \n', 0o644)   # same size
         self.assertIsNone(self.decide('gh wd 1'))
         os.unlink(cfg)
@@ -2648,7 +2680,6 @@ class CacheTest(CacheCase):
     def test_two_hooks_at_once_keep_one_whole_cache(self):
         hook = slow_copy(self, racy=RACY)
         names = [self.write(f'm{i}.py', f'x = {i}\n', 0o644) for i in range(6)]
-        settle()
         ev = lambda c: json.dumps({'tool_name': 'Bash', 'cwd': self.dir, 'tool_input': {'command': c}})
         for _ in range(3):
             runs = [(c, subprocess.Popen([sys.executable, '-I', hook], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2682,9 +2713,11 @@ def slow_copy(case, read=0.0, gh=0.0, racy=None):
         case.assertIn(head, text)
         text = text.replace(head, f"{head}    with open({calls!r}, 'a') as _f: _f.write({name!r} + '\\n')\n"
                                   f'    time.sleep({delay})\n', 1)
-    if racy is not None:
+    if racy is not None:   # also the start check: the hook file is older than the process by the same rule
         case.assertIn('\nCACHE_RACY = 2.0\n', text)
         text = text.replace('\nCACHE_RACY = 2.0\n', f'\nCACHE_RACY = {racy}\n', 1)
+        case.assertIn('\nSTART_SLACK = 0.05 ', text)
+        text = text.replace('\nSTART_SLACK = 0.05 ', f'\nSTART_SLACK = {racy} ', 1)
     return case.write('slow-hook', text, 0o755)
 
 
@@ -2699,6 +2732,10 @@ def slow_calls(case):
 
 class SlowBackendTest(CacheCase):
     """#1752 fix points 3 and 4: with a slow backend the hook still answers well inside its 10 s limit."""
+    # HOOK_START: a hook run that reads nothing slowly (a cache hit), measured on a 12-core dev VM at load 17
+    # (issue 999, 30 runs): median 0.11 s, max 0.14 s, all of it CPU (Python start and the parse). SLOW leaves the
+    # same 2 s for that in the first run and is the bound for the second: about 15 times the worst measured run.
+    SLOW = 2.0   # seconds a slow read takes: 2 s of the 4 s reading window stay for the start and the rest
 
     def run_hook(self, hook, cmd):
         import time
@@ -2775,24 +2812,32 @@ class SlowBackendTest(CacheCase):
         self.assertFalse(os.path.exists(os.path.join(self.dir, '.local', 'state', 'actions-disable-guard', 'log')))
 
     def test_the_second_run_is_fast_with_the_same_answer(self):
-        # 3 s of slow reads in a 5 s budget: the run that pays for them must still leave them in the cache
-        slow_read = slow_copy(self, read=3.0, racy=RACY)
+        # SLOW s of slow reads in the hook's reading window (BUDGET - 1 s from the process start): the run that pays
+        # for them must still leave them in the cache. The work is counted (slow_calls), which load cannot change:
+        # the second run starts no slow read. The rest of the window is for Python's start and the reading itself
+        # (see HOOK_START); the old 3 s read left 1 s, and under load the first run sometimes passed its save time,
+        # kept no cache, and the second run read again (issue 999).
+        slow_read = slow_copy(self, read=self.SLOW, racy=RACY)
         os.rename(slow_read, slow_read + '-read')
         slow_read += '-read'
-        slow_gh = slow_copy(self, gh=3.0, racy=RACY)
+        slow_gh = slow_copy(self, gh=self.SLOW, racy=RACY)
         self.write('.config/gh/config.yml', 'aliases:\n    wd: workflow disable\n    co: pr checkout\n', 0o644)
-        settle()
         for cmd, verdict, hook in (('python3 ok.py', None, slow_read), ('python3 evil.py', 'deny', slow_read),
                                    ('gh wd 1', 'deny', slow_gh), ('gh co 1', None, slow_gh)):
             with self.subTest(cmd=cmd):
                 if os.path.exists(self.cache_path()):   # each command starts with no cache
                     os.unlink(self.cache_path())
+                n = len(slow_calls(self))
                 first, took1 = self.run_hook(hook, cmd)
+                paid = slow_calls(self)[n:]
                 again, took2 = self.run_hook(hook, cmd)
+                self.assertTrue(paid, 'the first run read nothing slowly')
+                self.assertEqual(slow_calls(self)[n + len(paid):], [], f'the second run read again ({took1:.2f} s, '
+                                 f'{took2:.2f} s): the first run kept no cache')
                 self.assertEqual(first, again)
                 self.assertEqual(first and first['permissionDecision'], verdict)
-                self.assertGreater(took1, 3.0)
-                self.assertLess(took2, 0.9)
+                self.assertGreater(took1, self.SLOW)
+                self.assertLess(took2, self.SLOW)   # waited for no slow read (HOOK_START: the margin)
 
 
 class Issue930Test(Case):
@@ -3267,8 +3312,8 @@ class Pr993Round2Test(Case):
 
     def test_2_a_refuse_script_named_in_piped_data_counts_wherever_the_text_goes_on(self):
         """A file that names `<script> <flag>` counts wherever its text goes on, as round 1 had it: the guard
-        cannot list every place that runs piped or substituted text, so a mere mention piped into a program that
-        reads it as data is refused too (known over-refusal), and the refusal names the way out (`< msg.md`)."""
+        cannot list every place that runs piped or substituted text, and the refusal names the way out (`< msg.md`).
+        Since issue 999 a mention that goes only into a program that reads it as data passes (Issue999Test test_6)."""
         self.write(GARDEN['name'], 'print(1)\n', 0o644)
         self.write('msg.md', f'Fix: never run {GARDEN["name"]} {GARDEN["flag"]} on CI\n', 0o644)
         self.write('q.txt', f'python3 {GARDEN["name"]} {GARDEN["flag"]}\n', 0o644)
@@ -3283,12 +3328,11 @@ class Pr993Round2Test(Case):
                      'cat q.txt > run.sh; bash run.sh', 'cp q.txt run.sh && bash run.sh', "sed -n '1e' q.txt",
                      'sed e q.txt', 'cat q.txt | sed e', "cat q.txt | sed 's/^//e'", 'cat q.txt | grep -v x | sed e',
                      'head -1 q.txt | sed e')
-        # a mere mention, piped: refused (known over-refusal), told the redirect
-        mentions = ('cat msg.md | python3 tools/check.py', 'cat msg.md | node x.js', 'cat msg.md | ssh host cat',
+        # a mere mention, piped into a program that reads it as data: passes since issue 999 (was refused)
+        self.passes('cat msg.md | python3 tools/check.py', 'cat msg.md | node x.js', 'cat msg.md | ssh host cat',
                     'cat msg.md | claude -p hi', 'cat msg.md | grep -v y | python3 tools/check.py',
                     'cat q.txt | python3 tools/check.py')
-        self.refused(*mentions)
-        for cmd in mentions + self.PIPED_RUNS:
+        for cmd in self.PIPED_RUNS:
             self.assertIn('`python3 tools/check.py < msg.md`', self.decide(cmd), cmd)
         self.passes('python3 tools/check.py < msg.md', 'cp msg.md notes2.md', 'cat msg.md | sed -n 1p',
                     'cat notes.md | python3 tools/check.py', "cat notes.md | ssh host 'cat > f'",
@@ -3351,6 +3395,405 @@ class Pr993Round2Test(Case):
         self.assertIn('query($n: Int!)', why)
         self.passes("gh api graphql -f query='query($n: Int!) { repository(owner: \"o\", name: \"r\") { pullRequest("
                     "number: $n) { title } } }' -F n=\"$N\"")
+
+
+class Issue999Test(Case):
+    """The left-overs of #993 (issue 999): each test is red without its fix."""
+    refused = Issue930Test.refused
+    passes = Issue930Test.passes
+    T = Issue930Test.T
+
+    def files(self):
+        self.write(GARDEN['name'], 'print(1)\n', 0o644)
+        self.write('q.txt', f'python3 {GARDEN["name"]} {GARDEN["flag"]}\n', 0o644)
+        self.write('q2.txt', f'python3 {GARDEN["name"]} \\\n  {GARDEN["flag"]}\n', 0o644)   # one line, split
+        self.write('d.txt', self.T + '\n', 0o644)
+        self.write('msg.md', f'Fix: never run {GARDEN["name"]} {GARDEN["flag"]} on CI\n', 0o644)
+        self.write('notes.md', 'Fix: the CI cache\n', 0o644)
+        self.write('ids.txt', '1\n2\n', 0o644)
+        self.write('tools/check.py', 'import sys\nprint(len(sys.stdin.read()))\n', 0o644)
+        self.write('x.js', 'process.stdin.resume()\n', 0o644)
+
+    def test_1_more_writers_into_a_home_path_folder_then_run(self):
+        """sed -f FILE with w in FILE, awk print > VAR (-v) and print | "cat > FILE", rsync: like Pr993Round1Test
+        test_4, the file a later word runs gets the text of p.txt."""
+        D = self.dir
+        self.write('run.sh', self.T + '\n')
+        self.write('p.txt', 'bash run.sh\n', 0o644)
+        self.write('ok.txt', 'echo hi\n', 0o644)
+        self.write('b/ls', 'echo hi\n')
+        t = f'{D}/b/ls'
+        self.write('prog.sed', f'w {t}\n', 0o644)
+        self.write('prog2.sed', f's/bash/bash/w {t}\n', 0o644)
+        self.write('ok.sed', 'w out.txt\n', 0o644)
+        env = dict(self.env, PATH=f'{D}/b:/usr/bin:/bin')
+        self.refused('sed -n -f prog.sed p.txt; ls', 'sed -f prog2.sed p.txt; ls', 'sed -nf prog.sed p.txt; ls',
+                     'sed --file=prog.sed -n p.txt; ls', 'sed -n -f missing.sed p.txt; ls',
+                     f"awk -v f={t} '{{print > f}}' p.txt; ls", f"awk -v f={t} '{{printf \"%s\", $0 >> f}}' p.txt; ls",
+                     f"awk '{{print > f}}' f={t} p.txt; ls",
+                     f"awk '{{print | \"cat > {t}\"}}' p.txt; ls", f"awk '{{print | \"tee {t}\"}}' p.txt; ls",
+                     f'rsync p.txt {t}; ls', f'rsync -a p.txt {t} && ls', f'rsync -av p.txt {D}/b/; p.txt',
+                     env=env)
+        self.passes('sed -n -f ok.sed p.txt; wc -l out.txt', "awk -v f=out.txt '{print > f}' p.txt; cat out.txt",
+                    "awk '{print | \"sort\"}' p.txt; ls", "awk '{print | \"cat > out.txt\"}' p.txt; ls",
+                    f'rsync -a p.txt {D}/out.txt; ls', f'rsync -a ok.txt {t}; ls', "awk '$1 > max' p.txt; ls",
+                    env=env)
+
+    def test_2_code_that_runs_its_input_files(self):
+        """awk system($0) / print | "sh", perl and ruby -n code that calls system: the lines of the input files run."""
+        self.files()
+        self.refused("awk '{system($0)}' q.txt", "awk '{print | \"sh\"}' q.txt", "awk '{print | \"bash -s\"}' q.txt",
+                     "perl -ne 'system $_' q.txt", "ruby -ne 'system $_' q.txt", "perl -lne 'qx($_)' q.txt",
+                     "awk '{system($0)}' d.txt", "gawk -f /dev/null -e '{system($0)}' q.txt",
+                     "awk '{ cmd = $0; cmd | getline x }' q.txt")
+        self.passes("awk '{print $1}' q.txt", "awk '{print | \"sort\"}' msg.md", "perl -ne 'print' q.txt",
+                    "awk '{system(\"date\")}' notes.md", "awk '{system($0)}' notes.md", "perl -ne 'system $_' ids.txt",
+                    "awk '{print | \"sort -u\"}' q.txt", "awk '$1 || $2' q.txt")
+
+    def test_3_a_refuse_line_split_by_a_backslash_newline_is_one_line(self):
+        self.files()
+        self.refused('cat q2.txt | bash', 'eval "$(cat q2.txt)"', 'source <(cat q2.txt)', 'sed e q2.txt',
+                     "sed -n '1e' q2.txt")
+
+    def test_4_an_unquoted_query_string_on_a_ruleset_path(self):
+        """An unquoted `?` is a glob (left as written when it matches no file): the path is cut there, as the
+        quoted form is cut at its query string."""
+        self.refused('gh api -X DELETE repos/o/r/rulesets/1/?x=1', 'gh api -X DELETE repos/o/r/rulesets/1?x=1',
+                     'gh api -X PUT repos/o/r/rulesets/1/?x=1 -f enforcement=disabled',
+                     "gh api -X DELETE 'repos/o/r/rulesets/1/?x=1'", 'gh api --method DELETE repos/o/r/rulesets/1/*')
+        self.passes('gh api repos/o/r/rulesets/1/?x=1', 'gh api repos/o/r/rulesets?includes_parents=1',
+                    'gh api -X DELETE repos/o/r/rulesets/1/history/?x=1', 'gh api -X DELETE repos/o/r/issues/1/?x=1')
+
+    def test_5_a_filter_into_a_shell_runs_its_input(self):
+        """One rule: a word whose output a shell or interpreter runs (also through data filters) hands on the text of
+        the files it reads, whatever the filter (sort, nl, cut, grep, rev, `$(< f)`); `sudo -s`, `doas -s`, bare
+        `sudo` and `xargs` with no command (or only `env`, a shell -c "{}") run the words they read."""
+        self.files()
+        self.refused('sort q.txt | bash', 'sort -u q.txt | sh', 'nl q.txt | cut -f2 | bash',
+                     'nl -ba d.txt | cut -f2 | bash', 'uniq q.txt | bash', 'rev q.txt | rev | bash',
+                     'grep -v x q.txt | bash', 'grep -v x d.txt | bash', 'cat q.txt | sudo -s', 'cat q.txt | sudo',
+                     'cat d.txt | sudo -i', 'cat q.txt | doas -s', 'sudo -s < q.txt', "sudo -s <<'EOF'\n" + self.T + '\nEOF',
+                     'bash -c "$(< q.txt)"', 'bash -c "$(< d.txt)"', 'x=$(< q.txt); bash -c "$x"',
+                     'python3 -c "$(< d.txt)"', 'cat q.txt | xargs -L1 env', 'cat d.txt | xargs -L1 env',
+                     'xargs -a q.txt sh -c', 'xargs -a q.txt -I{} sh -c "{}"', 'xargs -a d.txt -L1 env',
+                     'xargs --arg-file=q.txt -L1 env', 'cat q.txt | xargs -I{} sh -c "{}"')
+        self.passes('sort notes.md | bash', 'sort q.txt | head -1', 'nl q.txt | cut -f2', 'cat notes.md | sudo -s',
+                    'bash -c "$(< notes.md)"', 'cat ids.txt | xargs -L1 env', 'xargs -a ids.txt -L1 echo',
+                    'cat q.txt | sudo tee out.txt >/dev/null', 'sort q.txt > sorted.txt', 'x=$(< notes.md); echo "$x"',
+                    'xargs -a q.txt echo', 'grep -c fix q.txt')
+
+    def test_6_a_mere_mention_piped_into_a_program_that_reads_it_as_data_passes(self):
+        """The known over-refusal of #993, now narrowed: a refuse-script line that goes only into a program that
+        reads its input as data (a script file of an interpreter, `-m`, `claude -p`, `ssh host cat`, a compressor,
+        a pager) runs nowhere. Anything else is still refused, and a guarded token (not a refuse-script line) still
+        counts wherever it goes."""
+        self.files()
+        self.passes('cat msg.md | python3 tools/check.py', 'cat msg.md | node x.js', 'cat msg.md | ssh host cat',
+                    "cat msg.md | ssh host 'wc -l'", 'cat msg.md | claude -p hi', 'cat msg.md | gzip > m.gz',
+                    'cat msg.md | less', 'cat msg.md | grep -v y | python3 tools/check.py',
+                    'cat q.txt | python3 tools/check.py', 'cat msg.md | python3 -m json.tool', 'cat msg.md | xz -9 | wc -c')
+        self.refused('cat msg.md | python3', 'cat msg.md | python3 -', 'cat msg.md | node', 'cat msg.md | ssh host',
+                     'cat msg.md | ssh host bash', "cat msg.md | ssh host 'cat | sh'", 'cat q.txt | python3 tools/check.py | bash',
+                     'cat msg.md | python3 -c "import sys; exec(sys.stdin.read())"', 'cat msg.md | claude -p --bare hi',
+                     'cat msg.md | gzip -d | bash', 'cat msg.md | tee x | python3 tools/check.py', 'cat msg.md | less | sh',
+                     "cat msg.md | ssh host 'cat > f'; ssh host sh f", 'cat d.txt | python3 tools/check.py',
+                     'cat q.txt | python3 tools/check.py > out.sh; bash out.sh')
+
+    def test_7_the_same_command_twice_and_an_empty_one_decide_the_same(self):
+        """State question: the decisions above use no cached text, so a second run (the cache warm) answers the same,
+        and an empty command still passes."""
+        self.files()
+        for cmd in ('sort q.txt | bash', 'cat msg.md | python3 tools/check.py', 'cat q.txt | sudo -s',
+                    'gh api -X DELETE repos/o/r/rulesets/1/?x=1', 'cat q2.txt | bash'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd) is None, self.decide(cmd) is None)
+        self.assertIsNone(self.decide(''))
+
+
+class Pr1041Round1Test(Case):
+    """The lens findings of PR 1041 round 1, from the lenses' own examples: each is red on the round-0 head. The new
+    passes of #999 (a data reader, a compressor's file, a filter, a sed/awk -f script) trust only a short allow-list
+    and fail closed: nothing origin/main refused may pass."""
+    refused = Issue930Test.refused
+    passes = Issue930Test.passes
+    T = Issue930Test.T
+
+    def files(self):
+        Issue999Test.files(self)
+        D = self.dir
+        self.write('qpy.txt', f"import os\nos.system('python3 {GARDEN['name']} {GARDEN['flag']}')\n", 0o644)
+        self.write('p.txt', 'bash run.sh\n', 0o644)
+        self.write('run.sh', self.T + '\n')
+        self.write('b/ls', 'echo hi\n')
+        self.write('run.awk', '{system($0)}\n', 0o644)
+        self.write('run.pl', 'system $_ while <>;\n', 0o644)
+        self.write('list.txt', 'p.txt\n', 0o644)
+        self.write('ok.awk', '{print $1}\n', 0o644)
+        self.write('ok.sed', 's/a/b/\n', 0o644)
+        return dict(self.env, PATH=f'{D}/b:/usr/bin:/bin')
+
+    def test_1_a_data_reader_is_a_real_file_or_an_allow_listed_module(self):
+        """Major 1 (merge path) and code item E: stdin as the script through any spelling of /dev or /proc, `-m` of
+        anything but json.tool, `deno run -`, `bun run -`, a long flag before `-`."""
+        self.files()
+        self.refused('cat q.txt | python3 -m code', 'cat q.txt | python3 -m asyncio',
+                     'cat q.txt | python3 -m pdb tools/check.py', 'cat q.txt | python3 -m runpy /dev/stdin',
+                     'cat q.txt | python3 -m trace --trace /dev/stdin', 'cat qpy.txt | python3 //dev/stdin',
+                     'cat qpy.txt | python3 /dev/./stdin', 'cat qpy.txt | python3 /proc/self/fd//0',
+                     'cat qpy.txt | python3 /proc/thread-self/fd/0', 'cat qpy.txt | python3 /dev/fd/../fd/0',
+                     'cat qpy.txt | node /dev/./stdin', 'cat qpy.txt | python3 --check-hash-based-pycs never -',
+                     'cat qpy.txt | deno run -', 'cat qpy.txt | deno run /dev/stdin', 'cat qpy.txt | bun run -',
+                     'ln -s /dev/stdin s.py; cat qpy.txt | python3 s.py', 'cat q.txt | python3 -i tools/check.py',
+                     'printf x > tools/check.py; cat q.txt | python3 tools/check.py',
+                     'cp run.pl tools/check.py; cat q.txt | python3 tools/check.py',
+                     'cat q.txt | PYTHONPATH=. python3 tools/check.py', 'cat q.txt | node --require ./x.js tools/check.py',
+                     'cat q.txt | bash ../../../../../../dev/stdin', 'cat q.txt | sort | python3 -m code')
+        self.passes('cat msg.md | python3 -m json.tool', 'cat msg.md | python3 tools/check.py',
+                    'cat msg.md | sort | python3 tools/check.py', 'cat msg.md | python3 -I tools/check.py',
+                    'gh pr view 1 --json body | python3 -m json.tool', 'python3 tools/check.py < msg.md')
+
+    def test_2_a_compressed_file_that_the_same_command_unpacks_and_runs(self):
+        """Major 2 (merge path): a compressor may write its file only when nothing later in the command unpacks and
+        runs it, or runs any file."""
+        env = self.files()
+        self.refused('cat q.txt | gzip > y.gz; gunzip y.gz; bash y', 'cat q.txt | xz > y.xz; unxz y.xz; . y',
+                     'cat q.txt | gzip -c > y.gz; gzip -df y.gz; source y', 'cat q.txt | gzip > y.gz; zcat y.gz | sh',
+                     'cat q.txt | gzip > y.gz; f() { gunzip y.gz; bash y; }; f', 'cat q.txt | gzip --decomp',
+                     "cat q.txt | gzip > y.gz; alias ls='gunzip y.gz; bash y'; ls", env=env)
+        self.passes('cat msg.md | gzip > m.gz', 'cat msg.md | xz -9 | wc -c', env=env)
+
+    def test_3_any_filter_into_a_shell_hands_on_its_input(self):
+        """Major 3 (code): awk and perl filters, also with the input on `<`, are filters like sort and grep."""
+        self.files()
+        self.refused("awk 'NR>1' d.txt | bash", 'awk 1 d.txt | bash', "awk '{print}' d.txt | bash", 'gawk 1 d.txt | bash',
+                     "perl -pe '' q.txt | bash", 'awk 1 < q.txt | bash', 'sort q.txt | at now', 'sort q.txt | batch',
+                     'sort q.txt | flock L sh', 'sort q.txt | sudo su', 'sort q.txt | su', 'sort q.txt | make -f -',
+                     'sort q.txt > r.sh; bash r.sh', 'sort -o r.sh q.txt; bash r.sh', 'su - x < q.txt')
+        self.passes('awk 1 notes.md | bash', 'sort notes.md | bash', "awk '{print $1}' q.txt", 'sed -n 1p q.txt',
+                    'grep -n fix q.txt', 'git log --oneline | head', 'sort -u ids.txt -o ids.txt')
+
+    def test_4_rsync_into_a_path_folder_like_cp_r(self):
+        """Major 4 (code): the rsync line in data_gate was dead; rsync of a folder into a PATH folder is refused."""
+        env = self.files()
+        D = self.dir
+        self.refused(f'rsync -a ./ {D}/b/; ls', f'rsync -a . {D}/b; ls', f'rsync --files-from=list.txt . {D}/b/; ls',
+                     f'cp -r ./ {D}/b/; ls', env=env)
+        self.passes('rsync -a ./ out/', env=env)
+
+    def test_5_a_script_file_the_same_command_writes_first_is_not_trusted(self):
+        """Major 5 (state): sed -f / awk -f read a file an earlier part of the command writes or replaces: unknown,
+        like a file that does not exist yet."""
+        env = self.files()
+        D = self.dir
+        self.refused(f"printf 'w {D}/b/ls\\n' > ids.txt; sed -n -f ids.txt p.txt; ls",
+                     f"printf '{{print > \"{D}/b/ls\"}}\\n' > ids.txt; awk -f ids.txt p.txt; ls",
+                     'cp run.awk ids.txt; awk -f ids.txt q.txt',
+                     f"printf 's/x/y/w {D}/b/ls\\n' | tee ids.txt; sed -f ids.txt p.txt; ls",
+                     f"sed -i 's/1/w {D}\\/b\\/ls/' ids.txt; sed -n -f ids.txt p.txt; ls", env=env)
+        self.passes('awk -f ok.awk q.txt', 'sed -f ok.sed q.txt', 'awk -f ok.awk q.txt > out.txt',
+                    'sed -f ok.sed notes.md > out.txt; cat out.txt', 'sed -i -f ok.sed notes.md', env=env)
+
+    def test_6_the_minors(self):
+        """gawk -E/-i program files, perl readpipe/open2, xargs and parallel argument files, awk and perl input
+        through `<`/getline/a script file, awk pipes past the first command and joined write targets,
+        `$(cat < f)`, a `while read` loop that runs its lines."""
+        env = self.files()
+        D = self.dir
+        self.refused('gawk -E run.awk q.txt', 'gawk --exec=run.awk q.txt', 'gawk -i run.awk q.txt',
+                     'gawk --include run.awk q.txt', 'gawk --ex run.awk q.txt', 'awk -bf run.awk q.txt',
+                     "perl -ne 'readpipe $_' q.txt", "perl -MIPC::Open2 -ne 'open2(my $o, my $i, $_)' q.txt",
+                     'xargs --arg-file q.txt -L1 env', 'xargs -aq.txt -L1 env', 'xargs -L1 env < q.txt',
+                     'sort q.txt | xargs -L1 env', "awk '{system($0)}' < q.txt",
+                     "awk 'BEGIN{while ((getline l < \"d.txt\") > 0) system(l)}'", 'perl run.pl q.txt',
+                     "perl -e 'system $_ for <STDIN>' < q.txt", "awk '{print | \"true; sh\"}' q.txt",
+                     "awk '{print | \"sort\" \";sh\"}' q.txt", 'bash -c "$(cat < q.txt)"', 'parallel -a d.txt',
+                     'parallel :::: d.txt', 'parallel -aq.txt', 'cat q.txt | parallel',
+                     'while read -r l; do $l; done < d.txt', 'while read l; do eval "$l"; done < d.txt',
+                     'while read l; do bash -c "$l"; done < q.txt',
+                     # round 2: `$(< f 2>/dev/null)` reads f like `$(< f)` (other redirects next to the `<`)
+                     'bash -c "$(< d.txt 2>/dev/null)"', 'x=$(< d.txt 2>/dev/null); $x', '$(< d.txt 2>/dev/null)',
+                     'bash -c "$(< q.txt 2>&1)"', '$(2>/dev/null < q.txt)', env=env)
+        self.refused(f"awk '{{print > \"{D}/b/\" \"ls\"}}' p.txt; ls", f"awk -v d={D}/b/ '{{print > d \"ls\"}}' p.txt; ls",
+                     env=env)
+        self.passes("awk '{print > \"out.txt\"}' p.txt", "awk '{print | \"sort\"}' p.txt", "perl -i -pe 's/a/b/' notes.md",
+                    "perl -pi -e 's/a/b/' notes.md", "sed -i 's/a/b/' notes.md", "awk -F, '{print $2}' notes.md",
+                    'gh api repos/o/r/pulls?per_page=5', "gh api graphql -f query='query { viewer { login } }'",
+                    'xargs gh pr view < ids.txt', "find . -name '*.py' | xargs grep x", 'cat ids.txt | xargs -n1 echo',
+                    env=env)
+
+    def test_8_an_interpreter_that_runs_a_file_on_stdin(self):
+        """r1b: python/node/perl/ruby whose script comes from stdin through `<` (no pipe), a here-string or a
+        heredoc fed from a file: a refuse-script line in that file is refused, as for a shell. A script file that
+        reads the file as data (an allow-listed data reader) still passes."""
+        env = self.files()
+        self.refused('python3 - < qpy.txt', 'python3 /dev/./stdin < qpy.txt', 'python3 < qpy.txt',
+                     'python3 -u < qpy.txt', 'python3 /proc/self/fd/0 < qpy.txt', 'python3 -W ignore - < qpy.txt',
+                     'node < qpy.txt', 'node - < qpy.txt', 'node /dev/stdin < qpy.txt', 'perl < q.txt', 'ruby < q.txt',
+                     'sudo python3 < qpy.txt', 'env python3 < qpy.txt', 'python3 - <<< "$(< qpy.txt)"',
+                     'python3 - <<EOF\n$(cat qpy.txt)\nEOF', env=env)
+        self.passes('python3 tools/check.py < msg.md', 'python3 tools/check.py < q.txt', 'python3 - < notes.md',
+                    'python3 -m json.tool < msg.md', 'node x.js < msg.md', 'python3 - <<< "print(1)"',
+                    "python3 - <<'EOF'\nprint(1)\nEOF", 'cat < q.txt', 'grep fix < q.txt', env=env)
+
+    def test_9_a_json_module_created_in_the_same_command(self):
+        """r1b: `python3 -m json.tool` loads a json.py or json/ from the folder first: one created by the same
+        command (touch, mkdir, as well as a write) makes it no data reader."""
+        env = self.files()
+        self.refused('touch json.py; cat q.txt | python3 -m json.tool', 'touch -- json.py; cat q.txt | python3 -m json.tool',
+                     'mkdir json; cat q.txt | python3 -m json.tool',
+                     'mkdir -p json && touch json/__init__.py; cat q.txt | python3 -m json.tool',
+                     'echo x > json.py; cat q.txt | python3 -m json.tool', env=env)
+        self.write('json.py', '', 0o644)
+        self.refused('cat q.txt | python3 -m json.tool', env=env)
+        os.remove(os.path.join(self.dir, 'json.py'))
+        # (round 2: `mkdir -p out; python3 tools/check.py < msg.md` is refused now, Pr1041Round2Test test_3)
+        self.passes('touch out.txt; cat msg.md | python3 -m json.tool', 'mkdir -p out; python3 tools/check.py < notes.md',
+                    'cat msg.md | python3 -m json.tool', env=env)
+
+    def test_7_the_new_checks_answer_the_same_twice(self):
+        """State question: the new checks read files each time and keep no text in the cache, so a second run (the
+        cache warm) answers the same as the first; an empty command passes."""
+        env = self.files()
+        for cmd in ('cat qpy.txt | python3 /dev/./stdin', 'cat q.txt | gzip > y.gz; gunzip y.gz; bash y',
+                    'awk 1 d.txt | bash', 'cp run.awk ids.txt; awk -f ids.txt q.txt', 'cat msg.md | python3 -m json.tool',
+                    'awk -f ok.awk q.txt', 'x=$(< notes.md 2>/dev/null)'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd, env) is None, self.decide(cmd, env) is None)
+        self.assertIsNone(self.decide('', env))
+        # round 2: a harmless `$(< f 2>/dev/null)` decides without an exception, and passes
+        self.assertIsNone(self.decide('x=$(< notes.md 2>/dev/null)', env))
+
+
+class Pr1041Round2Test(Case):
+    """The lens findings of PR 1041 round 2: each is red on the round-1 head (c94b1d35)."""
+    refused = Issue930Test.refused
+    passes = Issue930Test.passes
+    T = Issue930Test.T
+    pipe = GuardTest.pipe
+    event = GuardTest.event
+
+    def files(self):
+        env = Pr1041Round1Test.files(self)
+        self.write('evil.py', 'import sys; exec(sys.stdin.read())\n', 0o644)
+        self.write('tools/cj.py', 'import json, sys\nprint(len(sys.stdin.read()))\n', 0o644)
+        self.write('tools/imp.py', 'import helper, sys\nprint(len(sys.stdin.read()))\n', 0o644)
+        self.write('pre/argparse.py', 'x = 1\n', 0o644)
+        self.write('mk/json.py', 'x = 1\n', 0o644)
+        self.write('sub/keep.txt', 'x\n', 0o644)
+        return env
+
+    def test_1_a_part_with_no_words_does_not_crash(self):
+        """Blocker (both lenses): `( bash ) < f` and `$(< f 2>/dev/null)` crashed the check of a bare shell, and a
+        crash passed when the text held no gh or HTTP words."""
+        env = self.files()
+        self.refused('( bash ) < d.txt', '(sh)<d.txt', '( . /dev/stdin ) < d.txt', '( bash -s ) < run.sh',
+                     '( bash ) <<< "$(cat d.txt)"', 'cd . && (bash < /dev/stdin) < d.txt',
+                     'eval "$(< d.txt 2>/dev/null)"', 'eval "$(< q.txt 2>/dev/null)"', '( bash ) < q.txt', env=env)
+        self.passes('( cat ) < notes.md', '< notes.md', 'x=$(< notes.md 2>/dev/null); echo "$x"', env=env)
+
+    def test_2_a_crash_fails_closed_when_the_command_may_run_hidden_text(self):
+        """Root cause of the blocker: after a crash only a plain call of a known system program passes (no `<`,
+        `$`, backtick or backslash, no shell, interpreter, wrapper or script word)."""
+        crash = {'ACTIONS_DISABLE_GUARD_TEST_CRASH': '1'}
+        for cmd in ('( bash ) < d.txt', 'cat x | python3 -', './run.sh', 'x=$(cat f)', 'eval "$y"', 'b=1 sh x',
+                    'ls; source x', 'make -f x.mk', 'hash -p run.sh ls; ls',
+                    # r3: quotes inside a word, braces, a shell under another name, a launcher in front
+                    "ba''sh d.txt", '"ba"sh d.txt', "py''thon3 qpy.txt", '{bash,d.txt}', 'rbash d.txt', 'rksh d.txt',
+                    'taskset 1 bash d.txt', 'unshare bash d.txt', 'chrt -o 0 bash d.txt', 'nice -n1 bash d.txt',
+                    'prlimit bash d.txt', 'ls *; bash d.txt'):
+            with self.subTest(cmd=cmd):
+                r = self.pipe(self.event(cmd), crash)
+                self.assertEqual(json.loads(r.stdout)['hookSpecificOutput']['permissionDecision'], 'deny', r.stderr)
+        for cmd in ('ls -la', 'echo hi', 'wc -l notes.md'):
+            with self.subTest(cmd=cmd):
+                r = self.pipe(self.event(cmd), crash)
+                self.assertEqual((r.returncode, r.stdout), (0, ''), r.stderr)
+
+    def test_3_no_command_of_the_tests_crashes_in_a_group_redirect_or_substitution(self):
+        """Every string of this file and capacity-pipe.test.py, wrapped as the lens did (a group fed a file, a
+        `$(< f 2>/dev/null)` in front, a { } group fed a file, a subshell, eval, bash -c), decides without an
+        exception."""
+        import ast
+        env = self.files()
+        here = os.path.dirname(os.path.abspath(__file__))
+        seen = {}
+        for name in ('actions-disable.test.py', 'capacity-pipe.test.py'):
+            with open(os.path.join(here, name)) as f:
+                for node in ast.walk(ast.parse(f.read())):
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str) and 0 < len(node.value) < 400:
+                        seen.setdefault(node.value, None)
+        bad = []
+        for s in seen:
+            for w in ('( {} ) < d.txt', '$(< d.txt 2>/dev/null) {}', '{{ {}; }} < d.txt', '( {} )', 'eval "{}"',
+                      'bash -c "{}"'):
+                try:
+                    self.decide(w.format(s), env)
+                except Exception as e:   # noqa: BLE001 - the test counts every kind
+                    bad.append((w.format(s)[:80], type(e).__name__))
+        self.assertEqual(bad[:10], [], f'{len(bad)} commands crash')
+
+    def test_4_stderr_redirects_in_a_file_substitution(self):
+        """Code lens: `$(< f 2>/dev/null)` reads f like `$(< f)`."""
+        env = self.files()
+        self.refused('bash -c "$(< d.txt 2>/dev/null)"', 'x=$(< d.txt 2>/dev/null); $x', '$(< d.txt 2>/dev/null)',
+                     'bash -c "$(< q.txt 2>&1)"', '$(2>/dev/null < q.txt)', env=env)
+        self.passes('x=$(< notes.md 2>/dev/null)', 'echo "$(< notes.md 2>/dev/null)"', env=env)
+
+    def test_5_a_data_reader_after_a_python_module_is_planted(self):
+        """Merge-path major: python loads a module from the script's folder (or cwd for -m) before the stdlib, so
+        a command that writes a code file or makes a folder, or a folder that already holds a stdlib name, makes it
+        no data reader; -I (or -P) does not look there."""
+        env = self.files()
+        self.refused('cp evil.py argparse.py; cat qpy.txt | python3 -m json.tool',
+                     'cp evil.py re.py; cat qpy.txt | python3 -m json.tool',
+                     'cp evil.py tools/json.py; cat qpy.txt | python3 tools/cj.py',
+                     'cp evil.py tools/helper.py; cat qpy.txt | python3 tools/imp.py',
+                     'cd pre && cat qpy.txt | python3 -m json.tool',
+                     'cp evil.py argparse.pyc; cat qpy.txt | python3 -m json.tool',
+                     'cp -r pre re; cat qpy.txt | python3 -m json.tool',
+                     'cp evil.py tools/json.py; python3 tools/cj.py < qpy.txt',
+                     'cp evil.py argparse.py; python3 -m json.tool < qpy.txt',
+                     'cp evil.py pre/re.py; cd pre && python3 -m json.tool < q.txt',
+                     # item 5 of the round: a pipe into a group feeds the whole group, and mk holds json.py
+                     'cat q.txt | (cd mk && python3 -m json.tool)',
+                     # the stricter rule: also a folder made, or another program that may write files
+                     'mkdir -p out; python3 tools/check.py < msg.md', 'git status; python3 tools/check.py < msg.md',
+                     env=env)
+        self.passes('cat q.txt | python3 -I -m json.tool', 'cd pre && cat q.txt | python3 -I -m json.tool',
+                    'cd sub && cat q.txt | python3 -m json.tool', 'cat q.txt | python3 tools/check.py',
+                    'python3 -I tools/check.py < q.txt', 'touch out.txt; cat q.txt | python3 tools/check.py', env=env)
+
+    def test_6_the_minors(self):
+        """An alias for the data reader, stdin through a group, `exec <` or `xargs -a`, a line read into a variable
+        and run, perl do/require and ruby load/instance_eval of a line, a pipe into a group."""
+        env = self.files()
+        self.refused('alias python3=bash; cat q.txt | python3 tools/check.py',
+                     'alias python3=bash\ncat q.txt | python3 tools/check.py',
+                     'alias python3=bash; python3 tools/check.py < q.txt',
+                     '{ python3 -; } < qpy.txt', 'exec 0< qpy.txt; python3 -', 'exec < qpy.txt; python3 -',
+                     'xargs -0 -a qpy.txt python3 -c', 'read -r x < d.txt; $x', 'read -r x < q.txt; $x',
+                     'mapfile -t a < q.txt; "${a[@]}"', "perl -ne 'do+$_' q.txt", "perl -ne 'require+$_' q.txt",
+                     "ruby -ne 'load $_' q.txt", "ruby -ne 'instance_eval $_' q.txt",
+                     'cat qpy.txt | (cd sub && python3 -)', 'cat q.txt | (cd sub && bash)',
+                     'cat d.txt | { cd sub; bash; }', 'cat q.txt | (true; bash)', 'cat q.txt | { true; bash; }',
+                     '{ python3 tools/check.py; } < msg.md', env=env)
+        self.passes("perl -ne 'print' msg.md", "ruby -ne 'print' msg.md", 'read -r x < notes.md; echo "$x"',
+                    'mapfile -t a < notes.md; echo "${a[@]}"', '{ cat; } < notes.md',
+                    '{ python3 tools/check.py; } < notes.md', 'python3 tools/check.py < msg.md',
+                    "python3 -c 'import sys; print(open(sys.argv[1]).read())' msg.md", env=env)
+
+    def test_7_braces_in_the_command_word_and_restricted_shells(self):
+        """r3 (merge path, passed on main too): the shell makes `bash run.sh` of `{bash,run.sh}`, and rbash/rksh
+        are bash/ksh. The guard now also reads the words a literal brace makes; braces in arguments still pass."""
+        env = self.files()
+        self.refused('{bash,d.txt}', '{bash,run.sh}', '{sudo,bash} d.txt', '{python3,run.sh}',
+                     'cat {d,ids}.txt | bash', 'x{,}; {bash,d.txt}', 'rbash d.txt', 'rksh d.txt', 'rbash run.sh',
+                     'mksh d.txt', env=env)
+        self.passes('echo {a,b}', 'mkdir -p x/{a,b}', 'cp notes.md notes.md{,.bak}', 'ls {a,b}.txt',
+                    'touch {a,b}.txt', 'echo {1..3} {a..c} {1..9..2}', 'echo a{b,{c,d}}e', '{echo,hi}',
+                    "grep -E 'a{2,3}' notes.md", "awk '{print $1}' notes.md", 'cat {notes,ids}.md', 'echo ${HOME}',
+                    # `bash bsh d.txt`: bash runs the file bsh (there is none), d.txt is only its argument
+                    'b{a,}sh d.txt', env=env)
 
 
 if __name__ == '__main__':

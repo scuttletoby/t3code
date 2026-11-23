@@ -24,7 +24,8 @@ attack, this is a mistake):
     `--split-string` run the words of TEXT, which are read as the command; the keyword `time [-p]` before a group);
   - commands inside `$(..)`, backticks, `<(..)`, and a `( .. )` or `{ ..; }` group whose LAST command is the check;
   - shell text handed on, read again by the same rules: `bash -c '..'` (sh, zsh, dash, ksh, su, runuser; also behind
-    another word: `heavy bash -c`, `timeout 60 bash -lc`), `eval ..`, `ssh host '..'`, `watch '..'`, and a heredoc into
+    another word: `heavy bash -c`, `timeout 60 bash -lc`; su and runuser also glued `-c'..'`, `-lc'..'`,
+    `--command[=]..` and `--session-command[=]..`), `eval ..`, `ssh host '..'`, `watch '..'`, and a heredoc into
     a shell.
 Text that only mentions it passes: echo, grep, commit messages, a heredoc into cat/tee/a file (briefs), comments.
 
@@ -76,6 +77,7 @@ CLOSERS = {'}', 'fi', 'done', 'esac'}
 ASSIGN = re.compile(r'[A-Za-z_]\w*\+?=')
 PLAIN = re.compile(r'-|\d+(\.\d+)?[smhd]?$')   # a wrapper's flag, or its number / duration (timeout 5m, nice 10)
 C_FLAG = re.compile(r'-[A-Za-z]*c[A-Za-z]*$')  # -c, -lc, -ec
+GETOPT_SHELLS = {'su': 'gGsw', 'runuser': 'ugGsw'}   # read their flags like getopt; value: letters taking a value
 REDIR = re.compile(r'&>>|&>|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>')
 VAR = re.compile(r'\$(?:[A-Za-z_]\w*|[0-9@*#?$!-])')
 
@@ -153,16 +155,60 @@ def command_at(ws):
     return ws, len(ws)
 
 
+def shell_text(shell, w, rest):
+    """The shell text the word w (and the words behind it, rest) hands to shell, or None. `-c TEXT` and a cluster
+    (-lc, -ec); su and runuser read their options as getopt does, so also a glued `-cTEXT` / `-lcTEXT` (a letter that
+    takes a value before the c ends the cluster: `-uc` is user c), `--command[=]TEXT`, `--session-command[=]TEXT`
+    and any unambiguous start of those (`--co=`, `--se`)."""
+    if shell not in GETOPT_SHELLS:
+        return (rest[0] if rest else None) if C_FLAG.match(w) else None
+    if w.startswith('--'):
+        name, eq, value = w[2:].partition('=')
+        if name and ('command'.startswith(name) or len(name) > 1 and 'session-command'.startswith(name)):
+            return value if eq else (rest[0] if rest else None)
+        return None
+    if len(w) < 2 or w[0] != '-':
+        return None
+    for j, ch in enumerate(w[1:], 1):
+        if ch == 'c':
+            return w[j + 1:] or (rest[0] if rest else None)
+        if ch in GETOPT_SHELLS[shell] or not ch.isalpha():
+            return None
+    return None
+
+
+GETOPT_LONG = ('shell', 'group', 'supp-group', 'whitelist-environment', 'user')   # su/runuser long flags with a value
+
+
+def takes_value(shell, w):
+    """Whether the flag word w of su/runuser takes the next word as its value: -s, -g, -G, -w (runuser -u) alone or
+    last in a cluster (-ls), --shell and any start of the long flags that take one."""
+    if shell not in GETOPT_SHELLS or not w.startswith('-') or w == '-':
+        return False
+    if w.startswith('--'):
+        name, eq, _ = w[2:].partition('=')
+        return not eq and len(name) > 1 and any(f.startswith(name) for f in GETOPT_LONG)
+    for j, ch in enumerate(w[1:], 1):
+        if ch in GETOPT_SHELLS[shell]:
+            return j == len(w) - 1
+    return False
+
+
 def handed_on(ws, depth):
     """Read the shell text a simple command hands on. True when a shell is among its words (its heredoc is commands)."""
     ws, k = command_at(ws)   # first: env -S TEXT puts the words of TEXT in place
-    shell = False
+    shell, skip = None, False
     for n, w in enumerate(ws):
-        if base(w) in SHELLS:
-            shell = True
-        elif shell and C_FLAG.match(w) and n + 1 < len(ws):
-            read(ws[n + 1], depth=depth + 1)
-            break
+        if skip:   # su -s /bin/sh -c ..: the value of a flag is no shell of its own
+            skip = False
+        elif base(w) in SHELLS and not w.startswith('-'):   # -ls/bin/sh is a flag cluster, not sh
+            shell = base(w)
+        elif shell:
+            text = shell_text(shell, w, ws[n + 1:])
+            if text is not None:
+                read(text, depth=depth + 1)
+                break
+            skip = takes_value(shell, w)
     if k < len(ws):
         word, args = base(ws[k]), ws[k + 1:]
         if word == 'eval':
@@ -171,7 +217,7 @@ def handed_on(ws, depth):
             for a in args:
                 if any(t in a for t in CHECKS):
                     read(a, depth=depth + 1)
-    return shell
+    return bool(shell)
 
 
 def dollar(s, i, out, depth):

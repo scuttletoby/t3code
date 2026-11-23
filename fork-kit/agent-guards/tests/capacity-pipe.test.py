@@ -100,6 +100,26 @@ REFUSED = [
     "runuser someone -c 't3-capacity 1 | tail'",
     "runuser -l someone -c 't3-capacity 1 | tail -1'",
     "runuser -c 't3-capacity 1 | tail' someone",
+    # issue 999: the text of su / runuser glued to -c (also in a letter cluster) or given as a long flag
+    "runuser -c't3-capacity 1 | tail' someone",
+    "runuser -lc't3-capacity 1 | tail' someone",
+    "runuser someone -c't3-capacity 1 | tail'",
+    "su -c't3-capacity 1 | tail' someone",
+    "su -lc't3-capacity 1 | tail'",
+    "runuser --command='t3-capacity 1 | tail' someone",
+    "runuser --command 't3-capacity 1 | tail' someone",
+    "runuser --co='t3-capacity 1 | tail' someone",
+    "su --command='t3-capacity 1 | tail' someone",
+    "su --session-command='t3-capacity 1 | tail' someone",
+    "su --session-command 't3-capacity 1 | tail' someone",
+    "sudo runuser -u someone --command='t3-capacity 1 | tail'",
+    # PR 1041 round 1: the value of -s / --shell (also glued at the end of a cluster) is no shell of its own
+    "su -s /bin/sh -c't3-capacity 1 | tail' someone",
+    "su -s /bin/sh -c 't3-capacity 1 | tail' someone",
+    "su -ls/bin/sh -c't3-capacity 1 | tail' someone",
+    "su -ls /bin/sh -c't3-capacity 1 | tail' someone",
+    "su --shell /bin/bash -c't3-capacity 1 | tail' someone",
+    "runuser -u someone -s /bin/sh -c't3-capacity 1 | tail'",
     'heavy t3-capacity 1 | tail',
     'heavy --wait 60 t3-capacity 1 | tail',
     'heavy --kind test --mb 512 -- t3-capacity 1 | tail',
@@ -231,6 +251,11 @@ ALLOWED = [
     'runuser -s t3-capacity -u someone ls | tail',
     'heavy --kind t3-capacity ls | tail',
     "runuser someone -c 'grep t3-capacity x | tail'",
+    "runuser someone -c'grep t3-capacity x | tail'",            # issue 999: glued and long forms read the same way
+    "su --command='t3-capacity 1 > f && x' someone | tail",
+    "runuser -s'/bin/sh' --shell=t3-capacity someone | tail",   # values of -s / --shell, no text to read
+    "su --session-command='echo t3-capacity | tail'",
+    "su -s /bin/sh -c'grep t3-capacity x | tail' someone",       # PR 1041: still read as text, nothing piped
     'heavy sweep --dry-run | tail',
     'taskset -p 1234 | tail',
     'python3 -I scripts/dev/run_tests.py scripts/dev/tests/test_t3_capacity.py 2>&1 | tail -5',
