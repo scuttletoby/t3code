@@ -185,7 +185,8 @@ def run_project(cfg, project, args, t, gh_factory):
         for check in project['checks']:
             c = dict(check, fix=check['fix'] and not args.dry_run)
             try:
-                got, ok = runner.run(project, c, today, cfg['gh'])
+                got, ok = runner.run(project, c, today, cfg['gh'], os.path.join(folder, 'cache', check['id']),
+                                     args.dry_run)
             except Exception as e:             # a MemoryError too: one check never stops the run
                 got, ok = [runner.failed(check, 'the gardener could not run it', type(e).__name__)], False
             findings += got
@@ -195,12 +196,13 @@ def run_project(cfg, project, args, t, gh_factory):
         home = report.home_dir()
         text_checks = {c['id'] for c in project['checks'] if c['name'] or c['publicText']}
         counts = counts_only(cfg, project, gh_factory)
-        public = report.public_findings(findings, root, home, project['reportRepo'], text_checks, counts)
+        public = report.public_findings(findings, root, home, project['reportRepo'], text_checks, counts,
+                                        project['repo'])
         answer, note = judge.judge(project['model'], public, root)
         if note:
             notes.append(note)
         part = report.render_issue(name, today, findings, notes, answer, root, home, project['reportRepo'],
-                                   text_checks, counts)
+                                   text_checks, counts, project['repo'])
         full = report.render_local(name, today, findings, notes, answer)
         if args.dry_run:
             say(f'{name}: dry run: the report issue would get:')

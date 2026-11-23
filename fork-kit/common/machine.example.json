@@ -47,6 +47,7 @@
           { "name": "worktrees", "options": { "staleDays": 14 } },
           { "name": "workflows-off", "options": { "ignore": ["old-deploy.yml"] } },
           { "name": "install-drift" },
+          { "name": "review-tiers", "options": { "days": 7, "waivers": ["no review needed:"] } },
           { "path": "/srv/example/bin/doc-check", "id": "docs", "timeoutSeconds": 120 }
         ]
       }
