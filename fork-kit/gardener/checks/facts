@@ -1,0 +1,40 @@
+#!/usr/bin/python3 -IB
+"""facts: the state tables of the project root's folder, through the agent-guards kit's `facts --check`
+(fork-kit/agent-guards/FACTS.md). Report only.
+
+It runs `facts --check --no-records` in the project root, so only the machine's tables and this project's are
+read; never --all, whose output may name other, private projects. Each problem line is one finding, its `where`
+the table file: the report issue counts the findings of a table outside the repository (the machine's) and names
+rows only of the project's own tables; the local report names them all.
+
+Options:
+  command   "facts": the facts command (a name on PATH or an absolute path)
+"""
+import os, re, shutil, subprocess, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from gardener.contract import emit, read_context  # noqa: E402
+
+ctx = read_context()
+cmd = ctx['options'].get('command') or 'facts'
+exe = cmd if os.path.isabs(cmd) else shutil.which(cmd)
+if not exe or not os.access(exe, os.X_OK):
+    emit('facts.not-installed', 'info', f'the facts command ({cmd}) is not installed here: tables not checked',
+         '', 'install the agent-guards kit, or drop this check')
+    sys.exit(0)
+p = subprocess.run([exe, '--check', '--no-records'], cwd=ctx['project']['root'] or None, capture_output=True,
+                   text=True, timeout=120, stdin=subprocess.DEVNULL)
+if p.returncode not in (0, 1):
+    sys.exit(f'facts --check exited with {p.returncode}: {(p.stderr or p.stdout).strip()[-200:]}')
+for line in p.stdout.splitlines():
+    m = re.match(r'^facts check: (.*)$', line)
+    if not m:
+        continue
+    text = m.group(1)
+    if re.match(r'^(OK \(|\d+ finding\(s\)$)', text):
+        continue
+    where, sep, rest = text.partition(': ')
+    if not sep or ' ' in where:
+        where, rest = '', text
+    stale = 'days old' in rest or 'in the future' in rest or 'no date' in rest
+    emit('facts.stale' if stale else 'facts.table', 'warn', rest, where,
+         'check the thing, then edit its row (and its Updated date)' if stale else 'fix the table (facts --check)')

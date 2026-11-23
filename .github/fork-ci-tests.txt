@@ -125,6 +125,10 @@ fork-kit/common/tests/kit_install.test.py ~125s unittest
 fork-kit/common/tests/machine_file.test.py unittest
 fork-kit/desk/tests/install.test.py ~103s unittest
 fork-kit/desk/tests/windows.test.py ~65s unittest
+fork-kit/gardener/tests/checks.test.py unittest
+fork-kit/gardener/tests/install.test.py unittest
+fork-kit/gardener/tests/report.test.py unittest
+fork-kit/gardener/tests/run.test.py ~30s unittest
 fork-kit/golive/tests/back.test.py ~100s unittest
 fork-kit/golive/tests/check.test.py unittest
 fork-kit/golive/tests/contract.test.py unittest
