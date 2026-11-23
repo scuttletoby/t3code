@@ -220,6 +220,6 @@ whether `--timer` is on) and `installed.tsv`; the tick's state in `/var/lib/upda
 
 `tests/*.test.py`, run with `python3 -I -B fork-kit/update-policy/tests/NAME.test.py` from the repository root:
 fake cgroups, `/proc`, sockets and programs in a temporary folder, a fixed clock. No root, no systemd, no network.
-`tick.test.py` and `idle.test.py` end with a red check that breaks each rule in a copy of the code and shows its
-test then fails. What every kit's installer does is tested in
+Each file ends with a red check that breaks each rule in a copy of the code (or the installer) and shows its test
+then fails. What every kit's installer does is tested in
 [kit_install.test.py](../common/tests/kit_install.test.py); `install.test.py` covers this kit's own files.
