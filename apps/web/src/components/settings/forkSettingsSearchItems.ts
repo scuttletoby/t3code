@@ -10,7 +10,7 @@ const FORK_PAGE = "/settings/fork" as const;
 export const FORK_SETTINGS_SEARCH_ITEMS = [
   {
     id: "fork-status",
-    title: "Fork features on or off",
+    title: "What the fork has on",
     to: FORK_PAGE,
     searchTerms: ["fork overview status enabled report"],
     environmentOnly: true,
@@ -33,7 +33,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   })),
   {
     id: "wait-checks",
-    title: "Wait checks",
+    title: "Custom wait checks",
     to: FORK_PAGE,
     searchTerms: ["wait_for check command exit code poll condition"],
     environmentOnly: true,
@@ -57,7 +57,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   })),
   {
     id: "usage-pacing-gate",
-    title: "Usage pacing gate",
+    title: "Pace agents by plan usage",
     to: FORK_PAGE,
     searchTerms: ["usagePacingGate delegate_task usage limits pace advise enforce"],
     environmentOnly: true,
@@ -73,7 +73,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "usage-pacing",
-    title: "Usage reserve per account",
+    title: "Share of each plan kept for you",
     to: FORK_PAGE,
     searchTerms: [
       "usagePacing reservePercent burn first burnFirstWindows window weekly monthly 5-hour no limits api key provider account",
@@ -83,7 +83,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "model-policy",
-    title: "Model policy",
+    title: "Limit which models agents pick",
     to: FORK_PAGE,
     searchTerms: [
       "modelPolicy delegate_task create_threads t3_thread_launch allowed models effort advise enforce",
@@ -101,7 +101,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "model-policy-picks",
-    title: "Your model picks and the policy",
+    title: "Your own model picks",
     to: FORK_PAGE,
     searchTerms: ["modelPolicy outside policy default model text generation fallback"],
     environmentOnly: true,
@@ -125,7 +125,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "automatic-updates-quiet-command",
-    title: "Quiet check before an update",
+    title: "Ask a program before updating",
     to: FORK_PAGE,
     searchTerms: ["automaticUpdatesQuietCommand program exit code not now"],
     environmentOnly: true,
@@ -133,7 +133,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "handoff",
-    title: "Handoff instead of compaction",
+    title: "Hand off instead of compacting",
     to: FORK_PAGE,
     searchTerms: ["handoff compaction compact long thread fresh session context"],
     environmentOnly: true,
@@ -141,7 +141,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "handoff-threads",
-    title: "Handoff mode per thread",
+    title: "Choice per thread",
     to: FORK_PAGE,
     searchTerms: ["handoff threads thread id own mode"],
     environmentOnly: true,
@@ -149,7 +149,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "handoff-size",
-    title: "Handoff size",
+    title: "Hand off at this size",
     to: FORK_PAGE,
     searchTerms: ["handoff sizeTokens backstop tokens"],
     environmentOnly: true,
@@ -157,7 +157,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "handoff-idle",
-    title: "Idle handoff size",
+    title: "Hand off an idle thread from",
     to: FORK_PAGE,
     searchTerms: ["handoff idleTokens prompt cache idle tokens"],
     environmentOnly: true,
@@ -165,7 +165,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "handoff-source",
-    title: "Handoff written by",
+    title: "Who writes the handoff note",
     to: FORK_PAGE,
     searchTerms: ["handoff source agent command program"],
     environmentOnly: true,
@@ -173,7 +173,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "handoff-instructions",
-    title: "Handoff instructions",
+    title: "What the handoff note should say",
     to: FORK_PAGE,
     searchTerms: ["handoff instructions text prompt"],
     environmentOnly: true,
@@ -181,7 +181,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "playtest",
-    title: "Playtest sessions",
+    title: "Let agents run playtests",
     to: FORK_PAGE,
     searchTerms: ["playtest test target staging round adapter"],
     environmentOnly: true,
@@ -189,7 +189,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "playtest-steps",
-    title: "Playtest steps",
+    title: "Commands for each playtest step",
     to: FORK_PAGE,
     searchTerms: ["playtest claim renew push release adapter argv program"],
     environmentOnly: true,
@@ -221,7 +221,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "mcp-profiles",
-    title: "MCP profiles",
+    title: "Profiles and their tools",
     to: FORK_PAGE,
     searchTerms: ["mcpProfiles mcp profile servers t3Tools tool groups all t3-only"],
     environmentOnly: true,
@@ -229,7 +229,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "mcp-profile-default",
-    title: "Default MCP profile",
+    title: "Profile for new threads",
     to: FORK_PAGE,
     searchTerms: ["mcpProfile mcp profile default project"],
     environmentOnly: true,
@@ -237,7 +237,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "mcp-subagent-profile",
-    title: "Sub-agent MCP profile",
+    title: "Profile for sub-agents",
     to: FORK_PAGE,
     searchTerms: ["mcpSubagentProfile mcp profile sub-agent delegate child inherit"],
     environmentOnly: true,
@@ -245,7 +245,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "mcp-thread-picks",
-    title: "MCP profile per thread",
+    title: "Profile picked per thread",
     to: FORK_PAGE,
     searchTerms: ["mcpThreadProfiles mcp profile thread pick"],
     environmentOnly: true,
@@ -253,7 +253,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "stop-finished-children",
-    title: "Stop finished children",
+    title: "Stop finished sub-agents",
     to: FORK_PAGE,
     searchTerms: ["stop finished delegated task child process memory idle reap"],
     environmentOnly: true,
@@ -261,7 +261,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "stop-finished-children-grace",
-    title: "Grace time",
+    title: "Wait before stopping",
     to: FORK_PAGE,
     searchTerms: ["finished child grace seconds stop process"],
     environmentOnly: true,
@@ -269,7 +269,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "assistant",
-    title: "Assistant",
+    title: "Offer an assistant thread",
     to: FORK_PAGE,
     searchTerms: ["assistant personal one thread across projects"],
     environmentOnly: true,
@@ -277,7 +277,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "assistant-thread",
-    title: "Make assistant",
+    title: "Assistant thread",
     to: FORK_PAGE,
     searchTerms: ["assistant thread role scratch make"],
     environmentOnly: true,

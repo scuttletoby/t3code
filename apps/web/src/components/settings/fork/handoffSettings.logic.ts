@@ -13,17 +13,22 @@ export const HANDOFF_MODE_OPTIONS: ReadonlyArray<{
   readonly label: string;
   readonly description: string;
 }> = [
-  { value: "off", label: "Off", description: "Long threads compact as upstream's settings say." },
+  {
+    value: "off",
+    label: "Off",
+    description: "Off: long threads compact as T3's own settings say.",
+  },
   {
     value: "handoff",
     label: "Handoff",
     description:
-      "A long thread moves to a fresh session in the same thread with a written handoff, so its children, pull requests and waits keep working.",
+      "Handoff: a long thread moves to a fresh session in the same thread with a short handoff note, so its sub-agents, pull requests and waits keep working.",
   },
   {
     value: "compact",
     label: "Compact",
-    description: "Same as Off; use it to keep one project or thread out of a Handoff above it.",
+    description:
+      "Compact: same as Off; use it to keep one project or thread out of a Handoff set above it.",
   },
 ];
 

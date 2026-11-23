@@ -367,6 +367,17 @@ export interface McpThreadPickRow {
 export const MCP_BLANK_PICK_ISSUE =
   "Its pick in settings.json is blank, so it is ignored and the thread's defaults apply. Pick a profile, or clear it.";
 
+/** The line above the closed Advanced fold when saved thread picks need a look, else null. */
+export function mcpPickProblemSummary(blank: number, wider: number): string | null {
+  const parts = [
+    blank > 0 ? `${blank} thread ${blank === 1 ? "pick is" : "picks are"} blank and ignored` : null,
+    wider > 0
+      ? `${wider} thread ${wider === 1 ? "pick gives" : "picks give"} more than the thread's parent has`
+      : null,
+  ].filter((part) => part !== null);
+  return parts.length === 0 ? null : `${parts.join("; ")}.`;
+}
+
 /** The thread picks, titled where this client knows the thread, by title then id. */
 export function mcpThreadPickRows(
   picks: Readonly<Record<string, string>>,

@@ -172,6 +172,7 @@ describe("McpProfileSettings", () => {
     setup({ mcpProfiles: { lean: { servers: [], t3Tools: "all" } } });
     state.writeAllowed = false;
     await using screen = await render(<McpProfileSettings isProjectScope={false} />);
+    await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await expect.element(screen.getByText("lean")).toBeVisible();
     for (const selector of [
       '[aria-label="Delete MCP profile lean"]',
@@ -191,6 +192,7 @@ describe("McpProfileSettings", () => {
       mcpThreadProfiles: { "thread-2": "t3-only" },
     });
     await using screen = await render(<McpProfileSettings isProjectScope={false} />);
+    await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await userEvent.click(screen.getByRole("button", { name: "Add thread" }));
     const id = screen.getByRole("textbox", { name: "Thread id for an MCP profile pick" });
     await userEvent.fill(id, "thread-1");
@@ -221,6 +223,7 @@ describe("McpProfileSettings", () => {
   it("writes nothing on cancel, also after a profile was chosen", async () => {
     setup({});
     await using screen = await render(<McpProfileSettings isProjectScope={false} />);
+    await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await userEvent.click(screen.getByRole("button", { name: "Add thread" }));
     await userEvent.fill(
       screen.getByRole("textbox", { name: "Thread id for an MCP profile pick" }),
@@ -249,6 +252,13 @@ describe("McpProfileSettings", () => {
     });
     state.shells = [shellOf("parent", "Lead"), shellOf("child", "Helper", "parent")];
     await using screen = await render(<McpProfileSettings isProjectScope={false} />);
+    // Shown with Advanced still folded.
+    await expect
+      .element(
+        screen.getByText("Under Advanced: 1 thread pick gives more than the thread's parent has."),
+      )
+      .toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await expect
       .element(
         screen.getByText(
@@ -264,6 +274,11 @@ describe("McpProfileSettings", () => {
   it("shows a blank pick from a hand edit as broken, and clears it", async () => {
     setup({ mcpThreadProfiles: { "thread-1": "  " } });
     await using screen = await render(<McpProfileSettings isProjectScope={false} />);
+    // Shown with Advanced still folded.
+    await expect
+      .element(screen.getByText("Under Advanced: 1 thread pick is blank and ignored."))
+      .toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await expect
       .element(screen.getByText(/Its pick in settings.json is blank, so it is ignored/))
       .toBeVisible();

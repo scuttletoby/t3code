@@ -1,13 +1,13 @@
-> **This is a fork of [T3 Code](https://github.com/pingdotgg/t3code).** It follows upstream's releases daily. With no fork
-> settings it behaves like upstream, except that it updates from this fork's releases. What it adds:
+> **This is a fork of [T3 Code](https://github.com/pingdotgg/t3code)** for people who run many coding agents on their own
+> machines and plans. It rebases onto upstream's newest release daily and ships it as `v<upstream>.fork.<n>`. With no fork
+> settings it behaves like upstream, except that it updates from this fork's releases. Every fork switch is off until you
+> turn it on, most in **Settings → Fork** (a few only in the settings file). Among what it adds:
 >
-> - **Usage pacing and agent slots:** agents keep a reserve of each subscription limit free for you, and a machine never
->   runs more agents than it has room for.
-> - **Waits:** an agent sleeps until a pull request, file, system unit or check changes, and is woken then, instead of polling.
-> - **Self-update:** a server running as a boot service can update itself once no thread is working.
-> - **Fleet CI:** one-job runners on your own machines and desktops, each behind walls, a merge queue and shared CI actions.
+> - **Plan usage pacing and a limit on running agents:** agents leave you part of each plan, and a machine never runs too many.
+> - **Agent waits**, **models agents may use**, **tool profiles**, **handoff instead of compaction**, **automatic updates**.
 >
-> Every change, one line each: [FORK_CHANGES.md](FORK_CHANGES.md). Settings and how to install: [docs/fork/README.md](docs/fork/README.md).
+> About the fork, every feature with where to turn it on, and what is planned: [docs/fork/about.md](docs/fork/about.md).
+> Install and every setting: [docs/fork/README.md](docs/fork/README.md). Every change: [FORK_CHANGES.md](FORK_CHANGES.md).
 
 <p align="center">
   <a href="https://t3.codes">

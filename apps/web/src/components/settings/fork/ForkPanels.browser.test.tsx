@@ -114,6 +114,8 @@ describe("UpdatesSettings", () => {
     await userEvent.click(toggle);
     expect(state.update.mock.calls[0]![0]).toEqual({ automaticUpdates: true });
 
+    // The quiet check is a rarely changed option, folded under Advanced.
+    await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await userEvent.type(
       screen.getByRole("textbox", { name: "Quiet check before an update" }),
       " /usr/local/bin/quiet {Enter}",

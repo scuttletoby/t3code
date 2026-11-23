@@ -11,11 +11,12 @@ fork switch is off by default, except one read-only refresh of usage limits.
 
 Server settings are in `settings.json` in the server's `userdata` folder (by default
 `~/.t3/userdata/settings.json`). The server reads the file again when it changes; no restart is
-needed. Fork settings also have rows on the app's own **Settings → Fork** page (named below), with
-one line per feature at the top saying whether it is on, by the same rules as the fork report below
+needed. Fork settings also have rows on the app's own **Settings → Fork** page (named below), grouped by
+what a person wants to do (plan usage and machine load, waiting, models and tools, then one section each for handoff,
+review rules, assistant, playtest sessions and updates), rare options folded under **Advanced**, and one line per
+feature at the top saying whether it is on, by the same rules as the fork report below
 (on a server, a project's override or one thread's handoff entry counts too). A project's overrides are set in **Settings** with that project chosen at the top ("Applying settings
-for …", see [project settings](../user/project-settings.md)). An agent's tools cannot change any
-fork setting.
+for …", see [project settings](../user/project-settings.md)).
 
 To check what a T3 home has switched on without changing anything, the fork's hidden command
 `t3 __fork-report --base-dir <home>` prints it as JSON, each feature with where it is on (the server,
@@ -89,7 +90,7 @@ A server installed as a boot service (`t3 service install`) updates itself to th
 once no thread is working. Off: it updates only when someone runs `t3 update` or presses **Update**.
 Upstream has a setting of this name pending (not on its `main` yet); the fork keeps `false` through every sync.
 
-Switch on: **Settings → Fork**, section Updates, "Update automatically", or in `settings.json`:
+Switch on: **Settings → Fork**, section Automatic updates, "Update automatically", or in `settings.json`:
 `"automaticUpdates": true`. An
 admin policy with updates `"off"` still wins. Details: [updates.md](updates.md).
 
@@ -98,7 +99,7 @@ admin policy with updates `"off"` still wins. Details: [updates.md](updates.md).
 An optional program asked before each automatic update; a non-zero exit means "not now". Used only
 while `automaticUpdates` is on. Empty: no program is asked.
 
-Set: **Settings → Fork**, section Updates, "Quiet check before an update", or in `settings.json`:
+Set: **Settings → Fork**, section Automatic updates, under Advanced, "Ask a program before updating", or in `settings.json`:
 `"automaticUpdatesQuietCommand": "/path/to/quiet-check"`. Details:
 [updates.md](updates.md).
 
@@ -155,7 +156,7 @@ Set in `settings.json`:
 ```
 
 The key is the provider instance id, for example `codex` or `codex_work`. In the app: **Settings →
-Fork**, section Usage pacing, one row per account by its name (an entry for an account that is gone
+Fork**, section Plan usage pacing, one row per account by its name (an entry for an account that is gone
 is listed with **Remove**).
 
 `burnFirstWindows` limits `burnFirst` to some window kinds (`session`, `weekly`, `monthly`,
@@ -186,7 +187,7 @@ What happens when an agent starts a task with `delegate_task`. `"off"`: nothing,
 on an account that is ahead of its pace moves to another account of the same provider, runs at a
 lower effort (`usagePacingLowerEffort`), or is refused for now and the agent asks again later.
 
-Switch on: **Settings → Fork**, section Usage pacing, "Usage pacing gate", or in `settings.json`:
+Switch on: **Settings → Fork**, section Plan usage pacing, "Pace agents by plan usage", or in `settings.json`:
 `"usagePacingGate": "advise"` (try `advise` before `enforce`).
 
 ### `server.usagePacingLowerEffort`
@@ -195,7 +196,7 @@ For `"enforce"`: what each effort level turns into while an account is ahead of 
 account has room, for example `{ "high": "medium", "medium": "medium" }`. A task at a level not
 listed is held instead. Empty: no effort is ever lowered.
 
-Set: **Settings → Fork**, "Lower effort when ahead of pace" (pairs like `high=medium`; a level no
+Set: **Settings → Fork**, section Plan usage pacing, under Advanced, "Lower effort when ahead of pace" (pairs like `high=medium`; a level no
 model on the server offers is refused), or in `settings.json`: `"usagePacingLowerEffort": { "high": "medium" }`.
 
 ### `server.waitFor`
@@ -251,7 +252,7 @@ thread's own children (it reads each one's live status), `wait_list` for whether
 will be let through (it shows what the slot gate counts against `server.agentSlots`, every agent on
 the machine or account).
 
-Switch on: **Settings → Fork**, section Waits (shown while a server is connected), "Let agents wait for events", or in `settings.json`:
+Switch on: **Settings → Fork**, section Agent waits (shown while a server is connected), "Let agents wait for events", or in `settings.json`:
 `"waitFor": { "enabled": true }`.
 
 ### `server.waitChecks`
@@ -261,7 +262,7 @@ fixed arguments, no shell; exit 0 means the event happened. It runs unsandboxed 
 with the server's environment, so use fixed programs that run no files from the repository (no test
 runners or build scripts). Only the person can add one; agents cannot.
 
-Add one: **Settings → Fork**, section Wait checks, **Add check**, or in `settings.json`:
+Add one: **Settings → Fork**, section Custom wait checks, **Add check**, or in `settings.json`:
 
 ```json
 { "waitChecks": { "build-done": { "argv": ["test", "-f", "/tmp/build.done"] } } }
@@ -281,7 +282,7 @@ starts, pushes, checks and ends its thread's session with the `playtest` tool (i
 thread controls come in a later pull request. The steps' contract and the tool are in
 [playtest.md](playtest.md).
 
-In the app: **Settings → Fork**, section Playtest: the switch (it stays off until all four steps are
+In the app: **Settings → Fork**, section Playtest sessions: the switch (it stays off until all four steps are
 set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
 
 Only the person can change it; agents cannot. A save that is on without all four steps, repeats a
@@ -508,7 +509,7 @@ defaults, where the policy would be off; the server log says the model policy ca
 file that parses but fails on another key keeps its own policy. The value is kept as written, and
 saves of other settings write it back unchanged until the person saves this setting.
 
-In the app: **Settings → Fork**, section Model policy (server only; a project cannot override it): the
+In the app: **Settings → Fork**, section Models agents may use (server only; a project cannot override it): the
 mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a save is. An unreadable
 value is shown with a warning and the kept text; a save there replaces it. **Edit allowed models**
 then starts from the value's own rows and saves only once the person picks the mode, so a save never
@@ -840,7 +841,7 @@ readers are free, until it ends or the server restarts. Delegations go through t
 time, so with a stuck store queued callers wait about 5 s each in turn (the third one about 15 s)
 and are then refused.
 
-Switch on: **Settings → Fork**, section Agent slots, "Limit running agents", or in `settings.json`:
+Switch on: **Settings → Fork**, section Limit on running agents, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is
 refused.
 
@@ -1195,7 +1196,7 @@ the owner set up so.
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
 ```
 
-In the app: **Settings → Fork**, section MCP profiles. It lists the built-ins (read-only)
+In the app: **Settings → Fork**, section Tool profiles. It lists the built-ins (read-only)
 and each named profile, and adds, edits and deletes named ones: `servers` is all or a list of
 names (the editor offers the names other profiles use and takes any other; no list of the
 machine's servers reaches the app yet), `t3Tools` all or a list of groups, and a "No built-in tools" box sets `builtinTools: "none"`. `request_secret`,
@@ -1206,7 +1207,7 @@ too, naming who uses the profile. An entry this version cannot read
 (fields from a newer build) shows as broken and cannot be edited there, only deleted; one that
 names T3 tool groups this version does not know shows as from a newer version, the same way. The
 default profile and the sub-agent rule have the usual project-override control, and each thread's
-pick is listed by title, changed or cleared. Adding a pick saves nothing until a profile is
+pick (under Advanced) is listed by title, changed or cleared. Adding a pick saves nothing until a profile is
 chosen next to the thread id; the panel says what the pick gives the thread, and when that is more
 than the parent's cut-down set (a pick is never cut down to the parent's). A blank pick from a hand
 edit shows as broken, as it is ignored, and can be cleared. Every save sends only the entries it changes (a pick
@@ -1313,7 +1314,7 @@ program `env` finds on the `PATH`, and runners such as `make` or `npm` are refus
 against mistakes, not attacks: [handoff.md](handoff.md) lists what it does not catch. A command
 already stored is not checked again. The command gets a short list of the server's environment.
 
-In the app: **Settings → Fork**, section Handoff: the mode, each thread's own mode (added by thread
+In the app: **Settings → Fork**, section Handoff instead of compaction: the mode, each thread's own mode (added by thread
 id, shown with its title where this client knows the thread), and under Advanced the sizes, who
 writes the handoff (with its command) and the instructions. `modelSelection` has no row yet; a save
 there keeps it as stored.
@@ -1390,7 +1391,7 @@ process as any resumed thread does.
 - Timers live in memory. A restart ends every provider session anyway; after it, a child's next run
   end arms again. A second stop of the same child finds nothing live and does nothing.
 
-Switch on: **Settings → Fork**, section Finished children, or in `settings.json`:
+Switch on: **Settings → Fork**, section Stop finished sub-agents, or in `settings.json`:
 `"stopFinishedChildren": { "enabled": true, "graceSeconds": 60 }`. Anything but `"enabled": true`
 reads as off, and a bad `graceSeconds` as 60; a save with a bad value is refused.
 
@@ -1399,7 +1400,7 @@ reads as off, and a bad `graceSeconds` as 60; a save with a bad value is refused
 A project's own list of wait checks. It replaces the server's list for that project as a whole (a
 project lists every check it uses). Not set: the project uses the server's checks.
 
-Set: **Settings → Fork**, choose the project at the top, then **Wait checks**.
+Set: **Settings → Fork**, choose the project at the top, then **Custom wait checks**.
 
 ### `projectOverride.playtest`
 
@@ -1567,6 +1568,8 @@ switch.
 
 ## Other fork pages
 
+- [about.md](about.md): what the fork is, how it follows upstream, every feature in one line
+  and what is planned.
 - [go-live.md](go-live.md): the runbook for moving a boot-service machine to the fork, the way back,
   and switching features on one at a time.
 - [updates.md](updates.md): update defaults, how a test pins them, the nightly sync runbook,

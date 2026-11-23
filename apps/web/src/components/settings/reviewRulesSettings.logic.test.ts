@@ -32,7 +32,7 @@ describe("old, empty and bad settings files", () => {
     expect(reviewRulesState(value)).toBe("off");
     expect(reviewRulesSummary(value)).toBe("Off");
     expect(reviewRulesDescription(value, environment)).toBe(
-      "Off: nothing is listed, changed or checked.",
+      "Off: agents get no way to start review lenses here and nothing is checked. On: they can start the lenses a pull request still needs (lens_start), with the Recommended values. Default: off.",
     );
     expect(effectiveReviewRulesRows(value)).toEqual([]);
     // Undefined (a server too old to send the key) reads the same.

@@ -30,7 +30,7 @@ import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
-import { ForkRow, useSelectedProvidersByEnvironment } from "./ForkRow";
+import { ForkRow, OptionLines, useSelectedProvidersByEnvironment } from "./ForkRow";
 import {
   aliasModelPolicyRows,
   MODEL_POLICY_MODE_OPTIONS,
@@ -43,6 +43,7 @@ import {
   unreadableModelPolicyText,
   withModelPolicyAllow,
 } from "./modelPolicySettings.logic";
+import { defaultIs } from "./forkDefaultText.logic";
 
 const MIXED = "The selected environments have different values. Select one environment to edit it.";
 
@@ -225,7 +226,7 @@ export function ModelPolicySettings() {
 
   if (mixed) {
     return (
-      <SettingsSection id="model-policy-section" title="Model policy">
+      <SettingsSection id="model-policy-section" title="Models agents may use">
         <ForkRow
           serverScoped
           {...searchableSetting("model-policy")}
@@ -249,13 +250,20 @@ export function ModelPolicySettings() {
   for (const row of shown.allow)
     byDriver.set(row.driver, [...(byDriver.get(row.driver) ?? []), row]);
   return (
-    <SettingsSection id="model-policy-section" title="Model policy">
+    <SettingsSection id="model-policy-section" title="Models agents may use">
       <ForkRow
         serverScoped
         {...searchableSetting("model-policy")}
         settingKeys={["modelPolicy"]}
         lockPaths={["modelPolicy"]}
-        description={`Which models agents may pick (delegate_task, create_threads, t3_thread_launch, t3_thread_configure). ${option?.description ?? ""} Your own picks are never refused; below, one outside the rows is marked. While it is on, a child that names its model keeps only the options it names.`}
+        description={
+          <OptionLines
+            lead="Which models and efforts agents may pick when they start threads or sub-agents."
+            options={MODEL_POLICY_MODE_OPTIONS}
+            selected={shown.mode}
+            tail={`Your own picks are never refused; one outside the list is marked below. While it is on, a sub-agent that names its model keeps only the options it names. ${defaultIs("modelPolicy")}`}
+          />
+        }
         resetAction={
           isDefault ? null : (
             <SettingResetButton
@@ -272,7 +280,11 @@ export function ModelPolicySettings() {
               save({ mode: next as ModelPolicyMode, allow: shown.allow });
             }}
           >
-            <SelectTrigger size="sm" className="w-full sm:w-36" aria-label="Model policy mode">
+            <SelectTrigger
+              size="sm"
+              className="w-full sm:w-36"
+              aria-label="Models agents may use: mode"
+            >
               <SelectValue>{option?.label ?? shown.mode}</SelectValue>
             </SelectTrigger>
             <SelectPopup align="end" alignItemWithTrigger={false}>

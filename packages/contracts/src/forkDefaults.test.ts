@@ -62,3 +62,113 @@ describe("fork setting defaults", () => {
     ]);
   });
 });
+
+// The settings page groups and names fork settings for people, but the stored keys stay as
+// they are: a settings file saved by an older build must load with every value it had.
+const decodeServerFile = Schema.decodeUnknownSync(ServerSettings);
+const encodeServerFile = Schema.encodeSync(ServerSettings);
+const decodeProjectOverrides = Schema.decodeUnknownSync(ProjectSettingsOverrides);
+
+describe("settings saved by an older build", () => {
+  it("keeps the stored key names", () => {
+    expect(FORK_SETTING_DEFAULTS.map(rowId)).toEqual(
+      expect.arrayContaining([
+        "server.automaticUpdates",
+        "server.automaticUpdatesQuietCommand",
+        "server.usagePacing",
+        "server.usagePacingGate",
+        "server.usagePacingLowerEffort",
+        "server.waitFor",
+        "server.waitChecks",
+        "server.agentSlots",
+        "server.modelPolicy",
+        "server.reviewRules",
+        "server.handoff",
+        "server.playtest",
+        "server.mcpProfiles",
+        "server.mcpProfile",
+        "server.mcpSubagentProfile",
+        "server.mcpThreadProfiles",
+        "server.assistant",
+        "server.stopFinishedChildren",
+        "projectOverride.waitChecks",
+        "projectOverride.mcpProfile",
+        "projectOverride.mcpSubagentProfile",
+        "projectOverride.playtest",
+        "projectOverride.handoff",
+        "projectOverride.reviewRules",
+        "projectOverride.placementNeeds",
+      ]),
+    );
+    // A project's saved overrides are read by these names: renaming one loses what projects saved.
+    expect(Object.keys(ForkProjectOverrideFields).toSorted()).toEqual([
+      "handoff",
+      "mcpProfile",
+      "mcpSubagentProfile",
+      "placementNeeds",
+      "playtest",
+      "reviewRules",
+      "waitChecks",
+    ]);
+  });
+
+  it("loads the overrides a project saved with an older build", () => {
+    const saved = {
+      mcpProfile: "lean",
+      mcpSubagentProfile: "lean",
+      handoff: { mode: "handoff" },
+      reviewRules: { preset: "recommended" },
+      playtest: {
+        enabled: true,
+        claim: { argv: ["/usr/bin/playtest", "claim"] },
+        renew: { argv: ["/usr/bin/playtest", "renew"] },
+        push: [{ name: "build", argv: ["/usr/bin/playtest", "build"] }],
+        release: { argv: ["/usr/bin/playtest", "release"] },
+      },
+    };
+    // The struct drops a key it does not know, so a renamed key fails here.
+    expect(decodeProjectOverrides(saved)).toMatchObject(saved);
+  });
+
+  it("loads the values an older settings file saved, not the defaults", () => {
+    const saved = {
+      automaticUpdates: true,
+      automaticUpdatesQuietCommand: "true",
+      usagePacingGate: "advise",
+      waitFor: { enabled: true },
+      agentSlots: { enabled: true },
+      modelPolicy: {
+        mode: "enforce",
+        allow: [{ driver: "claudeAgent", model: "claude-opus-5-5" }],
+      },
+      reviewRules: { preset: "recommended" },
+      handoff: { mode: "handoff" },
+      playtest: {
+        enabled: true,
+        claim: { argv: ["/usr/bin/playtest", "claim"] },
+        renew: { argv: ["/usr/bin/playtest", "renew"] },
+        push: [{ name: "build", argv: ["/usr/bin/playtest", "build"] }],
+        release: { argv: ["/usr/bin/playtest", "release"] },
+      },
+      mcpProfiles: { lean: { servers: [], t3Tools: "all" } },
+      mcpProfile: "lean",
+      mcpSubagentProfile: "lean",
+      mcpThreadProfiles: { "thread-1": "lean" },
+      assistant: { enabled: true },
+      stopFinishedChildren: { enabled: true },
+    };
+    const settings = decodeServerFile(saved);
+    expect(settings).toMatchObject(saved);
+    // Written back, the same keys keep the same values.
+    expect(encodeServerFile(settings)).toMatchObject(saved);
+  });
+
+  it("reads missing fork keys as defaults and ignores keys it does not know", () => {
+    const settings = decodeServerFile({ notAForkSetting: 1 });
+    for (const row of FORK_SETTING_DEFAULTS.filter((r) => r.scope === "server")) {
+      expect(
+        pinnedPart(row, forkSettingAsSaved(row, settings[row.key as keyof typeof settings])),
+      ).toEqual(row.default);
+    }
+  });
+});

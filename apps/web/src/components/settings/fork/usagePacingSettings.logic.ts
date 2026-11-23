@@ -113,19 +113,19 @@ export const USAGE_PACING_GATE_OPTIONS: ReadonlyArray<{
   {
     value: "off",
     label: "Off",
-    description: "Agents start tasks as asked; the pace is not read.",
+    description: "Off: tasks start as asked and usage is not checked.",
   },
   {
     value: "advise",
     label: "Advise",
     description:
-      "Tasks start as asked, and the agent is told when an account is ahead of its pace.",
+      "Advise: tasks start as asked, and the agent is told when an account is ahead of its pace.",
   },
   {
     value: "enforce",
     label: "Enforce",
     description:
-      "A task on an account ahead of its pace moves to another account of the same provider, runs at a lower effort, or waits.",
+      "Enforce: a task on an account ahead of its pace moves to another account of the same provider, runs at a lower effort, or waits.",
   },
 ];
 

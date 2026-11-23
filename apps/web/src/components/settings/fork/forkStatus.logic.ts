@@ -26,30 +26,30 @@ export interface ForkStatusTarget {
 
 /** Typed by every feature, so a feature the report counts cannot be left off the page. */
 const LABELS: Record<ForkFeature, string> = {
-  waitFor: "Waits",
-  agentSlots: "Agent slots",
-  usagePacingGate: "Usage pacing",
-  modelPolicy: "Model policy",
+  usagePacingGate: "Plan usage pacing",
+  agentSlots: "Limit on running agents",
+  stopFinishedChildren: "Stop finished sub-agents",
+  waitFor: "Agent waits",
+  modelPolicy: "Models agents may use",
+  handoff: "Handoff instead of compaction",
   reviewRules: "Review rules",
+  playtest: "Playtest sessions",
   automaticUpdates: "Automatic updates",
-  activityProbe: "Activity probe",
-  stopFinishedChildren: "Stop finished children",
-  handoff: "Handoff",
-  playtest: "Playtest",
+  activityProbe: "Busy check (settings file only)",
 };
 
-/** The page's order: the Agents group first, as the sections below it. */
+/** The page's order: the groups below it, top to bottom. */
 const ORDER: ReadonlyArray<ForkFeature> = [
-  "waitFor",
-  "agentSlots",
   "usagePacingGate",
-  "modelPolicy",
+  "agentSlots",
   "stopFinishedChildren",
+  "waitFor",
+  "modelPolicy",
+  "handoff",
   "reviewRules",
+  "playtest",
   "automaticUpdates",
   "activityProbe",
-  "handoff",
-  "playtest",
 ];
 
 /**

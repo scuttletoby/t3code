@@ -17,16 +17,16 @@ describe("forkFeatureStatuses", () => {
         .toSorted(),
     ).toEqual([...FORK_FEATURES].toSorted());
     expect(lines(server({}))).toEqual([
-      "Waits: Off",
-      "Agent slots: Off",
-      "Usage pacing: Off",
-      "Model policy: Off",
-      "Stop finished children: Off",
+      "Plan usage pacing: Off",
+      "Limit on running agents: Off",
+      "Stop finished sub-agents: Off",
+      "Agent waits: Off",
+      "Models agents may use: Off",
+      "Handoff instead of compaction: Off",
       "Review rules: Off",
+      "Playtest sessions: Off",
       "Automatic updates: Off",
-      "Activity probe: Off",
-      "Handoff: Off",
-      "Playtest: Off",
+      "Busy check (settings file only): Off",
     ]);
   });
 
@@ -45,16 +45,16 @@ describe("forkFeatureStatuses", () => {
       }),
     );
     expect(statuses).toEqual([
-      "Waits: On",
-      "Agent slots: On",
-      "Usage pacing: On: advise",
-      "Model policy: On: enforce",
-      "Stop finished children: On",
+      "Plan usage pacing: On: advise",
+      "Limit on running agents: On",
+      "Stop finished sub-agents: On",
+      "Agent waits: On",
+      "Models agents may use: On: enforce",
+      "Handoff instead of compaction: On for 1 thread",
       "Review rules: On",
+      "Playtest sessions: Off",
       "Automatic updates: On",
-      "Activity probe: On",
-      "Handoff: On for 1 thread",
-      "Playtest: Off",
+      "Busy check (settings file only): On",
     ]);
   });
 
@@ -67,7 +67,7 @@ describe("forkFeatureStatuses", () => {
     });
     expect(forkFeatureStatuses([{ projectId: null, settings }])).toContainEqual({
       key: "handoff",
-      label: "Handoff",
+      label: "Handoff instead of compaction",
       on: true,
       detail: "On for 1 project, 1 thread",
     });
@@ -79,23 +79,23 @@ describe("forkFeatureStatuses", () => {
         projectId: "project-3",
         settings: { ...project, projectSettingsOverrides: settings.projectSettingsOverrides },
       }),
-    ).toContain("Handoff: Off");
+    ).toContain("Handoff instead of compaction: Off");
   });
 
   it("shows Mixed when the selected servers read differently", () => {
     expect(lines(server({ waitFor: { enabled: true } }), server({}))).toContain(
-      "Waits: Mixed: on for 1 of 2",
+      "Agent waits: Mixed: on for 1 of 2",
     );
-    expect(lines(server({}), server({}))).toContain("Waits: Off");
+    expect(lines(server({}), server({}))).toContain("Agent waits: Off");
   });
 
   it("reads an unreadable hand-edited value as the load does, never half on", () => {
     expect(lines(server({ reviewRules: { preset: "newer-preset" } }))).toContain(
       "Review rules: Off",
     );
-    expect(lines(server({ handoff: { mode: 7 } }))).toContain("Handoff: Off");
+    expect(lines(server({ handoff: { mode: 7 } }))).toContain("Handoff instead of compaction: Off");
     expect(lines(server({ modelPolicy: { mode: "enforce", typo: 1 } }))).toContain(
-      "Model policy: On: enforce (unreadable)",
+      "Models agents may use: On: enforce (unreadable)",
     );
   });
 });

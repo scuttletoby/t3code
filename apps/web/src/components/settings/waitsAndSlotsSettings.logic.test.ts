@@ -83,9 +83,9 @@ describe("turning a feature off while it runs", () => {
       agentSlots: { enabled: false },
     });
     expect(waitForSummary(off.waitFor)).toBe("Off");
-    expect(waitForDescription(off.waitFor)).toContain("Waits already stored are kept");
+    expect(waitForDescription(off.waitFor)).toContain("waits already saved are kept");
     expect(agentSlotsSummary(off.agentSlots)).toBe("Off");
-    expect(agentSlotsDescription(off.agentSlots)).toContain("not affected");
+    expect(agentSlotsDescription(off.agentSlots)).toContain("Running agents are never stopped");
     expect(off.waitFor.maxPerThread).toBe(5);
     expect(off.agentSlots.maxPerAccount).toEqual({ [claude]: 2 });
 
