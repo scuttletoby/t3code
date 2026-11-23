@@ -32,13 +32,16 @@ class Base(unittest.TestCase):
                 os.path.join(fx.BIN, HOOK)]
         env = dict(os.environ, HOME=self.home, BG_EVENT=ev, BG_PY=argv[0], BG_RUNNER=argv[4], BG_LIB=argv[5],
                    BG_MACHINE=argv[6], BG_UID=argv[7], BG_HOOK=argv[8])
-        if not parent:
-            r = subprocess.run(argv, input=ev, capture_output=True, text=True, timeout=60, env=env)
-            return r
+        if not parent:      # no `claude` above it, also when an agent runs this test
+            return fx.run_hook(HOOK, ev, self.machine, env=env, parent=None)
         # a simple command in a pipeline: the shell forks and execs it, so the hook's parent is `claude`
         script = (BUSY if busy else '') + 'printf "%s" "$BG_EVENT" | "$BG_PY" -I -B -c "$BG_RUNNER" "$BG_LIB" ' \
             '"$BG_MACHINE" "$BG_UID" "$BG_HOOK"; r=$?; ' \
             + ('kill $B 2>/dev/null; ' if busy else '') + 'exit $r'
+        return self.under_claude(script, env)
+
+    def under_claude(self, script, env):
+        """`script` run by the stand-in `claude`, in a process group of its own, ended whole afterwards."""
         p = subprocess.Popen([self.claude, '-c', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              env=env, start_new_session=True)
         try:
@@ -106,6 +109,35 @@ class Stop(Base):
             with self.subTest(text):
                 r = fx.run_hook(HOOK, text, env=dict(os.environ, HOME=self.home))
                 self.assert_passed(r)
+
+
+class UnderAnAgent(Base):
+    """config.test.py failed 4 of 15 when an agent ran the suites with another command of its own in the background:
+    the shared fixture ran each hook as a child of the test, so bg-guard walked up to that agent's Claude Code, found
+    the other command and blocked. Here the tests themselves run under such an agent (the stand-in `claude` with a
+    background command): a hook run as the fixture once ran it blocks; the fixture's runs now never see that agent."""
+
+    CHILD = '''import json, os, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+import guards_fixture as fx
+ev = {"hook_event_name": "Stop", "session_id": "under-an-agent"}
+old = subprocess.run([sys.executable, "-I", "-B", "-c", fx.RUNNER, fx.LIB, fx.NO_MACHINE, str(os.geteuid()),
+                      os.path.join(fx.BIN, "bg-guard")], input=json.dumps(ev), capture_output=True, text=True,
+                     timeout=60)
+runs = [old] + [fx.run_hook("bg-guard", ev, parent=p) for p in ("claude", None)]
+print(json.dumps([[r.returncode, r.stdout, r.stderr] for r in runs]))
+'''
+
+    def test_the_fixtures_hook_runs_never_see_the_agent_that_runs_the_tests(self):
+        script = BUSY + '"$BG_PY" -I -B -c "$BG_CHILD" "$BG_TESTS"; r=$?; kill $B 2>/dev/null; exit $r'
+        env = dict(os.environ, HOME=self.home, BG_PY=sys.executable, BG_CHILD=self.CHILD,
+                   BG_TESTS=os.path.dirname(os.path.abspath(__file__)))
+        r = self.under_claude(script, env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        old, standin, orphan = (subprocess.CompletedProcess([], *x) for x in json.loads(r.stdout))
+        self.assert_blocked(old)              # the agent and its background command are there
+        self.assert_passed(standin)
+        self.assert_passed(orphan)
 
 
 class Count(Base):
