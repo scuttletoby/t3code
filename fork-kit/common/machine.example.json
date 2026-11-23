@@ -135,6 +135,7 @@
       "fixWaitingDays": 3,
       "staleDays": 3,
       "maxFeedMb": 64,
+      "maxXmlMb": 1024,
       "timeoutSeconds": 60,
       "ignore": [
         {

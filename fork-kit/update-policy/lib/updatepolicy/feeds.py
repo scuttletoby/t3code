@@ -3,16 +3,32 @@ server's ETag / Last-Modified (a feed that did not change is not downloaded agai
 
 Per feed NAME the cache holds NAME.data and NAME.meta.json ({url, etag, lastModified, fetchedAt, sha256, size}).
 A new download goes to a temporary file, is checked by the feed's own reader (a file it does not understand never
-replaces a good copy), then renamed into place, then the meta is written. So a run stopped half-way leaves the old
+replaces a good copy; the reader returns how many entries it holds, and a download with fewer than FLOOR of the kept
+copy's never replaces it either), then renamed into place, then the meta (with that count) is written. Redirects
+are followed only to https. So a run stopped half-way leaves the old
 copy (or none); a copy whose sha256 does not match its meta is no copy. What happened is returned as a problem
 string, never raised: the caller turns it into a "cannot check" line.
 """
 import datetime, hashlib, http.client, json, os, tempfile, urllib.error, urllib.request
 
+
 UTC = datetime.timezone.utc
 DAY = datetime.timedelta(hours=20)          # "once a day", with room for a timer that runs a little early
 AGENT = 'update-policy-exposure (fork-kit)'
 CHUNK = 1 << 16
+FLOOR = 0.5
+
+
+class _HttpsOnly(urllib.request.HTTPRedirectHandler):
+    """A redirect to anything but https is refused (a feed is never read over plain http)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith('https://'):
+            raise urllib.error.URLError(f'a redirect to {newurl.split("?")[0][:80]} (not https) was refused')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_HttpsOnly)
 
 
 class Fetched:
@@ -26,8 +42,10 @@ class Fetched:
 def urlopen(url, headers, timeout):
     """(status, headers dict lower-case, readable). 304 is a status, not an error."""
     req = urllib.request.Request(url, headers=dict(headers, **{'User-Agent': AGENT}))
+    if not url.lower().startswith('https://'):
+        raise urllib.error.URLError('only https is read')
     try:
-        r = urllib.request.urlopen(req, timeout=timeout)
+        r = _OPENER.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code == 304:
             return 304, {k.lower(): v for k, v in e.headers.items()}, None
@@ -78,8 +96,8 @@ def _write_json(path, data):
 
 
 def fetch(cache, name, url, check, now, max_bytes, timeout, opener=urlopen):
-    """The feed NAME from URL into CACHE. `check(path)` raises on a file it does not understand (the problem says
-    why). Returns Fetched."""
+    """The feed NAME from URL into CACHE. `check(path)` returns how many entries the file holds, and raises on a file
+    it does not understand (the problem says why). Returns Fetched."""
     meta = _meta(cache, name)
     if meta.get('url') != url:
         meta = {}                                       # another URL: an old copy is no copy of this feed
@@ -117,21 +135,36 @@ def fetch(cache, name, url, check, now, max_bytes, timeout, opener=urlopen):
             out.flush()
             os.fsync(out.fileno())
         try:
-            check(tmp)
+            entries = int(check(tmp))
         except Exception as e:      # noqa: BLE001 - any reader failure means: not understood
             return Fetched(copy, f'{name}: the download is in a format this check does not understand ({e})',
                            fetched_at)
+        kept = meta.get('count') if copy else None
+        if isinstance(kept, int) and entries < FLOOR * kept:
+            return Fetched(copy, f'{name}: the download holds {entries} entries, under half of the kept copy\'s {kept}: '
+                                 'kept the old copy', fetched_at)
         path = os.path.join(cache, f'{name}.data')
         os.replace(tmp, path)
         tmp = None
         meta = {'url': url, 'etag': rh.get('etag'), 'lastModified': rh.get('last-modified'),
-                'fetchedAt': now.isoformat(), 'sha256': _sha256(path), 'size': size}
+                'fetchedAt': now.isoformat(), 'sha256': _sha256(path), 'size': size, 'count': entries}
         _write_json(os.path.join(cache, f'{name}.meta.json'), meta)
         return Fetched(path, None, now)
     except (OSError, ValueError, http.client.HTTPException) as e:
+        # the server's or the error's text: the caller makes every line one safe line
         return Fetched(copy, f'{name}: download failed ({getattr(e, "reason", None) or e})', fetched_at)
     finally:
         if body is not None and hasattr(body, 'close'):
             body.close()
         if tmp and os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def sweep(cache):
+    """Temporary files a killed run left (SIGTERM runs no `finally`). Call under the cache's lock."""
+    for name in os.listdir(cache):
+        if name.startswith('.') and name.endswith('.tmp'):
+            try:
+                os.unlink(os.path.join(cache, name))
+            except OSError:
+                pass

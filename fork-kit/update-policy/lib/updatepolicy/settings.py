@@ -155,9 +155,11 @@ EXPOSURE = {
     'fixWaitingDays': (int, 3, _between(0, 60)),
     'staleDays': (int, 3, _between(1, 60)),
     'maxFeedMb': (int, 64, _between(1, 1024)),
+    'maxXmlMb': (int, 1024, _between(16, 4096)),
     'timeoutSeconds': (int, 60, _between(5, 600)),
     'ovalUrl': (str, '', _https),
     'kevUrl': (str, '', _https),
+    'epssUrl': (str, '', _https),
     'ignore': (list, [], _ignore),
 }
 

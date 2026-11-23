@@ -21,3 +21,8 @@ ExecStopPost=+/usr/bin/python3 -I -B /usr/local/libexec/update-policy/current/bi
 # findings are exit 1: the unit shows as failed until they are gone (systemctl --failed)
 Nice=10
 TimeoutStartSec=30min
+# a real feed peaks near 350 MB; a broken or hostile one is stopped by the check's own caps, and by these
+MemoryHigh=768M
+MemoryMax=1G
+CPUWeight=20
+IOWeight=20

@@ -217,34 +217,62 @@ others still run.
 ## The daily exposure check
 
 `update-policy exposure` (`update-policy-exposure.timer`, daily around 07:00; on with `exposure.enabled`) answers
-"is anything installed here exploited in the wild, or waiting for a security fix?" It prints one line per thing that
-needs action and nothing else; exit 1 when there is any line, and the alert command gets the lines (`exposure`).
+"is anything installed here, or the running kernel, exploited in the wild, or waiting for a security fix?" It prints
+one line per thing that needs action (one per CVE on KEV, one per source package with a waiting fix; at most 40, the
+rest counted on a last line and kept in the report), ranked KEV first then by EPSS; exit 1 when there is any line,
+and the alert command gets the lines (`exposure`). To run it by hand: `systemctl start update-policy-exposure.service`
+and `journalctl -u update-policy-exposure` (as root on the unit's cache it refuses: it would leave root-owned files
+there; `--cache DIR` for a cache of your own).
 
-| Line                                                               | When                                                                                                                           | Action                |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ | --------------------- |
-| `KEV CVE-…: PKG VERSION is exploited in the wild; update to FIXED` | a CVE on CISA's KEV list affects an installed version and a fixed version is out                                               | update                |
-| `KEV CVE-…: SOURCE … has no fix yet: mitigate or watch`            | the same, with no fixed version                                                                                                | mitigate, watch       |
-| `security fix waiting N day(s): PKG VERSION -> FIXED: CVE-…`       | a security fix is out for an installed package and its EPSS is at least `epssMin`, or it has waited more than `fixWaitingDays` | update                |
-| `cannot check: …`                                                  | a feed that could not be downloaded or read, a distribution without a data source, packages that cannot be listed, EPSS down   | look; never all clear |
-| `drift: …`                                                         | a cached feed older than `staleDays`; an ignore entry past its date                                                            | look                  |
+| Line                                                                          | When                                                                                                                                  | Action                |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| `KEV CVE-… is exploited in the wild: SOURCE VERSION (PKGS): update to FIXED`  | a CVE on CISA's KEV list affects an installed version (or the running kernel: `and restart`) and a fixed version is out               | update                |
+| `KEV CVE-… is exploited in the wild and has no fix yet: mitigate or watch: …` | the same, with no fixed version                                                                                                       | mitigate, watch       |
+| `security fix waiting N day(s): SOURCE VERSION (PKGS) -> FIXED: CVE-…`        | a source package has a security fix out, and a CVE's EPSS is at least `epssMin` or the fix has waited longer than `fixWaitingDays`    | update                |
+| `cannot check: …`                                                             | a feed that could not be downloaded, read or that holds far fewer entries than before; no data source; packages that cannot be listed | look; never all clear |
+| `drift: …`                                                                    | a cached feed older than `staleDays`; an ignore entry past its date                                                                   | look                  |
+| `kernel: not checked (why)`                                                   | a note, in every report where the running kernel could not be judged (a WSL or custom kernel, no data); no finding                    | none                  |
 
-Lines are ranked: KEV first, then by EPSS. A fix that needs Ubuntu Pro (an `esm` version) says so. A CVE without a
-fix that is not on KEV is not shown (Ubuntu lists thousands as "might be affected"); neither is a waiting fix below
-the thresholds (unattended-upgrades installs it the next night).
+A fix that needs Ubuntu Pro (an `esm` version) says so. A CVE without a fix that is not on KEV is not shown (Ubuntu
+lists thousands as "might be affected"); neither is a waiting fix below the thresholds (unattended-upgrades installs it
+the next night). The "waiting" days count per CVE and package from the first run that saw it, kept in the cache's
+state: a newer fix does not restart them, and neither does a run without usable data.
+
+**Installed** packages come from `dpkg-query`: installed, held, and those whose files are on disk though dpkg did not
+finish (half-installed, unpacked, half-configured, triggers) all count; a status it does not know is `cannot check`.
+Versions are compared in dpkg's own order.
+
+**The kernel** is judged by the running one only (`uname -r`), never by other kernels, headers or modules that are
+installed:
+
+- Ubuntu: the OVAL file's own kernel tests (each kernel flavour's release pattern, and its fixed version). The flavour
+  is the source package of the running kernel's `linux-modules-<release>`; a release that no flavour matches (a WSL,
+  mainline or custom kernel), or several match and the packages do not say which, is the note `kernel: not checked`;
+- Debian: the running kernel's `linux-image-<release>` (from `linux-signed-*`) is matched as the source `linux` the
+  OVAL file names; none installed is the note. Livepatch is not looked at.
 
 **Data**, each downloaded at most once a day into `/var/cache/update-policy-exposure/`, with a size cap
-(`maxFeedMb`), a timeout (`timeoutSeconds`), the server's ETag / Last-Modified (an unchanged feed is not downloaded
-again) and a sha256 of the stored copy (a copy that does not match is no copy):
+(`maxFeedMb`), a timeout (`timeoutSeconds`), the server's ETag / Last-Modified, https only (a redirect to anything
+else is refused) and a sha256 of the stored copy (a copy that does not match is no copy):
 
 - the distribution's OVAL file: Ubuntu's `com.ubuntu.<codename>.cve.oval.xml.bz2` (security-metadata.canonical.com)
   or Debian's `oval-definitions-<codename>.xml.bz2` (debian.org), by `/etc/os-release` (`ovalUrl` to use another
-  copy). It says, per CVE, which binary (Ubuntu) or source (Debian) packages it affects and the fixed version.
-  Installed versions come from `dpkg-query` and are compared in dpkg's own order. The kernel's CVEs are judged by
-  Ubuntu with tests of the running kernel, which this check does not read: a new kernel is the restart policy's
-  business;
-- CISA's KEV JSON (`kevUrl` to use another copy);
-- EPSS from FIRST.org's API, asked only for the CVEs found here (at most 100 per request), kept a day. These CVE ids
-  are all that leaves the machine.
+  copy). Debian writes "no fix yet" as "less than 0:0", which is read as no fixed version (Debian uses the same form
+  for some entries it judges not to affect the release; those may then show as "no fix yet" if on KEV);
+- CISA's KEV JSON (`kevUrl`);
+- FIRST.org's daily EPSS file (`epssUrl`, about 3 MB): every CVE's score, so nothing about this machine is sent
+  anywhere. The OVAL URL names the release codename; that is all a server learns.
+
+**A feed that changed** never reads as all clear. A download goes to a temporary file and is read by its own reader
+before it replaces the kept copy; it is refused, the old copy kept and the reason a `cannot check` line, when:
+
+- it is not the format (an OVAL test kind, state operation, object or variable the reader does not know; fewer than
+  90% of its package tests naming a package; no `vulnerabilities` list; no `cve,epss,percentile` header);
+- it holds fewer entries than an absolute floor (OVAL 1,000, KEV 500, EPSS 100,000) or under half the kept copy's;
+- it is larger than `maxFeedMb`, or than `maxXmlMb` once decompressed, or one entry holds over 500,000 elements.
+
+The OVAL file is read as a stream and every finished entry is dropped (a real noble file: about 350 MB). The unit has
+`MemoryHigh=768M`, `MemoryMax=1G` and low CPU and IO weights, so a hostile feed cannot take the machine's memory.
 
 Other package systems (rpm, apk) fit in as one more entry of `ECOSYSTEMS` in `lib/updatepolicy/exposure.py`: their
 installed list, version order and data source.
@@ -260,20 +288,23 @@ runs as root, so the alert command can read a root-only file. It needs no secret
 | `exposure.fixWaitingDays` | 3       | a waiting fix is shown once it has waited longer than this (as this check first saw it)         |
 | `exposure.staleDays`      | 3       | a cached feed older than this is drift                                                          |
 | `exposure.maxFeedMb`      | 64      | the size cap of one download                                                                    |
+| `exposure.maxXmlMb`       | 1024    | the size cap of the OVAL file once decompressed                                                 |
 | `exposure.timeoutSeconds` | 60      | the timeout of one request                                                                      |
 | `exposure.ovalUrl`        | `""`    | another `https://` copy of the distribution's OVAL file                                         |
 | `exposure.kevUrl`         | `""`    | another `https://` copy of the KEV JSON                                                         |
+| `exposure.epssUrl`        | `""`    | another `https://` copy of the daily EPSS file (gzip CSV)                                       |
 | `exposure.ignore`         | `[]`    | `{"cve": "CVE-…", "reason": "…", "until": "YYYY-MM-DD"}`: not shown until that date, then drift |
 
 **Runs again, stops half-way, old or empty cache, a feed format change:**
 
-- runs again the same day: no download (once a day), the same lines; the next day only a changed feed is downloaded;
-- stops half-way: a download goes to a temporary file, is read by its own reader, and only then replaces the copy;
-  the meta and the state are written whole through a rename. A stop leaves the old copy or none;
-- old or empty cache: no copy is `cannot check` (never all clear); a broken meta, state or EPSS file starts again
-  from empty (a waiting fix is then dated from today); a copy older than `staleDays` is still read and is drift;
-- a feed format change: a download the reader does not understand (no `vulnerabilities` list, no OVAL definitions
-  or dpkg tests, not XML) never replaces the good copy and is a `cannot check` line naming the feed.
+- runs again the same day: no download (once a day), the same lines; the next day only a changed feed is
+  downloaded. Two runs at once: the second finds the cache's lock held and does nothing;
+- stops half-way (a timeout's SIGTERM runs no cleanup): every write goes to a temporary file and is renamed whole;
+  the next run first removes temporary files a killed run left. A stop between a copy and its meta leaves a copy that
+  does not match its checksum: no copy, so `cannot check` until the next download;
+- old or empty cache: no copy is `cannot check` (never all clear); a broken meta or state starts again from empty (a
+  waiting fix is then dated from today); a copy older than `staleDays` is still read and is drift;
+- a feed format change: see "A feed that changed": the old copy stays and the line names the feed.
 
 ## Install
 
