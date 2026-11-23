@@ -3,18 +3,22 @@ current user as root, fake useradd, usermod, apt-get, dpkg-query, dpkg, systemct
 (fake_curl.py) (each logs to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and
 policy a started one runs with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units, and a
 running unit's processes in its control group, /sys/fs/cgroup/system.slice/UNIT/cgroup.procs: its main PID, and
-those a test adds); the real openssl. No root, no systemd, no network, no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
+those a test adds); the real openssl. No root, no systemd, no network, no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture;
+or, for a Case with platform = 'linux', a plain Linux box (the fleet's linux walls fixture) where the owner already
+has a login user and the system resolver's stub."""
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest
 from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(KIT))
 WSL2 = os.path.join(REPO, '.github', 'scripts', 'fork-fleet-walls', 'wsl2.fixture.json')
+LINUX = os.path.join(REPO, '.github', 'scripts', 'fork-fleet-walls', 'linux.fixture.json')
 SHA1, SHA2 = 'a' * 40, 'b' * 40
 CONFIG = {'organization': 'Example lab', 't3Version': '1.2.3', 't3ReleaseBaseUrl': 'https://example.com/releases',
           'port': 3800, 'maxRuntimeMode': 'full-access', 'lockedSettings': {'agentSlots.maxPerMachine': 2},
           'memoryMax': '8G', 'cpuQuota': '400%', 'nameservers': ['1.1.1.1', '9.9.9.9'], 'peers': ['100.101.102.103/32'],
           'tailscaleTag': 'tag:pc-agents'}
+LINUX_CONFIG = {**CONFIG, 'platform': 'linux'}
 TOOLS = {  # fake programs, under the fake root; each finds the root from its own path
     'usr/sbin/useradd': 'R="${0%/usr/sbin/useradd}"; uid=; sh=/bin/sh; prev=; for a; do [ "$prev" = --uid ] && uid=$a; '
                         '[ "$prev" = --shell ] && sh=$a; prev=$a; done\n'
@@ -27,8 +31,17 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                            'while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; cmd=$2\n'
                            'case "$cmd" in */*) [ -x "$R$cmd" ] || [ -x "$cmd" ];; *) command -v "$cmd" >/dev/null;; esac'
                            ' || { echo "Failed to find executable $cmd: No such file or directory" >&2; exit 1; }\n',
-    # journalctl: prints what the test put in /log/journal (none: an empty journal)
-    'usr/bin/journalctl': 'R="${0%/usr/bin/journalctl}"; echo "$*" >>"$R/log/journalctl"; cat "$R/log/journal" 2>/dev/null; :\n',
+    # journalctl: prints what the test put in /log/journal (none: an empty journal); with _SYSTEMD_INVOCATION_ID=ID,
+    # that run's own lines (/log/journal.ID), with INVOCATION_ID=ID systemd's entries about the run
+    # (/log/journal.ID.start). A started T3 (systemctl's run below) writes both: its start, and T3 saying it is ready.
+    # Of the version in /log/t3-not-ready T3 says only "Listening"; of the version in /log/t3-silent nothing yet.
+    # /log/journal-none: the journal keeps nothing of a run; /log/journal-rotated: only a later line of T3's, the
+    # run's start and its ready line rotated away; /log/journal-fail: journalctl fails.
+    'usr/bin/journalctl': 'R="${0%/usr/bin/journalctl}"; echo "$*" >>"$R/log/journalctl"\n'
+                          '[ -e "$R/log/journal-fail" ] && { echo "Failed to open journal (test)" >&2; exit 1; }\n'
+                          'case "$1" in _SYSTEMD_INVOCATION_ID=*) cat "$R/log/journal.${1#*=}";; '
+                          'INVOCATION_ID=*) cat "$R/log/journal.${1#*=}.start";; *) cat "$R/log/journal";; '
+                          'esac 2>/dev/null; :\n',
     'usr/bin/systemctl': 'R="${0%/usr/bin/systemctl}"; echo "$*" >>"$R/log/systemctl"; S="$R/log/units"; mkdir -p "$S"\n'
                          '[ -e "$R/log/systemctl-fail" ] && { echo "systemctl: failed (test)" >&2; exit 1; }\n'
                          # what a started unit runs with: its ExecStart and T3's policy
@@ -46,6 +59,15 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '*) echo 1 >"$S/$1.code";; esac; echo "${c:-1}" >"$S/$1.status"; return; }\n'
                          '{ grep "^ExecStart=" "$R/etc/systemd/system/$1"; '
                          'cat "$R/etc/t3code/policy.json"; } >"$S/$1.active" 2>/dev/null || :\n'
+                         'i=$(printf %032x $$); echo $i >"$S/$1.invocation"\n'
+                         'if [ "$1" = t3code-agents.service ] && [ ! -e "$R/log/journal-none" ]; then\n'
+                         '  of() { [ -e "$R/log/$1" ] && grep -qF "/versions/$(cat "$R/log/$1")/" '
+                         '"$R/etc/systemd/system/t3code-agents.service"; }\n'
+                         '  if [ -e "$R/log/journal-rotated" ]; then echo "a later line" >"$R/log/journal.$i"\n'
+                         '  else echo "Started t3code-agents.service" >"$R/log/journal.$i.start"\n'
+                         '    if of t3-not-ready; then echo Listening >"$R/log/journal.$i"\n'
+                         '    elif ! of t3-silent; then printf "Listening\\nT3 Code server is ready.\\n" '
+                         '>"$R/log/journal.$i"; fi; fi; fi\n'
                          'echo $$ >"$S/$1.pid"; g="$R/sys/fs/cgroup/system.slice/$1"; rm -rf "$g"; mkdir -p "$g"; '
                          'echo $$ >"$g/cgroup.procs"; python3 -I -c "import time; print(time.monotonic_ns() // 1000)" '
                          '>"$S/$1.start"; }\n'
@@ -70,6 +92,7 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '  if [ -e "$S/$u.active" ]; then echo ActiveState=active; echo "MainPID=$(cat "$S/$u.pid")"\n'
                          '  echo "ControlGroup=/system.slice/$u"\n'
                          '  else echo ActiveState=inactive; echo MainPID=0; echo ControlGroup=; fi; echo NRestarts=0\n'
+                         '  echo "InvocationID=$(cat "$S/$u.invocation" 2>/dev/null)"\n'
                          '  [ -e "$S/$u.status" ] && { echo "ExecMainCode=$(cat "$S/$u.code")"; echo "ExecMainStatus=$(cat "$S/$u.status")"; }\n'
                          '  echo "ExecMainStartTimestampMonotonic=$(cat "$S/$u.start" 2>/dev/null || echo 0)";;\n'
                          'esac\n',
@@ -168,6 +191,7 @@ class Case(unittest.TestCase):
     # How long setup watches T3 after a start here (15 s on a machine). 0: one look, for a test about the writes
     # and not the watch (no_watch()).
     settle = 0.3
+    platform = 'wsl2'   # the kind of machine: 'wsl2' (a fresh WSL2 distro) or 'linux' (a plain Linux box)
 
     def setUp(self):
         k.SETTLE, k.SETTLE_STEP = self.settle, 0.05
@@ -181,23 +205,33 @@ class Case(unittest.TestCase):
         os.chmod(self.root, 0o755)
         self.addCleanup(self.close)
         k.ROOT, k.OWNER = self.root, os.geteuid()
-        with open(WSL2, encoding='utf-8') as f:
+        k.USER, k.HOME = 'agent', '/home/agent'   # the defaults, as a fresh import has them (config() sets them)
+        linux = self.platform == 'linux'
+        with open(LINUX if linux else WSL2, encoding='utf-8') as f:
             files = json.load(f)['pass']
-        for rel in ('etc/wsl.conf', 'etc/resolv.conf', 'etc/binfmt.d/WSLInterop.conf'):
-            del files[rel]   # a fresh distro: the kit writes these
-        files['etc/wsl.conf'] = '[boot]\nsystemd=true\n'
-        files['etc/passwd'] = 'root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n'
-        files['etc/group'] = 'root:x:0:\nsudo:x:27:\nnogroup:x:65534:\n'
+        people = 'root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n'
+        if linux:   # the owner's box: their login user, the system resolver's stub, the router as the gateway
+            files['etc/passwd'] = people + 'owner:x:1000:1000:Owner:/home/owner:/bin/bash\n'
+            files['etc/group'] = 'root:x:0:\nsudo:x:27:owner\nnogroup:x:65534:\nowner:x:1000:\n'
+            files['run/systemd/resolve/stub-resolv.conf'] = 'nameserver 127.0.0.53\noptions edns0 trust-ad\n'
+            files['proc/net/route'] = 'Iface\tDestination\tGateway\tFlags\neth0\t00000000\t0101A8C0\t0003\n'
+        else:
+            for rel in ('etc/wsl.conf', 'etc/resolv.conf', 'etc/binfmt.d/WSLInterop.conf'):
+                del files[rel]   # a fresh distro: the kit writes these
+            files['etc/wsl.conf'] = '[boot]\nsystemd=true\n'
+            files['etc/passwd'] = people
+            files['etc/group'] = 'root:x:0:\nsudo:x:27:\nnogroup:x:65534:\n'
+            files['proc/net/route'] = 'Iface\tDestination\tGateway\tFlags\nboth\t00000000\t011014AC\t0003\n'
         files['proc/sys/kernel/random/boot_id'] = '0f8e4f9c-1b6a-4d2e-9a57-3c1d2e4f5a6b\n'
-        files['proc/net/route'] = 'Iface\tDestination\tGateway\tFlags\nboth\t00000000\t011014AC\t0003\n'
         files['log/'] = files['opt/'] = files['etc/systemd/system/'] = ''   # as in a fresh Ubuntu
         files['log/packages/nftables'] = 'install ok installed'   # and no libatomic1 or unzip, as in a fresh Ubuntu
         files.update({rel: {'text': '#!/bin/sh\n' + text, 'mode': '755'} for rel, text in TOOLS.items()})
         for rel, value in files.items():
             self.write('/' + rel, value)
-        os.symlink('/mnt/wsl/resolv.conf', self.path('/etc/resolv.conf'))
+        os.symlink('../run/systemd/resolve/stub-resolv.conf' if linux else '/mnt/wsl/resolv.conf',
+                   self.path('/etc/resolv.conf'))
         os.symlink(shutil.which('openssl'), self.path('/usr/bin/openssl'))   # the attestation check's
-        self.machine(CONFIG)
+        self.machine(LINUX_CONFIG if linux else CONFIG)
 
     def close(self):
         os.umask(self.umask)
@@ -208,23 +242,23 @@ class Case(unittest.TestCase):
         hundreds of times for its writes, not its watch (the watch has tests of its own)."""
         self.settle = k.SETTLE = 0
 
-    def same_wsl2_walls(self):
-        """The fleet's wsl2 walls (fork-fleet-walls.py describe, a subprocess with about 80 more: some 0.3 s, most of
+    def same_fleet_walls(self):
+        """The fleet's walls (wsl2 or linux) (fork-fleet-walls.py describe, a subprocess with about 80 more: some 0.3 s, most of
         a setup run here) are looked at once for real, and every later look gets that answer: for a test that runs
         setup hundreds of times for its writes. A write a rerun leaves out still fails such a test, in one of two
         ways: setup.test.py's stopped-half-way and killed-upgrade tests compare the fake root file by file
         (same_files(): kind, mode, owner, group, content) with a whole run's; update.test.py's tests have the kit's own walls
-        (check, whose file:* walls are not cached) say so. A wsl2 wall added later that reads a file the kit writes
+        (check, whose file:* walls are not cached) say so. A fleet wall added later that reads a file the kit writes
         gets the cached answer too: in update.test.py, a write only that wall would catch goes unseen. The walls' own
         answers have their tests (check.test.py, the fleet walls' tests)."""
-        real, seen = cli.wsl2_walls, []
+        real, seen = cli.fleet_walls, []
 
-        def once():
+        def once(c):
             if not seen:
-                seen.append(real())
+                seen.append(real(c))
             return list(seen[0])
-        cli.wsl2_walls = once
-        self.addCleanup(setattr, cli, 'wsl2_walls', real)
+        cli.fleet_walls = once
+        self.addCleanup(setattr, cli, 'fleet_walls', real)
 
     def keep(self):
         """A copy of the fake root as it is now, for restore(): the same machine again, without the setup runs that
@@ -284,8 +318,11 @@ class Case(unittest.TestCase):
             return []
 
     def ready(self):
-        """A distro set up all the way: first run, `wsl --terminate`, second run."""
+        """A distro set up all the way: first run, `wsl --terminate`, second run. A plain Linux box: one run (no
+        Windows drive to unmount)."""
         code, out = self.setup_run()
+        if self.platform == 'linux':
+            return self.assertEqual(code, 0, out)
         self.assertEqual(code, 3, out)
         self.terminate()
         code, out = self.setup_run()

@@ -9,7 +9,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import golive_fixture as fx  # noqa: E402
 import back_fixture as bx  # noqa: E402
-from golive import back, check, coldcopy, config, journal, keptruntime  # noqa: E402
+from golive import back, check, coldcopy, config, journal, keptruntime, switch  # noqa: E402
 
 # A back run in its own process, SIGKILLed where `setup` says.
 KILLED = '''import os, sys
@@ -1555,6 +1555,23 @@ class Status(BackBase):
         self.assertEqual(code, 1)
         self.assertIn('boom', out)
 
+
+
+class Ready(BackBase):
+    """#1047: a port that answers is not a T3 that is ready (a request between "Listening" and "T3 Code server is
+    ready." can wait minutes). A wait after a start is over only when T3's own runtime record names a new server."""
+
+    def test_a_port_that_answers_is_not_a_started_t3(self):
+        old = self.m.server.pid
+        self.adapter.stop()
+        os.unlink(self.m.path('home/userdata/server-runtime.json'))
+        self.adapter._svc(ActiveState='active', MainPID=os.getpid())   # the unit runs, its server not ready yet
+        self.assertTrue(switch.answers(self.m.port))
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.2), \
+                self.assertRaisesRegex(RuntimeError, r'did not come back within .*server-runtime\.json is missing'):
+            coldcopy._wait_started(config.load(), self.adapter, None, old)
+        self.adapter.start()   # the server wrote its record: started
+        self.assertNotEqual(coldcopy._wait_started(config.load(), self.adapter, None, old)['pid'], old)
 
 if __name__ == '__main__':
     unittest.main()

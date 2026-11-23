@@ -2,7 +2,7 @@
 
 Every path is read and written under ROOT, which is '' (the real machine) except in the tests, where
 PC_AGENTS_ROOT names a fake one; root never gets a fake one. Standard library only."""
-import hashlib, ipaddress, json, os, re, signal, subprocess, time
+import hashlib, ipaddress, json, os, re, signal, stat, subprocess, time
 
 import machine_file
 
@@ -11,6 +11,8 @@ ROOT = os.environ.get('PC_AGENTS_ROOT', '')
 if ROOT and os.geteuid() == 0:
     raise SystemExit('pc-agents: PC_AGENTS_ROOT is for the tests only, never for root; unset it')
 OWNER = os.geteuid() if ROOT else 0   # who must own every file the kit writes
+# The agent user and its home: these defaults, or the machine file's agentUser and agentHome (an existing user a
+# plain Linux box adopts, #1047); config() sets them, before anything reads them.
 HOME, USER = '/home/agent', 'agent'
 NOLOGIN = '/usr/sbin/nologin'   # the agent's login shell: no shell for `wsl -u agent` or su; T3 gets SHELL from its unit
 OPT, STATE = '/opt/pc-agents', '/etc/pc-agents'
@@ -48,11 +50,26 @@ ARCHIVE_MAX, SUMS_MAX, JSON_MAX = 1 << 30, 1 << 16, 16 << 20   # largest downloa
 UNPACKED_MAX = 4 << 30   # the most an archive may unpack to (bytes)
 CHECK = OPT + '/current/sbin/pc-agents'
 WALLS_PY = OPT + '/current/walls/fork-fleet-walls.py'
-# Walls of fork-fleet-walls/wsl2 that are about the fleet launcher's job units. Here the job unit is T3's own unit,
-# whose sandbox this kit writes and checks itself (the unit file must be exactly the kit's, with no drop-in).
+# Walls of fork-fleet-walls/wsl2 (and /linux) that are about the fleet launcher's job units. Here the job unit is T3's
+# own unit, whose sandbox this kit writes and checks itself (the unit file must be exactly the kit's, with no drop-in).
 UNIT_WALLS = {'mounts', 'sockets', 'userns'}
+# The kinds of machine (the machine file's "platform"): a WSL2 distro of its own (the default: a machine file from
+# before the key) or a plain Linux box that is also the owner's (issue #1027). On linux the WSL steps are left out
+# (wsl.conf, the binfmt mask, the /mnt/wsl and /run/WSL hides, the host's own resolv.conf) and so are the masks of the
+# owner's cron, at and ssh: T3's unit cannot use cron or at (NoNewPrivileges: crontab and at are setgid), and sshd
+# refuses the agent (SSHD_CONF). Every other wall is the same on both.
+PLATFORMS = ('wsl2', 'linux')
 MASKS = ['/etc/binfmt.d/WSLInterop.conf'] + ['/etc/systemd/system/' + u for u in
                                             ('cron.service', 'atd.service', 'ssh.service', 'ssh.socket')]
+SSHD_CONF = '/etc/ssh/sshd_config.d/pc-agents.conf'   # linux: sshd refuses the agent (a key it wrote, a forward)
+# Sockets that hand out root (a container engine's API): the agent must not be able to reach one (linux and wsl2)
+ROOT_SOCKETS = ('/run/docker.sock', '/var/run/docker.sock', '/run/containerd/containerd.sock',
+                '/run/podman/podman.sock')
+# A helper the agent may run through sudo (sudoHelpers): an absolute plain path, each folder named, then plain
+# arguments (or "" for none: sudo's own way to say no arguments). No wildcard, no ALL, no `..`, no list, and none of
+# sudoers' special characters in an argument (#1047): an unescaped `:` starts another `Host = Cmnd` spec on the same
+# line (`/usr/bin/id x:ALL=NOPASSWD:ALL` grants ALL), and `=`, `,`, `\`, `!` are its other separators and escapes.
+HELPER = re.compile(r'(/(?!\.\.?(?:/| |$))[A-Za-z0-9._+-]+)+( (""|(?!ALL( |$))[A-Za-z0-9._/@+-]+))*')
 # Every folder systemd reads system units and drop-ins from (systemd.unit(5)); the kit's units live in the first.
 UNIT_DIRS = ('/etc/systemd/system', '/etc/systemd/system.control', '/run/systemd/system.control',
              '/run/systemd/transient', '/run/systemd/generator.early', '/etc/systemd/system.attached',
@@ -119,11 +136,61 @@ SPEC = {
     'tailscaleTag': (str, machine_file.REQUIRED, lambda v: None if re.fullmatch(r'tag:[a-z0-9-]{1,50}', v) else 'tag:name'),
     'devPorts': (str, '4100-4199', lambda v: None if port_range(v) else 'LOW-HIGH, 1024 to 65535, like 4100-4199'),
     'autoUpdate': (dict, {'enabled': False, 'follow': ''}, lambda v: auto_update_problem(v)),
+    'platform': (str, 'wsl2', lambda v: None if v in PLATFORMS else 'wsl2 or linux'),
+    'sudoHelpers': (list, [], lambda v: helpers_problem(v)),
     'gpu': (bool, False, None),
+    'agentUser': (str, 'agent', lambda v: None if re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', v) and v != 'root' else
+                  'a user name (lowercase letters, digits, _ and -), not root'),
+    'agentHome': (str, '/home/agent', lambda v: None if re.fullmatch(r'/home/[a-z_][a-z0-9_.-]{0,31}', v) else
+                  '/home/NAME: one folder under /home (the unit hides every other home)'),
+    'sudoRules': (list, [], lambda v: rules_problem(v)),
+    'keepUserManager': (bool, False, None),
 }
 REPO_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.+$)[A-Za-z0-9._-]{1,100}')   # not `.` or `..`
 AUTO_UPDATE = {'enabled': (bool, machine_file.REQUIRED, None),
                'follow': (str, '', lambda v: None if not v or REPO_NAME.fullmatch(v) else 'the fork as OWNER/NAME')}
+
+
+def helpers_problem(value):
+    """Why sudoHelpers is not a list of at most 8 helpers (HELPER), or None."""
+    if len(value) > 8:
+        return 'at most 8 helpers'
+    bad = next((h for h in value if not isinstance(h, str) or not HELPER.fullmatch(h)), None)
+    return None if bad is None else (f'{bad!r}: an absolute path of plain names, then plain arguments (no wildcard, '
+                                     'no ALL, no list), as the sudo rule names it')
+
+
+# A sudoRules line (#1047): `USER HOST=(RUNAS) [TAG:]... COMMAND[, COMMAND]...` with the agent as USER, ALL or a
+# lower-case host name as HOST, RUNAS ALL or lower-case user names (an upper-case word is an alias, defined
+# somewhere the wall does not look), tags that keep sudo's environment as it is (no SETENV), and each COMMAND a
+# helper's form (HELPER: an absolute path of plain names, plain arguments, no wildcard, no ALL, no alias).
+RULE_RUNAS = r'(ALL|[a-z_][a-z0-9_-]*)(:(ALL|[a-z_][a-z0-9_-]*))?'
+RULE_TAGS = r'((NOPASSWD|PASSWD|NOEXEC|EXEC|NOSETENV)\s*:\s*)*'
+
+
+def rule_commands(user, line):
+    """The commands of a sudoRules line in the form above for user (blanks as one), or None when it is not one."""
+    m = re.fullmatch(rf'{re.escape(user)}\s+(ALL|[a-z0-9][a-z0-9.-]*)\s*=\s*\({RULE_RUNAS}\)\s*{RULE_TAGS}(.+)',
+                     sudo_line(line))
+    if not m:
+        return None
+    commands = [' '.join(x.split()) for x in m[m.lastindex].split(',')]
+    return commands if all(HELPER.fullmatch(x) for x in commands) else None
+
+
+def rules_problem(value):
+    """Why sudoRules is not a list of at most 16 sudoers lines (one line each, not blank), or None. Their form
+    (rule_commands) needs agentUser: config() checks it."""
+    if len(value) > 16:
+        return 'at most 16 rules'
+    bad = next((r for r in value if not isinstance(r, str) or not r.strip() or '\n' in r or len(r) > 300), None)
+    return None if bad is None else f'{bad!r}: one sudoers line as the file has it, 1 to 300 characters'
+
+
+def sudo_line(text):
+    """A sudoers line as the sudoers wall compares it to sudoRules: comment gone, blanks one space, none around
+    = ( ) : and , (sudo reads `agent ALL = (root)` as `agent ALL=(root)`)."""
+    return re.sub(r' ?([=():,]) ?', r'\1', ' '.join(re.sub(r'#(?!include)(?!\d).*', '', text).split()))
 
 
 def auto_update_problem(value):
@@ -182,6 +249,22 @@ def config():
             f'{where}.t3ReleaseBaseUrl: is {c["t3ReleaseBaseUrl"]}, but autoUpdate follows the releases of '
             f'{c["autoUpdate"]["follow"]}: set it to {fork_downloads(c)} (an update installs from there what it finds '
             'there), or turn autoUpdate off')
+    if c['keepUserManager'] and c['platform'] != 'linux':
+        raise machine_file.MachineFileError(f'{where}.keepUserManager: only with "platform": "linux" (WSL2 masks '
+                                            'the agent\'s user manager)')
+    if c['keepUserManager'] and (c['sudoHelpers'] or c['sudoRules']):
+        raise machine_file.MachineFileError(
+            f'{where}.keepUserManager: not with sudoHelpers or sudoRules. With its user manager (and rootless '
+            'Docker) the agent can run code outside T3\'s unit, where NoNewPrivileges does not hold, so a sudo rule '
+            'would be its own to use: drop the sudo rules, or keepUserManager')
+    bad = next((r for r in c['sudoRules'] if rule_commands(c['agentUser'], r) is None), None)
+    if bad is not None:
+        raise machine_file.MachineFileError(
+            f'{where}.sudoRules: {bad!r} is not `{c["agentUser"]} HOST=(RUNAS) [TAG:] COMMAND[, COMMAND]`: HOST ALL '
+            'or a host name, RUNAS ALL or user names, no alias, no SETENV, each COMMAND an absolute path with plain '
+            'arguments (no wildcard, no ALL)')
+    global USER, HOME
+    USER, HOME = c['agentUser'], c['agentHome']
     return c
 
 
@@ -228,9 +311,11 @@ def runtime(c):
 
 
 def masks(c):
-    """Units the kit masks: WSL's binfmt handler, cron, at, ssh and the agent's systemd user manager (with it masked,
-    no login of the agent, no linger and no user unit runs anything outside T3's unit)."""
-    return MASKS + [f'/etc/systemd/system/user@{c["agentUid"]}.service']
+    """Units the kit masks: WSL's binfmt handler, cron, at, ssh (WSL2 only: on linux they are the owner's) and the
+    agent's systemd user manager (with it masked, no login of the agent, no linger and no user unit runs anything
+    outside T3's unit), but on linux with keepUserManager (the agent's linger and rootless Docker work)."""
+    return (MASKS if c['platform'] == 'wsl2' else []) + \
+        ([] if c['keepUserManager'] else [f'/etc/systemd/system/user@{c["agentUid"]}.service'])
 
 
 def dropin_dirs(unit):
@@ -255,29 +340,72 @@ GPU = ('InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/run/tailscale',
        'DeviceAllow=/dev/dxg rw')
 
 
-def gpu_lines(text):
-    """Whether a unit text has GPU access: True (every GPU line, not HIDDEN), False (HIDDEN, no GPU line) or None
-    (a mix: neither the kit's unit with the setting on nor off)."""
+# linux, `gpu` on (#1027): NVIDIA's device nodes instead, and nothing else (a plain box has no /dev/dxg and no
+# /usr/lib/wsl; its driver's libraries are in /usr, which the unit already reads). Same two lines per node as /dev/dxg
+# (BindPaths puts the node in the unit's private /dev, DeviceAllow opens it), each skipped when missing ("-"). The list
+# is fixed, not read from /dev by setup: the driver makes some nodes only on first use (nvidia-uvm, nvidia-caps), and
+# a unit that changed with /dev would fail its file wall (and so stop T3) each time one appears. Cards: the first
+# NVIDIA_CARDS. /dev/nvidia-caps (MIG access files, root's alone by default) is bound as a folder, so it is opened by
+# its device class (the driver's "nvidia-caps" in /proc/devices), which holds just those files.
+NVIDIA_CARDS = 16
+NVIDIA = tuple(f'/dev/nvidia{i}' for i in range(NVIDIA_CARDS)) + \
+    ('/dev/nvidiactl', '/dev/nvidia-modeset', '/dev/nvidia-uvm', '/dev/nvidia-uvm-tools')
+NVIDIA_CAPS = '/dev/nvidia-caps'
+LINUX_GPU = ('BindPaths=' + ' '.join('-' + p for p in NVIDIA + (NVIDIA_CAPS,)),
+             *(f'DeviceAllow={p} rw' for p in NVIDIA),
+             'DeviceAllow=char-nvidia-caps rw')
+GPU_NODE = re.compile(r'/dev/(dxg|nvidia[^/]*|nvidia-caps/[^/]+)')   # a GPU device node, of either kind
+
+
+def gpu_lines(text, platform='wsl2'):
+    """Whether a unit text has GPU access: True (every GPU line of platform: wsl2's not HIDDEN), False (no GPU line;
+    wsl2: HIDDEN) or None (a mix, or the other kind's lines: neither the kit's unit with the setting on nor off)."""
     lines = set(text.splitlines())
-    has = [g in lines for g in GPU]
-    return True if all(has) and HIDDEN not in lines else False if not any(has) and HIDDEN in lines else None
+    if platform == 'wsl2':
+        has = [g in lines for g in GPU]
+        if any(g in lines for g in LINUX_GPU):
+            return None
+        return True if all(has) and HIDDEN not in lines else False if not any(has) and HIDDEN in lines else None
+    has = [g in lines for g in LINUX_GPU]
+    return None if any(g in lines for g in GPU[1:]) or any(has) and not all(has) else all(has)
+
+
+def gpu_granted(c, path):
+    """Whether T3's unit gives path (a GPU_NODE) with the machine file's `gpu` setting as it is."""
+    if not c['gpu']:
+        return False
+    if c['platform'] == 'wsl2':
+        return path == '/dev/dxg'
+    return path in NVIDIA or path.startswith(NVIDIA_CAPS + '/')
 
 
 def sandbox(c):
-    """The unit's walls, one `Key=value` each: T3's unit runs under them, and so does `pc-agents as-agent`."""
+    """The unit's walls, one `Key=value` each: T3's unit runs under them, and so does `pc-agents as-agent`. On linux
+    the owner's homes (and /run/user) are hidden, not only read-only, removable media too, and the unit alone reads
+    the machine file's nameservers (the host's resolver is the owner's; the firewall drops the loopback stub)."""
+    if c['platform'] == 'wsl2':
+        home = ['ProtectHome=read-only', f'ReadWritePaths={HOME}']
+        hide = GPU if c['gpu'] else (HIDDEN,)
+    else:
+        # keepUserManager: its rootless Docker's socket alone, when there ("-"); never the runtime folder, which
+        # holds the user manager's own sockets (bus, systemd/private: a way to start anything outside the unit)
+        run = f' -/run/user/{c["agentUid"]}/docker.sock' if c['keepUserManager'] else ''
+        home = ['ProtectHome=tmpfs', f'BindPaths={HOME}{run}',
+                f'BindReadOnlyPaths={STATE}/resolv.conf:/etc/resolv.conf']
+        hide = ('InaccessiblePaths=-/mnt -/media -/run/media -/tmp/.X11-unix -/run/tailscale -/run/docker.sock '
+                '-/run/containerd', *(LINUX_GPU if c['gpu'] else ()))
     return [
         'UMask=0077',
         f'MemoryMax={c["memoryMax"]}',
         f'CPUQuota={c["cpuQuota"]}',
         'NoNewPrivileges=yes',
         'ProtectSystem=strict',
-        'ProtectHome=read-only',
-        f'ReadWritePaths={HOME}',
+        *home,
         'PrivateTmp=yes',
         'PrivateDevices=yes',
         'PrivateIPC=yes',
         'ProtectProc=invisible',
-        *(GPU if c['gpu'] else (HIDDEN,)),
+        *hide,
         f'IPAddressDeny={" ".join(BLOCKED4 + BLOCKED6)}',
         f'IPAddressAllow={" ".join(c["peers"] + c["allow"])}',
         'SocketBindDeny=any',
@@ -315,11 +443,13 @@ def render(c):
         (f'\t\tip6 daddr {{ {", ".join(allow6)} }} accept\n' if allow6 else '') + \
         f'\t\tip daddr {{ {", ".join(BLOCKED4)} }} drop\n\t\tip6 daddr {{ {", ".join(BLOCKED6)} }} drop\n\t}}\n}}\n'
     walls = '\n'.join(sandbox(c))
+    # keepUserManager: after the agent's user manager, whose runtime folder holds the Docker socket the unit binds
+    after = f'After=user@{c["agentUid"]}.service\n' if c['keepUserManager'] else ''
     unit = HEAD + f'''[Unit]
 Description=T3 Code for agents, walled (pc-agents kit)
 Wants=network-online.target
 After=network-online.target
-# any failure but a policy T3 cannot apply (77, below): give up after 5 starts in 10 minutes
+{after}# any failure but a policy T3 cannot apply (77, below): give up after 5 starts in 10 minutes
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
@@ -335,6 +465,10 @@ Restart=on-failure
 RestartSec=30
 # 77: T3 cannot apply the managed policy; a restart cannot fix that
 RestartPreventExitStatus=77
+# 130: T3's own exit on SIGTERM (a stop), not a failure (#1047); restarted all the same when the SIGTERM was not
+# systemd's stop (an agent's kill or pkill in the unit): systemd never restarts after `systemctl stop`
+SuccessExitStatus=130
+RestartForceExitStatus=130
 {walls}
 
 [Install]
@@ -343,9 +477,11 @@ WantedBy=multi-user.target
     wsl = HEAD + ('[boot]\nsystemd=true\n[automount]\nenabled=false\nmountFsTab=false\n[interop]\nenabled=false\n'
                   'appendWindowsPath=false\n[network]\ngenerateResolvConf=false\n[user]\ndefault=root\n')
     sd = '/etc/systemd/system/'
+    resolv = HEAD + ''.join(f'nameserver {n}\n' for n in c['nameservers'])
+    host = {'/etc/wsl.conf': (wsl, 0o644), '/etc/resolv.conf': (resolv, 0o644)} if c['platform'] == 'wsl2' else \
+        {STATE + '/resolv.conf': (resolv, 0o644), SSHD_CONF: (HEAD + f'DenyUsers {USER}\n', 0o644)}
     return {
-        '/etc/wsl.conf': (wsl, 0o644),
-        '/etc/resolv.conf': (HEAD + ''.join(f'nameserver {n}\n' for n in c['nameservers']), 0o644),
+        **host,
         '/etc/t3code/policy.json': (json.dumps(policy, indent=2, sort_keys=True) + '\n', 0o644),
         STATE + '/firewall.nft': (nft, 0o644),
         sd + UNIT: (unit, 0o644),
@@ -458,14 +594,19 @@ def users():
             {r[0]: [m for m in r[3].split(',') if m] for r in rows('/etc/group')})
 
 
-def login_shell(name):
-    """name's login shell in the passwd file, or None."""
+def passwd_field(name, index):
+    """Field index of name's line in the passwd file (5: home, 6: login shell), or None."""
     try:
         with open(ROOT + '/etc/passwd', encoding='utf-8') as f:
-            return next((r[6] for r in (line.rstrip('\n').split(':') for line in f) if r[0] == name and len(r) > 6),
-                        None)
+            return next((r[index] for r in (line.rstrip('\n').split(':') for line in f)
+                         if r[0] == name and len(r) > index), None)
     except FileNotFoundError:
         return None
+
+
+def login_shell(name):
+    """name's login shell in the passwd file, or None."""
+    return passwd_field(name, 6)
 
 
 def clock():
@@ -520,10 +661,38 @@ def stop_on_signals():
         signal.signal(s, stop)
 
 
+def helper_rule(c, line):
+    """Whether a sudoers line is exactly `agent ALL=(root) NOPASSWD: H[, H]...`, each H an allow-listed helper
+    (sudoHelpers, word for word: sudo runs a command named without arguments with any) that is root's alone. Nothing
+    wider: no other user, host, run-as user or tag, no wildcard, no alias."""
+    m = re.fullmatch(rf'{USER}\s+ALL\s*=\s*\(root\)\s*NOPASSWD:\s*(.+)', line)
+    if not m:
+        return False
+    helpers = [' '.join(h.split()) for h in m[1].split(',')]
+    return all(h in c['sudoHelpers'] and owned_alone(h.split()[0]) for h in helpers)
+
+
+def owned_alone(path):
+    """Whether path, a plain file, and every folder above it are the kit's owner's, writable by it alone."""
+    parts = path.split('/')
+    folders = ['/'.join(parts[:i]) or '/' for i in range(1, len(parts))]
+    return safe(path, lstat(path), stat.S_ISREG) is None and \
+        all(safe(d, lstat(d), stat.S_ISDIR) is None for d in folders)
+
+
 def sudo_problem(c):
-    """Why sudo could give the agent more (a sudoers line naming it, its group or uid, or every user), or None.
-    Harmless inside the unit (NoNewPrivileges), but a way out from anywhere else."""
+    """Why sudo could give the agent more (a sudoers line naming it, its group or uid, or every user; Defaults for it
+    or for a helper of it), or None. Harmless inside the unit (NoNewPrivileges), but a way out from anywhere else.
+    Only an allow-listed helper's rule passes (helper_rule), or a line the machine file's sudoRules names word for
+    word (blanks aside): the owner's, kept as it is, never widened."""
     who = re.compile(rf'(^|[\s,=:!(])(%?{USER}|%?#{c["agentUid"]}|ALL)($|[\s,=:)])')
+    # Defaults!<command> lines are checked for the commands of helpers and of listed rules alike (setenv and the like
+    # would widen either)
+    helpers = {h.split()[0] for h in c['sudoHelpers']} | \
+        {x.split()[0] for r in c['sudoRules'] for x in rule_commands(USER, r) or ()}
+    # a listed rule passes only while each of its commands is root's alone, as a helper's must be
+    allowed = {sudo_line(r) for r in c['sudoRules']
+               if all(owned_alone(x.split()[0]) for x in rule_commands(USER, r) or ['/'])}
     found = []
     names = ['/etc/sudoers'] + (['/etc/sudoers.d/' + n for n in sorted(os.listdir(ROOT + '/etc/sudoers.d'))]
                                 if os.path.isdir(ROOT + '/etc/sudoers.d') else [])
@@ -535,27 +704,71 @@ def sudo_problem(c):
             continue
         for line in lines:
             line = re.sub(r'#(?!include)(?!\d).*', '', line).strip()
-            if line.startswith('Defaults') or line.startswith(('@include', '#include')):
+            if line.startswith(('@include', '#include')) or line and sudo_line(line) in allowed:
+                continue
+            if line.startswith('Defaults'):   # Defaults:agent (a user list), Defaults!helper (a command list)
+                bound = re.match(r'Defaults([:!])\s*(\S+)', line)
+                if bound and (who.search(bound[2]) if bound[1] == ':' else set(bound[2].split(',')) & helpers):
+                    found.append(f'{path}: {line[:80]}')
                 continue
             first = line.split(None, 1)[0] if line else ''
             # a user list (first field) or an alias naming the agent; `root ALL=(ALL) ALL` names root, not the agent
-            if line and (who.search(first) or re.match(r'User_Alias\b', line) and who.search(line.split('=', 1)[-1])):
+            if line and (who.search(first) and not helper_rule(c, line) or
+                         re.match(r'User_Alias\b', line) and who.search(line.split('=', 1)[-1])):
                 found.append(f'{path}: {line[:80]}')
     return found and 'sudo rules that cover the agent: ' + '; '.join(found[:3])
 
 
 def user_problem(c, need_agent):
-    """Why this distro is someone else's (another login user, an agent that is not the kit's), or None."""
+    """Why this distro is someone else's (another login user: WSL2 only; on a plain Linux box the owner's users are
+    expected), or the agent is not the kit's (its uid, home, primary group, any other group), or None. An agent made
+    by hand is kept when it is the kit's, never changed to be (setup only takes its login shell away)."""
     people, groups = users()
     others = sorted(n for n, (uid, _) in people.items() if 1000 <= uid < 60000 and n != USER)
-    if others:
+    if others and c['platform'] == 'wsl2':
         return f'this distro already has login users ({", ".join(others)}): use a fresh distro for pc-agents'
     if USER not in people:
-        return f'no user {USER}' if need_agent else None
+        return f'no user {USER}' if need_agent else home_problem(c)
     if people[USER][0] != c['agentUid']:
         return f'user {USER} has uid {people[USER][0]}, not {c["agentUid"]}: not the kit\'s'
+    if (home := passwd_field(USER, 5)) != HOME:
+        return f'user {USER}\'s home is {home}, not {HOME}: not the kit\'s'
+    if why := home_problem(c):
+        return why
+    if people[USER][1] != gid(USER):
+        return f'user {USER}\'s primary group is gid {people[USER][1]}, not its own group {USER}: not the kit\'s'
     extra = sorted(g for g, members in groups.items() if USER in members)
     return f'user {USER} is in other groups ({", ".join(extra)}): it must have none' if extra else None
+
+
+def home_problem(c):
+    """Why the agent's home is not its own (#1047), or None: another user's home too (in the passwd file), or there
+    and not a folder of the agent's uid (useradd keeps the owner of a home that is already there, and T3's unit
+    binds it read-write). In the tests the agent's uid is the test user's."""
+    try:
+        with open(ROOT + '/etc/passwd', encoding='utf-8') as f:
+            others = sorted(r[0] for r in (line.rstrip('\n').split(':') for line in f)
+                            if len(r) > 5 and r[5].rstrip('/') == HOME and r[0] != USER)
+    except FileNotFoundError:
+        others = []
+    if others:
+        return f'{HOME} is also the home of {", ".join(others)}: the agent needs a home of its own'
+    st = lstat(HOME)
+    uid = OWNER if ROOT else c['agentUid']
+    if st is not None and (not stat.S_ISDIR(st.st_mode) or st.st_uid != uid):
+        return f'{HOME} is not a folder of uid {c["agentUid"]}\'s: the agent needs a home of its own (chown it, or ' \
+            'another agentHome)'
+    return None
+
+
+def gid(group):
+    """group's gid in the group file, or None."""
+    try:
+        with open(ROOT + '/etc/group', encoding='utf-8') as f:
+            return next((int(r[2]) for r in (line.rstrip('\n').split(':') for line in f)
+                         if r[0] == group and len(r) > 2 and r[2].isdigit()), None)
+    except FileNotFoundError:
+        return None
 
 
 def run(argv, timeout=120, env=None, inherit=True):
