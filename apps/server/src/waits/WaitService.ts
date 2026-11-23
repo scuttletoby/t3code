@@ -17,6 +17,7 @@ import {
   type WaitSlotSpec,
   type WaitStoreNotice,
   type WaitTarget,
+  WaitPrSpec,
   WaitToolFailure,
   type WaitToolFailureCode,
 } from "@t3tools/contracts/waitFor";
@@ -61,6 +62,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Latch from "effect/Latch";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import { ServerSettingsService } from "../serverSettings.ts";
@@ -391,6 +393,29 @@ type Loaded =
   | { readonly ok: true; readonly contents: WaitStore.WaitStoreContents }
   | { readonly ok: false; readonly reason: string };
 
+/**
+ * Fork (review rules): what a wait's `action` runs once its wake is in the thread (lens_start
+ * {afterCi}). It runs before the delivery is written, so a restart in between runs it again: it
+ * must be idempotent. `run` answers null when it is done, or a problem to tell the thread.
+ * `ready` false (the server is still starting): the message is held, nothing is sent.
+ */
+export interface WaitAction {
+  readonly ready: Effect.Effect<boolean>;
+  readonly run: (wait: WaitRecord) => Effect.Effect<string | null>;
+}
+
+const isPrSpec = Schema.is(WaitPrSpec);
+
+/**
+ * The longest one wait's action may run in a delivery: the delivery sweep holds the sweep lock, so a slow start
+ * (GitHub, the thread's run) must not stall every other wait. Past it the delivery is tried again later (the action
+ * is idempotent, and the wake is found, not sent twice).
+ */
+export const WAIT_ACTION_LIMIT = Duration.seconds(90);
+
+/** The message id of an `action` problem: one per wait, so a retry finds it again. */
+const actionMessageId = (wait: WaitRecord) => `${wait.id}-action`;
+
 export const make = Effect.fn("WaitService.make")(function* (input: {
   readonly filePath: string;
   readonly delivery: WaitDelivery;
@@ -414,6 +439,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
    * waits hold. Without it, slot waits are refused as not supported.
    */
   readonly slots?: SlotGate["Service"];
+  /** Fork (review rules): runs a wait's `action`; without it such a wait is held, never sent half. */
+  readonly action?: WaitAction;
 }) {
   const onChange = input.onChange ?? Effect.void;
   const settingsService = yield* ServerSettingsService;
@@ -761,6 +788,10 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     /** The thread's subagent parent now, so a wait still reaches it if the thread is deleted. */
     readonly parentThreadId?: ThreadId | undefined;
     readonly input: WaitForInput;
+    /** Fork (review rules): a `pr` wait for only these checks at this head (lens_start {afterCi}). */
+    readonly narrow?: { readonly checks: ReadonlyArray<string>; readonly head: string };
+    /** Fork (review rules): what the server does once the wake is in the thread. */
+    readonly action?: "lens_start";
   }) {
     const settings = yield* readSettings;
     if (!settings.waitFor.enabled) {
@@ -777,7 +808,24 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       testArgPattern: false,
     });
     if (!valid.ok) return yield* failure(valid.code, valid.message);
-    const target = valid.target;
+    const narrow = request.narrow;
+    if (narrow !== undefined && valid.target.kind !== "pr") {
+      return yield* failure("invalid", "Only a pull request wait can be narrowed to checks.");
+    }
+    const target: WaitTarget =
+      narrow !== undefined && valid.target.kind === "pr"
+        ? {
+            kind: "pr",
+            spec: { ...valid.target.spec, checks: [...narrow.checks], head: narrow.head },
+          }
+        : valid.target;
+    // A narrowed spec the store could not read back (no check, too many, a bad head) is refused, never stored.
+    if (target.kind === "pr" && !isPrSpec(target.spec)) {
+      return yield* failure(
+        "invalid",
+        "A pull request wait narrowed to checks needs 1 to 20 check names and a full head sha.",
+      );
+    }
     const judge = judgeOf(target.kind);
     const slotGate = target.kind === "slot" ? input.slots : undefined;
     if (judge === undefined && slotGate === undefined) {
@@ -919,6 +967,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
             state: "waiting",
             attempt: 0,
             ...(parentThreadId === undefined ? {} : { parentThreadId }),
+            ...(request.action === undefined ? {} : { action: request.action }),
             // The key stays the asked target's, so asking the same again finds this wait.
             ...(pinned ?? target),
           } as WaitRecord;
@@ -2058,12 +2107,48 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       (group) =>
         Effect.gen(function* () {
           if (!(yield* stillOn)) return null;
+          // Fork (review rules): a wait whose `action` cannot run yet is held, never sent half.
+          // Only a wait that passed has anything to run; any other end is told in the wake itself.
+          const actions = group.waits.filter(
+            (wait) => wait.action !== undefined && wait.result?.outcome === "passed",
+          );
+          if (actions.length > 0 && !(input.action !== undefined && (yield* input.action.ready))) {
+            return [
+              group,
+              { type: "retry", detail: "Its action cannot run yet (the server is starting)." },
+            ] as const;
+          }
           const result = yield* send({
             threadId: group.threadId,
             messageId: group.messageId,
             commandId: deliveryCommandId(group),
             text: joinedWakeMessage(group.waits),
           });
+          if (result.type !== "delivered" || input.action === undefined)
+            return [group, result] as const;
+          // In the thread: run each action before the delivery is written (a restart runs it again).
+          for (const wait of actions) {
+            const ran = yield* input.action.run(wait).pipe(Effect.timeoutOption(WAIT_ACTION_LIMIT));
+            if (Option.isNone(ran)) {
+              return [
+                group,
+                {
+                  type: "retry",
+                  detail: `Its action did not finish in ${Duration.toSeconds(WAIT_ACTION_LIMIT)} s; it runs again later.`,
+                },
+              ] as const;
+            }
+            const problem = ran.value;
+            if (problem === null) continue;
+            const told = yield* send({
+              threadId: group.threadId,
+              messageId: actionMessageId(wait),
+              commandId: `${actionMessageId(wait)}:${wait.attempt}`,
+              text: `[wait ${wait.id}] ${messageText(problem, 1000)}`,
+            });
+            // Not told yet: the whole delivery is tried again (the wake is found, the run repeats).
+            if (told.type !== "delivered") return [group, told] as const;
+          }
           return [group, result] as const;
         }).pipe(
           Effect.catchCauseIf(
