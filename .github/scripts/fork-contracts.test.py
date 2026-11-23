@@ -79,6 +79,10 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                continue-on-error, a checkout with its own timeout, and a job timeout that holds the worst
                case: the checkout's timeout, the wait cap (or the script's git calls, if longer) and one
                last poll, from the script's own limits, with a minute to spare for the job's set-up.
+  windows      fork-windows-tests.yml (a nightly report, never in the merge path) runs on schedule and by
+               hand only, reads only, cancels an older run, hides no red result, keeps the recorded steps of
+               upstream's windows-tests.yml and its 45-minute limit on hosted Windows, and runs the Windows
+               drift check itself; fork-tests.yml and its record never read or name windows-tests.yml.
 
   review-kit   the review kit (fork-kit/review) reads the fork's kit settings
                (.github/fork-review-kit.json, given with --settings) and through them the fork's queue
@@ -5196,6 +5200,100 @@ for label, change in {
     "a slower last poll than the budget holds": {"API_TIMEOUT": 200},
 }.items():
     check(f"policies: {label} fails", *policy_mutant(lambda p, w, t: None, {**POLICY_LIMITS, **change}))
+
+# --- windows -------------------------------------------------------------------------------------
+# fork-windows-tests.yml: a nightly report of upstream's windows-tests.yml on GitHub-hosted Windows. Its own `drift`
+# job follows upstream's file (fork-tests-drift.cjs --windows); this contract reads only fork files, so an upstream
+# change or removal of windows-tests.yml never turns Fork tests (the merge path and the release) red.
+WINDOWS_FILE = "fork-windows-tests.yml"
+WINDOWS_UPSTREAM = ".github/workflows/windows-tests.yml"
+WINDOWS_RECORD = ".github/fork-windows-tests-upstream.json"
+WINDOWS_LIMIT = 45  # upstream's timeout-minutes
+WINDOWS_DRIFT = "node .github/scripts/fork-tests-drift.cjs --windows"
+
+
+def windows_problems(wf, recorded, tests_wf, tests_text, tests_record):
+    problems = []
+    if triggers(wf) != {"schedule", "workflow_dispatch"}:
+        problems.append(f"{WINDOWS_FILE}: triggers are not exactly schedule and workflow_dispatch")
+    if wf.get("permissions") != {"contents": "read"}:
+        problems.append(f"{WINDOWS_FILE}: permissions are not exactly contents: read")
+    if (wf.get("concurrency") or {}).get("cancel-in-progress") is not True:
+        problems.append(f"{WINDOWS_FILE}: a newer run does not cancel an older one (cancel-in-progress)")
+    jobs = wf.get("jobs") or {}
+    if set(jobs) != {"drift", "test"}:
+        problems.append(f"{WINDOWS_FILE}: jobs are not exactly drift and test: {sorted(jobs)}")
+    for job_id, job in jobs.items():
+        limit = job.get("timeout-minutes")
+        if not (type(limit) is int and 0 < limit <= WINDOWS_LIMIT):
+            problems.append(f"{WINDOWS_FILE}/{job_id}: timeout-minutes is not 1 to {WINDOWS_LIMIT}")
+        hosted = ("windows-",) if job_id == "test" else ("windows-", "ubuntu-")
+        if not str(job.get("runs-on", "")).startswith(hosted):
+            problems.append(f"{WINDOWS_FILE}/{job_id}: runs-on is not a GitHub-hosted {' or '.join(hosted)} image")
+        if job.get("continue-on-error") or any(s.get("continue-on-error") for s in job.get("steps") or []):
+            problems.append(f"{WINDOWS_FILE}/{job_id}: a red result is hidden (continue-on-error)")
+    drift_runs = [str(s.get("run", "")).strip() for s in (jobs.get("drift") or {}).get("steps") or []]
+    if WINDOWS_DRIFT not in drift_runs:
+        problems.append(f"{WINDOWS_FILE}/drift: no step runs `{WINDOWS_DRIFT}`")
+    up_steps = [s.get("name") for s in ((recorded.get(WINDOWS_UPSTREAM) or {}).get("test") or {}).get("steps") or []]
+    if not up_steps:
+        problems.append(f"{WINDOWS_RECORD}: no recorded test job of {WINDOWS_UPSTREAM} (record it with --windows)")
+    mine = [s.get("name") or s.get("uses") for s in (jobs.get("test") or {}).get("steps") or []]
+    if mine != up_steps:
+        problems.append(f"{WINDOWS_FILE}/test: steps differ from the recorded upstream steps: {mine} != {up_steps}")
+    # Fork tests (merge path, release) must not depend on upstream's Windows lane.
+    if re.search(r"(?<!fork-)windows-tests\.yml", tests_text):
+        problems.append("fork-tests.yml: names upstream's windows-tests.yml")
+    if any("fork-tests-drift.cjs" in str(s.get("run", "")) and "--windows" in str(s.get("run", ""))
+           for _, s in steps(tests_wf)):
+        problems.append("fork-tests.yml: runs the Windows drift check (fork-tests-drift.cjs --windows)")
+    if WINDOWS_UPSTREAM in tests_record:
+        problems.append(f".github/fork-tests-upstream.json: tracks {WINDOWS_UPSTREAM} (Fork tests would follow it)")
+    return problems
+
+
+windows_inputs = (
+    real.get(WINDOWS_FILE, {}),
+    json.loads((root / WINDOWS_RECORD).read_text()) if (root / WINDOWS_RECORD).exists() else {},
+    real.get("fork-tests.yml", {}),
+    (workflows_dir / "fork-tests.yml").read_text(),
+    json.loads((root / ".github/fork-tests-upstream.json").read_text()),
+)
+problems = windows_problems(*windows_inputs)
+check("windows: fork-windows-tests.yml runs nightly and by hand only, cancels an older run, keeps the recorded "
+      "upstream steps and 45-minute limit on hosted Windows, runs its own drift check; Fork tests never read "
+      "windows-tests.yml", not problems, "; ".join(problems))
+for label, mutate in {
+    "a pull_request trigger": lambda w, r, t, x, tr: w[True].__setitem__("pull_request", None),
+    "a push trigger": lambda w, r, t, x, tr: w[True].__setitem__("push", None),
+    "no cancel-in-progress": lambda w, r, t, x, tr: w["concurrency"].__setitem__("cancel-in-progress", False),
+    "a write permission": lambda w, r, t, x, tr: w["permissions"].__setitem__("actions", "write"),
+    "a longer limit": lambda w, r, t, x, tr: w["jobs"]["test"].__setitem__("timeout-minutes", 90),
+    "upstream's Blacksmith runner": lambda w, r, t, x, tr: w["jobs"]["test"].__setitem__(
+        "runs-on", "blacksmith-8vcpu-windows-2025"),
+    "a step dropped": lambda w, r, t, x, tr: w["jobs"]["test"]["steps"].pop(1),
+    "a step renamed": lambda w, r, t, x, tr: w["jobs"]["test"]["steps"][0].__setitem__("name", "Clone"),
+    "a recorded upstream step the copy lacks": lambda w, r, t, x, tr: r[WINDOWS_UPSTREAM]["test"]["steps"].append(
+        {"name": "New"}),
+    "no record": lambda w, r, t, x, tr: r.clear(),
+    "continue-on-error": lambda w, r, t, x, tr: w["jobs"]["test"].__setitem__("continue-on-error", True),
+    "no drift job": lambda w, r, t, x, tr: w["jobs"].pop("drift"),
+    "a drift job without --windows": lambda w, r, t, x, tr: w["jobs"]["drift"]["steps"][-1].__setitem__(
+        "run", "node .github/scripts/fork-tests-drift.cjs"),
+    "fork-tests.yml running the Windows drift check": lambda w, r, t, x, tr: t["jobs"]["workflows"]["steps"].append(
+        {"run": WINDOWS_DRIFT}),
+    "the merge-path record tracking windows-tests.yml": lambda w, r, t, x, tr: tr.__setitem__(WINDOWS_UPSTREAM, {}),
+}.items():
+    args = copy.deepcopy(windows_inputs)
+    try:
+        mutate(*args)
+        caught = bool(windows_problems(*args))
+    except Exception as e:
+        caught = False
+        label += f" (crashed: {e!r})"
+    check(f"windows: {label} fails", caught)
+caught = bool(windows_problems(*windows_inputs[:3], windows_inputs[3] + "\n# windows-tests.yml\n", windows_inputs[4]))
+check("windows: fork-tests.yml naming windows-tests.yml fails", caught)
 
 # --- review-kit (#957) ---------------------------------------------------------------------------
 # The fork keeps its kit settings under its own name, so the general kit's tests do not name them (#957 item 5).
