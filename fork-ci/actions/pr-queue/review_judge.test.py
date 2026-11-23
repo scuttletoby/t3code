@@ -550,7 +550,7 @@ NOT_GATE = ('.github/fork-ci-tests.txt',)
 # other kits run machines and agents, and the merge gate reads none of them.
 GATE_KITS = ('gh-apps', 'review')
 OTHER_KITS = ('.gitignore', 'README.md', 'agent-guards', 'cleaner', 'common', 'desk', 'golive', 'heavy', 'model-guard',
-              'pc-agents', 'schedule-kick')
+              'pc-agents', 'schedule-kick', 'update-policy')
 
 
 class ForkConfig(unittest.TestCase):

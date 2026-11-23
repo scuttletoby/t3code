@@ -1,0 +1,12 @@
+# update-policy kit: written by update-policy-install. Do not edit: run the installer again.
+[Unit]
+Description=update-policy tick: restart at the quiet hour only when idle; live roles alert (fork-kit/update-policy)
+# runs the release in use; without one (an uninstall half-way) it does nothing
+ConditionPathExists=/usr/local/libexec/update-policy/current/bin/update-policy
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/update-policy/current/bin/update-policy tick
+Nice=5
+TimeoutStartSec=5min
+UMask=0022

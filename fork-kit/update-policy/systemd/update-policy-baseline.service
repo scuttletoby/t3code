@@ -1,0 +1,14 @@
+# update-policy kit: written by update-policy-install. Do not edit: run the installer again.
+[Unit]
+Description=update-policy baseline: report drift from the update and restart policy (fork-kit/update-policy)
+ConditionPathExists=/usr/local/libexec/update-policy/current/bin/update-policy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/update-policy/current/bin/update-policy baseline
+# drift is exit 1: the unit shows as failed until the drift is gone (systemctl --failed)
+Nice=10
+TimeoutStartSec=10min
+UMask=0022
