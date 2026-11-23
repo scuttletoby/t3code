@@ -54,6 +54,12 @@ down to `elevated` after `severeClearSeconds` without severe readings, `elevated
 reads, one per box it asks for (the level includes that box's PSI); no previous state means the raw level; no
 clock means no step down; a clock that went back restarts the wait.
 
+**CPU brake (`cpu`, optional).** `pressureSomeAvg10Pct` and `loadPerCorePercent`: one more job is refused while
+the CPU pressure (`some avg10`) reaches the first, or, where no pressure is read, the 1-minute load per CPU
+reaches the second. Only the host kit reads it
+for now (`fork-kit/heavy`, README "CPU brake"); this evaluator and its vectors do not, so no vector holds its
+numbers. A rule without it has no brake.
+
 ## Units and rounding (every evaluator does exactly this)
 
 - Memory is whole MB (1 MB = 1048576 bytes) in every key ending in `Mb`; CPU is hundredths of a core in keys

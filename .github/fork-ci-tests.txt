@@ -46,7 +46,7 @@
 .github/scripts/fork-checks-ran.test.py unittest
 .github/scripts/fork-ci-pressure.test.py unittest
 .github/scripts/fork-ci-rerun.test.py unittest
-.github/scripts/fork-contracts.test.py ~45s ok lines
+.github/scripts/fork-contracts.test.py ~91s ok lines
 .github/scripts/fork-fleet-desk-agent.test.py ~23s unittest
 .github/scripts/fork-fleet-desk-key.test.py ~10s unittest
 .github/scripts/fork-fleet-desk-seed.test.py ~34s unittest

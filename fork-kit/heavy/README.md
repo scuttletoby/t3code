@@ -692,6 +692,27 @@ Two thin callers come with it:
 A `heavy facts` that does not answer within 5 s (it is killed), fails or prints something else is never free for
 either caller.
 
+**CPU brake (#1047).** Memory alone admitted a build on a machine whose every core was taken by work outside heavy
+(containers its user had started). The rule's `cpu` (`capacity-rule.json`) brakes one more job: busy when the
+CPU pressure (`some avg10`) is at least `pressureSomeAvg10Pct` (80). The pressure is the machine's
+(`/proc/pressure/cpu`), or in a container with a CPU limit (the cgroup root's `cpu.max`) the container's own
+(`cpu.pressure` there): the host can be busy while the container's share is free. Only where no pressure is read
+does the 1-minute load decide, at `loadPerCorePercent` (150) of the host's online CPUs (the load is the host's; it
+counts tasks waiting for I/O too, so it never overrides a pressure reading). It brakes
+jobs and MB alone (which asks for a job), never agents, which mostly wait on their model; the job kinds' `fits` are
+then 0, and the reason names the reading (`NOT OK: cpu pressure 93% (some avg10; the brake is 80%)`). A missing or
+broken CPU PSI or load brakes nothing (the memory rule still decides). The shared TypeScript evaluator does not read
+`cpu`: it brakes the kit's callers (`heavy`, `t3-capacity`) only. A cache from an older
+kit is not read (cache version 5), so the first call after an update starts "elevated", as after any update.
+
+**Containers outside heavy.** Their memory is counted where it is used: the machine's available memory (and a
+container's own `memory.max`, read as the reader's container cap) already leaves out what every container holds
+now. What a container may still grow into is not: most have no limit, and their cgroups sit in places that differ
+by engine (rootful Docker's `system.slice/docker-<id>.scope`, rootless Docker's under its user's manager, Podman's
+`libpod-*`, Kubernetes' `kubepods`), so no cheap and general read gives a budget. To keep room for them, give their
+slice a hold (`heavy.capacity.holds`, below) where it is one fixed cgroup outside the user managers, or a
+reservation (`reserve.d`) for their work folder.
+
 **Swap trend, per read.** Swap is "filling" when its free MB fell by more than `swapFillingMb` (64) since the last
 read. That limit is per read, not per second: `heavy facts` reads at most every 5 s (its cache) and carries the last
 reading up to 5 minutes, the T3 server reads every 30 s and on each ask, so swap that fills slowly can be "filling"

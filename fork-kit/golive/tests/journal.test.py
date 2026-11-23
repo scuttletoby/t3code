@@ -1,10 +1,11 @@
 """The kit's lock and journal, the systemd adapter (with stub commands) and the version order.
 No root, no systemd, no T3.  python3 -I -B fork-kit/golive/tests/journal.test.py"""
-import fcntl, json, os, subprocess, sys, unittest
+import fcntl, io, json, os, subprocess, sys, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import golive_fixture as fx  # noqa: E402
-from golive import journal, live, osadapter  # noqa: E402
+from unittest import mock  # noqa: E402
+from golive import check, coldcopy, journal, live, osadapter  # noqa: E402
 
 HOLD = '''import os, sys, time
 sys.path[:0] = {paths!r}
@@ -108,6 +109,99 @@ class Lock(Base):
             pass
         self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(os.path.join(self.state, 'journal.jsonl')).st_mode & 0o777, 0o600)
+
+
+class AsRoot(Base):
+    """Root never makes the lock (or the journal) in a state folder that is another user's (fork #1047): refused,
+    nothing made, so the T3 user can still take the lock afterwards."""
+    def setUp(self):
+        super().setUp()
+        real = journal._euid
+        journal._euid = lambda: 0
+        self.addCleanup(setattr, journal, '_euid', real)
+
+    def test_refused_in_another_users_folder(self):
+        for state in (self.state, os.path.join(self.state, 'not', 'yet')):   # there, or the folder above it
+            with self.subTest(state=state):
+                with self.assertRaises(journal.WrongUser) as e:
+                    with journal.lock(state, 'copy', exclusive=True):
+                        self.fail('locked as root')
+                self.assertIn('not as root', str(e.exception))
+                self.assertIsInstance(e.exception, journal.Busy)   # every command refuses it as a held lock
+                self.assertFalse(os.path.exists(os.path.join(state, 'lock')))
+                self.assertFalse(os.path.exists(os.path.join(self.state, 'not')))
+        with self.assertRaises(journal.WrongUser):
+            with journal.run(self.state, 'copy'):
+                self.fail('ran as root')
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'journal.jsonl')))
+
+    def test_status_writes_nothing_and_goes_on(self):
+        with journal.lock(self.state, 'status', exclusive=False, create=False):
+            pass
+
+    def test_refused_by_the_t3_homes_owner_whatever_owns_the_state_folder(self):
+        """A stateDir an earlier root run made root's, or a missing one under a folder of root's, passes the state
+        folder's own owner check; the T3 home's owner (golive acts as that user) refuses them all."""
+        self.m.standard()
+        for state in (self.state, os.path.join(self.state, 'missing')):
+            with self.subTest(state=state):
+                self.assertIn('the T3 home', journal.as_root_problem(self.m.home, state))
+        with mock.patch.object(journal, '_not_roots', lambda d: None):   # as if stateDir were root's
+            for argv in (['check'], ['copy', '--here'], ['settle', '--reason', 'x'], ['rehearse']):
+                with self.subTest(argv=argv):
+                    err = io.StringIO()
+                    self.assertEqual(check.main(argv, out=io.StringIO(), err=err), 2)
+                    self.assertIn('not as root', err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'lock')))
+        journal._euid = os.geteuid
+        self.assertIsNone(journal.as_root_problem(self.m.home, self.state))
+
+    def test_no_guard_log_as_root(self):
+        """The guards log before they take the lock: never a root-owned guard.log either."""
+        with self.assertRaises(PermissionError):
+            coldcopy._guard_log(self.state, {'run': 'x', 'waiting': True})
+        self.assertFalse(os.path.exists(os.path.join(self.state, coldcopy.GUARD_LOG)))
+
+    def test_the_user_itself_goes_on(self):
+        journal._euid = os.geteuid
+        with journal.lock(self.state, 'copy', exclusive=True):
+            pass
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'lock')))
+
+
+class LeftByAnotherUser(Base):
+    """State an older root run left (fork #1047): the T3 user is told which files and the chown that fixes them,
+    instead of an unhandled PermissionError."""
+    def test_a_lock_of_another_owner_names_the_fix(self):
+        with journal.lock(self.state, 'copy', exclusive=True):
+            pass
+        real = journal._euid
+        journal._euid = lambda: real() + 1   # the files are now someone else's
+        self.addCleanup(setattr, journal, '_euid', real)
+        for take in (lambda: journal.lock(self.state, 'check', exclusive=False), lambda: journal.run(self.state, 'copy')):
+            with self.assertRaises(journal.WrongUser) as e:
+                with take():
+                    self.fail('took a lock of another owner')
+            self.assertIn(f'chown -R ', str(e.exception))
+            self.assertIn(os.path.join(self.state, 'lock'), str(e.exception))
+
+
+class StateDirNotMakeable(Base):
+    def test_a_missing_state_folder_it_may_not_make_names_the_fix(self):
+        """#1047: a stateDir missing under a folder the T3 user may not write (one of root's) is a clear refusal with
+        the commands that fix it, not an unhandled PermissionError."""
+        parent = os.path.join(self.m.root, 'not-mine')
+        os.makedirs(parent)
+        os.chmod(parent, 0o555)
+        self.addCleanup(os.chmod, parent, 0o755)
+        state = os.path.join(parent, 'kit-state')
+        if os.access(parent, os.W_OK):
+            self.skipTest('this user may write any folder (root)')
+        with self.assertRaises(journal.WrongUser) as e:
+            with journal.lock(state, 'copy', exclusive=True):
+                self.fail('made a folder it may not')
+        self.assertIn(f'mkdir -p {state} && chown ', str(e.exception))
+        self.assertFalse(os.path.exists(state))
 
 
 class Journal(Base):

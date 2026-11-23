@@ -62,7 +62,7 @@ import datetime, errno, fcntl, fnmatch, hashlib, json, math, os, pwd, re, select
 
 CACHE_SECONDS, CARRY_SECONDS, ANSWER_SECONDS, STALE_TMP_SECONDS = 5, 300, 5, 60
 EXIT_FREE, EXIT_BUSY, EXIT_ERROR = 0, 75, 1
-CACHE_VERSION = 4                               # 3: reservations owedMb (#923); 4: full-tier pieceCaps (#951)
+CACHE_VERSION = 5                               # 3: reservations owedMb (#923); 4: full-tier pieceCaps (#951); 5: cpu (#1047)
 AGENT_SCOPE_RE = re.compile(r'^t3code-[A-Za-z0-9_.:\\-]+\.scope\Z')
 SCOPE_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\.scope\Z')
 TICKET_RE = re.compile(r'^t-[0-9]{1,15}-[0-9]{1,10}\.json\Z')
@@ -72,7 +72,7 @@ HOLD_LABEL_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,39}\Z')
 CG_PART_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\Z')
 CACHE_FILE_RE = re.compile(r'^heavy-facts(-v[0-9]{1,4}-[0-9a-f]{16})?\.json\Z')   # an older kit's: heavy-facts.json
 CACHE_KEYS = {'v', 'key', 'atMs', 'tier', 'facts', 'boxPsi', 'reservations', 'learned', 'carry', 'notes', 'load1',
-              'queue', 'pressure'}
+              'cpu', 'queue', 'pressure'}
 USERS = '/sys/fs/cgroup/user.slice'
 MOUNTS_LIMIT = 1 << 22                          # the mount table read for automounts (#996: longer is a note)
 RUN_USER = '/run/user'                          # the cache's folder: /run/user/<uid>
@@ -115,6 +115,45 @@ def load1():
         return float(_read('/proc/loadavg').split()[0])
     except (OSError, ValueError, IndexError):
         return None
+
+
+def cpu_reading(host):
+    """The CPU readings of the brake (#1047): {'pressureSome10': the "some avg10" CPU pressure in percent (the share
+    of time some runnable task waited for a CPU) or None, 'hostCores': the CPUs the kernel has online (what
+    /proc/loadavg is a load of) or None}. In a container with a CPU limit (the cgroup root's cpu.max), its own
+    cpu.pressure, not the host's /proc/pressure/cpu: the host can be busy while the container's share is free. Only
+    the some line: a kernel before 5.13 writes no full line for the CPU. None: missing, turned off or unreadable."""
+    capped = cr.is_num(rd._container_cpus(host, 'v2'))
+    read = rd._read_text(host, rd.CGROUP + '/cpu.pressure' if capped else '/proc/pressure/cpu')
+    some = rd._psi_line('some', read['text']) if 'text' in read else None
+    online = rd._read_text(host, '/sys/devices/system/cpu/online')
+    cores = 0
+    for part in online.get('text', '').strip().split(',') if 'text' in online else ():
+        lo, _, hi = part.partition('-')
+        cores = cores + int(hi or lo) - int(lo) + 1 if lo.isdigit() and (hi or lo).isdigit() else None
+        if cores is None:
+            break
+    return {'pressureSome10': float(some) if some is not None and float(some) <= 100 else None,
+            'hostCores': cores or None}
+
+
+def cpu_busy(rule, cpu, load):
+    """Why the CPU is too busy for one more job (the rule's optional `cpu`, #1047), or None. Memory alone missed a
+    machine whose CPU was taken by work outside heavy (containers its user started). CPU pressure decides where it
+    is read (at or above pressureSomeAvg10Pct); the 1-minute load only where it is not (at or above
+    loadPerCorePercent of the host's online CPUs: the load is the host's, and it counts tasks waiting for I/O too, so
+    it never overrides a pressure reading). A missing reading brakes nothing: the memory rule still decides."""
+    c, cpu = rule.get('cpu'), cpu or {}
+    if not c:
+        return None
+    psi, cores = cpu.get('pressureSome10'), cpu.get('hostCores')
+    if psi is not None:
+        return f'cpu pressure {psi:g}% (some avg10; the brake is {c["pressureSomeAvg10Pct"]:g}%)' \
+            if psi >= c['pressureSomeAvg10Pct'] else None
+    if cr.is_num(load) and cr.is_num(cores) and cores > 0 and load * 100 >= cores * c['loadPerCorePercent']:
+        return f'cpu load {load:g} on {cores:g} cores (no CPU pressure reading; the brake is ' \
+            f'{c["loadPerCorePercent"]}% of the cores)'
+    return None
 
 
 def cg(path):
@@ -1006,7 +1045,8 @@ def read_machine(rule, where, carry, now):
                       'pieceCaps': tier == 'full', 'swap': m['swap'], 'psi': m['psi'], 'osLevel': m['osLevel'],
                       'pieces': pieces},
             'boxPsi': box_psi, 'reservations': res, 'learned': learned, 'carry': carry,
-            'notes': notes, 'load1': load1(), 'queue': {'running': running, 'waiting': waiting, 'agents': agents}}
+            'notes': notes, 'load1': load1(), 'cpu': cpu_reading(host),
+            'queue': {'running': running, 'waiting': waiting, 'agents': agents}}
 
 
 def no_carry():
@@ -1120,12 +1160,15 @@ def answer(rule, readings, kind=None, need_mb=None, cwds=()):
     basic = readings['tier'] not in ('full', 'machine')
     # with a kind the rule alone decides (its floor too: a declared size is already a floor of the cost); MB alone
     # asks only whether they fit the free budget at level ok
-    free = not basic and (d['admit'] if kind else d['level'] == 'ok' and d['freeMb'] is not None
-                          and need_mb <= d['freeMb'])
+    roomy = not basic and (d['admit'] if kind else d['level'] == 'ok' and d['freeMb'] is not None
+                           and need_mb <= d['freeMb'])
+    # the CPU brake (#1047): jobs only (MB alone asks for a job), never past what memory refused
+    busy_cpu = cpu_busy(rule, readings.get('cpu'), readings['load1'])
+    free = roomy and not (busy_cpu and group == 'job')
     fits = {}
     for k, spec in rule['kinds'].items():
         g = spec['group']
-        fits[k] = 0 if basic else cr.fill(rule, facts_for(readings, g, cwds),
+        fits[k] = 0 if basic or busy_cpu and g == 'job' else cr.fill(rule, facts_for(readings, g, cwds),
                                           [{'kind': k, 'count': rule['ceilings'][g]}], learned, carry.get(g),
                                           now_ms)['admitted'][0]
     facts, swap = readings['facts'], readings['facts']['swap']
@@ -1141,11 +1184,14 @@ def answer(rule, readings, kind=None, need_mb=None, cwds=()):
                       'swapFreeMb': math.floor(swap['freeMb']) if swap else 0,
                       'swapUsedPercent': round(100 - 100 * swap['freeMb'] / swap['totalMb'], 1) if swap else None,
                       'pressureFull10': facts['psi']['fullAvg10Pct'] if isinstance(facts['psi'], dict) else None},
-           'queue': readings['queue'], 'cpu': {'cores': facts['cpuCores'], 'load1': readings['load1']},
+           'queue': readings['queue'], 'cpu': {'cores': facts['cpuCores'], 'load1': readings['load1'],
+                                               'pressureSome10': (readings.get('cpu') or {}).get('pressureSome10')},
            'reservations': [{'name': r['name'], 'mb': r['mb'], 'useMb': math.floor(r['useMb']),
                              'owedMb': math.floor(r['owedMb']), 'own': own(r, cwds)} for r in readings['reservations']],
            'notes': list(readings['notes'])}
-    if not free:
+    if not free and roomy:
+        out['reason'] = f'{kind}: {busy_cpu}' if kind else busy_cpu
+    elif not free:
         why = 'basic tier' if basic and (d['admit'] if kind else d['level'] == 'ok') else \
             (d['reason'] if kind else f'{need_mb} MB')
         out['reason'] = (f'{kind}: {why}' if kind else why) + \

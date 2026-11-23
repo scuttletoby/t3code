@@ -799,7 +799,12 @@ class StaleFirewall(Case):
 UNIT = '/etc/systemd/system/t3code-agents.service'
 # The unit fake_distro's CONFIG gives, as the kit wrote it before the `gpu` setting existed (#1024): with no setting
 # (or "gpu": false) the unit stays byte for byte this one. Change it only when the unit itself is meant to change.
-DEFAULT_UNIT_SHA = '11263b1dddb775e704fec1371ee56b99965581a35cfee361c3e02f8e8e98142a'
+# #1047 changed it on purpose by EXIT_130 alone (exit 130: success, and restarted unless systemd stopped it): the unit without those lines is still the one before (OLD_UNIT_SHA).
+DEFAULT_UNIT_SHA = '560e819a371e749ba507f2b2f48d3e5fc57f684fe11ae1ff7bc967385ba64b32'
+OLD_UNIT_SHA = '11263b1dddb775e704fec1371ee56b99965581a35cfee361c3e02f8e8e98142a'
+EXIT_130 = ("# 130: T3's own exit on SIGTERM (a stop), not a failure (#1047); restarted all the same when the SIGTERM "
+            "was not\n# systemd's stop (an agent's kill or pkill in the unit): systemd never restarts after `systemctl "
+            "stop`\nSuccessExitStatus=130\nRestartForceExitStatus=130\n")
 HIDDEN_WSL = 'InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl -/run/tailscale'
 GPU_LINES = ['InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/run/tailscale', 'TemporaryFileSystem=/usr/lib/wsl:ro',
              'BindReadOnlyPaths=-/usr/lib/wsl/lib -/usr/lib/wsl/drivers', 'BindPaths=-/dev/dxg',
@@ -816,6 +821,7 @@ class Gpu(Case):
         c = k.config()
         self.assertIs(c['gpu'], False)
         self.assertEqual(k.sha(k.render(c)[UNIT][0]), DEFAULT_UNIT_SHA)
+        self.assertEqual(k.sha(k.render(c)[UNIT][0].replace(EXIT_130, '', 1)), OLD_UNIT_SHA)
         self.assertIn(HIDDEN_WSL, k.sandbox(c))
         for line in GPU_LINES:
             self.assertNotIn(line, k.sandbox(c))

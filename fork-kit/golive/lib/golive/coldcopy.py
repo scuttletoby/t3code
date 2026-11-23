@@ -1130,6 +1130,8 @@ def _same_after_stop(cfg, server):
 
 
 def _guard_log(state_dir, record):
+    if why := journal._not_roots(state_dir):   # never a root-owned guard.log (fork #1047); callers skip an OSError
+        raise PermissionError(why)
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
     with open(os.path.join(state_dir, GUARD_LOG), 'a', encoding='utf-8') as f:
         f.write(json.dumps({'at': _stamp(), **record}) + '\n')

@@ -405,6 +405,9 @@ class Unit(Case):
         self.assertIn('\nIPAddressAllow=100.101.102.103/32\n', unit)
         self.assertIn('\nStartLimitBurst=5\n', unit)
         self.assertIn('\nRestartPreventExitStatus=77\n', unit)   # a policy T3 cannot apply is not retried
+        self.assertIn('\nSuccessExitStatus=130\n', unit)   # T3's exit on SIGTERM: a stop is not a failure
+        self.assertIn('\nRestartForceExitStatus=130\n', unit)   # but a SIGTERM that is not systemd's stop restarts
+        self.assertIn('\nRestart=on-failure\n', unit)
         self.assertIn('\n[user]\ndefault=root\n', files['/etc/wsl.conf'][0])
         self.assertIn('\nOnUnitActiveSec=2min\n', files['/etc/systemd/system/pc-agents-walls.timer'][0])
         self.assertIn(' SHELL=/bin/bash\n', unit)   # the agent's login shell is nologin; T3's shells are bash

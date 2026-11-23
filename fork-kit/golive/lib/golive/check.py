@@ -440,6 +440,9 @@ def main(argv, out=sys.stdout, err=sys.stderr):
         print(f't3-golive: {e}\nThe machine file needs a "golive" section like this (placeholder values):\n'
               f'{config_mod.TEMPLATE}', file=err)
         return 2
+    if args.command != 'status' and (why := journal.as_root_problem(cfg.home, cfg.state_dir)):
+        print(f't3-golive: {why}', file=err)   # status writes nothing: it may run as root
+        return 2
     if args.command == 'settle':
         return _settle(cfg, args.reason, out, err)
     if args.command == 'rehearse':  # it never stops or starts the boot service: no adapter needed
