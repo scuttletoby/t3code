@@ -156,7 +156,10 @@ The installer ([sbin/agent-guards-install](sbin/agent-guards-install), on the sh
 [kit_install.py](../common/kit_install.py)) copies the release to `/usr/local/libexec/agent-guards/versions/<sha>/`,
 self-tests the copy, and links `/usr/local/bin/<hook>`, `/usr/local/bin/agent-guards` and `/usr/local/bin/facts` to it. It is safe to run
 again and to stop at any step. `facts` is a common name: when `/usr/local/bin/facts` is something other than the kit's
-link, the installer leaves it alone and says so (a warning; the install goes on, and uninstall does not remove it).
+link, the installer leaves it alone and says so (a warning; the install goes on, and uninstall does not remove it or
+wait for it to stop running). Installing a release from before `facts` was added leaves `/usr/local/bin/facts` as a
+link to a file that is not there (`facts` then says "No such file") until a newer release is installed again or the
+kit is uninstalled.
 
 `--settings` also writes the hooks' entries as a Claude Code **managed settings drop-in**,
 `/etc/claude-code/managed-settings.d/agent-guards.json`. Every Claude Code session of every user on the machine
