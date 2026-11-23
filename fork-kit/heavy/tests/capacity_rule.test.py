@@ -129,7 +129,8 @@ class Vectors(unittest.TestCase):
         """Every number of the rule, changed by +1 and changed by -1 (each one at a time, #800: both directions), turns
         some vector red, so a value changed either way in capacity-rule.json shows in this test and in
         capacityRule.test.ts alike. Not held: the agents' startCentiCores, which no decision reads (the core check is
-        for jobs)."""
+        for jobs), and `cpu`, which the shared evaluators do not read (the host kit's CPU brake, #1047: facts.test.py
+        CpuBrake holds it)."""
         self.assertEqual(failing(self.rule), [])
         quiet = []
         for path in number_paths(RULE_JSON):
@@ -145,7 +146,9 @@ class Vectors(unittest.TestCase):
                 if not (errors or failing(rule)):   # neither refused outright nor a vector that differs
                     quiet.append('.'.join(path) + ' ' + name)
         self.assertEqual(quiet, ['kinds.agent-light.startCentiCores +1', 'kinds.agent-light.startCentiCores -1',
-                                 'kinds.agent-writer.startCentiCores +1', 'kinds.agent-writer.startCentiCores -1'],
+                                 'kinds.agent-writer.startCentiCores +1', 'kinds.agent-writer.startCentiCores -1',
+                                 'cpu.pressureSomeAvg10Pct +1', 'cpu.pressureSomeAvg10Pct -1',
+                                 'cpu.loadPerCorePercent +1', 'cpu.loadPerCorePercent -1'],
                          'rule numbers no vector holds: a change to them goes unseen by both evaluators')
 
     def test_unknown_fact_set_and_ask_or_fill(self):

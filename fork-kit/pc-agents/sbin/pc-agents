@@ -506,6 +506,10 @@ def setup(source, sha):
     why = k.load_firewall()   # now, not after the install: a tightened firewall must not wait for a download
     if why:
         return say(why) or 1
+    if c['keepUserManager']:   # the mask a run with keepUserManager off left: the agent's user manager may run again
+        mask = f'/etc/systemd/system/user@{c["agentUid"]}.service'
+        if (st := k.lstat(mask)) and stat.S_ISLNK(st.st_mode) and os.readlink(k.ROOT + mask) == '/dev/null':
+            os.unlink(k.ROOT + mask)
     k.run(['/usr/bin/systemctl', 'daemon-reload'])   # systemd reads the units as written, even if the install fails
     if c['platform'] == 'linux':   # every run (one stopped after the write too): a running sshd reads the kit's file
         k.run(['/usr/bin/systemctl', 'try-reload-or-restart', 'ssh.service'])   # none running: nothing to do
@@ -786,14 +790,22 @@ def own_walls(c, before_enable=False):
     out.append(('record', f'{k.RECORD} is root-owned', k.safe(k.RECORD, k.lstat(k.RECORD), stat.S_ISREG)))
     masks = [p for p in k.masks(c) if not (k.lstat(p) and os.path.islink(k.ROOT + p)
                                            and os.readlink(k.ROOT + p) == '/dev/null')]
+    kept = c['keepUserManager']   # linux only: the agent's user manager runs (linger, rootless Docker), unmasked
     out.append(('masks', 'WSL interop, cron, at, ssh and the agent\'s user manager are masked' if wsl2 else
+                'the agent\'s user manager is kept (keepUserManager): the agent can run code outside T3\'s unit '
+                '(its user units, rootless Docker), walled there only as an unprivileged user and by the firewall'
+                if kept else
                 'the agent\'s user manager is masked',
                 masks and 'not masked: ' + ', '.join(masks)))
     linger = sorted(os.listdir(k.ROOT + '/var/lib/systemd/linger')) if k.lstat('/var/lib/systemd/linger') else []
-    out.append(('linger', 'no user lingers', linger and 'lingering: ' + ', '.join(linger[:5])))
-    units = [p for p in ('.config/systemd/user', '.config/systemd/user.control', '.local/share/systemd/user')
-             if os.path.isdir(f'{k.ROOT}{k.HOME}/{p}') and os.listdir(f'{k.ROOT}{k.HOME}/{p}')]
-    out.append(('user-units', f'{k.USER} has no systemd user units', units and 'found ~/' + ', ~/'.join(units)))
+    linger = [n for n in linger if not (kept and n == k.USER)]
+    out.append(('linger', f'no user but {k.USER} lingers' if kept else 'no user lingers',
+                linger and 'lingering: ' + ', '.join(linger[:5])))
+    units = [] if kept else \
+        [p for p in ('.config/systemd/user', '.config/systemd/user.control', '.local/share/systemd/user')
+         if os.path.isdir(f'{k.ROOT}{k.HOME}/{p}') and os.listdir(f'{k.ROOT}{k.HOME}/{p}')]
+    out.append(('user-units', f'{k.USER}\'s user units run in its user manager (keepUserManager)' if kept else
+                f'{k.USER} has no systemd user units', units and 'found ~/' + ', ~/'.join(units)))
     extra = [f'{d}/{n}' for d in k.UNIT_DIRS for u in k.UNITS
              for n in k.dropin_dirs(u) + ([u] if d != k.UNIT_DIRS[0] else []) if k.lstat(f'{d}/{n}')]
     out.append(('drop-ins', 'no drop-in or other copy of the kit\'s units', extra and 'found ' + ', '.join(extra[:5])))
@@ -1086,11 +1098,40 @@ def busy():
     return found and f'T3 runs {len(found)} other process(es): ' + ', '.join(sorted(found)[:5]) or None
 
 
+# `t3 serve`'s first line once it has started (apps/server/src/startupAccess.ts), after it listens: a request sent
+# between "Listening" and this line can wait minutes for an answer (fork #1047), so none is sent before it.
+READY = 'T3 Code server is ready.'
+
+
+def t3_ready():
+    """Whether the T3 that runs now said READY in this run of its unit's journal (its InvocationID): True; False
+    while the journal holds this run from its start (systemd's own entry about it, INVOCATION_ID=) but no READY yet,
+    T3 having printed nothing or not that line; None when the journal cannot tell: the run cannot be named,
+    journalctl fails, or the run's start is not there (journald keeps nothing, or rotated it away with, maybe, the
+    ready line of a run that started long ago)."""
+    got = k.props(k.run(['/usr/bin/systemctl', 'show', '-p', 'InvocationID', k.UNIT]).stdout).get('InvocationID', '')
+    if not re.fullmatch(r'[0-9a-f]{32}', got):
+        return None
+    said, start = (k.run(['/usr/bin/journalctl', f'{field}={got}', '-o', 'cat', '--no-pager'], timeout=60)
+                   for field in ('_SYSTEMD_INVOCATION_ID', 'INVOCATION_ID'))
+    if said.returncode or start.returncode:
+        return None
+    if READY in said.stdout.splitlines():
+        return True
+    return False if start.stdout.strip() else None
+
+
 def serves(c, version):
-    """Why T3 does not answer as version on its port (its environment descriptor's serverVersion, no sign-in needed)
-    within k.HTTP_WAIT seconds, or None."""
+    """Why T3 does not answer as version on its port (its environment descriptor's serverVersion, no sign-in
+    needed) within k.HTTP_WAIT seconds, or None. No request goes out before T3 says it is ready (READY) where the
+    journal can tell; where it cannot (t3_ready None: nothing of this run there, or journalctl fails), the answer
+    alone decides, as before, so a journal that keeps nothing never fails a T3 that serves."""
     url = f'http://127.0.0.1:{c["port"]}/.well-known/t3/environment'
     end = time.monotonic() + k.HTTP_WAIT
+    while (ready := t3_ready()) is False:
+        if time.monotonic() >= end:
+            return f'T3 did not say "{READY}" (journalctl -u {k.UNIT})'
+        time.sleep(k.HTTP_STEP)
     while True:
         r = k.run(['/usr/bin/curl', '-q', '-fsS', '--proto', '=http', '--noproxy', '*', '--max-time', '10', url],
                   timeout=30)

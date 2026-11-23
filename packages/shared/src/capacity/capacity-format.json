@@ -60,6 +60,9 @@
             "elevatedClearSeconds": "uint",
             "severeClearSeconds": "uint"
           }
+        },
+        "cpu?": {
+          "object": { "pressureSomeAvg10Pct": "@nonneg", "loadPerCorePercent": "uint" }
         }
       }
     },
