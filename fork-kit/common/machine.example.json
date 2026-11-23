@@ -22,6 +22,36 @@
     },
     "disk": { "floorGb": 25, "path": "~" }
   },
+  "gardener": {
+    "stateDir": "~/.local/state/gardener",
+    "gh": "gh",
+    "projects": [
+      {
+        "name": "example",
+        "repo": "example-owner/example-repo",
+        "reportRepo": "example-owner/example-repo",
+        "root": "/srv/example/repo",
+        "schedule": "03:00",
+        "quietHours": "02:00-07:00",
+        "timeZone": "Europe/London",
+        "model": { "endpoint": "http://127.0.0.1:8080/v1", "model": "example-local-model" },
+        "checks": [
+          {
+            "name": "context-budget",
+            "options": {
+              "files": { "AGENTS.md": 6000 },
+              "memoryIndexes": ["~/.claude/memory/MEMORY.md"]
+            }
+          },
+          { "name": "facts" },
+          { "name": "worktrees", "options": { "staleDays": 14 } },
+          { "name": "workflows-off", "options": { "ignore": ["old-deploy.yml"] } },
+          { "name": "install-drift" },
+          { "path": "/srv/example/bin/doc-check", "id": "docs", "timeoutSeconds": 120 }
+        ]
+      }
+    ]
+  },
   "golive": {
     "home": "/srv/example/t3-home",
     "targetVersion": "0.0.0-example.fork.1",

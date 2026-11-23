@@ -1,0 +1,14 @@
+# gardener kit: written by gardener-install. Do not edit: run the installer again.
+[Unit]
+Description=gardener: run each project's checks once a day, report to its issue (fork-kit/gardener)
+# runs the release in use; without one (an uninstall half-way) it does nothing
+ConditionPathExists=/usr/local/libexec/gardener/current/bin/gardener
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/gardener/current/bin/gardener run --timer
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h
+# files it makes are this user's only
+UMask=0077
