@@ -1,0 +1,107 @@
+#!/usr/bin/python3 -IB
+"""facts: look up what we made for a thing and its state now, in the state tables (fork-kit/agent-guards/FACTS.md),
+then in the record repo.
+
+  facts WORDS...           the table rows that hold every word (any case), with their table's header; Thing-column
+                           hits first. No row with all of them: the rows with some, and it says so. Then the lines
+                           of the record repo's text files that hold every word (at most 10)
+  facts --records WORDS... only the record repo's lines (at most 50)
+  facts --index            every thing, one per line, under its table file
+  facts --dirs             where it looked: each configured entry and record repo, and what it found
+  facts --check            the gardener's check of this folder's tables, report only: rows whose Updated is older
+                           than staleDays (or has no date, or is in the future), tables over maxRows rows, broken
+                           rows, entries that are missing or empty (exit 1 when any). Never reads the record repo
+  --all                    every configured project's tables (and record repo folders) too, not only the machine's
+                           and this folder's project's. Its output may name private projects: never post it to a
+                           public place
+  --no-records             tables only
+
+The tables come from the machine file's "agent-guards" section, part "facts" (dirs, projects, records); FACTS_DIRS
+(paths joined by ":") replaces dirs and projects. A missing or empty folder, or a broken row, is a note: the rest is
+still shown. Read only. Tests: fork-kit/agent-guards/tests/facts.test.py
+"""
+import datetime, os, sys
+
+_kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(_kit, 'lib'))
+
+PROG = 'facts'
+FLAGS = ('--all', '--no-records')
+MODES = ('--index', '--dirs', '--check', '--records')
+
+
+def today():
+    """Today; FACTS_TODAY (YYYY-MM-DD) sets it, for tests."""
+    try:
+        return datetime.date.fromisoformat(os.environ['FACTS_TODAY'])
+    except (KeyError, ValueError):
+        return datetime.date.today()
+
+
+def main(argv):
+    if not argv or argv[0] in ('-h', '--help'):
+        print(__doc__.strip())
+        return 0 if argv else 1
+    from agent_guards import config, facts
+    every, no_records = '--all' in argv, '--no-records' in argv
+    argv = [a for a in argv if a not in FLAGS]
+    modes = [a for a in argv if a in MODES]
+    words = [a for a in argv if a not in modes]
+    bad = [a for a in words if a.startswith('--')]
+    needs_words = modes in ([], ['--records'])
+    if len(modes) > 1 or bad or (needs_words and not words) or (not needs_words and words) \
+            or (no_records and modes == ['--records']):
+        print(f'{PROG}: use one of: WORDS..., --records WORDS..., --index, --dirs, --check (and --all, '
+              f'--no-records); see {PROG} --help', file=sys.stderr)
+        return 1
+    c, problem = config.load('facts')
+    if problem:
+        print(f'note: {config.problem_text(PROG, problem)}')
+    mode = modes[0] if modes else None
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ''
+    projects = facts.projects_for(c, cwd) if not every else c['projects']
+    found = facts.places(c, cwd, every=every, projects=projects)   # --records: only to skip their copies
+    recs = [] if no_records or mode == '--check' else facts.records(c, projects, every)
+    if not found and not recs:
+        print(f'{PROG}: no state table is configured for this folder (machine file "agent-guards" part "facts": '
+              'dirs, projects, records; or FACTS_DIRS)')
+        return 0
+    if mode == '--dirs':
+        for p in found:
+            what = (f'{len(p.rows())} rows in {len(p.tables)} table(s)' if p.tables else
+                    '; '.join(p.notes) or 'no table')
+            print(f'{p.entry} ({p.source}): {p.file or "-"}: {what}')
+        for r in recs:
+            print(f'{r.root} (record repo): {r.note or "searched: " + ", ".join(r.folders)}')
+        return 0
+    if mode == '--check':
+        out = facts.check(found, c['staleDays'], c['maxRows'], today())
+        for line in out:
+            print(f'{PROG} check: {line}')
+        rows = sum(len(p.rows()) for p in found)
+        print(f'{PROG} check: ' + (f'{len(out)} finding(s)' if out else
+                                   f'OK ({sum(1 for p in found if p.tables)} table file(s), {rows} rows)'))
+        return 1 if out else 0
+    if mode == '--index':
+        lines = facts.index(found)
+    elif found and mode != '--records':
+        lines = facts.search(found, words)
+    else:
+        lines = []
+    rec_notes = []
+    if recs and mode != '--index':
+        skip = {p.digest for p in found if p.digest}
+        more, rec_notes = facts.search_records(recs, words, skip, limit=50 if mode == '--records' else 10)
+        lines += more or ([f'Records: no line holds all of: {" ".join(words)}'] if not rec_notes else [])
+    for line in lines:
+        print(line)
+    for n in (facts.notes(found) if mode != '--records' else []) + rec_notes:
+        print(f'note: {n}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

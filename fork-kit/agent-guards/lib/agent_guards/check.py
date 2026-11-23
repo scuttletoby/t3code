@@ -2,18 +2,20 @@
 event it must refuse (block) and one it must let through, the way Claude Code runs it (`/bin/sh -c COMMAND`, the
 event on stdin), and the entry's matcher must take the case's tool (Bash, Monitor, Write). Nothing of the machine is
 changed: the memory index and the session ids are made up in a temporary folder, the hooks run with HOME there (so
-the "~/" state folders, the refusal log and the cache are written there and removed with it; agent-slots keeps the
-real HOME, it writes nothing), and the state files a hook writes in a configured absolute folder for those made-up
-sessions are removed afterwards.
+the "~/" state folders, the refusal log and the cache are written there and removed with it; agent-slots and
+facts-hook keep the real HOME: they write nothing, and their "~/" paths must mean what the wanted answer read), and
+the state files a hook writes in a configured absolute folder for those made-up sessions are removed afterwards.
 
 A hook that is not wired is reported as MISSING (a problem); agent-slots with no sessionsFile only gets its pass
-case (it does nothing for any session then).
+case (it does nothing for any session then); facts-hook wants context when the machine has a state table with a row
+or a record repo for the check's folder, else nothing.
 """
 import json, os, shutil, signal, subprocess, tempfile
 
-from . import config, wiring
+from . import config, facts, wiring
 
 SESSION = 'agent-guards-check-'
+READ_ONLY = ('agent-slots', 'facts-hook')   # hooks that write nothing: run with the caller's HOME
 
 
 def _run(cmd, event, cwd, env=None, argv=None, timeout=30):
@@ -115,6 +117,13 @@ def cases(tmp, sid):
         ('agent-slots', 'Stop', 'a session it does not watch', {'hook_event_name': 'Stop', 'session_id': sid},
          'passed', None),
     ]
+    fc = config.load('facts')[0]       # read only: the machine's own tables and record repos, if any; the hook
+    projects = facts.projects_for(fc, tmp)   # runs with this process's HOME (READ_ONLY), so "~/" means the same
+    text = facts.session_text(facts.places(fc, tmp, projects=projects), projects, fc['indexLines'],
+                              fc['indexChars'], facts.records(fc, projects))
+    out.append(('facts-hook', 'SessionStart', 'a new session',
+                {'hook_event_name': 'SessionStart', 'source': 'startup', 'session_id': sid, 'cwd': tmp},
+                'context' if text else 'passed', None))
     slots = config.load('agentSlots')[0]
     watched = []
     try:
@@ -160,7 +169,7 @@ def run(settings, source, say=print):
                     bad += 1
                     say(f'MISSING {hook} ({event}{", " + tool if tool else ""}): not wired in {source}')
                 continue
-            env = dict(os.environ, HOME=home) if hook != 'agent-slots' else dict(os.environ)
+            env = dict(os.environ, HOME=home) if hook not in READ_ONLY else dict(os.environ)
             if how:
                 env.update(AG_EVENT=json.dumps(ev), AG_HOOK=cmd)
                 r = _run(cmd, ev, tmp, env=env, argv=[fake, '-c', scripts[how]])

@@ -74,6 +74,28 @@
       "maxAlive": 10,
       "processName": "claude",
       "note": "at most 4 build agents"
+    },
+    "facts": {
+      "dirs": ["/etc/fork-kit/facts"],
+      "staleDays": 30,
+      "maxRows": 60,
+      "indexLines": 40,
+      "indexChars": 4000,
+      "projects": [
+        {
+          "match": "github.com/example/project",
+          "dirs": ["/srv/example/project-facts"],
+          "text": "Project notes: see the project's AGENTS.md.",
+          "name": "project"
+        }
+      ],
+      "records": [
+        {
+          "path": "/srv/example/records",
+          "projectsDir": "projects",
+          "shared": ["machines", "orch", "shared"]
+        }
+      ]
     }
   },
   "cleaner": {

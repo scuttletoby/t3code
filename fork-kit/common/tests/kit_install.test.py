@@ -576,7 +576,13 @@ class Contract:
                 shutil.rmtree(self.root)
                 os.makedirs(self.path(os.path.dirname(path)))
                 os.symlink('/somewhere/else', self.path(path))
-                code, _, err = self.install()
+                code, out, err = self.install()
+                if path in self.m.OPTIONAL_LINKS:          # a common name: left alone with a warning, install goes on
+                    self.assertEqual(code, 0, err)
+                    self.assertIn(f"warning: {path} is there and is not this kit's link: left alone", out)
+                    self.assertEqual(os.readlink(self.path(path)), '/somewhere/else')
+                    self.assertEqual(self.run_main('self-check')[0], 0)
+                    continue
                 self.assertEqual(code, 1)
                 self.assertIn("is not the kit's link", err)
                 self.assertFalse(os.path.exists(self.path(self.m.LIBEXEC)))

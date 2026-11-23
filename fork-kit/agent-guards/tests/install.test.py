@@ -114,6 +114,29 @@ class Install(fx.FakeHost):
         self.assertEqual(self.config()['settings'], False)
         self.assertEqual(self.run_main('self-check')[0], 0)
 
+    def test_an_unrelated_facts_command_is_left_alone_and_our_own_link_is_kept(self):
+        # review round 1: `facts` is a common name; another program there is never replaced or removed
+        os.makedirs(self.path('/usr/local/bin'), exist_ok=True)
+        with open(self.path('/usr/local/bin/facts'), 'w') as f:
+            f.write('#!/bin/sh\necho another program\n')
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertIn('warning: /usr/local/bin/facts is there and is not this kit\'s link: left alone', out)
+        self.assertTrue(self.is_file('/usr/local/bin/facts-hook'))
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        self.assertEqual(self.install(sha=SHA2)[0], 0)
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        with open(self.path('/usr/local/bin/facts')) as f:
+            self.assertEqual(f.read(), '#!/bin/sh\necho another program\n')
+        os.unlink(self.path('/usr/local/bin/facts'))
+        self.fresh()
+        code, out, _ = self.install()                         # nothing there: our link, kept by the next run
+        self.assertNotIn('warning', out)
+        self.assertTrue(os.path.islink(self.path('/usr/local/bin/facts')))
+        self.assertEqual(self.install(sha=SHA2)[0], 0)
+        self.assertTrue(os.path.islink(self.path('/usr/local/bin/facts')))
+        self.assertTrue(self.is_file('/usr/local/bin/facts'))
+
     def test_runs_again_and_changes_nothing(self):
         self.assertEqual(self.install('--settings')[0], 0)
         before = self.snapshot()

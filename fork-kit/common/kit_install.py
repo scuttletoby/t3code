@@ -82,6 +82,7 @@ class Installer:
     LIBEXEC = None          # '/usr/local/libexec/fork-cleaner': versions/, current, replaced/
     LINKS = {}              # {'/usr/local/bin/fork-cleaner': 'bin/fork-cleaner'}: path -> file under current
     KEEP_OLD = ()           # link paths where a plain old file (a hand copy) is kept, not refused
+    OPTIONAL_LINKS = ()     # link paths with a common name: when something else is there it is left alone (a warning)
     SOURCE_FILES = ()       # the files of a release, relative to the kit folder (common/... from fork-kit/common)
     EXECUTABLE = frozenset()
     PACKAGE = None          # 'cleaner': lib/<PACKAGE>/<module>.py for each of MODULES; each is imported by the self-test
@@ -420,7 +421,7 @@ class Installer:
         """Refuse, before writing anything, what the installer must not overwrite."""
         for path, target in self.links().items():
             real = self.p(path)
-            if not os.path.lexists(real) or self.ours(path, target):
+            if not os.path.lexists(real) or self.ours(path, target) or path in self.OPTIONAL_LINKS:
                 continue
             if path in self.KEEP_OLD and self.plain_file(real):
                 continue                    # a plain old copy: kept in REPLACED, put back by uninstall
@@ -525,8 +526,13 @@ class Installer:
         order = [n for n in self.kept_order() if n in found]
         return [found[n] for n in order] + [found[n] for n in sorted(set(found) - set(order))]
 
+    def foreign(self, path, target):
+        """An OPTIONAL_LINKS path where something that is not the kit's link is: left alone."""
+        return path in self.OPTIONAL_LINKS and os.path.lexists(self.p(path)) and not self.ours(path, target)
+
     def record_rows(self, sha, plan):
-        rows = [(path, 'link', target) for path, target in sorted(self.links().items())]
+        rows = [(path, 'link', target) for path, target in sorted(self.links().items())
+                if not self.foreign(path, target)]
         rows.append((self.CURRENT, 'link', f'{self.VERSIONS}/{sha}'))
         for rel, digest in sorted(read_manifest(self.p(f'{self.VERSIONS}/{sha}')).items()):
             rows.append((f'{self.VERSIONS}/{sha}/{rel}', 'file', digest))
@@ -567,6 +573,10 @@ class Installer:
         self.switch_link(self.CURRENT, f'{self.VERSIONS}/{a.sha}')
         done('switch')
         for path, target in self.links().items():
+            if self.foreign(path, target):
+                self.say(f'warning: {path} is there and is not this kit\'s link: left alone (run '
+                         f'{target} by its full path, or remove {path} and install again)')
+                continue
             if path in self.KEEP_OLD:
                 self.drop_restore_leftover(path)
                 self.keep_old(path)
