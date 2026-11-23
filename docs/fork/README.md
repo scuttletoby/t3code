@@ -317,7 +317,8 @@ session ends (`idleMinutes`) and the longest session (`maxHours`).
 How this machine runs a review lens on a pull request: which provider driver, model and effort run
 it, and the state question every review asks. The repository's own config file says what a pull
 request needs (its lenses, critical paths, rounds) and the CI gate enforces it; this setting is only
-the machine's half. Nothing reads it yet: the review runner comes in a later pull request.
+the machine's half. While it is on, the T3 tool `lens_start` (below) reads it; while it is off that
+tool is not listed, refused if called and not found by `tool_search`.
 
 `preset` is `off` (nothing is listed, changed or checked) or `recommended`, which fills in the
 fork's defaults: Claude (`claudeAgent`) with `claude-opus-5-5` at `high` effort, the `approach`
@@ -351,6 +352,34 @@ and "Turn off" buttons; it asks first before a button drops hand-set fields or a
   "reviewRules": { "preset": "recommended" }
 }
 ```
+
+**`lens_start {pr, head?, afterCi?}`** (T3 tool, in the `orchestration` group of MCP profiles)
+starts the review lenses a pull request's head still needs. It reads the config at the base
+(`configPath`), the changed paths and the lens comments, plans with the shared review rules
+(`apps/server/src/fork/reviewRules/lensStart.ts`) and starts one read-only child per lens through
+`delegate_task` (role `review`), so the agent slot gate, usage pacing and the model policy apply.
+The server writes each prompt: the read-only frame, the lens prompt file from the base, the state
+question word for word with "answer it in a line starting `state:`", the `blocker:` / `major:` /
+`minor:` lines and, from round 2, "check each earlier finding first, then the changes since". The
+id of a child is `lens/<repo>#<pr>/<head>/<lens>`; a repeat returns the running child, a lens whose
+newest comment read this head starts nothing, and a child that ended without a read starts again as
+the next attempt (at most 3 per head). The children started are kept in
+`<stateDir>/lens-children.json` (an unreadable file reads as none). It refuses: review rules off, a
+round above the config's `rounds.max`, a runner the model policy refuses, a checkout of the pull
+request's branch with uncommitted or unpushed commits, a head that moved, and anything it cannot
+read (it starts nothing rather than too few). In `enforce` mode the config's path rules name the
+lenses; T3 does not read a gate caller's `required-lenses` input, so outside `enforce` it refuses.
+
+With `afterCi: true` the call returns at once: it registers a wait (`server.waitFor` must be on) on
+the config's `required_checks` other than its `head_check`, at that head. When they pass, the wake
+is sent to the thread and the server then starts the lenses in the run that wake starts (a
+delegated child needs its parent's run); a red check, a new head (`moved`) or the deadline starts
+nothing and the wake says why. A config whose only required check is its `head_check` has no CI to
+wait for, so the lenses start at once. A problem starting them comes as a second message. The action
+is part of the stored wait, so a restart before its delivery was written runs it again; the start is
+idempotent. It runs at most 90 s per delivery (the delivery is tried again after that), so a slow
+GitHub or thread does not stall other waits. Like the gate, lens_start skips a review or inline
+comment that is not submitted yet, and dates an inline comment by when it was published.
 
 ### `server.modelPolicy`
 

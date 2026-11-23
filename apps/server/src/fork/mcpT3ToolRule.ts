@@ -32,6 +32,14 @@ import { WaitsToolkit } from "../mcp/toolkits/waits/tools.ts";
 import { WorktreeToolkit } from "../mcp/toolkits/worktree/tools.ts";
 import { makeThreadMcpProfilesById } from "./claudeMcpProfile.ts";
 import { MCP_T3_TOOL_NOT_ALLOWED, mcpT3ToolGroup } from "./mcpProfile.ts";
+import { installLensStartServer } from "./reviewRules/lensStartServer.ts";
+import {
+  LENS_START_OFF,
+  LENS_START_TOOL,
+  lensStartSearchable,
+  makeLensStartOn,
+} from "./reviewRules/lensStartVisibility.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { installT3ToolSearchCheck } from "./mcpT3ToolFilter.ts";
 import {
   type T3ToolSet,
@@ -147,11 +155,14 @@ const searchable = (threadId: string, name: string) =>
   t3ToolAllowed(
     t3ToolSetFor(threadId) ?? refused.get(threadId)?.set ?? refusedT3ToolSet(NO_SET_YET),
     name,
-  );
+  ) &&
+  // Fork (review rules): off means off, also for a search.
+  (name !== LENS_START_TOOL || lensStartSearchable(threadId));
 
 /** The rule's check of one tool for one request, as {@link layer} runs it. */
 const makeVisible = Effect.gen(function* () {
   const profileById = yield* makeThreadMcpProfilesById;
+  const lensStartOn = yield* makeLensStartOn;
   /** Worked out now from the settings: kept when it applies, reused briefly when refused. */
   const workedOut = Effect.fnUntraced(function* (threadId: ThreadId) {
     const now = yield* Clock.currentTimeMillis;
@@ -211,9 +222,14 @@ const makeVisible = Effect.gen(function* () {
     );
     if (thread === undefined) return true;
     const set = yield* setFor(thread.threadId);
-    if (t3ToolAllowed(set, target)) return true;
+    if (!t3ToolAllowed(set, target)) {
+      if (method === "tools/list") return false;
+      return yield* new T3ToolOutsideProfile({ message: t3ToolRefusal(set, target) });
+    }
+    // Fork (review rules): lens_start only where the thread's project has review rules on.
+    if (target !== LENS_START_TOOL || (yield* lensStartOn(thread.threadId))) return true;
     if (method === "tools/list") return false;
-    return yield* new T3ToolOutsideProfile({ message: t3ToolRefusal(set, target) });
+    return yield* new T3ToolOutsideProfile({ message: LENS_START_OFF });
   });
 });
 
@@ -228,6 +244,12 @@ export const layer = McpServer.visibility(
     yield* SqlClient.SqlClient;
     yield* ServerSettingsService.ServerSettingsService;
     yield* installT3ToolSearchCheck(searchable);
+    // Fork (review rules): lens_start's children start through this server's own delegate_task.
+    const environment = yield* Effect.serviceOption(ServerEnvironment.ServerEnvironment);
+    const here = Option.isSome(environment)
+      ? yield* environment.value.getEnvironmentId.pipe(Effect.option)
+      : Option.none();
+    yield* installLensStartServer(yield* McpServer.McpServer, Option.getOrUndefined(here));
     return yield* makeVisible;
   }).pipe(Effect.withSpan("McpT3ToolRule.make")),
   { global: true },

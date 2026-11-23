@@ -903,7 +903,12 @@ describe("lens_start's plan, prompt and refusals", () => {
       prompt,
       `read it before at ${A}: check each earlier finding first, then the changes since ${A}`,
     );
-    assert.include(prompt, "`lens_report`, for the head above");
+    // Until lens_report (T4) exists, the child posts one new comment whose first line is the lens header.
+    assert.include(prompt, `\`gh pr comment 4 --repo ${REPO} --body-file <file>\``);
+    assert.include(
+      prompt,
+      `\`lens: code · reviewer: <your model> · read at: <the full head sha>\``,
+    );
     const custom = effectiveReviewRules({
       preset: "recommended",
       stateQuestion: "What if it runs twice or finds old data?",

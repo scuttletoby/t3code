@@ -277,6 +277,18 @@ export const WaitPrSpec = Schema.Struct({
    */
   host: Schema.optionalKey(PrHost),
   until: WaitPrUntil,
+  /**
+   * Fork (review rules): only these checks count, by name; set by `lens_start {afterCi}` from the
+   * project's config, never asked for by `wait_for`. A named check not listed yet is not met.
+   */
+  checks: Schema.optionalKey(
+    Schema.Array(TrimmedNonEmptyString.check(Schema.isMaxLength(200))).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(20),
+    ),
+  ),
+  /** Fork (review rules): the head these checks are for; another head ends the wait as `moved`. */
+  head: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[0-9a-f]{40}$/u))),
 });
 export const WaitFileSpec = Schema.Struct({ path: FilePath, until: WaitFileUntil });
 export const WaitUnitSpec = Schema.Struct({ name: UnitName, scope: WaitUnitScope });
@@ -325,6 +337,8 @@ export const WaitOutcome = Schema.Literals([
   "ended",
   "met",
   "free",
+  /** Fork (review rules): the pull request's head is no longer the one the wait is for. */
+  "moved",
   "timeout",
   "check_error",
 ]);
@@ -368,6 +382,12 @@ const WaitRecordFields = {
   handedOverBecause: Schema.optionalKey(Schema.Literals(["gone", "stopped"])),
   /** When the receiver was first seen stopped; cleared when it runs again. */
   stoppedSince: Schema.optionalKey(IsoDateTime),
+  /**
+   * Fork (review rules): what the server does once the wake is in the thread. `lens_start`: when
+   * the narrowed checks passed at the wait's head, start that head's review lenses (lens_start
+   * {afterCi}). It is part of the record, so a restart before the delivery is written runs it again.
+   */
+  action: Schema.optionalKey(Schema.Literal("lens_start")),
 };
 
 export const WaitRecord = Schema.Union([
