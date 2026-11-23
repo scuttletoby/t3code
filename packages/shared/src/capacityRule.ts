@@ -71,7 +71,7 @@ export interface CapacityRule {
   readonly floors: CapacityPerGroup;
   readonly ceilings: CapacityPerGroup;
   readonly pressure: PressureRule;
-  /** The CPU brake for one more job; read by the host kit (fork-kit/heavy) only, not by this evaluator. */
+  /** The CPU brake for one more job; read by the host kit's evaluator only (README.md "CPU brake"), not by this one. */
   readonly cpu?: { readonly pressureSomeAvg10Pct: number; readonly loadPerCorePercent: number };
 }
 

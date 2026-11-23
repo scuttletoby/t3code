@@ -50,7 +50,7 @@
     "severeClearSeconds": 120
   },
   "cpu": {
-    "//": "The CPU brake for one more job (README.md beside this file, \"CPU brake\"). Read by the host kit (fork-kit/heavy: heavy and t3-capacity) only for now; optional, absent = no brake.",
+    "//": "The CPU brake for one more job (README.md beside this file, \"CPU brake\"). Read only by the host kit's evaluator for now, not by the TypeScript one; optional, absent = no brake.",
     "pressureSomeAvg10Pct": 80,
     "loadPerCorePercent": 150
   }
