@@ -3696,7 +3696,11 @@ class Pr1041Round2Test(Case):
         `$`, backtick or backslash, no shell, interpreter, wrapper or script word)."""
         crash = {'ACTIONS_DISABLE_GUARD_TEST_CRASH': '1'}
         for cmd in ('( bash ) < d.txt', 'cat x | python3 -', './run.sh', 'x=$(cat f)', 'eval "$y"', 'b=1 sh x',
-                    'ls; source x', 'make -f x.mk', 'hash -p run.sh ls; ls'):
+                    'ls; source x', 'make -f x.mk', 'hash -p run.sh ls; ls',
+                    # r3: quotes inside a word, braces, a shell under another name, a launcher in front
+                    "ba''sh d.txt", '"ba"sh d.txt', "py''thon3 qpy.txt", '{bash,d.txt}', 'rbash d.txt', 'rksh d.txt',
+                    'taskset 1 bash d.txt', 'unshare bash d.txt', 'chrt -o 0 bash d.txt', 'nice -n1 bash d.txt',
+                    'prlimit bash d.txt', 'ls *; bash d.txt'):
             with self.subTest(cmd=cmd):
                 r = self.pipe(self.event(cmd), crash)
                 self.assertEqual(json.loads(r.stdout)['hookSpecificOutput']['permissionDecision'], 'deny', r.stderr)
@@ -3777,6 +3781,19 @@ class Pr1041Round2Test(Case):
                     'mapfile -t a < notes.md; echo "${a[@]}"', '{ cat; } < notes.md',
                     '{ python3 tools/check.py; } < notes.md', 'python3 tools/check.py < msg.md',
                     "python3 -c 'import sys; print(open(sys.argv[1]).read())' msg.md", env=env)
+
+    def test_7_braces_in_the_command_word_and_restricted_shells(self):
+        """r3 (merge path, passed on main too): the shell makes `bash run.sh` of `{bash,run.sh}`, and rbash/rksh
+        are bash/ksh. The guard now also reads the words a literal brace makes; braces in arguments still pass."""
+        env = self.files()
+        self.refused('{bash,d.txt}', '{bash,run.sh}', '{sudo,bash} d.txt', '{python3,run.sh}',
+                     'cat {d,ids}.txt | bash', 'x{,}; {bash,d.txt}', 'rbash d.txt', 'rksh d.txt', 'rbash run.sh',
+                     'mksh d.txt', env=env)
+        self.passes('echo {a,b}', 'mkdir -p x/{a,b}', 'cp notes.md notes.md{,.bak}', 'ls {a,b}.txt',
+                    'touch {a,b}.txt', 'echo {1..3} {a..c} {1..9..2}', 'echo a{b,{c,d}}e', '{echo,hi}',
+                    "grep -E 'a{2,3}' notes.md", "awk '{print $1}' notes.md", 'cat {notes,ids}.md', 'echo ${HOME}',
+                    # `bash bsh d.txt`: bash runs the file bsh (there is none), d.txt is only its argument
+                    'b{a,}sh d.txt', env=env)
 
 
 if __name__ == '__main__':

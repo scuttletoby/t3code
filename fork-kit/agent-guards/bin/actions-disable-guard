@@ -224,7 +224,9 @@ GUARDED = {'disable': (DISABLE_RE, [(['actions', 'workflows', None, 'disable'], 
            'ruleset': (RULESET_RE, [(['rulesets', None], False)])}   # part of protect: one ruleset, by id
 PLACEHOLDER = re.compile(r'\{(?:owner|repo|branch)\}')   # gh api fills these in from the checkout
 READS = ('GET', 'HEAD')
-SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'busybox'}
+# restricted and other sh/csh-family names too: rbash is bash (a link), rksh is ksh
+SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'busybox', 'rbash', 'rksh', 'rzsh', 'mksh', 'lksh', 'oksh',
+          'pdksh', 'ksh93', 'ash', 'yash', 'posh', 'csh', 'tcsh'}
 WRAPPERS = {'sudo', 'doas', 'env', 'command', 'exec', 'builtin', 'nohup', 'time', 'nice', 'ionice', 'timeout',
             'stdbuf', 'xargs', 'setsid', 'unbuffer', 'chronic', 'flock', 'eval', 'source', '.', 'do', 'then',
             'else', 'elif', 'if', 'while', 'until', '{', '}', '!', 'watch', 'script', 'runuser', 'systemd-run',
@@ -851,7 +853,47 @@ def readings(cmd, env):
         for w in cmd['words']:
             toks += expand_word(w, bind)
         out.append(toks)
-    return out
+    braced = brace_reading(cmd['words'], out[0] if len(out) == 1 else None)
+    return out + ([braced] if braced else [])
+
+
+def brace_reading(words, plain):
+    """One more reading when a word of only literal text has an unquoted {a,b} or {1..3}: the words the shell
+    makes of it (`{bash,run.sh}` runs `bash run.sh`, `b{a,}sh f` runs `bash bsh f`). The first reading keeps such
+    a word as hidden text; this one lets the rest of the guard see a command word or a file it spells. Only when
+    the command has no variables (plain: its one reading), and at most 32 words come out of one word."""
+    if plain is None or not any(not q and k == 'L' and BRACE.search(t) for w in words for k, t, q in w):
+        return None
+    toks = []
+    for w in words:
+        if not all(k == 'L' for k, _, _ in w) or not any(not q and BRACE.search(t) for _, t, q in w):
+            toks += expand_word(w, {})
+            continue
+        texts = [''.join(t.translate(SHIELD_QUOTED) if q else t for _, t, q in w)]
+        while any(BRACE.search(x) for x in texts):
+            texts = [y for x in texts for y in brace_once(x)]
+            if len(texts) > 32:
+                return None
+        toks += [finish(x, False) for x in texts if x]   # an empty unquoted result is no word
+    return toks
+
+
+def brace_once(text):
+    """The texts one (innermost) brace of text makes: {a,b,} parts, {1..3} / {a..e} / {1..9..2} ranges; a range
+    bash does not expand stays as it is (with its braces swapped for private ones, so it is not tried again)."""
+    m = BRACE.search(text)
+    pre, body, post = text[:m.start()], m.group()[1:-1], text[m.end():]
+    if ',' in body:
+        return [pre + x + post for x in body.split(',')]
+    r = re.fullmatch(r'(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?', body)
+    if r and r.group(1).lstrip('-').isdigit() == r.group(2).lstrip('-').isdigit():
+        num = r.group(1).lstrip('-').isdigit()
+        a, b = (int(r.group(1)), int(r.group(2))) if num else (ord(r.group(1)), ord(r.group(2)))
+        step = abs(int(r.group(3) or 1)) or 1
+        vals = range(a, b + 1, step) if a <= b else range(a, b - 1, -step)
+        if len(vals) <= 32:
+            return [pre + (str(v) if num else chr(v)) + post for v in vals]
+    return [pre + m.group().translate(SHIELD_QUOTED) + post]
 
 
 def segments(cmd):
@@ -4966,15 +5008,31 @@ CRASH_KEYWORDS = {'if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'd
 CRASH_RUNNERS = WRAPPERS | SHELLS | LOGIN_RUNNERS | {
     'alias', 'trap', 'at', 'batch', 'make', 'gmake', 'git', 'ssh', 'su', 'parallel', 'find', 'awk', 'gawk', 'mawk',
     'nawk', 'busybox', 'sed', 'perl', 'ruby', 'claude', 'npx', 'npm', 'pnpm', 'yarn', 'tmux', 'screen', 'crontab',
-    'install', 'rsync', 'tar', 'unzip', 'cp', 'mv', 'ln', 'tee', 'dd', 'heavy', 'vp', 'hash', 'enable', 'fc'}
+    'install', 'rsync', 'tar', 'unzip', 'cp', 'mv', 'ln', 'tee', 'dd', 'heavy', 'vp', 'hash', 'enable', 'fc',
+    # launchers that run the words after them as a command
+    'taskset', 'unshare', 'chrt', 'prlimit', 'setpriv', 'ssh-agent', 'dbus-run-session', 'chroot', 'nsenter', 'sg',
+    'newgrp', 'pkexec', 'firejail', 'bwrap', 'proot', 'fakeroot', 'fakechroot', 'schroot', 'strace', 'ltrace', 'gdb',
+    'lldb', 'valgrind', 'perf', 'catchsegv', 'xvfb-run', 'faketime', 'torsocks', 'proxychains', 'proxychains4',
+    'numactl', 'cgexec', 'systemd-run', 'run-parts', 'start-stop-daemon', 'expect', 'vi', 'vim', 'nvim', 'view',
+    'ex', 'emacs', 'less', 'more', 'man', 'Rscript', 'julia'}
+# any sh or csh family name (rbash, mksh, tcsh ..), also after a link is resolved
+CRASH_SHELL = re.compile(r'^r?(?:ba|z|k|mk|lk|ok|pdk|da|a|ya|po|tc|c|fi)?sh[\d.]*$')
+
+
+def crash_runner(word):
+    """After a crash: whether a word (or the program it names) is a shell, interpreter, wrapper or runner."""
+    base = os.path.basename(word)
+    return base in CRASH_RUNNERS or bool(INTERPRETERS.match(base) or CRASH_SHELL.match(base))
 
 
 def crash_passes(raw, env):
     """After a crash while the guard read a command that names no gh, HTTP client or disabling word: whether it
     still surely runs only text it spells out, so passing it is safe. Refused (False) when it may run text from
-    elsewhere: a < file, heredoc or here-string, $(..), `..`, a variable, >(..), a backslash, a shell, interpreter,
-    wrapper or runner word (eval, source, ., xargs, sudo, git, make, awk ..), a command word with a / (a script),
-    or one that is no compiled program in a system folder on PATH (a script there, a project's PATH folder).
+    elsewhere: a < file, heredoc or here-string, $(..), `..`, a variable, >(..), a backslash, a brace expansion
+    (`{bash,f}`), a shell, interpreter, wrapper, launcher or runner word anywhere in a part, quotes removed (eval,
+    source, ., xargs, sudo, taskset, unshare, git, make, awk, ba''sh, rbash ..), a command word with a / (a script)
+    or a glob, or one that is no compiled program in a system folder on PATH (a script there, a project's PATH
+    folder) or whose real path is a shell or interpreter (a link).
     Input that is no event is read by the same rule as text; anything else it cannot work out counts as refused."""
     try:
         try:
@@ -4982,23 +5040,24 @@ def crash_passes(raw, env):
             cmd = (ev.get('tool_input') or {}).get('command') or ''
         except (ValueError, AttributeError):
             cmd = raw
-        if not isinstance(cmd, str) or CRASH_TEXT.search(cmd):
+        if not isinstance(cmd, str) or CRASH_TEXT.search(cmd) or BRACE.search(cmd):   # `{bash,f}` runs `bash f`
             return False
         dirs = (env.get('PATH') or '').split(os.pathsep)
-        for part in re.split(r'[;&|(){}\n]+', cmd):
-            words = [w.strip('\'"') for w in part.split()]
+        for part in re.split(r'[;&|()\n]+', cmd):
+            words = [re.sub('[\'"]', '', w) for w in part.split()]   # every quote, also inside a word (ba''sh)
             words = [w for w in words if not is_assign(w) and w not in CRASH_KEYWORDS and not re.match(r'\d*>', w)]
             if not words:
                 continue
             word = words[0]
-            if not word or '/' in word or word in CRASH_RUNNERS or INTERPRETERS.match(word) or word.startswith('-'):
+            if not word or '/' in word or word.startswith('-') or re.search(r'[*?\[]', word) \
+                    or any(crash_runner(w) for w in words):   # any word: `taskset 1 bash f`, `nice -n1 bash f`
                 return False
             for d in dirs:
                 p = os.path.join(d, word)
                 if not os.path.isabs(d):
                     return False
                 if os.path.isfile(p) and os.access(p, os.X_OK):
-                    if d not in STD_BINS:
+                    if d not in STD_BINS or crash_runner(os.path.realpath(p)):   # rbash -> bash
                         return False
                     with open(p, 'rb') as f:
                         if f.read(4) != b'\x7fELF':
