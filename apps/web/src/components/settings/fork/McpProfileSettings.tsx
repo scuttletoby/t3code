@@ -19,7 +19,6 @@ import { Button } from "../../ui/button";
 import { Checkbox } from "../../ui/checkbox";
 import { Input } from "../../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
-import { AdvancedSettings } from "../AdvancedSettings";
 import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
@@ -30,7 +29,7 @@ import {
   useScopedSettingsMixed,
   useUpdateScopedSettings,
 } from "../useScopedSettings";
-import { ForkRow, useForkRowLock } from "./ForkRow";
+import { ForkAdvanced, ForkRow, useForkRowLock } from "./ForkRow";
 import {
   MCP_ALWAYS_KEPT_NOTE,
   MCP_NOT_A_SANDBOX_NOTE,
@@ -45,6 +44,7 @@ import {
   emptyMcpProfileDraft,
   mcpProfileChoices,
   mcpProfileRows,
+  mcpPickProblemSummary,
   mcpServerSuggestions,
   mcpThreadPickRows,
   notSetUpNotes,
@@ -53,6 +53,7 @@ import {
   threadPickPatch,
   threadPickProblem,
 } from "./mcpProfileSettings.logic";
+import { defaultIs } from "./forkDefaultText.logic";
 
 const MIXED =
   "The selected environments or projects have different MCP profile settings. Select one to edit them.";
@@ -198,7 +199,7 @@ function ProfileEditor({
         <p className="text-xs font-medium">{editing}</p>
       )}
       <ListOrAll
-        legend="Outside MCP servers"
+        legend="Outside tool servers (MCP)"
         allLabel="All servers"
         value={draft.servers}
         options={serverOptions}
@@ -312,7 +313,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
 
   if (mixed) {
     return (
-      <SettingsSection id="mcp-profiles-section" title="Tools each thread gets">
+      <SettingsSection id="mcp-profiles-section" title="Tool profiles">
         <ForkRow
           serverScoped
           {...searchableSetting("mcp-profiles")}
@@ -331,7 +332,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
       settingKeys={["mcpProfile"]}
       lockPaths={["mcpProfile"]}
       onResetOverride={() => clearScopedSettings(["mcpProfile"])}
-      description={`The profile a thread gets when nobody picked one for it. ${MCP_PROFILE_ALL}: every outside server and every T3 tool, as in upstream T3 Code. Default: ${MCP_PROFILE_ALL}.${
+      description={`The profile a thread gets when nobody picked one for it. ${MCP_PROFILE_ALL}: every outside server and every T3 tool, as in upstream T3 Code. ${defaultIs("mcpProfile")}${
         isProjectScope && defaultSource === "project" ? " This project's own value." : ""
       } ${MCP_PICK_APPLIES_NOTE}`}
       control={
@@ -351,7 +352,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
       settingKeys={["mcpSubagentProfile"]}
       lockPaths={["mcpSubagentProfile"]}
       onResetOverride={() => clearScopedSettings(["mcpSubagentProfile"])}
-      description={`The profile a sub-agent gets when nobody picked one for it. ${MCP_SUBAGENT_INHERIT}: the same as any other thread. A sub-agent never gets more than its parent. Default: ${MCP_SUBAGENT_INHERIT}.${
+      description={`The profile a sub-agent gets when nobody picked one for it. ${MCP_SUBAGENT_INHERIT}: the same as any other thread. A sub-agent never gets more than its parent. ${defaultIs("mcpSubagentProfile")}${
         isProjectScope && ruleSource === "project" ? " This project's own value." : ""
       }`}
       control={
@@ -368,7 +369,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
 
   if (isProjectScope) {
     return (
-      <SettingsSection id="mcp-profiles-section" title="Tools each thread gets">
+      <SettingsSection id="mcp-profiles-section" title="Tool profiles">
         {defaultRow}
         {ruleRow}
       </SettingsSection>
@@ -381,6 +382,11 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
   const threadSettings = { ...settings, mcpCarriedProfiles, projectSettingsOverrides, threadRoles };
   const pickEffect = (threadId: string, name: string) =>
     threadPickEffect(threadSettings, threadId, name, shells);
+  const blankPicks = pickRows.filter((row) => row.pick === null).length;
+  const widerPicks = pickRows.filter(
+    (row) => row.pick !== null && pickEffect(row.threadId, row.pick).widerThanParent,
+  ).length;
+  const pickProblem = mcpPickProblemSummary(blankPicks, widerPicks);
   const draftEffect =
     pickDraft !== null && pickDraft.threadId.trim() !== "" && pickDraft.profile !== null
       ? pickEffect(pickDraft.threadId.trim(), pickDraft.profile)
@@ -400,12 +406,12 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
   };
 
   return (
-    <SettingsSection id="mcp-profiles-section" title="Tools each thread gets">
+    <SettingsSection id="mcp-profiles-section" title="Tool profiles">
       <ForkRow
         {...searchableSetting("mcp-profiles")}
         settingKeys={["mcpProfiles"]}
         lockPaths={["mcpProfiles"]}
-        description="A profile is a named set of outside MCP servers and T3 tool groups. Give a thread a smaller profile so it sees only the tools it needs. Claude and Codex threads apply a smaller profile; other providers refuse a turn whose profile leaves out an outside server. Built in: all and t3-only."
+        description="A profile is a named set of outside tool servers (MCP) and T3 tool groups. Give a thread a smaller profile so it sees only the tools it needs. Claude and Codex threads apply a smaller profile; other providers refuse a turn whose profile leaves out an outside server. Built in: all and t3-only."
       >
         <div className="grid gap-2 pb-2">
           {rows.map((row) => (
@@ -525,12 +531,12 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
       </ForkRow>
       {defaultRow}
       {ruleRow}
-      <AdvancedSettings targetIds={["mcp-thread-picks"]}>
+      <ForkAdvanced targetIds={["mcp-thread-picks"]} problem={pickProblem}>
         <ForkRow
           {...searchableSetting("mcp-thread-picks")}
           settingKeys={["mcpThreadProfiles"]}
           lockPaths={["mcpThreadProfiles"]}
-          description={`A thread's own pick wins over every default and is never cut down to its parent's, also for a sub-agent. Pick one from the thread's menu, or here by thread id. Default: none. ${MCP_PICK_APPLIES_NOTE}`}
+          description={`A thread's own pick wins over every default and is never cut down to its parent's, also for a sub-agent. Pick one from the thread's menu, or here by thread id. ${defaultIs("mcpThreadProfiles")} ${MCP_PICK_APPLIES_NOTE}`}
         >
           <div className="grid gap-2 pb-2">
             {pickRows.map((row) => {
@@ -644,7 +650,7 @@ export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope
             )}
           </div>
         </ForkRow>
-      </AdvancedSettings>
+      </ForkAdvanced>
     </SettingsSection>
   );
 }

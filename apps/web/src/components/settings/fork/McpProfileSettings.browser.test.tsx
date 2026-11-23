@@ -252,6 +252,12 @@ describe("McpProfileSettings", () => {
     });
     state.shells = [shellOf("parent", "Lead"), shellOf("child", "Helper", "parent")];
     await using screen = await render(<McpProfileSettings isProjectScope={false} />);
+    // Shown with Advanced still folded.
+    await expect
+      .element(
+        screen.getByText("Under Advanced: 1 thread pick gives more than the thread's parent has."),
+      )
+      .toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await expect
       .element(
@@ -268,6 +274,10 @@ describe("McpProfileSettings", () => {
   it("shows a blank pick from a hand edit as broken, and clears it", async () => {
     setup({ mcpThreadProfiles: { "thread-1": "  " } });
     await using screen = await render(<McpProfileSettings isProjectScope={false} />);
+    // Shown with Advanced still folded.
+    await expect
+      .element(screen.getByText("Under Advanced: 1 thread pick is blank and ignored."))
+      .toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await expect
       .element(screen.getByText(/Its pick in settings.json is blank, so it is ignored/))

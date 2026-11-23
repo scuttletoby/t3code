@@ -221,7 +221,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "mcp-profiles",
-    title: "Tool profiles (MCP)",
+    title: "Profiles and their tools",
     to: FORK_PAGE,
     searchTerms: ["mcpProfiles mcp profile servers t3Tools tool groups all t3-only"],
     environmentOnly: true,

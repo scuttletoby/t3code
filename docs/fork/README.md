@@ -12,12 +12,11 @@ fork switch is off by default, except one read-only refresh of usage limits.
 Server settings are in `settings.json` in the server's `userdata` folder (by default
 `~/.t3/userdata/settings.json`). The server reads the file again when it changes; no restart is
 needed. Fork settings also have rows on the app's own **Settings → Fork** page (named below), grouped by
-what a person wants to do (plan usage and machine load, waiting, models and tools, long threads,
-reviews, assistant, playtesting, updates), rare options folded under **Advanced**, and one line per
+what a person wants to do (plan usage and machine load, waiting, models and tools, then one section each for handoff,
+review rules, assistant, playtest sessions and updates), rare options folded under **Advanced**, and one line per
 feature at the top saying whether it is on, by the same rules as the fork report below
 (on a server, a project's override or one thread's handoff entry counts too). A project's overrides are set in **Settings** with that project chosen at the top ("Applying settings
-for …", see [project settings](../user/project-settings.md)). An agent's tools cannot change any
-fork setting.
+for …", see [project settings](../user/project-settings.md)).
 
 To check what a T3 home has switched on without changing anything, the fork's hidden command
 `t3 __fork-report --base-dir <home>` prints it as JSON, each feature with where it is on (the server,
@@ -157,7 +156,7 @@ Set in `settings.json`:
 ```
 
 The key is the provider instance id, for example `codex` or `codex_work`. In the app: **Settings →
-Fork**, section Plan usage, one row per account by its name (an entry for an account that is gone
+Fork**, section Plan usage pacing, one row per account by its name (an entry for an account that is gone
 is listed with **Remove**).
 
 `burnFirstWindows` limits `burnFirst` to some window kinds (`session`, `weekly`, `monthly`,
@@ -188,7 +187,7 @@ What happens when an agent starts a task with `delegate_task`. `"off"`: nothing,
 on an account that is ahead of its pace moves to another account of the same provider, runs at a
 lower effort (`usagePacingLowerEffort`), or is refused for now and the agent asks again later.
 
-Switch on: **Settings → Fork**, section Plan usage, "Pace agents by plan usage", or in `settings.json`:
+Switch on: **Settings → Fork**, section Plan usage pacing, "Pace agents by plan usage", or in `settings.json`:
 `"usagePacingGate": "advise"` (try `advise` before `enforce`).
 
 ### `server.usagePacingLowerEffort`
@@ -197,7 +196,7 @@ For `"enforce"`: what each effort level turns into while an account is ahead of 
 account has room, for example `{ "high": "medium", "medium": "medium" }`. A task at a level not
 listed is held instead. Empty: no effort is ever lowered.
 
-Set: **Settings → Fork**, section Plan usage, under Advanced, "Lower effort when ahead of pace" (pairs like `high=medium`; a level no
+Set: **Settings → Fork**, section Plan usage pacing, under Advanced, "Lower effort when ahead of pace" (pairs like `high=medium`; a level no
 model on the server offers is refused), or in `settings.json`: `"usagePacingLowerEffort": { "high": "medium" }`.
 
 ### `server.waitFor`
@@ -842,7 +841,7 @@ readers are free, until it ends or the server restarts. Delegations go through t
 time, so with a stuck store queued callers wait about 5 s each in turn (the third one about 15 s)
 and are then refused.
 
-Switch on: **Settings → Fork**, section How many agents run at once, "Limit running agents", or in `settings.json`:
+Switch on: **Settings → Fork**, section Limit on running agents, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is
 refused.
 
@@ -1197,7 +1196,7 @@ the owner set up so.
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
 ```
 
-In the app: **Settings → Fork**, section Tools each thread gets. It lists the built-ins (read-only)
+In the app: **Settings → Fork**, section Tool profiles. It lists the built-ins (read-only)
 and each named profile, and adds, edits and deletes named ones: `servers` is all or a list of
 names (the editor offers the names other profiles use and takes any other; no list of the
 machine's servers reaches the app yet), `t3Tools` all or a list of groups, and a "No built-in tools" box sets `builtinTools: "none"`. `request_secret`,
@@ -1392,7 +1391,7 @@ process as any resumed thread does.
 - Timers live in memory. A restart ends every provider session anyway; after it, a child's next run
   end arms again. A second stop of the same child finds nothing live and does nothing.
 
-Switch on: **Settings → Fork**, section Finished sub-agents, or in `settings.json`:
+Switch on: **Settings → Fork**, section Stop finished sub-agents, or in `settings.json`:
 `"stopFinishedChildren": { "enabled": true, "graceSeconds": 60 }`. Anything but `"enabled": true`
 reads as off, and a bad `graceSeconds` as 60; a save with a bad value is refused.
 

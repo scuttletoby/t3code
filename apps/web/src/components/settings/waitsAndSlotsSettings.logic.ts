@@ -15,6 +15,7 @@ import {
 import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
+import { defaultIs } from "./fork/forkDefaultText.logic";
 
 type NumberKey<T> = { [K in keyof T]-?: T[K] extends number ? K : never }[keyof T];
 
@@ -186,8 +187,8 @@ export function waitForSummary(settings: WaitForSettings): string {
  */
 export function waitForDescription(settings: WaitForSettings): string {
   return settings.enabled
-    ? "On: an agent can wait for a pull request, a file, a service or a custom check, end its turn, and get one message when it happens. Default: off."
-    : "On: an agent can wait for a pull request, a file, a service or a custom check, end its turn, and get one message when it happens. Off: agents cannot add waits and nothing is checked; waits already saved are kept and can still be listed and cancelled. Default: off.";
+    ? `On: an agent can wait for a pull request, a file, a service or a custom check, end its turn, and get one message when it happens. ${defaultIs("waitFor")}`
+    : `On: an agent can wait for a pull request, a file, a service or a custom check, end its turn, and get one message when it happens. Off: agents cannot add waits and nothing is checked; waits already saved are kept and can still be listed and cancelled. ${defaultIs("waitFor")}`;
 }
 
 export function agentSlotsSummary(settings: AgentSlotsSettings): string {
@@ -203,11 +204,11 @@ export function agentSlotsSummary(settings: AgentSlotsSettings): string {
 
 export function agentSlotsDescription(settings: AgentSlotsSettings): string {
   if (!settings.enabled) {
-    return "On: a new sub-agent (delegate_task) is refused while a limit below is reached, and the agent can wait for a free slot. Off: every sub-agent starts. Running agents are never stopped. Default: off.";
+    return `On: a new sub-agent is refused while a limit below is reached, and the agent can wait for a free slot. Off: every sub-agent starts. Running agents are never stopped. ${defaultIs("agentSlots")}`;
   }
   return agentSlotsSummary(settings) === "On, no limit set"
-    ? "On, but no limit is set, so every sub-agent still starts. Set a limit below. Default: off."
-    : "On: a new sub-agent (delegate_task) is refused while a limit is reached, and the agent can wait for a free slot. Running agents are never stopped. Default: off.";
+    ? `On, but no limit is set, so every sub-agent still starts. Set a limit below. ${defaultIs("agentSlots")}`
+    : `On: a new sub-agent is refused while a limit is reached, and the agent can wait for a free slot. Running agents are never stopped. ${defaultIs("agentSlots")}`;
 }
 
 /** One row per provider instance on this server, plus limits stored for instances it no longer has. */

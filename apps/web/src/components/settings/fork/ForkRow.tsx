@@ -6,10 +6,12 @@
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
 import { isManagedSettingPath, type ServerSettings } from "@t3tools/contracts";
+import { CheckIcon, CircleAlertIcon } from "lucide-react";
 import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { useEnvironmentProviders } from "../../../state/environments";
 import { EMPTY_SERVER_PROVIDERS } from "../../../state/server";
+import { AdvancedSettings } from "../AdvancedSettings";
 import { IntervalSecondsField } from "../IntervalSecondsField";
 import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingResetButton, SettingsRow } from "../settingsLayout";
@@ -140,8 +142,9 @@ export function useSubRowReset<K extends "handoff" | "playtest">(
 }
 
 /**
- * A dropdown row's help: a lead line, then one line for every option (the chosen one stands out),
- * then a closing line. Upstream's select items hold only a label, so the choices are explained here.
+ * A dropdown row's help: a lead line, then one line for every option, then a closing line. The chosen
+ * option is marked with a check and the words "(chosen)" for screen readers, not by colour alone.
+ * Upstream's select items hold only a label, so the choices are explained here.
  */
 export function OptionLines({
   lead,
@@ -157,15 +160,55 @@ export function OptionLines({
   return (
     <>
       {lead ? <span className="block">{lead}</span> : null}
-      {options.map((option) => (
-        <span
-          key={option.value}
-          className={option.value === selected ? "block font-medium text-foreground" : "block"}
-        >
-          {option.description}
-        </span>
-      ))}
+      {options.map((option) =>
+        option.value === selected ? (
+          <span
+            key={option.value}
+            data-chosen-option
+            className="flex items-baseline gap-1 font-medium text-foreground"
+          >
+            <CheckIcon aria-hidden className="size-3 shrink-0 translate-y-0.5" />
+            <span>
+              {option.description}
+              <span className="sr-only"> (chosen)</span>
+            </span>
+          </span>
+        ) : (
+          <span key={option.value} className="block pl-4">
+            {option.description}
+          </span>
+        ),
+      )}
       <span className="block">{tail}</span>
+    </>
+  );
+}
+
+/**
+ * Upstream's Advanced fold, plus a line above it naming a problem in a saved value under the fold,
+ * so a problem shows while the fold is closed.
+ */
+export function ForkAdvanced({
+  targetIds,
+  problem,
+  children,
+}: {
+  readonly targetIds: ReadonlyArray<string>;
+  readonly problem?: string | null;
+  readonly children: ReactNode;
+}) {
+  return (
+    <>
+      {problem ? (
+        <p
+          role="status"
+          className="flex items-start gap-1.5 border-t border-border/50 px-3 py-2 text-xs text-warning-foreground sm:px-4"
+        >
+          <CircleAlertIcon aria-hidden className="mt-px size-3.5 shrink-0" />
+          <span>Under Advanced: {problem}</span>
+        </p>
+      ) : null}
+      <AdvancedSettings targetIds={targetIds}>{children}</AdvancedSettings>
     </>
   );
 }

@@ -23,28 +23,29 @@ people who run many coding agents on their own machines and plan limits.
 
 See [Install the fork today](README.md#install-the-fork-today): a fork release (Linux x64 CLI
 archive with the install script, Windows x64 CLI archive, unsigned desktop apps), or a build from
-source. A release build's `t3 update` takes only the fork's releases. A server installed as a boot
-service can also update itself (**Settings → Fork → Automatic updates**, below). A machine that already runs
+source. A release build's `t3 update` takes only the fork's releases. A server that starts with the
+computer (a boot service) can also update itself (**Settings → Fork → Automatic updates**, below). A machine that already runs
 T3 as a boot service moves over with the go-live kit ([go-live.md](go-live.md)).
 
 ## What it adds
 
-All settings are on the app's **Settings → Fork** page, grouped by what you want to do. The top row,
+Most settings are on the app's **Settings → Fork** page, grouped by what you want to do. The top row,
 **What the fork has on**, lists every feature with on or off. "Settings file only" means the setting
-has no row yet: set it in `settings.json` ([where settings live](README.md#where-settings-live)).
+has no row yet (usage history, busy check, placement, thread roles): set it in `settings.json`
+([where settings live](README.md#where-settings-live)).
 
 **Plan usage and machine load**
 
 - Plan usage pacing: keeps a share of each plan's usage window free for you and paces agents evenly
-  across the window. Settings → Fork → Plan usage.
+  across the window. Settings → Fork → Plan usage pacing.
 - Usage history: the server records each account's usage-limit readings and reads them every 10
   minutes while no app is open. On by default (read only); settings file only
   (`headlessUsageRefreshInterval`).
-- Agent slots: a new sub-agent is refused above a number of running agents per machine or account,
-  or below a free-memory floor, and can wait for a free slot. Settings → Fork → How many agents run
-  at once.
-- Finished sub-agents: a delegated sub-agent's process stops once its task is over and it has been
-  idle a short while. Settings → Fork → Finished sub-agents.
+- Limit on running agents: a new sub-agent is refused above a number of running agents per machine
+  or account, or below a free-memory floor, and can wait for a free slot. Settings → Fork → Limit on
+  running agents.
+- Stop finished sub-agents: a delegated sub-agent's process stops once its task is over and it has
+  been idle a short while. Settings → Fork → Stop finished sub-agents.
 - Machine facts: `t3_environment_read` also returns the machine's CPU, cores and memory. Always on.
 
 **Waiting instead of polling**
@@ -58,10 +59,10 @@ has no row yet: set it in `settings.json` ([where settings live](README.md#where
 
 **Models and tools agents get**
 
-- Model policy: which models and efforts agents may pick, as advice or enforced. Settings → Fork →
-  Models agents may use.
-- Tool profiles (MCP): named sets of outside MCP servers and T3 tool groups, with one for new
-  threads, one for sub-agents, and a pick per thread. Settings → Fork → Tools each thread gets.
+- Models agents may use: which models and efforts agents may pick, as advice or enforced. Settings
+  → Fork → Models agents may use.
+- Tool profiles: named sets of outside tool servers (MCP) and T3 tool groups, with one for new
+  threads, one for sub-agents, and a pick per thread. Settings → Fork → Tool profiles.
 
 **Long threads**
 
@@ -72,12 +73,18 @@ has no row yet: set it in `settings.json` ([where settings live](README.md#where
 **Reviews**
 
 - Review rules: how this machine runs a review lens; the Recommended preset turns the fork's defaults
-  on. Nothing uses them yet. Settings → Fork → Review rules.
+  on. While on, agents can start the lenses a pull request still needs (`lens_start`). Settings →
+  Fork → Review rules.
 
-**Assistant**
+**Assistant and your threads**
 
-- Assistant thread: Settings offers **Make assistant**, one thread that can reach every project.
+- Assistant: Settings offers **Make assistant**, one thread that can reach every project.
   Settings → Fork → Assistant ([assistant.md](assistant.md)).
+- Thread roles: which thread is the assistant and which is each project's orchestrator. Only you
+  set them (**Make assistant** sets the assistant); the app does not show them yet. Settings file
+  only (`threadRoles`).
+- Waiting on you: a page that lists the open owner questions of every project on every connected
+  server, read only. No menu leads to it yet: open `/owner-questions` in the app.
 
 **Playtesting**
 
@@ -87,7 +94,7 @@ has no row yet: set it in `settings.json` ([where settings live](README.md#where
 **Updates and machines**
 
 - Fork releases: the server, CLI and desktop app look for updates in the fork's releases. Always on.
-- Self-update: a server running as a boot service updates itself once no thread is working, after an
+- Automatic updates: a server that starts with the computer updates itself once no thread is working, after an
   optional "is it quiet?" program agrees. Settings → Fork → Automatic updates
   ([updates.md](updates.md)).
 - `t3 serve --hold-work`: try a build on a copy of a T3 home with all agent work held.
@@ -109,8 +116,9 @@ has no row yet: set it in `settings.json` ([where settings live](README.md#where
 - Fleet runners: one-job CI runners started on demand on your own machines, each behind walls.
 - fork-ci: CI actions any repository can pin, a pull request queue, and a head gate posted by a
   GitHub App ([`fork-ci/README.md`](../../fork-ci/README.md)).
-- Host kits: GitHub App tokens for agents, capped build slices, the go-live kit and opt-in PC
-  updates ([`fork-kit/README.md`](../../fork-kit/README.md)).
+- Host kits: GitHub App tokens for agents, capped build slices, the go-live kit, opt-in PC updates,
+  agent guard hooks, a model guard, a disk cleaner, on-time scheduled workflows, an update and
+  security baseline policy, and a review skill ([`fork-kit/README.md`](../../fork-kit/README.md)).
 - Guards: checks that keep fork lines inside agreed places in upstream files, refuse schema changes,
   scan for secrets and keep outside pull requests from running anything.
 
@@ -139,11 +147,11 @@ From the fork's open issues, grouped. Each is one line; the issue has the detail
 
 **Models, tools and reviews**
 
-- Model policy: the server-side backstop, sub-agents and handover
+- Models agents may use: the server-side backstop, sub-agents and handover
   ([#876](https://github.com/scuttletoby/t3code/issues/876)).
 - Tool profiles: the remaining T3 tool groups, Codex and optional narrowing
   ([#875](https://github.com/scuttletoby/t3code/issues/875)).
-- Review rules: the review runner and lens tools
+- Review rules: the rest of the review runner
   ([#888](https://github.com/scuttletoby/t3code/issues/888)); one review kit with thin project
   adapters ([#1011](https://github.com/scuttletoby/t3code/issues/1011)).
 - Check a sub-agent's final report against the real pull request and CI
@@ -159,7 +167,7 @@ From the fork's open issues, grouped. Each is one line; the issue has the detail
 - Playtest: a thread chip with an End button
   ([#889](https://github.com/scuttletoby/t3code/issues/889)) and what blocks turning it on
   ([#901](https://github.com/scuttletoby/t3code/issues/901)).
-- Issues page: a "Waiting on you" view for owner questions
+- Waiting on you: the Issues page opens it
   ([#887](https://github.com/scuttletoby/t3code/issues/887)).
 - Every question, approval or sign-in from any machine shows up in the thread you read
   ([#808](https://github.com/scuttletoby/t3code/issues/808)).
@@ -178,7 +186,7 @@ From the fork's open issues, grouped. Each is one line; the issue has the detail
 
 - Updates in each machine's own hours, only when quiet, and a view of machines that are behind
   ([#886](https://github.com/scuttletoby/t3code/issues/886)).
-- Security baseline on every machine: automatic updates, exposure and hardening checks
+- The rest of the security baseline on every machine: automatic updates, exposure and hardening checks
   ([#1045](https://github.com/scuttletoby/t3code/issues/1045)).
 - Host tools: agents use your other computers safely
   ([#885](https://github.com/scuttletoby/t3code/issues/885)).

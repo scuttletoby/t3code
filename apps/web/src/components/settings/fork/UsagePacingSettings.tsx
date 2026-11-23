@@ -36,6 +36,7 @@ import {
   usagePacingAccountRows,
   usagePacingAccountSummary,
 } from "./usagePacingSettings.logic";
+import { defaultIs } from "./forkDefaultText.logic";
 
 type UpdateSettings = ReturnType<typeof useUpdateScopedSettings>;
 
@@ -44,7 +45,7 @@ const MIXED = "The selected environments have different values. Select one envir
 export function UsagePacingSettings() {
   const updateSettings = useUpdateScopedSettings();
   return (
-    <SettingsSection id="usage-pacing-section" title="Plan usage">
+    <SettingsSection id="usage-pacing-section" title="Plan usage pacing">
       <GateRow updateSettings={updateSettings} />
       <AccountRows updateSettings={updateSettings} />
       <AdvancedSettings targetIds={["usage-pacing-lower-effort"]}>
@@ -73,10 +74,10 @@ function GateRow({ updateSettings }: { readonly updateSettings: UpdateSettings }
           MIXED
         ) : (
           <OptionLines
-            lead="What happens when an agent hands a task to a sub-agent (delegate_task) while an account is using its plan faster than an even pace."
+            lead="What happens when an agent starts a sub-agent while an account is using its plan faster than an even pace."
             options={USAGE_PACING_GATE_OPTIONS}
             selected={gate}
-            tail="Default: Off."
+            tail={defaultIs("usagePacingGate")}
           />
         )
       }
@@ -146,7 +147,7 @@ function LowerEffortRow({ updateSettings }: { readonly updateSettings: UpdateSet
       description={
         mixed
           ? MIXED
-          : "Only with pacing on Enforce: the effort a task drops to while its account is ahead of pace, as pairs like high=medium. A level not listed waits instead. Empty: effort is never lowered. Default: empty."
+          : `Only with pacing on Enforce: the effort a task drops to while its account is ahead of pace, as pairs like high=medium. A level not listed waits instead. Empty: effort is never lowered. ${defaultIs("usagePacingLowerEffort")}`
       }
       resetAction={
         !mixed && storedText !== "" ? (
@@ -208,7 +209,7 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
             ? MIXED
             : rows.length === 0
               ? "No provider accounts on this server yet."
-              : "Per account: how much of each usage window agents leave free for you (handed back over the window's last 12 hours), whether agents should use this account first, and whether it has no limits at all. Only used while pacing is on. Default: 0% kept, no account first."
+              : `Per account: how much of each usage window agents leave free for you (handed back over the window's last 12 hours), whether agents should use this account first, and whether it has no limits at all. Only used while pacing is on. ${defaultIs("usagePacingAccount")}`
         }
       />
       {mixed

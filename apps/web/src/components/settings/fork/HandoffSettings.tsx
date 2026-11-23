@@ -17,7 +17,6 @@ import { useThreadShells } from "../../../state/entities";
 import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
-import { AdvancedSettings } from "../AdvancedSettings";
 import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import {
@@ -28,7 +27,7 @@ import {
   useUpdateScopedSettings,
 } from "../useScopedSettings";
 import { CommitTextField } from "./CommitTextField";
-import { BoundedNumberField, ForkRow, OptionLines, useSubRowReset } from "./ForkRow";
+import { BoundedNumberField, ForkAdvanced, ForkRow, OptionLines, useSubRowReset } from "./ForkRow";
 import {
   HANDOFF_MODE_OPTIONS,
   boundHandoffTokens,
@@ -40,6 +39,7 @@ import {
   threadModeProblem,
   withThreadMode,
 } from "./handoffSettings.logic";
+import { defaultIs } from "./forkDefaultText.logic";
 
 const MIXED =
   "The selected environments or projects have different handoff settings. Select one to edit them.";
@@ -150,7 +150,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
           <OptionLines
             options={HANDOFF_MODE_OPTIONS}
             selected={shown.mode}
-            tail={`Default: Off.${scopeNote}`}
+            tail={`${defaultIs("handoff")}${scopeNote}`}
           />
         }
         resetAction={
@@ -236,8 +236,9 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
           ) : null}
         </div>
       </ForkRow>
-      <AdvancedSettings
+      <ForkAdvanced
         targetIds={["handoff-size", "handoff-idle", "handoff-source", "handoff-instructions"]}
+        problem={handoffSourceProblem(shown.source, shown.command)}
       >
         <ForkRow
           {...searchableSetting("handoff-size")}
@@ -353,7 +354,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
             ["instructions"],
             "Reset handoff instructions to the environment's",
           )}
-          description="What the old session is asked to write, when it writes the note. Empty: T3's built-in text. Default: empty."
+          description={`What the old session is asked to write, when it writes the note. Empty: T3's built-in text. ${defaultIs("handoffInstructions")}`}
         >
           <div className="pb-2">
             <CommitTextField
@@ -368,7 +369,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
             />
           </div>
         </ForkRow>
-      </AdvancedSettings>
+      </ForkAdvanced>
     </SettingsSection>
   );
 }

@@ -67,6 +67,7 @@ describe("fork setting defaults", () => {
 // they are: a settings file saved by an older build must load with every value it had.
 const decodeServerFile = Schema.decodeUnknownSync(ServerSettings);
 const encodeServerFile = Schema.encodeSync(ServerSettings);
+const decodeProjectOverrides = Schema.decodeUnknownSync(ProjectSettingsOverrides);
 
 describe("settings saved by an older build", () => {
   it("keeps the stored key names", () => {
@@ -91,10 +92,42 @@ describe("settings saved by an older build", () => {
         "server.assistant",
         "server.stopFinishedChildren",
         "projectOverride.waitChecks",
+        "projectOverride.mcpProfile",
+        "projectOverride.mcpSubagentProfile",
+        "projectOverride.playtest",
         "projectOverride.handoff",
         "projectOverride.reviewRules",
+        "projectOverride.placementNeeds",
       ]),
     );
+    // A project's saved overrides are read by these names: renaming one loses what projects saved.
+    expect(Object.keys(ForkProjectOverrideFields).toSorted()).toEqual([
+      "handoff",
+      "mcpProfile",
+      "mcpSubagentProfile",
+      "placementNeeds",
+      "playtest",
+      "reviewRules",
+      "waitChecks",
+    ]);
+  });
+
+  it("loads the overrides a project saved with an older build", () => {
+    const saved = {
+      mcpProfile: "lean",
+      mcpSubagentProfile: "lean",
+      handoff: { mode: "handoff" },
+      reviewRules: { preset: "recommended" },
+      playtest: {
+        enabled: true,
+        claim: { argv: ["/usr/bin/playtest", "claim"] },
+        renew: { argv: ["/usr/bin/playtest", "renew"] },
+        push: [{ name: "build", argv: ["/usr/bin/playtest", "build"] }],
+        release: { argv: ["/usr/bin/playtest", "release"] },
+      },
+    };
+    // The struct drops a key it does not know, so a renamed key fails here.
+    expect(decodeProjectOverrides(saved)).toMatchObject(saved);
   });
 
   it("loads the values an older settings file saved, not the defaults", () => {

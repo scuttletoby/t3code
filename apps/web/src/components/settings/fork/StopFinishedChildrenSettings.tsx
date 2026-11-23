@@ -15,6 +15,7 @@ import { useSearchableSetting } from "../settingsSearch";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
 import { ForkRow } from "./ForkRow";
+import { defaultIs } from "./forkDefaultText.logic";
 
 const DEFAULTS = DEFAULT_SERVER_SETTINGS.stopFinishedChildren;
 
@@ -29,11 +30,11 @@ export function StopFinishedChildrenSettings() {
     (settings) => settings.stopFinishedChildren.graceSeconds,
   );
   return (
-    <SettingsSection id="stop-finished-children-section" title="Finished sub-agents">
+    <SettingsSection id="stop-finished-children-section" title="Stop finished sub-agents">
       <ForkRow
         serverScoped
         {...searchableSetting("stop-finished-children")}
-        description="On: once a delegated task is finished and its thread has sat idle for a while, its provider process is stopped so it frees memory; a later message starts it again with its history. A thread that works, waits or asks is never stopped. Off: finished sub-agents keep running until T3's own idle stop. Default: off."
+        description={`On: once a delegated task is finished and its thread has sat idle for a while, its agent program (Claude, Codex) is stopped so it frees memory; a later message starts it again with its history. A thread that works, waits or asks is never stopped. Off: finished sub-agents keep running until T3's own idle stop. ${defaultIs("stopFinishedChildren")}`}
         settingKeys={["stopFinishedChildren"]}
         lockPaths={["stopFinishedChildren"]}
         mixed={enabledMixed}

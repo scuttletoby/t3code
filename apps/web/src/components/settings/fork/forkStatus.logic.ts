@@ -30,10 +30,10 @@ const LABELS: Record<ForkFeature, string> = {
   agentSlots: "Limit on running agents",
   stopFinishedChildren: "Stop finished sub-agents",
   waitFor: "Agent waits",
-  modelPolicy: "Model policy",
+  modelPolicy: "Models agents may use",
   handoff: "Handoff instead of compaction",
   reviewRules: "Review rules",
-  playtest: "Playtests",
+  playtest: "Playtest sessions",
   automaticUpdates: "Automatic updates",
   activityProbe: "Busy check (settings file only)",
 };

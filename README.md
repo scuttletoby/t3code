@@ -1,10 +1,11 @@
 > **This is a fork of [T3 Code](https://github.com/pingdotgg/t3code)** for people who run many coding agents on their own
 > machines and plans. It rebases onto upstream's newest release daily and ships it as `v<upstream>.fork.<n>`. With no fork
 > settings it behaves like upstream, except that it updates from this fork's releases. Every fork switch is off until you
-> turn it on in **Settings → Fork**. Among what it adds:
+> turn it on, most in **Settings → Fork** (a few only in the settings file). Among what it adds:
 >
-> - **Plan usage pacing and agent slots:** agents leave you part of each plan, and a machine never runs too many.
-> - **Waits** instead of polling, **model policy**, **tool profiles**, **handoff** instead of compaction and **self-update**.
+> - **Plan usage pacing and a limit on running agents:** agents leave you part of each plan, and a machine never runs too many.
+> - **Agent waits** instead of polling, **models agents may use**, **tool profiles**, **handoff instead of compaction** and
+>   **automatic updates**.
 >
 > About the fork, every feature with where to turn it on, and what is planned: [docs/fork/about.md](docs/fork/about.md).
 > Install and every setting: [docs/fork/README.md](docs/fork/README.md). Every change: [FORK_CHANGES.md](FORK_CHANGES.md).

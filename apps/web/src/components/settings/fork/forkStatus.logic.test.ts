@@ -21,10 +21,10 @@ describe("forkFeatureStatuses", () => {
       "Limit on running agents: Off",
       "Stop finished sub-agents: Off",
       "Agent waits: Off",
-      "Model policy: Off",
+      "Models agents may use: Off",
       "Handoff instead of compaction: Off",
       "Review rules: Off",
-      "Playtests: Off",
+      "Playtest sessions: Off",
       "Automatic updates: Off",
       "Busy check (settings file only): Off",
     ]);
@@ -49,10 +49,10 @@ describe("forkFeatureStatuses", () => {
       "Limit on running agents: On",
       "Stop finished sub-agents: On",
       "Agent waits: On",
-      "Model policy: On: enforce",
+      "Models agents may use: On: enforce",
       "Handoff instead of compaction: On for 1 thread",
       "Review rules: On",
-      "Playtests: Off",
+      "Playtest sessions: Off",
       "Automatic updates: On",
       "Busy check (settings file only): On",
     ]);
@@ -95,7 +95,7 @@ describe("forkFeatureStatuses", () => {
     );
     expect(lines(server({ handoff: { mode: 7 } }))).toContain("Handoff instead of compaction: Off");
     expect(lines(server({ modelPolicy: { mode: "enforce", typo: 1 } }))).toContain(
-      "Model policy: On: enforce (unreadable)",
+      "Models agents may use: On: enforce (unreadable)",
     );
   });
 });

@@ -59,6 +59,7 @@ import {
   withWaitCheck,
   withoutWaitCheck,
 } from "./waitsAndSlotsSettings.logic";
+import { defaultIs } from "./fork/forkDefaultText.logic";
 
 type UpdateSettings = ReturnType<typeof useUpdateScopedSettings>;
 
@@ -504,7 +505,7 @@ function AgentSlotsSection({ updateSettings }: { readonly updateSettings: Update
   const accounts = agentSlotAccountRows(providers, slots.maxPerAccount);
 
   return (
-    <SettingsSection id="agent-slots-section" title="How many agents run at once">
+    <SettingsSection id="agent-slots-section" title="Limit on running agents">
       <SettingsRow
         serverScoped
         {...searchableSetting("agent-slots")}
@@ -542,7 +543,7 @@ function AgentSlotsSection({ updateSettings }: { readonly updateSettings: Update
             accountsMixed
               ? "The selected environments have different account limits. Select one environment to edit them."
               : account.known
-                ? "Most agents running at once on this provider account. 0 means no limit. Default: 0."
+                ? `Most agents running at once on this provider account. 0 means no limit. ${defaultIs("agentSlotsPerAccount")}`
                 : "This provider instance is not on this server any more. Set 0 to remove its limit."
           }
           settingKeys={["agentSlots"]}

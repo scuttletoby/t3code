@@ -43,6 +43,7 @@ import {
   unreadableModelPolicyText,
   withModelPolicyAllow,
 } from "./modelPolicySettings.logic";
+import { defaultIs } from "./forkDefaultText.logic";
 
 const MIXED = "The selected environments have different values. Select one environment to edit it.";
 
@@ -260,7 +261,7 @@ export function ModelPolicySettings() {
             lead="Which models and efforts agents may pick when they start threads or sub-agents."
             options={MODEL_POLICY_MODE_OPTIONS}
             selected={shown.mode}
-            tail="Your own picks are never refused; one outside the list is marked below. While it is on, a sub-agent that names its model keeps only the options it names. Default: Off."
+            tail={`Your own picks are never refused; one outside the list is marked below. While it is on, a sub-agent that names its model keeps only the options it names. ${defaultIs("modelPolicy")}`}
           />
         }
         resetAction={
@@ -279,7 +280,11 @@ export function ModelPolicySettings() {
               save({ mode: next as ModelPolicyMode, allow: shown.allow });
             }}
           >
-            <SelectTrigger size="sm" className="w-full sm:w-36" aria-label="Model policy mode">
+            <SelectTrigger
+              size="sm"
+              className="w-full sm:w-36"
+              aria-label="Models agents may use: mode"
+            >
               <SelectValue>{option?.label ?? shown.mode}</SelectValue>
             </SelectTrigger>
             <SelectPopup align="end" alignItemWithTrigger={false}>

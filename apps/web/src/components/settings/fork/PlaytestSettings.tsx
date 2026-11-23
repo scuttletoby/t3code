@@ -40,6 +40,7 @@ import {
   withPlaytestSteps,
 } from "./playtestSettings.logic";
 import { BoundedNumberField, ForkRow, useSubRowReset } from "./ForkRow";
+import { defaultIs } from "./forkDefaultText.logic";
 
 const MIXED =
   "The selected environments or projects have different playtest settings. Select one to edit them.";
@@ -198,7 +199,7 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
         description={`${
           !shown.enabled && missing.length > 0
             ? `Set the steps below first (missing: ${missing.join(", ")}).`
-            : "On: an agent can start a playtest with its playtest tool: T3 claims your test target, sends each round with your steps, and gives the target back at the end, so you can try unfinished work. Off: no playtest starts. Default: off."
+            : `On: an agent can start a playtest with its playtest tool: T3 claims your test target, sends each round with your steps, and gives the target back at the end, so you can try unfinished work. Off: no playtest starts. ${defaultIs("playtest")}`
         }${scopeNote}`}
         resetAction={
           !isProjectScope && !Equal.equals(shown, DEFAULT_SERVER_SETTINGS.playtest) ? (

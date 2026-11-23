@@ -14,6 +14,7 @@ import { useSearchableSetting } from "../settingsSearch";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
 import { CommitTextField } from "./CommitTextField";
+import { defaultIs } from "./forkDefaultText.logic";
 
 const MIXED = "The selected environments have different values. Select one environment to edit it.";
 
@@ -36,7 +37,7 @@ export function UpdatesSettings() {
         description={
           automaticMixed
             ? MIXED
-            : "On: a server installed as a boot service updates itself to the newest fork release once no thread is working. Off: it updates only when you run t3 update or press Update. Default: off."
+            : `On: a server that starts with the computer (a boot service) updates itself to the newest fork release once no thread is working. Off: it updates only when you run t3 update or press Update. ${defaultIs("automaticUpdates")}`
         }
         resetAction={
           !automaticMixed && automatic !== DEFAULT_SERVER_SETTINGS.automaticUpdates ? (
@@ -66,7 +67,7 @@ export function UpdatesSettings() {
           description={
             quietMixed
               ? MIXED
-              : "A program (its full path) asked before each automatic update; a non-zero exit means not now, so the update waits. Empty: no program is asked. Default: empty."
+              : `A program (its full path) asked before each automatic update; a non-zero exit means not now, so the update waits. Empty: no program is asked. ${defaultIs("automaticUpdatesQuietCommand")}`
           }
           resetAction={
             !quietMixed && quietCommand !== "" ? (
