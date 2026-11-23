@@ -2,7 +2,18 @@
 // devices, a file downloads to the viewing device, and a file on another machine opens in the
 // viewing device's editor over SSH. MarkdownFileLink.tsx and ChatMarkdown.tsx only call these.
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own messages are English only; upstream's translation catalogs hold no fork keys. */
-import type { ContextMenuSource } from "@t3tools/contracts";
+import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
+import {
+  squashAtomCommandFailure,
+  type AtomCommandResult,
+} from "@t3tools/client-runtime/state/runtime";
+import type {
+  AssetCreateUrlResult,
+  AssetResource,
+  ContextMenuSource,
+  EnvironmentId,
+  ScopedThreadRef,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import {
@@ -18,10 +29,16 @@ import type { MessageResolver } from "../../i18n/messages";
 import type { MarkdownFileLinkMeta } from "../../markdown-links";
 import {
   openRemoteEditorUrl,
+  resolveRemoteOpenState,
   useRemoteCapableEditors,
   type RemoteOpenState,
 } from "../../remoteOpen";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
+import { hostEnvironmentIdAtom } from "../../state/primaryEnvironment";
+import { readPreparedConnection } from "../../state/session";
+import { downloadFile } from "../media/mediaContent";
 import { stackedThreadToast, toastManager } from "../ui/toast";
+import { forkMarkdownDownloadError } from "./forkMarkdownFileDownload";
 import { markdownFileRemoteEditorUrl } from "./forkMarkdownFileLinkMenu";
 import { reportMarkdownActionFailure } from "./markdownActionFailure";
 
@@ -117,6 +134,47 @@ function swallowLateContextMenu(chip: HTMLElement): () => void {
   window.addEventListener("pointerdown", release, true);
   window.addEventListener("keydown", release, true);
   return release;
+}
+
+/**
+ * Fetches a file from the environment's machine to this device. A file the machine does not have
+ * fails naming the machine and the path it checked, as upstream's media preview does.
+ */
+export async function forkFetchMarkdownFile(input: {
+  threadRef: ScopedThreadRef;
+  path: string;
+  fileName: string;
+  createAssetUrl: (request: {
+    environmentId: EnvironmentId;
+    input: { resource: AssetResource };
+  }) => Promise<AtomCommandResult<AssetCreateUrlResult, unknown>>;
+}): Promise<void> {
+  const { environmentId, threadId } = input.threadRef;
+  const { path } = input;
+  const result = await input.createAssetUrl({
+    environmentId,
+    input: { resource: { _tag: "media-file", threadId, path, disposition: "attachment" } },
+  });
+  if (result._tag === "Failure") {
+    const target = readPreparedConnection(environmentId)?.target ?? null;
+    const isRemote =
+      target !== null &&
+      resolveRemoteOpenState({
+        target,
+        sshTarget: null,
+        remoteOpenTargets: undefined,
+        isDesktopRenderer: window.desktopBridge !== undefined,
+        hostEnvironmentId: appAtomRegistry.get(hostEnvironmentIdAtom),
+      }).mode !== "local-exec";
+    throw forkMarkdownDownloadError(squashAtomCommandFailure(result), {
+      requestedPath: path,
+      machine: isRemote ? target.label : null,
+    });
+  }
+  const connection = readPreparedConnection(environmentId);
+  const url = connection && resolveAssetUrl(connection.httpBaseUrl, result.value.relativeUrl);
+  if (!url) throw new Error("Reconnect to the environment and try again.");
+  await downloadFile(url, input.fileName);
 }
 
 /** Downloads the linked file; a failure is reported the way the link's other actions report one. */

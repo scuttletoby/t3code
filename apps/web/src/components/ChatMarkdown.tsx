@@ -65,7 +65,6 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
-import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import type {
   CodexArtifactTemplate,
   CodexArtifactTemplateKind,
@@ -124,7 +123,6 @@ import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { markdownImageGallery } from "./chat/markdownImageGallery";
 import { type MediaActionSource } from "./media/MediaActions";
 import { resolveProtocolRelativeMediaUrl } from "./media/mediaContent";
-import { downloadFile } from "./media/mediaContent"; // Fork
 import {
   revealInFileExplorerLabelForKind,
   revealInFileExplorerLabelForOs,
@@ -232,8 +230,10 @@ import {
 import { MarkdownExternalLinkContent } from "./chat/MarkdownExternalLink";
 import { MarkdownFileLink } from "./chat/MarkdownFileLink";
 import { canUseMarkdownFileShellActions } from "./chat/MarkdownFileLink.logic";
-import { useForkMarkdownFileRemoteEditor } from "./chat/forkMarkdownFileLinkActions"; // Fork
-import { forkMarkdownDownloadError } from "./chat/forkMarkdownFileDownload"; // Fork
+import {
+  forkFetchMarkdownFile,
+  useForkMarkdownFileRemoteEditor,
+} from "./chat/forkMarkdownFileLinkActions"; // Fork
 import { rehypeChipPunctuation } from "./chat/markdownChipPunctuation";
 import { handleMarkdownFragmentClick, rehypeHeadingIds } from "./chat/markdownFragments";
 import { rehypeTextDirection } from "./chat/markdownTextDirection";
@@ -899,35 +899,6 @@ function useChatMarkdownState({
     }
     return findAgentDirectoryMatch(workspaceRelativePath, agentRoots, searchRoot);
   };
-  const downloadMarkdownFile = async (path: string, fileName: string) => {
-    if (!threadRef) return;
-    const { environmentId: fileEnvironmentId, threadId } = threadRef;
-    const result = await createAssetUrl({
-      environmentId: fileEnvironmentId,
-      input: { resource: { _tag: "media-file", threadId, path, disposition: "attachment" } },
-    });
-    if (result._tag === "Failure") {
-      // A missing file names the machine and path, as the media preview's message does.
-      const target = readPreparedConnection(fileEnvironmentId)?.target ?? null;
-      const isRemote =
-        target !== null &&
-        resolveRemoteOpenState({
-          target,
-          sshTarget: null,
-          remoteOpenTargets: undefined,
-          isDesktopRenderer: window.desktopBridge !== undefined,
-          hostEnvironmentId: appAtomRegistry.get(hostEnvironmentIdAtom),
-        }).mode !== "local-exec";
-      throw forkMarkdownDownloadError(squashAtomCommandFailure(result), {
-        requestedPath: path,
-        machine: isRemote ? target.label : null,
-      });
-    }
-    const connection = readPreparedConnection(fileEnvironmentId);
-    const url = connection && resolveAssetUrl(connection.httpBaseUrl, result.value.relativeUrl);
-    if (!url) throw new Error("Reconnect to the environment and try again.");
-    await downloadFile(url, fileName);
-  };
   const openFileInPanel = (fileLinkMeta: MarkdownFileLinkMeta, panelPath: string) => {
     if (!threadRef) return;
     const openAt = (path: string) =>
@@ -1039,7 +1010,12 @@ function useChatMarkdownState({
         onDownload={
           threadRef && canReadFiles && !isAppBundle
             ? async () =>
-                downloadMarkdownFile((await resolveHostPath()).absolutePath, fileLinkMeta.basename)
+                forkFetchMarkdownFile({
+                  threadRef,
+                  path: (await resolveHostPath()).absolutePath,
+                  fileName: fileLinkMeta.basename,
+                  createAssetUrl,
+                })
             : undefined
         }
         onOpenMedia={
