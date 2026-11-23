@@ -1079,13 +1079,6 @@ function useChatMarkdownState(
             : undefined
         }
         openInEditorMenuLabel={canOpenApp ? gt("Open app") : preferredEditorMenuLabel}
-        // Fork: over SSH the viewing device's editor opens the file, and the menu names it.
-        {...forkRemoteEditor?.linkProps({
-          canOpenApp,
-          canUseShellActions,
-          fileLinkMeta,
-          resolveAbsolutePath: async () => (await resolveHostPath()).absolutePath,
-        })}
         onReveal={
           canUseShellActions && revealInFileManagerLabel !== undefined
             ? async () => revealFileInFileManager((await resolveHostPath()).absolutePath)
@@ -1109,6 +1102,13 @@ function useChatMarkdownState(
             ? () => openMarkdownFileInPreview(fileLinkMeta.filePath)
             : undefined
         }
+        // Fork: a link naming an environment downloads from it; over SSH, this device's editor.
+        {...forkRemoteEditor.linkProps({
+          canOpenApp,
+          canUseShellActions,
+          fileLinkMeta,
+          resolveAbsolutePath: async () => (await resolveHostPath()).absolutePath,
+        })}
       />
     );
   };

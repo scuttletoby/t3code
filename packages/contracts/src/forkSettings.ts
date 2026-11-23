@@ -65,6 +65,7 @@ import {
 } from "./waitFor.ts";
 
 export * from "./assistant.ts";
+export * from "./forkEnvironmentFileLinks.ts";
 export * from "./forkFeatures.ts";
 export * from "./forkOwnerQuestions.ts";
 export * from "./handoff.ts";
