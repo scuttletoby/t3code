@@ -9,7 +9,11 @@ import { assert, it } from "@effect/vitest";
 import { ProjectId, ThreadId } from "@t3tools/contracts";
 import type { WaitRecord } from "@t3tools/contracts/waitFor";
 import type { Judgement } from "@t3tools/shared/waitFor";
+import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import { TestClock } from "effect/testing";
@@ -81,19 +85,25 @@ const recordingAction = () => {
   const runs: Array<WaitRecord> = [];
   let ready = true;
   let answer: string | null = null;
+  let hang = false;
+  /** Done once the action has run (a milestone the timeout test awaits). */
+  const ran = Deferred.makeUnsafe<void>();
   const action: WaitService.WaitAction = {
     ready: Effect.sync(() => ready),
     run: (wait) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
         runs.push(wait);
-        return answer;
+        Deferred.doneUnsafe(ran, Exit.void);
+        return hang ? Effect.never : Effect.succeed(answer);
       }),
   };
   return {
     action,
     runs,
+    ran,
     setReady: (value: boolean) => void (ready = value),
     setAnswer: (value: string | null) => void (answer = value),
+    setHang: (value: boolean) => void (hang = value),
   };
 };
 
@@ -284,6 +294,62 @@ it.layer(NodeServices.layer)("WaitService action: lens_start", (it) => {
       // The action ran again (it is idempotent); the wake was found, not sent twice.
       assert.strictEqual(action.runs.length, 2);
     }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect("a narrowed wait the store could not read back is refused, never stored", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const filePath = yield* storePath;
+      const pr = scriptedPrJudge();
+      const send = recordingDelivery();
+      const service = yield* make(filePath, pr.judge, send.delivery, recordingAction().action);
+      for (const narrow of [
+        { checks: [], head: HEAD },
+        { checks: ["ci-result"], head: "not-a-sha" },
+      ]) {
+        const refused = yield* service
+          .register({
+            threadId: THREAD,
+            projectId: PROJECT,
+            input: { kind: "pr", pr: { number: 7, repository: "o/r" } },
+            narrow,
+            action: "lens_start",
+          })
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.code, "invalid");
+      }
+      assert.deepStrictEqual(pr.asked, []);
+    }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "an action that does not finish in time: the sweep goes on, the delivery runs again later",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const filePath = yield* storePath;
+        const pr = scriptedPrJudge();
+        const send = recordingDelivery();
+        const action = recordingAction();
+        action.setHang(true);
+        const service = yield* make(filePath, pr.judge, send.delivery, action.action);
+        yield* registerAfterCi(service);
+        pr.answer(passed);
+        yield* TestClock.adjust(130_000);
+        const sweep = yield* Effect.forkChild(service.runDue());
+        // Once the action hangs in the sweep, pass its limit.
+        yield* Deferred.await(action.ran);
+        yield* TestClock.adjust(Duration.toMillis(WaitService.WAIT_ACTION_LIMIT) + 1_000);
+        yield* Fiber.join(sweep);
+        assert.strictEqual(send.sent.length, 1, "the wake is in the thread");
+        assert.strictEqual(action.runs.length, 1);
+        // Not written as delivered: the next delivery runs the action again, the wake is found.
+        action.setHang(false);
+        yield* TestClock.adjust(130_000);
+        yield* service.deliverDue();
+        assert.strictEqual(action.runs.length, 2);
+        assert.strictEqual(send.sent.length, 1);
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
   );
 
   it.effect("a server without the action: the wait is kept, never delivered half", () =>

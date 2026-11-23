@@ -374,9 +374,12 @@ With `afterCi: true` the call returns at once: it registers a wait (`server.wait
 the config's `required_checks` other than its `head_check`, at that head. When they pass, the wake
 is sent to the thread and the server then starts the lenses in the run that wake starts (a
 delegated child needs its parent's run); a red check, a new head (`moved`) or the deadline starts
-nothing and the wake says why. A problem starting them comes as a second message. The action is
-part of the stored wait, so a restart before its delivery was written runs it again; the start is
-idempotent.
+nothing and the wake says why. A config whose only required check is its `head_check` has no CI to
+wait for, so the lenses start at once. A problem starting them comes as a second message. The action
+is part of the stored wait, so a restart before its delivery was written runs it again; the start is
+idempotent. It runs at most 90 s per delivery (the delivery is tried again after that), so a slow
+GitHub or thread does not stall other waits. Like the gate, lens_start skips a review or inline
+comment that is not submitted yet, and dates an inline comment by when it was published.
 
 ### `server.modelPolicy`
 

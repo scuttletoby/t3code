@@ -17,6 +17,7 @@ import {
   type WaitSlotSpec,
   type WaitStoreNotice,
   type WaitTarget,
+  WaitPrSpec,
   WaitToolFailure,
   type WaitToolFailureCode,
 } from "@t3tools/contracts/waitFor";
@@ -61,6 +62,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Latch from "effect/Latch";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import { ServerSettingsService } from "../serverSettings.ts";
@@ -401,6 +403,15 @@ export interface WaitAction {
   readonly ready: Effect.Effect<boolean>;
   readonly run: (wait: WaitRecord) => Effect.Effect<string | null>;
 }
+
+const isPrSpec = Schema.is(WaitPrSpec);
+
+/**
+ * The longest one wait's action may run in a delivery: the delivery sweep holds the sweep lock, so a slow start
+ * (GitHub, the thread's run) must not stall every other wait. Past it the delivery is tried again later (the action
+ * is idempotent, and the wake is found, not sent twice).
+ */
+export const WAIT_ACTION_LIMIT = Duration.seconds(90);
 
 /** The message id of an `action` problem: one per wait, so a retry finds it again. */
 const actionMessageId = (wait: WaitRecord) => `${wait.id}-action`;
@@ -808,6 +819,13 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
             spec: { ...valid.target.spec, checks: [...narrow.checks], head: narrow.head },
           }
         : valid.target;
+    // A narrowed spec the store could not read back (no check, too many, a bad head) is refused, never stored.
+    if (target.kind === "pr" && !isPrSpec(target.spec)) {
+      return yield* failure(
+        "invalid",
+        "A pull request wait narrowed to checks needs 1 to 20 check names and a full head sha.",
+      );
+    }
     const judge = judgeOf(target.kind);
     const slotGate = target.kind === "slot" ? input.slots : undefined;
     if (judge === undefined && slotGate === undefined) {
@@ -2110,7 +2128,17 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
             return [group, result] as const;
           // In the thread: run each action before the delivery is written (a restart runs it again).
           for (const wait of actions) {
-            const problem = yield* input.action.run(wait);
+            const ran = yield* input.action.run(wait).pipe(Effect.timeoutOption(WAIT_ACTION_LIMIT));
+            if (Option.isNone(ran)) {
+              return [
+                group,
+                {
+                  type: "retry",
+                  detail: `Its action did not finish in ${Duration.toSeconds(WAIT_ACTION_LIMIT)} s; it runs again later.`,
+                },
+              ] as const;
+            }
+            const problem = ran.value;
             if (problem === null) continue;
             const told = yield* send({
               threadId: group.threadId,

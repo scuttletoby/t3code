@@ -89,6 +89,8 @@ const serverClient = McpSchema.McpServerClient.of({
 
 const encodeDelegate = Schema.encodeSync(OrchestratorMcpDelegateTaskInput);
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+/** How long the after-CI start waits for the thread's run (the wake starts it): 20 tries, 2 s apart. */
+const PARENT_RUN_TRIES = 20;
 
 /** One `delegate_task` call's answer, read from its tool result. */
 function startAnswerOf(result: McpSchema.CallToolResult): StartAnswer {
@@ -211,7 +213,10 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
     );
   });
 
-  /** One connection of the pull request, every page, via GraphQL. */
+  /**
+   * One connection of the pull request, every page, via GraphQL. A pull request GitHub does not know: `pull` null. A
+   * page that fails or is not the shape asked for, or more than MAX_PAGES pages: refused, never a partial list.
+   */
   const pages = Effect.fnUntraced(function* (
     cwd: string,
     repo: string,
@@ -219,17 +224,18 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
     connection: string,
   ) {
     const [owner, name] = repo.split("/") as [string, string];
+    const key = connection.split("(")[0]!;
     const nodes: Array<Record<string, unknown>> = [];
     let pull: Record<string, unknown> | null = null;
     let after: string | null = null;
     for (let page = 0; ; page += 1) {
       if (page === MAX_PAGES) {
         return yield* new LensReadError({
-          message: `#${number} has more than ${MAX_PAGES * 100} ${connection.split("(")[0]}: not all read`,
+          message: `#${number} has more than ${MAX_PAGES * 100} ${key}: not all read`,
         });
       }
       const query = `query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){state headRefOid baseRefName headRefName ${connection.replace("$AFTER", "after:$after")}}}}`;
-      const data: unknown = yield* ghJson(cwd, [
+      const out: ProcessRunner.ProcessRunOutput = yield* gh(cwd, [
         "api",
         "graphql",
         "-f",
@@ -242,18 +248,42 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
         `number=${number}`,
         ...(after === null ? [] : ["-f", `after=${after}`]),
       ]);
-      const repository = isRecord(data) && isRecord(data.data) ? data.data.repository : null;
-      const pr =
+      if (out.code !== 0) {
+        if (page === 0 && /Could not resolve to a PullRequest/u.test(out.stderr)) {
+          return { pull: null, nodes };
+        }
+        return yield* new LensReadError({
+          message: `page ${page + 1} of #${number}'s ${key} could not be read: ${out.stderr.trim().slice(0, 300)}`,
+        });
+      }
+      const data: unknown = yield* decodeJson(out.stdout).pipe(
+        Effect.mapError(
+          () =>
+            new LensReadError({ message: `page ${page + 1} of #${number}'s ${key} gave no JSON` }),
+        ),
+      );
+      const repository: unknown =
+        isRecord(data) && isRecord(data.data) ? data.data.repository : null;
+      const pr: Record<string, unknown> | null =
         isRecord(repository) && isRecord(repository.pullRequest) ? repository.pullRequest : null;
-      if (pr === null) return { pull: null, nodes };
+      const conn: Record<string, unknown> | null =
+        pr !== null && isRecord(pr[key]) ? pr[key] : null;
+      if (pr === null || conn === null || !Array.isArray(conn.nodes)) {
+        return yield* new LensReadError({
+          message: `page ${page + 1} of #${number}'s ${key} is missing from GitHub's answer: not all read`,
+        });
+      }
       pull = pr;
-      const key = connection.split("(")[0]!;
-      const conn = isRecord(pr[key]) ? (pr[key] as Record<string, unknown>) : {};
-      for (const node of Array.isArray(conn.nodes) ? conn.nodes : []) {
+      for (const node of conn.nodes) {
         if (isRecord(node)) nodes.push(node);
       }
-      const info = isRecord(conn.pageInfo) ? conn.pageInfo : {};
-      if (info.hasNextPage !== true || typeof info.endCursor !== "string") break;
+      const info: Record<string, unknown> = isRecord(conn.pageInfo) ? conn.pageInfo : {};
+      if (info.hasNextPage !== true) break;
+      if (typeof info.endCursor !== "string") {
+        return yield* new LensReadError({
+          message: `#${number}'s ${key} has a next page GitHub gave no cursor for: not all read`,
+        });
+      }
       after = info.endCursor;
     }
     return { pull, nodes };
@@ -297,33 +327,33 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
         `comments(first:100,$AFTER){pageInfo{hasNextPage endCursor} nodes{createdAt ${POST_FIELDS}}}`,
       );
       if (comments.pull === null) return null;
+      // Reviews with their inline comments, as the gate reads them (pr_queue.review_flags, inline_post): a review or
+      // comment not submitted yet (PENDING: only its author sees it) is no post; a comment's time is when it was
+      // published.
       const reviews = yield* pages(
         cwd,
         repo,
         number,
-        `reviews(first:100,$AFTER){pageInfo{hasNextPage endCursor} nodes{submittedAt ${POST_FIELDS}}}`,
+        `reviews(first:100,$AFTER){pageInfo{hasNextPage endCursor} nodes{state submittedAt ${POST_FIELDS} comments(first:100){totalCount nodes{state createdAt publishedAt ${POST_FIELDS}}}}}`,
       );
-      const inline = yield* pages(
-        cwd,
-        repo,
-        number,
-        `reviewThreads(first:100,$AFTER){pageInfo{hasNextPage endCursor} nodes{comments(first:100){totalCount nodes{createdAt ${POST_FIELDS}}}}}`,
-      );
-      const inlinePosts: Array<{ when: string; post: RawPost }> = [];
-      for (const thread of inline.nodes) {
-        const conn = isRecord(thread.comments) ? thread.comments : {};
+      const reviewPosts: RawPost[] = [];
+      const inlinePosts: RawPost[] = [];
+      for (const review of reviews.nodes) {
+        if (review.state === "PENDING") continue;
+        reviewPosts.push(postOf(review, review.submittedAt));
+        const conn = isRecord(review.comments) ? review.comments : {};
         if (typeof conn.totalCount === "number" && conn.totalCount > 100) {
           return yield* new LensReadError({
-            message: `#${number} has a review thread of more than 100 comments: not all read`,
+            message: `#${number} has a review of more than 100 inline comments: not all read`,
           });
         }
         for (const node of Array.isArray(conn.nodes) ? conn.nodes : []) {
-          if (isRecord(node)) {
-            inlinePosts.push({
-              when: String(node.createdAt ?? ""),
-              post: postOf(node, node.createdAt),
-            });
-          }
+          if (!isRecord(node) || node.state === "PENDING") continue;
+          const published =
+            typeof node.publishedAt === "string" && node.publishedAt !== ""
+              ? node.publishedAt
+              : node.createdAt;
+          inlinePosts.push(postOf(node, published));
         }
       }
       const pr = comments.pull;
@@ -336,10 +366,8 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
         headBranch: String(pr.headRefName ?? ""),
         posts: [
           ...comments.nodes.map((node) => postOf(node, node.createdAt)),
-          ...reviews.nodes.map((node) => postOf(node, node.submittedAt)),
-          ...inlinePosts
-            .toSorted((a, b) => (a.when < b.when ? -1 : a.when > b.when ? 1 : 0))
-            .map((p) => p.post),
+          ...reviewPosts,
+          ...inlinePosts,
         ],
       } satisfies PullRead;
     });
@@ -369,7 +397,17 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
         "api",
         `repos/${repo}/compare/${encodeURIComponent(base)}...${head}`,
       ]);
-      const files = isRecord(data) && Array.isArray(data.files) ? data.files : [];
+      if (!isRecord(data) || !Array.isArray(data.files)) {
+        return yield* new LensReadError({
+          message: `GitHub's compare of ${base}...${head} lists no files: no lens is started rather than too few`,
+        });
+      }
+      const files: ReadonlyArray<unknown> = data.files;
+      if (files.some((file) => !isRecord(file) || typeof file.filename !== "string")) {
+        return yield* new LensReadError({
+          message: `GitHub's compare of ${base}...${head} lists a file without a name: no lens is started rather than too few`,
+        });
+      }
       if (files.length >= COMPARE_FILES_MAX) {
         return yield* new LensReadError({
           message: `the change lists ${files.length} files or more, the most GitHub's compare lists: lens_start cannot know it read every path, so no lens is started rather than too few`,
@@ -467,7 +505,7 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
 
   /**
    * The after-CI start, as the thread that registered the wait (the wake starts its run): `delegate_task` refuses a
-   * child while that thread has no run, so it is asked again for up to a minute, once per action.
+   * child while that thread has no run, so it is asked again for up to 40 s, once per action.
    */
   const startForWait = (wait: WaitRecord) => {
     /** Waited once for the thread's run: the next child does not wait again. */
@@ -483,7 +521,7 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
           } as StartAnswer;
         }
         let answer: StartAnswer = { type: "refused", code: "parent_not_active", message: "no run" };
-        const tries = waited ? 1 : 30;
+        const tries = waited ? 1 : PARENT_RUN_TRIES;
         waited = true;
         for (let attempt = 0; attempt < tries; attempt += 1) {
           const shell = yield* threads
@@ -539,7 +577,7 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
     ),
   };
 
-  return { worldFor, startInRequest, action, waitForCiAction: "lens_start" as const };
+  return { worldFor, startInRequest, startForWait, action, waitForCiAction: "lens_start" as const };
 });
 
 export type LensStartServer = Effect.Success<ReturnType<typeof makeLensStartServer>>;

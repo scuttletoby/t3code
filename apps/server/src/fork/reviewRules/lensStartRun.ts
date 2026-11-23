@@ -437,8 +437,13 @@ export const runLensStart = Effect.fn("lensStart.run")(function* (
     } satisfies LensStartResult;
   }
 
-  if (request.afterCi === true) {
-    const checks = ciChecksOf(config);
+  const checks = ciChecksOf(config);
+  if (request.afterCi === true && checks.length === 0) {
+    // The gate requires no check but its own: no CI to wait for, so the head is as ready as a green one.
+    notes.push(
+      `${rules.configPath} at ${pull.base} requires no check but ${config.headCheck}, so there is no CI to wait for: the lenses start now`,
+    );
+  } else if (request.afterCi === true) {
     if (world.waitForCi === undefined) {
       return {
         ...refusedResult(request.pr, head, [

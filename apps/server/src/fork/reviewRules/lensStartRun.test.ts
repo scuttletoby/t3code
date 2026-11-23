@@ -388,6 +388,21 @@ describe("lens_start afterCi", () => {
     }),
   );
 
+  it.effect(
+    "a config whose only required check is the gate's own: no CI to wait for, starts now",
+    () =>
+      Effect.gen(function* () {
+        const { w, started, waits } = world({
+          config: { ...CONFIG, required_checks: ["head_check"] },
+        });
+        const result = yield* runLensStart(w, { pr: 7, afterCi: true });
+        assert.deepStrictEqual(waits, []);
+        assert.strictEqual(result.state, "started");
+        assert.strictEqual(started.length, 1);
+        assert.isTrue(result.notes.some((note) => note.includes("no CI to wait for")));
+      }),
+  );
+
   it.effect("CI already green at the head: starts now", () =>
     Effect.gen(function* () {
       const { w, started } = world({

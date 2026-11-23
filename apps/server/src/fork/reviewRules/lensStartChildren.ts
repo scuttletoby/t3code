@@ -1,7 +1,7 @@
 /**
- * Fork: the lens children lens_start started, kept in `<stateDir>/lens-children.json` so a later call (or the
- * after-CI wait) passes them to the plan (lensStart.ts `children`): a long request id is a digest and cannot be read
- * back. Old or empty state: a missing or unreadable file is no children known (logged); the newest 500 are kept.
+ * Fork: lens_start's children in `<stateDir>/lens-children.json` (a long request id cannot be read back). A missing or
+ * unreadable file is none known; the newest 500 are kept. A failed write is only logged: the stable request id is the
+ * guard against a duplicate (delegate_task returns the task it started for that id).
  */
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import * as Effect from "effect/Effect";
