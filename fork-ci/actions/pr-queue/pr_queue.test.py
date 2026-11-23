@@ -889,6 +889,85 @@ class Main(Base):
         self.assertIn('another pr_queue run', out)
 
 
+def other_unicode(*unassigned):
+    """This Python as if its Unicode were another one, which assigns the code points `unassigned` and the rules'
+    Unicode (lens.PY_UNICODE) does not: a lens comment holding one of them is refused (lens.UnicodeDrift)."""
+    table = ([], [])
+    for a, b in zip(*lens.py_assigned()):
+        for cp in sorted(c for c in unassigned if a <= c <= b):
+            if a < cp:
+                table[0].append(a), table[1].append(cp - 1)
+            a = cp + 1
+        if a <= b:
+            table[0].append(a), table[1].append(b)
+    return unittest.mock.patch.multiple(lens, UNIDATA='99.0.0', _ASSIGNED=table)
+
+
+class ReviewOnAnotherUnicode(Base):
+    """Issue #1005 fix round: on a runner whose Python has another Unicode, a lens comment the rules would read
+    otherwise is refused (lens.UnicodeDrift). The queue never dies on it: it says so on that PR, once, and goes on."""
+    DRIFT = 'l\u0435ns: correctness \u00b7 reviewer: x \u00b7 read at: ' + 'c3' * 20 + '\nmajor: x'
+
+    def comments(self):
+        return [lens_at('correctness', self.c), note(self.DRIFT, '2026-11-07T11:00:00Z')]
+
+    def run_main(self, gh):
+        self.q.gh = self.q.gh_write = gh
+        with other_unicode(0x435):
+            return run_quiet(self.q.main)
+
+    def assertTold(self, comment, *said):
+        for s in said:
+            self.assertIn(s, comment)
+        self.assertNotRegex(comment, r'(?i)read at\s*:', 'a queue comment must never count as a lens read')
+        self.assertIsNone(REVIEW.lens_problem(note(comment, 't')))
+
+    def test_an_armed_pr_is_told_once_and_passed_over_and_the_queue_goes_on(self):
+        f = self.fake(comments=self.comments())
+        listed = [dict(Main.listed(), headRefOid=self.c), Main.listed(8, 'CLEAN')]
+        code, out = self.run_main(Main.listing(f, listed))
+        self.assertEqual((code, f.order()[:2], f.armed, f.updated), (0, ['list', 'comment'], self.c, False), out)
+        self.assertFalse({'disarm', 'update', 'arm'} & set(f.order()), 'PR 7 stays armed as it was')
+        self.assertIn('skip #7: its review cannot be read on this runner', out)
+        self.assertIn('U+0435', out)
+        self.assertIn('#8 is up to date', out, 'the queue went on to the next PR')
+        self.assertEqual(len(f.comments), 1, f.comments)
+        self.assertTold(f.comments[0], f'pr_queue: its lens comments cannot be read on this runner on {self.c[:12]},',
+                        'U+0435', f'Unicode {lens.PY_UNICODE}')
+        self.assertFalse(self.plan_exists(), 'nothing changed: no plan')
+        f.on_pr.append(dict(note(f.comments[0], '2026-11-07T12:00:00Z'), viewerDidAuthor=True))
+        code, out = self.run_main(Main.listing(f, listed))
+        self.assertEqual((code, len(f.comments)), (0, 1), 'told once per head')
+
+    def test_a_dry_run_says_it_and_writes_nothing(self):
+        f = self.fake(comments=self.comments())
+        self.q.gh = self.q.gh_write = Main.listing(f, [dict(Main.listed(), headRefOid=self.c)])
+        with other_unicode(0x435):
+            code, out = run_quiet(self.q.main, True)
+        self.assertEqual((code, f.order(), f.comments), (0, ['list'], []), out)
+        self.assertIn('skip #7: its review cannot be read on this runner', out)
+
+    def test_a_pr_a_stopped_run_left_off_is_left_off_with_one_comment(self):
+        f = self.fake(armed=False, comments=self.comments())
+        self.q.write_state({'repo': REPO, 'pr': 7, 'old': self.c, 'base': 'main', 'read': self.c})
+        code, out = self.run_main(Main.listing(f, []))
+        self.assertEqual((code, f.armed), (0, None), out)
+        self.assertIn('#7: its review cannot be read on this runner', out)
+        self.assertIn('queue empty', out, 'the queue went on')
+        self.assertEqual(len(f.comments), 1, f.comments)
+        self.assertTold(f.comments[0], 'pr_queue turned auto-merge OFF', 'U+0435', 'was not re-armed')
+        self.assertFalse(self.plan_exists(), 'said on the PR: nothing left to finish')
+
+    def test_a_reason_the_queue_cannot_clean_is_left_out_of_its_comment(self):
+        f = self.fake()
+        self.q.gh = self.q.gh_write = f
+        with other_unicode(0x435):
+            code, out = run_quiet(self.q.leave_off, 7, 'gh said: \u0435rror', 'Run `tool ready 7`.')
+        self.assertEqual((code, len(f.comments)), (0, 1), out)
+        self.assertTold(f.comments[0], 'text left out', 'U+0435', '`tool ready 7`')
+        self.assertNotIn('\u0435', f.comments[0])
+
+
 class ReviewedHead(unittest.TestCase):   # which head the queue keeps
     def test_one_sha_for_every_lens(self):
         pr = {'headRefOid': H2, 'commits': [{'oid': H1}, {'oid': H2}],
