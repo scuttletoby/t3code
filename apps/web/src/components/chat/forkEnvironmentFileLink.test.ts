@@ -1,5 +1,10 @@
 // Fork: file links that name the environment holding the file.
-import { AssetWorkspaceAssetNotFoundError, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import {
+  AssetWorkspaceAssetNotFoundError,
+  ENVIRONMENT_FILE_LINK_THREAD_ID,
+  EnvironmentId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
@@ -22,6 +27,7 @@ const readers = (
   httpBaseUrl: (id) => (id === THERE ? "https://there.example:3773/" : null),
   canReadFiles: () => true,
   label: (id) => (id === THERE ? "Build box" : null),
+  reconnecting: () => false,
   ...overrides,
 });
 
@@ -42,9 +48,31 @@ describe("environmentFileAccess", () => {
       unavailable:
         "This file is on Build box, which this device is not connected to. Connect to Build box in Settings > Connections, then try again.",
     });
-    expect(environmentFileAccess(EnvironmentId.make("env-unknown"), readers())).toEqual({
+  });
+
+  it("never shows the id from the link for an environment this device does not know", () => {
+    const crafted = EnvironmentId.make("Your-bank-says-call-0800");
+    const access = environmentFileAccess(crafted, readers());
+    expect(access).toEqual({
       unavailable:
-        "This file is on env-unknown, which this device is not connected to. Connect to env-unknown in Settings > Connections, then try again.",
+        "This file is on an environment this device does not know. Add it in Settings > Connections, then try again.",
+    });
+    expect(JSON.stringify(access)).not.toContain("0800");
+  });
+
+  it("says to try again while it reconnects, not to connect or that it may not read", () => {
+    const reconnecting = { reconnecting: () => true };
+    const message = {
+      unavailable: "This device is reconnecting to Build box. Try again in a moment.",
+    };
+    expect(
+      environmentFileAccess(THERE, readers({ ...reconnecting, httpBaseUrl: () => null })),
+    ).toEqual(message);
+    expect(
+      environmentFileAccess(THERE, readers({ ...reconnecting, canReadFiles: () => false })),
+    ).toEqual(message);
+    expect(environmentFileAccess(THERE, readers(reconnecting))).toEqual({
+      httpBaseUrl: "https://there.example:3773/",
     });
   });
 
@@ -77,7 +105,7 @@ describe("environmentFileDownloadUrl", () => {
       input: {
         resource: {
           _tag: "media-file",
-          threadId: ThreadId.make("environment-file-link"),
+          threadId: ENVIRONMENT_FILE_LINK_THREAD_ID,
           path: "/home/a/app.log",
           disposition: "attachment",
         },
@@ -89,6 +117,21 @@ describe("environmentFileDownloadUrl", () => {
     const createAssetUrl = vi.fn<CreateAssetUrl>();
     await expect(download(createAssetUrl, { httpBaseUrl: () => null })).rejects.toThrow(
       "This file is on Build box, which this device is not connected to.",
+    );
+    expect(createAssetUrl).not.toHaveBeenCalled();
+  });
+
+  it("refuses a home-folder path by name and asks nothing", async () => {
+    const createAssetUrl = vi.fn<CreateAssetUrl>();
+    await expect(
+      environmentFileDownloadUrl({
+        environmentId: THERE,
+        path: "~/notes.txt",
+        readers: readers(),
+        createAssetUrl,
+      }),
+    ).rejects.toThrow(
+      "A link to a file on Build box needs the file's absolute path; ~/notes.txt starts at a home folder.",
     );
     expect(createAssetUrl).not.toHaveBeenCalled();
   });
@@ -133,6 +176,7 @@ describe("environmentFileLinkProps", () => {
     const props = environmentFileLinkProps(meta, linkDeps)!;
     expect(props).toMatchObject({
       environmentId: null,
+      label: "app.log on Build box",
       href: "/srv/app.log",
       targetPath: "/srv/app.log",
       panelPath: null,
@@ -152,9 +196,15 @@ describe("environmentFileLinkProps", () => {
     expect(await props.resolveDragPath()).toBe("/srv/app.log");
   });
 
-  it("reports a failure through the link's own open result", async () => {
+  it("reports a failure through the link's own open result, naming no unknown id", async () => {
     const meta = resolveMarkdownFileLinkMeta("/t3-environment/env-gone/srv/app.log")!;
-    const result = await environmentFileLinkProps(meta, deps())!.onOpen();
-    expect(result._tag).toBe("Failure");
+    const props = environmentFileLinkProps(meta, deps())!;
+    expect(props.label).toBe("app.log on unknown environment");
+    const result = await props.onOpen();
+    if (result._tag !== "Failure") throw new Error("Expected the open to fail");
+    const error = Cause.squash(result.cause);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("does not know");
+    expect((error as Error).message).not.toContain("env-gone");
   });
 });

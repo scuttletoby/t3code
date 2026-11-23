@@ -2,6 +2,7 @@
 // devices, a file downloads to the viewing device, a file on another machine opens in the viewing
 // device's editor over SSH, and a link naming an environment downloads from it.
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own messages are English only; upstream's translation catalogs hold no fork keys. */
+import { useAtomValue } from "@effect/atom-react";
 import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import {
   squashAtomCommandFailure,
@@ -37,8 +38,13 @@ import {
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { assetEnvironment } from "../../state/assets";
 import { readEnvironment } from "../../state/environments";
+import { environmentPresentations } from "../../state/presentation";
 import { hostEnvironmentIdAtom } from "../../state/primaryEnvironment";
-import { readEnvironmentScope, readPreparedConnection } from "../../state/session";
+import {
+  environmentSession,
+  readEnvironmentScope,
+  readPreparedConnection,
+} from "../../state/session";
 import { useAtomQueryRunner } from "../../state/use-atom-query-runner";
 import { downloadFile } from "../media/mediaContent";
 import { stackedThreadToast, toastManager } from "../ui/toast";
@@ -204,11 +210,27 @@ export function forkDownloadMarkdownFile(
   });
 }
 
-const environmentFileReaders: EnvironmentFileAccessReaders = {
+const environmentFileReaders: Omit<EnvironmentFileAccessReaders, "label"> = {
   httpBaseUrl: (id) => readPreparedConnection(id)?.httpBaseUrl ?? null,
   canReadFiles: (id) => readEnvironmentScope(id, AuthFilesystemReadScope),
-  label: (id) => readEnvironment(id)?.entry.target.label ?? null,
+  reconnecting: (id) => {
+    const phase = readEnvironment(id)?.connection.phase;
+    if (phase === "connecting" || phase === "reconnecting") return true;
+    // Connected, but its session (and so its scopes) is not read yet.
+    const session = appAtomRegistry.get(environmentSession.sessionStateAtom(id));
+    return phase === "connected" && (AsyncResult.isInitial(session) || session.waiting);
+  },
 };
+
+/** Saved environment names as one string, so the chat re-renders only when a name changes. */
+function environmentNamesKey(
+  presentations: ReadonlyMap<
+    EnvironmentId,
+    { readonly entry: { readonly target: { readonly label: string } } }
+  >,
+): string {
+  return JSON.stringify([...presentations].map(([id, { entry }]) => [id, entry.target.label]));
+}
 
 /**
  * The props a file link takes after upstream's own: a link naming an environment downloads from
@@ -225,6 +247,12 @@ export function useForkMarkdownFileRemoteEditor(
     reportFailure: false,
     refresh: true,
   });
+  const namesKey = useAtomValue(environmentPresentations.presentationsAtom, environmentNamesKey);
+  const names = new Map<string, string>(JSON.parse(namesKey) as Array<[string, string]>);
+  const readers: EnvironmentFileAccessReaders = {
+    ...environmentFileReaders,
+    label: (id) => names.get(id) ?? null,
+  };
   const remoteEditor =
     remoteOpenState.mode === "remote-links" && editor !== null
       ? { editor, host: remoteOpenState.host }
@@ -260,7 +288,7 @@ export function useForkMarkdownFileRemoteEditor(
       resolveAbsolutePath: () => Promise<string>;
     }) =>
       environmentFileLinkProps(input.fileLinkMeta, {
-        readers: environmentFileReaders,
+        readers,
         createAssetUrl,
         downloadFile,
       }) ??

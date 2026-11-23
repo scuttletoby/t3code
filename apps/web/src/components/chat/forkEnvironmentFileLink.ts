@@ -7,8 +7,9 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import {
   AssetWorkspaceAssetNotFoundError,
+  ENVIRONMENT_FILE_LINK_THREAD_ID,
+  isAbsoluteEnvironmentFilePath,
   parseEnvironmentFileLinkPath,
-  ThreadId,
   type AssetCreateUrlResult,
   type AssetResource,
   type EnvironmentId,
@@ -22,20 +23,25 @@ import { markdownFileCopyPaths } from "../../markdownFileHostPath";
 
 const isAssetNotFoundError = Schema.is(AssetWorkspaceAssetNotFoundError);
 
-/**
- * `assets.createUrl` needs a thread id, but for an absolute path the server serves the file
- * without looking the thread up, so the file's environment need not have the message's thread.
- */
-const FILE_LINK_THREAD_ID = ThreadId.make("environment-file-link");
-
 export const DOWNLOAD_LABEL = "Download to this device";
+const UNKNOWN_ENVIRONMENT = "unknown environment";
 
 export interface EnvironmentFileAccessReaders {
   /** This client's prepared connection to the environment, if it has one. */
   readonly httpBaseUrl: (environmentId: EnvironmentId) => string | null;
   readonly canReadFiles: (environmentId: EnvironmentId) => boolean;
-  /** The environment's saved name on this client. */
+  /** The environment's saved name on this client, or null when this client does not know it. */
   readonly label: (environmentId: EnvironmentId) => string | null;
+  /** Whether this client is (re)connecting to it, so a missing connection or scope may pass. */
+  readonly reconnecting: (environmentId: EnvironmentId) => boolean;
+}
+
+/** The name to show for an environment; a link's id is never shown, as the link may be crafted. */
+function environmentFileLinkName(
+  environmentId: EnvironmentId,
+  readers: Pick<EnvironmentFileAccessReaders, "label">,
+): string {
+  return readers.label(environmentId) ?? UNKNOWN_ENVIRONMENT;
 }
 
 /** The environment's connection base URL, or a message that names it and says what is missing. */
@@ -43,17 +49,24 @@ export function environmentFileAccess(
   environmentId: EnvironmentId,
   readers: EnvironmentFileAccessReaders,
 ): { readonly httpBaseUrl: string } | { readonly unavailable: string } {
-  const name = readers.label(environmentId) ?? environmentId;
   const httpBaseUrl = readers.httpBaseUrl(environmentId);
-  if (httpBaseUrl === null) {
+  if (httpBaseUrl !== null && readers.canReadFiles(environmentId)) return { httpBaseUrl };
+  const label = readers.label(environmentId);
+  if (label === null) {
     return {
-      unavailable: `This file is on ${name}, which this device is not connected to. Connect to ${name} in Settings > Connections, then try again.`,
+      unavailable:
+        "This file is on an environment this device does not know. Add it in Settings > Connections, then try again.",
     };
   }
-  if (!readers.canReadFiles(environmentId)) {
-    return { unavailable: `This device may not read files on ${name}.` };
+  if (readers.reconnecting(environmentId)) {
+    return { unavailable: `This device is reconnecting to ${label}. Try again in a moment.` };
   }
-  return { httpBaseUrl };
+  if (httpBaseUrl === null) {
+    return {
+      unavailable: `This file is on ${label}, which this device is not connected to. Connect to ${label} in Settings > Connections, then try again.`,
+    };
+  }
+  return { unavailable: `This device may not read files on ${label}.` };
 }
 
 export type CreateAssetUrl = (input: {
@@ -69,6 +82,12 @@ export async function environmentFileDownloadUrl(input: {
   readonly createAssetUrl: CreateAssetUrl;
 }): Promise<string> {
   const { environmentId, path, readers } = input;
+  const name = environmentFileLinkName(environmentId, readers);
+  if (!isAbsoluteEnvironmentFilePath(path)) {
+    throw new Error(
+      `A link to a file on ${name} needs the file's absolute path; ${path} starts at a home folder.`,
+    );
+  }
   const access = environmentFileAccess(environmentId, readers);
   if ("unavailable" in access) throw new Error(access.unavailable);
   const result = await input.createAssetUrl({
@@ -76,7 +95,7 @@ export async function environmentFileDownloadUrl(input: {
     input: {
       resource: {
         _tag: "media-file",
-        threadId: FILE_LINK_THREAD_ID,
+        threadId: ENVIRONMENT_FILE_LINK_THREAD_ID,
         path,
         disposition: "attachment",
       },
@@ -85,9 +104,7 @@ export async function environmentFileDownloadUrl(input: {
   if (result._tag === "Failure") {
     const cause = squashAtomCommandFailure(result);
     if (isAssetNotFoundError(cause)) {
-      throw new Error(
-        `The file was not found on ${readers.label(environmentId) ?? environmentId} at ${cause.checkedPath ?? path}.`,
-      );
+      throw new Error(`The file was not found on ${name} at ${cause.checkedPath ?? path}.`);
     }
     throw cause instanceof Error ? cause : new Error("An error occurred.");
   }
@@ -112,8 +129,11 @@ export function environmentFileLinkProps(
   const link = parseEnvironmentFileLinkPath(fileLinkMeta.filePath);
   if (link === null) return null;
   const { environmentId, path } = link;
+  const name = environmentFileLinkName(environmentId, deps.readers);
   return {
     environmentId: null,
+    // The chip names the environment, so a file elsewhere does not look local.
+    label: `${fileLinkMeta.basename} on ${name}`,
     href: path,
     targetPath: path,
     iconPath: path,
