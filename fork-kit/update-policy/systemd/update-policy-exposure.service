@@ -1,0 +1,29 @@
+# update-policy kit: written by update-policy-install. Do not edit: run the installer again.
+[Unit]
+Description=update-policy exposure: installed packages against KEV, distro security data and EPSS (fork-kit/update-policy)
+ConditionPathExists=/usr/local/libexec/update-policy/current/bin/update-policy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# the check needs no privilege: a user made for the run, its own cache folder, nothing else writable
+DynamicUser=yes
+CacheDirectory=update-policy-exposure
+CacheDirectoryMode=0750
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/update-policy/current/bin/update-policy exposure --cache /var/cache/update-policy-exposure
+# as root ("+"), after the check whatever it found: the alert command may read a root-only file
+ExecStopPost=+/usr/bin/python3 -I -B /usr/local/libexec/update-policy/current/bin/update-policy exposure-alert --cache /var/cache/update-policy-exposure
+# findings are exit 1: the unit shows as failed until they are gone (systemctl --failed)
+Nice=10
+TimeoutStartSec=30min
+# with only the running kernel's entries kept, a real feed peaks near 265 MB (noble) and 375 MB (jammy); a broken
+# or hostile one is stopped by the check's own caps, and by these
+MemoryHigh=768M
+MemoryMax=1G
+CPUWeight=20
+IOWeight=20
