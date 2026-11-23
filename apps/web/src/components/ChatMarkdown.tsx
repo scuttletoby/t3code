@@ -233,6 +233,7 @@ import { MarkdownExternalLinkContent } from "./chat/MarkdownExternalLink";
 import { MarkdownFileLink } from "./chat/MarkdownFileLink";
 import { canUseMarkdownFileShellActions } from "./chat/MarkdownFileLink.logic";
 import { useForkMarkdownFileRemoteEditor } from "./chat/forkMarkdownFileLinkActions"; // Fork
+import { forkMarkdownDownloadError } from "./chat/forkMarkdownFileDownload"; // Fork
 import { rehypeChipPunctuation } from "./chat/markdownChipPunctuation";
 import { handleMarkdownFragmentClick, rehypeHeadingIds } from "./chat/markdownFragments";
 import { rehypeTextDirection } from "./chat/markdownTextDirection";
@@ -905,7 +906,23 @@ function useChatMarkdownState({
       environmentId: fileEnvironmentId,
       input: { resource: { _tag: "media-file", threadId, path, disposition: "attachment" } },
     });
-    if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+    if (result._tag === "Failure") {
+      // A missing file names the machine and path, as the media preview's message does.
+      const target = readPreparedConnection(fileEnvironmentId)?.target ?? null;
+      const isRemote =
+        target !== null &&
+        resolveRemoteOpenState({
+          target,
+          sshTarget: null,
+          remoteOpenTargets: undefined,
+          isDesktopRenderer: window.desktopBridge !== undefined,
+          hostEnvironmentId: appAtomRegistry.get(hostEnvironmentIdAtom),
+        }).mode !== "local-exec";
+      throw forkMarkdownDownloadError(squashAtomCommandFailure(result), {
+        requestedPath: path,
+        machine: isRemote ? target.label : null,
+      });
+    }
     const connection = readPreparedConnection(fileEnvironmentId);
     const url = connection && resolveAssetUrl(connection.httpBaseUrl, result.value.relativeUrl);
     if (!url) throw new Error("Reconnect to the environment and try again.");
