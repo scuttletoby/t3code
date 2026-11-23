@@ -19,8 +19,8 @@ For each project in the config (or the one `--project` names):
 2. **Window** (only with `--timer`, which the timer passes): see [Window](#window).
 3. **Checks**, one after another, each with its own timeout. A check that fails in any way becomes exactly one
    finding and the next check still runs (see [Checks](#checks)).
-4. **Judgment** (optional): with a `model` configured, the findings go to a local model; see
-   [Judgment](#judgment).
+4. **Judgment** (optional): with a `model` configured, the findings go to a model (a local one, by design) for a
+   draft opinion; see [Judgment](#judgment).
 5. **Report**: the full report is saved as `report.md` and the issue's part as `issue.md` in the state folder.
    Then the done marker. Then the report issue is written (see [Report issue](#report-issue)); if that fails, only
    the issue is tried again on later ticks, at most 3 times a day; the checks and the model do not run again.
@@ -102,9 +102,15 @@ A check is any executable. It gets one JSON object on stdin:
   "options": {},
   "fix": false,
   "today": "2026-11-23",
-  "gh": "gh"
+  "gh": "gh",
+  "cacheDir": "/srv/example/state/example/cache/docs",
+  "dryRun": false
 }
 ```
+
+`cacheDir` is this check's own folder in the project's private state folder, kept between runs (the check makes it
+when it needs it); in a dry run (`dryRun` true) a check writes nothing there. Both came later in version 1: read
+them with `.get()`.
 
 It runs in the project root, in a process group of its own. It prints one finding per line on stdout and nothing
 else (notes go to stderr), and exits 0:
@@ -114,7 +120,7 @@ else (notes go to stderr), and exits 0:
 ```
 
 `id`, `severity` (`error`, `warn` or `info`) and `text` are required; `where` (a path relative to the root, or
-`OWNER/REPO: path`, ...) and `fix` (what a person does about it) are optional. Nothing else. An `id` is a letter or
+`OWNER/REPO: path`, `#N` for a pull request or issue of the project's repository, ...) and `fix` (what a person does about it) are optional. Nothing else. An `id` is a letter or
 digit, then up to 99 letters, digits, `.`, `_` or `-`. Python checks can use `gardener.contract.read_context()`
 and `emit()`.
 
@@ -151,6 +157,33 @@ All report only, and none needs root. Options as in each script's header.
 - **install-drift**: each fork kit's install record (`/etc/<kit>/installed.tsv`) against the files and links on
   the machine, as the user that runs it (paths it cannot read are one note, not drift). With `release` (a commit),
   kits on another release.
+- **review-tiers**: merged pull requests (last `days`, 7) of the project's own repository (`repo`; there is no
+  option for another one) that had less review than their tier asks for. Without options it judges by the merge
+  gate's own `review` block in the queue config (`queueConfig`, default `.github/pr-queue.json`, read from git at
+  `base`); with `tiers` by the project's tiers: `rules` (globs to a tier), a `registry` file in the repository (rows
+  of paths with a tier, for example a list of modules), `unmatched`, and per tier `requires` {`minLenses`,
+  `lenses`: [{`name`, `match` (a regex on lens names), `count`}]}.
+  Lens comments are read by the gate's own code (`fork-ci/actions/pr-queue`, copied into the install as `gate/`),
+  so a comment counts exactly when the gate would take it as a lens, and only those posted by the queue config's
+  lens authors; a valid override comment before the merge settles a pull request, and so does a comment of a
+  counted author whose first line starts with one of `waivers` (a person decided, at any time; anyone the queue
+  counts for lenses can waive, the pull request's own author too). `exemptLabels`, `exemptAuthors`. Inline review
+  comments are not read; a pull request with more than 100 files is judged at the top tier (with the gate's
+  `review` block: as critical).
+  Findings: `review-tiers.skipped` (warn) no lens at all before the merge; `review-tiers.short` lenses before the
+  merge, but not the ones its tier asks for (warn at the top tier or critical, else info); `review-tiers.late`
+  (info) the lenses before and after the merge together are enough: reviewing a pull request after its merge
+  clears the warning and leaves this note.
+  GitHub: `gh api rate_limit` (free) and one paged GraphQL search per run (`maxPages`, 8; give the check about 10
+  seconds a page in its `timeoutSeconds`); below `minRemaining` (1000) points left this hour it does not search and
+  judges from its cache. The cache (in `cacheDir`) keeps per pull request only what the verdict needs (paths, lens
+  names, no comment text), so the next run searches only pull requests updated since the day before: a page or two.
+  A search cut off half-way (`maxPages`, the budget) is a `review-tiers.partial` warning; the cache keeps where it
+  stopped, and the next runs go on from there (older pull requests first) until every pull request in the window was
+  read, then search from the new day. A GitHub error fails the check and writes nothing; a page GitHub cannot answer
+  is asked again once with fewer pull requests. An old, broken or other-repository cache, or one written by other
+  gate code (a kit upgrade), is read as empty, a broken resume point is dropped, and a newer cache is never
+  overwritten. Its findings name the pull request (`#N`). Never fixes: a review is done by people.
 
 ## Report issue
 
@@ -159,9 +192,11 @@ issue is built from an allow-list and the full report stays on the machine (`rep
 issue says so):
 
 - Per finding: its severity, check, id, and its `where` only when that is a path inside the project's repository
-  (relative) or `OWNER/REPO: path`; its text and fix with what still looks like a local name (a path, also a
-  Windows drive or `\\server` path, URL, IPv4 or IPv6 address, e-mail or `user@host`, a home folder encoded in a
-  folder name) masked. The project root and home folder are replaced only as whole folders (`/srv/app` is not
+  (relative), `OWNER/REPO: path`, or a pull request or issue of the project's repository (`#N`, written
+  `OWNER/REPO#N` when the report goes to another repository); its text and fix with what still looks like a local
+  name (a path, also a Windows drive or `\\server` path, URL, IPv4 or IPv6 address, e-mail or `user@host`, a home
+  folder encoded in a folder name) or a well-known token shape (`ghp_`, `github_pat_`, `sk-`, `xoxb-`, `AKIA`, a
+  private key block) masked. The project root and home folder are replaced only as whole folders (`/srv/app` is not
   part of `/srv/app2`).
 - The text and fix of a project's own check (`path`) are shown only with `"publicText": true`; otherwise the
   issue shows its id, count and `where`, and the text stays in the local report. General checks are shown.
@@ -173,7 +208,7 @@ issue says so):
 - A failed check shows its id and why in fixed words (`exited with code 1`); what it printed on stderr goes to the
   local report only.
 - Notes are the gardener's own words; the model's endpoint is never shown (`model reachable` or `unreachable`).
-- The judgment is masked like the rest.
+- The judgment (a model draft) is masked like the rest.
 
 A check must still not print secrets. Check authors: with `publicText`, everything your check prints in `text`
 and `fix` (host names, user names, paths not masked above) may be published in the issue.
@@ -201,13 +236,19 @@ run. There are no retries inside a run.
 
 ## Judgment
 
-Optional, and phase 1 is the interface only. With `model` set, the findings as the issue shows them (nothing from
+Optional. With `model` set, the findings as the issue shows them (nothing from
 outside the repository) and a few of the files they name (`maxFiles`, each cut to `maxFileBytes`, only files git
 tracks in the root: never an ignored or untracked file such as a local `.env`) go to the endpoint's OpenAI-style
-`/chat/completions` in one request. The answer goes into the report under "Judgment", masked like the rest of the
-issue. An endpoint that is not reachable, or answers with an error, nonsense or not HTTP at all, is a note
-(`model unreachable`) and the run goes on. The endpoint is never shown. There is no fallback to a paid model, and
-the model never sees the whole repository.
+`/chat/completions` in one request. The answer goes into the report under "Judgment (model draft)" with a line
+that nobody checked it; it passes the same filter as check text (masked; left out when the issue shows counts
+only). An endpoint that is not reachable, takes longer than `timeoutSeconds` in all (connecting and reading the
+whole answer, so a server that trickles bytes is cut off too), or answers with an error, nonsense or not HTTP at
+all, is a note (`model unreachable`) and the run goes on. The endpoint is never shown, and the model never sees
+the whole repository.
+
+There is **no fallback to a paid model**, on purpose: the projects this was made for allow only their chosen large
+paid models for agent work, and a cheap paid model is the wrong trade, while a local model costs nothing. A project
+that does want a paid model can point `endpoint` at an OpenAI-compatible gateway itself.
 
 ## State: runs again, stops half-way, old or empty state
 
@@ -267,6 +308,8 @@ copy of the code and shows its test then fails.
 
 ## General vs project
 
-General (this kit): the runner, the check contract, the report issue, the state, the general checks and the timer.
-Project (the machine file only): which projects, their repositories and folders, their schedule, their budgets and
-their own checks, given by path. The kit never names a project or a project's check.
+General (this kit): the runner, the check contract, the report issue, the state, the general checks (review-tiers
+too: tiers and how a review is shown come from options, the lens rules from the merge gate) and the timer.
+Project (the machine file only): which projects, their repositories and folders, their schedule, their budgets,
+their review tiers and waiver words, and their own checks, given by path. The kit never names a project or a
+project's check.

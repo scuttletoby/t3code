@@ -8,6 +8,7 @@ from unittest import mock
 
 FORK_KIT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 COMMON = os.path.join(FORK_KIT, 'common')
+GATE = os.path.join(os.path.dirname(FORK_KIT), 'fork-ci', 'actions', 'pr-queue')
 ENGINE = os.path.join(COMMON, 'kit_install.py')
 BOOTSTRAP = os.path.join(COMMON, 'bootstrap.sh')
 SHA1, SHA2 = 'a' * 40, 'b' * 40
@@ -179,10 +180,13 @@ class FakeHost(unittest.TestCase):
                              stop_after=stop_after)
 
     def copy_kit(self):
-        """A source folder of the kit (and its common/ beside it) the test may change."""
-        src = os.path.join(self.root, 'src')
-        shutil.copytree(self.KIT_DIR, src, ignore=shutil.ignore_patterns('__pycache__'))
-        shutil.copytree(COMMON, os.path.join(self.root, 'common'), ignore=shutil.ignore_patterns('__pycache__'))
+        """A source folder of the kit the test may change, laid out as in the fork: its common/ beside it, and the
+        fork's other folders a kit reads from at install (fork-ci/actions/pr-queue: the gardener's gate/) two up."""
+        src = os.path.join(self.root, 'fork-kit', 'src')
+        ignore = shutil.ignore_patterns('__pycache__')
+        shutil.copytree(self.KIT_DIR, src, ignore=ignore)
+        shutil.copytree(COMMON, os.path.join(self.root, 'fork-kit', 'common'), ignore=ignore)
+        shutil.copytree(GATE, os.path.join(self.root, 'fork-ci', 'actions', 'pr-queue'), ignore=ignore)
         return src
 
     @staticmethod
