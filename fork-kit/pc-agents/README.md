@@ -37,8 +37,8 @@ and its `platform` wall fails when that is not the machine file's `platform`) pl
   running any of it; it installs again a runtime an older setup left otherwise;
 - no Windows drive is mounted (WSL2);
 - GPU access is what the machine file's `gpu` says (`check` names it, on or off), T3's unit says the same, and the
-  running T3 sees no GPU device node the setting does not give; on a plain box with `gpu` on, NVIDIA's driver is
-  loaded (see "GPU access");
+  running T3 sees no GPU device node the setting does not give; on a plain box with `gpu` on and no NVIDIA driver
+  loaded, `check` only notes it (T3 still runs; see "GPU access");
 - the loaded firewall table is the one from the kit's `firewall.nft`: `pc-agents load-firewall` saves the file's hash
   and what the kernel then lists, and any later change, or an older file left loaded, differs;
 - the default gateway (the Windows host, or a plain box's router) is in a blocked range, and no `allow` or `peers` entry lets it through;
@@ -344,13 +344,16 @@ unit is byte for byte the one from before the setting reached plain boxes:
 The list is fixed (the first 16 cards), not read from `/dev` when setup runs: the driver makes some nodes only on
 first use, and a unit that changed with them would fail its file wall each time one appears. So a node made later
 (a driver installed after setup, `nvidia-uvm` on first use) needs no setup run, only a T3 start after it is there.
-`check` with `gpu` on names the nodes the box has and fails when no NVIDIA driver is loaded or it has not made its
-nodes (no `/dev/nvidiactl` or no `/dev/nvidia0`): install the driver (`ubuntu-drivers install` on Ubuntu) and
-reboot, then run setup again; or set `"gpu": false`. T3's own start runs the same check, so the nodes must be there
-at boot (a headless box's driver makes them only on first use): enable `nvidia-persistenced`, which makes them then;
-a start before they are there is tried again every 30 seconds, five times. With the driver loaded, `check` notes a
-missing `/dev/nvidia-uvm` (CUDA needs it; the driver makes it on first use, so load it at boot: `nvidia-persistenced`,
-or a root `nvidia-modprobe -u -c=0` at boot, then restart T3), a node T3 started before, and cards past the 16th. As on WSL2, the nodes are a direct line into the GPU's kernel driver: with `gpu`
+`check` with `gpu` on names the nodes the box has. When no NVIDIA driver is loaded or it has not made its nodes (no
+`/dev/nvidiactl` or no `/dev/nvidia0`; say a reboot after a kernel update the driver failed to rebuild for), that is
+a note, not a failure: T3's start, setup and the automatic update go on, and only GPU jobs fail. The note names both
+ways out: install the driver (`ubuntu-drivers install` on Ubuntu) and reboot, or set `"gpu": false` and run setup.
+A headless box's driver makes its nodes only on first use, so enable `nvidia-persistenced`, which makes them at
+boot, before T3 starts; nodes made after T3 started are only a note too (`check` names a node T3 started before:
+restart T3 to give it to the agent). With the driver loaded, `check` also notes a missing `/dev/nvidia-uvm` (CUDA
+needs it; load it at boot: `nvidia-persistenced`, or a root `nvidia-modprobe -u -c=0` at boot, then restart T3) and
+cards past the 16th. What still fails: a running T3 that sees a node the setting does not give, and unit lines that
+differ from the setting. As on WSL2, the nodes are a direct line into the GPU's kernel driver: with `gpu`
 on, a bug in NVIDIA's driver is reachable from the sandbox. To see it work: run `nvidia-smi` as the agent, the way
 "Plain Linux box" below runs `claude` (as root, through the kit's `as-agent`).
 
@@ -384,7 +387,7 @@ the box as it is. Same kit, same files and walls, but for these:
 | other homes read-only (`ProtectHome=read-only`)                                | other homes are not there at all (`ProtectHome=tmpfs`, only `/home/agent` bound in)                                                                                                                                                                                                                |
 | the kit writes `/etc/resolv.conf` with `nameservers`                           | the box's `/etc/resolv.conf` stays yours; T3's unit sees the kit's `/etc/pc-agents/resolv.conf` (the same `nameservers`) in its place, since the box's own stub (`127.0.0.53`) is on the agent's blocked localhost                                                                                 |
 | hidden: `/mnt`, `/run/WSL`, `/usr/lib/wsl`, `/tmp/.X11-unix`, `/run/tailscale` | hidden: `/mnt`, `/media`, `/run/media` (your drives), `/tmp/.X11-unix`, `/run/tailscale`, `/run/docker.sock`, `/run/containerd`                                                                                                                                                                    |
-| `gpu`: `/dev/dxg` and WSL's GPU folders                                        | `gpu`: NVIDIA's device nodes (see "GPU access"); with it on, `check` fails while no NVIDIA driver is loaded                                                                                                                                                                                        |
+| `gpu`: `/dev/dxg` and WSL's GPU folders                                        | `gpu`: NVIDIA's device nodes (see "GPU access"); with it on and no NVIDIA driver loaded, `check` only notes it                                                                                                                                                                                     |
 | the gateway wall: the Windows host                                             | the gateway wall: the router                                                                                                                                                                                                                                                                       |
 
 **Sudo helpers.** A sudo rule for the agent fails the `sudoers` wall, on both kinds, but for one exact form: the
@@ -454,8 +457,9 @@ the fleet's other kits: remove its `pc-agents` section, or the file if nothing e
   setting) stays exactly as it is, and so does writing `"gpu": false`. The unit is written whole, so a stop half-way
   leaves the old unit or the new one, never a mix (and the `restart` wall stops a T3 that still runs under the old).
   On a plain box the same holds; the unit lists NVIDIA's nodes without reading `/dev`, so a driver missing at setup
-  (setup stops at the failed check, T3 not enabled) or added later changes no file: once it is loaded, the next setup
-  run finishes and starts T3 with the nodes. A machine file without `platform` or `gpu` reads as before (`wsl2`, off).
+  or gone later (a note: setup, T3's start and the automatic update all go on) or added later changes no file: once
+  it is loaded, a T3 restart gives the agent the nodes. A machine file without `platform` or `gpu` reads as before
+  (`wsl2`, off).
 - **Start limit:** a rerun within 10 minutes of five failed starts still starts T3 (`systemctl reset-failed` first).
 - **An older kit's distro:** an `agent` made with a login shell gets `/usr/sbin/nologin` (`usermod`), once.
 - **Packages:** setup installs `nftables`, `libatomic1` and `unzip` when `dpkg` does not list one as installed (held
@@ -559,7 +563,10 @@ the fleet's other kits: remove its `pc-agents` section, or the file if nothing e
   GitHub's attestations move to another log format, every new release is refused (an alert on every PC). Then
   install a kit with the new keys (step 3 again) and run `pc-agents auto-update --clear`.
 - **No uninstall** but removing the distro; the distro holds nothing else. A plain box: by hand ("The way back").
-- **A plain box is shared with you:** the walls keep the agent out of your files, users, mounts and LAN, but the
+- **A plain box is shared with you:** the walls hide your homes (all of `/home` but the agent's, `/root`,
+  `/run/user`), `/mnt`, `/media` and `/run/media`, and keep the agent off your users and LAN. The rest of the
+  system, `/srv`, `/opt`, `/var` and any other mount included, is only read-only (`ProtectSystem=strict`): files
+  there that anyone may read, the agent may read too, so keep private files under a home or those mount folders. The
   kernel, `/dev/shm`, the system D-Bus and abstract unix sockets are shared with your programs, as with other
   distros in WSL2. Not yet tried on a real plain box when this was written: the tests use a fake box.
 - **No code hash manifest yet:** the kit's code is checked for root ownership and its written files byte for byte,
@@ -585,10 +592,11 @@ setup runs again, `SIGTERM` and `SIGHUP` end the download too, each kind of fore
 fails on its own when its part is taken away. `gpu`: off leaves the unit byte for byte as before the setting existed
 (its hash is pinned, on both kinds), on adds only its lines (on a plain box only NVIDIA's nodes, never WSL's), off
 again and an older setup's unit change nothing else, `check` refuses a unit that differs from the setting, a plain
-box with `gpu` on and no NVIDIA driver, and a running T3 that sees a GPU node the setting does not give. The
-automatic update: off does nothing; only a newer published full release on the stable track is taken; it waits
-while T3 runs an agent's process; a version that does not come up is rolled back and not tried again; a run again
-changes nothing; a run stopped before or after the machine file, in setup, before the check or in a rollback is finished or rolled back; no journal, a bad one, a bad machine file, an
+box with `gpu` on and no NVIDIA driver (or one gone after setup) only notes it (setup, T3's start and the automatic
+update go on), a restart marker from an earlier boot hides no node, and a running T3 that sees a GPU node the
+setting does not give. The automatic update: off does nothing; only a newer published full release on the stable
+track is taken; it waits while T3 runs an agent's process; a version that does not come up is rolled back and not
+tried again; a run again changes nothing; a run stopped before or after the machine file, in setup, before the check or in a rollback is finished or rolled back; no journal, a bad one, a bad machine file, an
 empty release list or an API error do nothing and say so; old versions are pruned to three; one run at a time.
 A fake plain Linux box (`linux.test.py`): one run serves, a run again changes nothing, a run stopped half-way is
 finished, the WSL steps are skipped and every other wall holds, a hand-made agent, a sudo rule (allow-listed or
