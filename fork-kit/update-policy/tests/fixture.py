@@ -128,8 +128,9 @@ class HostCase(unittest.TestCase):
             self.write(tick.PENDING_PKGS, ''.join(f'{p}\n' for p in pkgs))
 
 
-def me():
-    return pwd.getpwuid(os.geteuid())
+def fake_user(name, uid):
+    """A password-database entry of a made-up user, so no test depends on the users of the machine it runs on."""
+    return pwd.struct_passwd((name, 'x', uid, uid, '', f'/home/{name}', '/bin/sh'))
 
 
 def red_check(case, test_file, mutations):

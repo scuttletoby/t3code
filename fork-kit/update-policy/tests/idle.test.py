@@ -145,8 +145,8 @@ class Look(fx.HostCase):
 
     def test_docker_is_asked_only_while_its_daemon_runs(self):
         """A socket-activated docker.sock starts dockerd (and containers with restart: always) when asked."""
-        self.host.users['agent'] = fx.me()
-        uid = fx.me().pw_uid
+        uid = 4242                                       # a made-up user: nothing of the host's own
+        self.host.users['agent'] = fx.fake_user('agent', uid)
         self.host.dockers = {'/run/docker.sock': ['dev-db', 'mutation-run'],
                              f'/run/user/{uid}/docker.sock': ['pg-test']}
         self.assertEqual(self.look(containerUsers=['agent']), [])     # no dockerd: never asked
