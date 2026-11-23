@@ -612,12 +612,13 @@ class Installer:
     def code_paths(self):
         """The paths a command line or a unit names when it runs this kit's code: <libexec>/ (and its real path, where
         /usr/local or a folder in it is a link: the kit's runs name the real path of their version), and the kit's
-        links."""
+        links (not an OPTIONAL_LINKS path where another program is: running that is not this kit's code)."""
         roots = {self.LIBEXEC}
         real = os.path.realpath(self.p(self.LIBEXEC))
         if real.startswith(self.PREFIX + '/'):
             roots.add(real[len(self.PREFIX):])
-        return tuple(os.fsencode(r + '/') for r in sorted(roots)), {os.fsencode(p) for p in self.LINKS}
+        return (tuple(os.fsencode(r + '/') for r in sorted(roots)),
+                {os.fsencode(p) for p, t in self.links().items() if not self.foreign(p, t)})
 
     @staticmethod
     def _norm(arg, cwd):

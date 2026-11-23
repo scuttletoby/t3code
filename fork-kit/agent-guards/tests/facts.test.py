@@ -313,6 +313,13 @@ class Projects(unittest.TestCase):
         self.assertEqual(facts.project_name({'match': 'github.com/example/project'}), 'project')
         self.assertEqual(facts.project_name({'match': '/srv/example/notes/'}), 'notes')
         self.assertEqual(facts.project_name({'match': 'github.com/example/project', 'name': 'own'}), 'own')
+        # follow-up: a remote's .git is dropped; a match that ends in "." or ".." names no folder
+        self.assertEqual(facts.project_name({'match': 'github.com/example/project.git'}), 'project')
+        self.assertEqual(facts.project_name({'match': '/srv/example/notes.git'}), 'notes.git')
+        for bad in ('/srv/example/..', '/srv/example/.', '/', 'github.com/example/.git'):
+            self.assertIsNone(facts.project_name({'match': bad}), bad)
+        recs = facts.records({'records': [{'path': self.tmp}]}, [{'match': '/srv/example/..'}])
+        self.assertEqual(recs[0].folders, ['machines', 'orch', 'shared'])
 
 
 class Command(unittest.TestCase):
@@ -580,12 +587,77 @@ class RecordRepo(unittest.TestCase):
     def test_a_mirrored_table_is_skipped_by_its_bytes(self):
         found = [facts.read_place(self.place, 'test')]
         recs = facts.records({'records': [{'path': self.records}]}, [], every=True)
-        skip = {found[0].digest}
+        skip = {found[0].digest: found[0].file}
         self.assertEqual(found[0].digest, hashlib.sha256(TABLE.encode()).hexdigest())
-        lines, notes = facts.search_records(recs, ['backup'], skip)
+        lines, notes, copies = facts.search_records(recs, ['backup'], skip)
         self.assertEqual((lines, notes), ([], []))
-        lines, _ = facts.search_records(recs, ['backup'], set())
+        self.assertEqual(copies, [(f'{self.records}/machines/box/STATE.md', found[0].file)])
+        lines, _, copies = facts.search_records(recs, ['backup'], {})
         self.assertIn('machines/box/STATE.md:', lines[1])
+        self.assertEqual(copies, [])
+
+    def test_records_only_a_copy_holds_the_words_and_says_which(self):
+        r = self.facts('--records', 'backup')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('no line holds all of', r.stdout)
+        self.assertIn('Records: only copies of state tables hold all of: backup; their rows: '
+                      '`facts --no-records backup`', r.stdout)
+        self.assertIn(f'  {self.records}/machines/box/STATE.md (a copy of {self.place}/STATE.md)', r.stdout)
+        r = self.facts('--records', 'nothing-like-this')
+        self.assertIn('Records: no line holds all of: nothing-like-this', r.stdout)
+
+    def test_records_with_no_record_repo_configured_is_a_note(self):
+        self.configure(records=[])
+        r = self.facts('--records', 'gpu')
+        self.assertEqual((r.returncode, r.stdout.strip()),
+                         (0, 'note: no record repo is configured (machine file "agent-guards" part "facts": records)'))
+        os.unlink(os.path.join(self.place, 'STATE.md'))
+        self.assertEqual(self.facts('--records', 'gpu').returncode, 0)
+
+    def test_a_folder_that_leads_out_of_the_repo_is_not_searched(self):
+        outside = os.path.join(self.tmp, 'outside')
+        write(f'{outside}/proj/secret.md', 'gpu outside the repo\n')
+        write(f'{outside}/elsewhere.md', 'gpu outside too\n')
+        os.rename(f'{self.records}/projects', f'{self.tmp}/old-projects')
+        os.symlink(outside, f'{self.records}/projects')           # projectsDir is a link out of the repo
+        os.symlink(outside, f'{self.records}/orch-link')
+        recs = facts.records({'records': [{'path': self.records, 'shared': ['shared', 'orch-link']}]},
+                             [{'match': self.proj, 'name': 'proj'}])
+        lines, notes, _ = facts.search_records(recs, ['gpu'])
+        self.assertTrue(lines and notes == [], (lines, notes))
+        self.assertNotIn('outside', '\n'.join(lines))
+        self.assertIn('shared/runbook.txt:1:', '\n'.join(lines))
+        linked = os.path.join(self.tmp, 'linked-records')             # the repo itself reached by a link: searched
+        os.symlink(self.records, linked)
+        lines, _, _ = facts.search_records(facts.records({'records': [{'path': linked}]}, []), ['gpu'])
+        self.assertIn('shared/runbook.txt:1:', '\n'.join(lines))
+
+    def test_a_file_with_a_nul_byte_is_not_text(self):
+        write(f'{self.records}/shared/blob.json', b'gpu\x00binary\n', 'wb')
+        lines, _, _ = facts.search_records(facts.records({'records': [{'path': self.records}]}, []), ['gpu'])
+        self.assertNotIn('blob.json', '\n'.join(lines))
+        self.assertIn('runbook.txt', '\n'.join(lines))
+
+    def test_the_time_limit_is_checked_for_each_folder_too(self):
+        for k in range(30):
+            os.makedirs(f'{self.records}/shared/empty/{k:02}')    # folders with no files: no file-level check
+        seen = []
+        real_walk = os.walk
+
+        def walk(top, *a, **kw):
+            for d, dirs, files in real_walk(top, *a, **kw):
+                seen.append(d)
+                yield d, dirs, files
+        clock = iter(range(0, 10 ** 6, 1))
+        old_walk, old_time = facts.os.walk, facts.time.monotonic
+        facts.os.walk, facts.time.monotonic = walk, lambda: next(clock)
+        try:
+            recs = facts.records({'records': [{'path': self.records, 'shared': ['shared']}]}, [])
+            _lines, notes, _ = facts.search_records(recs, ['gpu'], seconds=5)
+        finally:
+            facts.os.walk, facts.time.monotonic = old_walk, old_time
+        self.assertLess(len(seen), 10, seen)
+        self.assertIn('search stopped after 5 s', notes[0])
 
 
 if __name__ == '__main__':
