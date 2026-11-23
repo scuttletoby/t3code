@@ -6,7 +6,7 @@ Options:
   repos    [OWNER/REPO] (default: the project's repo)
   ignore   [workflow file name, e.g. "old-deploy.yml"] that are meant to be off
 """
-import json, os, subprocess, sys
+import json, os, shlex, subprocess, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
 from gardener.contract import emit, read_context  # noqa: E402
 
@@ -16,7 +16,7 @@ repos = opt.get('repos') or ([ctx['project']['repo']] if ctx['project']['repo'] 
 ignore = set(opt.get('ignore') or [])
 if not repos:
     emit('workflows.no-repo', 'info', 'no repository to read: the project has no "repo" and the check no "repos"',
-         'check workflows-off')
+         '')
 for repo in repos:
     p = subprocess.run([ctx['gh'], 'api', f'repos/{repo}/actions/workflows?per_page=100'], capture_output=True,
                        text=True, timeout=60, stdin=subprocess.DEVNULL)
@@ -28,4 +28,5 @@ for repo in repos:
         if state == 'active' or name in ignore or not path.startswith('.github/workflows/'):
             continue
         emit('workflows.off', 'warn', f'workflow {w.get("name") or name} is {state}', f'{repo}: {path}',
-             f'gh workflow enable {name} -R {repo} (or add it to this check\'s "ignore" if it is meant to be off)')
+             f'gh workflow enable {shlex.quote(name)} -R {shlex.quote(repo)} (or add it to this check\'s "ignore" '
+             'if it is meant to be off)')

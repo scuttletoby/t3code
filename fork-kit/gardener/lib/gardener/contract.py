@@ -11,22 +11,23 @@ It prints its findings to stdout, one JSON object per line, and exits 0 (with or
   {"id": "worktrees.merged", "severity": "warn", "where": "path or thing", "text": "what is wrong",
    "fix": "how to fix it (a hint)"}
 
-`id` and `text` are required, `severity` is one of error, warn, info, `where` and `fix` are optional strings; no
-other keys. A check changes nothing unless "fix" is true, and then only what its README says. Empty lines are
+`id` (a dotted name: letters, digits, `.`, `_`, `-`, at most 100) and `text` are required, `severity` is one of
+error, warn, info, `where` and `fix` are optional strings; no other keys. A check changes nothing unless "fix" is true, and then only what its README says. Empty lines are
 ignored; anything else on stdout (a line that is not such an object), an exit code other than 0, more than
 MAX_OUTPUT bytes or a run past its timeout makes the whole check one failed-check finding: the runner never trusts
-part of a broken check's output. stderr is kept only for that finding's text (its last line).
+part of a broken check's output. stderr (its last 4 KiB) is kept only for the local report and log, never the issue.
 
 Check programs written in Python can use read_context() and emit() below.
 """
-import json, sys
+import json, re, sys
 
 VERSION = 1
 SEVERITIES = ('error', 'warn', 'info')
 KEYS = ('id', 'severity', 'where', 'text', 'fix')
-MAX_OUTPUT = 1 << 20
+MAX_OUTPUT = 256 << 10      # bytes of stdout; the runner stops reading (and the check) after this
 MAX_FINDINGS = 200          # per check; more are folded into one finding
 MAX_TEXT = 2000             # per field, in characters
+ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
 
 
 def parse_finding(line):
@@ -40,6 +41,8 @@ def parse_finding(line):
     for key in ('id', 'text'):
         if not isinstance(obj.get(key), str) or not obj[key].strip():
             raise ValueError(f'"{key}" must be a non-empty string')
+    if not ID.fullmatch(obj['id']):
+        raise ValueError('"id" must be a dotted name (letters, digits, ".", "_", "-")')
     if obj.get('severity') not in SEVERITIES:
         raise ValueError(f'"severity" must be one of {", ".join(SEVERITIES)}')
     for key in ('where', 'fix'):

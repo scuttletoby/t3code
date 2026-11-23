@@ -105,6 +105,14 @@ class Install(fx.FakeHost):
                                cwd=self.root, timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
 
+    def assert_disable_said_first(self, out):
+        """Users are told to disable the timer before the units go, not after (no dangling wants link)."""
+        said = out.find('systemctl --user disable --now gardener.timer')
+        removed = out.find('removed /etc/systemd/user/')
+        self.assertGreaterEqual(said, 0, out)
+        self.assertGreaterEqual(removed, 0, out)
+        self.assertLess(said, removed, out)
+
     def test_timer_kept_by_an_upgrade_and_removed_by_no_timer_and_uninstall(self):
         self.assertEqual(self.install('--timer')[0], 0)
         self.assertEqual(self.install(sha=SHA2)[0], 0)                 # upgrade without the option: kept
@@ -112,13 +120,15 @@ class Install(fx.FakeHost):
         self.assertTrue(os.path.isdir(self.path(f'/usr/local/libexec/gardener/versions/{SHA1}')))
         code, out, _ = self.install('--no-timer', sha=SHA2)
         self.assertEqual(code, 0)
-        self.assertIn('systemctl --user disable --now gardener.timer', out)
+        self.assert_disable_said_first(out)
         self.assertEqual(self.units(), [False, False])
         self.assertEqual(self.install(sha=SHA2)[0], 0)                 # again without the option: still off
         self.assertEqual(self.units(), [False, False])
         self.assertEqual(self.run_main('self-check')[0], 0)
         self.assertEqual(self.install('--timer', sha=SHA2)[0], 0)
-        self.assertEqual(self.run_main('uninstall')[0], 0)
+        code, out, _ = self.run_main('uninstall')
+        self.assertEqual(code, 0)
+        self.assert_disable_said_first(out)
         self.assertEqual(self.units(), [False, False])
         for gone in ('/usr/local/libexec/gardener', '/etc/gardener', '/usr/local/bin/gardener',
                      '/usr/local/sbin/gardener-install'):
@@ -177,6 +187,9 @@ MUTATIONS = {
     'timer: kept by a run without the option': (
         'installer', "bool(self.read_config().get('timer'))", 'False',
         'test_timer_kept_by_an_upgrade_and_removed_by_no_timer_and_uninstall'),
+    'units: disable is said before they are removed': (
+        'installer', "        if ours:\n            self.say(f'the timer goes: each user who enabled it runs `{DISABLE}` first')\n",
+        '', 'test_timer_kept_by_an_upgrade_and_removed_by_no_timer_and_uninstall'),
 }
 
 

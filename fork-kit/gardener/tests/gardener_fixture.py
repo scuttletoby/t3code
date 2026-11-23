@@ -3,7 +3,8 @@ RedCheck. No root, no systemd, no network.
 
 The kit reads the machine file at the fixed path; a test points config.MACHINE_PATH at a file in a temporary folder
 owned by the user who runs it (config.OWNER_UID). RedCheck copies lib/ to a temporary folder, breaks one text in
-one module, and runs one named test against that copy (GARDENER_TEST_LIB names it). The test must then fail."""
+one module, and runs one named test against that copy (GARDENER_TEST_LIB names it). The test must then fail.
+A module named "checks/NAME" is a general check: it is broken in a copy of checks/ (GARDENER_TEST_CHECKS)."""
 import json, os, shutil, subprocess, sys, tempfile, textwrap, unittest
 from unittest import mock
 
@@ -12,7 +13,8 @@ sys.dont_write_bytecode = True
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIB_ENV = 'GARDENER_TEST_LIB'
 LIB = os.environ.get(LIB_ENV) or os.path.join(KIT, 'lib')
-CHECKS = os.path.join(KIT, 'checks')
+CHECKS_ENV = 'GARDENER_TEST_CHECKS'
+CHECKS = os.environ.get(CHECKS_ENV) or os.path.join(KIT, 'checks')
 sys.path.insert(0, LIB)
 
 from gardener import cli, config, contract, judge, report, runner  # noqa: E402,F401
@@ -27,6 +29,7 @@ class FakeGitHub:
         self.issues = {}
         self.calls = []
         self.fail = None          # a call name that raises GitHubError
+        self.body_search_blind = False   # True: a body search finds nothing (search may skip HTML comments)
 
     def _maybe_fail(self, what):
         self.calls.append(what)
@@ -45,9 +48,11 @@ class FakeGitHub:
             raise report.GitHubError(f'gh api GET repos/{repo}/issues/{number}: HTTP 404: Not Found')
         return dict(self.issues[number])
 
-    def search_open(self, repo, text):
+    def search_open(self, repo, text, field='body'):
         self._maybe_fail('search')
-        return [dict(i) for i in self.issues.values() if i['state'] == 'open' and text in (i['body'] or '')]
+        if field == 'body' and self.body_search_blind:
+            return []
+        return [dict(i) for i in self.issues.values() if i['state'] == 'open' and text in (i[field] or '')]
 
     def create(self, repo, title, body):
         self._maybe_fail('create')
@@ -128,14 +133,19 @@ def red_check(case, test_file, mutations):
                 os.makedirs(os.path.join(tmp, 'common'))      # where config finds machine_file in an installed copy
                 shutil.copy(os.path.join(os.path.dirname(KIT), 'common', 'machine_file.py'),
                             os.path.join(tmp, 'common'))
-                path = os.path.join(lib, 'gardener', f'{module}.py')
+                env = {LIB_ENV: lib}
+                if module.startswith('checks/'):
+                    shutil.copytree(os.path.join(KIT, 'checks'), os.path.join(tmp, 'checks'), symlinks=True)
+                    path = env[CHECKS_ENV] = os.path.join(tmp, module)
+                else:
+                    path = os.path.join(lib, 'gardener', f'{module}.py')
                 with open(path, encoding='utf-8') as f:
                     source = f.read()
-                case.assertEqual(source.count(text), 1, f'{rule}: the text is not in {module}.py exactly once')
+                case.assertEqual(source.count(text), 1, f'{rule}: the text is not in {module} exactly once')
                 with open(path, 'w', encoding='utf-8') as f:
                     f.write(source.replace(text, broken))
                 r = subprocess.run([sys.executable, '-I', '-B', test_file, test], capture_output=True, text=True,
-                                   timeout=300, env=dict(os.environ, **{LIB_ENV: lib}), stdin=subprocess.DEVNULL)
+                                   timeout=300, env=dict(os.environ, **env), stdin=subprocess.DEVNULL)
                 case.assertIn('Ran 1 test', r.stderr, f'{rule}: {test} did not run:\n{r.stderr[-800:]}')
                 case.assertNotEqual(r.returncode, 0, f'{test} still passes with {rule!r} broken')
             finally:

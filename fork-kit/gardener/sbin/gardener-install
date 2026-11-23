@@ -91,20 +91,26 @@ class GardenerInstaller(kit_install.Installer):
                 with open(os.path.join(dest, 'systemd', name), encoding='utf-8') as f:
                     if self.write_file(path, f.read()):
                         self.say(f'wrote {path}: each user with a config runs `{ENABLE}`')
-            elif self.ours_unit(path):
-                os.unlink(self.p(path))
-                self.say(f'removed {path} (users run `{DISABLE}`)')
+        if not plan['timer']:
+            self.remove_units()
 
     def kit_rows(self, plan):
         if not plan['timer']:
             return []
         return [(path, 'file', kit_install.sha256_file(self.p(path))) for path in self.unit_paths()]
 
+    def remove_units(self):
+        """Remove our timer units. Users who enabled the timer disable it first: said before anything goes, so
+        nobody is left with a link in timers.target.wants to a unit that is gone."""
+        ours = [path for path in self.unit_paths() if self.ours_unit(path)]
+        if ours:
+            self.say(f'the timer goes: each user who enabled it runs `{DISABLE}` first')
+        for path in ours:
+            os.unlink(self.p(path))
+            self.say(f'removed {path}')
+
     def kit_uninstall(self):
-        for path in self.unit_paths():
-            if self.ours_unit(path):
-                os.unlink(self.p(path))
-                self.say(f'removed {path} (users run `{DISABLE}`)')
+        self.remove_units()
 
     def installed_summary(self, plan):
         return ', timer units written (every hour; each user enables their own)' if plan['timer'] else ', no timer'

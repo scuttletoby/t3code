@@ -62,6 +62,10 @@ def _time(value):
     return None if TIME_RE.match(value) else 'must be HH:MM (24 hours)'
 
 
+def _time_or_empty(value):
+    return _time(value) if value else None
+
+
 def _quiet(value):
     if not value:
         return None
@@ -136,7 +140,7 @@ def project(obj, where):
         'repo': (str, '', _repo),
         'reportRepo': (str, '', _repo),
         'root': (str, '', _path_or_empty),
-        'schedule': (str, '00:00', _time),
+        'schedule': (str, '', _time_or_empty),
         'quietHours': (str, '', _quiet),
         'timeZone': (str, '', _zone),
         'model': (dict, None, None),

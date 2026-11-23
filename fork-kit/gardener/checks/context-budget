@@ -80,4 +80,10 @@ for d in opt.get('skillDirs') or []:
             continue
         seen.add(real)
         rel = os.path.join(d, os.path.basename(os.path.dirname(s)), 'SKILL.md')
-        size_check('skill', rel, os.path.getsize(real), skill_max)
+        try:
+            size = os.path.getsize(real)
+        except OSError:                              # a broken link, or gone since the listing
+            emit('context-budget.missing', 'warn', 'skill file cannot be read (a broken link?)', rel,
+                 'fix or remove the skill folder')
+            continue
+        size_check('skill', rel, size, skill_max)

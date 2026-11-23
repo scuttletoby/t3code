@@ -1,10 +1,11 @@
-"""The report issue (missing, closed, edited by hand, its marker removed, a GitHub error), what goes into it (local
-paths redacted, the size cap) and the judgment step (a fake local model over HTTP, and one that is not there).
+"""The report issue (missing, closed, edited by hand, its marker removed, a GitHub error), what goes into it (the
+allow-list: nothing local reaches the issue; the size cap) and the judgment step (a fake local model over HTTP, one
+that is not there and one that does not speak HTTP).
 GitHub is a fake (gardener_fixture.FakeGitHub); the `gh api` wrapper is run against a fake gh script.
 
   python3 -I -B fork-kit/gardener/tests/report.test.py
 """
-import http.server, json, os, sys, threading, unittest
+import http.server, json, os, socket, subprocess, sys, threading, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gardener_fixture as gf  # noqa: E402
@@ -21,7 +22,7 @@ class Publish(unittest.TestCase):
 
     def test_missing_issue_is_created(self):
         self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART), (1, 'created'))
-        self.assertEqual(self.gh.calls, ['search', 'create'])
+        self.assertEqual(self.gh.calls, ['search', 'search', 'create'])        # by title, then by marker
         self.assertEqual(self.gh.issues[1]['title'], 'Gardener report: example')
 
     def test_the_remembered_issue_is_edited_without_a_search(self):
@@ -30,12 +31,20 @@ class Publish(unittest.TestCase):
         self.assertEqual(self.gh.calls, ['issue', 'edit'])
         self.assertEqual(self.gh.issues[n]['body'], PART)
 
-    def test_a_forgotten_issue_is_found_by_its_marker(self):
+    def test_a_forgotten_issue_is_found_by_its_title(self):
+        """GitHub search may not index the hidden marker (an HTML comment): the title is searched first."""
+        self.gh.body_search_blind = True
         self.gh.add('another issue')
         n = self.gh.add('text\n' + report.marker('example') + '\nold\n')
-        self.gh.add(report.marker('other-project') + '\n')
+        self.gh.add(report.marker('other-project') + '\n', title='Gardener report: other-project')
         self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART), (n, 'updated'))
         self.assertEqual(self.gh.calls, ['search', 'edit'])
+
+    def test_a_forgotten_issue_renamed_by_hand_is_found_by_its_marker(self):
+        self.gh.add('another issue')
+        n = self.gh.add('text\n' + report.marker('example') + '\nold\n', title='Docs work this week')
+        self.assertEqual(report.publish(self.gh, 'o/r', 'example', PART), (n, 'updated'))
+        self.assertEqual(self.gh.calls, ['search', 'search', 'edit'])
 
     def test_two_open_report_issues_always_pick_the_oldest(self):
         self.gh.add('x')
@@ -66,6 +75,16 @@ class Publish(unittest.TestCase):
         report.publish(self.gh, 'o/r', 'example', PART, known_number=n)
         self.assertEqual(self.gh.issues[n]['body'],
                          'Owner note: ignore the docs warnings this week.\n\n' + PART)
+
+    def test_a_long_hand_written_text_is_cut_so_the_body_fits(self):
+        n = self.gh.add('H' * 70000 + report.marker('example') + '\nold\n')
+        part = report.marker('example') + '\n' + 'p' * 40000 + '\n'
+        report.publish(self.gh, 'o/r', 'example', part, known_number=n)
+        body = self.gh.issues[n]['body']
+        self.assertLessEqual(len(body), report.MAX_BODY)
+        self.assertTrue(body.endswith(part))                            # the gardener's part is whole
+        self.assertIn('the text above was cut', body)
+        self.assertTrue(body.startswith('H' * 1000))
 
     def test_a_pull_request_with_the_marker_is_not_the_report(self):
         n = self.gh.add(report.marker('example'))
@@ -99,15 +118,18 @@ class GhWrapper(gf.Temp):
         ''')
         g = report.GitHub(gh)
         self.assertEqual(g.search_open('o/r', 'gardener-report:x'), [{'number': 3}])
+        self.assertEqual(g.search_open('o/r', 'Gardener report: x', 'title'), [{'number': 3}])
         self.assertEqual(g.create('o/r', 'T', 'B')['number'], 4)
         self.assertEqual(g.edit('o/r', 4, 'B2')['number'], 4)
         with open(log) as f:
             calls = [json.loads(ln) for ln in f]
         self.assertEqual(calls[0][0][:4], ['api', '--method', 'GET', calls[0][0][3]])
         self.assertIn('is%3Aopen', calls[0][0][3])
-        self.assertEqual(calls[1], [['api', '--method', 'POST', 'repos/o/r/issues', '--input', '-'],
+        self.assertIn('in%3Abody', calls[0][0][3])
+        self.assertIn('in%3Atitle', calls[1][0][3])
+        self.assertEqual(calls[2], [['api', '--method', 'POST', 'repos/o/r/issues', '--input', '-'],
                                     json.dumps({'title': 'T', 'body': 'B'})])
-        self.assertEqual(calls[2][0][2:4], ['PATCH', 'repos/o/r/issues/4'])
+        self.assertEqual(calls[3][0][2:4], ['PATCH', 'repos/o/r/issues/4'])
 
     def test_failures(self):
         for body, want in (('import sys\nsys.stderr.write("HTTP 403: API rate limit exceeded\\n")\nsys.exit(1)',
@@ -130,33 +152,74 @@ class Render(unittest.TestCase):
     def test_local_paths_are_redacted(self):
         root, home = '/srv/u/repo', '/srv/u'
         f = self.finding(where='/srv/u/repo/docs/a.md', text='see /srv/u/notes and /srv/u/repo', fix='')
-        body = report.render('example', '2026-11-23', [f], ['note about /srv/u/repo/x'], 'judge saw /srv/u/x',
-                             root=root, home=home)
+        body = report.render_issue('example', '2026-11-23', [f], ['note about /srv/u/repo/x'], 'judge saw /srv/u/x',
+                                   root=root, home=home)
         self.assertNotIn('/srv/u', body)
-        self.assertIn('./docs/a.md', body)
-        self.assertIn('see ~/notes and .', body)
+        self.assertIn('| docs/a.md |', body)
+        self.assertIn('see <path> and .', body)
         self.assertIn('note about ./x', body)
-        self.assertIn('judge saw ~/x', body)
+        self.assertIn('judge saw <path>', body)
 
     def test_table_cells_are_escaped_and_sorted_by_severity(self):
         fs = [self.finding(severity='info', id='i'), self.finding(severity='error', id='e', text='a | b\nc')]
-        body = report.render('example', '2026-11-23', fs, [])
-        self.assertLess(body.index('| error |'), body.index('| info |'))
-        self.assertIn('a \\| b c', body)
-        self.assertIn('1 error(s), 0 warning(s), 1 note(s)', body)
+        for body in (report.render_issue('example', '2026-11-23', fs, []),
+                     report.render_local('example', '2026-11-23', fs, [])):
+            self.assertLess(body.index('| error |'), body.index('| info |'))
+            self.assertIn('a \\| b c', body)
+            self.assertIn('1 error(s), 0 warning(s), 1 note(s)', body)
 
     def test_no_findings(self):
-        body = report.render('example', '2026-11-23', [], [])
+        body = report.render_issue('example', '2026-11-23', [], [])
         self.assertTrue(body.startswith(report.marker('example') + '\n'))
         self.assertIn('No findings.', body)
         self.assertNotIn('| Severity', body)
 
     def test_the_body_stays_under_githubs_limit(self):
         fs = [self.finding(id=f'n.{i}', text='x' * 1500) for i in range(200)]
-        body = report.render('example', '2026-11-23', fs, ['a note'], 'j' * 8000)
-        self.assertLess(len(body), report.MAX_BODY)
-        self.assertIn('more finding(s) not shown (the issue is full)', body)
+        body = report.render_issue('example', '2026-11-23', fs, ['a note'], 'j' * 8000)
+        self.assertLess(len(body), report.MAX_PART)
+        self.assertIn('more row(s) not shown (the issue is full)', body)
         self.assertIn('### Judgment', body)
+        self.assertEqual(report.render_local('example', '2026-11-23', fs, []).count('| warn |'), 200)
+
+    def test_only_paths_inside_the_repository_are_shown(self):
+        root = '/srv/u/repo'
+        cases = {'docs/a.md': 'docs/a.md', 'docs/a.md:12': 'docs/a.md:12', '/srv/u/repo/b/c.py:3': 'b/c.py:3',
+                 '.': '.', '': '', '/srv/u/other/x.md': None, '../x': None, '~/notes.md': None,
+                 '/etc/passwd': None, 'docs/a b.md': None, 'example-owner/app: .github/workflows/ci.yml':
+                 'example-owner/app: .github/workflows/ci.yml', 'someone/private: x.yml': None,
+                 'example-owner/app: /srv/u/x': None}
+        for where, want in cases.items():
+            with self.subTest(where=where):
+                self.assertEqual(report.public_where(where, root, 'example-owner/app'), want)
+
+    def test_a_finding_outside_the_repository_is_only_counted(self):
+        fs = [self.finding(where='/srv/u/.claude/projects/-srv-u--repo/memory/plans.md', text='orphan plans.md'),
+              self.finding(where='/srv/u/.claude/projects/-srv-u--repo/memory/b.md', text='orphan b.md'),
+              self.finding(where='', text='private-host is down', id='x.y'),
+              dict(GOOD, check='c', id='gardener.check-failed', where='', own=True, text='exited with code 1',
+                   detail='ssh: connect to host private-host port 22')]
+        issue = report.render_issue('example', '2026-11-23', fs, [], root='/srv/u/repo', home='/srv/u')
+        local = report.render_local('example', '2026-11-23', fs, [])
+        for secret in ('plans.md', 'b.md', 'private-host', '-srv-u-', '/srv/u'):
+            self.assertNotIn(secret, issue)
+        self.assertIn('2 finding(s), in the local report only | <outside repo>', issue)
+        self.assertIn('1 finding(s), in the local report only', issue)
+        self.assertIn('gardener.check-failed: exited with code 1', issue)
+        self.assertIn('report.md', issue)                               # where the rest is
+        for shown in ('plans.md', 'private-host is down', 'ssh: connect to host private-host'):
+            self.assertIn(shown, local)
+
+    def test_masks(self):
+        for text, gone in (('see http://100.64.1.2:8080/v1 now', '100.64'), ('mail a.b@example.org', 'a.b@'),
+                           ('host 10.0.0.5 down', '10.0.0.5'), ('at fe80::1:2', 'fe80'),
+                           ('box nas.local and pc.tail1234.ts.net', 'nas'), ('in ~/secret/x', 'secret'),
+                           ('memory -home-user--proj', 'user'), ('file /opt/x/y', '/opt')):
+            with self.subTest(text=text):
+                self.assertNotIn(gone, report.public_text(text, '/srv/u/repo', '/srv/u'))
+        for kept in ('origin/main is ahead', 'docs/a.md', 'at 12:30:45', 'std::vector', 'a.b c'):
+            with self.subTest(kept=kept):
+                self.assertEqual(report.public_text(kept, '/srv/u/repo', '/srv/u'), kept)
 
 
 class Judge(gf.Temp):
@@ -186,18 +249,32 @@ class Judge(gf.Temp):
         return dict({'endpoint': endpoint, 'model': 'local-model', 'timeoutSeconds': 10, 'maxFiles': 5,
                      'maxFileBytes': 100}, **kw)
 
-    def test_the_model_gets_findings_and_only_files_inside_the_root(self):
+    def git(self, *args):
+        env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@example.invalid', GIT_COMMITTER_NAME='t',
+                   GIT_COMMITTER_EMAIL='t@example.invalid', GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
+        subprocess.run(['git', '-C', self.tmp, *args], check=True, capture_output=True, env=env)
+
+    def repo_files(self):
+        """The project root is a folder of a larger repository: docs/a.md tracked; .env ignored; notes.txt
+        untracked; secret.txt tracked too, but outside the root."""
         os.makedirs(os.path.join(self.root, 'docs'))
-        with open(os.path.join(self.root, 'docs', 'a.md'), 'w') as f:
-            f.write('A' * 500)
-        with open(os.path.join(self.tmp, 'secret.txt'), 'w') as f:
-            f.write('outside the root')
+        for rel, text in (('docs/a.md', 'A' * 500), ('.gitignore', '.env\n'), ('.env', 'TOKEN=ignored-secret'),
+                          ('notes.txt', 'untracked-secret'), ('../secret.txt', 'outside the root')):
+            with open(os.path.join(self.root, rel), 'w') as f:
+                f.write(text)
+        self.git('init', '-q', '-b', 'main')
+        self.git('add', 'repo/docs/a.md', 'repo/.gitignore', 'secret.txt')
+        self.git('commit', '-q', '-m', 'one')
+
+    def test_the_model_gets_findings_and_only_tracked_files_inside_the_root(self):
+        self.repo_files()
         endpoint, seen = self.serve({'choices': [{'message': {'content': ' looks real \n'}}]})
-        fs = [dict(GOOD, check='c'), dict(GOOD, check='c', where='../secret.txt'),
-              dict(GOOD, check='c', where='/etc/passwd')]
+        fs = [dict(GOOD, check='c', where=w) for w in ('docs/a.md:3', '../secret.txt', '/etc/passwd', '.env',
+                                                      'notes.txt')]
         answer, note = judge.judge(self.model(endpoint), fs, self.root)
         self.assertEqual(answer, 'looks real')
-        self.assertIn('read 3 finding(s) and 1 file(s)', note)
+        self.assertEqual(note, 'judgment: model reachable; it read 5 finding(s) and 1 file(s)')
+        self.assertNotIn('127.0.0.1', note)
         path, req = seen[0]
         self.assertEqual(path, '/v1/chat/completions')
         self.assertEqual((req['model'], req['temperature']), ('local-model', 0))
@@ -205,8 +282,8 @@ class Judge(gf.Temp):
         self.assertIn('File docs/a.md:', user)
         self.assertIn('A' * 100, user)
         self.assertNotIn('A' * 101, user)                               # cut to maxFileBytes
-        self.assertNotIn('outside the root', user)
-        self.assertNotIn('root:x:', user)
+        for secret in ('outside the root', 'root:x:', 'ignored-secret', 'untracked-secret'):
+            self.assertNotIn(secret, user)
 
     def test_no_model_no_findings_and_bad_answers(self):
         self.assertEqual(judge.judge(None, [GOOD], self.root), (None, None))
@@ -214,15 +291,41 @@ class Judge(gf.Temp):
         self.assertEqual(judge.judge(self.model(endpoint), [], self.root)[0], None)
         self.assertEqual(seen, [])                                      # nothing to judge: no request
         for answer, status in (({'choices': []}, 200), ({'error': 'x'}, 500),
-                               ({'choices': [{'message': {'content': '  '}}]}, 200)):
+                               ({'choices': [{'message': {'content': '  '}}]}, 200), ([1], 200)):
             with self.subTest(answer=answer):
                 endpoint, _ = self.serve(answer, status)
                 got, note = judge.judge(self.model(endpoint), [dict(GOOD, check='c')], self.root)
                 self.assertIsNone(got)
-                self.assertIn('judgment skipped', note)
+                self.assertIn('judgment: model unreachable or no usable answer', note)
+                self.assertNotIn('127.0.0.1', note)
+
+    def junk_server(self, reply):
+        """A socket that answers every connection with reply and closes (a wrong port: ssh, not HTTP)."""
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(4)
+        self.addCleanup(srv.close)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                with conn:
+                    conn.recv(65536)
+                    conn.sendall(reply)
+        threading.Thread(target=serve, daemon=True).start()
+        return f'http://127.0.0.1:{srv.getsockname()[1]}/v1'
+
+    def test_an_endpoint_that_does_not_speak_http_is_a_note(self):
+        for reply in (b'SSH-2.0-OpenSSH_9.6\r\n', b'HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n{"cho'):
+            with self.subTest(reply=reply):
+                got, note = judge.judge(self.model(self.junk_server(reply)), [dict(GOOD, check='c')], self.root)
+                self.assertIsNone(got)
+                self.assertIn('model unreachable', note)
 
     def test_an_unreachable_model_is_a_note_and_the_run_goes_on(self):
-        import socket
         s = socket.socket()
         s.bind(('127.0.0.1', 0))
         port = s.getsockname()[1]
@@ -233,7 +336,8 @@ class Judge(gf.Temp):
         code, out = self.run_cli('run')
         self.assertEqual(code, 0, out)
         body = self.gh.issues[1]['body']
-        self.assertIn('judgment skipped: the model at', body)
+        self.assertIn('judgment: model unreachable', body)
+        self.assertNotIn(str(port), body)                               # the endpoint is never shown
         self.assertNotIn('### Judgment', body)
 
     def test_the_judgment_goes_into_the_report(self):
@@ -254,15 +358,36 @@ MUTATIONS = {
     'hand-written text above the marker is kept': (
         'report', "        head = old_body[:old_body.index(marker(name))]", "        head = ''",
         'Publish.test_text_written_above_the_marker_by_hand_is_kept'),
-    'local paths are redacted': (
-        'report', "    if home and home != '/':", '    if False:',
+    'the root is shown as "."': (
+        'report', "    if root:\n        text = text.replace(", "    if False:\n        text = text.replace(",
         'Render.test_local_paths_are_redacted'),
+    'text in the issue is masked': (
+        'report', "    for rx, sub in _MASKS:\n        text = rx.sub(sub, text)\n", '',
+        'Render.test_masks'),
+    'a where outside the repository is not shown': (
+        'report', "    if w == '..' or w.startswith('../') or not _SAFE_REL.fullmatch(w):\n        return None\n", '',
+        'Render.test_only_paths_inside_the_repository_are_shown'),
+    'a finding outside the repository is only counted': (
+        'report', "        if w is None or (w == '' and not f.get('own')):",
+        "        if False:", 'Render.test_a_finding_outside_the_repository_is_only_counted'),
     'judge reads only files inside the root': (
         'judge', 'not full.startswith(real_root + os.sep) or ', '',
-        'Judge.test_the_model_gets_findings_and_only_files_inside_the_root'),
-    'the body is capped': (
-        'report', '        if len(row) + 1 > budget:\n            break\n', '',
+        'Judge.test_the_model_gets_findings_and_only_tracked_files_inside_the_root'),
+    'judge reads only tracked files': (
+        'judge', '        if not tracked(real_root, rel):\n            continue\n', '',
+        'Judge.test_the_model_gets_findings_and_only_tracked_files_inside_the_root'),
+    'judge: any failure is a note': (
+        'judge', '    except Exception as e:', '    except (OSError, ValueError, KeyError, IndexError, TypeError) as e:',
+        'Judge.test_an_endpoint_that_does_not_speak_http_is_a_note'),
+    'the issue part is capped': (
+        'report', '            if len(row) + 1 > budget:\n                break\n', '',
         'Render.test_the_body_stays_under_githubs_limit'),
+    'a long hand-written text is cut': (
+        'report', '    if len(head) > room:', '    if False:',
+        'Publish.test_a_long_hand_written_text_is_cut_so_the_body_fits'),
+    'the forgotten issue is searched by title first': (
+        'report', "((f'Gardener report: {name}', 'title'), (f'gardener-report:{name}', 'body'))",
+        "((f'gardener-report:{name}', 'body'),)", 'Publish.test_a_forgotten_issue_is_found_by_its_title'),
 }
 
 

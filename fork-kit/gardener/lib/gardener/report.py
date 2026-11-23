@@ -1,16 +1,46 @@
 """gardener.report: the rolled-up report of one project's run, and its one issue on GitHub, updated in place.
 
+Two reports are written from the same findings:
+- The issue part (render_issue) is built from an allow-list, because the report repository may be public: per
+  finding only its severity, check, id, a `where` that is a path inside the project's repository (relative), and
+  its text and fix with what still looks like a local name (a path, URL, address, e-mail) masked. A finding whose
+  `where` is outside the repository, or that has none, is only counted (the gardener's own findings excepted: their
+  words are fixed). Notes are the gardener's own words; the judgment is masked the same way. Nothing a check
+  printed on stderr goes there.
+- The local report (render_local, report.md in the state folder) holds everything, as it is.
+
 The issue is found by a hidden marker line, `<!-- gardener-report:NAME -->`. Everything from the marker down is the
-gardener's and is written whole on each run; text a person wrote above the marker is kept. An issue without the
-marker (edited away by hand) is no longer the report: the next run looks again and, finding none, opens a new one.
-A closed report issue is left closed, and a new one is opened. GitHub calls per run: at most one issue read (the
-number the state file remembers), one search (only when that read does not give an open report issue) and one
-write (create or edit).
+gardener's and is written whole on each run; text a person wrote above the marker is kept (cut, with a note, only
+when the whole body would pass MAX_BODY). An issue without the marker (edited away by hand) is no longer the
+report: the next run looks again and, finding none, opens a new one. A closed report issue is left closed, and a
+new one is opened. GitHub calls per run: at most one issue read (the number the state file remembers); only when
+that does not give the open report issue, a search by title and, when that finds none, one by marker; and one write
+(create or edit).
 """
 import json, os, re, subprocess
 
 SEVERITY_ORDER = {'error': 0, 'warn': 1, 'info': 2}
-MAX_BODY = 60000             # GitHub's limit is 65536 characters
+MAX_PART = 50000             # the gardener's part of the issue
+MAX_BODY = 60000             # the whole body, a person's text above the marker too; GitHub's limit is 65536
+CUT_NOTE = '\n\n_(the text above was cut to fit the issue size limit)_\n\n'
+OUTSIDE = '<outside repo>'
+LOCAL_HINT = ('Full text, notes and paths outside the repository: `report.md` in the gardener\'s state folder on the '
+              'machine that runs it.')
+
+_SAFE_REL = re.compile(r'[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*')
+_REPO_WHERE = re.compile(r'([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+): (.+)')
+_MASKS = (
+    (re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://\S+'), '<url>'),
+    (re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+'), '<email>'),
+    (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b'), '<ip>'),
+    (re.compile(r'(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}\b'
+                r'|(?<![\w:])[0-9A-Fa-f]{0,4}::[0-9A-Fa-f:]*[0-9A-Fa-f]'), '<ip>'),
+    (re.compile(r'\S*-home-\S*'), '<path>'),                      # a home folder encoded in a folder name
+    (re.compile(r'(?<![\w.~/-])~[\w.-]*(?:/\S*)?'), '<path>'),
+    (re.compile(r'(?<![\w.~-])/[^\s\'"`|),;]+'), '<path>'),
+    (re.compile(r'\b[\w-]+(?:\.[\w-]+)*\.(?:local|lan|internal|localdomain|home\.arpa|ts\.net)\b', re.I),
+     '<host>'),
+)
 
 
 class GitHubError(Exception):
@@ -22,7 +52,7 @@ def marker(name):
 
 
 def redact(text, root, home):
-    """Local folder names out of text that may go to a public issue: the project root becomes ".", the home "~"."""
+    """The project root becomes ".", the home "~"."""
     if root:
         text = text.replace(root.rstrip('/') + '/', './').replace(root.rstrip('/'), '.')
     if home and home != '/':
@@ -30,55 +60,129 @@ def redact(text, root, home):
     return text
 
 
+def public_text(text, root, home):
+    """Text for the issue: the root as ".", then every path outside it, URL, address, e-mail and local host name
+    masked."""
+    text = redact(text or '', root, home)
+    for rx, sub in _MASKS:
+        text = rx.sub(sub, text)
+    return text
+
+
+def public_where(where, root, report_repo=''):
+    """Where to show in the issue: a path inside the repository, relative (":LINE" kept), "OWNER/REPO: path" of the
+    report repository, or '' for none. None: outside the repository, or not a plain path."""
+    w = (where or '').strip()
+    if not w:
+        return ''
+    m = _REPO_WHERE.fullmatch(w)
+    if m:
+        if report_repo and m.group(1).lower() == report_repo.lower():
+            rest = public_where(m.group(2), '', '')
+            return f'{m.group(1)}: {rest}' if rest else None
+        return None
+    line = ''
+    m = re.fullmatch(r'(.+?)(:\d+)', w)
+    if m:
+        w, line = m.groups()
+    if w.startswith('~'):
+        return None
+    if os.path.isabs(w):
+        if not root:
+            return None
+        w = os.path.relpath(os.path.normpath(w), os.path.normpath(root))
+    w = os.path.normpath(w)
+    if w == '.':
+        return '.' + line
+    if w == '..' or w.startswith('../') or not _SAFE_REL.fullmatch(w):
+        return None
+    return w + line
+
+
 def _cell(text):
     return text.replace('\\', '\\\\').replace('|', '\\|').replace('\r', ' ').replace('\n', ' ').strip()
 
 
-def render(name, today, findings, notes, judgment=None, root='', home=''):
-    """The report text from the marker down (markdown)."""
-    findings = sorted(findings, key=lambda f: (SEVERITY_ORDER.get(f['severity'], 3), f['check'], f['id'], f['where']))
-    counts = {s: sum(1 for f in findings if f['severity'] == s) for s in SEVERITY_ORDER}
-    lines = [marker(name), f'## Gardener report: {name}, {today}', '']
-    if findings:
-        lines.append(f'{counts["error"]} error(s), {counts["warn"]} warning(s), {counts["info"]} note(s). '
-                     'Report only, unless a check is set to fix.')
-    else:
-        lines.append('No findings.')
-    lines.append('')
+def _counts(findings):
+    c = {s: sum(1 for f in findings if f['severity'] == s) for s in SEVERITY_ORDER}
+    return (f'{c["error"]} error(s), {c["warn"]} warning(s), {c["info"]} note(s). Report only, unless a check is '
+            'set to fix.') if findings else 'No findings.'
+
+
+def _document(name, title, today, counts, rows, notes, judgment, cap, more_hint, extra=()):
+    rows = sorted(rows, key=lambda r: (SEVERITY_ORDER.get(r[0], 3), r[1], r[2], r[3]))
+    lines = [marker(name), f'## {title}: {name}, {today}', '', counts, *extra, '']
     tail = []
-    for n in notes:
-        tail.append(f'- {_cell(redact(n, root, home))}')
+    if notes:
+        tail += ['### Notes', ''] + [f'- {_cell(n)}' for n in notes]
     if judgment:
-        tail += ['', '### Judgment (local model)', '', redact(judgment, root, home).strip()]
+        tail += ['', '### Judgment (local model)', '', judgment.strip()]
     tail += ['', f'<sub>Written by the gardener (fork-kit/gardener) on {today}; it rewrites everything below the '
                  'marker on each run.</sub>']
-    if notes:
-        tail.insert(0, '### Notes')
-        tail.insert(1, '')
-    if findings:
+    if rows:
         lines += ['| Severity | Check | Finding | Where | Fix |', '| --- | --- | --- | --- | --- |']
     shown = 0
-    budget = MAX_BODY - len('\n'.join(lines)) - len('\n'.join(tail)) - 200
-    for f in findings:
-        row = '| ' + ' | '.join(_cell(redact(v, root, home)) for v in
-                                (f['severity'], f['check'], f'{f["id"]}: {f["text"]}', f['where'], f['fix'])) + ' |'
-        if len(row) + 1 > budget:
-            break
+    budget = (cap - len('\n'.join(lines)) - len('\n'.join(tail)) - 300) if cap else None
+    for r in rows:
+        row = '| ' + ' | '.join(_cell(v) for v in r) + ' |'
+        if budget is not None:
+            if len(row) + 1 > budget:
+                break
+            budget -= len(row) + 1
         lines.append(row)
-        budget -= len(row) + 1
         shown += 1
-    if shown < len(findings):
-        lines += ['', f'{len(findings) - shown} more finding(s) not shown (the issue is full): run '
-                      f'`gardener run --project {name} --dry-run` to see them all.']
+    if shown < len(rows):
+        lines += ['', f'{len(rows) - shown} more row(s) not shown (the issue is full): {more_hint}']
     lines.append('')
     return '\n'.join(lines + tail) + '\n'
 
 
+def public_findings(findings, root, home, report_repo=''):
+    """The allow-listed view of the findings (module doc): [{severity, check, id, text, where, fix}]; the findings
+    outside the repository, or of a check and with no where, folded into one counted entry per severity, check, id
+    and where."""
+    out, hidden = [], {}
+    for f in findings:
+        w = public_where(f.get('where'), root, report_repo)
+        if w is None or (w == '' and not f.get('own')):
+            key = (f['severity'], f['check'], f['id'], OUTSIDE if w is None else '')
+            hidden[key] = hidden.get(key, 0) + 1
+            continue
+        out.append({'severity': f['severity'], 'check': f['check'], 'id': f['id'], 'where': w,
+                    'text': public_text(f['text'], root, home), 'fix': public_text(f.get('fix') or '', root, home)})
+    for (severity, check, id_, where), n in hidden.items():
+        out.append({'severity': severity, 'check': check, 'id': id_, 'where': where,
+                    'text': f'{n} finding(s), in the local report only', 'fix': ''})
+    return out
+
+
+def render_issue(name, today, findings, notes, judgment=None, root='', home='', report_repo=''):
+    """The issue part, from the marker down (markdown), from the allow-list (module doc)."""
+    rows = [(f['severity'], f['check'], f'{f["id"]}: {f["text"]}', f['where'], f['fix'])
+            for f in public_findings(findings, root, home, report_repo)]
+    return _document(name, 'Gardener report', today, _counts(findings), rows,
+                     [public_text(n, root, home) for n in notes],
+                     public_text(judgment, root, home) if judgment else None, MAX_PART,
+                     'the local report has them all', ('', LOCAL_HINT))
+
+
+def render_local(name, today, findings, notes, judgment=None):
+    """The local report (report.md): every finding, its detail and its full where, as they are."""
+    rows = [(f['severity'], f['check'], f'{f["id"]}: {f["text"]}' + (f' ({f["detail"]})' if f.get('detail') else ''),
+             f.get('where') or '', f.get('fix') or '') for f in findings]
+    return _document(name, 'Gardener report (local, in full)', today, _counts(findings), rows, notes, judgment,
+                     None, '')
+
+
 def body_with(old_body, name, new_part):
-    """The new issue body: what a person wrote above the marker, then the new report part."""
+    """The new issue body: what a person wrote above the marker, then the new report part; at most MAX_BODY (the
+    person's text is cut, with a note, when it does not fit)."""
     head = ''
     if old_body and marker(name) in old_body:
         head = old_body[:old_body.index(marker(name))]
+    room = MAX_BODY - len(new_part)
+    if len(head) > room:
+        head = head[:max(0, room - len(CUT_NOTE))] + CUT_NOTE
     return head + new_part
 
 
@@ -113,8 +217,8 @@ class GitHub:
     def issue(self, repo, number):
         return self.call('GET', f'repos/{repo}/issues/{number}')
 
-    def search_open(self, repo, text):
-        q = f'repo:{repo} is:issue is:open in:body "{text}"'
+    def search_open(self, repo, text, field='body'):
+        q = f'repo:{repo} is:issue is:open in:{field} "{text}"'
         from urllib.parse import quote
         found = self.call('GET', f'search/issues?q={quote(q)}&per_page=10') or {}
         return found.get('items') or []
@@ -142,10 +246,12 @@ def publish(gh, repo, name, part, known_number=None):
             got = None                         # deleted, moved or unreadable: look again
         if _ours(got, name):
             issue = got
-    if issue is None:
-        mine = [i for i in gh.search_open(repo, f'gardener-report:{name}') if _ours(i, name)]
-        if mine:
-            issue = min(mine, key=lambda i: i['number'])      # the oldest open one, always the same
+    if issue is None:            # by title, then (renamed by hand) by the marker; GitHub search may skip comments
+        for text, field in ((f'Gardener report: {name}', 'title'), (f'gardener-report:{name}', 'body')):
+            mine = [i for i in gh.search_open(repo, text, field) if _ours(i, name)]
+            if mine:
+                issue = min(mine, key=lambda i: i['number'])  # the oldest open one, always the same
+                break
     if issue is None:
         made = gh.create(repo, f'Gardener report: {name}', part)
         return made['number'], 'created'

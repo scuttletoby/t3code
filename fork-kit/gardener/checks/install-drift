@@ -19,7 +19,7 @@ from gardener.contract import emit, read_context  # noqa: E402
 ctx = read_context()
 opt = ctx['options']
 etc = opt.get('etc') or '/etc'
-prefix = opt.get('prefix') or ''        # tests only: every recorded path is read under this folder
+prefix = os.environ.get('GARDENER_TEST_PREFIX', '')   # tests only: every recorded path is read under this folder
 release = opt.get('release') or ''
 kits = opt.get('kits') or sorted(os.path.basename(os.path.dirname(p))
                                  for p in glob.glob(os.path.join(prefix + etc, '*', 'installed.tsv')))

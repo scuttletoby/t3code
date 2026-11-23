@@ -13,23 +13,32 @@ its own window.
 
 For each project in the config (or the one `--project` names):
 
-1. **Done today?** The project's state file holds a done marker (the day, in the project's time zone). If it is
-   today, nothing happens: no check, no API call. `--force` runs it again.
-2. **Window** (only with `--timer`, which the timer passes): the project runs once its `schedule` time has passed
-   today and, with `quietHours`, only inside them.
+1. **Done today?** The project's state file holds a done marker (the project's day, in its time zone; see
+   [Window](#window)). If it is today, nothing happens: no check, no API call, unless the day's report issue is
+   still to be written (then that alone is tried again). `--force` runs it again.
+2. **Window** (only with `--timer`, which the timer passes): see [Window](#window).
 3. **Checks**, one after another, each with its own timeout. A check that fails in any way becomes exactly one
    finding and the next check still runs (see [Checks](#checks)).
 4. **Judgment** (optional): with a `model` configured, the findings go to a local model; see
    [Judgment](#judgment).
-5. **Report**: the report issue is written (see [Report issue](#report-issue)) and a copy saved as `report.md` in
-   the state folder. Then the done marker.
+5. **Report**: the full report is saved as `report.md` and the issue's part as `issue.md` in the state folder.
+   Then the done marker. Then the report issue is written (see [Report issue](#report-issue)); if that fails, only
+   the issue is tried again on later ticks, at most 3 times a day; the checks and the model do not run again.
 
-`gardener run --dry-run` runs the checks and prints the report instead. It writes nothing (no issue, no state, no
+`gardener run --dry-run` runs the checks and prints both reports (the issue's part and the local one) instead. It writes nothing (no issue, no state, no
 done marker), ignores the done marker and the window, and runs checks set to fix with fix off. `gardener check`
 reads the config and lists each project and its checks; it runs nothing.
 
-Exit codes: 0 fine (also: skipped, already done), 1 a project's run or report failed (it runs again on the next
-tick), 2 the config is refused.
+Exit codes: 0 fine (also: skipped, already done), 1 a project's run or report issue failed, 2 the config is
+refused.
+
+### Window
+
+Without `quietHours` the project's day is its local date, and the timer runs it once a day, after the `schedule`
+time if one is set (else at the first tick of the day). With `quietHours` (which may wrap past midnight) the day
+starts when they start: with `22:00-06:00`, 01:00 on the 24th still belongs to the 23rd's window, so one window is
+one run, and a tick missed at 23:00 runs at 01:00. The timer runs it only inside them, and a `schedule` inside them
+holds it until that time (one outside them is not used).
 
 ## Config
 
@@ -67,7 +76,7 @@ A key it does not know, or a value it cannot use, refuses the whole section: a t
 | `repo`                    | none                       | `OWNER/REPO` the checks look at (workflows-off's default)                         |
 | `reportRepo`              | none                       | `OWNER/REPO` of the report issue; none: `report.md` in the state folder only      |
 | `root`                    | none                       | the project's folder: each check runs in it; relative check options are inside it |
-| `schedule`                | `00:00`                    | the timer runs the project after this local time                                  |
+| `schedule`                | none                       | `HH:MM`: the timer runs the project after this local time; none: any time         |
 | `quietHours`              | none                       | `HH:MM-HH:MM` (may wrap past midnight): the timer runs it only inside them        |
 | `timeZone`                | the machine's              | for the day and the window                                                        |
 | `model`                   | none                       | `{endpoint, model, timeoutSeconds 120, maxFiles 5, maxFileBytes 20000}`           |
@@ -104,12 +113,16 @@ else (notes go to stderr), and exits 0:
 ```
 
 `id`, `severity` (`error`, `warn` or `info`) and `text` are required; `where` (a path relative to the root, or
-`OWNER/REPO: path`, ...) and `fix` (what a person does about it) are optional. Nothing else. Python checks can use
-`gardener.contract.read_context()` and `emit()`.
+`OWNER/REPO: path`, ...) and `fix` (what a person does about it) are optional. Nothing else. An `id` is a letter or
+digit, then up to 99 letters, digits, `.`, `_` or `-`. Python checks can use `gardener.contract.read_context()`
+and `emit()`.
 
 A check that cannot start, exits non-zero, runs past its timeout, prints a line that is not a finding or more than
-1 MiB becomes **one** finding `gardener.check-failed` (severity error) naming why; nothing else it printed is
-used. More than 200 findings are cut to 200 and one `gardener.more-findings`.
+256 KiB becomes **one** finding `gardener.check-failed` (severity error) naming why; nothing else it printed is
+used. Its output is read as it comes: past 256 KiB, or past its timeout, the check and everything it started is
+stopped, so a check that prints without end costs no memory. Only the last 4 KiB of its stderr are kept, for the
+local report. An error inside the gardener itself on one check is one such finding too, and the next check runs.
+More than 200 findings are cut to 200 and one `gardener.more-findings`.
 
 ### General checks
 
@@ -117,15 +130,18 @@ All report only, and none needs root. Options as in each script's header.
 
 - **context-budget**: instruction files (`files`: `{path: bytes}`), memory indexes (`memoryIndexes`: size,
   `indexMaxChars` 6000, lines over `indexMaxLine` 160, entries whose file is missing, files the index does not
-  list) and skills (`skillDirs`: each `*/SKILL.md` against `skillMaxBytes` 8000). Near a budget (`warnRatio` 0.85)
+  list) and skills (`skillDirs`: each `*/SKILL.md` against `skillMaxBytes` 8000; a missing or broken one is a
+  warning). Near a budget (`warnRatio` 0.85)
   is a note.
 - **facts**: `facts --check --no-records` of the [agent-guards](../agent-guards/README.md) kit, in the project
-  root: the machine's state tables and this project's, never `--all` (other projects' rows may be private). Not
-  installed: one note.
+  root: the machine's state tables and this project's, never `--all` (other projects' rows may be private). The
+  issue names rows only of a table inside the repository; the machine's tables are only counted. Not installed:
+  one note.
 - **worktrees**: git worktrees and local branches (`repos`, default the root) that are merged into the base
   (`base`, default `origin/HEAD`, else `origin/main`, else `main`) or whose upstream is gone, and unmerged worktrees
   whose last commit is older than `staleDays` (14). `ignore`: branch patterns. No fetch: "merged" is as of the
-  last fetch. With `fix`, it runs `git worktree prune` (records of worktrees whose folder is gone) and nothing
+  last fetch. A branch with no work of its own yet (a worktree just started) is not "merged". Fix hints quote every
+  name. With `fix`, it runs `git worktree prune` (records of worktrees whose folder is gone) and nothing
   else; removing worktrees and branches is the [cleaner](../cleaner/README.md) kit's job, or a person's.
 - **workflows-off**: GitHub Actions workflows of `repos` (default the project's `repo`) that are switched off, by
   hand or for inactivity; `ignore` lists workflow files meant to be off. One API call per repository. Never fixes:
@@ -136,46 +152,67 @@ All report only, and none needs root. Options as in each script's header.
 
 ## Report issue
 
-One issue per project in `reportRepo`, titled `Gardener report: NAME`. Its body holds a hidden marker line,
+One issue per project in `reportRepo`, titled `Gardener report: NAME`. The report repository may be public, so the
+issue is built from an allow-list and the full report stays on the machine (`report.md` in the state folder; the
+issue says so):
+
+- Per finding: its severity, check, id, and its `where` only when that is a path inside the project's repository
+  (relative) or `OWNER/REPO: path`; its text and fix with what still looks like a local name (a path, URL,
+  address, e-mail, a home folder encoded in a folder name) masked.
+- A finding whose `where` is outside the repository, or that has none, is only counted per check and id
+  (`<outside repo>`). The gardener's own findings are shown, with its fixed words.
+- A failed check shows its id and why in fixed words (`exited with code 1`); what it printed on stderr goes to the
+  local report only.
+- Notes are the gardener's own words; the model's endpoint is never shown (`model reachable` or `unreachable`).
+- The judgment is masked like the rest.
+
+A check must still not print secrets. Its body holds a hidden marker line,
 `<!-- gardener-report:NAME -->`; everything from the marker down is rewritten on each run (a table of findings by
 severity, notes, the judgment), and text a person writes above the marker is kept.
 
-- **Missing** (never made, deleted, moved): a search for the marker finds an open one, or a new one is opened.
+- **Missing** (never made, deleted, moved): a search by the title, then by the marker, finds an open one, or a new
+  one is opened.
 - **Closed**: left closed; a new one is opened. Closing the issue is how a person says "start over".
 - **Marker edited away by hand**: that issue is no longer the report and is left alone; a new one is opened.
 - **Two open issues with the marker**: the oldest is used, always the same one.
 
-Before it goes out, the report has the project root replaced by `.` and the home folder by `~`, so local paths do
-not reach a public issue. A check must still not print secrets. The body is kept under GitHub's size limit; findings
-that do not fit are counted, and `--dry-run` shows them all.
+The whole body (a person's text above the marker too) is kept under GitHub's size limit: findings that do not fit
+are counted, a person's text is cut with a note when it is too long, and `report.md` has them all.
 
-API calls per project per run: at most one issue read (the number the state remembers), one search (only when that
-read does not give the open report issue) and one write; checks make their own (workflows-off: one per
-repository). A GitHub error, a rate limit too, fails that project's run with exit 1 and no done marker, so the next
-hourly tick tries again; there are no retries inside a run.
+API calls per project per run: at most one issue read (the number the state remembers), up to two searches (by
+title, then by marker; only when that read does not give the open report issue) and one write; checks make their
+own (workflows-off: one per repository). A GitHub error, a rate limit too, fails that project's report with exit 1.
+The done marker is already written, so the checks do not run again: the next ticks try the issue alone, at most 3
+times a day; after that, the next day's run. There are no retries inside a run.
 
 ## Judgment
 
-Optional, and phase 1 is the interface only. With `model` set, the findings and a few of the files they name
-(`maxFiles`, each cut to `maxFileBytes`, only regular files inside the root) go to the endpoint's OpenAI-style
-`/chat/completions` in one request. The answer goes into the report under "Judgment". An endpoint that is not
-reachable, or answers with an error or nothing, is a note in the report and the run goes on. There is no fallback
-to a paid model, and the model never sees the whole repository.
+Optional, and phase 1 is the interface only. With `model` set, the findings as the issue shows them (nothing from
+outside the repository) and a few of the files they name (`maxFiles`, each cut to `maxFileBytes`, only files git
+tracks in the root: never an ignored or untracked file such as a local `.env`) go to the endpoint's OpenAI-style
+`/chat/completions` in one request. The answer goes into the report under "Judgment", masked like the rest of the
+issue. An endpoint that is not reachable, or answers with an error, nonsense or not HTTP at all, is a note
+(`model unreachable`) and the run goes on. The endpoint is never shown. There is no fallback to a paid model, and
+the model never sees the whole repository.
 
 ## State: runs again, stops half-way, old or empty state
 
-`<stateDir>/<name>/`, mode 700: `state.json` (`doneDay`, the report `issue` number, `lastRun`, the finding count),
-`report.md` (the last report) and `lock`. Both files are written to a temporary file and renamed into place.
+`<stateDir>/<name>/`, mode 700: `state.json` (`doneDay`, the report `issue` number, `lastRun`, the finding count,
+`reportPending` and `reportTries`), `report.md` (the last full report), `issue.md` (the last issue part) and
+`lock`. Each file is written to a temporary file and renamed into place.
 
 - **Runs again** the same day: the done marker; nothing runs and no API call. `--force` runs it again and updates
   the same issue. Two runs at once: the second finds the lock held and skips the project.
-- **Stopped half-way**: the done marker is written last, so a run stopped before it runs again on the next tick.
-  The issue number is saved as soon as the issue is written, and the marker search finds it even if that save was
-  lost, so a stop never makes a second issue.
-- **Old, broken or missing state:** read as empty, with a note in the report; the issue is found again by its
-  marker (one search).
+- **Stopped half-way**: stopped before the done marker, the run starts again on the next tick. Stopped after it,
+  the next tick sends the saved `issue.md` alone (`reportPending`). The issue number is saved once the issue is
+  written, and the title and marker searches find it even if that save was lost, so a stop never makes a second
+  issue.
+- **Old, broken or missing state:** read as empty, with a note in the report; the issue is found again by a
+  search. A state file of a **newer** version (a downgraded kit) is refused and kept: that project fails with
+  exit 1 until the kit is upgraded again (`--dry-run` still runs).
 - **Host off for days:** one run for today; days missed are not made up.
-- **One project fails** (a broken state folder, a GitHub error): the others still run; the exit code is 1.
+- **One project fails** (a broken state folder, a GitHub error, any error inside the gardener): the others still
+  run; the exit code is 1.
 
 ## Install
 
@@ -201,8 +238,9 @@ Files: `/usr/local/libexec/gardener/versions/<sha>/` (code, checks, with `MANIFE
 `/usr/local/bin/gardener`, `/usr/local/sbin/gardener-install`, `/etc/gardener/config.json` (only whether the timer
 units are installed) and `installed.tsv`, and with `--timer` the user units `gardener.service` and `gardener.timer`
 in `/etc/systemd/user/` (hourly, `Nice=10`, idle I/O, `UMask=0077`). `gardener-install self-check` reports drift.
-Upgrade: the bootstrap with the new sha. Remove: each user runs `systemctl --user disable --now gardener.timer`,
-then `gardener-install uninstall` as root. State folders and report issues stay.
+Upgrade: the bootstrap with the new sha. Remove: first each user runs `systemctl --user disable --now
+gardener.timer` (the uninstall says so before it removes the units), then `gardener-install uninstall` as root.
+State folders and report issues stay.
 
 ## Tests
 
