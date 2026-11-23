@@ -7,11 +7,12 @@ real HOME, it writes nothing), and the state files a hook writes in a configured
 sessions are removed afterwards.
 
 A hook that is not wired is reported as MISSING (a problem); agent-slots with no sessionsFile only gets its pass
-case (it does nothing for any session then).
+case (it does nothing for any session then); facts-hook wants context when the machine has a state table with a row,
+else nothing.
 """
 import json, os, shutil, signal, subprocess, tempfile
 
-from . import config, wiring
+from . import config, facts, wiring
 
 SESSION = 'agent-guards-check-'
 
@@ -115,6 +116,10 @@ def cases(tmp, sid):
         ('agent-slots', 'Stop', 'a session it does not watch', {'hook_event_name': 'Stop', 'session_id': sid},
          'passed', None),
     ]
+    tables = facts.places(config.load('facts')[0], tmp)   # read only: the machine's own tables, if any
+    out.append(('facts-hook', 'SessionStart', 'a new session',
+                {'hook_event_name': 'SessionStart', 'source': 'startup', 'session_id': sid, 'cwd': tmp},
+                'context' if any(p.rows() for p in tables) else 'passed', None))
     slots = config.load('agentSlots')[0]
     watched = []
     try:

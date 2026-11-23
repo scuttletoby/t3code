@@ -1,0 +1,75 @@
+#!/usr/bin/python3 -IB
+"""facts: look up what we made for a thing and its state now, in the state tables (fork-kit/agent-guards/FACTS.md).
+
+  facts WORDS...     the rows that hold every word (any case), with their table's header; Thing-column hits first.
+                     No row with all of them: the rows with some, and it says so
+  facts --index      every thing, one per line, under its table file
+  facts --dirs       where it looked: each configured entry, where it was configured, and what it found
+  facts --check      the gardener's check, report only: rows whose Updated is older than staleDays (or has no date),
+                     tables over maxRows rows, broken rows, entries that are missing or empty (exit 1 when any)
+  --all              every configured project's tables too, not only the machine's and this folder's project's
+                     (--check always reads every one)
+
+The tables come from the machine file's "agent-guards" section, part "facts" (dirs, projects); FACTS_DIRS (paths
+joined by ":") replaces them. A missing or empty folder, or a broken row, is a note: the rest is still shown.
+Read only. Tests: fork-kit/agent-guards/tests/facts.test.py
+"""
+import datetime, os, sys
+
+_kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(_kit, 'lib'))
+
+PROG = 'facts'
+
+
+def main(argv):
+    if not argv or argv[0] in ('-h', '--help'):
+        print(__doc__.strip())
+        return 0 if argv else 1
+    from agent_guards import config, facts
+    every = '--all' in argv
+    argv = [a for a in argv if a != '--all']
+    modes = [a for a in argv if a in ('--index', '--dirs', '--check')]
+    words = [a for a in argv if a not in modes]
+    bad = [a for a in words if a.startswith('--')]
+    if len(modes) > 1 or (modes and words) or bad or (not modes and not words):
+        print(f'{PROG}: use one of: WORDS..., --index, --dirs, --check (and --all); see {PROG} --help',
+              file=sys.stderr)
+        return 1
+    c, problem = config.load('facts')
+    if problem:
+        print(f'note: {config.problem_text(PROG, problem)}')
+    mode = modes[0] if modes else None
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ''
+    found = facts.places(c, cwd, every=every or mode == '--check')
+    if not found:
+        print(f'{PROG}: no state table is configured for this folder (machine file "agent-guards" part "facts": '
+              'dirs, projects; or FACTS_DIRS)')
+        return 0
+    if mode == '--dirs':
+        for p in found:
+            what = (f'{len(p.rows())} rows in {len(p.tables)} table(s)' if p.tables else
+                    '; '.join(p.notes) or 'no table')
+            print(f'{p.entry} ({p.source}): {p.file or "-"}: {what}')
+        return 0
+    if mode == '--check':
+        out = facts.check(found, c['staleDays'], c['maxRows'], datetime.date.today())
+        for line in out:
+            print(f'{PROG} check: {line}')
+        rows = sum(len(p.rows()) for p in found)
+        print(f'{PROG} check: ' + (f'{len(out)} finding(s)' if out else
+                                   f'OK ({sum(1 for p in found if p.tables)} table file(s), {rows} rows)'))
+        return 1 if out else 0
+    lines = facts.index(found) if mode == '--index' else facts.search(found, words)
+    for line in lines:
+        print(line)
+    for n in facts.notes(found):
+        print(f'note: {n}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

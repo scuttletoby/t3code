@@ -14,7 +14,9 @@ names every problem, unknown keys too.
     "memoryIndex":    {"maxChars": 6000, "maxLine": 160, "stateDir": "~/.cache/memory-index-guard"},
     "bgGuard":        {"skipSessionsFiles": [], "maxBlocks": 3, "stateDir": "~/.local/state/bg-guard"},
     "agentSlots":     {"sessionsFile": "", "queue": "", "readyHeading": "## Ready", "maxAlive": 10,
-                       "processName": "claude", "note": ""}
+                       "processName": "claude", "note": ""},
+    "facts":          {"dirs": [], "staleDays": 30, "maxRows": 60, "indexLines": 40,
+                       "projects": [{"match": "github.com/owner/repo", "dirs": ["/srv/repo-facts"], "text": ""}]}
   }
 
 Paths are absolute or start with "~/" (each user's own home). Plain Python 3 standard library.
@@ -62,6 +64,14 @@ def _commands(value):
     return None
 
 
+def _projects(value):
+    for k, v in enumerate(value):
+        p = _project_problem(k, v)
+        if p:
+            return p
+    return None
+
+
 def _scripts(value):
     for k, v in enumerate(value):
         p = _row_problem(k, v)
@@ -96,6 +106,13 @@ SPEC = {
         'processName': (str, 'claude', lambda v: None if COMMAND_RE.match(v) else 'must be a process name'),
         'note': (str, '', None),
     },
+    'facts': {
+        'dirs': (list, [], _paths),
+        'staleDays': (int, 30, _positive),
+        'maxRows': (int, 60, _positive),
+        'indexLines': (int, 40, _positive),
+        'projects': (list, [], _projects),
+    },
 }
 HOOKS = tuple(SPEC)
 
@@ -117,6 +134,24 @@ def _row_problem(k, v):
     return None
 
 
+def _project_problem(k, v):
+    """The problem of one facts.projects row, or None."""
+    if not isinstance(v, dict) or set(v) - {'match', 'dirs', 'text'} or not isinstance(v.get('match'), str) \
+            or not isinstance(v.get('dirs', []), list) or not isinstance(v.get('text', ''), str):
+        return f'entry {k} must be {{"match": "<host/owner/repo or a folder>", "dirs": [<paths>], "text": "<text>"}}'
+    m = v['match']
+    if m.startswith('/') or m.startswith('~/'):
+        if _path(m):
+            return f'entry {k}: "match" {m!r} {_path(m)}'
+    elif not re.match(r'^[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/-]+$', m):
+        return f'entry {k}: "match" must be a remote as host/owner/repo or a folder, not {m!r}'
+    p = _paths(v.get('dirs', []))
+    return f'entry {k}: "dirs": {p}' if p else None
+
+
+ROW_CHECKS = {'refuseScripts': _row_problem, 'projects': _project_problem}
+
+
 def _own(section, hook):
     """(settings, [problems]) of one hook from its own part of the section. Each key is checked on its own: a bad
     key keeps its built-in default (and is named), the others keep their values; a bad refuseScripts row is dropped
@@ -131,12 +166,12 @@ def _own(section, hook):
         if key not in SPEC[hook]:
             problems.append(f'{where}: unknown key {key!r} (ignored; known: {", ".join(sorted(SPEC[hook]))})')
             continue
-        if key == 'refuseScripts' and isinstance(value, list):
+        if key in ROW_CHECKS and isinstance(value, list):
             rows = []
             for k, row in enumerate(value):
-                p = _row_problem(k, row)
+                p = ROW_CHECKS[key](k, row)
                 if p:
-                    problems.append(f'{where}.refuseScripts: {p} (that entry is left out)')
+                    problems.append(f'{where}.{key}: {p} (that entry is left out)')
                 else:
                     rows.append(row)
             out[key] = rows

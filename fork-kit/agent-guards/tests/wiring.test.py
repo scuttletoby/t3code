@@ -52,7 +52,8 @@ class Entries(unittest.TestCase):
                          sorted([('PreToolUse', 'Write|Edit|MultiEdit', [5]), ('PreToolUse', 'Bash|Monitor', [10]),
                                  ('PreToolUse', 'Bash|Monitor', [10]),
                                  ('PostToolUse', 'Write|Edit|MultiEdit|Bash|Monitor', [5]),
-                                 ('UserPromptSubmit', None, [5]), ('Stop', None, [5, 5])]))
+                                 ('UserPromptSubmit', None, [5]), ('Stop', None, [5, 5]),
+                                 ('SessionStart', None, [5]), ('PreCompact', None, [5])]))
         for _e, _m, cmd in wiring.commands_in({'hooks': wiring.hooks()}):
             self.assertIn('/usr/local/bin/', cmd)
             self.assertIn('/usr/bin/python3 -IB "$g"', cmd)
@@ -182,7 +183,7 @@ class Check(unittest.TestCase):
     def test_the_kit_entries_pass(self):
         code, lines = self.run_check(self.settings)
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 13, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 14, '\n'.join(lines))
         self.assertEqual(lines[-1], 'check: test settings: OK')
         # lens A nit: the hooks ran with HOME in check's own temporary folder; nothing (log, cache, state) is
         # written in the caller's HOME
