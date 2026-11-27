@@ -36,6 +36,7 @@ const {
   writeRecords,
   command,
   NODE_COUNTS,
+  fileLimit,
 } = require("./fork-ci-tests.cjs");
 
 const never = () => false;
@@ -879,6 +880,83 @@ test("a process a test leaves behind holding its output does not hang the run", 
     try {
       process.kill(Number(fs.readFileSync(path.join(root, "left.pid"), "utf8")));
     } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a test file's time limit: FORK_CI_TEST_LIMIT, else 3 times its weight and at least 240 s (#1070)", () => {
+  assert.equal(fileLimit(null, {}), 240);
+  assert.equal(fileLimit(30, {}), 240);
+  assert.equal(fileLimit(120, {}), 360);
+  assert.equal(fileLimit(120, { FORK_CI_TEST_LIMIT: "" }), 360);
+  assert.equal(fileLimit(120, { FORK_CI_TEST_LIMIT: "2" }), 2);
+  assert.equal(fileLimit(null, { FORK_CI_TEST_LIMIT: "0.5" }), 0.5);
+  for (const bad of ["0", "-1", "x", "1e3", " 5", "Infinity"])
+    assert.throws(() => fileLimit(10, { FORK_CI_TEST_LIMIT: bad }), /FORK_CI_TEST_LIMIT/, bad);
+});
+
+// A test that never ends fails at its time limit, quickly, with its file named and its last output lines shown
+// outside the group, and the run goes on to the next file. The 60 s limit of runScript() is the hang this replaces.
+test("a test file that never ends is stopped at its time limit and fails, naming the file (#1070)", () => {
+  const { root, run } = runScript(
+    {
+      // Ignores SIGTERM too: SIGKILL follows.
+      "fork-ci/hang.test.sh": "trap '' TERM; echo hang-started; sleep 30 & wait; sleep 30\n",
+      "fork-ci/after.test.sh": "echo after-ran\n",
+    },
+    1,
+    [],
+    "fork-ci/hang.test.sh\nfork-ci/after.test.sh",
+    { FORK_CI_TEST_LIMIT: "1" },
+  );
+  try {
+    assert.equal(run.error, undefined, String(run.error)); // not killed at the 60 s limit
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    assert.match(
+      run.stdout,
+      /::error file=fork-ci\/hang\.test\.sh::fork-ci\/hang\.test\.sh timed out after 1 s/,
+    );
+    assert.match(run.stdout, /Last \d+ line\(s\) of fork-ci\/hang\.test\.sh:\nhang-started\n/);
+    assert.match(run.stdout, /did not end within 1 s: stopping it/);
+    assert.match(run.stdout, /::group::fork-ci\/after\.test\.sh[^\n]*\nafter-ran\n/);
+    assert.doesNotMatch(run.stdout, /::error file=fork-ci\/after\.test\.sh/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The case that hung the runner: a Python test file whose failing test leaves a thread that never ends (its cleanup never ran), so
+// the file does not end after unittest's summary. It fails at its limit with what it printed (not lost in a buffer)
+// and where each thread was (fork-ci-unittest.py's stack dump on SIGTERM).
+test("a failing Python test file that never ends shows its output and its threads' stacks (#1070)", () => {
+  const py = [
+    "import threading, unittest",
+    "stop = threading.Event()",
+    "def waits_for_ever():",
+    "    stop.wait()",
+    "class T(unittest.TestCase):",
+    "    def test_leaves_a_thread(self):",
+    "        threading.Thread(target=waits_for_ever).start()  # not a daemon: the file cannot end",
+    "        print('printed-before-the-hang')",
+    "        self.fail('this test fails before its cleanup would stop the thread')",
+    "unittest.main()",
+    "",
+  ].join("\n");
+  const { root, run } = runScript(
+    { "fork-ci/hang.test.py": py },
+    1,
+    [],
+    "fork-ci/hang.test.py unittest",
+    { FORK_CI_TEST_LIMIT: "2" },
+  );
+  try {
+    assert.equal(run.error, undefined, String(run.error));
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    assert.match(run.stdout, /fork-ci\/hang\.test\.py timed out after 2 s/);
+    assert.match(run.stdout, /printed-before-the-hang/);
+    assert.match(run.stdout, /FAILED \(failures=1\)/);
+    assert.match(run.stdout, /in waits_for_ever/); // the stack of the thread that kept it running
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

@@ -247,6 +247,23 @@ function readShard(env = process.env) {
   return { index: Number(match[1]), count: Number(match[2]) };
 }
 
+// A test file's time limit in seconds: FORK_CI_TEST_LIMIT when set, else LIMIT_TIMES its weight, at least LIMIT_FLOOR.
+// Under the jobs' limits, so a test that never ends fails with its file named and its output shown, not the whole job
+// at its timeout with nothing shown (runTest() prints output only once a test ends). A setting that is not a positive
+// number throws, so a typo cannot lift every limit.
+const LIMIT_FLOOR = 240;
+const LIMIT_TIMES = 3;
+function fileLimit(weight, env = process.env) {
+  const value = env.FORK_CI_TEST_LIMIT ?? "";
+  if (value !== "") {
+    const seconds = Number(value);
+    if (!/^\d+(?:\.\d+)?$/.test(value) || !(seconds > 0))
+      throw new Error(`FORK_CI_TEST_LIMIT="${value}": expected a number of seconds above 0`);
+    return seconds;
+  }
+  return Math.max(LIMIT_FLOOR, LIMIT_TIMES * (weight ?? 0));
+}
+
 // Whether `file` is in the part the arguments name: under one of the `<prefix>` ones (any, when there are none),
 // and under none of the `!<prefix>` ones.
 function inPart(file, parts) {
@@ -843,10 +860,17 @@ function readCounts(file) {
     });
 }
 
+// The last lines of a test's output a failure repeats outside its group (GitHub shows a group folded).
+const TAIL_LINES = 20;
+// After a test's time limit: SIGTERM, then SIGKILL this long after, then the test counts as ended this long after that
+// even if it has not (a process as root this user cannot signal).
+const KILL_GRACE_MS = 5000;
+
 // Runs one test file (`run`: one of its own runs), its stdout and stderr shown together as one group when it ends, and
 // each also kept on its own (countTests()), with a Python or node test's counts (`unittest`, readCounts()) from a file
 // of this run only: a new folder each time, made here (so a run as root adds to a file this user owns), then removed.
-function runTest(file, run = null) {
+// `limit`: seconds (fileLimit()) after which the test is stopped and fails as timed out; none without one.
+function runTest(file, run = null, { limit = null } = {}) {
   const countsDir = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-counts-"));
   const counts = path.join(countsDir, "counts.jsonl");
   fs.writeFileSync(counts, "", { flag: "wx", mode: 0o644 });
@@ -871,19 +895,29 @@ function runTest(file, run = null) {
       stderr.push(chunk);
     });
     let ended = false;
+    let timedOut = false;
+    const timers = [];
     const done = (status, signal) => {
       if (ended) return;
       ended = true;
+      for (const timer of timers) clearTimeout(timer);
       // Stop reading pipes a left-behind process still holds, so they do not keep this script alive.
       child.stdout.destroy();
       child.stderr.destroy();
+      if (timedOut) child.unref(); // a process it could not stop must not keep this script alive either
       const seconds = ((Date.now() - started) / 1000).toFixed(1);
       const label = run ? ` --run ${runLabel(run)}`.trimEnd() : "";
+      const text = Buffer.concat(output);
       process.stdout.write(`::group::${file}${label} (${seconds} s)\n`);
-      process.stdout.write(Buffer.concat(output));
+      process.stdout.write(text);
       process.stdout.write("\n::endgroup::\n");
-      if (status !== 0)
-        console.log(`::error file=${file}::${file}${label} failed (exit ${status ?? signal})`);
+      if (timedOut) status = null;
+      if (status !== 0) {
+        const why = timedOut ? `timed out after ${limit} s` : `failed (exit ${status ?? signal})`;
+        console.log(`::error file=${file}::${file}${label} ${why}`);
+        const tail = text.toString("utf8").trimEnd().split("\n").slice(-TAIL_LINES);
+        console.log(`Last ${tail.length} line(s) of ${file}${label}:\n${tail.join("\n")}`);
+      }
       const unittest = readCounts(counts);
       fs.rmSync(countsDir, { recursive: true, force: true });
       resolve({
@@ -902,6 +936,26 @@ function runTest(file, run = null) {
     child.on("close", done);
     // A process the test left behind may hold the pipes open: the test is done when it exits.
     child.on("exit", (status, signal) => setTimeout(() => done(status, signal), 5000).unref());
+    // A test that never ends (a thread, a child or a read that waits for ever) is stopped at its limit and fails.
+    const stop = (sig) => {
+      try {
+        child.kill(sig);
+      } catch {}
+    };
+    if (limit !== null)
+      timers.push(
+        setTimeout(() => {
+          timedOut = true;
+          output.push(
+            Buffer.from(
+              `\nfork-ci-tests: ${file} did not end within ${limit} s: stopping it (SIGTERM, then SIGKILL)\n`,
+            ),
+          );
+          stop("SIGTERM");
+          timers.push(setTimeout(() => stop("SIGKILL"), KILL_GRACE_MS));
+          timers.push(setTimeout(() => done(null, "timeout"), 2 * KILL_GRACE_MS));
+        }, limit * 1000),
+      );
   });
 }
 
@@ -931,7 +985,7 @@ async function runOwn(args, { runTest: run = runTest } = {}) {
   }
   const results = [];
   for (const how of own.runs) {
-    const result = await run(file, how);
+    const result = await run(file, how, { limit: fileLimit(entry.weight) });
     results.push(record(runKey(file, how), file, how, result, [], entry.format));
   }
   let failed = results.filter((r) => r.status !== 0).length;
@@ -1000,7 +1054,10 @@ async function main(
   const mine = shard(result.run, entries, index, count);
   const jobs = jobCount();
   const started = now();
-  const runs = await runAll(order(mine, entries), jobs, (file) => run(file));
+  const limits = new Map(mine.map((file) => [file, fileLimit(weight.get(file))]));
+  const runs = await runAll(order(mine, entries), jobs, (file) =>
+    run(file, null, { limit: limits.get(file) }),
+  );
   const seconds = (now() - started) / 1000;
   const judged = judge(runs, weight);
   const { speed } = judged;
@@ -1100,6 +1157,7 @@ async function main(
 
 module.exports = {
   plan,
+  fileLimit,
   jsCode,
   readList,
   order,
