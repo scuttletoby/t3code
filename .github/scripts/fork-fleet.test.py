@@ -16,7 +16,7 @@ fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate a
 # fork-ci: run as root with FORK_FLEET_ROOT_TESTS=1 only LauncherAsRoot
 import ast, copy, datetime, glob, grp, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat
 import shlex, subprocess, sys, tempfile, textwrap, time
-import unittest, urllib.error, urllib.parse
+import unittest, unittest.mock, urllib.error, urllib.parse
 from contextlib import redirect_stdout, suppress
 from functools import partial
 
@@ -1426,6 +1426,43 @@ class Dispatch(unittest.TestCase):
         self.dispatch()
         self.assertEqual(json.loads(self.gh.variables[POOLS[WAITING]['beacon']])['free'], 0)
 
+    def test_free_counts_how_many_of_the_biggest_job_fit_not_only_whether_one_does(self):
+        """Fix 1: a pool with slots for 4 but memory for 2 tells route 2. Route hands a pool up to `free` jobs of a
+        run; a job routed there that never fits waits until the watch cancels the run and re-runs it hosted."""
+        biggest = max(MEMORY.values())
+        many = {**CFG, 'pools': [{**p, 'slots': 4} for p in CFG['pools']]}
+        self.hosts = {name: ff.Host(many['pools'][i], run=self.fake[name].run) for i, name in enumerate(POOLS)}
+        self.fake[WAITING].memory_ok = lambda mb: mb <= 2 * biggest
+        quiet(ff.dispatch_pass, many, self.gh, self.hosts, self.state, now=lambda: self.clock[0])
+        self.assertEqual(json.loads(self.gh.variables[POOLS[WAITING]['beacon']])['free'], 2)
+        self.assertEqual(json.loads(self.gh.variables[POOLS[FIRST]['beacon']])['free'], 4)   # memory for all 4
+
+    def test_a_dispatcher_exits_when_its_config_changes_so_its_unit_starts_it_again(self):
+        """Fix 5: both dispatcher units (the vm pool's and each desk pool's) pick up new files by themselves."""
+        with tempfile.TemporaryDirectory() as d:
+            token, config = os.path.join(d, 'token'), os.path.join(d, 'fork-fleet.json')
+            with open(token, 'w') as f:
+                f.write('tok\n')
+            os.chmod(token, 0o600)
+            shutil.copy(ff.CONFIG, config)
+            passes = []
+
+            def sleep(_):
+                passes.append(1)
+                if len(passes) > 3:
+                    raise AssertionError('the dispatcher kept going with its old config')
+                if len(passes) == 2:
+                    with open(config, 'a') as f:
+                        f.write('\n')
+
+            args = ff.argparse.Namespace(pool=[WAITING], token_file=token, lock_dir=os.path.join(d, 'locks'),
+                                         once=False, config=config)
+            with unittest.mock.patch.object(ff, 'dispatch_pass') as one, unittest.mock.patch.object(ff, 'GitHub'):
+                got, log = quiet(ff.cmd_dispatch, CFG, args, sleep=sleep)
+            self.assertEqual((got, one.call_count), (0, 2))
+            self.assertIn(f'{config} changed since this dispatcher started', log)
+            os.close(ff.take_locks(os.path.join(d, 'locks'), [WAITING])[0])   # and it let go of its lock
+
     def test_a_beacon_write_other_than_missing_fails(self):
         self.gh.trouble.append((r'PATCH actions/variables/\w+', http_error(403)))
         with self.assertRaises(urllib.error.HTTPError):
@@ -1623,6 +1660,9 @@ class Launcher(unittest.TestCase):
                   'SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS',
                   'SystemCallArchitectures=native')
     USERS = ('nobody', 'daemon')   # two slots: two users of their own (in CI and here, each in its own group only)
+    # A job unit's own limits with no JOB_* settings: (16000 MB MemTotal - 2048 RESERVE_MB) / 2 RUNNER_USERS.
+    LIMITS = ('-p', 'MemoryMax=6976M', '-p', 'MemoryHigh=6278M', '-p', 'MemorySwapMax=0M', '-p', 'CPUWeight=50',
+              '-p', 'CPUQuota=', '-p', 'OOMScoreAdjust=500', '-p', 'OOMPolicy=kill')
     NAME = 'fleet-vm-t3code-11'
     JIT = 'SklUc2VjcmV0'
     INPUT = f'ACTIONS_RUNNER_INPUT_JITCONFIG={JIT}\nFORK_FLEET_RUN=5\nFORK_FLEET_ATTEMPT=1\n'
@@ -1750,7 +1790,8 @@ class Launcher(unittest.TestCase):
                                 '--working-directory', dest, '-p', 'Type=exec', '-p', 'KillMode=control-group',
                                 '-p', f'EnvironmentFile={run_dir}/{self.NAME}.env',
                                 *self.sandbox('nobody', f'{run_dir}/{self.NAME}.root', dest),
-                                '-p', f'ReadWritePaths={dest}', '-p', 'RuntimeMaxSec=3600', '-p', 'TimeoutStopSec=90',
+                                '-p', f'ReadWritePaths={dest}', *self.LIMITS,
+                                '-p', 'RuntimeMaxSec=3600', '-p', 'TimeoutStopSec=90',
                                 '-p', 'TimeoutAbortSec=90', '--', f'{dest}/run.sh'])
         # HOME and TMPDIR inside the copy, which goes once its unit is gone: nothing of a job reaches the next one.
         self.assertEqual(self.rec_text('env'), self.INPUT + f'HOME={dest}/home\nTMPDIR={dest}/tmp\n'
@@ -1770,6 +1811,47 @@ class Launcher(unittest.TestCase):
         self.assertEqual(self.rec_text('shown'), f'{SHOW_ARGS} fork-fleet-{self.NAME}.service\n')
         self.assertIsNone(self.rec_text('killed'))
         self.assertIsNone(self.rec_text('stopped'))
+
+    def test_a_job_unit_gets_memory_cpu_and_oom_limits_of_its_own(self):
+        """Fix 2: a job that runs away is held (MemoryHigh, CPUWeight), killed alone (MemoryMax, no swap, OOMPolicy=kill)
+        and, should the host itself run out, killed before the host's own processes (OOMScoreAdjust). launch.conf sets
+        each; a value that would let a job outlive the host's own work, or that is not a number, refuses every start.
+        State: each start reads the conf and MemTotal again, so a changed setting reaches the next job."""
+        def limits():
+            return [w for w in self.rec_text('systemd-run').splitlines() if w.split('=')[0] in {
+                'MemoryMax', 'MemoryHigh', 'MemorySwapMax', 'CPUWeight', 'CPUQuota', 'OOMScoreAdjust', 'OOMPolicy'}]
+        self.conf(JOB_MEMORY_MAX_MB='4096', JOB_SWAP_MAX_MB='512', JOB_CPU_WEIGHT='20', JOB_CPU_QUOTA='300',
+                  JOB_OOM_SCORE_ADJUST='1000')
+        got = self.launch('start', self.NAME, stdin=self.INPUT)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(limits(), ['MemoryMax=4096M', 'MemoryHigh=3686M', 'MemorySwapMax=512M', 'CPUWeight=20',
+                                    'CPUQuota=300%', 'OOMScoreAdjust=1000', 'OOMPolicy=kill'])
+        refused = {'JOB_OOM_SCORE_ADJUST': ['0', '-500', '1001', 'x'], 'JOB_CPU_WEIGHT': ['0', '10001', '08'],
+                   'JOB_CPU_QUOTA': ['0', '50.5', '1%'], 'JOB_MEMORY_MAX_MB': ['1e3', '-1', '012'],
+                   'JOB_SWAP_MAX_MB': ['', 'all']}
+        for key, values in refused.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    with suppress(FileNotFoundError):
+                        os.remove(os.path.join(self.rec, 'systemd-run'))
+                    self.conf(**{key: value})
+                    if not value:   # conf() leaves empty ones out
+                        with open(self.path('launch.conf'), 'a') as f:
+                            f.write(f'{key}=\n')
+                    got = self.launch('start', f'fleet-vm-t3code-{20 + len(value)}', stdin=self.INPUT)
+                    self.assertNotEqual(got.returncode, 0)
+                    self.assertIn(key, got.stderr)
+                    self.assertIsNone(self.rec_text('systemd-run'))
+        # Too little memory for a job's share, or a MemoryHigh over MemoryMax: no start either.
+        for i, (over, why) in enumerate((({'JOB_MEMORY_MAX_MB': '512'}, 'under 1024 MB'),
+                                         ({'RESERVE_MB': '14000'}, 'under 1024 MB'),
+                                         ({'JOB_MEMORY_MAX_MB': '2048', 'JOB_MEMORY_HIGH_MB': '4096'}, 'over the job'))):
+            with self.subTest(over=over):
+                self.conf(**over)
+                got = self.launch('start', f'fleet-vm-t3code-4{i}', stdin=self.INPUT)
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn(why, got.stderr)
+                self.assertIsNone(self.rec_text('systemd-run'))
 
     def test_start_kills_a_unit_whose_applied_stop_timeouts_are_over_stop_max(self):
         """Issues #365 item 1, #636: start reads what systemd really applies to the unit it just started (a drop-in or a
@@ -4260,7 +4342,7 @@ class LauncherAsRoot(unittest.TestCase):
         for d in ('template', 'template/bin'):
             os.chmod(self.path(d), 0o755)
         self.hook = Launcher.write(self, 'hook.sh', '#!/bin/sh\n', 0o755)
-        Launcher.write(self, 'meminfo', 'MemAvailable:    8388608 kB\n', 0o644)
+        Launcher.write(self, 'meminfo', 'MemTotal:       16384000 kB\nMemAvailable:    8388608 kB\n', 0o644)
         Launcher.write(self, 'resolv.conf', 'nameserver 1.1.1.1\n', 0o644)
         Launcher.write(self, 'ip_forward', '1\n', 0o644)
         with open(os.path.join(os.path.dirname(LAUNCH), 'fork-fleet-job-paths.txt')) as f:
@@ -5020,6 +5102,53 @@ def draft(is_draft, **kw):
 def private(event):
     """The event as a private repository's run has it (GitHub puts the repository in every event payload)."""
     return dict(event, repository=dict(event.get('repository') or {}, **PRIVATE)) if isinstance(event, dict) else event
+
+
+class Runbook(unittest.TestCase):
+    """What .github/fork-fleet.md tells the owner to run must work with this code."""
+    with open(os.path.join(HERE, '..', 'fork-fleet.md'), encoding='utf-8') as f:
+        DOC = f.read()
+
+    def section(self, title):
+        start = self.DOC.index(f'\n## {title}')
+        end = self.DOC.find('\n## ', start + 1)
+        return self.DOC[start:end if end > 0 else None]
+
+    def test_the_proof_workflows_re_run_of_one_job_asks_for_its_own_attempt(self):
+        """Fix 3 (proof check 4): a re-run of `lint` alone keeps the first job's outputs, so a label that the first job
+        made with the attempt in it stays -a1, which the dispatcher refuses for attempt 2 and no runner ever takes. The
+        attempt must come from lint's own runs-on, as fork-tests.yml does; the dispatcher starts that job."""
+        proof = self.section('Real-runner check')
+        made = re.search(r'writes `label=(fleet-proof-t3code-lint-)<16 hex>`', proof)
+        runs_on = re.search(r"`runs-on: \$\{\{ fromJSON\(format\('([^']*)', ([\w.<>]+), ([\w.]+)\)\) \}\}`", proof)
+        self.assertTrue(made and runs_on, 'the proof workflow recipe changed: keep its labels checked here')
+        self.assertEqual(runs_on.group(2, 3), ('needs.<first>.outputs.label', 'github.run_attempt'))
+        label = made.group(1) + NONCE
+        for attempt in (1, 2):   # format(), as GitHub does it: {N} is the argument after the text
+            got = json.loads(runs_on.group(1).replace('{0}', label).replace('{1}', str(attempt)))
+            self.assertEqual(got, ['fleet-proof-t3code', f'{label}-a{attempt}'])
+            read = ff.NONCE.fullmatch(got[1].removeprefix('fleet-proof-t3code-'))   # as the dispatcher reads it
+            self.assertEqual((read['key'], read['attempt']), ('lint', str(attempt)))
+
+    def test_the_rollback_removes_every_pools_heartbeat_and_stops_every_dispatcher(self):
+        """Fix 6: switched off, nothing of the fleet is left in the repository: each dispatched pool's FLEET_BEACON_*
+        variable is deleted, each dispatcher unit stopped (the vm pool's and each desk pool's), and the offline
+        one-job runners a stopped dispatcher leaves are listed by the pools' labels."""
+        back = self.section('Rollback')
+        self.assertIn('gh variable set CI_RUNNERS -R scuttletoby/t3code --body github', back)
+        for p in ff.dispatched(CFG):
+            with self.subTest(pool=p['name']):
+                self.assertIn(f'gh variable delete {p["beacon"]} -R scuttletoby/t3code', back)
+                unit = 't3code-fleet-dispatcher' + ('' if p['waits'] else f'-{p["name"]}')
+                self.assertRegex(back, rf'systemctl disable --now [^\n]*\b{re.escape(unit)}( |\n)')
+                names = re.search(r'test\("(\^[^"]+)"\)', back)
+                self.assertTrue(names and re.match(names.group(1), f'{p["label"]}-12345'))
+
+    def test_the_host_steps_say_every_dispatcher_restarts_by_itself(self):
+        """Fix 5: a config change on the host reaches both dispatcher units, not only the vm pool's."""
+        host = self.section('Host setup')
+        self.assertIn('systemctl restart t3code-fleet-dispatcher t3code-fleet-dispatcher-pc', host)
+        self.assertIn('Restart=always', host)
 
 
 class AnyRepository(unittest.TestCase):

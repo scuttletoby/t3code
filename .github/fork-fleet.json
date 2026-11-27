@@ -26,10 +26,10 @@
   },
   "pools": [
     {
-      "_doc": "The owner's PC, a desk pool: its desk agent dials out to the always-on host, whose dispatcher for this pool starts runners on the PC through that link (fork-fleet.md, The desk link).",
+      "_doc": "The owner's PC, a desk pool: its desk agent dials out to the always-on host, whose dispatcher for this pool starts runners on the PC through that link (fork-fleet.md, The desk link). Slots 4: its heartbeat counts only the slots its memory admits (the biggest job's memory_mb each), so a busy PC is sent fewer jobs, and each job unit has its own MemoryMax (the launcher's JOB_MEMORY_MAX_MB).",
       "name": "pc",
       "label": "fleet-pc-t3code",
-      "slots": 1,
+      "slots": 4,
       "beacon": "FLEET_BEACON_PC",
       "launch": ["python3", "-I", "/opt/fork-fleet/fork-fleet-desk.py", "launch", "pc"],
       "waits": false
