@@ -1,10 +1,11 @@
 /**
  * Fork: lens_start's reads on a server (lensStartServer.ts), over a fake `gh`/`git` runner: files at the base ref and
  * a 404, GraphQL pages (missing, capped, pending reviews and comments), GitHub's compare (its cap, a missing or
- * nameless file list), whether a stored child still runs, and the after-CI start waiting for its thread's run.
+ * nameless file list), whether a stored child still runs, the after-CI start waiting for its thread's run, and
+ * lens_report's post (once, also for a repeat, two at once or a post whose answer was lost).
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import { ProjectId, ThreadId } from "@t3tools/contracts";
 import type { WaitRecord } from "@t3tools/contracts/waitFor";
 import * as Effect from "effect/Effect";
@@ -30,7 +31,7 @@ const PROJECT = ProjectId.make("project-a");
 const HEAD = "a".repeat(40);
 
 type Answer = Partial<Omit<ProcessRunner.ProcessRunOutput, "code">> & { readonly code?: number };
-type Script = (command: string, args: ReadonlyArray<string>) => Answer;
+type Script = (command: string, args: ReadonlyArray<string>, stdin?: string) => Answer;
 
 const output = (answer: Answer) =>
   ({
@@ -49,7 +50,14 @@ const output = (answer: Answer) =>
 const scene = (script: { current: Script }, shells: Map<string, unknown>) =>
   Layer.mergeAll(
     Layer.mock(ProcessRunner.ProcessRunner)({
-      run: (input) => Effect.sync(() => output(script.current(input.command, input.args))),
+      // A few turns before each answer, as a real process takes: two calls at once interleave.
+      run: (input) =>
+        Effect.yieldNow.pipe(
+          Effect.repeat({ times: 3 }),
+          Effect.andThen(
+            Effect.sync(() => output(script.current(input.command, input.args, input.stdin))),
+          ),
+        ),
     }),
     Layer.mock(ThreadManagement.ThreadManagementService)({
       getThreadShell: (threadId) => Effect.succeed((shells.get(threadId) ?? null) as never),
@@ -386,4 +394,119 @@ it.layer(NodeServices.layer)("lens_start's server reads", (it) => {
       }),
     ),
   );
+
+  describe("lens_report posts a lens child's report", () => {
+    const BODY = "state: fine\nblocker: none\nmajor: none";
+    const COMMENT = `lens: code · reviewer: model-x · read at: ${HEAD}\n\n${BODY}`;
+    const child = {
+      requestId: "lens/owner/repo#7/aaaaaaa/code",
+      key: "code",
+      prs: [{ number: 7, head: HEAD }],
+      taskId: "task-1",
+      childThreadId: CHILD_THREAD,
+      parentThreadId: THREAD,
+      startedAt: "2026-11-22T11:59:30Z",
+    };
+    /** GitHub with the comments posted so far; `failPost` drops the answer of a post GitHub took. */
+    const github = () => {
+      const comments: Array<string> = [];
+      const posts: Array<{ args: ReadonlyArray<string>; stdin: string | undefined }> = [];
+      const state = { failPost: false };
+      const script: Script = (_, args, stdin) => {
+        if (args.includes("POST")) {
+          posts.push({ args, stdin });
+          comments.push((JSON.parse(stdin ?? "{}") as { body: string }).body);
+          return state.failPost
+            ? { code: 1, stderr: "connection reset" }
+            : { stdout: JSON.stringify({ html_url: "https://example.test/pull/7#c9" }) };
+        }
+        return connectionOf(args) === "comments"
+          ? {
+              stdout: page(
+                "comments",
+                comments.map((body) => node(body, { createdAt: "2026-11-22T12:00:00Z" })),
+              ),
+            }
+          : { stdout: page("reviews", []) };
+      };
+      return { comments, posts, state, script };
+    };
+    const reportOf = (
+      built: Effect.Success<ReturnType<typeof make>["server"]>,
+      threadId = CHILD_THREAD,
+    ) =>
+      built.report({
+        threadId: ThreadId.make(threadId),
+        projectId: PROJECT,
+        reviewer: "model-x",
+        pr: 7,
+        body: BODY,
+      });
+
+    it.effect("posts T3's first line and the report once; a repeat posts nothing new", () =>
+      Effect.gen(function* () {
+        const gh = github();
+        const built = yield* make(gh.script).server;
+        yield* (yield* worldOf(built)).children.add(child);
+        const first = yield* reportOf(built);
+        assert.deepStrictEqual(first, {
+          type: "posted",
+          head: HEAD,
+          lens: "code",
+          url: "https://example.test/pull/7#c9",
+        });
+        assert.deepStrictEqual(gh.posts, [
+          {
+            args: ["api", "--method", "POST", "repos/owner/repo/issues/7/comments", "--input", "-"],
+            stdin: JSON.stringify({ body: COMMENT }),
+          },
+        ]);
+        const again = yield* reportOf(built);
+        assert.strictEqual(again.type, "already");
+        assert.strictEqual(gh.posts.length, 1);
+      }),
+    );
+
+    it.effect("two calls at once post one comment", () =>
+      Effect.gen(function* () {
+        const gh = github();
+        const built = yield* make(gh.script).server;
+        yield* (yield* worldOf(built)).children.add(child);
+        const answers = yield* Effect.all([reportOf(built), reportOf(built)], {
+          concurrency: "unbounded",
+        });
+        assert.deepStrictEqual(answers.map((a) => a.type).toSorted(), ["already", "posted"]);
+        assert.strictEqual(gh.comments.length, 1);
+      }),
+    );
+
+    it.effect("a post whose answer was lost is failed; the retry finds it, not a second post", () =>
+      Effect.gen(function* () {
+        const gh = github();
+        gh.state.failPost = true;
+        const built = yield* make(gh.script).server;
+        yield* (yield* worldOf(built)).children.add(child);
+        const lost = yield* reportOf(built);
+        assert.strictEqual(lost.type, "failed");
+        assert.include(lost.type === "failed" ? lost.reason : "", "connection reset");
+        gh.state.failPost = false;
+        assert.strictEqual((yield* reportOf(built)).type, "already");
+        assert.strictEqual(gh.comments.length, 1);
+      }),
+    );
+
+    it.effect("a thread no stored child has, or an empty store, posts nothing", () =>
+      Effect.gen(function* () {
+        const gh = github();
+        const built = yield* make(gh.script).server;
+        const empty = yield* reportOf(built);
+        assert.strictEqual(empty.type, "refused");
+        yield* (yield* worldOf(built)).children.add(child);
+        const other = yield* reportOf(built, "thread-someone-else");
+        assert.strictEqual(other.type, "refused");
+        assert.include(other.type === "refused" ? other.reason : "", "no lens child");
+        assert.strictEqual(gh.posts.length, 0);
+      }),
+    );
+  });
 });

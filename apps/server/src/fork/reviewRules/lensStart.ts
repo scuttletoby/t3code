@@ -678,11 +678,14 @@ function lensPrompt(
     "## Your report",
     "",
     batch
-      ? "Post one report per pull request, each a new comment on that pull request for its head above " +
-        `(\`gh pr comment <number> --repo ${repo} --body-file <file>\`). Never one report for several.`
-      : `Post your report as one new comment on the pull request, for the head above ` +
-        `(\`gh pr comment ${reads[0]!.number} --repo ${repo} --body-file <file>\`).`,
-    `Its first line is exactly \`lens: ${lens} · reviewer: <your model> · read at: <the full head sha>\`.`,
+      ? "Post one report per pull request with the T3 tool `lens_report` (`pr`: its number, `body`: the report). " +
+        "Never one report for several."
+      : `Post your report with the T3 tool \`lens_report\` (\`pr: ${reads[0]!.number}\`, \`body\`: the report).`,
+    `T3 writes its first line (\`lens: ${lens} · reviewer: <your model> · read at: <the head>\`) and posts it ` +
+      "as a new comment while the head is the one above: write no `lens:` or `read at` line yourself, also where " +
+      "the lens text above says to. Never post a report another way (not with `gh`).",
+    "If lens_report refuses, fix what it names and call it again; if it cannot be fixed, post nothing and say " +
+      "why in your answer.",
     "Write one line per finding, starting `blocker:`, `major:` or `minor:`; write `blocker: none` and " +
       "`major: none` when there is none.",
     `Keep each report under ${rules.reportMaxChars} characters.`,

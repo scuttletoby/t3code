@@ -6,6 +6,7 @@ import { Waits } from "../../../waits/WaitWorker.ts";
 import { assertSameLink } from "../../linkOrigin.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { assertTargetWithinLimits, type Caller, unavailable } from "../../threadAccess.ts";
+import { lensReportCall } from "../../../fork/reviewRules/lensReportTool.ts";
 import { lensStartCall } from "../../../fork/reviewRules/lensStartTool.ts";
 import { callingThread as threadOfCaller } from "./callingThread.ts";
 import { playtestCall } from "./playtest.ts";
@@ -92,6 +93,7 @@ const handlers = {
   task_list: McpToolAccess.readsAsCaller((input) => listTasks(input)),
   playtest: McpToolAccess.actsAsCaller((input) => playtestCall(input)),
   lens_start: McpToolAccess.actsAsCaller((input) => lensStartCall(input)),
+  lens_report: McpToolAccess.actsAsCaller((input) => lensReportCall(input)),
 } satisfies McpToolAccess.Handlers<typeof WaitsToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(WaitsToolkit, handlers);

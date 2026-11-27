@@ -27,6 +27,10 @@ import {
   LensStartToolInput,
   LensStartToolResult,
 } from "../../../fork/reviewRules/lensStartTool.ts";
+import {
+  LensReportToolInput,
+  LensReportToolResult,
+} from "../../../fork/reviewRules/lensReportTool.ts";
 import { TaskListInput, TaskListResult } from "./taskList.ts";
 
 const dependencies = [
@@ -151,6 +155,23 @@ const LensStartTool = Tool.make("lens_start", {
   .annotate(Tool.OpenWorld, true)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
+const LensReportTool = Tool.make("lens_report", {
+  description:
+    "Post a lens child's report on a PR it reads: T3 writes the first line (lens, reviewer, head) and posts it while the head is the one read. A repeat posts nothing new.",
+  parameters: LensReportToolInput,
+  success: LensReportToolResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Post a lens report")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  // The same report twice is posted once.
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
 export const WaitsToolkit = Toolkit.make(
   WaitForTool,
   WaitListTool,
@@ -158,4 +179,5 @@ export const WaitsToolkit = Toolkit.make(
   TaskListTool,
   PlaytestTool,
   LensStartTool,
+  LensReportTool,
 );

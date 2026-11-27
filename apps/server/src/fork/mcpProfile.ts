@@ -72,8 +72,8 @@ export const MCP_T3_UNGROUPED_TOOL_KITS: Readonly<Record<string, string>> = {
 /**
  * Tools in a group other than their toolkit's, each pinned to the toolkit that has it: `playtest`
  * claims a shared test target and runs build and deploy steps, so keeping `waits` (to wait and
- * list tasks) does not give it; `lens_start` starts delegated children, so it needs `orchestration`. The test in personOnlySettings.test.ts checks each row against the
- * toolkit files.
+ * list tasks) does not give it; `lens_start` starts delegated children, so it needs `orchestration`, and
+ * `lens_report` goes with it. The test in personOnlySettings.test.ts checks each row against the toolkit files.
  */
 export const MCP_T3_TOOL_OWN_GROUPS: Readonly<
   Record<string, { readonly toolkit: string; readonly group: McpT3ToolGroup }>
@@ -81,6 +81,8 @@ export const MCP_T3_TOOL_OWN_GROUPS: Readonly<
   playtest: { toolkit: "waits", group: "playtest" },
   // Fork (review rules): it starts delegated children, so it goes with delegate_task, not with waits.
   lens_start: { toolkit: "waits", group: "orchestration" },
+  // Fork (review rules): lens_start's children call it; they carry the profile of the thread that had lens_start.
+  lens_report: { toolkit: "waits", group: "orchestration" },
 };
 
 /** {@link mcpT3ToolGroup}'s answer for a tool no profile may keep. */

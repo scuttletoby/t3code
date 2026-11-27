@@ -19,6 +19,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import { McpSchema } from "effect/ai";
 
 import { ServerConfig } from "../../config.ts";
@@ -29,6 +30,7 @@ import * as ProjectEnrichmentService from "../../project/ProjectEnrichmentServic
 import * as ProjectService from "../../project/ProjectService.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { WaitAction } from "../../waits/WaitService.ts";
+import { planLensReport } from "./lensReport.ts";
 import type { LensStartChild } from "./lensStart.ts";
 import * as LensChildren from "./lensStartChildren.ts";
 import {
@@ -89,6 +91,16 @@ const serverClient = McpSchema.McpServerClient.of({
 
 const encodeDelegate = Schema.encodeSync(OrchestratorMcpDelegateTaskInput);
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+/** gh's `--input -` for a new issue comment. */
+const encodeComment = Schema.encodeEffect(
+  Schema.fromJsonString(Schema.Struct({ body: Schema.String })),
+);
+const encodeCommentBody = (value: { readonly body: string }) =>
+  encodeComment(value).pipe(
+    Effect.mapError(
+      () => new LensReadError({ message: "the report could not be written as JSON" }),
+    ),
+  );
 /** How long the after-CI start waits for the thread's run (the wake starts it): 20 tries, 2 s apart. */
 const PARENT_RUN_TRIES = 20;
 
@@ -186,23 +198,38 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
   const config = yield* ServerConfig;
   const children = yield* LensChildren.make(config.stateDir);
 
-  const run = (cwd: string, command: string, args: ReadonlyArray<string>) =>
+  const run = (cwd: string, command: string, args: ReadonlyArray<string>, stdin?: string) =>
     runner
-      .run({ command, args, cwd, timeout: GH_TIMEOUT, timeoutBehavior: "timedOutResult" })
+      .run({
+        command,
+        args,
+        cwd,
+        timeout: GH_TIMEOUT,
+        timeoutBehavior: "timedOutResult",
+        ...(stdin === undefined ? {} : { stdin }),
+      })
       .pipe(
         Effect.mapError(
           (error) => new LensReadError({ message: `${command} could not run: ${error.message}` }),
         ),
       );
 
-  const gh = Effect.fnUntraced(function* (cwd: string, args: ReadonlyArray<string>) {
-    const out = yield* run(cwd, "gh", args);
+  const gh = Effect.fnUntraced(function* (
+    cwd: string,
+    args: ReadonlyArray<string>,
+    stdin?: string,
+  ) {
+    const out = yield* run(cwd, "gh", args, stdin);
     if (out.timedOut) return yield* new LensReadError({ message: "gh timed out" });
     return out;
   });
 
-  const ghJson = Effect.fnUntraced(function* (cwd: string, args: ReadonlyArray<string>) {
-    const out = yield* gh(cwd, args);
+  const ghJson = Effect.fnUntraced(function* (
+    cwd: string,
+    args: ReadonlyArray<string>,
+    stdin?: string,
+  ) {
+    const out = yield* gh(cwd, args, stdin);
     if (out.code !== 0) {
       return yield* new LensReadError({
         message: `gh ${args[0] ?? ""} failed: ${out.stderr.trim().slice(0, 300)}`,
@@ -464,7 +491,7 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
       return shell.activeRunId !== null;
     });
 
-    return {
+    const world = {
       rules,
       repo,
       readPull,
@@ -480,6 +507,8 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
         Effect.map((ms) => DateTime.formatIso(DateTime.makeUnsafe(ms))),
       ),
     } satisfies LensStartWorld;
+    /** `cwd`: where gh runs for this project (lens_report posts from there). */
+    return { ...world, cwd };
   });
 
   /** The start in the caller's own MCP request: `delegate_task` as that caller (its own scope). */
@@ -577,7 +606,105 @@ export const makeLensStartServer = Effect.fn("LensStartServer.make")(function* (
     ),
   };
 
-  return { worldFor, startInRequest, startForWait, action, waitForCiAction: "lens_start" as const };
+  /** One report at a time: a repeat sent while the first is posting finds that post, never posts twice. */
+  const reportLock = yield* Semaphore.make(1);
+  const noStart = () =>
+    Effect.succeed<StartAnswer>({ type: "refused", code: "orchestration_error", message: "none" });
+
+  /**
+   * lens_report for a lens child (lensReport.ts): its stored record names the lens and head, GitHub the pull
+   * request's head and posts now; the comment goes up as a new issue comment through gh. A post whose answer is lost
+   * (gh failed or timed out after GitHub took it) is found by the repeat, so it is not posted twice.
+   */
+  const report = Effect.fn("LensStartServer.report")(function* (args: {
+    readonly threadId: ThreadId;
+    readonly projectId: ProjectId;
+    readonly reviewer: string;
+    readonly pr: number;
+    readonly body: string;
+  }) {
+    const world = yield* worldFor({
+      threadId: args.threadId,
+      projectId: args.projectId,
+      start: noStart,
+    });
+    const refused = (head: string | null, reason: string): LensReportAnswer => ({
+      type: "refused",
+      head,
+      lens: null,
+      reason,
+    });
+    if (world.repo === null) {
+      return refused(
+        null,
+        "this thread's project has no GitHub repository lens_report can post to",
+      );
+    }
+    const repo = world.repo;
+    return yield* reportLock
+      .withPermits(1)(
+        Effect.gen(function* () {
+          const children = yield* world.children.list;
+          const pull = yield* world.readPull(args.pr);
+          const plan = planLensReport({
+            rules: world.rules,
+            caller: args.threadId,
+            reviewer: args.reviewer,
+            pr: args.pr,
+            body: args.body,
+            children,
+            pull,
+          });
+          if (plan.type === "refused") return refused(plan.head, plan.reason);
+          if (plan.type === "posted") {
+            return { type: "already", head: plan.head, lens: plan.lens, url: plan.url } as const;
+          }
+          const posted = yield* ghJson(
+            world.cwd,
+            ["api", "--method", "POST", `repos/${repo}/issues/${args.pr}/comments`, "--input", "-"],
+            yield* encodeCommentBody({ body: plan.comment }),
+          );
+          const url =
+            isRecord(posted) && typeof posted.html_url === "string" ? posted.html_url : null;
+          return { type: "posted", head: plan.head, lens: plan.lens, url } as const;
+        }),
+      )
+      .pipe(
+        Effect.catchTags({
+          LensReadError: (error) =>
+            Effect.succeed<LensReportAnswer>({
+              type: "failed",
+              head: null,
+              lens: null,
+              reason: error.message,
+            }),
+        }),
+      );
+  });
+
+  return {
+    worldFor,
+    startInRequest,
+    startForWait,
+    action,
+    report,
+    waitForCiAction: "lens_start" as const,
+  };
 });
+
+/** lens_report's answer: posted now, already posted (a repeat), refused, or failed (it may have been posted). */
+export type LensReportAnswer =
+  | {
+      readonly type: "posted" | "already";
+      readonly head: string;
+      readonly lens: string;
+      readonly url: string | null;
+    }
+  | {
+      readonly type: "refused" | "failed";
+      readonly head: string | null;
+      readonly lens: null;
+      readonly reason: string;
+    };
 
 export type LensStartServer = Effect.Success<ReturnType<typeof makeLensStartServer>>;

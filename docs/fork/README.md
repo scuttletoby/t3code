@@ -382,6 +382,19 @@ idempotent. It runs at most 90 s per delivery (the delivery is tried again after
 GitHub or thread does not stall other waits. Like the gate, lens_start skips a review or inline
 comment that is not submitted yet, and dates an inline comment by when it was published.
 
+**`lens_report {pr, body}`** (T3 tool, in the same group, hidden and refused while review rules are
+off) is how a lens child posts its report. Only a thread lens_start started as a child (its newest
+record in `lens-children.json`) may call it, and only for a pull request that child reads. T3
+writes the first line, `lens: <lens> · reviewer: <model> · read at: <head>`, from that record and
+the model the child runs on, so a child never types a lens name or a sha. T3 posts the report as a
+new comment only while the pull request is open and still at that head, and only if the gate would
+read it as one valid read with a findings section; otherwise it refuses and says why. The report
+may not hold its own `lens:` or `read at` line, and it must fit `reportMaxChars` with T3's line.
+The same shared vectors (`written` in `review.vectors.json`) test this writer and the gate. A repeat
+finds the earlier comment and posts nothing new, including after a post whose answer was lost (the
+tool then says `failed`: call it again). One report posts at a time, so two calls at once post
+once. Nothing is stored.
+
 ### Slot filler route (`/api/fork/delegate`)
 
 Lets a program start a delegated task as a given parent thread, so a script (fork-kit/slot-filler)

@@ -35,6 +35,7 @@ import { WorktreeToolkit } from "../mcp/toolkits/worktree/tools.ts";
 import { makeThreadMcpProfilesById } from "./claudeMcpProfile.ts";
 import { MCP_T3_TOOL_NOT_ALLOWED, mcpT3ToolGroup } from "./mcpProfile.ts";
 import { installFillerDelegateServer } from "./fillerDelegate.ts";
+import { LENS_REPORT_OFF, LENS_REPORT_TOOL } from "./reviewRules/lensReport.ts";
 import { installLensStartServer } from "./reviewRules/lensStartServer.ts";
 import {
   LENS_START_OFF,
@@ -152,6 +153,9 @@ export const T3_TOOL_SET_HOLD_WAIT_MS = HOLD_WAIT_MS;
 const HOLD_TIMED_OUT =
   "T3 is still working out this thread's MCP profile for the turn that just started, or that check stopped; the profile applies again once it ends or the thread's next turn starts. Try again in a moment.";
 
+/** Fork (review rules): the tools listed and callable only where the thread's project has review rules on. */
+const LENS_TOOLS: ReadonlySet<string> = new Set([LENS_START_TOOL, LENS_REPORT_TOOL]);
+
 /** Recent refused sets, by thread, with when each stops being reused. */
 const refused = new Map<string, { readonly set: T3ToolSet; readonly until: number }>();
 
@@ -162,7 +166,7 @@ const searchable = (threadId: string, name: string) =>
     name,
   ) &&
   // Fork (review rules): off means off, also for a search.
-  (name !== LENS_START_TOOL || lensStartSearchable(threadId));
+  (!LENS_TOOLS.has(name) || lensStartSearchable(threadId));
 
 /** The rule's check of one tool for one request, as {@link layer} runs it. */
 const makeVisible = Effect.gen(function* () {
@@ -231,10 +235,12 @@ const makeVisible = Effect.gen(function* () {
       if (method === "tools/list") return false;
       return yield* new T3ToolOutsideProfile({ message: t3ToolRefusal(set, target) });
     }
-    // Fork (review rules): lens_start only where the thread's project has review rules on.
-    if (target !== LENS_START_TOOL || (yield* lensStartOn(thread.threadId))) return true;
+    // Fork (review rules): lens_start and lens_report only where the thread's project has review rules on.
+    if (!LENS_TOOLS.has(target) || (yield* lensStartOn(thread.threadId))) return true;
     if (method === "tools/list") return false;
-    return yield* new T3ToolOutsideProfile({ message: LENS_START_OFF });
+    return yield* new T3ToolOutsideProfile({
+      message: target === LENS_REPORT_TOOL ? LENS_REPORT_OFF : LENS_START_OFF,
+    });
   });
 });
 

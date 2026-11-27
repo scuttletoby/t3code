@@ -48,6 +48,7 @@ import { Waits } from "../waits/WaitWorker.ts";
 import { makeClaudeMcpProfiles } from "./claudeMcpProfile.ts";
 import * as McpT3ToolFilter from "./mcpT3ToolFilter.ts";
 import * as McpT3ToolRule from "./mcpT3ToolRule.ts";
+import * as LensReport from "./reviewRules/lensReport.ts";
 import * as LensStartVisibility from "./reviewRules/lensStartVisibility.ts";
 import * as T3ToolSets from "./mcpT3ToolSets.ts";
 
@@ -472,8 +473,11 @@ describe("the T3 tool filter on /mcp", () => {
 const drive = <A>(fiber: Fiber.Fiber<A>, millis: number) =>
   TestClock.adjust(millis).pipe(Effect.andThen(Fiber.join(fiber)));
 
-describe("lens_start: off means off (review rules, fork issue #888)", () => {
-  const LENS = "lens_start";
+describe("lens_start and lens_report: off means off (review rules, fork issue #888)", () => {
+  const LENSES = [
+    { name: "lens_start", off: LensStartVisibility.LENS_START_OFF, input: { pr: 7 } },
+    { name: "lens_report", off: LensReport.LENS_REPORT_OFF, input: { pr: 7, body: "x" } },
+  ] as const;
   const found = (reply: RpcReply) =>
     (
       (reply.result?.structuredContent as { tools?: ReadonlyArray<{ name: string }> })?.tools ?? []
@@ -483,12 +487,14 @@ describe("lens_start: off means off (review rules, fork issue #888)", () => {
     withServer(({ list, call }) =>
       Effect.gen(function* () {
         LensStartVisibility.__testing.clear();
-        expect(yield* list("all")).not.toContain(LENS);
-        const refused = yield* call("all", LENS, { pr: 7 });
-        expect(refused.error?.message).toBe(LensStartVisibility.LENS_START_OFF);
-        expect(
-          found(yield* call("all", "tool_search", { query: "lens_start review lenses" })),
-        ).not.toContain(LENS);
+        for (const lens of LENSES) {
+          expect(yield* list("all")).not.toContain(lens.name);
+          const refused = yield* call("all", lens.name, lens.input);
+          expect(refused.error?.message).toBe(lens.off);
+          expect(
+            found(yield* call("all", "tool_search", { query: `${lens.name} review lens` })),
+          ).not.toContain(lens.name);
+        }
       }),
     ),
   );
@@ -498,12 +504,15 @@ describe("lens_start: off means off (review rules, fork issue #888)", () => {
       ({ list, call }) =>
         Effect.gen(function* () {
           LensStartVisibility.__testing.clear();
-          expect(yield* list("all")).toContain(LENS);
-          expect(
-            found(yield* call("all", "tool_search", { query: "lens_start review lenses" })),
-          ).toContain(LENS);
-          // A profile without `orchestration` (it starts delegated children) does not keep it.
-          expect(yield* list("waits")).not.toContain(LENS);
+          for (const lens of LENSES) {
+            expect(yield* list("all")).toContain(lens.name);
+            expect(
+              found(yield* call("all", "tool_search", { query: `${lens.name} review lens` })),
+            ).toContain(lens.name);
+            // A profile without `orchestration` (lens_start starts delegated children; its children carry the
+            // profile that had it) does not keep either.
+            expect(yield* list("waits")).not.toContain(lens.name);
+          }
         }),
       { ...SETTINGS, reviewRules: { preset: "recommended" } },
     ),
@@ -514,7 +523,7 @@ describe("lens_start: off means off (review rules, fork issue #888)", () => {
       ({ list }) =>
         Effect.gen(function* () {
           LensStartVisibility.__testing.clear();
-          expect(yield* list("all")).not.toContain(LENS);
+          for (const lens of LENSES) expect(yield* list("all")).not.toContain(lens.name);
         }),
       {
         ...SETTINGS,

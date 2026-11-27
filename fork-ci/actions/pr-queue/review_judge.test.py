@@ -358,8 +358,9 @@ class Rounds(unittest.TestCase):
 # Every section of review.vectors.json, replayed whole: the TypeScript side (apps/server/src/reviewRules) runs the same
 # sections, and each side fails on a section or a vector field it does not run, so neither can skip one quietly.
 SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds',
-            'reads', 'linear', 'py_unicode', 'unicode'}
-FIELDS = {'linear': {'name', 'fn', 'parts', 'expect', 'ms'},
+            'reads', 'linear', 'py_unicode', 'unicode', 'written'}
+FIELDS = {'written': {'name', 'lens', 'reviewer', 'head', 'body', 'comment', 'refused', 'expect'},
+          'linear': {'name', 'fn', 'parts', 'expect', 'ms'},
           'unicode': {'name', 'body', 'findings', 'section', 'unassigned', 'refused'},
           'reads': {'name', 'posts', 'head', 'same', 'override_authors', 'required', 'expect'},
           'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
@@ -510,6 +511,17 @@ class SharedVectors(unittest.TestCase):
         for v in VECTORS['reads']:
             with self.subTest(v['name']):
                 self.assertEqual(replay_reads(v), v['expect'])
+
+    def test_every_written_vector(self):   # T3's lens_report writes the header: the gate reads what it posts
+        self.assertGreaterEqual(len(VECTORS['written']), 10)
+        for v in VECTORS['written']:
+            with self.subTest(v['name']):
+                got = replay_reads({'posts': [{'body': v['comment']}], 'head': v['head'], 'same': [],
+                                    'override_authors': [], 'required': [v['lens']]})
+                self.assertEqual(got, v['expect'])
+                self.assertTrue(v['comment'].startswith(f"lens: {v['lens']} · reviewer: "), v['comment'])
+                if v['refused'] is None:   # a report T3 posts is one valid read of its lens at the head
+                    self.assertEqual((got['reads'], got['again']), ({v['lens']: v['head']}, []))
 
     def test_every_round(self):
         self.assertGreaterEqual(len(VECTORS['rounds']), 28)
