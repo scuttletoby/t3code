@@ -9,7 +9,7 @@ import {
   PLAYTEST_STATE_PATH,
   type PlaytestRouteEndAnswer,
   type PlaytestRouteState,
-  type PlaytestSessionView,
+  type PlaytestChipSession,
   type ScopedThreadRef,
 } from "@t3tools/contracts";
 
@@ -53,7 +53,7 @@ async function primaryFetch(
 export async function readPlaytestSession(
   threadRef: ScopedThreadRef,
   signal?: AbortSignal,
-): Promise<PlaytestSessionView | null> {
+): Promise<PlaytestChipSession | null> {
   if (!onPrimaryEnvironment(threadRef)) return null;
   try {
     const response = await primaryFetch(PLAYTEST_STATE_PATH, {

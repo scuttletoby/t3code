@@ -8,6 +8,7 @@ import {
   AuthOrchestrationReadScope,
   PLAYTEST_END_PATH,
   PLAYTEST_STATE_PATH,
+  type PlaytestChipSession,
   type PlaytestRouteEndAnswer,
   type PlaytestRouteState,
   ThreadId,
@@ -21,7 +22,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import { Playtest } from "./PlaytestLayer.ts";
-import type { PlaytestService } from "./PlaytestService.ts";
+import type { PlaytestService, PlaytestSessionView } from "./PlaytestService.ts";
 
 const noStore = { headers: { "cache-control": "no-store" } };
 const decodeThreadId = Schema.decodeUnknownOption(ThreadId);
@@ -53,6 +54,23 @@ const failureText = (cause: Cause.Cause<unknown>): string => {
     : "T3 could not read its playtest sessions now.";
 };
 
+/** Only what the chip shows: never the worktree, a step's output or a problem's text. */
+export function chipSessionOf(session: PlaytestSessionView): PlaytestChipSession {
+  const round = session.lastRound;
+  return {
+    id: session.id,
+    target: session.target,
+    state: session.state,
+    note: session.note,
+    rounds: session.rounds,
+    ...(round === undefined
+      ? {}
+      : { lastRound: { number: round.number, state: round.state, step: round.step } }),
+    ...(session.running === undefined ? {} : { running: session.running }),
+    releaseProblem: session.state === "ending" && session.problem !== undefined,
+  };
+}
+
 /** The thread's session that is on. One that ended, or a failed read, shows no chip. */
 export const handleState = Effect.fn("fork.playtest.state")(function* (
   auth: Auth,
@@ -75,7 +93,7 @@ export const handleState = Effect.fn("fork.playtest.state")(function* (
     ),
   );
   const answer: PlaytestRouteState = {
-    session: session === null || session.state === "ended" ? null : session,
+    session: session === null || session.state === "ended" ? null : chipSessionOf(session),
   };
   return HttpServerResponse.jsonUnsafe(answer, noStore);
 });
@@ -91,7 +109,10 @@ export const handleEnd = Effect.fn("fork.playtest.end")(function* (
   const body = decodeEndBody(yield* request.json.pipe(Effect.orElseSucceed(() => null)));
   if (Option.isNone(body)) return badRequest();
   const answer = yield* playtest.end({ threadId: body.value.threadId, reason: "person" }).pipe(
-    Effect.map((result): PlaytestRouteEndAnswer => result),
+    Effect.map((result): PlaytestRouteEndAnswer => ({
+      outcome: result.outcome,
+      session: result.session === null ? null : chipSessionOf(result.session),
+    })),
     Effect.catchCauseIf(
       (cause) => !Cause.hasInterruptsOnly(cause),
       (cause) =>

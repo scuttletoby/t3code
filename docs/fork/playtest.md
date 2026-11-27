@@ -138,14 +138,17 @@ chip above that thread's composer: the target, whether the session starts, is on
 round and the step that runs now. Its **End** button ends the session exactly as the tool's `end`
 does (the session's end reason is `person`), and a toast says what happened: ended (the target is
 back, the worktree and its changes are kept), already ended, or still ending (the release has not
-worked yet; T3 tries again, or press End again). Pressing End needs a connection that may change
-threads (the operate scope); a read-only one sees the chip only.
+worked yet; T3 tries again, or press End again). End shows only for a connection that may change
+threads (the operate scope); a read-only one sees the chip without it. The chip's tooltip has the
+agent's note and how many rounds ran.
 
 The chip goes when the session ends any other way (the agent's `end`, idle, time limit, claim gone,
 thread gone). It is read again whenever the thread changes and every 10 seconds while it shows.
 A read that fails, an older server without the chip's routes, or a thread on another environment
 than the app's own server shows no chip. The routes are `GET /api/fork/playtest/state?threadId=`
-(read scope) and `POST /api/fork/playtest/end` with `{ "threadId": … }` (operate scope).
+(read scope) and `POST /api/fork/playtest/end` with `{ "threadId": … }` (operate scope). They send only
+what the chip shows: no worktree, no step output and no problem text, just whether a release has
+failed.
 
 ## The worker
 

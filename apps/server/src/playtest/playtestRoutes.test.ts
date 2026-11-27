@@ -19,7 +19,7 @@ import * as Layer from "effect/Layer";
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/http";
 
 import type * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
-import { handleEnd, handleState } from "./playtestRoutes.ts";
+import { chipSessionOf, handleEnd, handleState } from "./playtestRoutes.ts";
 import type { PlaytestService } from "./PlaytestService.ts";
 
 /** `authorization: Bearer <scopes, comma separated>`; no header is no session. */
@@ -49,6 +49,14 @@ const session = (threadId: string, state: PlaytestSessionView["state"]) =>
     startedAt: "2026-11-27T10:00:00.000Z",
     lastActivityAt: "2026-11-27T10:05:00.000Z",
     rounds: 2,
+    lastRound: {
+      number: 2,
+      state: "failed",
+      step: "deploy",
+      detail: "step output with a path /home/someone/secret",
+      startedAt: "2026-11-27T10:04:00.000Z",
+    },
+    problem: "release: exit 1 with its output",
   }) as unknown as PlaytestSessionView;
 
 const serve = Effect.gen(function* () {
@@ -104,7 +112,17 @@ describe("playtest chip routes (F5)", () => {
       const on = yield* get("?threadId=thread-a", READ);
       expect(on.status).toBe(200);
       expect(on.headers["cache-control"]).toBe("no-store");
-      expect(yield* on.json).toEqual({ session: session("thread-a", "active") });
+      const answer = (yield* on.json) as { session: Record<string, unknown> };
+      expect(answer).toEqual({ session: chipSessionOf(session("thread-a", "active")) });
+      // Only the chip's fields: no worktree, no step output, no problem text.
+      expect(Object.keys(answer.session).toSorted()).toEqual(
+        ["id", "lastRound", "note", "releaseProblem", "rounds", "state", "target"].toSorted(),
+      );
+      expect(answer.session.lastRound).toEqual({ number: 2, state: "failed", step: "deploy" });
+      expect(JSON.stringify(answer)).not.toMatch(/work\/tree|secret|exit 1/);
+      // A problem counts only while the release is what fails (the session is ending).
+      expect(answer.session.releaseProblem).toBe(false);
+      expect(chipSessionOf(session("thread-a", "ending")).releaseProblem).toBe(true);
 
       // The last session ended (by the agent, idle, time limit…): no chip.
       expect(yield* (yield* get("?threadId=thread-ended", READ)).json).toEqual({ session: null });
@@ -135,7 +153,10 @@ describe("playtest chip routes (F5)", () => {
 
       const ok = yield* post(thread("thread-a"), OPERATE);
       expect(ok.status).toBe(200);
-      expect(yield* ok.json).toEqual({ outcome: "ended", session: session("thread-a", "ended") });
+      expect(yield* ok.json).toEqual({
+        outcome: "ended",
+        session: chipSessionOf(session("thread-a", "ended")),
+      });
       // Pressed again after it ended (or it ended some other way first): nothing to end.
       expect(yield* (yield* post(thread("thread-none"), OPERATE)).json).toEqual({
         outcome: "nothing-to-end",

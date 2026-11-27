@@ -4,59 +4,91 @@
  * so it goes when the session ends any other way (docs/fork/playtest.md, "The thread chip").
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own text is English only; upstream's translation catalogs hold no fork keys. */
-import type {
-  PlaytestRouteEndAnswer,
-  PlaytestSessionView,
-  ScopedThreadRef,
+import {
+  AuthOrchestrationOperateScope,
+  type PlaytestChipSession,
+  type PlaytestRouteEndAnswer,
+  type ScopedThreadRef,
 } from "@t3tools/contracts";
 import { GamepadIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { useQuietThreadShell } from "../../../state/entities";
+import { useEnvironmentScope } from "../../../state/session";
 import type { ComposerBannerStackItem } from "../../chat/ComposerBannerStack";
 import { Button } from "../../ui/button";
 import { toastManager } from "../../ui/toast";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../../ui/tooltip";
 import { endPlaytest, readPlaytestSession } from "./playtestApi";
 
 /** While the chip shows: an end by T3 itself (idle, time limit) changes nothing the shell carries. */
 const PLAYTEST_CHIP_POLL_MS = 10_000;
 
-const STATE_TEXT: Record<Exclude<PlaytestSessionView["state"], "ended">, string> = {
+const STATE_TEXT: Record<PlaytestChipSession["state"], string> = {
   claiming: "starting",
   active: "on",
   ending: "ending",
+  ended: "ended",
 };
 
 /** The chip's line under the title: the last round, and the step that runs now. */
-function roundText(session: PlaytestSessionView): string {
+function roundText(session: PlaytestChipSession): string {
   const round = session.lastRound;
   const last =
     round === undefined ? "No round yet." : `Round ${round.number} ${round.state} (${round.step}).`;
   const running = session.running === undefined ? "" : ` A ${session.running} step runs now.`;
-  const problem =
-    session.state === "ending" && session.problem !== undefined
-      ? ` Its release has not worked yet; T3 tries again, or press End again.`
-      : "";
+  const problem = session.releaseProblem
+    ? ` Its release has not worked yet; T3 tries again, or press End again.`
+    : "";
   return `${last}${running}${problem}`;
 }
 
-/** The chip for `session`, or none when no session is on. */
+/** The title's tooltip: the agent's note and how many rounds ran. */
+function playtestChipTooltip(session: PlaytestChipSession): string {
+  const rounds = `${session.rounds} ${session.rounds === 1 ? "round" : "rounds"} so far`;
+  return session.note === "" ? rounds : `${session.note} · ${rounds}`;
+}
+
+function PlaytestChipTitle({ session }: { readonly session: PlaytestChipSession }) {
+  const tooltipId = `fork-playtest-tooltip-${session.id}`;
+  const tooltip = playtestChipTooltip(session);
+  return (
+    <Tooltip>
+      <TooltipTrigger render={<span aria-describedby={tooltipId} tabIndex={0} />}>
+        {`Playtest ${STATE_TEXT[session.state]}: ${session.target}`}
+      </TooltipTrigger>
+      <span id={tooltipId} className="sr-only">
+        {tooltip}
+      </span>
+      <TooltipPopup side="top">{tooltip}</TooltipPopup>
+    </Tooltip>
+  );
+}
+
+/**
+ * The chip for `session`, or none when no session is on. End only for a connection that may change
+ * threads (the operate scope, as the route asks); a read-only one sees the chip alone.
+ */
 export function playtestChipItem(
-  session: PlaytestSessionView | null,
-  options: { readonly ending: boolean; readonly onEnd: () => void },
+  session: PlaytestChipSession | null,
+  options: { readonly ending: boolean; readonly canEnd: boolean; readonly onEnd: () => void },
 ): ComposerBannerStackItem | null {
   if (session === null || session.state === "ended") return null;
   return {
     id: "fork-playtest-session",
     variant: "info",
     icon: <GamepadIcon />,
-    title: `Playtest ${STATE_TEXT[session.state]}: ${session.target}`,
+    title: <PlaytestChipTitle session={session} />,
     description: roundText(session),
-    actions: (
-      <Button size="xs" variant="ghost" disabled={options.ending} onClick={options.onEnd}>
-        {options.ending ? "Ending…" : "End"}
-      </Button>
-    ),
+    ...(options.canEnd
+      ? {
+          actions: (
+            <Button size="xs" variant="ghost" disabled={options.ending} onClick={options.onEnd}>
+              {options.ending ? "Ending…" : "End"}
+            </Button>
+          ),
+        }
+      : {}),
   };
 }
 
@@ -98,12 +130,13 @@ export function useForkPlaytestItems(
   const environmentId = threadRef?.environmentId ?? null;
   const threadId = threadRef?.threadId ?? null;
   const shell = useQuietThreadShell(threadRef);
+  const canEnd = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
   // The thread's change marker: a tool call, a turn end, T3's "Playtest ended" notice.
   const changed = shell?.updatedAt ?? null;
   const key = environmentId !== null && threadId !== null ? `${environmentId}:${threadId}` : null;
   const [read, setRead] = useState<{
     readonly key: string;
-    readonly session: PlaytestSessionView | null;
+    readonly session: PlaytestChipSession | null;
   } | null>(null);
   const [endingKey, setEndingKey] = useState<string | null>(null);
   const session = read !== null && read.key === key ? read.session : null;
@@ -152,6 +185,6 @@ export function useForkPlaytestItems(
       });
   };
 
-  const item = playtestChipItem(session, { ending: endingKey === key, onEnd });
+  const item = playtestChipItem(session, { ending: endingKey === key, canEnd, onEnd });
   return item === null ? NONE : [item];
 }

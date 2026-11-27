@@ -1,7 +1,7 @@
 // The playtest chip (F5) above the composer: does a thread with a session that is on show it, does
 // End end that session through the end route, and does the chip go when the session ends any other
 // way? The server calls are stubbed; the chip renders in upstream's banner stack.
-import type { PlaytestSessionView, ScopedThreadRef } from "@t3tools/contracts";
+import type { PlaytestChipSession, ScopedThreadRef } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { userEvent } from "vite-plus/test/browser";
 
@@ -11,10 +11,16 @@ import { ComposerBannerStack } from "../../chat/ComposerBannerStack";
 
 const state = vi.hoisted(() => ({
   updatedAt: "2026-11-27T10:00:00.000Z" as string | null,
-  session: null as PlaytestSessionView | null,
+  session: null as PlaytestChipSession | null,
   read: vi.fn(),
   end: vi.fn(),
   toast: vi.fn(),
+  canOperate: true,
+}));
+
+vi.mock(import("../../../state/session"), async (original) => ({
+  ...(await original()),
+  useEnvironmentScope: (() => state.canOperate) as never,
 }));
 
 vi.mock(import("../../ui/toast"), async (original) => ({
@@ -53,28 +59,18 @@ const QUICKER_THAN_POLL = 2_000;
 
 const REF = { environmentId: "env-a", threadId: "thread-a" } as unknown as ScopedThreadRef;
 
+// The chip's own shape (the state route sends nothing else): no worktree, no step output.
 const session = (patch: Record<string, unknown> = {}) =>
   ({
-    id: "pt0000000001",
-    threadId: "thread-a",
-    projectId: "project-a",
+    id: "pt_aaaaaaaaaa",
     target: "staging",
-    note: "",
-    worktree: "/work/tree",
     state: "active",
-    startedAt: "2026-11-27T10:00:00.000Z",
-    lastActivityAt: "2026-11-27T10:05:00.000Z",
+    note: "",
     rounds: 2,
-    lastRound: {
-      number: 2,
-      state: "done",
-      step: "deploy",
-      detail: "",
-      startedAt: "2026-11-27T10:04:00.000Z",
-      endedAt: "2026-11-27T10:05:00.000Z",
-    },
+    lastRound: { number: 2, state: "done", step: "deploy" },
+    releaseProblem: false,
     ...patch,
-  }) as unknown as PlaytestSessionView;
+  }) as unknown as PlaytestChipSession;
 
 function Chip({ threadRef }: { readonly threadRef: ScopedThreadRef | null }) {
   return <ComposerBannerStack items={useForkPlaytestItems(threadRef)} />;
@@ -137,26 +133,48 @@ describe("playtest chip (F5)", () => {
 
   it("names a session that starts or ends, and a release T3 still tries", () => {
     const onEnd = () => {};
-    expect(playtestChipItem(null, { ending: false, onEnd })).toBeNull();
-    expect(playtestChipItem(session({ state: "ended" }), { ending: false, onEnd })).toBeNull();
+    expect(playtestChipItem(null, { ending: false, canEnd: true, onEnd })).toBeNull();
+    expect(
+      playtestChipItem(session({ state: "ended" }), { ending: false, canEnd: true, onEnd }),
+    ).toBeNull();
     expect(
       playtestChipItem(session({ state: "claiming", lastRound: undefined, running: "claim" }), {
         ending: false,
+        canEnd: true,
         onEnd,
       }),
-    ).toMatchObject({
-      title: "Playtest starting: staging",
-      description: "No round yet. A claim step runs now.",
-    });
+    ).toMatchObject({ description: "No round yet. A claim step runs now." });
     expect(
-      playtestChipItem(session({ state: "ending", problem: "release: exit 1" }), {
+      playtestChipItem(session({ state: "ending", releaseProblem: true }), {
         ending: false,
+        canEnd: true,
         onEnd,
       }),
     ).toMatchObject({
-      title: "Playtest ending: staging",
       description:
         "Round 2 done (deploy). Its release has not worked yet; T3 tries again, or press End again.",
     });
+  });
+
+  it("a connection that cannot operate threads sees the chip without End", async () => {
+    state.updatedAt = "2026-11-27T13:00:00.000Z";
+    state.session = session();
+    state.canOperate = false;
+    try {
+      await using screen = await render(<Chip threadRef={REF} />, { router: false });
+      await expect.element(screen.getByText("Playtest on: staging")).toBeVisible();
+      expect(screen.getByRole("button", { name: "End" }).elements()).toHaveLength(0);
+    } finally {
+      state.canOperate = true;
+    }
+  });
+
+  it("names the state in its title, with the agent's note and the rounds in its tooltip", async () => {
+    state.updatedAt = "2026-11-27T14:00:00.000Z";
+    state.session = session({ state: "ending", note: "try the new jump", rounds: 3 });
+    await using screen = await render(<Chip threadRef={REF} />, { router: false });
+    const title = screen.getByText("Playtest ending: staging");
+    await expect.element(title).toHaveAccessibleDescription("try the new jump · 3 rounds so far");
+    state.session = null;
   });
 });
