@@ -1,4 +1,5 @@
 import { ORCHESTRATION_V2_WS_METHODS, WS_METHODS, type WsRpcGroup } from "@t3tools/contracts";
+import { FORK_PLAYTEST_RPC_SPANS } from "@t3tools/contracts"; // Fork (playtest F5)
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -259,6 +260,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.subscribeServerConfig]: "server",
   [WS_METHODS.subscribeServerLifecycle]: "server",
   [WS_METHODS.subscribeAuthAccess]: "auth",
+  ...FORK_PLAYTEST_RPC_SPANS, // Fork (playtest F5)
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";

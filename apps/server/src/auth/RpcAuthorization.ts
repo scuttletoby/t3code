@@ -33,6 +33,7 @@ import {
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
+import { FORK_PLAYTEST_RPC_SCOPES } from "@t3tools/contracts"; // Fork (playtest F5)
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Layer from "effect/Layer";
@@ -241,6 +242,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.subscribeServerConfig]: AuthOrchestrationReadScope,
   [WS_METHODS.subscribeServerLifecycle]: AuthOrchestrationReadScope,
   [WS_METHODS.subscribeAuthAccess]: AuthAccessReadScope,
+  ...FORK_PLAYTEST_RPC_SCOPES, // Fork (playtest F5)
 } as const satisfies Readonly<Record<WsRpcMethod, AuthEnvironmentScope>>;
 
 export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope {

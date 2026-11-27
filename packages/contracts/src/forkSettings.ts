@@ -68,6 +68,7 @@ export * from "./assistant.ts";
 export * from "./forkEnvironmentFileLinks.ts";
 export * from "./forkFeatures.ts";
 export * from "./forkOwnerQuestions.ts";
+export * from "./forkPlaytestRpc.ts";
 export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
 export * from "./mcpProfileResolve.ts";

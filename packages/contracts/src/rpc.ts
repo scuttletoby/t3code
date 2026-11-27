@@ -45,6 +45,7 @@ import * as Schema from "effect/Schema";
 import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
+import * as ForkPlaytestRpc from "./forkPlaytestRpc.ts"; // Fork (playtest F5)
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { SecretSourceCheckResult } from "./settingsSecretValue.ts";
 import { SecretReference } from "./secretReference.ts";
@@ -2618,4 +2619,6 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeThreadRpc,
   WsOrchestrationV2SubscribeCommandOutputRpc,
   WsOrchestrationV2SubscribePromptSuggestionRpc,
+  ForkPlaytestRpc.WsForkPlaytestStatusRpc, // Fork (playtest F5)
+  ForkPlaytestRpc.WsForkPlaytestEndRpc, // Fork (playtest F5)
 ).middleware(RpcScopeAuthorization);

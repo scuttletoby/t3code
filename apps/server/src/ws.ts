@@ -256,6 +256,8 @@ import * as UsageService from "./usage/UsageService.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as TriageService from "./triage/TriageService.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
+import * as ForkPlaytestRpcHandlers from "./fork/playtestRpcHandlers.ts"; // Fork (playtest F5)
+import { Playtest } from "./playtest/PlaytestLayer.ts"; // Fork (playtest F5)
 import * as IssueService from "./issue/IssueService.ts";
 import * as ThreadIssueService from "./orchestration-v2/ThreadIssueService.ts";
 import * as IssueTrackerConnections from "./issue/IssueTrackerConnections.ts";
@@ -1497,6 +1499,7 @@ export const layerWsRpc = (
       const threadIssues = yield* ThreadIssueService.ThreadIssueService;
       const issueTrackers = yield* IssueTrackerConnections.IssueTrackerConnections;
       const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
+      const forkPlaytest = yield* Effect.serviceOption(Playtest); // Fork (playtest F5)
       const pullRequestSync = yield* PullRequestSyncReactor.PullRequestSyncReactor;
       const deviceService = yield* DeviceService.DeviceService;
       const deviceHostContext =
@@ -1988,6 +1991,7 @@ export const layerWsRpc = (
       });
 
       const handlers = ServerWsRpcGroup.of({
+        ...ForkPlaytestRpcHandlers.make(forkPlaytest), // Fork (playtest F5)
         [WS_METHODS.issuesList]: (input) => issues.list(input),
         [WS_METHODS.issuesDetail]: (input) => issues.detail(input),
         [WS_METHODS.issuesComments]: (input) => issues.comments(input),

@@ -7,8 +7,7 @@ target. This page is what an adapter must do. The settings are
 [`server.playtest` and `projectOverride.playtest`](README.md#serverplaytest).
 
 Status: the settings, this contract, the session store, the worker (renew, the limits, ends for
-gone threads) and the agent's `playtest` tool exist. The thread controls come in a later pull
-request and follow this page.
+gone threads), the agent's `playtest` tool and the thread chip with End (web) exist.
 
 ## The steps
 
@@ -130,6 +129,23 @@ plan mode, by the thread's modes as T3 records them at each call (they run the p
 outside the thread's sandbox, without an approval); any other thread is refused with what to do.
 `status` and `end` work in every thread, so a restricted thread can still release its target. An
 outside MCP client (not in a T3 thread) is not offered the tool; a read-only client cannot use it.
+
+## The thread chip
+
+On web, a thread whose session is on shows a chip in its header: **Playtest: <target>** (while
+claiming: "claiming", while ending: "ending"), with the note and the rounds so far in its tooltip,
+and **End**. End is the tool's `end` with the person as the reason (`endReason: "person"`): it stops
+a running claim or round, runs `release`, and keeps the worktree. Pressed when the session already
+ended, it says so; when the release fails, it says that the session is ending and T3 tries again.
+End needs the right to operate threads on that server; without it the chip shows no End.
+
+The chip asks the server for the thread's session when the thread opens and every 15 seconds while
+it stays open, and right after End, so a session that ends any other way (the agent's `end`, idle,
+time limit, claim gone) loses its chip within 15 seconds. It asks only a server where playtest is on
+(the server's setting or a project's), so with playtest off it sends nothing. Two RPCs carry it:
+`fork.playtest.status` (read scope; the session's id, target, note, state, start and rounds, never
+its steps, worktree or output) and `fork.playtest.end` (operate scope). There is nothing new to set:
+the chip follows the settings above.
 
 ## The worker
 
