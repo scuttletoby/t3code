@@ -11,6 +11,7 @@
     "fork-kit",
     ".github/workflows/fork-pr-queue.yml",
     ".github/workflows/fork-head-gate.yml",
+    ".github/scripts/fork-ci-pressure.py",
     ".github/scripts/fork-fleet.py",
     ".github/scripts/fork-fleet-walls.py",
     ".github/scripts/fork-fleet-walls",

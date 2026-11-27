@@ -13,6 +13,13 @@ nothing.
 
 ## After ci/v14
 
+### pressure-note: a new action for a job's memory pressure numbers (#880)
+
+`pressure-note` runs the release's `.github/scripts/fork-ci-pressure.py` (now in every release commit): `phase: start`
+after the checkout, `phase: end` as the job's last step with `if: always()` and `job-status`. A job that did not
+succeed leaves the numbers as the notice the one automatic re-run reads. It never fails the job. Nothing changes for a
+project that does not use it.
+
 ### checkout-state: a lint for checkout state a self-hosted runner keeps (#932)
 
 New action. It fails a workflow whose jobs on a self-hosted runner could leave checkout state in the shared work

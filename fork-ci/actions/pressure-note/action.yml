@@ -1,0 +1,28 @@
+name: pressure-note
+description: >-
+  The machine's memory pressure numbers for one job: `phase: start` right after the checkout saves a sample,
+  `phase: end` as the job's last step (if: always()) prints them in the log and, when the job did not succeed, leaves
+  them as one notice annotation (fork-ci-pressure) that the one automatic re-run reads (.github/fork-ci-rerun.md).
+  Runs .github/scripts/fork-ci-pressure.py of the same release. Never fails the job. Needs python3 and timeout.
+inputs:
+  phase:
+    description: "`start` (after the checkout) or `end` (the job's last step, with if: always())."
+    required: true
+  job-status:
+    description: The job's status for `end` (pass the expression job.status); anything but success leaves the notice.
+    required: false
+    default: ""
+  time-limit:
+    description: Seconds the probe may take; past them it is stopped with a warning and the job goes on.
+    required: false
+    default: "30"
+runs:
+  using: composite
+  steps:
+    - name: Note memory pressure
+      shell: bash
+      env:
+        PHASE: ${{ inputs.phase }}
+        JOB_STATUS: ${{ inputs.job-status }}
+        TIME_LIMIT: ${{ inputs.time-limit }}
+      run: exec bash "$GITHUB_ACTION_PATH/pressure_note.sh"

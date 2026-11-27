@@ -1525,7 +1525,8 @@ that owns it within 10 minutes, once per head, with nothing registered.
   GitHub error sends nothing and leaves the file as it was. A held server (`serve --hold-work`)
   does not sweep.
 
-In `settings.json`: `"armedSweep": { "mode": "dry", "scope": "linked" }`. A mode other than `dry`
+Switch on: **Settings → Fork**, section Armed pull request sweep (timing under Advanced), or in
+`settings.json`: `"armedSweep": { "mode": "dry", "scope": "linked" }`. A mode other than `dry`
 or `on` reads as off, a scope other than `all` as `linked`, a bad number as its default; a save
 with a bad value is refused.
 

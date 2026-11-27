@@ -12,6 +12,7 @@ import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { AgentSlotsSettings, WaitsSettings } from "../WaitsAndSlotsSettings";
+import { ArmedSweepSettings } from "./ArmedSweepSettings";
 import { AssistantSettings } from "./AssistantSettings";
 import { forkFeatureStatuses } from "./forkStatus.logic";
 import { HandoffSettings } from "./HandoffSettings";
@@ -56,6 +57,7 @@ export function ForkSettingsPanel() {
         description="Agents end their turn and are woken when something they wait for happens."
       >
         <WaitsSettings isProjectScope={isProjectScope} />
+        {server(<ArmedSweepSettings />)}
       </ForkGroup>
       <ForkGroup
         title="Models and tools agents get"
