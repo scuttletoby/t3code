@@ -1,8 +1,7 @@
 /**
- * Fork: a child that closed its stdin before the runner wrote it (it exited at once) ends with its
- * own exit code, not as "its output could not be read". The handoff's `command` source writes an
- * empty stdin to a missing program under `timeout`, which exits 127 at once; the write then failed
- * with EPIPE in a few runs of a hundred (fork/processRunnerFork.ts).
+ * Fork: a child whose stdin closed before the runner wrote it ends with its own non-zero exit code
+ * (the handoff's `timeout` exits 127 at once for a missing program, EPIPE in a few runs of a
+ * hundred); an empty stdin loses nothing. Exit 0 without reading a real stdin stays an error.
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -82,6 +81,31 @@ describe("a child that closed its stdin", () => {
       }).pipe(Effect.flip);
       assert.strictEqual(error._tag, "ProcessStdinError");
     }),
+  );
+
+  it.effect("a child that exited 0 without reading its stdin is still a stdin error", () =>
+    Effect.gen(function* () {
+      const error = yield* runOn(exitedChild({ code: 0, stdout: "", stdin: "EPIPE" }), {
+        command: "true",
+        args: [],
+        stdin: "input",
+      }).pipe(Effect.flip);
+      assert.strictEqual(error._tag, "ProcessStdinError");
+    }),
+  );
+
+  it.effect(
+    "an empty stdin on a closed pipe loses nothing, so a child that exited 0 succeeds",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* runOn(exitedChild({ code: 0, stdout: "done", stdin: "EPIPE" }), {
+          command: "program",
+          args: [],
+          stdin: "",
+        });
+        assert.strictEqual(result.code, 0);
+        assert.strictEqual(result.stdout, "done");
+      }),
   );
 
   it.live("a real child that exits before reading 1 MB of stdin reports its exit code", () =>

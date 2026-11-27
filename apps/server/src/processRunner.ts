@@ -15,7 +15,7 @@ import {
   decodeUtf8,
   type CollectedUint8StreamText,
 } from "@t3tools/provider-core/server/collectStreamText";
-import { collectTail, isClosedStdin } from "./fork/processRunnerFork.ts";
+import { closedStdinOf, collectTail, isClosedStdin } from "./fork/processRunnerFork.ts";
 
 export interface ProcessRunInput {
   readonly command: string;
@@ -330,7 +330,7 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
     stdin === undefined
       ? Effect.void
       : Stream.run(Stream.encodeText(Stream.make(stdin)), child.stdin).pipe(
-          Effect.catchIf(isClosedStdin, () => Effect.void), // Fork: a child that already exited
+          Effect.catchIf(isClosedStdin, closedStdinOf(child, stdin)), // Fork: nothing went unread
           Effect.mapError(
             (cause) =>
               new ProcessStdinError({
