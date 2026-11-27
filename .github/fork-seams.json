@@ -563,9 +563,7 @@
       ],
       "announced": {
         "since": "2026-11-27",
-        "added": [
-          "DelegateChecks.promptEndsWait(result) || // Fork: a secret request ends a wait"
-        ]
+        "added": ["DelegateChecks.promptEndsWait(result) || // Fork: a secret request ends a wait"]
       }
     },
     "apps/server/src/peer/PeerLinks.ts": {
