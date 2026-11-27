@@ -1279,6 +1279,90 @@ describe("lens_start plans what the gate reads (fix round A+B)", () => {
     );
   });
 
+  it("the cap counts only this lens's children, and a batch starts at its largest count", () => {
+    const dead = (key: string, reads: Array<[number, string]>, attempt: number) => {
+      const prs = reads.map(([number, head]) => ({ number, head }));
+      return { requestId: lensRequestId(REPO, key, prs, attempt), key, prs, running: false };
+    };
+    const shape = (plan: LensStartPlan) => ({
+      starts: plan.starts.map((s) => [s.lens, s.prs.map((r) => r.number), s.attempt]),
+      refused: plan.refused.map((r) => r.pr),
+    });
+    // Three ended children of another lens at this very head: lens code has its own count, so it starts as attempt 1.
+    const other = [1, 2, 3].map((n) => dead("data", [[1, A]], n));
+    assert.deepStrictEqual(shape(planLensStart(input({ children: other }))), {
+      starts: [["code", [1], 1]],
+      refused: [],
+    });
+    // #1 had two children end, #2 none: the batch is attempt 3, never 1, and replaces both.
+    const two = [1, 2].map((n) => dead("code", [[1, A]], n));
+    const batch = planLensStart(
+      input({ pullList: [pull(1), pull(2, { head: B })], children: two }),
+    );
+    assert.deepStrictEqual(shape(batch), { starts: [["code", [1, 2], 3]], refused: [] });
+    assert.deepStrictEqual(
+      batch.starts[0]!.replaces,
+      two.map((c) => c.requestId),
+    );
+    assert.include(
+      batch.notes,
+      "lens code for #1 #2: 2 earlier children of it ended at one of these heads with no read the gate counts " +
+        `(the last: ${two[1]!.requestId}), so it starts again as attempt 3`,
+    );
+  });
+
+  it("a head read again after a force-push back to it: the read a newer post replaced is no failed attempt", () => {
+    const dead = (attempt: number) => ({
+      requestId: lensRequestId(REPO, "code", [{ number: 1, head: A }], attempt),
+      key: "code",
+      prs: [{ number: 1, head: A }],
+      running: false,
+    });
+    const shape = (plan: LensStartPlan) => ({
+      starts: plan.starts.map((s) => [s.prs.map((r) => r.number), s.attempt]),
+      refused: plan.refused.map((r) => r.reason),
+    });
+    // Head A, read; B, read; A again (force-push). Of three children at A, one read it: two failed, under the cap.
+    const ended = [1, 2, 3].map(dead);
+    const back = [report("code", A), report("code", B)];
+    const plan = planLensStart(input({ pullList: [pull(1, { posts: back })], children: ended }));
+    assert.deepStrictEqual(shape(plan), { starts: [[[1], 4]], refused: [] });
+    assert.include(
+      plan.notes,
+      "lens code for #1: 3 earlier children of it ended at this head (2 with no read the gate counts, 1 whose read " +
+        `a newer post of the lens replaced) (the last: ${ended[2]!.requestId}), so it starts again as attempt 4`,
+    );
+    // A read of A that did not count (edited, or no findings section in enforce) is a failed attempt: capped.
+    const edited = { ...report("code", A), edited: true };
+    const bare = {
+      ...report("code", A),
+      body: `lens: code · reviewer: x · read at: ${A}\nstate: fine`,
+    };
+    for (const first of [edited, bare]) {
+      const capped = planLensStart(
+        input({ pullList: [pull(1, { posts: [first, report("code", B)] })], children: ended }),
+      );
+      assert.deepStrictEqual(capped.starts, [], first.body);
+      assert.include(
+        capped.refused[0]!.reason,
+        "3 of its children ended with no read the gate counts",
+        first.body,
+      );
+    }
+    // A child that posts a read and then replaces it, again and again: twice the cap stops it all the same.
+    const many = [1, 2, 3, 4, 5, 6].map(dead);
+    const posts = many.flatMap(() => [report("code", A), report("code", B)]);
+    const stopped = planLensStart(input({ pullList: [pull(1, { posts })], children: many }));
+    assert.deepStrictEqual(shape(stopped), {
+      starts: [],
+      refused: [
+        "lens code is not started: 6 of its children ended at this head, and a newer post of the lens replaced " +
+          `each read the gate counted (the last: ${many[5]!.requestId}); a person looks at why before it starts ` +
+          "again, and a new head starts it afresh",
+      ],
+    });
+  });
+
   it("the caller stores each child's lens and pull requests: a hashed long id is still found again", () => {
     const long = `code-${"x".repeat(240)}`;
     const first = planLensStart(input({ review: null, required: [long] }));

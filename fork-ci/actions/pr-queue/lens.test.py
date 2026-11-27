@@ -1019,6 +1019,27 @@ class UnicodeVersion(unittest.TestCase):
                     read(body)
                 self.assertEqual(e.exception.code_points, ['U+0435'])
 
+    def test_a_code_point_an_html_reference_writes_is_refused_where_the_text_is_folded(self):
+        body = 'lens: code \u00b7 reviewer: x \u00b7 read at: ' + SHA_A + '\nblocker: none\n&#x435;major: x'
+        review = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',))
+        with self.other_unicode({0x435}):
+            for read in (review_judge.fold, review_judge.read_findings, lambda b: review.report_problem({'body': b})):
+                with self.assertRaises(lens.UnicodeDrift) as e:
+                    read(body)
+                self.assertEqual(e.exception.code_points, ['U+0435'])
+            # The header, key and marker rules read the text as written: no reference is decoded there.
+            self.assertEqual(lens.lens_header(body), ('code', SHA_A))
+            lens.lens_key(body)
+            self.assertTrue(lens.has_marker(body))
+
+    def test_a_mark_or_a_symbol_nfkc_changes_is_read_otherwise(self):   # each clause of _reads_otherwise
+        for cp in (0x483, 0x2122):   # a mark (category Mn); a symbol (So) that NFKC writes as letters (`TM`)
+            body = 'lens: code \u00b7 reviewer: x \u00b7 read at: ' + SHA_A + f'\nblocker: none\n{chr(cp)}major: x'
+            with self.subTest(cp=hex(cp)), self.other_unicode({cp}):
+                with self.assertRaises(lens.UnicodeDrift) as e:
+                    review_judge.read_findings(body)
+                self.assertEqual(e.exception.code_points, [f'U+{cp:04X}'])
+
     def test_text_both_unicodes_read_alike_is_read(self):
         body = 'lens: code \u00b7 reviewer: x \u00b7 read at: ' + SHA_A + '\nmajor: \u00e9 \U0001f600'
         with self.other_unicode({0x1F600}):   # a new symbol (an emoji) reads alike: no rule reads it
