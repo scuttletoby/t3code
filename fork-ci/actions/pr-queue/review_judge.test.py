@@ -5,7 +5,7 @@ The shared vectors (review.vectors.json: `cases`, `findings`, `scans`, `rounds`)
 rest here: reading git's name-status output, and that a rule set the parser
 would refuse, or a diff line nobody knows, never judges.
 """
-import dataclasses, json, os, re, sys, time, types, unittest, unittest.mock
+import dataclasses, html, json, os, re, sys, time, types, unittest, unittest.mock
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 
@@ -491,8 +491,10 @@ class SharedVectors(unittest.TestCase):
             with self.subTest(v['name']):
                 said, section = rj.read_findings(v['body'])
                 self.assertEqual(([list(f) for f in said], section), (v['findings'], v['section']))
+                # As written or as its HTML references write it (`&#x1C89;`): the rules read both.
                 self.assertEqual(v['unassigned'],
-                                 sorted({f'U+{ord(c):04X}' for c in v['body'] if unicodedata.category(c) == 'Cn'}))
+                                 sorted({f'U+{ord(c):04X}' for c in v['body'] + html.unescape(v['body'])
+                                         if unicodedata.category(c) == 'Cn'}))
                 # What T3 refuses on a runtime that assigns them (a letter, number, mark, format or space there): a
                 # subset; the rest (a new symbol) reads alike here and there.
                 self.assertLessEqual(set(v['refused']), set(v['unassigned']))

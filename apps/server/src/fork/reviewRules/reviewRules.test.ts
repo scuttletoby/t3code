@@ -200,12 +200,33 @@ describe("the shared vectors", () => {
         continue;
       }
       refused++;
-      for (const read of [readFindings, lensProblem, lensHeader, lensKey, fold, hasMarker]) {
+      // A code point an HTML reference writes (`&#x1C89;`) is read only where the text is folded (the findings rules):
+      // the header, key and marker rules read the text as written.
+      const written = drift.filter((u) =>
+        v.body.includes(String.fromCodePoint(Number.parseInt(u.slice(2), 16))),
+      );
+      const reads: Array<[(body: string) => unknown, string[]]> = [
+        [readFindings, drift],
+        [lensProblem, drift],
+        [fold, drift],
+        [lensHeader, written],
+        [lensKey, written],
+        [hasMarker, written],
+      ];
+      for (const [read, want] of reads) {
+        if (want.length === 0) {
+          assert.doesNotThrow(() => read(v.body), `${v.name}: ${read.name}`);
+          continue;
+        }
         assert.throws(() => read(v.body), PyTextError, undefined, `${v.name}: ${read.name}`);
         try {
           read(v.body);
         } catch (error) {
-          assert.deepStrictEqual((error as PyTextError).codePoints, drift, v.name);
+          assert.deepStrictEqual(
+            (error as PyTextError).codePoints,
+            want,
+            `${v.name}: ${read.name}`,
+          );
         }
       }
     }
