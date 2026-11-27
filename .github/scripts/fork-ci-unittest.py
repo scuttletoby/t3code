@@ -24,9 +24,11 @@ FORK_CI_TEST_COUNTS is removed from the environment before the test starts, so n
 process writes (a child made by os.fork keeps the shim, and writes nothing): a forked child's end line never stands in
 for its parent's."""
 import ast
+import faulthandler
 import json
 import os
 import runpy
+import signal
 import sys
 import unittest
 
@@ -236,6 +238,13 @@ def main():
         sys.path[0] = os.path.dirname(os.path.abspath(test))
     sys.argv = sys.argv[1:]
     source = defined(test)
+    # A test the runner stops at its time limit (fork-ci-tests.cjs) shows where it was: each line it printed so far
+    # (stdout line-buffered, so no whole line waits in a buffer the kill drops), and on SIGTERM every thread's stack,
+    # before the signal's own action (chain). A test that sets its own SIGTERM handler replaces this one.
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(faulthandler, "register"):
+        faulthandler.register(signal.SIGTERM, chain=True)
     try:
         runpy.run_path(test, run_name="__main__")
     finally:
