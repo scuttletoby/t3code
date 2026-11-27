@@ -533,7 +533,8 @@ KITS = {"agent-guards": ("kit_install", "sbin/agent-guards-install", "kit"),
         "desk": ("desk", "sbin/desk-install", "top"),
         "pc-agents": ("own", "sbin/pc-agents", "top")}
 # fork-kit folders that install nothing on a host
-NO_INSTALLER = {"common": "the code and the bootstrap the kits share", "review": "a skill an agent reads"}
+NO_INSTALLER = {"common": "the code and the bootstrap the kits share", "review": "a skill an agent reads",
+                "placement-facts": "example scripts a person copies"}
 # What each kind of failure asks for
 CAUSES = {"path": "add the path(s) to .github/fork-ci-release.json paths",
           "self-test": "the installer's own self-test failed on the release: a file a copied script loads is not in "

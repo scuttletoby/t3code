@@ -397,6 +397,9 @@ const FORK_LAYER_SPANS = [
   // The `threadRoles` save check's thread lookup in `ForkLayers.layerRuntimeServices`. Without it
   // the app refuses every new role ("cannot be checked here") and nothing else fails.
   "ThreadRoleTargets.make",
+  // The facts read's `factsCommand` runs in `ForkLayers.layerRuntimeServices`. Without them every
+  // machine with a `factsCommand` reads "no process runner here" and nothing else fails.
+  "FactsCommands.make",
 ];
 
 const missingForkLayers = (spans: ReadonlySet<string>) =>

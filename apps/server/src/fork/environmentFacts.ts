@@ -1,12 +1,14 @@
 /**
- * Fork (placement row P3): the facts `t3_environment_read` returns beside upstream's fields, both
- * optional ("Machine facts on t3_environment_read" in docs/fork/README.md). Slot facts come only
- * from the gate's status read; a gate that cannot be read gives a reason, never a count.
+ * Fork (placement rows P3, P4): the facts `t3_environment_read` returns beside upstream's fields
+ * ("Machine facts on t3_environment_read" in docs/fork/README.md). Slot facts come only from the
+ * gate's status read, labels and "the machine says" from Settings and `factsCommand`.
  */
 import {
+  canonicalPlacementLabels,
   ENVIRONMENT_FILE_LINK_AGENT_HINT,
   HostResourcesSnapshot,
   NonNegativeInt,
+  type ServerSettings,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
@@ -17,17 +19,19 @@ import * as Schema from "effect/Schema";
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as Settings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
+import { type FactsCommandResult, FactsCommands } from "./factsCommand.ts";
+import { readPlacementForThisOs } from "./placementRead.ts";
 
 /**
  * Placement facts. Every field but `labels`, `available` and `factsAt` is optional, so a machine on
  * a newer or older fork build that adds or drops one still decodes here.
  */
 export const Placement = Schema.Struct({
-  /** Declared facts, typed once in that machine's Settings. Empty until that setting exists (P2). */
+  /** That machine's `placement.labels` and the lines its `factsCommand` printed, canonical. */
   labels: Schema.Array(Schema.String),
   /**
-   * Whether the slot gate would take one more agent on this machine now. `false` also when the
-   * gate cannot be read: then no count is given, only `reason`.
+   * Whether the slot gate would take one more agent on this machine now and its `factsCommand`
+   * (if set) says it is free. `false` also when either cannot be read: then only `reason` says why.
    */
   available: Schema.Boolean,
   /** Why `available` is what it is, when the counts alone do not say it. */
@@ -73,36 +77,70 @@ export const REASON_SLOTS_OFF =
 export const REASON_FULL = "Every machine slot is in use.";
 export const REASON_LOW_MEMORY = "Free memory is below the floor the slot gate keeps.";
 
+export const REASON_FACTS_RUNNER_MISSING =
+  "This server cannot run its factsCommand (no process runner here).";
+export const REASON_FACTS_UNREAD = "This machine's own facts could not be read.";
+const reasonPlacementNotValid = (problem: string) =>
+  `This machine's placement setting is not valid on it, so it reads as not available: ${problem}`;
+
 const unavailable = (reason: string) => ({ available: false, reason }) as const;
 
 /** The slot facts, read once; never fails, never dies. */
-const slotFacts = Effect.gen(function* () {
-  const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
-  if (Option.isNone(gate)) return unavailable(REASON_GATE_MISSING);
-  const settingsService = yield* Effect.serviceOption(Settings.ServerSettingsService);
-  const settings = Option.isNone(settingsService)
-    ? Option.none()
-    : yield* settingsService.value.getSettings.pipe(Effect.option);
-  if (Option.isNone(settings)) return unavailable(REASON_SETTINGS_UNREAD);
-  const agentSlots = settings.value.agentSlots;
-  if (!agentSlots.enabled) return { available: true, reason: REASON_SLOTS_OFF } as const;
-  const usage = yield* gate.value.usage.pipe(Effect.timeoutOption(USAGE_READ_TIMEOUT));
-  // `usage` is null while slots are off (checked above) or when its counts cannot be read.
-  if (Option.isNone(usage) || usage.value === null) return unavailable(REASON_GATE_UNREAD);
-  const { machine, freeMemoryMb } = usage.value;
-  const slotsFree = machine.max === null ? null : Math.max(0, machine.max - machine.used);
-  const memoryFloorMb = agentSlots.minFreeMemoryMb > 0 ? agentSlots.minFreeMemoryMb : null;
-  const lowMemory = memoryFloorMb !== null && freeMemoryMb !== null && freeMemoryMb < memoryFloorMb;
-  const reason = slotsFree === 0 ? REASON_FULL : lowMemory ? REASON_LOW_MEMORY : undefined;
-  return {
-    available: reason === undefined,
-    ...(reason === undefined ? {} : { reason }),
-    runningAgents: machine.used,
-    slotsFree,
-    memoryFloorMb,
-    freeMemoryMb,
-  };
-}).pipe(Effect.catchCause(() => Effect.succeed(unavailable(REASON_GATE_UNREAD))));
+const slotFacts = Effect.fn("EnvironmentFacts.slotFacts")(
+  function* (settings: Option.Option<ServerSettings>) {
+    const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
+    if (Option.isNone(gate)) return unavailable(REASON_GATE_MISSING);
+    if (Option.isNone(settings)) return unavailable(REASON_SETTINGS_UNREAD);
+    const agentSlots = settings.value.agentSlots;
+    if (!agentSlots.enabled) return { available: true, reason: REASON_SLOTS_OFF } as const;
+    const usage = yield* gate.value.usage.pipe(Effect.timeoutOption(USAGE_READ_TIMEOUT));
+    // `usage` is null while slots are off (checked above) or when its counts cannot be read.
+    if (Option.isNone(usage) || usage.value === null) return unavailable(REASON_GATE_UNREAD);
+    const { machine, freeMemoryMb } = usage.value;
+    const slotsFree = machine.max === null ? null : Math.max(0, machine.max - machine.used);
+    const memoryFloorMb = agentSlots.minFreeMemoryMb > 0 ? agentSlots.minFreeMemoryMb : null;
+    const lowMemory =
+      memoryFloorMb !== null && freeMemoryMb !== null && freeMemoryMb < memoryFloorMb;
+    const reason = slotsFree === 0 ? REASON_FULL : lowMemory ? REASON_LOW_MEMORY : undefined;
+    return {
+      available: reason === undefined,
+      ...(reason === undefined ? {} : { reason }),
+      runningAgents: machine.used,
+      slotsFree,
+      memoryFloorMb,
+      freeMemoryMb,
+    };
+  },
+  Effect.catchCause(() => Effect.succeed(unavailable(REASON_GATE_UNREAD))),
+);
+
+/**
+ * What this machine says about itself: its `placement.labels`, then its `factsCommand`'s answer.
+ * A setting not valid on this OS, a runner that is not here or a failed run is "not available" with
+ * the reason, never "free"; no command set changes nothing. Never fails, never dies.
+ */
+const selfFacts = Effect.fn("EnvironmentFacts.selfFacts")(
+  function* (
+    settings: Option.Option<ServerSettings>,
+  ): Effect.fn.Return<{ readonly labels: ReadonlyArray<string>; readonly notAvailable?: string }> {
+    if (Option.isNone(settings)) return { labels: [] };
+    const placement = yield* readPlacementForThisOs(settings.value);
+    if (placement.problem !== undefined) {
+      return { labels: [], notAvailable: reasonPlacementNotValid(placement.problem) };
+    }
+    const commands = yield* Effect.serviceOption(FactsCommands);
+    const answer: FactsCommandResult =
+      placement.factsCommand === ""
+        ? { available: true, labels: [] }
+        : Option.isNone(commands)
+          ? { available: false, reason: REASON_FACTS_RUNNER_MISSING }
+          : yield* commands.value.run(placement.factsCommand);
+    return answer.available
+      ? { labels: canonicalPlacementLabels([...placement.labels, ...answer.labels]) }
+      : { labels: canonicalPlacementLabels(placement.labels), notAvailable: answer.reason };
+  },
+  Effect.catchCause(() => Effect.succeed({ labels: [], notAvailable: REASON_FACTS_UNREAD })),
+);
 
 /**
  * The facts for this machine's `t3_environment_read`. `hostResources` is left out when the host
@@ -116,10 +154,25 @@ export const read = Effect.gen(function* () {
         Effect.timeoutOption(HOST_READ_TIMEOUT),
         Effect.catchCause(() => Effect.succeedNone),
       );
-  const [hostResources, slots] = yield* Effect.all([hostRead, slotFacts], { concurrency: 2 });
+  const settingsService = yield* Effect.serviceOption(Settings.ServerSettingsService);
+  const settings = Option.isNone(settingsService)
+    ? Option.none()
+    : yield* settingsService.value.getSettings.pipe(
+        Effect.option,
+        Effect.catchCause(() => Effect.succeedNone),
+      );
+  const [hostResources, slots, self] = yield* Effect.all(
+    [hostRead, slotFacts(settings), selfFacts(settings)],
+    { concurrency: 3 },
+  );
+  // Not available if either says so; each "no" keeps its reason, slots first.
+  const reasons = [slots.available ? undefined : slots.reason, self.notAvailable].filter(
+    (reason) => reason !== undefined,
+  );
   const placement: Placement = {
-    labels: [],
     ...slots,
+    labels: self.labels,
+    ...(reasons.length === 0 ? {} : { available: false, reason: reasons.join(" ") }),
     factsAt: yield* Clock.currentTimeMillis,
   };
   return {

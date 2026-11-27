@@ -12,12 +12,16 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProcessRunner from "../processRunner.ts";
+import * as FactsCommands from "./factsCommand.ts";
 import { FACTS_COMMAND_TIMEOUT, runFactsCommand } from "./factsCommand.ts";
 
 /** A stand-in runner that records what it was asked and answers `answer`. */
@@ -370,3 +374,71 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
     );
   },
 );
+
+describe("factsCommand: one run serves the facts reads of a short window", () => {
+  /** A runner that counts runs; `hold` keeps a run from answering until it is opened. */
+  const counting = (hold?: Deferred.Deferred<void>) => {
+    const runs: Array<string> = [];
+    const layer = Layer.mock(ProcessRunner.ProcessRunner)({
+      run: (input) =>
+        Effect.gen(function* () {
+          runs.push(input.command);
+          if (hold !== undefined) yield* Deferred.await(hold);
+          return {
+            stdout: `gpu\nrun-${runs.length}\n`,
+            stderr: "",
+            code: 0,
+            timedOut: false,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutInvalidUtf8: false,
+            stderrInvalidUtf8: false,
+          } as ProcessRunner.ProcessRunOutput;
+        }),
+    });
+    return { runs, layer };
+  };
+  const service = (layer: Layer.Layer<ProcessRunner.ProcessRunner>) =>
+    FactsCommands.make.pipe(
+      Effect.provide(layer),
+      Effect.provideService(HostProcess.Platform, "linux"),
+    );
+
+  it.effect("reads at the same time share one run; the answer is kept for the window", () =>
+    Effect.gen(function* () {
+      const { runs, layer } = counting();
+      const facts = yield* service(layer);
+      const both = yield* Effect.all([facts.run("/x/facts"), facts.run("/x/facts")], {
+        concurrency: 2,
+      });
+      expect(both).toEqual([
+        { available: true, labels: ["gpu", "run-1"] },
+        { available: true, labels: ["gpu", "run-1"] },
+      ]);
+      yield* TestClock.adjust(Duration.toMillis(FactsCommands.FACTS_COMMAND_CACHE_TTL) - 1);
+      expect(yield* facts.run("/x/facts")).toEqual({ available: true, labels: ["gpu", "run-1"] });
+      expect(runs).toEqual(["/x/facts"]);
+      // Runs again once the window is over: a machine that became busy says so then.
+      yield* TestClock.adjust(Duration.millis(1));
+      expect(yield* facts.run("/x/facts")).toEqual({ available: true, labels: ["gpu", "run-2"] });
+      // A changed setting is another command: it runs at once.
+      expect(yield* facts.run("/y/facts")).toEqual({ available: true, labels: ["gpu", "run-3"] });
+      expect(runs).toEqual(["/x/facts", "/x/facts", "/y/facts"]);
+    }),
+  );
+
+  it.effect("a run every reader stopped waiting for is stopped and not kept", () =>
+    Effect.gen(function* () {
+      const hold = yield* Deferred.make<void>();
+      const { runs, layer } = counting(hold);
+      const facts = yield* service(layer);
+      const stopped = yield* facts.run("/x/facts").pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      expect(runs).toEqual(["/x/facts"]);
+      yield* Fiber.interrupt(stopped);
+      yield* Deferred.succeed(hold, undefined);
+      expect(yield* facts.run("/x/facts")).toEqual({ available: true, labels: ["gpu", "run-2"] });
+      expect(runs).toEqual(["/x/facts", "/x/facts"]);
+    }),
+  );
+});
