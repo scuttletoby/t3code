@@ -498,6 +498,17 @@
         ]
       }
     },
+    "apps/web/src/components/chat/RightPanelSurfaceContent.tsx": {
+      "why": "A chat file link naming another environment (/t3-environment/<id>/<path>, #1046) opens in the files viewer: a file surface with such a path renders the fork's panel (components/chat/forkEnvironmentFilePanel.tsx), which reads the file through that environment's own connection and file-read scope, instead of upstream's FilePreviewPanel, which reads through the thread's environment. One import and one line before upstream's file branch, so no upstream line changes (owner decision #1072).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import { ForkEnvironmentFilePanel, isForkEnvironmentFile } from \"./forkEnvironmentFilePanel\"; // Fork",
+          "if (isForkEnvironmentFile(surface)) return <ForkEnvironmentFilePanel surface={surface} />; // Fork"
+        ]
+      }
+    },
     "packages/provider-acp/src/server/adapter.ts": {
       "why": "Fix for #846 (an upstream bug, not reported upstream). At a turn's end the ACP adapter caches the provider thread as active; usage and session info an agent (Kiro, Kimi) sends after the prompt settles re-send that snapshot session-scoped, which the server writes unguarded, so a race with the run's final write can leave an ended thread active. The cached snapshot is settled (idle) like the server's final write; a broken thread keeps upstream's error. One override line after upstream's status line, so no upstream line changes.",
       "added": [
