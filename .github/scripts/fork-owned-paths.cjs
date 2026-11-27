@@ -1,10 +1,13 @@
 // Fork only: prints `fork_only=true` and upstream's gates for an empty change (all false) when every path
-// this pull request changes is fork-owned (.github/fork-owned-paths.txt); else `fork_only=false`. Fails
-// closed and never exits non-zero. Run by fork-tests.yml's `changes` job from the merge commit:
+// this pull request changes is fork-owned (.github/fork-owned-paths.txt). When only some are, it prints
+// `fork_only=false` and upstream's gates for the other paths alone: no app job reads a fork-owned path, so
+// those paths must not make upstream's detector run every job (it does for any path it does not know).
+// Else just `fork_only=false` (the detector's own answer stands). Fails closed and never exits non-zero.
+// Run by fork-tests.yml's `changes` job from the merge commit:
 //   node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT"   (tests: fork-owned-paths.test.py)
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
-const { decide } = require("./ci-changes.cjs");
+const { decide, readWorkspace } = require("./ci-changes.cjs");
 
 const LIST = ".github/fork-owned-paths.txt";
 
@@ -66,6 +69,13 @@ function forkOnlyOutputs() {
   return ["fork_only=true", ...Object.entries(outputs).map(([key, value]) => `${key}=${value}`)];
 }
 
+/** Upstream's gates for `paths` alone (the paths that are not fork-owned), as `key=value` lines. */
+function narrowedOutputs(paths, packages = readWorkspace()) {
+  if (paths.length === 0 || packages.length === 0) throw new Error("nothing to narrow to");
+  const { outputs } = decide(paths, packages, false);
+  return ["fork_only=false", ...Object.entries(outputs).map(([key, value]) => `${key}=${value}`)];
+}
+
 function git(args) {
   return execFileSync("git", ["-c", "core.quotePath=false", ...args], {
     encoding: "utf8",
@@ -92,7 +102,17 @@ function main(env = process.env, log = console.error) {
     if (files.length === 0) return no("the pull request changes no path.");
     if (!forkOnly) {
       const shown = notOwned.slice(0, 5).join(", ") + (notOwned.length > 5 ? ", ..." : "");
-      return no(`${notOwned.length} of ${files.length} paths are not fork-owned: ${shown}.`);
+      if (notOwned.length === files.length) {
+        return no(`${notOwned.length} of ${files.length} paths are not fork-owned: ${shown}.`);
+      }
+      // Some paths are fork-owned: upstream's detector judges the rest alone. Anything that fails here
+      // (no workspace, a broken manifest) falls to the catch: the detector's answer for every path stands.
+      const lines = narrowedOutputs(notOwned);
+      log(
+        `Partly fork-owned: ${files.length - notOwned.length} of ${files.length} changed paths are fork-owned ` +
+          `(${LIST}) and left out; the gates are upstream's detector's for the other ${notOwned.length}: ${shown}.`,
+      );
+      return lines;
     }
     log(`Fork-only: all ${files.length} changed paths are fork-owned (${LIST}).`);
     return forkOnlyOutputs();
@@ -101,7 +121,7 @@ function main(env = process.env, log = console.error) {
   }
 }
 
-module.exports = { NEVER, parseList, owned, judge, forkOnlyOutputs, main };
+module.exports = { NEVER, parseList, owned, judge, forkOnlyOutputs, narrowedOutputs, main };
 
 if (require.main === module) {
   for (const line of main()) console.log(line);
