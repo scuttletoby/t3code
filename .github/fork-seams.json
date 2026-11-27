@@ -452,13 +452,15 @@
       }
     },
     "apps/web/src/components/chat/ChatHeader.tsx": {
-      "why": "The thread header shows the thread's role badge, Assistant or Orchestrator (calm sidebar, #878 CAL3): one import and one element after upstream's linked-environment badge, hidden while the title is renamed; the badge and its rule are in fork/calmSidebar/ForkThreadRoleBadge.tsx.",
+      "why": "The thread header shows the thread's role badge, Assistant or Orchestrator (calm sidebar, #878 CAL3): one import and one element after upstream's linked-environment badge, hidden while the title is renamed; the badge and its rule are in fork/calmSidebar/ForkThreadRoleBadge.tsx. The thread header shows the playtest chip with End while the thread has a session on (playtest F5, #889): one import and one element after upstream's guest-share indicator; the chip is in fork/playtest/ForkPlaytestChip.tsx.",
       "added": [],
       "announced": {
         "since": "2026-11-27",
         "added": [
           "import { ForkThreadRoleBadge } from \"../fork/calmSidebar/ForkThreadRoleBadge\"; // Fork (calm sidebar)",
-          "{renamingTitle === null ? <ForkThreadRoleBadge threadRef={activeThreadRef} /> : null}"
+          "{renamingTitle === null ? <ForkThreadRoleBadge threadRef={activeThreadRef} /> : null}",
+          "import { ForkPlaytestChip } from \"../fork/playtest/ForkPlaytestChip\"; // Fork (playtest F5)",
+          "{isServerThread ? <ForkPlaytestChip threadRef={activeThreadRef} /> : null}"
         ]
       }
     },
@@ -648,6 +650,53 @@
         "record, // Fork: the model policy reads context, model and effort from it",
         "export { parseSkillFrontmatter }; // Fork: one frontmatter read for skills and the model policy"
       ]
+    },
+    "packages/contracts/src/rpc.ts": {
+      "why": "The playtest thread chip's two RPCs (playtest F5, #889) join upstream's RPC group: one import and one line each in `WsRpcGroup`; the RPCs, their method names and their scope and span maps are in the fork file forkPlaytestRpc.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import * as ForkPlaytestRpc from \"./forkPlaytestRpc.ts\"; // Fork (playtest F5)",
+          "ForkPlaytestRpc.WsForkPlaytestStatusRpc, // Fork (playtest F5)",
+          "ForkPlaytestRpc.WsForkPlaytestEndRpc, // Fork (playtest F5)"
+        ]
+      }
+    },
+    "apps/server/src/ws.ts": {
+      "why": "The playtest thread chip's two RPC handlers (playtest F5, #889; fork/playtestRpcHandlers.ts) spread into the handler table. The playtest service is read optionally, so a server built without it (ws.test.ts's layers) needs no change and answers store_unavailable.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import * as ForkPlaytestRpcHandlers from \"./fork/playtestRpcHandlers.ts\"; // Fork (playtest F5)",
+          "import { Playtest } from \"./playtest/PlaytestLayer.ts\"; // Fork (playtest F5)",
+          "const forkPlaytest = yield* Effect.serviceOption(Playtest); // Fork (playtest F5)",
+          "...ForkPlaytestRpcHandlers.make(forkPlaytest), // Fork (playtest F5)"
+        ]
+      }
+    },
+    "apps/server/src/auth/RpcAuthorization.ts": {
+      "why": "The scope table must name every RPC: the playtest chip's two (playtest F5, #889) come in with one spread of the fork's map (contracts forkPlaytestRpc.ts): status read, end operate.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import { FORK_PLAYTEST_RPC_SCOPES } from \"@t3tools/contracts\"; // Fork (playtest F5)",
+          "...FORK_PLAYTEST_RPC_SCOPES, // Fork (playtest F5)"
+        ]
+      }
+    },
+    "apps/server/src/observability/RpcInstrumentation.ts": {
+      "why": "The span table must name every RPC: the playtest chip's two (playtest F5, #889) come in with one spread of the fork's map (contracts forkPlaytestRpc.ts).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import { FORK_PLAYTEST_RPC_SPANS } from \"@t3tools/contracts\"; // Fork (playtest F5)",
+          "...FORK_PLAYTEST_RPC_SPANS, // Fork (playtest F5)"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
