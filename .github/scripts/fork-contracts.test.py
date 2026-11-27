@@ -4589,7 +4589,7 @@ MAY_SKIP = {
         "test_the_path_rules_are_first_in_the_release_the_guide_names")],
     # Run older releases' installers, found by their ci/vN tags; CI's checkout fetches none.
     "fork-kit/heavy/tests/install.test.py": [
-        "Install.test_a_rollback_with_a_real_older_installer_keeps_t3_capacity_running",
+        "Install.test_a_rollback_with_a_real_older_installer_rolls_t3_capacity_back_too",
         "Install.test_older_installers_install_and_uninstall_keep_the_hosts_t3_capacity"],
 }
 check("records: the tests a part run may skip are exactly the pinned ones, each by name (MAY_SKIP)",

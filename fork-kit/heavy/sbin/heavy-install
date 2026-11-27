@@ -40,13 +40,11 @@ CAPACITY = '/usr/local/bin/t3-capacity'
 # and its uninstall deletes LIBEXEC and ETC whole (so a copy kept anywhere in them would be lost)
 KEPT_CAPACITY = '/usr/local/libexec/heavy-kept'
 UNIT_DIR = '/etc/systemd/user'
-# t3-capacity links to the release's own folder, not to `current` (#933): a rollback to a release without
-# bin/t3-capacity (ci/v20 or older) switches `current` but keeps every version folder, so the link still runs.
-# ci/v23 to the release before #933 linked it to `current/bin/t3-capacity`: that form is still the kit's (kit_link).
+# Every link names `current`, the form every installer from ci/v23 on knows as its own, so a rollback to any of them
+# switches t3-capacity together with heavy (#1095). ci/v20 and older have no bin/t3-capacity: before going back to one,
+# run this release's uninstall (README, Rollback past the `t3-capacity` link).
 LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-install',
-         CAPACITY: VERSIONS + '/{sha}/bin/t3-capacity'}
-OLD_CAPACITY_LINK = CURRENT + '/bin/t3-capacity'
-CAPACITY_LINK_RE = re.compile(re.escape(VERSIONS) + r'/[0-9a-f]{40}/bin/t3-capacity\Z')
+         CAPACITY: CURRENT + '/bin/t3-capacity'}
 KEPT = {WRAPPER: (REPLACED, 'heavy'), CAPACITY: (KEPT_CAPACITY, 't3-capacity')}   # where a plain old file goes
 
 SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'lib/heavy_queue.py',
@@ -148,21 +146,10 @@ def switch_link(path, target):
     os.replace(tmp, real)
 
 
-def link_target(path, sha):
-    """What the kit links PATH to for release SHA."""
-    return LINKS[path].format(sha=sha)
-
-
 def kit_link(path):
-    """PATH is a link this kit made, for any release: t3-capacity's to a version folder or (before #933) to
-    `current`, the others' to `current`. Its target may be gone."""
+    """PATH is the link this kit makes (its target may be gone, e.g. after a rollback to ci/v20 or older)."""
     real = p(path)
-    if not os.path.islink(real):
-        return False
-    if path == CAPACITY:
-        target = os.readlink(real)
-        return target == OLD_CAPACITY_LINK or bool(CAPACITY_LINK_RE.match(target))
-    return os.readlink(real) == LINKS[path]
+    return os.path.islink(real) and os.readlink(real) == LINKS[path]
 
 
 def read_manifest(folder):
@@ -348,7 +335,7 @@ def ours_unit(path):
 
 
 def record_rows(sha, unit_path, sweep_timer=False):
-    rows = [(path, 'link', link_target(path, sha)) for path in sorted(LINKS)
+    rows = [(path, 'link', target) for path, target in sorted(LINKS.items())
             if path != CAPACITY or kit_link(path)]     # a host's own t3-capacity left in place is not recorded
     rows.append((CURRENT, 'link', f'{VERSIONS}/{sha}'))
     folder = p(f'{VERSIONS}/{sha}')
@@ -422,8 +409,7 @@ def install(a, stop_after=None):
     done('slice-unit')
     switch_link(CURRENT, f'{VERSIONS}/{a.sha}')
     done('switch')
-    for path in LINKS:
-        target = link_target(path, a.sha)
+    for path, target in LINKS.items():
         if path == CAPACITY and os.path.lexists(p(path)) and not kit_link(path) and not a.replace_t3_capacity:
             if os.path.islink(p(path)):
                 say(f'note: {path} is a link this kit did not make (to {os.readlink(p(path))}): left as it is (its '
