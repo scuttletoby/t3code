@@ -117,6 +117,26 @@ describe("listingGaps", () => {
     expect(readInFull(gaps)).toBe(false);
   });
 
+  // Does the cut line write the repository as the project names it, not as the cursor key does?
+  it("names a cut repository as the listing writes it, not lowercased", () => {
+    const cutAnswer = answer([entry("9", "A bug")], {
+      nextCursors: { "github.com acme/myapp": "page-2" },
+      scopes: [
+        {
+          projectId: ProjectId.make("app"),
+          tracker: "github",
+          host: "github.com",
+          scope: "Acme/MyApp",
+        } as NonNullable<IssueListResult["scopes"]>[number],
+      ],
+    });
+    const gaps = listingGaps({
+      all: listing("all", everyServer(cutAnswer)),
+      labelled: listing("labelled", everyServer()),
+    });
+    expect(gaps.cut).toEqual([{ host: "github.com", scope: "Acme/MyApp", labelled: false }]);
+  });
+
   it("names a repository whose labelled listing was cut too", () => {
     const gaps = listingGaps({
       all: listing("all", everyServer()),

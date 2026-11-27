@@ -95,11 +95,20 @@ export function listingGaps(listings: {
     if (listing.error !== null) failed = true;
     for (const [, answer] of listing.answers) {
       if (answer.errors.length > 0) failed = true;
+      // A cursor's key lowercases the scope; the listing's scopes keep the name as it is written.
+      const named = new Map(
+        (answer.scopes ?? []).flatMap((ref) =>
+          ref.host === undefined
+            ? []
+            : [[`${ref.host} ${ref.scope}`.toLowerCase(), { host: ref.host, scope: ref.scope }]],
+        ),
+      );
       for (const key of Object.keys(answer.nextCursors)) {
         // Keyed `"<host> <scope>"`.
         const space = key.indexOf(" ");
-        const host = space < 0 ? "" : key.slice(0, space);
-        const scope = key.slice(space + 1);
+        const ref = named.get(key.toLowerCase());
+        const host = ref?.host ?? (space < 0 ? "" : key.slice(0, space));
+        const scope = ref?.scope ?? key.slice(space + 1);
         const id = `${which}\u0000${key.toLowerCase()}`;
         if (seenCuts.has(id)) continue;
         seenCuts.add(id);

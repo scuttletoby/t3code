@@ -16,6 +16,7 @@ import { AssistantSettings } from "./AssistantSettings";
 import { forkFeatureStatuses } from "./forkStatus.logic";
 import { HandoffSettings } from "./HandoffSettings";
 import { McpProfileSettings } from "./McpProfileSettings";
+import { OwnerQuestionsSettings } from "./OwnerQuestionsSettings";
 import { PlaytestSettings } from "./PlaytestSettings";
 import { StopFinishedChildrenSettings } from "./StopFinishedChildrenSettings";
 import { UpdatesSettings } from "./UpdatesSettings";
@@ -68,6 +69,7 @@ export function ForkSettingsPanel() {
       {server(<AssistantSettings />)}
       <PlaytestSettings isProjectScope={isProjectScope} />
       {server(<UpdatesSettings />)}
+      {server(<OwnerQuestionsSettings />)}
     </SettingsPageContainer>
   );
 }

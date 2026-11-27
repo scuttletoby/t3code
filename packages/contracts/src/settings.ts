@@ -2227,5 +2227,6 @@ export const ClientSettingsPatch = Schema.Struct({
   snapShotAnimations: Schema.optionalKey(Schema.Boolean),
   wordWrap: Schema.optionalKey(Schema.Boolean),
   mathRenderingEnabled: Schema.optionalKey(Schema.Boolean),
+  ...ForkSettings.ForkClientSettingsPatchFields,
 });
 export type ClientSettingsPatch = typeof ClientSettingsPatch.Type;
