@@ -64,6 +64,7 @@
 .github/scripts/fork-owned-reads.test.py run by .github/workflows/fork-tests.yml ok lines
 .github/scripts/fork-pr-queue-workflow.test.py ok lines
 .github/scripts/fork-ci-release.test.py ok lines
+.github/scripts/fork-ci-release-cleanup.test.py unittest
 .github/scripts/fork-changes-list.test.cjs
 .github/scripts/fork-release-workflow.test.py ok lines
 .github/scripts/fork-release.test.sh ~5s
@@ -147,7 +148,7 @@ fork-kit/gh-apps/tests/wrapper.test.py unittest
 # Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml unittest
 fork-kit/heavy/tests/capacity_rule.test.py ~5s unittest
-fork-kit/heavy/tests/facts.test.py ~30s unittest
+fork-kit/heavy/tests/facts.test.py ~62s unittest
 fork-kit/heavy/tests/install.test.py ~8s unittest
 fork-kit/heavy/tests/measure.test.py ~10s unittest
 fork-kit/heavy/tests/queue.test.py ~18s unittest
