@@ -67,6 +67,7 @@ if (isMain) {
     const { json } = args;
     const outcome = await runPrepare({
       ...args.options,
+      stopOnSignals: true,
       log: (text) => process.stderr.write(text),
     });
     process.stdout.write(json ? `${JSON.stringify(outcome.result, null, 2)}\n` : outcome.text);

@@ -114,16 +114,24 @@ export type BaselineOutcome =
   | ({ readonly status: "green" | "red"; readonly files: ReadonlyArray<string> } & CommandRun)
   | { readonly status: "skipped"; readonly reason: string };
 
-export type FailedStep = "checkout" | "clone" | "branch" | "config" | "merge" | "install";
+export type FailedStep =
+  | "checkout"
+  | "clone"
+  | "branch"
+  | "config"
+  | "merge"
+  | "install"
+  | "baseline";
 
 export interface PrepareResult {
   readonly version: 1;
   /**
    * `running` is written first, so a prepare stopped half-way never leaves an older run's result
-   * looking current. `no-config`: the project has no prepare config; nothing but the asked-for
-   * clone and branch was done.
+   * looking current; `pid` tells a reader whether that run is still alive. `no-config`: the project
+   * has no prepare config; nothing but the asked-for clone and branch was done.
    */
   readonly status: "running" | "prepared" | "no-config" | "failed";
+  readonly pid: number;
   readonly checkout: string;
   readonly branch: string | null;
   readonly head: string | null;
@@ -151,6 +159,11 @@ export interface PrepareOptions {
   readonly base?: string;
   /** Files the work will touch, besides the ones the branch already changed against the base. */
   readonly paths?: ReadonlyArray<string>;
+  /**
+   * The CLI: on SIGINT, SIGTERM or SIGHUP, stop the running command's process group, write a
+   * `failed` result and exit 128 + the signal's number.
+   */
+  readonly stopOnSignals?: boolean;
   readonly now?: () => Date;
   /** Progress and command output, as it comes (the CLI sends it to stderr). */
   readonly log?: (text: string) => void;
@@ -163,6 +176,13 @@ export interface PrepareOutcome {
   /** 0 prepared (red baseline and conflicts included) or no config; 1 failed. */
   readonly exitCode: 0 | 1;
 }
+
+const LOCK_FILE = "t3-prepare.lock";
+const STOP_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+/** After a command exits, how long a process that left its group may hold its output open. */
+const EXIT_GRACE_MS = 1000;
+/** Shell exit codes for a command that is not executable or not found. */
+const COULD_NOT_RUN = new Set([126, 127]);
 
 interface GitRun {
   readonly code: number | null;
@@ -191,6 +211,11 @@ const gitLine = (cwd: string, args: ReadonlyArray<string>): string | null => {
 };
 const gitLines = (cwd: string, args: ReadonlyArray<string>): Array<string> =>
   (gitLine(cwd, args) ?? "").split("\n").filter((line) => line.length > 0);
+/** Paths from a `-z` listing: raw names, never C-quoted (non-ASCII ones included). */
+const gitPaths = (cwd: string, args: ReadonlyArray<string>): Array<string> => {
+  const run = git(cwd, args);
+  return run.code === 0 ? run.stdout.split("\0").filter((path) => path.length > 0) : [];
+};
 
 const lastLines = (text: string): string =>
   text.trimEnd().split("\n").slice(-TAIL_LINES).join("\n");
@@ -199,21 +224,37 @@ const lastLines = (text: string): string =>
 export const shellQuote = (value: string): string =>
   /^[\w./@%+=:,-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
 
+/** A touched file as the baseline command gets it: never read as an option (`-x` -> `./-x`). */
+const fileArgument = (path: string) => shellQuote(path.startsWith("-") ? `./${path}` : path);
+
+const isAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
 /**
- * Runs one shell command in its own process group (POSIX), so a timeout stops what it started.
- * Output goes to `log` as it comes; its tail is kept.
+ * Runs one shell command in its own process group (POSIX), so a timeout or a stopped prepare
+ * stops what it started. Output goes to `log` as it comes; its tail is kept. `track` gets the
+ * group's stop function while the command runs.
  */
 function runCommand(
   command: string,
   cwd: string,
   timeoutMs: number,
   log: (text: string) => void,
+  track: (stop: (() => void) | null) => void,
 ): Promise<CommandRun> {
   // oxlint-disable-next-line t3code/no-global-process-runtime -- A plain node script, no Effect runtime.
   const windows = NodeOS.platform() === "win32";
   return new Promise((resolve) => {
     let kept = "";
     let timedOut = false;
+    let done = false;
+    let grace: ReturnType<typeof setTimeout> | undefined;
     const keep = (chunk: Buffer) => {
       const text = chunk.toString("utf8");
       log(text);
@@ -234,20 +275,34 @@ function runCommand(
         // Already gone.
       }
     };
+    track(stop);
     const timer = setTimeout(() => {
       timedOut = true;
       stop();
     }, timeoutMs);
+    const finish = (code: number | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      track(null);
+      // What the command left running in its group is stopped too.
+      if (!timedOut) stop();
+      resolve({ command, exitCode: timedOut ? null : code, timedOut, tail: lastLines(kept) });
+    };
     child.stdout.on("data", keep);
     child.stderr.on("data", keep);
     child.on("error", (error) => {
       kept += `\n${error.message}`;
     });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      // What the command left running in its group is stopped too.
-      if (!timedOut) stop();
-      resolve({ command, exitCode: timedOut ? null : code, timedOut, tail: lastLines(kept) });
+    child.on("close", (code) => finish(code));
+    // A process that left the group (setsid) can hold the output open after the command exited.
+    child.on("exit", (code) => {
+      grace = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        finish(code);
+      }, EXIT_GRACE_MS);
     });
   });
 }
@@ -255,6 +310,7 @@ function runCommand(
 const nothingDone = (dir: string, startedAt: string): PrepareResult => ({
   version: 1,
   status: "running",
+  pid: process.pid,
   checkout: dir,
   branch: null,
   head: null,
@@ -274,18 +330,56 @@ const sameRemote = (left: string, right: string) =>
 const hasLocalChanges = (top: string) =>
   (gitLine(top, ["status", "--porcelain", "--untracked-files=no"]) ?? "x").length > 0;
 
-/** Fetches the remote a base like `origin/main` names, when there is one. False: it failed. */
-const fetchBaseRemote = (
-  top: string,
-  base: string,
-): { fetched: boolean; remote: string | null } => {
-  const remote = gitLines(top, ["remote"]).find((name) => base.startsWith(`${name}/`)) ?? null;
-  if (remote === null) return { fetched: true, remote: null };
-  return { fetched: gitOk(top, ["fetch", "--quiet", remote]), remote };
-};
-
 const resolves = (top: string, ref: string) =>
   gitOk(top, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+
+type ConfigRead =
+  | { readonly ok: true; readonly config: PrepareConfig | null }
+  | { readonly ok: false; readonly problem: string };
+
+/** The config in the checkout's work tree as it is now; null when the project has none. */
+const readConfig = (top: string): ConfigRead => {
+  const path = NodePath.join(top, PREPARE_CONFIG_PATH);
+  if (!NodeFS.existsSync(path)) return { ok: true, config: null };
+  const parsed = parsePrepareConfig(NodeFS.readFileSync(path, "utf8"));
+  return parsed.ok ? parsed : { ok: false, problem: `${PREPARE_CONFIG_PATH}: ${parsed.problem}` };
+};
+
+type Lock =
+  | { readonly ok: true; readonly stalePid: number | null; readonly release: () => void }
+  | { readonly ok: false; readonly pid: number };
+
+/** One prepare per checkout. A lock whose process is gone is taken over and reported. */
+const takeLock = (path: string): Lock => {
+  let stalePid: number | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      NodeFS.writeFileSync(path, `${process.pid}\n`, { flag: "wx" });
+      const release = () => {
+        try {
+          if (NodeFS.readFileSync(path, "utf8").trim() === String(process.pid)) {
+            NodeFS.unlinkSync(path);
+          }
+        } catch {
+          // Already gone.
+        }
+      };
+      return { ok: true, stalePid, release };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    let pid = Number.NaN;
+    try {
+      pid = Number.parseInt(NodeFS.readFileSync(path, "utf8"), 10);
+    } catch {
+      // Removed meanwhile: try again.
+    }
+    if (Number.isInteger(pid) && pid > 0 && isAlive(pid)) return { ok: false, pid };
+    stalePid = Number.isInteger(pid) && pid > 0 ? pid : null;
+    NodeFS.rmSync(path, { force: true });
+  }
+  return { ok: false, pid: Number.NaN };
+};
 
 export async function runPrepare(options: PrepareOptions): Promise<PrepareOutcome> {
   const now = options.now ?? (() => new Date());
@@ -294,190 +388,358 @@ export async function runPrepare(options: PrepareOptions): Promise<PrepareOutcom
   let result: PrepareResult = nothingDone(dir, now().toISOString());
   let resultDir: string | null = null;
   const notes: Array<string> = [];
+  let step: FailedStep = "checkout";
+  let stopCommand: (() => void) | null = null;
+  let release = () => {};
 
   const save = (next: PrepareResult): PrepareOutcome | null => {
     result = next;
     const text = formatPrepareResult(next, resultDir);
     if (resultDir !== null) {
-      writeAtomic(NodePath.join(resultDir, RESULT_JSON_FILE), `${JSON.stringify(next, null, 2)}\n`);
+      // The JSON is the one that counts: written last, so it never shows a step the text lacks.
       writeAtomic(NodePath.join(resultDir, RESULT_TEXT_FILE), text);
+      writeAtomic(NodePath.join(resultDir, RESULT_JSON_FILE), `${JSON.stringify(next, null, 2)}\n`);
     }
     return next.status === "running"
       ? null
       : { result: next, text, exitCode: next.status === "failed" ? 1 : 0 };
   };
-  const fail = (step: FailedStep, message: string, tail?: string): PrepareOutcome =>
+  const fail = (failed: FailedStep, message: string, tail?: string): PrepareOutcome =>
     save({
       ...result,
       status: "failed",
       finishedAt: now().toISOString(),
-      failure: tail === undefined ? { step, message } : { step, message, tail },
+      failure: tail === undefined ? { step: failed, message } : { step: failed, message, tail },
       notes: [...notes],
     })!;
 
-  // 1. The checkout.
-  if (options.clone !== undefined) {
-    if (!NodeFS.existsSync(dir)) {
-      log(`clone ${options.clone} -> ${dir}\n`);
-      NodeFS.mkdirSync(NodePath.dirname(dir), { recursive: true });
-      const cloned = git(NodePath.dirname(dir), ["clone", "--quiet", options.clone, dir]);
-      if (cloned.code !== 0) return fail("clone", "git clone failed", lastLines(cloned.stderr));
-    } else {
-      const origin = gitLine(dir, ["remote", "get-url", "origin"]);
-      if (origin === null || !sameRemote(origin, options.clone)) {
-        return fail(
+  const onSignal = (signal: (typeof STOP_SIGNALS)[number]) => {
+    stopCommand?.();
+    fail(step, `the prepare was stopped by ${signal} during ${step}`);
+    release();
+    process.exit(128 + (NodeOS.constants.signals[signal] ?? 0));
+  };
+  if (options.stopOnSignals === true) {
+    for (const signal of STOP_SIGNALS) process.on(signal, onSignal);
+  }
+  try {
+    return await prepareSteps();
+  } finally {
+    for (const signal of STOP_SIGNALS) process.off(signal, onSignal);
+    release();
+  }
+
+  async function prepareSteps(): Promise<PrepareOutcome> {
+    // 1. The checkout. A new clone is made beside it and renamed into place, so a clone stopped
+    // half-way is never at `dir`.
+    if (options.clone !== undefined) {
+      step = "clone";
+      if (!NodeFS.existsSync(dir)) {
+        log(`clone ${options.clone} -> ${dir}\n`);
+        NodeFS.mkdirSync(NodePath.dirname(dir), { recursive: true });
+        const partial = `${dir}.t3-prepare-clone-${process.pid}`;
+        NodeFS.rmSync(partial, { recursive: true, force: true });
+        const cloned = git(NodePath.dirname(dir), [
           "clone",
-          `${dir} exists and is not a clone of ${options.clone}; nothing was changed there`,
-        );
-      }
-      notes.push("reused the existing clone");
-    }
-  }
-  const top = NodeFS.existsSync(dir) ? gitLine(dir, ["rev-parse", "--show-toplevel"]) : null;
-  if (top === null) return fail("checkout", `${dir} is not a git checkout`);
-  resultDir = gitLine(top, ["rev-parse", "--absolute-git-dir"]);
-  result = { ...result, checkout: top };
-  save(result);
-
-  // A merge or rebase someone left here is theirs to finish: never undo it.
-  for (const marker of ["MERGE_HEAD", "rebase-merge", "rebase-apply"]) {
-    if (resultDir !== null && NodeFS.existsSync(NodePath.join(resultDir, marker))) {
-      return fail(
-        "checkout",
-        `a merge or rebase is in progress here (${marker}); finish or abort it first`,
-      );
-    }
-  }
-
-  // 2. The config, as the checkout has it now.
-  const configPath = NodePath.join(top, PREPARE_CONFIG_PATH);
-  let config: PrepareConfig | null = null;
-  if (NodeFS.existsSync(configPath)) {
-    const parsed = parsePrepareConfig(NodeFS.readFileSync(configPath, "utf8"));
-    if (!parsed.ok) return fail("config", `${PREPARE_CONFIG_PATH}: ${parsed.problem}`);
-    config = parsed.config;
-  }
-  const base = options.base ?? config?.base ?? DEFAULT_BASE;
-
-  // 3. The branch.
-  const fetch = fetchBaseRemote(top, base);
-  if (!fetch.fetched) notes.push(`could not fetch ${fetch.remote}; the base may be behind`);
-  if (options.branch !== undefined) {
-    const branch = options.branch;
-    const current = gitLine(top, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    if (current !== branch) {
-      if (hasLocalChanges(top)) {
-        return fail("branch", `local changes here; not switching to ${branch}`);
-      }
-      const remoteBranch = fetch.remote === null ? null : `${fetch.remote}/${branch}`;
-      const args = gitOk(top, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`])
-        ? ["checkout", "--quiet", branch]
-        : remoteBranch !== null && resolves(top, remoteBranch)
-          ? ["checkout", "--quiet", "-b", branch, "--track", remoteBranch]
-          : resolves(top, base)
-            ? ["checkout", "--quiet", "--no-track", "-b", branch, base]
-            : null;
-      if (args === null)
-        return fail("branch", `${branch} is not here and the base ${base} is not found`);
-      const switched = git(top, args);
-      if (switched.code !== 0) {
-        return fail("branch", `could not switch to ${branch}`, lastLines(switched.stderr));
+          "--quiet",
+          "--",
+          options.clone,
+          partial,
+        ]);
+        if (cloned.code !== 0) {
+          NodeFS.rmSync(partial, { recursive: true, force: true });
+          return fail("clone", "git clone failed", lastLines(cloned.stderr));
+        }
+        NodeFS.renameSync(partial, dir);
+      } else {
+        const origin = gitLine(dir, ["remote", "get-url", "origin"]);
+        if (origin === null || !sameRemote(origin, options.clone)) {
+          return fail(
+            "clone",
+            `${dir} exists and is not a clone of ${options.clone}; nothing was changed there`,
+          );
+        }
+        if (!resolves(dir, "HEAD")) {
+          return fail(
+            "clone",
+            `${dir} is a clone with no commit checked out (a clone stopped half-way?); remove it and run again`,
+          );
+        }
+        notes.push("reused the existing clone");
       }
     }
-  }
-  const describe = () => ({
-    branch: gitLine(top, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
-    head: gitLine(top, ["rev-parse", "HEAD"]),
-  });
-  result = { ...result, ...describe() };
+    step = "checkout";
+    const top = NodeFS.existsSync(dir) ? gitLine(dir, ["rev-parse", "--show-toplevel"]) : null;
+    if (top === null) return fail("checkout", `${dir} is not a git checkout`);
+    const gitDir = gitLine(top, ["rev-parse", "--absolute-git-dir"]);
+    if (gitDir === null) return fail("checkout", `${top} has no git folder`);
+    result = { ...result, checkout: top };
 
-  if (config === null) {
-    notes.push(`no ${PREPARE_CONFIG_PATH}: no merge, install or baseline`);
-    return save({ ...result, status: "no-config", finishedAt: now().toISOString(), notes })!;
-  }
-
-  // 4. The base merged in.
-  let merge: MergeOutcome;
-  if (!resolves(top, base)) {
-    merge = { status: "skipped", base, reason: `base ${base} not found` };
-  } else if (hasLocalChanges(top)) {
-    merge = { status: "skipped", base, reason: "local changes here" };
-  } else {
-    const before = gitLine(top, ["rev-parse", "HEAD"]);
-    log(`merge ${base}\n`);
-    const merged = git(top, ["merge", "--no-edit", "--quiet", base]);
-    if (merged.code === 0) {
-      merge = {
-        status: gitLine(top, ["rev-parse", "HEAD"]) === before ? "up-to-date" : "merged",
-        base,
+    const lock = takeLock(NodePath.join(gitDir, LOCK_FILE));
+    if (!lock.ok) {
+      // The other prepare's result stays as it is: nothing is written.
+      const refused: PrepareResult = {
+        ...result,
+        status: "failed",
+        finishedAt: now().toISOString(),
+        failure: {
+          step: "checkout",
+          message: `another prepare (pid ${lock.pid}) is running on this checkout`,
+        },
       };
-    } else {
-      const conflicts = gitLines(top, ["diff", "--name-only", "--diff-filter=U"]);
-      // Undo it either way: the agent starts on a clean checkout and merges with thought.
-      git(top, ["merge", "--abort"]);
-      if (conflicts.length === 0) {
-        result = { ...result, merge: { status: "skipped", base, reason: "merge failed" } };
+      return { result: refused, text: formatPrepareResult(refused, null), exitCode: 1 };
+    }
+    release = lock.release;
+    resultDir = gitDir;
+    if (lock.stalePid !== null) {
+      notes.push(`an earlier prepare (pid ${lock.stalePid}) was stopped before it finished`);
+    }
+    save({ ...result, notes: [...notes] });
+
+    // A merge or rebase someone left here is theirs to finish: never undo it.
+    for (const marker of ["MERGE_HEAD", "rebase-merge", "rebase-apply"]) {
+      if (NodeFS.existsSync(NodePath.join(gitDir, marker))) {
         return fail(
-          "merge",
-          `git merge ${base} failed`,
-          lastLines(`${merged.stdout}${merged.stderr}`),
+          "checkout",
+          `a merge or rebase is in progress here (${marker}); finish or abort it first`,
         );
       }
-      merge = { status: "conflicts", base, conflicts };
     }
-  }
-  result = { ...result, ...describe(), merge };
-  save(result);
 
-  // 5. Install.
-  const timeoutMs = config.timeoutMinutes * 60_000;
-  const installs: Array<CommandRun> = [];
-  for (const command of config.install) {
-    log(`$ ${command}\n`);
-    const run = await runCommand(command, top, timeoutMs, log);
-    installs.push(run);
-    result = { ...result, install: [...installs] };
-    if (run.exitCode !== 0) {
-      return fail(
-        "install",
-        run.timedOut
-          ? `\`${command}\` was stopped after ${config.timeoutMinutes} min`
-          : `\`${command}\` exited ${run.exitCode ?? "without a code"}`,
-        run.tail,
+    // 2. The branch. The config is not read yet: it is the branch's own. Only a new branch's start
+    // comes from the config the checkout has now.
+    step = "branch";
+    const remotes = gitLines(top, ["remote"]);
+    const remoteOf = (ref: string) => remotes.find((name) => ref.startsWith(`${name}/`)) ?? null;
+    const fetched = new Set<string>();
+    const fetchRemote = (remote: string | null) => {
+      if (remote === null || fetched.has(remote)) return;
+      fetched.add(remote);
+      if (!gitOk(top, ["fetch", "--quiet", remote])) {
+        notes.push(`could not fetch ${remote}; its branches may be behind`);
+      }
+    };
+    const peeked = readConfig(top);
+    const startBase = options.base ?? (peeked.ok ? peeked.config?.base : undefined) ?? DEFAULT_BASE;
+    const branchRemote =
+      remoteOf(startBase) ?? (remotes.includes("origin") ? "origin" : (remotes[0] ?? null));
+    fetchRemote(branchRemote);
+    if (options.branch !== undefined) {
+      const branch = options.branch;
+      const current = gitLine(top, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+      if (current !== branch) {
+        if (hasLocalChanges(top)) {
+          return fail("branch", `local changes here; not switching to ${branch}`);
+        }
+        if (
+          current === null &&
+          resolves(top, "HEAD") &&
+          gitLines(top, ["for-each-ref", "--contains", "HEAD", "refs/heads", "refs/remotes"])
+            .length === 0
+        ) {
+          return fail(
+            "branch",
+            `HEAD is detached at ${gitLine(top, ["rev-parse", "--short", "HEAD"])} with commits on no branch; not switching to ${branch}, which would leave them behind. Put them on a branch first.`,
+          );
+        }
+        const remoteBranch = branchRemote === null ? null : `${branchRemote}/${branch}`;
+        const args = gitOk(top, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`])
+          ? ["checkout", "--quiet", branch]
+          : remoteBranch !== null && resolves(top, remoteBranch)
+            ? ["checkout", "--quiet", "-b", branch, "--track", remoteBranch]
+            : resolves(top, startBase)
+              ? ["checkout", "--quiet", "--no-track", "-b", branch, startBase]
+              : null;
+        if (args === null) {
+          return fail("branch", `${branch} is not here and the base ${startBase} is not found`);
+        }
+        const switched = git(top, args);
+        if (switched.code !== 0) {
+          return fail("branch", `could not switch to ${branch}`, lastLines(switched.stderr));
+        }
+      }
+    }
+    const updated = bringUpToRemote(top, branchRemote, fetchRemote);
+    if (updated.failure !== null) return fail("branch", updated.failure);
+    if (updated.note !== null) notes.push(updated.note);
+    const describe = () => ({
+      branch: gitLine(top, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+      head: gitLine(top, ["rev-parse", "HEAD"]),
+    });
+    result = { ...result, ...describe() };
+
+    // 3. The config, as the branch being prepared has it.
+    step = "config";
+    const read = readConfig(top);
+    if (!read.ok) return fail("config", read.problem);
+    const config = read.config;
+    if (config === null) {
+      notes.push(`no ${PREPARE_CONFIG_PATH}: no merge, install or baseline`);
+      return save({ ...result, status: "no-config", finishedAt: now().toISOString(), notes })!;
+    }
+    const base = options.base ?? config.base;
+    fetchRemote(remoteOf(base));
+
+    // 4. The base merged in.
+    step = "merge";
+    let merge: MergeOutcome;
+    if (!resolves(top, base)) {
+      merge = { status: "skipped", base, reason: `base ${base} not found` };
+    } else if (hasLocalChanges(top)) {
+      merge = { status: "skipped", base, reason: "local changes here" };
+    } else {
+      const before = gitLine(top, ["rev-parse", "HEAD"]);
+      log(`merge ${base}\n`);
+      const merged = git(top, ["merge", "--no-edit", "--quiet", base]);
+      if (merged.code === 0) {
+        merge = {
+          status: gitLine(top, ["rev-parse", "HEAD"]) === before ? "up-to-date" : "merged",
+          base,
+        };
+      } else {
+        const conflicts = gitPaths(top, ["diff", "--name-only", "-z", "--diff-filter=U"]);
+        // Undo it either way: the agent starts on a clean checkout and merges with thought.
+        git(top, ["merge", "--abort"]);
+        if (conflicts.length === 0) {
+          result = { ...result, merge: { status: "skipped", base, reason: "merge failed" } };
+          return fail(
+            "merge",
+            `git merge ${base} failed`,
+            lastLines(`${merged.stdout}${merged.stderr}`),
+          );
+        }
+        merge = { status: "conflicts", base, conflicts };
+      }
+    }
+    result = { ...result, ...describe(), merge, notes: [...notes] };
+    save(result);
+
+    // 5. Install.
+    step = "install";
+    const timeoutMs = config.timeoutMinutes * 60_000;
+    const track = (stop: (() => void) | null) => {
+      stopCommand = stop;
+    };
+    const installs: Array<CommandRun> = [];
+    for (const command of config.install) {
+      log(`$ ${command}\n`);
+      const run = await runCommand(command, top, timeoutMs, log, track);
+      installs.push(run);
+      result = { ...result, install: [...installs] };
+      if (run.exitCode !== 0) {
+        return fail(
+          "install",
+          run.timedOut
+            ? `\`${command}\` was stopped after ${config.timeoutMinutes} min`
+            : `\`${command}\` exited ${run.exitCode ?? "without a code"}`,
+          run.tail,
+        );
+      }
+    }
+
+    // 6. Baseline tests of the touched files.
+    step = "baseline";
+    const files = touchedFiles(top, base, options.paths ?? []);
+    let baseline: BaselineOutcome;
+    if (config.baseline === undefined) {
+      baseline = { status: "skipped", reason: "no baseline command" };
+    } else if (config.baseline.includes(FILES_PLACEHOLDER) && files.length === 0) {
+      baseline = { status: "skipped", reason: "no touched files" };
+    } else {
+      const command = config.baseline.replaceAll(
+        FILES_PLACEHOLDER,
+        files.map(fileArgument).join(" "),
       );
+      log(`$ ${command}\n`);
+      const run = await runCommand(command, top, timeoutMs, log, track);
+      if (run.exitCode !== null && COULD_NOT_RUN.has(run.exitCode)) {
+        return fail(
+          "baseline",
+          `the baseline command could not run (exit ${run.exitCode}: not found or not executable), so no tests ran: \`${command}\``,
+          run.tail,
+        );
+      }
+      baseline = { ...run, command, status: run.exitCode === 0 ? "green" : "red", files };
     }
+    return save({
+      ...result,
+      status: "prepared",
+      finishedAt: now().toISOString(),
+      baseline,
+      notes,
+    })!;
   }
+}
 
-  // 6. Baseline tests of the touched files.
-  const files = touchedFiles(top, base, options.paths ?? []);
-  let baseline: BaselineOutcome;
-  if (config.baseline === undefined) {
-    baseline = { status: "skipped", reason: "no baseline command" };
-  } else if (config.baseline.includes(FILES_PLACEHOLDER) && files.length === 0) {
-    baseline = { status: "skipped", reason: "no touched files" };
-  } else {
-    const command = config.baseline.replaceAll(FILES_PLACEHOLDER, files.map(shellQuote).join(" "));
-    log(`$ ${command}\n`);
-    const run = await runCommand(command, top, timeoutMs, log);
-    baseline = { ...run, command, status: run.exitCode === 0 ? "green" : "red", files };
+/**
+ * Brings the checked-out branch up to its remote branch (its upstream, else the same name on
+ * `remote`): fast-forwards a clean branch that is behind; refuses a diverged one, or one behind
+ * with local changes, so a prepare never reports stale code as prepared.
+ */
+function bringUpToRemote(
+  top: string,
+  remote: string | null,
+  fetchRemote: (remote: string | null) => void,
+): { readonly failure: string | null; readonly note: string | null } {
+  const none = { failure: null, note: null };
+  const branch = gitLine(top, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  if (branch === null) return none;
+  const configured = gitLine(top, [
+    "rev-parse",
+    "--abbrev-ref",
+    "--symbolic-full-name",
+    "@{upstream}",
+  ]);
+  const sameName = remote === null ? null : `${remote}/${branch}`;
+  const upstream = configured ?? (sameName !== null && resolves(top, sameName) ? sameName : null);
+  if (upstream === null) return none;
+  fetchRemote(gitLines(top, ["remote"]).find((name) => upstream.startsWith(`${name}/`)) ?? null);
+  if (!resolves(top, upstream) || !resolves(top, "HEAD")) return none;
+  const counts = (gitLine(top, ["rev-list", "--left-right", "--count", `HEAD...${upstream}`]) ?? "")
+    .split(/\s+/)
+    .map(Number);
+  const ahead = counts[0] ?? 0;
+  const behind = counts[1] ?? 0;
+  if (behind === 0) {
+    return ahead === 0
+      ? none
+      : { failure: null, note: `${branch} has ${ahead} commit(s) not on ${upstream}` };
   }
-  return save({
-    ...result,
-    status: "prepared",
-    finishedAt: now().toISOString(),
-    baseline,
-    notes,
-  })!;
+  if (ahead > 0) {
+    return {
+      failure: `${branch} and ${upstream} have diverged (${ahead} local, ${behind} remote commit(s)); merge or rebase it first`,
+      note: null,
+    };
+  }
+  if (hasLocalChanges(top)) {
+    return {
+      failure: `${branch} is ${behind} commit(s) behind ${upstream} and has local changes; not updated`,
+      note: null,
+    };
+  }
+  const forwarded = git(top, ["merge", "--ff-only", "--quiet", upstream]);
+  if (forwarded.code !== 0) {
+    return {
+      failure: `could not fast-forward ${branch} to ${upstream}: ${lastLines(forwarded.stderr)}`,
+      note: null,
+    };
+  }
+  return { failure: null, note: `fast-forwarded ${branch} by ${behind} commit(s) to ${upstream}` };
 }
 
 /** The branch's own changes against the base, plus `extra`, that still exist (relative to `top`). */
 function touchedFiles(top: string, base: string, extra: ReadonlyArray<string>): Array<string> {
   const changed = resolves(top, base)
-    ? gitLines(top, ["diff", "--name-only", "--no-renames", `${base}...HEAD`])
+    ? gitPaths(top, ["diff", "--name-only", "-z", "--no-renames", `${base}...HEAD`])
     : [];
   const asked = extra.map((path) => NodePath.relative(top, NodePath.resolve(top, path)));
+  const inside = (path: string) =>
+    path.length > 0 &&
+    path !== ".." &&
+    !path.startsWith(`..${NodePath.sep}`) &&
+    !NodePath.isAbsolute(path);
   return [...new Set([...changed, ...asked])]
-    .filter((path) => !path.startsWith("..") && NodeFS.existsSync(NodePath.join(top, path)))
+    .filter((path) => inside(path) && NodeFS.existsSync(NodePath.join(top, path)))
     .sort();
 }
 

@@ -5,7 +5,9 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
+import { T3ProjectFileScript } from "@t3tools/contracts";
 import { afterAll, assert, beforeAll, describe, it } from "@effect/vitest";
+import { Schema } from "effect";
 
 import {
   type PrepareOptions,
@@ -80,7 +82,7 @@ const setup = (config: object | string | null) => {
     "check.cjs": CHECK_SCRIPT,
     "src/a.txt": "a\n",
     "src/shared.txt": "base\n",
-    ".gitignore": "installed.txt\nbaseline-args.txt\nseen.json\n",
+    ".gitignore": "installed.txt\nbaseline-args.txt\nseen.json\n*.pid\n",
   };
   if (config !== null) {
     files[".t3code/prepare.json"] = typeof config === "string" ? config : JSON.stringify(config);
@@ -99,6 +101,25 @@ const prepare = (options: PrepareOptions) => runPrepare({ log: () => {}, ...opti
 const readResult = (gitDir: string) =>
   JSON.parse(NodeFS.readFileSync(NodePath.join(gitDir, RESULT_JSON_FILE), "utf8"));
 const CONFIG = { install: [INSTALL_OK], baseline: "node check.cjs {files}" };
+const LOCK = "t3-prepare.lock";
+const decodeScript = Schema.decodeUnknownSync(T3ProjectFileScript);
+const clonePath = (name: string) => NodePath.join(root, "clones", `${name}${counter}`);
+const readPid = (file: string) => Number.parseInt(NodeFS.readFileSync(file, "utf8"), 10);
+/** Gone or a zombie: nothing of it runs any more (Linux). */
+const isGone = (pid: number) => {
+  try {
+    return NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]?.startsWith("Z") ?? true;
+  } catch {
+    return true;
+  }
+};
+const killQuietly = (pid: number) => {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Already gone.
+  }
+};
 
 describe("runPrepare", () => {
   it("does nothing but report for a project with no prepare config", async () => {
@@ -190,12 +211,28 @@ describe("runPrepare", () => {
 
   it("hands the baseline touched file names with spaces and quotes intact", async () => {
     const { work } = setup(CONFIG);
-    commit(work, { "src/it's a file.txt": "x\n" }, "an odd name");
+    commit(
+      work,
+      {
+        "src/it's a file.txt": "x\n",
+        "src/café.txt": "x\n",
+        "..notes.md": "x\n",
+        "--reporter=evil.txt": "x\n",
+      },
+      "odd names",
+    );
     const outcome = await prepare({ dir: work });
     assert.strictEqual(outcome.result.baseline?.status, "green");
+    // Non-ASCII and `..name` files are kept; a name like an option is never read as one.
     assert.deepStrictEqual(
       NodeFS.readFileSync(NodePath.join(work, "baseline-args.txt"), "utf8").split("\n"),
-      ["src/feature.txt", "src/it's a file.txt"],
+      [
+        "./--reporter=evil.txt",
+        "..notes.md",
+        "src/café.txt",
+        "src/feature.txt",
+        "src/it's a file.txt",
+      ],
     );
     assert.strictEqual(shellQuote("a/b-c.ts"), "a/b-c.ts");
   });
@@ -347,12 +384,161 @@ describe("runPrepare", () => {
     );
   });
 
+  it("reads the config of the branch it prepares, after switching to it", async () => {
+    const { origin, work } = setup(null);
+    commit(work, { ".t3code/prepare.json": JSON.stringify(CONFIG) }, "config on the branch only");
+    git(work, "push", "--quiet", "origin", "feature");
+    const dir = clonePath("branch-config");
+    const onBranch = await prepare({ dir, clone: origin, branch: "feature" });
+    assert.strictEqual(onBranch.result.status, "prepared");
+    assert.isTrue(NodeFS.existsSync(NodePath.join(dir, "installed.txt")));
+    // Back to a branch with no config: the last branch's commands do not run there.
+    NodeFS.rmSync(NodePath.join(dir, "installed.txt"));
+    const onMain = await prepare({ dir, clone: origin, branch: "main" });
+    assert.strictEqual(onMain.result.status, "no-config");
+    assert.isFalse(NodeFS.existsSync(NodePath.join(dir, "installed.txt")));
+  });
+
+  it("never reuses a clone stopped half-way as a good one, and leaves no half clone itself", async () => {
+    const { origin } = setup(CONFIG);
+    const dir = clonePath("half");
+    NodeFS.mkdirSync(dir, { recursive: true });
+    git(dir, "init", "--quiet");
+    git(dir, "remote", "add", "origin", origin);
+    const outcome = await prepare({ dir, clone: origin, branch: "feature" });
+    assert.strictEqual(outcome.exitCode, 1);
+    assert.strictEqual(outcome.result.failure?.step, "clone");
+    assert.include(outcome.result.failure?.message ?? "", "stopped half-way");
+
+    const whole = clonePath("whole");
+    assert.strictEqual((await prepare({ dir: whole, clone: origin })).exitCode, 0);
+    const leftovers = NodeFS.readdirSync(NodePath.dirname(whole)).filter((name) =>
+      name.startsWith(`${NodePath.basename(whole)}.`),
+    );
+    assert.deepStrictEqual(leftovers, []);
+  });
+
+  it("fast-forwards a branch that is behind its remote, and refuses one that has diverged", async () => {
+    const { origin, work } = setup(CONFIG);
+    git(work, "fetch", "--quiet", "origin");
+    git(work, "merge", "--quiet", "--no-edit", "origin/main");
+    git(work, "push", "--quiet", "origin", "feature");
+    const dir = clonePath("behind");
+    assert.strictEqual((await prepare({ dir, clone: origin, branch: "feature" })).exitCode, 0);
+
+    commit(work, { "src/more.txt": "more\n" }, "another writer pushed");
+    git(work, "push", "--quiet", "origin", "feature");
+    const again = await prepare({ dir, clone: origin, branch: "feature" });
+    assert.strictEqual(again.exitCode, 0);
+    assert.strictEqual(again.result.head, git(work, "rev-parse", "HEAD"));
+    assert.include(again.result.notes, "fast-forwarded feature by 1 commit(s) to origin/feature");
+    assert.include(
+      again.result.baseline?.status === "green" ? again.result.baseline.files : [],
+      "src/more.txt",
+    );
+
+    commit(dir, { "src/mine.txt": "mine\n" }, "local, not pushed");
+    commit(work, { "src/theirs.txt": "theirs\n" }, "pushed meanwhile");
+    git(work, "push", "--quiet", "origin", "feature");
+    const mine = git(dir, "rev-parse", "HEAD");
+    const diverged = await prepare({ dir, clone: origin, branch: "feature" });
+    assert.strictEqual(diverged.exitCode, 1);
+    assert.strictEqual(diverged.result.failure?.step, "branch");
+    assert.include(diverged.result.failure?.message ?? "", "have diverged (1 local, 1 remote");
+    assert.strictEqual(git(dir, "rev-parse", "HEAD"), mine, "the branch is left as it was");
+  });
+
+  it("refuses to switch away from a detached HEAD with commits on no branch", async () => {
+    const { origin, work } = setup(CONFIG);
+    git(work, "push", "--quiet", "origin", "feature");
+    const dir = clonePath("detached");
+    assert.strictEqual((await prepare({ dir, clone: origin })).exitCode, 0);
+    git(dir, "checkout", "--quiet", "--detach", "origin/main");
+    commit(dir, { "src/stray.txt": "stray\n" }, "a commit on no branch");
+    const stray = git(dir, "rev-parse", "HEAD");
+    const outcome = await prepare({ dir, clone: origin, branch: "feature" });
+    assert.strictEqual(outcome.exitCode, 1);
+    assert.strictEqual(outcome.result.failure?.step, "branch");
+    assert.include(outcome.result.failure?.message ?? "", "commits on no branch");
+    assert.strictEqual(git(dir, "rev-parse", "HEAD"), stray);
+  });
+
+  it("tracks the remote branch when the base has no remote in its name", async () => {
+    const { origin, work } = setup(null);
+    git(work, "push", "--quiet", "origin", "feature");
+    const dir = clonePath("plain-base");
+    await prepare({ dir, clone: origin, branch: "feature", base: "main" });
+    assert.strictEqual(
+      git(dir, "rev-parse", "--abbrev-ref", "feature@{upstream}"),
+      "origin/feature",
+    );
+  });
+
+  it("runs one prepare at a time on a checkout, and takes over a stale lock", async () => {
+    const { work, gitDir } = setup(CONFIG);
+    write(gitDir, LOCK, `${process.pid}\n`);
+    write(gitDir, RESULT_JSON_FILE, JSON.stringify({ status: "running", pid: process.pid }));
+    const refused = await prepare({ dir: work });
+    assert.strictEqual(refused.exitCode, 1);
+    assert.include(refused.result.failure?.message ?? "", "another prepare");
+    assert.strictEqual(readResult(gitDir).status, "running", "the other run's result is kept");
+    assert.isFalse(NodeFS.existsSync(NodePath.join(work, "installed.txt")));
+
+    const gone = NodeChildProcess.spawnSync(process.execPath, ["-e", ""]).pid;
+    write(gitDir, LOCK, `${gone}\n`);
+    const taken = await prepare({ dir: work });
+    assert.strictEqual(taken.result.status, "prepared");
+    assert.include(
+      taken.result.notes,
+      `an earlier prepare (pid ${gone}) was stopped before it finished`,
+    );
+    assert.isFalse(NodeFS.existsSync(NodePath.join(gitDir, LOCK)), "the lock is released");
+  });
+
+  it("reports a baseline command that cannot run as a failure, not as red tests", async () => {
+    const { work } = setup({ baseline: "t3-no-such-test-runner {files}" });
+    const outcome = await prepare({ dir: work });
+    assert.strictEqual(outcome.exitCode, 1);
+    assert.strictEqual(outcome.result.failure?.step, "baseline");
+    assert.include(outcome.result.failure?.message ?? "", "could not run");
+    assert.notInclude(outcome.text, "RED");
+  });
+
+  it("does not hang on a process that left the command's group but holds its output", async () => {
+    const { work } = setup({
+      install: [`setsid sh -c 'echo $$ > stray.pid; exec sleep 300' &`],
+    });
+    try {
+      const outcome = await prepare({ dir: work });
+      assert.strictEqual(outcome.result.status, "prepared");
+    } finally {
+      const stray = NodePath.join(work, "stray.pid");
+      if (NodeFS.existsSync(stray)) killQuietly(readPid(stray));
+    }
+  });
+
   it("does not switch branches over local changes", async () => {
     const { work } = setup(CONFIG);
     write(work, "src/a.txt", "edited\n");
     const outcome = await prepare({ dir: work, branch: "other" });
     assert.strictEqual(outcome.result.failure?.step, "branch");
     assert.strictEqual(git(work, "symbolic-ref", "--short", "HEAD"), "feature");
+  });
+});
+
+describe("docs/fork/delegate-prepare.md", () => {
+  it("shows a setup script that holds the agent until the prepare is done", () => {
+    const docs = NodeFS.readFileSync(
+      NodePath.join(import.meta.dirname, "../../../../../docs/fork/delegate-prepare.md"),
+      "utf8",
+    );
+    const block = [...docs.matchAll(/```json\n([\s\S]*?)```/g)]
+      .map((match) => match[1] ?? "")
+      .find((text) => text.includes("runOnWorktreeCreate"));
+    assert.isDefined(block, "the docs show the setup script entry");
+    const script = decodeScript(JSON.parse(block ?? "{}"));
+    assert.strictEqual(script.runOnWorktreeCreate, true);
+    assert.strictEqual(script.async, false, "upstream's default (true) starts the agent at once");
   });
 });
 
@@ -404,5 +590,48 @@ describe("prepareCli", () => {
       encoding: "utf8",
     });
     assert.strictEqual(usage.status, 2);
+  });
+
+  it("stops its command and writes a final result when it is stopped itself", async () => {
+    const { work, gitDir } = setup({
+      install: [
+        `node -e "require('node:fs').writeFileSync('install.pid', String(process.pid)); console.log(['install', 'started'].join(' ')); setTimeout(() => {}, 300000)"`,
+      ],
+    });
+    const cli = NodePath.join(import.meta.dirname, "prepareCli.ts");
+    const child = NodeChildProcess.spawn(process.execPath, [cli], {
+      cwd: work,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    // The CLI sends command output to stderr: the install's own line marks it running (built
+    // at run time, so the echoed command line does not match it).
+    const started = new Promise<void>((resolve) => {
+      let seen = "";
+      child.stderr.on("data", (chunk: Buffer) => {
+        seen += chunk.toString("utf8");
+        if (seen.includes("install started")) resolve();
+      });
+    });
+    const exited = new Promise<number | null>((resolve) =>
+      child.on("exit", (code) => resolve(code)),
+    );
+    const pidFile = NodePath.join(work, "install.pid");
+    let installPid = 0;
+    try {
+      await started;
+      installPid = readPid(pidFile);
+      child.kill("SIGTERM");
+      assert.strictEqual(await exited, 143);
+      const result = readResult(gitDir);
+      assert.strictEqual(result.status, "failed");
+      assert.strictEqual(result.failure.step, "install");
+      assert.include(result.failure.message, "stopped by SIGTERM");
+      // Its group was sent SIGKILL before the CLI wrote the result and exited.
+      assert.isTrue(isGone(installPid), "the install was stopped with the prepare");
+      assert.isFalse(NodeFS.existsSync(NodePath.join(gitDir, LOCK)), "the lock is released");
+    } finally {
+      child.kill("SIGKILL");
+      if (installPid > 0) killQuietly(installPid);
+    }
   });
 });
