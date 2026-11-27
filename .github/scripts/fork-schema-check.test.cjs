@@ -473,7 +473,7 @@ function runScripts(workflow) {
   return scripts;
 }
 
-// The check job's first step on a title or body edit (#1134): it checks out only the default branch
+// The check job's first step on a title or body edit: it checks out only the default branch
 // (sparse) and runs the default branch's fork-checks-ran.py --copy, which needs a token with
 // actions: read for the run and job lists. It is the one place the token may appear, so it is
 // pinned whole: any change to it leaves it in the text below, where its token and checkout fail.

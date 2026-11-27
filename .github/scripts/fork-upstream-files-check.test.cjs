@@ -87,7 +87,7 @@ function workflowProblems(workflow) {
   );
   expect(CONFIG_LINE.test(body), "the list is not the step's UPSTREAM_FILES line");
   expect(
-    // A copy (#1134: a title or body edit) skips it; nothing else may.
+    // A copy (a title or body edit) skips it; nothing else may.
     /^ {8}if: \$\{\{ !cancelled\(\) && env\.ONLY_COPY != 'true' \}\}$/m.test(body),
     "the step is skipped when the schema step refuses",
   );
