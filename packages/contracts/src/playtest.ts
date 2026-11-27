@@ -443,3 +443,26 @@ export const PlaytestToolResult = Schema.Struct({
   session: Schema.NullOr(PlaytestSessionView),
 });
 export type PlaytestToolResult = typeof PlaytestToolResult.Type;
+
+/**
+ * The web app's two playtest calls (the thread chip, F5): `GET` the thread's session that is on
+ * (read scope) and `POST` its end with `{ threadId }` (operate scope). End is the tool's `end`
+ * action with the reason `person`.
+ */
+export const PLAYTEST_STATE_PATH = "/api/fork/playtest/state";
+export const PLAYTEST_END_PATH = "/api/fork/playtest/end";
+
+/** The thread's session that is not ended, else null (none, the last one ended, or not readable). */
+export const PlaytestRouteState = Schema.Struct({ session: Schema.NullOr(PlaytestSessionView) });
+export type PlaytestRouteState = typeof PlaytestRouteState.Type;
+
+/**
+ * What a press of End did: as the tool's `end` (`ended`, `nothing-to-end`, `release-failed`), or
+ * `unavailable` when T3 could not try (its playtest file cannot be read now), with why.
+ */
+export const PlaytestRouteEndAnswer = Schema.Struct({
+  outcome: Schema.Literals(["ended", "nothing-to-end", "release-failed", "unavailable"]),
+  session: Schema.NullOr(PlaytestSessionView),
+  message: Schema.optionalKey(Schema.String),
+});
+export type PlaytestRouteEndAnswer = typeof PlaytestRouteEndAnswer.Type;

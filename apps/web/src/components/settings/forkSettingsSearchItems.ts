@@ -193,7 +193,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     id: "playtest",
     title: "Let agents run playtests",
     to: FORK_PAGE,
-    searchTerms: ["playtest test target staging round adapter"],
+    searchTerms: ["playtest test target staging round adapter chip end session"],
     environmentOnly: true,
     scope: "project-defaults",
   },

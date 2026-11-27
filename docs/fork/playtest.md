@@ -131,6 +131,22 @@ outside the thread's sandbox, without an approval); any other thread is refused 
 `status` and `end` work in every thread, so a restricted thread can still release its target. An
 outside MCP client (not in a T3 thread) is not offered the tool; a read-only client cannot use it.
 
+## The thread chip
+
+While a thread's session is on (`claiming`, `active` or `ending`), the web app shows a **Playtest**
+chip above that thread's composer: the target, whether the session starts, is on or ends, its last
+round and the step that runs now. Its **End** button ends the session exactly as the tool's `end`
+does (the session's end reason is `person`), and a toast says what happened: ended (the target is
+back, the worktree and its changes are kept), already ended, or still ending (the release has not
+worked yet; T3 tries again, or press End again). Pressing End needs a connection that may change
+threads (the operate scope); a read-only one sees the chip only.
+
+The chip goes when the session ends any other way (the agent's `end`, idle, time limit, claim gone,
+thread gone). It is read again whenever the thread changes and every 10 seconds while it shows.
+A read that fails, an older server without the chip's routes, or a thread on another environment
+than the app's own server shows no chip. The routes are `GET /api/fork/playtest/state?threadId=`
+(read scope) and `POST /api/fork/playtest/end` with `{ "threadId": … }` (operate scope).
+
 ## The worker
 
 A sweep on T3's scheduler (every few seconds; it reads the file only when something is due, and
