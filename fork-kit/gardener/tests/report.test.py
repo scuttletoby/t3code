@@ -359,24 +359,49 @@ class Judge(gf.Temp):
                 self.assertIn('judgment: model unreachable or no usable answer', note)
                 self.assertNotIn('127.0.0.1', note)
 
-    def junk_server(self, reply):
-        """A socket that answers every connection with reply and closes (a wrong port: ssh, not HTTP)."""
+    def one_connection_server(self, handle):
+        """A listening socket whose thread serves one connection with handle(conn, stop), and its address. The
+        thread is gone when the test ends: the cleanup sets stop, wakes an accept still waiting, joins the thread and
+        only then closes the socket. A thread still in accept when its socket is closed can accept on the socket
+        number the next socket reuses: a later test's model server, whose request then got this one's junk (#1141)."""
         srv = socket.socket()
         srv.bind(('127.0.0.1', 0))
         srv.listen(4)
-        self.addCleanup(srv.close)
+        stop = threading.Event()
 
         def serve():
-            while True:
-                try:
-                    conn, _ = srv.accept()
-                except OSError:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                if stop.is_set():                                       # the cleanup's wake-up call
                     return
-                with conn:
-                    conn.recv(65536)
-                    conn.sendall(reply)
-        threading.Thread(target=serve, daemon=True).start()
+                try:
+                    handle(conn, stop)
+                except OSError:
+                    pass
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+
+        def end():
+            stop.set()
+            try:
+                socket.create_connection(srv.getsockname(), timeout=5).close()
+            except OSError:
+                pass
+            thread.join(10)
+            srv.close()
+            self.assertFalse(thread.is_alive(), 'a fake server outlived its test')
+        self.addCleanup(end)
         return f'http://127.0.0.1:{srv.getsockname()[1]}/v1'
+
+    def junk_server(self, reply):
+        """A socket that answers one connection with reply and closes (a wrong port: ssh, not HTTP)."""
+        def handle(conn, stop):
+            conn.recv(65536)
+            conn.sendall(reply)
+        return self.one_connection_server(handle)
 
     def test_an_endpoint_that_does_not_speak_http_is_a_note(self):
         for reply in (b'SSH-2.0-OpenSSH_9.6\r\n', b'HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n{"cho'):
@@ -385,32 +410,39 @@ class Judge(gf.Temp):
                 self.assertIsNone(got)
                 self.assertIn('model unreachable', note)
 
+    def test_a_fake_server_is_gone_when_its_test_ends(self):
+        """#1141: the junk server's thread went back to accept after its answer and outlived its test. Its accept
+        took a later test's request on the socket number that test's server reused (or kept the old port listening)
+        and answered it with the SSH line: BadStatusLine instead of the model's answer."""
+        before = set(threading.enumerate())
+        case = Judge('test_an_endpoint_that_does_not_speak_http_is_a_note')
+        case.setUp()
+        endpoint = case.junk_server(b'SSH-2.0-OpenSSH_9.6\r\n')
+        self.assertIsNone(judge.judge(case.model(endpoint), [dict(GOOD, check='c')], case.root)[0])
+        case.doCleanups()
+        self.assertEqual(set(threading.enumerate()) - before, set())
+        try:
+            with socket.create_connection(('127.0.0.1', int(endpoint.split(':')[2].split('/')[0])), timeout=5) as c:
+                c.sendall(b'GET / HTTP/1.0\r\n\r\n')
+                got = c.recv(100)
+        except OSError:
+            got = b''                                                   # refused: nothing listens there now
+        self.assertNotIn(b'SSH', got)
+
     def trickle_server(self, gap):
         """An HTTP server that sends its headers at once and then one byte of the body every gap seconds: each read
         is quick (gap is under the 0.05 s the last reads may wait), the whole answer is not."""
-        srv = socket.socket()
-        srv.bind(('127.0.0.1', 0))
-        srv.listen(4)
-        self.addCleanup(srv.close)
         body = json.dumps({'choices': [{'message': {'content': 'late' + ' ' * 300}}]}).encode()
 
-        def serve():
-            try:
-                conn, _ = srv.accept()
-            except OSError:
-                return
-            with conn:
-                try:
-                    conn.recv(65536)
-                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
-                                 b'Content-Length: %d\r\n\r\n' % len(body))
-                    for i in range(len(body)):
-                        conn.sendall(body[i:i + 1])
-                        time.sleep(gap)
-                except OSError:
+        def handle(conn, stop):
+            conn.recv(65536)
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
+                         b'Content-Length: %d\r\n\r\n' % len(body))
+            for i in range(len(body)):
+                conn.sendall(body[i:i + 1])
+                if stop.wait(gap):
                     return
-        threading.Thread(target=serve, daemon=True).start()
-        return f'http://127.0.0.1:{srv.getsockname()[1]}/v1'
+        return self.one_connection_server(handle)
 
     def test_a_slow_model_is_cut_off_at_the_timeout_in_all(self):
         started = time.monotonic()
@@ -421,31 +453,15 @@ class Judge(gf.Temp):
         self.assertIn('model unreachable or no usable answer (TimeoutError)', note)
 
     def test_a_model_that_stalls_near_the_deadline_is_cut_off_at_the_deadline(self):
-        srv = socket.socket()
-        srv.bind(('127.0.0.1', 0))
-        srv.listen(4)
-        self.addCleanup(srv.close)
-        stop = threading.Event()
-        self.addCleanup(stop.set)
-
-        def serve():
-            try:
-                conn, _ = srv.accept()
-            except OSError:
-                return
-            with conn:
-                try:
-                    conn.recv(65536)
-                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n')
-                    time.sleep(0.8)
-                    conn.sendall(b'{')                                  # one byte, then nothing
-                    stop.wait(10)
-                except OSError:
-                    return
-        threading.Thread(target=serve, daemon=True).start()
+        def handle(conn, stop):
+            conn.recv(65536)
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n')
+            if not stop.wait(0.8):
+                conn.sendall(b'{')                                      # one byte, then nothing
+                stop.wait(10)
+        endpoint = self.one_connection_server(handle)
         started = time.monotonic()
-        got, note = judge.judge(self.model(f'http://127.0.0.1:{srv.getsockname()[1]}/v1', timeoutSeconds=1),
-                                [dict(GOOD, check='c')], self.root)
+        got, note = judge.judge(self.model(endpoint, timeoutSeconds=1), [dict(GOOD, check='c')], self.root)
         self.assertLess(time.monotonic() - started, 1.5)               # not 0.8 + another whole second
         self.assertIsNone(got)
         self.assertIn('model unreachable', note)
