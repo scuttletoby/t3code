@@ -19,7 +19,9 @@ decide() is the whole policy and is pure (a test hands in the clock, the state a
 State: /var/lib/update-policy/state.json, written whole through a rename. Missing, broken or from another version:
 read as empty (said in the journal); the worst it costs is one more look or one more alert.
 """
-import contextlib, datetime, fcntl, json, os, socket
+import contextlib, datetime, fcntl, json, os
+
+import alert as alert_channel
 
 from updatepolicy import aptconf, settings as settings_mod, window
 
@@ -221,11 +223,12 @@ class Machine:
                                         timeout=60)
         return None if code == 0 else settings_mod.one_line(err.strip() or f'exit {code}', 300)
 
-    def alert(self, command, event, text):
-        """Runs the alert command with the text on stdin; None or why it failed."""
-        env = dict(UPDATE_POLICY_EVENT=event, UPDATE_POLICY_HOST=socket.gethostname(),
-                   PATH='/usr/sbin:/usr/bin:/sbin:/bin', LANG='C.UTF-8')
-        code, _out, err = self.host.run(command, timeout=60, stdin=text + '\n', env=env)
+    def alert(self, command, event, text, timeout=alert_channel.TIMEOUT):
+        """Runs the alert command with the text on stdin; None or why it failed. Its environment is the shared
+        channel's (FORK_KIT_ALERT_*) and this kit's own names of the same (UPDATE_POLICY_EVENT and _HOST)."""
+        env = alert_channel.environment('update-policy', event)
+        env.update(UPDATE_POLICY_EVENT=event, UPDATE_POLICY_HOST=env['FORK_KIT_ALERT_HOST'])
+        code, _out, err = self.host.run(command, timeout=timeout, stdin=text + '\n', env=env)
         return None if code == 0 else (err.strip() or f'exit {code}')[:300]
 
     # state
@@ -305,12 +308,15 @@ def run_actions(m, s, acts, st):
 
 
 def send_alert(m, s, event, text):
+    """Through the kit's own alertCommand, else the machine's shared alert channel (settings.check); with neither,
+    the journal only. None, or why the command failed."""
     if not s or not s['alertCommand']:
-        m.log('warning', f'alert {event} (no alertCommand in the machine file): {text}')
+        m.log('warning', f'alert {event} (no alert channel in the machine file: no "alert" section and no '
+                         f'alertCommand): {text}')
         return None
     lines = text.splitlines() or ['']
     m.log('warning', f'alert {event}: {lines[0]}' + (f' (and {len(lines) - 1} more lines)' if len(lines) > 1 else ''))
-    err = m.alert(s['alertCommand'], event, text)
+    err = m.alert(s['alertCommand'], event, text, timeout=s.get('alertTimeout') or alert_channel.TIMEOUT)
     if err:
         m.log('err', f'the alert command failed: {err}')
     return err

@@ -5,7 +5,7 @@ here has a default for the facts of one machine (its role, its quiet hour and it
 is refused, and a refused file never restarts anything.
 """
 import fnmatch, ipaddress, os, re, unicodedata
-import machine_file
+import alert, machine_file
 from machine_file import REQUIRED, MachineFileError
 
 SECTION = 'update-policy'
@@ -15,13 +15,9 @@ HHMM_RE = re.compile(r'^([01][0-9]|2[0-3]):([0-5][0-9])\Z')
 USER_RE = re.compile(r'^[a-z_][a-z0-9_-]{0,31}\Z')
 SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
 PORT_RE = re.compile(r'^(tcp|udp)/([0-9]{1,5})(?:-([0-9]{1,5}))?(?:@(.+))?\Z')
-# values that look like credentials: GitHub, OpenAI-style and Slack tokens, and long hex or base64 runs. A secret in
-# the alert command's argv is readable by every user in /proc while it runs: keep it in a root-only file the
-# command reads (README, Machine file).
-TOKEN_RES = (re.compile(r'(gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}'), re.compile(r'\bsk-[A-Za-z0-9_-]{16,}'),
-             re.compile(r'\bxox[abposr]-[A-Za-z0-9-]{8,}'), re.compile(r'\b[0-9a-fA-F]{32,}\b'),
-             re.compile(r'(?<![/A-Za-z0-9+_=-])(?=[A-Za-z0-9+_=-]*[0-9])(?=[A-Za-z0-9+_=-]*[a-z])'
-                        r'(?=[A-Za-z0-9+_=-]*[A-Z])[A-Za-z0-9+_=-]{32,}(?![/A-Za-z0-9+_=-])'))
+# values that look like credentials (one list, the shared alert channel's): a secret in the alert command's argv is
+# readable by every user in /proc while it runs: keep it in a root-only file the command reads (README, Machine file).
+TOKEN_RES = alert.TOKEN_RES
 
 
 def one_line(text, limit=300):
@@ -181,17 +177,27 @@ SPEC = {
 }
 
 
-def check(section, where):
-    """The section as a dict with every default filled in (baseline too)."""
+def check(section, where, channel=None):
+    """The section as a dict with every default filled in (baseline too). `channel` is the machine file's shared
+    alert channel (alert.read()): used only when the section has no alertCommand of its own. alertSource says which
+    one alerts go through ('update-policy', 'alert', or None: the journal only) and alertTimeout for how long."""
     out = machine_file.fields(section, SPEC, where)
     out['baseline'] = machine_file.fields(out['baseline'], BASELINE, f'{where}.baseline')
     out['exposure'] = machine_file.fields(out['exposure'], EXPOSURE, f'{where}.exposure')
+    out['alertSource'], out['alertTimeout'] = ('update-policy' if out['alertCommand'] else None), alert.TIMEOUT
+    if not out['alertCommand'] and channel:
+        out['alertCommand'], out['alertTimeout'] = list(channel['command']), channel['timeoutSeconds']
+        out['alertSource'] = 'alert'
     return out
 
 
 def read(path=None, owner_uid=0):
+    """The checked section. The shared "alert" section is read only when the kit has no alertCommand of its own, and
+    a broken one is then refused like a broken key of this section."""
     where = f'{path or machine_file.default_path()}: {SECTION}'
-    return check(machine_file.read_section(SECTION, path=path, owner_uid=owner_uid), where)
+    section = machine_file.read_section(SECTION, path=path, owner_uid=owner_uid)
+    channel = None if section.get('alertCommand') else alert.read(path=path, owner_uid=owner_uid)
+    return check(section, where, channel)
 
 
 def ignored_container(settings, name):

@@ -37,7 +37,7 @@ the reason, and changes nothing):
   swapped in between is caught.
 - **Shape:** a JSON object with no key given twice and no deeper nesting than Python's JSON reader takes,
   `"version"` a whole number, one section per kit named after the kit's folder
-  (`"heavy"`, ...), camelCase keys.
+  (`"heavy"`, ...) and the shared [`"alert"`](#the-alert-channel) section, camelCase keys.
 - **Version:** a file newer than the kit knows is refused ("update the kit"); the kit never guesses.
 - **Each kit reads `version` and its own section only.** A missing section, an unknown key in it, or a value of
   the wrong type is refused, so a typo is never silently ignored.
@@ -50,6 +50,41 @@ install -d -m 755 /etc/fork-kit && install -m 644 /dev/stdin /etc/fork-kit/machi
 { "version": 1, "heavy": { "sweep": { "stop": false } } }
 EOF
 ```
+
+## The alert channel
+
+One command per machine that every kit with something to say runs: the machine file's `"alert"` section, read
+by [alert.py](alert.py). A kit that alerts (today [update-policy](../update-policy/README.md), for restarts, drift
+and exposure) uses it unless its own section names a command of its own (`alertCommand`), which wins, so a file
+from before the channel works as before. With neither, the kit's alerts go only to the journal, and the kit's
+daily check reports the missing channel.
+
+```json
+{
+  "version": 1,
+  "alert": {
+    "command": ["/usr/local/bin/notify-owner", "--topic", "machine"],
+    "timeoutSeconds": 60
+  }
+}
+```
+
+| Key              | Default  | What                                                                   |
+| ---------------- | -------- | ---------------------------------------------------------------------- |
+| `command`        | required | a program (absolute path) and its arguments                            |
+| `timeoutSeconds` | 60       | 5 to 600; then the command is stopped and the alert counts as not sent |
+
+The command gets the alert's text on stdin and, in a plain environment (`PATH=/usr/sbin:/usr/bin:/sbin:/bin`,
+`LANG=C.UTF-8`, nothing else of the kit's), `FORK_KIT_ALERT_KIT` (the kit's folder name), `FORK_KIT_ALERT_EVENT`
+(lower case, digits and `-`: the kit's README lists its events; `test` is a test) and `FORK_KIT_ALERT_HOST`. A kit
+may add its own names of the same. Exit 0 is sent; anything else is a failed alert, which the kit logs and
+reports. **No secrets in its arguments:** every user can read a running program's arguments in `/proc`; an
+argument that looks like a token (`ghp_...`, `github_pat_...`, `sk-...`, `xox...-`, a long hex or base64 run) is
+refused. Keep the secret in a root-only file (mode 600) the command reads.
+
+A broken section (no `command`, an unknown key, a relative program, a token in it) is refused like any other
+section: never taken for "no channel". After writing it, send a test alert through a kit that alerts
+(`update-policy test-alert`, as root) and check it arrived.
 
 ## free/v1
 

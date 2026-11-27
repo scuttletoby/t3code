@@ -9,6 +9,7 @@
   update-policy exposure    the daily exposure check: KEV, security fixes waiting, ranked by EPSS; exit 0 none, 1 any
                             (update-policy-exposure.service runs it as an unprivileged user; --cache DIR)
   update-policy exposure-alert   sends the last exposure report through the alert command (as root, after it)
+  update-policy test-alert  sends one test alert and says which channel took it; exit 0 sent, 1 none or it failed
 
 The facts of the machine (role, quiet hour, time zone, alert command, ...) are in the "update-policy" section of
 /etc/fork-kit/machine.json. Run it as root: it reads every user's cgroups, containers and sockets.
@@ -65,6 +66,27 @@ def status(host, m, read_settings):
     return 0
 
 
+def test_alert(m, read_settings):
+    """One alert, event "test", through the channel the tick and the baseline use: proves the channel end to end."""
+    try:
+        s = read_settings()
+    except settings.MachineFileError as e:
+        print(f'update-policy test-alert: the machine file cannot be used, nothing sent: {e}')
+        return 1
+    if not s['alertCommand']:
+        print('update-policy test-alert: no alert channel (no "alert" section and no update-policy alertCommand in '
+              'the machine file): nothing sent')
+        return 1
+    where = ('the update-policy alertCommand' if s['alertSource'] == 'update-policy'
+             else 'the machine file\'s "alert" section')
+    err = tick.send_alert(m, s, 'test', 'test alert from update-policy: if you can read this, alerts reach you')
+    if err is not None:
+        print(f'update-policy test-alert: sent through {where}, and it failed: {err}')
+        return 1
+    print(f'update-policy test-alert: sent through {where}')
+    return 0
+
+
 def main(argv, host=None, read_settings=None):
     ap = argparse.ArgumentParser(prog='update-policy', description=__doc__.split('\n\n')[0],
                                  epilog='\n\n'.join(__doc__.split('\n\n')[1:]),
@@ -80,6 +102,7 @@ def main(argv, host=None, read_settings=None):
     e.add_argument('--cache', default=exposure.CACHE)
     e2 = sub.add_parser('exposure-alert')
     e2.add_argument('--cache', default=exposure.CACHE)
+    sub.add_parser('test-alert')
     d = sub.add_parser('docker-ps')
     d.add_argument('socket')
     a = ap.parse_args(argv)
@@ -104,6 +127,8 @@ def main(argv, host=None, read_settings=None):
         return baseline.run(host, m, read_settings)
     if a.cmd == 'status':
         return status(host, m, read_settings)
+    if a.cmd == 'test-alert':
+        return test_alert(m, read_settings)
     try:
         s = read_settings()
     except settings.MachineFileError as e:

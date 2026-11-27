@@ -43,8 +43,18 @@ class Baseline(fx.HostCase):
         for name in ('tcp', 'tcp6', 'udp', 'udp6'):
             self.write(f'/proc/net/{name}', HEADER)
 
-    def drift(self, state=None, **over):
+    def drift(self, state=None, channel=True, **over):
+        if channel:
+            over.setdefault('alertCommand', ['/usr/local/bin/notify'])      # a machine with an alert channel
         return baseline.check(self.host, self.m, fx.make_settings(**over), state or {}, self.now)
+
+    def test_a_machine_with_no_alert_channel_is_drift(self):
+        self.assertEqual(self.drift(channel=False), [
+            'no alert channel: alerts go only to the journal (add the machine file\'s "alert" section, then run '
+            '`update-policy test-alert` as root)'])
+        channel = {'command': ['/usr/local/bin/notify'], 'timeoutSeconds': 30}
+        s = fx.settings.check({'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}, 'test', channel)
+        self.assertEqual(baseline.check(self.host, self.m, s, {}, self.now), [])
 
     def test_a_machine_on_the_policy_has_no_drift(self):
         self.assertEqual(self.drift(), [])
@@ -255,6 +265,10 @@ class Baseline(fx.HostCase):
 
 
 MUTATIONS = {
+    'no alert channel is drift': (
+        'baseline', "    if s['alertCommand']:\n        return []\n    return ['no alert channel",
+        "    if True:\n        return []\n    return ['no alert channel",
+        'Baseline.test_a_machine_with_no_alert_channel_is_drift'),
     'Automatic-Reboot not false is drift': (
         'baseline', "    if problem:\n        out.append(problem)", "    if False:\n        out.append(problem)",
         'Baseline.test_restart_policy_drift'),

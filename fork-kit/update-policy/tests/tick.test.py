@@ -4,7 +4,7 @@ rule in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/update-policy/tests/tick.test.py
 """
-import datetime, json, os, sys, unittest
+import datetime, json, os, shutil, sys, tempfile, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -214,6 +214,37 @@ class Settings(unittest.TestCase):
                                            'https://ntfy.example/updates', '--key-file=/etc/notify/key'])
         self.assertEqual(len(s['alertCommand']), 6)
 
+    def machine_file(self, content):
+        folder = tempfile.mkdtemp(prefix='update-policy-machine-')
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        os.chmod(folder, 0o755)
+        path = os.path.join(folder, 'machine.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(dict(content, version=1), f)
+        os.chmod(path, 0o644)
+        return path
+
+    def test_the_shared_alert_channel_is_used_when_the_kit_has_no_command_of_its_own(self):
+        base = {'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}
+        shared = {'command': ['/usr/local/bin/notify-all', '--topic', 'machine'], 'timeoutSeconds': 30}
+        uid = os.getuid()
+        s = settings.read(self.machine_file({'update-policy': base, 'alert': shared}), owner_uid=uid)
+        self.assertEqual((s['alertCommand'], s['alertTimeout'], s['alertSource']),
+                         (shared['command'], 30, 'alert'))
+        own = dict(base, alertCommand=['/usr/local/bin/notify-owner'])
+        s = settings.read(self.machine_file({'update-policy': own, 'alert': shared}), owner_uid=uid)
+        self.assertEqual((s['alertCommand'], s['alertTimeout'], s['alertSource']),
+                         (['/usr/local/bin/notify-owner'], 60, 'update-policy'))     # its own wins
+        s = settings.read(self.machine_file({'update-policy': base}), owner_uid=uid)
+        self.assertEqual((s['alertCommand'], s['alertSource']), ([], None))       # neither: the journal only
+        for bad, words in (({'command': []}, 'must name a program'), ({'command': ['notify']}, 'absolute path'),
+                           ({}, '"command" is missing'), ({'command': ['/x'], 'timeoutSeconds': 1}, '5 to 600'),
+                           ({'command': ['/x'], 'retries': 3}, 'unknown key'),
+                           ({'command': ['/usr/bin/notify', FAKE_GH_TOKEN]}, 'token')):
+            with self.subTest(bad=bad), self.assertRaises(settings.MachineFileError) as e:
+                settings.read(self.machine_file({'update-policy': base, 'alert': bad}), owner_uid=uid)
+            self.assertIn(words, str(e.exception))       # a broken section is never taken for "no channel"
+
     def test_the_example_machine_file_section_parses(self):
         with open(os.path.join(fx.COMMON, 'machine.example.json')) as f:
             section = json.load(f)[settings.SECTION]
@@ -327,8 +358,15 @@ class TickOnHost(fx.HostCase):
         self.pending(SINCE)
         self.assertEqual(self.tick(fx.make_settings(role='live')), 0)
         self.assertEqual(self.m.alerts, [])
-        self.assertIn('alert live-restart-pending (no alertCommand in the machine file): restart pending',
-                      self.m.log.text())
+        self.assertIn('alert live-restart-pending (no alert channel in the machine file: no "alert" section and no '
+                      'alertCommand): restart pending', self.m.log.text())
+
+    def test_the_alert_goes_out_with_the_channel_timeout(self):
+        self.pending(SINCE)
+        channel = {'command': ['/usr/local/bin/notify-all'], 'timeoutSeconds': 20}
+        s = settings.check({'role': 'live', 'quietHour': '05:00', 'timeZone': 'UTC'}, 'test', channel)
+        self.assertEqual(self.tick(s), 0)
+        self.assertEqual(self.m.alert_calls, [(['/usr/local/bin/notify-all'], 'live-restart-pending', 20)])
 
     def test_no_machine_file_never_restarts_and_says_so_once_an_hour(self):
         broken = settings.MachineFileError('/etc/fork-kit/machine.json: no "update-policy" section')
@@ -410,7 +448,7 @@ class Cli(fx.HostCase):
         def broken():
             raise settings.MachineFileError('/etc/fork-kit/machine.json: not there')
         with mock.patch('builtins.print'):
-            for cmd in ('idle', 'status', 'baseline'):
+            for cmd in ('idle', 'status', 'baseline', 'test-alert'):
                 self.assertEqual(fx.cli.main([cmd], host=self.host, read_settings=broken), 1, cmd)
 
     def test_alert_command_gets_the_text_on_stdin_and_the_event(self):
@@ -420,12 +458,43 @@ class Cli(fx.HostCase):
         argv, stdin, env = self.host.calls[-1]
         self.assertEqual((argv, stdin, env['UPDATE_POLICY_EVENT']), (['/usr/local/bin/notify', '--topic', 'x'],
                                                                       'two\nlines\n', 'drift'))
-        self.assertEqual(sorted(env), ['LANG', 'PATH', 'UPDATE_POLICY_EVENT', 'UPDATE_POLICY_HOST'])
+        self.assertEqual(sorted(env), ['FORK_KIT_ALERT_EVENT', 'FORK_KIT_ALERT_HOST', 'FORK_KIT_ALERT_KIT', 'LANG',
+                                       'PATH', 'UPDATE_POLICY_EVENT', 'UPDATE_POLICY_HOST'])
+        self.assertEqual((env['FORK_KIT_ALERT_KIT'], env['FORK_KIT_ALERT_EVENT']), ('update-policy', 'drift'))
+        self.assertEqual(env['FORK_KIT_ALERT_HOST'], env['UPDATE_POLICY_HOST'])
         self.host.answers['/usr/local/bin/notify'] = (3, '', 'no network')
         self.assertEqual(m.alert(['/usr/local/bin/notify'], 'drift', 'x'), 'no network')
 
+    def test_test_alert_says_which_channel_took_it(self):
+        base = {'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}
+        m = fx.FakeMachine(self.host, at('2026-11-24 08:00'))
+        cases = ((settings.check(dict(base, alertCommand=['/usr/local/bin/own']), 'test',
+                                 {'command': ['/usr/local/bin/shared'], 'timeoutSeconds': 60}),
+                  None, 0, 'sent through the update-policy alertCommand'),
+                 (settings.check(base, 'test', {'command': ['/usr/local/bin/shared'], 'timeoutSeconds': 60}),
+                  None, 0, 'sent through the machine file\'s "alert" section'),
+                 (settings.check(base, 'test', {'command': ['/usr/local/bin/shared'], 'timeoutSeconds': 60}),
+                  'exit 7', 1, 'and it failed: exit 7'),
+                 (settings.check(base, 'test'), None, 1, 'no alert channel'))
+        for s, error, code, words in cases:
+            with self.subTest(words=words), mock.patch('builtins.print') as out, \
+                    mock.patch.object(fx.cli, 'make', lambda host=None: (self.host, m)):
+                m.alert_error, sent = error, len(m.alert_calls)
+                self.assertEqual(fx.cli.main(['test-alert'], host=self.host, read_settings=lambda: s), code)
+                self.assertIn(words, out.call_args_list[-1].args[0])
+                self.assertEqual(len(m.alert_calls) - sent, 0 if words == 'no alert channel' else 1)
+        self.assertEqual([c[0] for c in m.alert_calls],
+                         [['/usr/local/bin/own'], ['/usr/local/bin/shared'], ['/usr/local/bin/shared']])
+        self.assertEqual({c[1] for c in m.alert_calls}, {'test'})
+
 
 MUTATIONS = {
+    'the shared alert channel is the fallback': (
+        'settings', "    if not out['alertCommand'] and channel:", "    if False:",
+        'Settings.test_the_shared_alert_channel_is_used_when_the_kit_has_no_command_of_its_own'),
+    'the alert runs with its channel timeout': (
+        'tick', "timeout=s.get('alertTimeout') or alert_channel.TIMEOUT)", "timeout=None)",
+        'TickOnHost.test_the_alert_goes_out_with_the_channel_timeout'),
     'live never restarts': (
         'tick', "    if s['role'] not in settings_mod.RESTARTS:\n        if 'live' not in alerted:",
         "    if False:\n        if 'live' not in alerted:",
