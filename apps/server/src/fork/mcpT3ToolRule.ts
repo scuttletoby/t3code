@@ -18,6 +18,7 @@ import * as ServerSettingsService from "../serverSettings.ts";
 import { AttachmentToolkit } from "../mcp/toolkits/attachment/tools.ts";
 import { DeviceToolkit } from "../mcp/toolkits/device/tools.ts";
 import { EnvironmentToolkit } from "../mcp/toolkits/environment/tools.ts";
+import { FeedbackToolkit } from "../mcp/toolkits/feedback/tools.ts";
 import { HtmlToolkit } from "../mcp/toolkits/html/tools.ts";
 import { IssuesToolkit } from "../mcp/toolkits/issues/tools.ts";
 import { MessageToolkit } from "../mcp/toolkits/message/tools.ts";
@@ -28,6 +29,7 @@ import { ProjectToolkit } from "../mcp/toolkits/project/tools.ts";
 import { PullRequestsToolkit } from "../mcp/toolkits/pullRequests/tools.ts";
 import { ThemeToolkit } from "../mcp/toolkits/theme/tools.ts";
 import { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
+import { WorkflowToolkit } from "../mcp/toolkits/workflow/tools.ts";
 import { WaitsToolkit } from "../mcp/toolkits/waits/tools.ts";
 import { WorktreeToolkit } from "../mcp/toolkits/worktree/tools.ts";
 import { makeThreadMcpProfilesById } from "./claudeMcpProfile.ts";
@@ -63,6 +65,7 @@ const TOOLKITS: ReadonlyArray<readonly [string, { readonly tools: object }]> = [
   ["attachment", AttachmentToolkit],
   ["device", DeviceToolkit],
   ["environment", EnvironmentToolkit],
+  ["feedback", FeedbackToolkit],
   ["html", HtmlToolkit],
   ["issues", IssuesToolkit],
   ["message", MessageToolkit],
@@ -74,6 +77,7 @@ const TOOLKITS: ReadonlyArray<readonly [string, { readonly tools: object }]> = [
   ["theme", ThemeToolkit],
   ["thread", ThreadToolkit],
   ["waits", WaitsToolkit],
+  ["workflow", WorkflowToolkit],
   ["worktree", WorktreeToolkit],
 ];
 

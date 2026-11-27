@@ -77,6 +77,8 @@ export const MCP_T3_TOOL_GROUPS = [
   "html",
   "waits",
   "playtest",
+  "workflows",
+  "feedback",
 ] as const;
 export type McpT3ToolGroup = (typeof MCP_T3_TOOL_GROUPS)[number];
 

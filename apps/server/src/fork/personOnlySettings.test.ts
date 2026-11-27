@@ -241,6 +241,12 @@ const OPEN_KEYS_REVIEWED: Readonly<Record<string, string>> = {
   "t3_thread_launch $.modelSelection.model": MODEL_SELECTION,
   "t3_thread_launch $.modelSelection.options": MODEL_SELECTION,
   "t3_thread_launch $.modelSelection.provider": MODEL_SELECTION,
+  // Upstream's workflow runs: the run's input and a stored or signalled value stay in the
+  // workflow store; workflows only read settings, never write them.
+  "t3_workflow $.input":
+    "a workflow run's own input, kept with the run; never merged into settings",
+  "t3_workflow $.value":
+    "a value a workflow keeps or a wait receives, kept in the workflow store; never merged into settings",
 };
 
 describe("person-only fork settings", () => {

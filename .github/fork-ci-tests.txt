@@ -182,6 +182,8 @@ fork-kit/update-policy/tests/tick.test.py unittest
 .github/scripts/stage-preview-bundle.test.py run by .github/workflows/fork-tests.yml unittest
 .github/scripts/test-delta.test.cjs run by .github/workflows/fork-tests.yml
 .github/scripts/vercel-deployment-output.test.cjs run by .github/workflows/fork-tests.yml
+# Reads mobile-eas-preview-fork.yml, which the fork deletes: its step puts upstream's copy back first.
+.github/scripts/workflow-credentials.test.cjs run by .github/workflows/fork-tests.yml
 # Upstream runs this one from thread-transfer-report.yml (workflow_run of the disabled CI).
 .github/scripts/thread-transfer-report.test.cjs run by .github/workflows/fork-tests.yml
 # Release Smoke runs scripts/release-smoke.ts, which runs this one.

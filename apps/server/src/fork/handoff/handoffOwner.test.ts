@@ -423,12 +423,14 @@ describe("server.ts wiring", () => {
         expect(pipe).toBeGreaterThan(start);
         const block = server.slice(start, pipe);
         expect(block).toMatch(/^\s*layerIdleCompactionWorker,$/m);
-        // First in the pipe: below it, upstream's orchestrator reaches only the workers above.
-        const firstInPipe = server.slice(
-          pipe,
-          server.indexOf("\n", server.indexOf("\n", pipe) + 1),
-        );
-        expect(firstInPipe).toContain("Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction)");
+        // First in the pipe: below it, upstream's orchestrator reaches only the workers above. Its
+        // first step, past comments and a `flow(` that groups steps (a pipe takes at most 20).
+        const steps = server
+          .slice(server.indexOf("\n", pipe) + 1)
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line !== "" && !line.startsWith("//") && line !== "flow(");
+        expect(steps[0]).toContain("Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction)");
         expect(server.split("ForkLayers.handoffThreadsSkipIdleCompaction")).toHaveLength(2);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
