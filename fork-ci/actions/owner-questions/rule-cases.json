@@ -1,0 +1,94 @@
+{
+  "//": "The owner-question rule's cases, shared by its two copies: packages/contracts/src/forkOwnerQuestions.ts (T3's pages and tools; forkOwnerQuestions.test.ts) and owner_questions.py (this action; owner_questions.test.py). Both run every case, so the copies cannot drift.",
+  "defaultRule": {
+    "label": "status:needs-owner-decision",
+    "titlePrefixes": ["Owner question"],
+    "topicQuestionTitles": true,
+    "decisionPrefix": "Owner decision"
+  },
+  "renamedRule": {
+    "label": "needs-decision",
+    "titlePrefixes": ["Decision needed"],
+    "topicQuestionTitles": false,
+    "decisionPrefix": "Decided"
+  },
+  "questions": [
+    {
+      "rule": "default",
+      "title": "Owner question: may agents merge?",
+      "labels": [],
+      "expect": true
+    },
+    {
+      "rule": "default",
+      "title": "owner question: lower case still asks",
+      "labels": [],
+      "expect": true
+    },
+    {
+      "rule": "default",
+      "title": "  Owner question - leading spaces",
+      "labels": [],
+      "expect": true
+    },
+    {
+      "rule": "default",
+      "title": "Owner questions are tracked here",
+      "labels": [],
+      "expect": false
+    },
+    {
+      "rule": "default",
+      "title": "Issues page Q1: how far should we change it?",
+      "labels": [],
+      "expect": true
+    },
+    {
+      "rule": "default",
+      "title": "Calm sidebar Q12: one group or two?",
+      "labels": [],
+      "expect": true
+    },
+    { "rule": "default", "title": "Q1: no topic before it", "labels": [], "expect": false },
+    { "rule": "default", "title": "Fix Q1 numbers in the report", "labels": [], "expect": false },
+    { "rule": "default", "title": "Topic Q1234: too many digits", "labels": [], "expect": false },
+    {
+      "rule": "default",
+      "title": "Plain bug report",
+      "labels": ["status:needs-owner-decision"],
+      "expect": true
+    },
+    { "rule": "default", "title": "Plain bug report", "labels": ["question"], "expect": false },
+    {
+      "rule": "default",
+      "title": "Plain bug report",
+      "labels": ["Status:Needs-Owner-Decision"],
+      "expect": true
+    },
+    { "rule": "renamed", "title": "Decision needed: which runner?", "labels": [], "expect": true },
+    { "rule": "renamed", "title": "Owner question: which runner?", "labels": [], "expect": false },
+    { "rule": "renamed", "title": "Issues page Q1: how far?", "labels": [], "expect": false },
+    { "rule": "renamed", "title": "Anything", "labels": ["needs-decision"], "expect": true }
+  ],
+  "decisions": [
+    { "rule": "default", "body": "Owner decision: yes.", "expect": true },
+    {
+      "rule": "default",
+      "body": "Owner decision (in chat, 2026-11-22): a version of C.",
+      "expect": true
+    },
+    { "rule": "default", "body": "**Owner decision:** keep it.", "expect": true },
+    { "rule": "default", "body": "**Owner decision**: keep it.", "expect": true },
+    { "rule": "default", "body": "__Owner decision__: keep it.", "expect": true },
+    { "rule": "default", "body": "Owner decision needed before PR 2 lands.", "expect": false },
+    { "rule": "default", "body": "Owner decision pending: asked in chat.", "expect": false },
+    { "rule": "default", "body": "Owner decision - yes", "expect": false },
+    { "rule": "default", "body": "Owner decision", "expect": false },
+    { "rule": "default", "body": "  \n owner decision: lower case", "expect": true },
+    { "rule": "default", "body": "> Owner decision: a quote of one is not one", "expect": false },
+    { "rule": "default", "body": "Waiting on the owner decision for this", "expect": false },
+    { "rule": "default", "body": "", "expect": false },
+    { "rule": "renamed", "body": "Decided: go.", "expect": true },
+    { "rule": "renamed", "body": "Owner decision: go.", "expect": false }
+  ]
+}

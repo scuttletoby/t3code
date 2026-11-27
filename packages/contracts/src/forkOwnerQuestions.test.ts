@@ -6,7 +6,10 @@ import {
   isOwnerQuestion,
   ownerQuestionStatus,
   ownerQuestionTitleForms,
+  type OwnerQuestionRule,
 } from "./forkOwnerQuestions.ts";
+// The cases the fork-ci action's copy of the rule runs too (owner_questions.test.py).
+import RULE_CASES_SOURCE from "../../../fork-ci/actions/owner-questions/rule-cases.json?raw";
 
 const issue = (
   title: string,
@@ -108,5 +111,45 @@ describe("ownerQuestionStatus", () => {
     const closed = issue("Owner question: may agents merge?", [], "closed");
     expect(ownerQuestionStatus(closed, [], DEFAULT_OWNER_QUESTION_RULE)).toBe("not-waiting");
     expect(ownerQuestionStatus(issue("Bug"), [], DEFAULT_OWNER_QUESTION_RULE)).toBe("not-waiting");
+  });
+});
+
+// Do this rule and the fork-ci owner-questions action's copy answer every shared case alike?
+describe("the cases shared with the fork-ci action", () => {
+  const cases = JSON.parse(RULE_CASES_SOURCE) as {
+    readonly defaultRule: OwnerQuestionRule;
+    readonly renamedRule: OwnerQuestionRule;
+    readonly questions: ReadonlyArray<{
+      readonly rule: "default" | "renamed";
+      readonly title: string;
+      readonly labels: ReadonlyArray<string>;
+      readonly expect: boolean;
+    }>;
+    readonly decisions: ReadonlyArray<{
+      readonly rule: "default" | "renamed";
+      readonly body: string;
+      readonly expect: boolean;
+    }>;
+  };
+  const ruleOf = (name: "default" | "renamed") =>
+    name === "default" ? DEFAULT_OWNER_QUESTION_RULE : cases.renamedRule;
+
+  it("has the defaults this file has", () => {
+    expect(cases.defaultRule).toEqual(DEFAULT_OWNER_QUESTION_RULE);
+  });
+
+  it("asks the owner exactly in the shared question cases", () => {
+    for (const entry of cases.questions) {
+      expect(
+        isOwnerQuestion(issue(entry.title, entry.labels), ruleOf(entry.rule)),
+        entry.title,
+      ).toBe(entry.expect);
+    }
+  });
+
+  it("reads an answer exactly in the shared decision cases", () => {
+    for (const entry of cases.decisions) {
+      expect(isOwnerDecision(entry.body, ruleOf(entry.rule)), entry.body).toBe(entry.expect);
+    }
   });
 });
