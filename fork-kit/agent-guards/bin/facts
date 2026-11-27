@@ -84,9 +84,10 @@ def main(argv):
         out = facts.check(found, c['staleDays'], c['maxRows'], today())
         for line in out:
             print(f'{PROG} check: {line}')
-        rows = sum(len(p.rows()) for p in found)
+        own = [p for p in found if p.source != facts.KIT_SOURCE]   # check() skips the kit's table too
+        rows = sum(len(p.rows()) for p in own)
         print(f'{PROG} check: ' + (f'{len(out)} finding(s)' if out else
-                                   f'OK ({sum(1 for p in found if p.tables)} table file(s), {rows} rows)'))
+                                   f'OK ({sum(1 for p in own if p.tables)} table file(s), {rows} rows)'))
         return 1 if out else 0
     if mode == '--index':
         lines = facts.index(found)

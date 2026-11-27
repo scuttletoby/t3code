@@ -1,0 +1,14 @@
+#!/usr/bin/python3 -IB
+"""fork-precheck: format and lint the files changed against the base, then run the test files the change touches, after the capacity check.
+`fork-precheck --help` for the usage (lib/agent_guards/kitcmds.py; COMMANDS.md). Tests: fork-kit/agent-guards/tests/kitcmds.test.py
+"""
+import os, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+
+if __name__ == '__main__':
+    from agent_guards import kitcmds
+    try:
+        sys.exit(kitcmds.precheck(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -113,6 +113,7 @@ fork-kit/agent-guards/tests/config.test.py unittest
 fork-kit/agent-guards/tests/facts.test.py unittest
 fork-kit/agent-guards/tests/fast.test.py ~25s unittest
 fork-kit/agent-guards/tests/install.test.py ~20s unittest
+fork-kit/agent-guards/tests/kitcmds.test.py unittest
 fork-kit/agent-guards/tests/memory-index.test.py unittest
 fork-kit/agent-guards/tests/poll-loop.test.py unittest
 fork-kit/agent-guards/tests/read-size.test.py unittest

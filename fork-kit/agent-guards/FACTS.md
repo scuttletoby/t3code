@@ -44,7 +44,7 @@ turn). A new thing gets a row when it is made; a thing that is gone loses its ro
 ## Where the tables are
 
 The machine file's `"agent-guards"` section, part `"facts"` ([README.md](README.md), Settings). Every key is optional;
-with none, the hook and the command do nothing.
+with none, the hook and the command show only the kit's own table (below).
 
 | Key          | Default | What it is                                                                                       |
 | ------------ | ------- | ------------------------------------------------------------------------------------------------ |
@@ -84,6 +84,14 @@ the format and the hook.
 
 `FACTS_DIRS` (paths joined by `:`) replaces both lists for one command or session: for a test, or a look at another
 place's table. It does not change the record repos.
+
+## The kit's commands
+
+The kit ships one table of its own, [COMMANDS.md](COMMANDS.md): its ready-made commands (`fork-ci-why`, `fork-clone`,
+`fork-precheck`; [README.md](README.md), Ready-made commands). It is read on every machine with the kit, after the
+configured tables (so their things come first in the session-start context), with the source `kit` in `facts --dirs`.
+It is not read when `FACTS_DIRS` is set (that replaces every place) or when the file is not there (an older copy of
+the kit), and `facts --check` skips it: it changes only with the kit, and its tests keep it.
 
 ## The record repo
 

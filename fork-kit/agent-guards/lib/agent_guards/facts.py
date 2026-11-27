@@ -25,6 +25,11 @@ import datetime, hashlib, os, re, stat, subprocess, time
 from .config import _NAME_RE as NAME_RE   # one rule for a project's folder name
 
 TABLE_FILE = 'STATE.md'
+# The kit's own table: its ready-made commands (COMMANDS.md), read on every machine with the kit, after the
+# configured tables, so agents find them with no setting. Left out when the file is not there (FACTS_DIRS too).
+KIT_TABLE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+                         'COMMANDS.md')
+KIT_SOURCE = 'kit'
 CALL_TO_LOOK = 'check the state table before diagnosing or redoing something: `facts <words>` prints the matching rows'
 MAX_READ = 4 * 1024 * 1024          # a table file is read up to this, the rest is cut (and named)
 RECORD_MAX = 1024 * 1024            # record repo files over this are skipped
@@ -281,6 +286,8 @@ def entries(cfg, cwd, env=None, every=False, projects=None):
             projects = projects_for(cfg, cwd)
         for p in projects:
             out += [(e, f'project {p["match"]}') for e in p.get('dirs') or []]
+        if os.path.isfile(KIT_TABLE):
+            out.append((KIT_TABLE, KIT_SOURCE))
     seen, uniq = set(), []
     for e, s in out:
         k = _same(e)
@@ -381,6 +388,7 @@ def check(found, stale_days, max_rows, today):
     """The gardener's findings (report only; nothing is changed): rows whose Updated is older than stale_days,
     in the future or cannot be read, tables without an Updated column or over max_rows, broken rows, entries that
     are missing, empty or hold no table."""
+    found = [p for p in found if p.source != KIT_SOURCE]   # the kit's table is the kit's, kept by its tests
     out = list(notes(found))
     for p in found:
         for t in p.tables:

@@ -12,6 +12,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guards_fixture as fx  # noqa: E402
 from agent_guards import config, facts  # noqa: E402
 
+# The kit's own table (COMMANDS.md) is left out of every test but KitTable's, so each test's tables are its own.
+KIT_TABLE = facts.KIT_TABLE
+facts.KIT_TABLE = fx.NO_KIT_TABLE
+
 HEAD = '| Thing | What we made / how to use it | State now | Why | Updated |\n|---|---|---|---|---|\n'
 TABLE = ('# What we have\n\nSome text first.\n\n' + HEAD
          + '| Example GPU | `gpu on\\|off\\|status` helper; off at boot | OFF on purpose; the vendor tool fails while '
@@ -332,6 +336,7 @@ class Command(unittest.TestCase):
         write(os.path.join(self.place, 'STATE.md'), TABLE)
         self.configure(dirs=[self.place])
         self.env = dict(os.environ, HOME=self.tmp, FACTS_TODAY=TODAY.isoformat())
+        self.env[fx.KIT_TABLE_VAR] = fx.NO_KIT_TABLE
         self.env.pop('FACTS_DIRS', None)
 
     def configure(self, **part):
@@ -511,6 +516,7 @@ class RecordRepo(unittest.TestCase):
         os.symlink(f'{r}/projects/other/notes.md', f'{r}/shared/link.md')
         self.configure()
         self.env = dict(os.environ, HOME=self.tmp, FACTS_TODAY=TODAY.isoformat())
+        self.env[fx.KIT_TABLE_VAR] = fx.NO_KIT_TABLE
         self.env.pop('FACTS_DIRS', None)
 
     def configure(self, records=None):
