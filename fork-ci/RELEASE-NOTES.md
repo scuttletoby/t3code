@@ -13,6 +13,15 @@ nothing.
 
 ## After ci/v14
 
+### lanes: a general test-lane pool and claims rule (#890)
+
+New: [`lanes/`](lanes/README.md). `pool.py run` runs one lane's command once its servers are claimed and the pool
+admits it from measured free memory; `claims.py` is the rule (shared or alone, a waiting restart first, dead holders
+swept by pid and start time or by unit, one lock); `contract.py` holds the contract tests a project runs against its
+own adapter.
+
+**Upgrade:** none (nothing used it before).
+
 ### checkout-state: a lint for checkout state a self-hosted runner keeps (#932)
 
 New action. It fails a workflow whose jobs on a self-hosted runner could leave checkout state in the shared work
