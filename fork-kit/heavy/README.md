@@ -776,13 +776,13 @@ Optional, in `/etc/fork-kit/machine.json` (`fork-kit/common/README.md`):
 }
 ```
 
-| Key in a hold | Default  | What                                                                                   |
-| ------------- | -------- | -------------------------------------------------------------------------------------- |
-| `label`       | required | the name in `reservations:` (lower-case letters, digits, `_ . -`; at most 40)          |
-| `cgroup`      | required | its folder below the cgroup root; below `user.slice` only a slice in a user manager    |
-| `inUseFromMb` | 1024     | held only while it uses more than this                                                 |
-| `budgetMb`    | 6144     | its budget when its `memory.max` is `max`, cannot be read or is not there              |
-| `users`       | `[]`     | user name patterns (`fnmatch`) whose own budget it is: never held back from them       |
+| Key in a hold | Default  | What                                                                                |
+| ------------- | -------- | ----------------------------------------------------------------------------------- |
+| `label`       | required | the name in `reservations:` (lower-case letters, digits, `_ . -`; at most 40)       |
+| `cgroup`      | required | its folder below the cgroup root; below `user.slice` only a slice in a user manager |
+| `inUseFromMb` | 1024     | held only while it uses more than this                                              |
+| `budgetMb`    | 6144     | its budget when its `memory.max` is `max`, cannot be read or is not there           |
+| `users`       | `[]`     | user name patterns (`fnmatch`) whose own budget it is: never held back from them    |
 
 At most 8 holds, none in another's cgroup (it would hold the same room twice). The sweep and the queue accept the
 `capacity` key and leave it to `heavy facts`.
