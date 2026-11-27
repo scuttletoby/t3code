@@ -105,6 +105,9 @@ has no row yet (usage history, busy check, placement, thread roles): set it in `
   `placementNeeds`); not acted on yet.
 - Run records: one line per finished agent run (model, effort, times, tokens) and a weekly summary
   ([run-records.md](run-records.md)). Always on.
+- Delegate prepare: a script merges the base, installs and runs the baseline tests of the touched
+  files before a delegated agent starts, by the project's `.t3code/prepare.json`
+  ([delegate-prepare.md](delegate-prepare.md)). Run by hand or as a project's worktree setup script.
 - File links: a file link in chat opens in the files viewer or an editor, or downloads, also from
   another linked machine. Always on.
 - Linked machines: a task delegated to another linked machine is still followed if the call is cut
@@ -179,7 +182,7 @@ From the fork's open issues, grouped. Each is one line; the issue has the detail
 - Orchestrator state and logic as fork features, not instructions
   ([#851](https://github.com/scuttletoby/t3code/issues/851),
   [#870](https://github.com/scuttletoby/t3code/issues/870)).
-- Delegation prepares the worktree before an agent starts
+- `delegate_task` runs the prepare itself and puts its result in the child's prompt
   ([#991](https://github.com/scuttletoby/t3code/issues/991)).
 
 **Updates, machines and safety**
