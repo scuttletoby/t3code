@@ -61,7 +61,7 @@
       ]
     },
     "apps/server/src/server.ts": {
-      "why": "The fork's service layers are wired here in one place each, from fork/forkLayers.ts (#384), so this file keeps as few fork lines as it can. The ten lines in \"added\" were its pending lines (ceiling 10) when it moved here (#361). The last line in \"added\" gives the runtime's workers upstream's orchestrator with one change: an idle compaction send to a thread whose handoff mode is \"handoff\" is skipped, so the handoff service alone owns that thread (fork/handoff, #361). The line naming ForkLayers.mcpProfileTurnCheck gives the runtime upstream's provider instance registry with one change: a provider that cannot apply MCP profiles (all but Claude) refuses a turn whose thread's profile is narrower than \"all\", at turn start (fork/mcpProfileTurnCheck.ts, #672). That line also carries upstream's next one, its task folders (upstream's `Layer.provideMerge(layerTaskFolders)`, the one upstream line it lost), wired exactly as before: Effect's pipe takes at most 20 steps, and upstream's 19 here plus the fork's two would be 21.",
+      "why": "The fork's service layers are wired here in one place each, from fork/forkLayers.ts (#384), so this file keeps as few fork lines as it can. The ten lines in \"added\" were its pending lines (ceiling 10) when it moved here (#361). The last line in \"added\" gives the runtime's workers upstream's orchestrator with one change: an idle compaction send to a thread whose handoff mode is \"handoff\" is skipped, so the handoff service alone owns that thread (fork/handoff, #361). The line naming ForkLayers.mcpProfileTurnCheck gives the runtime upstream's provider instance registry with one change: a provider that cannot apply MCP profiles (all but Claude) refuses a turn whose thread's profile is narrower than \"all\", at turn start (fork/mcpProfileTurnCheck.ts, #672). Effect's pipe takes at most 20 steps and upstream's chain there has 20 (v0.1.14), so each fork step shares a step with the upstream line below it: the check's line carries upstream's task folders line in its own pipe, and the handoff skip shares a flow with upstream's orchestration application line (each upstream line re-indented, not changed).",
       "added": [
         "import * as ForkLayers from \"./fork/forkLayers.ts\";",
         "// Fork (waits): the `pr` judge reads through the same pull request service and its caches.",
@@ -73,17 +73,22 @@
         "const layerWorkAdmission = yield* ForkLayers.makeWorkAdmissionLayer(config);",
         "Layer.provide(ForkLayers.holdWorkCloudLink(CloudLink.layer, ConnectReachability.layer)),",
         "Layer.provide(Layer.merge(layerActivation, layerWorkAdmission)),",
-        "Layer.provideMerge(ForkLayers.mcpProfileTurnCheck.pipe(Layer.provideMerge(layerTaskFolders))), // Fork: MCP profiles",
-        "Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction), // Fork: one owner (fork/handoff)"
+        "import { flow } from \"effect/Function\"; // Fork: see the runtime layer chain",
+        "),",
+        "Layer.provideMerge(",
+        "// Fork: one owner (fork/handoff). Effect's pipe takes at most 20 steps, upstream's 20 here.",
+        "flow(",
+        "Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction),",
+        "ForkLayers.mcpProfileTurnCheck.pipe(",
+        "), // Fork: MCP profiles"
       ]
     },
     "apps/server/src/serverSettings.ts": {
-      "why": "Every settings write goes through upstream's patch and write paths here. The fork swaps in its patch (fork/serverSettingsPatch.ts, under upstream's name, so a project's MCP profile a client left out is kept) and calls its save check (fork/serverSettingsWriteCheck.ts) once in each write path. The load decodes the file in fork/settingsFileRead.ts (old auto-update names renamed, an unusable interval left out so it reads as its default), in the server's fiber so what a lenient field drops is logged to the server's logger (#975); upstream's private settings schema is decoded there through the one exported decodePersistedSettings, which the fork report and the Claude MCP profile reader also pass to the silent copy of that decode. The lines from \"import { renameRetiredAutoUpdateKeys }\" on predate this list (#277): the load's decode of the file, which the fork report shares and which needs upstream's private decoders here, and the fallback when the file cannot be read. When the file fails to load, upstream runs on its defaults, whose model policy is off; the fork reads the policy from the file on its own and fails closed (enforce, nothing allowed) when the file does not parse, so a broken file never turns an enforced policy off (fork/modelPolicyFile.ts, #731). Each listed copy is one the fork adds over upstream; the run from upstream refuses a spare one (#311).",
+      "why": "Every settings write goes through upstream's patch and write paths here. The fork swaps in its patch (fork/serverSettingsPatch.ts, under upstream's name, so a project's MCP profile a client left out is kept) and calls its save check (fork/serverSettingsWriteCheck.ts) once in each write path. The load decodes the file in fork/settingsFileRead.ts (old auto-update names renamed, an unusable interval left out so it reads as its default), in the server's fiber so what a lenient field drops is logged to the server's logger (#975); upstream's private settings schema is decoded there through the one exported decodePersistedSettings, which the fork report and the Claude MCP profile reader also pass to the silent copy of that decode. The lines from \"import { renameRetiredAutoUpdateKeys }\" on predate this list (#277): the load's decode of the file, which the fork report shares and which needs upstream's private decoders here, and the fallback when the file cannot be read. When the file fails to load, upstream runs on its defaults, whose model policy is off; the fork reads the policy from the file on its own and fails closed (enforce, nothing allowed) when the file does not parse, so a broken file never turns an enforced policy off (fork/modelPolicyFile.ts, #731). Each listed copy is one the fork adds over upstream; the run from upstream refuses a spare one (#311). Since v0.1.14 upstream decodes the file in its own pure decodeSettingsFile(): it reads through the fork's silent decode (decodeSettingsFileSilently, one changed line), and the load runs the fork's logSettingsFileRead() first, in its fiber, for the warnings; the fork's fallback values (automaticUpdates off, the model policy) are in upstream's fallback there.",
       "added": [
         "// Fork: upstream's patch keeping a project's MCP profile a client left out, and the save check.",
         "import { applyServerSettingsPatchKeepingForkProjectKeys as applyServerSettingsPatch } from \"./fork/serverSettingsPatch.ts\";",
         "import * as ForkSettingsWrite from \"./fork/serverSettingsWriteCheck.ts\";",
-        "import { decodeSettingsFile, prepareSettingsFile } from \"./fork/settingsFileRead.ts\"; // Fork: load",
         ": decodePersistedServerSettingsExit(withDefaults(prepareSettingsFile(parsed.value)));",
         "Effect.flatMap(ForkSettingsWrite.withCheck(update, \"test settings\")), // Fork: save check",
         "yield* ForkSettingsWrite.check(current, updated, settingsPath); // Fork: save check",
@@ -91,8 +96,6 @@
         ") {",
         "}",
         "/**",
-        "* The load's decode of a settings file's text: parse, rename retired keys, fill policy defaults,",
-        "* decode. Synchronous: the load and `__fork-report` use fork/settingsFileRead.ts's Effect form.",
         "*/",
         "export function decodeSettingsFileText(",
         "raw: string,",
@@ -107,13 +110,28 @@
         "// The file before this write, parsed; only read when policy defaults need it. Fork: renamed as on",
         "// load, so a choice saved under an old name is kept like one under the new name.",
         "return Exit.isSuccess(parsed) ? renameRetiredAutoUpdateKeys(parsed.value) : undefined;",
-        "const decoded = yield* decodeSettingsFile(raw, managed.withDefaults, decodePersistedSettings);",
         "export const decodePersistedSettings = Schema.decodeUnknownEffect(PersistedServerSettings);",
-        "// The file may hold an opt-out we can no longer read; never resume threads or update on a",
-        "// guess, even when an admin policy defaults them on (a locked policy value still applies).",
-        "automaticUpdates: false,",
         "import * as ForkPolicy from \"./fork/modelPolicyFile.ts\"; // Fork: model policy",
-        "modelPolicy: yield* ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy"
+        "import {",
+        "decodeSettingsFileSilently,",
+        "logSettingsFileRead,",
+        "prepareSettingsFile,",
+        "} from \"./fork/settingsFileRead.ts\"; // Fork: load",
+        ");",
+        "const parsed = decodeSettingsFileJsonExit(raw);",
+        "? parsed",
+        ": decodeSettingsFileSilently(raw, managed.withDefaults, decodePersistedSettings); // Fork: read",
+        "automaticUpdates: false, // Fork: never update on a guess.",
+        "modelPolicy: ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy",
+        "* Fork: the load's decode of a settings file's text: parse, rename retired keys, fill policy",
+        "* defaults, decode. Synchronous; upstream's decodeSettingsFile reads as this does, silently, and",
+        "* the load logs what it drops through fork/settingsFileRead.ts's Effect form.",
+        "// Fork: what the read renames or drops is logged through the server's logger.",
+        "yield* logSettingsFileRead(",
+        "yield* readRawConfig,",
+        "managed.withDefaults,",
+        "decodePersistedSettings,",
+        "yield* ForkPolicy.warnAfterLoadFailure(settings.modelPolicy); // Fork: model policy"
       ]
     },
     "packages/shared/src/AgentScope.ts": {
@@ -211,8 +229,8 @@
         "const mcpProfile = yield* mcpProfiles(turnInput.appThread, mcpOverrides);",
         "const checkMcpProfile = ClaudeMcpProfile.checkClaudeSession(mcpProfile, mcpOverrides);",
         "mcpProfileOptions: mcpProfile.options,",
-        "Effect.tap(checkMcpProfile),",
-        "...input.mcpProfileOptions?.hooks,"
+        "...input.mcpProfileOptions?.hooks,",
+        "Effect.tap(({ querySession }) => checkMcpProfile(querySession)),"
       ]
     },
     "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts": {
@@ -487,12 +505,6 @@
         "...(input.threadDisposition === \"broken\" ? {} : { status: \"idle\" as const }),"
       ]
     },
-    "apps/server/src/orchestration-v2/Adapters/AcpAdapterV2.test.ts": {
-      "why": "Fix for #846: upstream's late usage_update test also checks that the re-sent snapshot is idle, not active.",
-      "added": [
-        "assert.equal(late.providerThread.status, \"idle\"); // Fork: not busy after the turn"
-      ]
-    },
     "packages/provider-cursor/src/server/adapter.test.ts": {
       "why": "Fix for #846: upstream's background-shell test also checks that the snapshot later shell updates re-send is idle, not active.",
       "added": [
@@ -636,12 +648,12 @@
     "apps/server/src/cli/server.ts": 17,
     "apps/server/src/cloud/selfUpdate.ts": 4,
     "apps/server/src/config.ts": 2,
-    "apps/server/src/mcp/McpHttpServer.ts": 10,
+    "apps/server/src/mcp/McpHttpServer.ts": 14,
     "apps/server/src/mcp/toolkits/environment/handlers.test.ts": 63,
     "apps/server/src/mcp/toolkits/project/handlers.test.ts": 48,
     "apps/server/src/orchestration-v2/EffectWorker.ts": 28,
     "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": 127,
-    "apps/server/src/orchestration-v2/ThreadLaunchService.test.ts": 84,
+    "apps/server/src/orchestration-v2/ThreadLaunchService.test.ts": 93,
     "apps/server/src/orchestration-v2/ThreadLaunchService.ts": 13,
     "apps/server/src/orchestration-v2/runtimeLayer.test.ts": 259,
     "apps/server/src/orchestration-v2/runtimeLayer.ts": 28,
@@ -659,9 +671,9 @@
     "apps/server/src/terminal/Manager.ts": 2,
     "apps/server/vite.config.ts": 2,
     "apps/web/src/cloud/linkEnvironment.test.ts": 34,
-    "apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx": 277,
-    "apps/web/src/components/ChatMarkdown.tsx": 32,
-    "apps/web/src/components/chat/MarkdownFileLink.tsx": 32,
+    "apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx": 241,
+    "apps/web/src/components/ChatMarkdown.tsx": 17,
+    "apps/web/src/components/chat/MarkdownFileLink.tsx": 23,
     "apps/web/src/components/media/mediaContent.ts": 8,
     "apps/web/src/components/settings/scopedSettings.test.ts": 153,
     "apps/web/src/components/settings/scopedSettings.ts": 9,
@@ -673,7 +685,6 @@
     "apps/web/src/remoteOpen.ts": 13,
     "apps/web/tsconfig.json": 1,
     "apps/web/vite.config.ts": 2,
-    "docs/operations/release.md": 1,
     "packages/contracts/package.json": 8,
     "packages/contracts/src/editor.ts": 40,
     "packages/provider-core/src/server/managedProvider.test.ts": 39,
@@ -748,8 +759,8 @@
       "gone": 1
     },
     "apps/server/src/serverSettings.ts": {
-      "lines": 9,
-      "gone": 7
+      "lines": 5,
+      "gone": 5
     },
     "apps/server/src/cloud/CloudLink.ts": {
       "lines": 1,
@@ -796,8 +807,8 @@
       "gone": 1
     },
     "apps/server/src/server.ts": {
-      "lines": 7,
-      "gone": 7
+      "lines": 8,
+      "gone": 5
     },
     "apps/server/src/serverRuntimeStartup.ts": {
       "lines": 6,
