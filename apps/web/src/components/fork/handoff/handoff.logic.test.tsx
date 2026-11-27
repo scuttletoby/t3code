@@ -6,7 +6,6 @@ import {
   threadActionRequiresOperate,
   type ThreadActionMenuState,
 } from "../../threadActionMenu.logic";
-import { handoffLabel } from "./handoffDivider";
 import { answerToast, HAND_OFF_NOW, handOffNowItems } from "./handoffMenu";
 import { handoffWaitingItem } from "./useForkHandoffWaitingItems";
 
@@ -103,28 +102,5 @@ describe("the handoff waiting chip (HO5)", () => {
       id: "fork-handoff-waiting",
       title: "Handoff waiting on a child's result not read yet, an active goal",
     });
-  });
-});
-
-describe("the handoff divider label (HO5)", () => {
-  const message = (messageId: string, text: string) => ({
-    type: "user_message",
-    messageId,
-    text,
-  });
-
-  it("labels a handoff's first message with its number", () => {
-    expect(handoffLabel(message("handoff:thread-a:run-3", "[T3 handoff 4] Carry on with"))).toBe(
-      "Handoff 4",
-    );
-    expect(handoffLabel(message("handoff:thread-a:run-3", "no number here"))).toBe("Handoff");
-  });
-
-  it("leaves other messages and other items to upstream's label", () => {
-    expect(handoffLabel(message("message-1", "[T3 handoff 4] typed by a person"))).toBeNull();
-    expect(
-      handoffLabel({ type: "assistant_message", messageId: "handoff:thread-a:run-3" }),
-    ).toBeNull();
-    expect(handoffLabel(undefined)).toBeNull();
   });
 });

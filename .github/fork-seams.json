@@ -1027,10 +1027,6 @@
     "packages/shared/src/usageLimits.ts": {
       "lines": 1,
       "gone": 1
-    },
-    "apps/web/src/components/chat/TimelineUserMessageRow.tsx": {
-      "lines": 1,
-      "gone": 0
     }
   }
 }

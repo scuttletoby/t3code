@@ -52,8 +52,8 @@ second press, or a press while that turn's handoff is going, sends one handoff. 
 thread queues nothing: the toast says what it waits on, and the person may press again later.
 
 When a due handoff waits on a busy thread, a chip above the composer says "Handoff waiting on …"
-and goes once it no longer waits. The handoff's first message shows "Handoff N" in place of the
-"New session" divider.
+and goes once it no longer waits. The handoff's first message still shows upstream's "New session"
+divider; a "Handoff N" label there is still to come.
 
 The app reads `GET /api/fork/handoff/state?threadId=` (read access) and presses with `POST
 /api/fork/handoff/now` and `{ "threadId": ... }` (operate access). A thread that cannot be read
@@ -358,7 +358,7 @@ written out in full. The message says when no effort is set.
   `handoffQuiet.ts`,
   `handoffShell.ts`, `handoffRelayView.ts`, `handoffRoutes.ts`). Settings and the routes' shapes:
   `packages/contracts/src/handoff.ts`. The app's parts: `apps/web/src/components/fork/handoff/`
-  (the menu item, the chip and the divider label), each joined to upstream's files by seam lines.
+  (the menu item and the chip), each joined to upstream's files by seam lines.
 - `Orchestrator.ts` stays upstream's (the fork check refuses edits to it). Every handoff send goes
   through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. The service starts from
   `ForkLayers.layerRuntimeServices` (`apps/server/src/fork/forkLayers.ts`), which `server.ts`
