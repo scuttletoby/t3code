@@ -11,6 +11,9 @@ starting points, one per OS. Like the review kit, this kit has no installer: cop
 | `facts-macos.sh`   | macOS   | the script itself (`chmod 755`)                                    |
 | `facts-windows.cs` | Windows | an `.exe` built with the `csc.exe` that ships with Windows (below) |
 
+**`facts-windows.cs` has never been compiled or run.** It was written without a Windows machine. Build it once and
+check its answers (free, busy file, on battery, `gpu`) before a machine relies on it.
+
 What each one does, in this order (the settings at the top of each file change it):
 
 1. **Not available** (exit 1, the reason on the error output) while the busy file is there
@@ -45,5 +48,5 @@ The busy file is a switch a person (or their own scripts) can flip without openi
 ## Tests
 
 `python3 -I -B fork-kit/placement-facts/tests/scripts.test.py` runs the Linux and macOS scripts with stand-in
-`pgrep`, `nvidia-smi` and `pmset`, a stand-in power-supply folder and busy file. The Windows example is checked for
-its settings and for C# 5 syntax only; build it on Windows to run it.
+`pgrep`, `nvidia-smi` and `pmset`, a stand-in power-supply folder and busy file. The Windows example is only read as text (its
+settings, and no syntax newer than C# 5); no test compiles or runs it.
