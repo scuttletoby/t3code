@@ -211,6 +211,11 @@ export interface GateInput<Target, R> {
   readonly instanceId: ProviderInstanceId;
   /** The caller named this instance itself: it is never swapped for another. */
   readonly pinned: boolean;
+  /**
+   * The task was sent by a linked machine (`fork/linkedLaunchPacing.ts`, with `pinned`): a hold is
+   * worded for a reader on that machine. It is paced as a task started here.
+   */
+  readonly linked?: boolean;
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined;
   readonly options: ReadonlyArray<ProviderOptionSelection> | undefined;
@@ -349,6 +354,10 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
         };
   }
 
+  const held =
+    input.linked === true
+      ? "Usage pacing on the machine asked to start it held this task"
+      : "Usage pacing held this task";
   const notBefore =
     standing.notBeforeMs === null
       ? null
@@ -368,7 +377,7 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
       }
     : {
         action: "hold",
-        message: `Usage pacing held this task: ${ahead}. ${elsewhere} ${when}`,
+        message: `${held}: ${ahead}. ${elsewhere} ${when}`,
         notBefore,
       };
 });

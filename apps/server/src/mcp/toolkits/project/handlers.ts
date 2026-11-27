@@ -40,7 +40,7 @@ import { resolveProjectScripts } from "@t3tools/shared/projectScripts";
 import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import * as LaunchMcpProfile from "../../../fork/launchMcpProfile.ts"; // Fork: MCP profile launch
 import * as ModelPolicyCheck from "../../../fork/modelPolicyCheck.ts"; // Fork: model policy
-import { checkLaunchSlot } from "../../../fork/agentSlotRoutes.ts"; // Fork: agent slots
+import { launchGate } from "../../../fork/agentSlotRoutes.ts"; // Fork: agent slots, linked pacing
 import {
   providerOptionDescriptors,
   refuseAgentModePick,
@@ -474,7 +474,6 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           });
         }
         yield* ModelPolicyCheck.checkLaunch(caller, modelSelection, input, replaying); // Fork: model policy
-        yield* checkLaunchSlot(caller, { threadId, modelSelection, replaying, input, attachments }); // Fork: agent slots
         const result = yield* ThreadMessageIntake.launchThread({
           commandId,
           threadId,
@@ -483,6 +482,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           ...(input.generateTitle === undefined ? {} : { generateTitle: input.generateTitle }),
           ...(input.generateTitle === true ? {} : { titleRenamed: true }),
           modelSelection,
+          ...(yield* launchGate(caller, threadId, modelSelection, replaying, input, attachments)), // Fork: agent slots, linked pacing
           runtimeMode: startedRuntimeMode,
           interactionMode,
           workspaceStrategy: strategy ?? { type: "root" },
