@@ -1531,9 +1531,13 @@ its head (its watched commit, else the runs GitHub ties to it or its branch in i
 the oldest queued wait and a link to the run. These numbers come from one shared read per server
 (`fork.workPanel`, `apps/server/src/fork/workPanel`), kept only in memory. The server asks GitHub
 (with its `gh` login) at most once a minute in all, for every viewer and every repository, counted
-from each call's start; a viewer who leaves mid-call does not free the minute. Each repository is
-read three ways in turn: its latest 100 runs, and every queued and every running run, which also
-finds a re-run of an older run. So one panel's three repositories (those of the thread and its
+from each call's start; a viewer who leaves mid-call does not free the minute. The minute goes to
+the read that has waited longest among every repository any viewer asked for in the last five
+minutes, so two panels on different repositories share it. A call that takes over 45 seconds counts
+as no answer. Each repository is read three ways in turn: its latest 100 runs, and every queued and
+every running run, which also finds a re-run of an older run (GitHub's `queued` list leaves out a
+re-run that is `waiting` for an approval, `requested` or `pending`; outside the latest page, those
+are missed). So one panel's three repositories (those of the thread and its
 sub-agents with the most pull requests) are each read fully every nine minutes; with more
 repositories in view at once, a line goes unknown for part of each cycle. It waits for the budget's
 reset when less than a fifth of the rate limit is left or GitHub refuses a read for it, and 2, 4, 8

@@ -4,11 +4,15 @@ import { assert, describe, it } from "@effect/vitest";
 import type { OrchestrationV2ThreadShell, ThreadPullRequestLink } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
+import * as Scheduler from "effect/Scheduler";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
   CALL_INTERVAL_MS,
+  CALL_TIMEOUT_MS,
   type GitHubRunsAnswer,
   makeRepoQueueCache,
   pullRequestRuns,
@@ -332,6 +336,133 @@ describe("the shared read, round 1 of #1142", () => {
         yield* Fiber.join(second);
         assert.strictEqual(github.calls.length, 2);
       }),
+  );
+});
+
+describe("the shared read, round 2 of #1142", () => {
+  const OTHER = { host: "github.com", repository: "owner/other" } as const;
+  /** A fake GitHub that records when each repository was called; each call takes `ms`. */
+  const timedGitHub = (
+    ms: number,
+    answer: (call: number) => Effect.Effect<GitHubRunsAnswer> = () => Effect.succeed(ok(RUNS)),
+  ) => {
+    const calls: Array<{ readonly repository: string; readonly at: number }> = [];
+    const source = (input: { repository: string }) =>
+      Effect.gen(function* () {
+        calls.push({ repository: input.repository, at: yield* Clock.currentTimeMillis });
+        // A negative time answers at once, without the clock.
+        if (ms >= 0) yield* Effect.sleep(ms);
+        return yield* answer(calls.length);
+      });
+    return { calls, source };
+  };
+  /** Runs `effect` and the test clock for `ms`: its answer, or none if it is still waiting. */
+  const joinWithin = <A>(effect: Effect.Effect<A>, ms: number) =>
+    Effect.gen(function* () {
+      const fiber = yield* Effect.forkChild(effect.pipe(Effect.timeoutOption(ms)));
+      yield* TestClock.adjust(ms);
+      return yield* Fiber.join(fiber);
+    });
+  const settle = Effect.gen(function* () {
+    for (let i = 0; i < 500; i++) yield* Effect.yieldNow;
+  });
+
+  it.effect("two panels on different repositories share the minute: neither waits long", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(T0);
+      const github = timedGitHub(800);
+      const cache = yield* makeRepoQueueCache(github.source);
+      // Each viewer refreshes a minute after its answer, like the panel.
+      const viewer = (repo: typeof REPO | typeof OTHER) =>
+        Effect.forever(cache.read([repo]).pipe(Effect.andThen(Effect.sleep(MINUTE))));
+      yield* Effect.forkChild(viewer(REPO));
+      yield* TestClock.adjust(30_000);
+      yield* Effect.forkChild(viewer(OTHER));
+      for (let minute = 0; minute < 60; minute++) yield* TestClock.adjust(MINUTE);
+      for (const repository of ["owner/repo", "owner/other"]) {
+        const at = github.calls.filter((c) => c.repository === repository).map((c) => c.at);
+        const gaps = at.slice(1).map((time, i) => time - at[i]!);
+        assert.isAbove(at.length, 20, repository);
+        // Two repositories share the minute: each is read at least every three minutes.
+        assert.isAtMost(Math.max(...gaps), 3 * MINUTE + 1_000, repository);
+      }
+    }),
+  );
+
+  it.effect("a viewer interrupted right after its claim leaves the gate free", () =>
+    Effect.gen(function* () {
+      // Every op yields, so the interrupt can land at each step of the claim, k = 0..40.
+      for (let k = 0; k <= 40; k++) {
+        yield* TestClock.setTime(T0);
+        const github = timedGitHub(-1);
+        const cache = yield* makeRepoQueueCache(github.source);
+        const first = yield* Effect.forkChild(
+          cache.read([REPO]).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 1)),
+        );
+        for (let i = 0; i < k; i++) yield* Effect.yieldNow;
+        yield* Fiber.interrupt(first);
+        yield* TestClock.adjust(2 * MINUTE);
+        const next = yield* Effect.forkChild(cache.read([REPO]));
+        yield* settle;
+        assert.isDefined(next.pollUnsafe(), `k = ${k}: a later read hangs`);
+        assert.isAtLeast(github.calls.length, 1, `k = ${k}: GitHub is never read again`);
+      }
+    }),
+  );
+
+  it.effect("a hung GitHub call times out and frees the gate", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(T0);
+      const github = timedGitHub(0, (call) =>
+        call === 1 ? Effect.never : Effect.succeed(ok(RUNS)),
+      );
+      const cache = yield* makeRepoQueueCache(github.source);
+      const first = yield* joinWithin(cache.read([REPO]), CALL_TIMEOUT_MS + 1_000);
+      assert.isTrue(Option.isSome(first), "the viewer of the hung call is never answered");
+      const line = Option.getOrThrow(first).lines[0]!;
+      assert.strictEqual(line.state, "unknown");
+      assert.match(line.reason ?? "", /took longer than 45 s/);
+      // GitHub did not answer: the next call comes after the 2-minute wait.
+      yield* TestClock.adjust(2 * MINUTE);
+      const later = yield* Effect.forkChild(cache.read([REPO]));
+      yield* settle;
+      assert.strictEqual((yield* Fiber.join(later)).lines[0]!.state, "answered");
+      assert.strictEqual(github.calls.length, 2);
+    }),
+  );
+
+  it.effect("the minute is spent when the call is claimed, even if the call dies", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(T0);
+      const github = timedGitHub(0, () => Effect.die("gh crashed"));
+      const cache = yield* makeRepoQueueCache(github.source);
+      const first = yield* Effect.forkChild(cache.read([REPO]));
+      yield* settle;
+      yield* Fiber.await(first);
+      yield* cache.read([REPO]);
+      yield* TestClock.adjust(CALL_INTERVAL_MS - 1);
+      yield* cache.read([REPO]);
+      assert.strictEqual(github.calls.length, 1);
+    }),
+  );
+
+  it.effect("an old failure is not the reason once newer reads of the repository worked", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(T0);
+      const down: GitHubRunsAnswer = { _tag: "Unreachable", reason: "connection refused" };
+      // latest ok, queued fails, in_progress ok, then latest ok again.
+      const github = fakeGitHub([ok(RUNS), down, ok(RUNS), ok(RUNS)]);
+      const cache = yield* makeRepoQueueCache(github.source);
+      yield* cache.read([REPO]);
+      yield* TestClock.adjust(MINUTE);
+      assert.match((yield* cache.read([REPO])).lines[0]!.reason ?? "", /did not answer/);
+      yield* TestClock.adjust(2 * MINUTE);
+      yield* cache.read([REPO]);
+      yield* TestClock.adjust(MINUTE);
+      const line = (yield* cache.read([REPO])).lines[0]!;
+      assert.strictEqual(github.calls.length, 4);
+      assert.notMatch(line.reason ?? "", /did not answer/);
+    }),
   );
 });
 

@@ -11,6 +11,7 @@ import type { ForkPullRequestRuns, ForkRepoQueue, ThreadPullRequestLink } from "
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FiberSet from "effect/FiberSet";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -34,6 +35,10 @@ const REFUSED_WAIT_MS = 15 * 60_000;
 const DOWN_WAITS_MS = [2 * 60_000, 4 * 60_000, 8 * 60_000, 15 * 60_000] as const;
 /** Repositories kept in the cache; the one read longest ago goes first. */
 const MAX_REPOSITORIES = 20;
+/** A repository some viewer asked for this recently takes its turn for the minute's call. */
+const WANTED_MS = 5 * 60_000;
+/** The longest one GitHub call may take (gh's own limit is 30 s); then it counts as no answer. */
+export const CALL_TIMEOUT_MS = 45_000;
 
 /** The three reads of a repository: the latest page, and every queued and every running run. */
 const READ_KINDS = ["latest", "queued", "in_progress"] as const;
@@ -214,6 +219,11 @@ interface CacheState {
   readonly downStreak: number;
   /** The call under way, if any: its repository and when it is done. */
   readonly inFlight: { readonly repo: string; readonly done: Deferred.Deferred<void> } | null;
+  /** Every repository a viewer asked for, and when it last did: the minute goes round them. */
+  readonly wanted: ReadonlyMap<
+    string,
+    { readonly host: string; readonly repository: string; readonly askedAt: number }
+  >;
 }
 
 export const REASON_NOT_READ =
@@ -336,7 +346,11 @@ export const makeRepoQueueCache = Effect.fn("ForkWorkPanel.makeRepoQueueCache")(
     nextCallAt: 0,
     downStreak: 0,
     inFlight: null,
+    wanted: new Map(),
   });
+  // The calls run detached from the viewer that started them, in a set the cache's scope (the
+  // server's layer) interrupts on shutdown.
+  const calls = yield* FiberSet.make<void>();
   // Held only to claim the minute's call, never during it, so a viewer whose answer is cached is
   // never held up by another viewer's call.
   const lock = yield* Semaphore.make(1);
@@ -350,14 +364,27 @@ export const makeRepoQueueCache = Effect.fn("ForkWorkPanel.makeRepoQueueCache")(
     readonly done: Deferred.Deferred<void>;
   };
 
-  /** Claims the minute's call for the read that waited longest, marking it spent at once. */
+  /**
+   * Claims the minute's call, marking it spent at once, for the read that waited longest among
+   * every repository asked for in the last `WANTED_MS`, by this viewer or another: so two panels
+   * on different repositories share the minute, whichever viewer comes back first.
+   */
   const claim = Effect.fn("ForkWorkPanel.repoQueue.claim")(function* (
-    wanted: ReadonlyArray<{ readonly host: string; readonly repository: string }>,
+    asked: ReadonlyArray<{ readonly host: string; readonly repository: string }>,
   ) {
     const now = yield* Clock.currentTimeMillis;
+    yield* Ref.update(state, (latest) => {
+      const wanted = new Map(
+        [...latest.wanted].filter(([, entry]) => entry.askedAt + WANTED_MS > now),
+      );
+      for (const repo of asked) {
+        wanted.set(keyOf(repo.host, repo.repository), { ...repo, askedAt: now });
+      }
+      return { ...latest, wanted };
+    });
     const current = yield* Ref.get(state);
     if (now < current.nextCallAt || current.inFlight !== null) return null;
-    const candidates = wanted.flatMap((repo, order) =>
+    const candidates = [...current.wanted.values()].flatMap((repo, order) =>
       READ_KINDS.map((kind, kindIndex) => {
         const key = entryKey(keyOf(repo.host, repo.repository), kind);
         return { repo, kind, key, order, kindIndex, entry: current.entries.get(key) };
@@ -393,7 +420,12 @@ export const makeRepoQueueCache = Effect.fn("ForkWorkPanel.makeRepoQueueCache")(
         attemptedAt: now,
         retryAt: previous?.retryAt ?? 0,
       });
-      return { ...latest, entries, nextCallAt: now + CALL_INTERVAL_MS, inFlight: { repo, done } };
+      return {
+        ...latest,
+        entries,
+        nextCallAt: now + CALL_INTERVAL_MS,
+        inFlight: { repo, done },
+      };
     });
     return {
       host: due.repo.host,
@@ -406,75 +438,95 @@ export const makeRepoQueueCache = Effect.fn("ForkWorkPanel.makeRepoQueueCache")(
   });
 
   /** The call and its record, whole: a viewer who leaves meanwhile does not cut it short. */
-  const call = Effect.fn("ForkWorkPanel.repoQueue.callGitHub")(
-    function* (job: Job) {
-      const answer = yield* source({
+  const call = Effect.fn("ForkWorkPanel.repoQueue.callGitHub")(function* (job: Job) {
+    const answer: GitHubRunsAnswer = yield* source({
+      host: job.host,
+      repository: job.repository,
+      perPage: RUNS_PER_READ,
+      ...(job.kind === "latest" ? {} : { status: job.kind }),
+    }).pipe(
+      Effect.timeoutOption(CALL_TIMEOUT_MS),
+      Effect.map((answered) =>
+        Option.getOrElse(answered, (): GitHubRunsAnswer => ({
+          _tag: "Unreachable",
+          reason: `the read took longer than ${CALL_TIMEOUT_MS / 1000} s.`,
+        })),
+      ),
+    );
+    const after = yield* Clock.currentTimeMillis;
+    const result = classifyAnswer(answer, after, job.downStreak);
+    const key = entryKey(keyOf(job.host, job.repository), job.kind);
+    yield* Ref.update(state, (latest) => {
+      const entries = new Map(latest.entries);
+      const previous = entries.get(key);
+      entries.set(key, {
         host: job.host,
         repository: job.repository,
-        perPage: RUNS_PER_READ,
-        ...(job.kind === "latest" ? {} : { status: job.kind }),
+        kind: job.kind,
+        good:
+          result._tag === "Runs" ? { readAt: after, runs: result.runs } : (previous?.good ?? null),
+        problem: result._tag === "Runs" ? null : result.reason,
+        attemptedAt: job.start,
+        retryAt: result._tag === "Problem" && result.scope === "repository" ? result.waitUntil : 0,
       });
-      const after = yield* Clock.currentTimeMillis;
-      const result = classifyAnswer(answer, after, job.downStreak);
-      const key = entryKey(keyOf(job.host, job.repository), job.kind);
-      yield* Ref.update(state, (latest) => {
-        const entries = new Map(latest.entries);
-        const previous = entries.get(key);
-        entries.set(key, {
-          host: job.host,
-          repository: job.repository,
-          kind: job.kind,
-          good:
-            result._tag === "Runs"
-              ? { readAt: after, runs: result.runs }
-              : (previous?.good ?? null),
-          problem: result._tag === "Runs" ? null : result.reason,
-          attemptedAt: job.start,
-          retryAt:
-            result._tag === "Problem" && result.scope === "repository" ? result.waitUntil : 0,
-        });
-        while (entries.size > MAX_REPOSITORIES * READ_KINDS.length) {
-          const oldest = [...entries.entries()].toSorted(
-            (a, b) => a[1].attemptedAt - b[1].attemptedAt,
-          )[0];
-          if (oldest === undefined) break;
-          entries.delete(oldest[0]);
-        }
-        // The minute counts from the call's start, so a viewer refreshing every minute is not
-        // pushed to every other minute; the longer waits count from its end.
-        const nextCallAt =
-          result._tag === "Runs"
-            ? result.lowBudget
-              ? result.waitUntil
-              : job.start + CALL_INTERVAL_MS
-            : result.scope === "repository"
-              ? job.start + CALL_INTERVAL_MS
-              : result.waitUntil;
-        return {
-          entries,
-          nextCallAt,
-          downStreak: result._tag === "Problem" && result.down ? latest.downStreak + 1 : 0,
-          inFlight: null,
-        };
-      });
-    },
-    (effect, job) =>
-      effect.pipe(
-        Effect.ensuring(
-          Ref.update(state, (latest) =>
-            latest.inFlight?.done === job.done ? { ...latest, inFlight: null } : latest,
-          ).pipe(Effect.andThen(Deferred.succeed(job.done, undefined))),
-        ),
-      ),
-  );
+      while (entries.size > MAX_REPOSITORIES * READ_KINDS.length) {
+        const oldest = [...entries.entries()].toSorted(
+          (a, b) => a[1].attemptedAt - b[1].attemptedAt,
+        )[0];
+        if (oldest === undefined) break;
+        entries.delete(oldest[0]);
+      }
+      // The minute counts from the call's start, so a viewer refreshing every minute is not
+      // pushed to every other minute; the longer waits count from its end.
+      const nextCallAt =
+        result._tag === "Runs"
+          ? result.lowBudget
+            ? result.waitUntil
+            : job.start + CALL_INTERVAL_MS
+          : result.scope === "repository"
+            ? job.start + CALL_INTERVAL_MS
+            : result.waitUntil;
+      return {
+        entries,
+        nextCallAt,
+        downStreak: result._tag === "Problem" && result.down ? latest.downStreak + 1 : 0,
+        inFlight: null,
+        wanted: latest.wanted,
+      };
+    });
+  });
+
+  /** Ends a call however it ends: no call is marked under way and its waiters wake. */
+  const release = (job: Job) =>
+    Ref.update(state, (latest) =>
+      latest.inFlight?.done === job.done ? { ...latest, inFlight: null } : latest,
+    ).pipe(Effect.andThen(Deferred.succeed(job.done, undefined)));
 
   const read: RepoQueueCache["read"] = Effect.fn("ForkWorkPanel.repoQueue.read")(
     function* (repositories) {
       const readable = repositories.filter(
         (repo) => repo.host.toLowerCase() === "github.com" && REPOSITORY_NAME.test(repo.repository),
       );
-      const job = yield* lock.withPermits(1)(claim(readable));
-      if (job !== null) yield* Effect.forkDetach(call(job));
+      // The claim and the call's start are one step: an interrupt in between would leave a call
+      // marked under way that never runs, and no viewer would read GitHub again.
+      yield* Effect.uninterruptible(
+        lock.withPermits(1)(
+          claim(readable).pipe(
+            Effect.flatMap((job) =>
+              // The call itself stays interruptible: its timeout and a shutdown stop it.
+              job === null
+                ? Effect.void
+                : // The release is in place before the call can be interrupted at all.
+                  Effect.asVoid(
+                    FiberSet.run(
+                      calls,
+                      Effect.interruptible(call(job)).pipe(Effect.ensuring(release(job))),
+                    ),
+                  ),
+            ),
+          ),
+        ),
+      );
       // Wait only for a call about one of this viewer's repositories (its own claim included).
       const inFlight = (yield* Ref.get(state)).inFlight;
       if (
@@ -500,9 +552,12 @@ export const makeRepoQueueCache = Effect.fn("ForkWorkPanel.makeRepoQueueCache")(
           return entry === undefined ? [] : [entry];
         });
         const latest = reads.find((entry) => entry.kind === "latest");
+        // The newest read's problem only: a failure that newer reads of the repository got past
+        // is not today's reason.
         const problem =
-          reads.toSorted((a, b) => b.attemptedAt - a.attemptedAt).find((entry) => entry.problem)
-            ?.problem ?? null;
+          reads
+            .filter((entry) => entry.good !== null || entry.problem !== null)
+            .toSorted((a, b) => b.attemptedAt - a.attemptedAt)[0]?.problem ?? null;
         const next = Math.max(nextCallAt, ...reads.map((entry) => entry.retryAt), now);
         if (latest?.good == null) {
           return {
