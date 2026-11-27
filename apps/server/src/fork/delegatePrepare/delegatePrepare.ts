@@ -97,6 +97,8 @@ export interface CommandRun {
   readonly command: string;
   readonly exitCode: number | null;
   readonly timedOut: boolean;
+  /** The signal that ended it, when one did. */
+  readonly signal: string | null;
   /** The last lines of its output (stdout and stderr together). */
   readonly tail: string;
 }
@@ -280,7 +282,7 @@ function runCommand(
       timedOut = true;
       stop();
     }, timeoutMs);
-    const finish = (code: number | null) => {
+    const finish = (code: number | null, signal: string | null) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
@@ -288,20 +290,26 @@ function runCommand(
       track(null);
       // What the command left running in its group is stopped too.
       if (!timedOut) stop();
-      resolve({ command, exitCode: timedOut ? null : code, timedOut, tail: lastLines(kept) });
+      resolve({
+        command,
+        exitCode: timedOut ? null : code,
+        timedOut,
+        signal: timedOut ? null : signal,
+        tail: lastLines(kept),
+      });
     };
     child.stdout.on("data", keep);
     child.stderr.on("data", keep);
     child.on("error", (error) => {
       kept += `\n${error.message}`;
     });
-    child.on("close", (code) => finish(code));
+    child.on("close", (code, signal) => finish(code, signal));
     // A process that left the group (setsid) can hold the output open after the command exited.
-    child.on("exit", (code) => {
+    child.on("exit", (code, signal) => {
       grace = setTimeout(() => {
         child.stdout.destroy();
         child.stderr.destroy();
-        finish(code);
+        finish(code, signal);
       }, EXIT_GRACE_MS);
     });
   });
@@ -434,24 +442,29 @@ export async function runPrepare(options: PrepareOptions): Promise<PrepareOutcom
     // half-way is never at `dir`.
     if (options.clone !== undefined) {
       step = "clone";
+      let cloned = false;
       if (!NodeFS.existsSync(dir)) {
         log(`clone ${options.clone} -> ${dir}\n`);
         NodeFS.mkdirSync(NodePath.dirname(dir), { recursive: true });
         const partial = `${dir}.t3-prepare-clone-${process.pid}`;
         NodeFS.rmSync(partial, { recursive: true, force: true });
-        const cloned = git(NodePath.dirname(dir), [
-          "clone",
-          "--quiet",
-          "--",
-          options.clone,
-          partial,
-        ]);
-        if (cloned.code !== 0) {
+        const run = git(NodePath.dirname(dir), ["clone", "--quiet", "--", options.clone, partial]);
+        if (run.code !== 0) {
           NodeFS.rmSync(partial, { recursive: true, force: true });
-          return fail("clone", "git clone failed", lastLines(cloned.stderr));
+          return fail("clone", "git clone failed", lastLines(run.stderr));
         }
-        NodeFS.renameSync(partial, dir);
-      } else {
+        try {
+          NodeFS.renameSync(partial, dir);
+          cloned = true;
+        } catch (error) {
+          NodeFS.rmSync(partial, { recursive: true, force: true });
+          // Another prepare cloned into the same folder first: check it and reuse it below.
+          if (!NodeFS.existsSync(dir)) {
+            return fail("clone", `could not move the clone into place: ${String(error)}`);
+          }
+        }
+      }
+      if (!cloned) {
         const origin = gitLine(dir, ["remote", "get-url", "origin"]);
         if (origin === null || !sameRemote(origin, options.clone)) {
           return fail(
@@ -631,7 +644,7 @@ export async function runPrepare(options: PrepareOptions): Promise<PrepareOutcom
           "install",
           run.timedOut
             ? `\`${command}\` was stopped after ${config.timeoutMinutes} min`
-            : `\`${command}\` exited ${run.exitCode ?? "without a code"}`,
+            : `\`${command}\` exited ${run.exitCode ?? `on ${run.signal ?? "a signal"}`}`,
           run.tail,
         );
       }
@@ -646,16 +659,22 @@ export async function runPrepare(options: PrepareOptions): Promise<PrepareOutcom
     } else if (config.baseline.includes(FILES_PLACEHOLDER) && files.length === 0) {
       baseline = { status: "skipped", reason: "no touched files" };
     } else {
-      const command = config.baseline.replaceAll(
-        FILES_PLACEHOLDER,
-        files.map(fileArgument).join(" "),
-      );
+      const list = files.map(fileArgument).join(" ");
+      // A function, so `$&` or `$'` in a file name is never read as a replacement pattern.
+      const command = config.baseline.replaceAll(FILES_PLACEHOLDER, () => list);
       log(`$ ${command}\n`);
       const run = await runCommand(command, top, timeoutMs, log, track);
       if (run.exitCode !== null && COULD_NOT_RUN.has(run.exitCode)) {
         return fail(
           "baseline",
           `the baseline command could not run (exit ${run.exitCode}: not found or not executable), so no tests ran: \`${command}\``,
+          run.tail,
+        );
+      }
+      if (run.exitCode === null && !run.timedOut) {
+        return fail(
+          "baseline",
+          `the baseline command was killed${run.signal === null ? "" : ` by ${run.signal}`} before it finished, so no result came back: \`${command}\``,
           run.tail,
         );
       }
@@ -672,9 +691,10 @@ export async function runPrepare(options: PrepareOptions): Promise<PrepareOutcom
 }
 
 /**
- * Brings the checked-out branch up to its remote branch (its upstream, else the same name on
- * `remote`): fast-forwards a clean branch that is behind; refuses a diverged one, or one behind
- * with local changes, so a prepare never reports stale code as prepared.
+ * Brings the checked-out branch up to the same name on `remote`: fast-forwards a clean branch that
+ * is behind; refuses a diverged one, or one behind with local changes, so a prepare never reports
+ * stale code as prepared. A configured upstream is not used: it is often the base, which the merge
+ * step brings in.
  */
 function bringUpToRemote(
   top: string,
@@ -684,16 +704,9 @@ function bringUpToRemote(
   const none = { failure: null, note: null };
   const branch = gitLine(top, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
   if (branch === null) return none;
-  const configured = gitLine(top, [
-    "rev-parse",
-    "--abbrev-ref",
-    "--symbolic-full-name",
-    "@{upstream}",
-  ]);
-  const sameName = remote === null ? null : `${remote}/${branch}`;
-  const upstream = configured ?? (sameName !== null && resolves(top, sameName) ? sameName : null);
-  if (upstream === null) return none;
-  fetchRemote(gitLines(top, ["remote"]).find((name) => upstream.startsWith(`${name}/`)) ?? null);
+  if (remote === null) return none;
+  const upstream = `${remote}/${branch}`;
+  fetchRemote(remote);
   if (!resolves(top, upstream) || !resolves(top, "HEAD")) return none;
   const counts = (gitLine(top, ["rev-list", "--left-right", "--count", `HEAD...${upstream}`]) ?? "")
     .split(/\s+/)

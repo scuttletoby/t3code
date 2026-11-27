@@ -218,6 +218,8 @@ describe("runPrepare", () => {
         "src/café.txt": "x\n",
         "..notes.md": "x\n",
         "--reporter=evil.txt": "x\n",
+        "a$&b.txt": "x\n",
+        "q$'r$`s$$.txt": "x\n",
       },
       "odd names",
     );
@@ -229,6 +231,8 @@ describe("runPrepare", () => {
       [
         "./--reporter=evil.txt",
         "..notes.md",
+        "a$&b.txt",
+        "q$'r$`s$$.txt",
         "src/café.txt",
         "src/feature.txt",
         "src/it's a file.txt",
@@ -448,6 +452,61 @@ describe("runPrepare", () => {
     assert.strictEqual(git(dir, "rev-parse", "HEAD"), mine, "the branch is left as it was");
   });
 
+  it("does not compare a branch with the base it tracks; the merge brings the base in", async () => {
+    const { origin, seed } = setup(CONFIG);
+    const dir = clonePath("tracks-base");
+    assert.strictEqual((await prepare({ dir, clone: origin })).exitCode, 0);
+    // As \`git checkout -b\` from a remote branch, or a new worktree branch, sets it up.
+    git(dir, "checkout", "--quiet", "-b", "tracks-base", "origin/main");
+    assert.strictEqual(
+      git(dir, "rev-parse", "--abbrev-ref", "tracks-base@{upstream}"),
+      "origin/main",
+    );
+    commit(dir, { "src/own.txt": "own\n" }, "own work");
+    git(dir, "push", "--quiet", "origin", "tracks-base");
+    commit(seed, { "src/newer.txt": "newer\n" }, "main moves on");
+    git(seed, "push", "--quiet", "origin", "main");
+
+    const again = await prepare({ dir, clone: origin, branch: "tracks-base" });
+    assert.strictEqual(again.exitCode, 0, again.text);
+    assert.strictEqual(again.result.status, "prepared");
+    assert.strictEqual(again.result.merge?.status, "merged");
+    assert.isTrue(NodeFS.existsSync(NodePath.join(dir, "src/newer.txt")));
+  });
+
+  it("lets a second first clone into the same folder reuse the one that got there first", async () => {
+    const { origin } = setup(CONFIG);
+    const dir = clonePath("race");
+    // The other prepare's clone lands at the folder while this one's clone is still beside it.
+    const templates = NodePath.join(root, `templates${counter}`);
+    write(
+      templates,
+      "hooks/post-checkout",
+      `#!/bin/sh\n[ -e "$T3_TEST_RACE" ] || cp -a "$PWD" "$T3_TEST_RACE"\n`,
+    );
+    NodeFS.chmodSync(NodePath.join(templates, "hooks/post-checkout"), 0o755);
+    const before = { template: process.env.GIT_TEMPLATE_DIR, race: process.env.T3_TEST_RACE };
+    process.env.GIT_TEMPLATE_DIR = templates;
+    process.env.T3_TEST_RACE = dir;
+    try {
+      const outcome = await prepare({ dir, clone: origin });
+      assert.strictEqual(outcome.exitCode, 0, outcome.text);
+      assert.include(outcome.result.notes, "reused the existing clone");
+    } finally {
+      for (const [key, value] of [
+        ["GIT_TEMPLATE_DIR", before.template],
+        ["T3_TEST_RACE", before.race],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+    const leftovers = NodeFS.readdirSync(NodePath.dirname(dir)).filter((name) =>
+      name.startsWith(`${NodePath.basename(dir)}.`),
+    );
+    assert.deepStrictEqual(leftovers, []);
+  });
+
   it("refuses to switch away from a detached HEAD with commits on no branch", async () => {
     const { origin, work } = setup(CONFIG);
     git(work, "push", "--quiet", "origin", "feature");
@@ -501,6 +560,15 @@ describe("runPrepare", () => {
     assert.strictEqual(outcome.exitCode, 1);
     assert.strictEqual(outcome.result.failure?.step, "baseline");
     assert.include(outcome.result.failure?.message ?? "", "could not run");
+    assert.notInclude(outcome.text, "RED");
+  });
+
+  it("reports a baseline killed by a signal as a failure with no result, not as red tests", async () => {
+    const { work } = setup({ baseline: "kill -9 $$" });
+    const outcome = await prepare({ dir: work });
+    assert.strictEqual(outcome.exitCode, 1);
+    assert.strictEqual(outcome.result.failure?.step, "baseline");
+    assert.include(outcome.result.failure?.message ?? "", "killed by SIGKILL");
     assert.notInclude(outcome.text, "RED");
   });
 
