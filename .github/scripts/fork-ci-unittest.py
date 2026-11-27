@@ -238,11 +238,11 @@ def main():
         sys.path[0] = os.path.dirname(os.path.abspath(test))
     sys.argv = sys.argv[1:]
     source = defined(test)
-    # A test the runner stops at its time limit (fork-ci-tests.cjs) shows where it was: what it printed so far
-    # (stdout written through, as stderr is, not lost in a buffer at the kill), and on SIGTERM every thread's stack,
+    # A test the runner stops at its time limit (fork-ci-tests.cjs) shows where it was: each line it printed so far
+    # (stdout line-buffered, so no whole line waits in a buffer the kill drops), and on SIGTERM every thread's stack,
     # before the signal's own action (chain). A test that sets its own SIGTERM handler replaces this one.
     if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(write_through=True)
+        sys.stdout.reconfigure(line_buffering=True)
     if hasattr(faulthandler, "register"):
         faulthandler.register(signal.SIGTERM, chain=True)
     try:
