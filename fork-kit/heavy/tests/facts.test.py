@@ -1625,7 +1625,8 @@ class T3Capacity(Case):
         for bad in (['x'], ['1', '2'], ['--kind']):
             self.assertEqual(self.cli([T3CAP, '--long'] + bad)[0], 2, bad)
 
-    SHORT_OK = r'^OK: free=-?\d+MB need=\d+MB available=\d+MB swapfree=\d+MB disk=(\d+GB(<\d+GB)?|off|\?)( notes=\d+)?$'
+    SHORT_OK = (r'^OK: free=-?\d+MB need=\d+MB available=\d+MB( held=\d+MB)? swapfree=\d+MB '
+                r'disk=(\d+GB(<\d+GB)?|off|\?)( notes=\d+)?$')
 
     def test_the_default_output_is_one_line_with_the_long_outputs_numbers(self):
         """#1150: one line, the answer first, so nobody pipes it to see the answer; --long is the older output."""
@@ -1909,10 +1910,14 @@ print(hf.hold('a:1', 'busy', None, {folder!r}))
         code, out, _ = self.cli([T3CAP, '--long', '64'])
         self.assertIn('available=10288MB', out.splitlines()[0])
         self.assertEqual(out.splitlines()[1], 'reservations: game:2000MB(using 0,holding 2000)')
+        code, out, _ = self.cli([T3CAP, '64'])      # #1151: the one line says what they hold, still one line
+        self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertIn(' available=10288MB held=2000MB swapfree=', out)
         os.makedirs(other)
         code, out, _ = self.cli([T3CAP, '--long', '64'], cwd=other)
         self.assertEqual(out.splitlines()[1], 'reservations: game:own')
         self.assertIn('available=12288MB', out.splitlines()[0])
+        self.assertNotIn('held=', self.cli([T3CAP, '64'], cwd=other)[1])
 
     def test_reserved_and_available_count_each_once(self):
         # #923: available= already has the reservations' hold taken off; reserved= is only what agents and jobs may

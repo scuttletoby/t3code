@@ -5,7 +5,7 @@ wiring.test.py.
 
   python3 -I -B fork-kit/agent-guards/tests/read-size.test.py
 """
-import io, json, os, shutil, subprocess, sys, tempfile, time, unittest
+import io, json, os, shutil, subprocess, sys, tempfile, time, unittest, uuid
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -40,7 +40,7 @@ class Files(unittest.TestCase):
         r = self.hook(read(path))
         self.assertEqual((r.returncode, r.stdout), (2, ''))
         self.assertTrue(r.stderr.startswith('Refused by read-size-guard: '), r.stderr)
-        for said in ('32000 characters', '400 lines', 'grep -n', 'offset and limit'):
+        for said in ('32000 characters', '400 lines', 'grep -n', 'offset and limit', 'allow_large: true'):
             self.assertIn(said, r.stderr)
 
     def test_characters_count_not_lines(self):
@@ -121,8 +121,23 @@ class Configured(unittest.TestCase):
         with open(self.big, 'w') as f:
             f.write('c' * 30000)
 
-    def run_hook(self, section=None, text=None, path=None):
-        return fx.run_hook('read-size-guard', read(path or self.big), fx.machine_file(self.tmp, section, text))
+    def run_hook(self, section=None, text=None, path=None, sid=None):
+        event = dict(read(path or self.big), session_id=uuid.uuid4().hex if sid is None else sid)
+        return fx.run_hook('read-size-guard', event, fx.machine_file(self.tmp, section, text),
+                           env=dict(os.environ, HOME=self.tmp))
+
+    def test_a_broken_file_is_said_once_a_session(self):
+        """#1151: one notice per hook per session, not one on every call; stderr (not read by the agent) keeps it."""
+        broken = {'text': '{"version": 1, "agent-guards": {"readSize": {"ena'}
+        first = self.run_hook(sid='one', **broken)
+        again = self.run_hook(sid='one', **broken)
+        other = self.run_hook(sid='two', **broken)
+        self.assertIn('systemMessage', json.loads(first.stdout))
+        self.assertEqual((again.returncode, again.stdout), (0, ''))
+        self.assertIn('built-in defaults used', again.stderr)
+        self.assertIn('systemMessage', json.loads(other.stdout))
+        nosid = self.run_hook(sid='', **broken)
+        self.assertIn('systemMessage', json.loads(nosid.stdout))
 
     def test_the_off_switch_and_the_limit(self):
         self.assertEqual(self.run_hook({'readSize': {'enabled': False}}).returncode, 0)

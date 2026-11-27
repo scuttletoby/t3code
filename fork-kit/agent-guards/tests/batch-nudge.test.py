@@ -5,7 +5,7 @@ in the shape Claude Code writes them (one line per content block; the lines of o
 
   python3 -I -B fork-kit/agent-guards/tests/batch-nudge.test.py
 """
-import io, json, os, shutil, subprocess, sys, tempfile, time, unittest
+import io, json, os, shutil, subprocess, sys, tempfile, time, unittest, uuid
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -91,8 +91,10 @@ class Transcripts(unittest.TestCase):
 
     def test_bash_counts_only_when_it_only_reads(self):
         reads = ('cat a | head -5', 'grep -n x a b 2>/dev/null', 'git log --oneline -5', 'ls; wc -l a',
-                 "grep -E 'a|b' x", 'FOO=1 sed -n 1,9p a', 'find . -name "*.ts"', 'git diff 2>&1 | tail')
+                 "grep -E 'a|b' x", 'FOO=1 sed -n 1,9p a', 'find . -name "*.ts"', 'git diff 2>&1 | tail',
+                 'git -C /work/x log -3', 'git -c core.pager=cat show HEAD', 'git --no-pager status')
         writes = ('rm -rf x', 'sed -i s/a/b/ f', 'cat a > b', 'echo $(rm x)', 'git commit -m x', 'find . -delete',
+                  'git -C /work/x push', 'git -C',
                   'npm test', 'ls `rm x`', 'cat <<EOF > f', "echo 'open", '', 'python3 x.py')
         for cmd in reads:
             with self.subTest(cmd):
@@ -117,9 +119,12 @@ class Transcripts(unittest.TestCase):
                 self.assertEqual((r.returncode, r.stdout), (0, ''))
         big = self.transcript(*([turn(f'x{k}', READ, READ) for k in range(20000)] + lines))
         self.assertGreater(os.path.getsize(big), S['tailBytes'])
-        start = time.perf_counter()
-        self.assertEqual(G.streak(big, S), 3)
-        self.assertLess(time.perf_counter() - start, 0.05)         # only the last tailBytes are read
+        took = []
+        for _ in range(3):                                         # the best of 3: a busy test machine is no bug
+            start = time.perf_counter()
+            self.assertEqual(G.streak(big, S), 3)
+            took.append(time.perf_counter() - start)
+        self.assertLess(min(took), 0.05)                           # only the last tailBytes are read
 
     def test_odd_input_adds_nothing_and_its_own_failure_says_so(self):
         for raw in ('{}', '[]', '{"hook_event_name": "PreToolUse", "tool_name": "Read"}'):
@@ -145,10 +150,24 @@ class Configured(unittest.TestCase):
                 for line in turn(f'm{k}', READ):
                     f.write(json.dumps(line) + '\n')
 
-    def run_hook(self, section=None, text=None, call=READ):
+    def run_hook(self, section=None, text=None, call=READ, sid=None):
         event = {'hook_event_name': 'PostToolUse', 'tool_name': call[0], 'tool_input': call[1],
-                 'transcript_path': self.path, 'session_id': 's'}
-        return fx.run_hook('batch-nudge', event, fx.machine_file(self.tmp, section, text))
+                 'transcript_path': self.path, 'session_id': uuid.uuid4().hex if sid is None else sid}
+        return fx.run_hook('batch-nudge', event, fx.machine_file(self.tmp, section, text),
+                           env=dict(os.environ, HOME=self.tmp))
+
+    def test_a_broken_file_is_said_once_a_session(self):
+        """#1151: one notice per hook per session, not one on every call; stderr (not read by the agent) keeps it."""
+        broken = {'text': '{"version": 1, "agent-guards": {"batchNudge": {"ena'}
+        first = self.run_hook(sid='one', **broken)
+        again = self.run_hook(sid='one', **broken)
+        other = self.run_hook(sid='two', **broken)
+        self.assertIn('systemMessage', json.loads(first.stdout))
+        self.assertEqual((again.returncode, again.stdout), (0, ''))
+        self.assertIn('built-in defaults used', again.stderr)
+        self.assertIn('systemMessage', json.loads(other.stdout))
+        nosid = self.run_hook(sid='', **broken)
+        self.assertIn('systemMessage', json.loads(nosid.stdout))
 
     def test_the_off_switch_and_the_limits(self):
         self.assertEqual(self.run_hook({'batchNudge': {'enabled': False}}).stdout, '')

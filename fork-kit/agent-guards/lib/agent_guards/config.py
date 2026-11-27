@@ -34,7 +34,7 @@ speed, not safety, and must never block work on a broken config. "enabled": fals
 
 Paths are absolute or start with "~/" (each user's own home). Plain Python 3 standard library.
 """
-import copy, os, re, sys
+import copy, hashlib, os, re, sys, time
 
 _kit = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 _common = os.path.join(_kit, 'common')
@@ -333,6 +333,39 @@ def notice(name, problem, event, out=None):
         hso['additionalContext'] = (hso['additionalContext'] + ' ' + text) if hso.get('additionalContext') else text
         out['hookSpecificOutput'] = hso
     return out
+
+
+NOTICE_DIR = '~/.cache/agent-guards/notices'
+NOTICE_DAYS = 7
+
+
+def first_notice(text, event, home=None):
+    """True the first time a session sees `text` (a speed hook's config notice), False after: a broken machine file
+    costs the agent one notice per hook per session, not one on every call (#1151). A marker file per (session,
+    text) in ~/.cache/agent-guards/notices, made with O_EXCL, so two calls at once still say it once; markers older
+    than NOTICE_DAYS go when a new one is made. No session id, or a folder it cannot write: True (say it every
+    time rather than never)."""
+    sid = event.get('session_id') if isinstance(event, dict) else None
+    if not isinstance(sid, str) or not sid:
+        return True
+    folder = expand(NOTICE_DIR, home)
+    name = hashlib.sha256(f'{sid}\0{text}'.encode()).hexdigest()[:32]
+    try:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        fd = os.open(os.path.join(folder, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return True
+    os.close(fd)
+    try:
+        old = time.time() - NOTICE_DAYS * 86400
+        for e in os.scandir(folder):
+            if e.is_file(follow_symlinks=False) and e.stat(follow_symlinks=False).st_mtime < old:
+                os.unlink(e.path)
+    except OSError:
+        pass
+    return True
 
 
 def warn(name, problem):

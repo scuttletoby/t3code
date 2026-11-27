@@ -70,7 +70,17 @@ def reason(path, shown, size, max_chars):
     return (f'Refused by {NAME}: a Read of all of {path} ({size}) returns {shown} characters, more than '
             f'{max_chars}, and it stays in the context until the next compaction. Find the part you need with '
             f'`grep -n PATTERN {path}` (or `sed -n 1,80p`), then Read only that range with offset and limit. A Read '
-            'with offset or limit is not refused.')
+            'with offset or limit is not refused; when you really need the whole file (a full rewrite, a brief '
+            'that asks for it), Read it again with allow_large: true.')
+
+
+def _first(text, event):
+    """True when this session has not had this notice yet (the kit's lib; a lib that cannot load: always)."""
+    try:
+        from agent_guards import config
+        return config.first_notice(text, event)
+    except BaseException:   # noqa: BLE001
+        return True
 
 
 def _problem_out(problem, event):
@@ -81,6 +91,8 @@ def _problem_out(problem, event):
         sys.stderr.write(text + '\n')
     except Exception:  # noqa: BLE001
         pass
+    if not _first(text, event):
+        return
     out = {'systemMessage': text}
     if isinstance(event, dict) and event.get('hook_event_name') == 'PreToolUse':
         out['hookSpecificOutput'] = {'hookEventName': 'PreToolUse', 'additionalContext': text}

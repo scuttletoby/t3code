@@ -8,21 +8,26 @@ Why: agents spent about 39% of their tool time in wait loops they wrote themselv
 Each loop overshoots the end by up to one sleep, it ends at the Bash timeout and is written again, and each new poll
 is a model turn that sends the whole context again. The host has wait tools that wake the agent instead.
 
-Refuses (a Bash call in the foreground) when the command checks such a state AND it waits:
+Refuses (a Bash call in the foreground) a loop that both checks such a state and sleeps, inside the same loop (its
+condition counts), when it waits long; or a check after long top-level sleeps:
   a check   `gh run|pr|api|workflow|release ...`, curl/wget (to any URL: a GitHub one counts as a CI check), or a
-            look at a file or a process: test, [, [[, ls, stat, grep, rg, tail, head, cat, wc, find, jq, pgrep,
-            pidof, ps, kill -0;
-  waits     its sleeps add up to more than maxSleepSeconds (default 120): `sleep N` counted once outside a loop,
-            N times the rounds of `for x in a b c`, `for i in $(seq 1 40)` or `{1..40}` (a list it cannot count:
-            one round); a while or until loop counts as endless when a round sleeps loopSleepSeconds (default 5)
-            or more, and for a CI check with any sleep at all;
-  or        `gh run watch`, `gh pr checks --watch` (CI waits that need no sleep).
-Lets through: short waits (a loop of 1 s sleeps for a local server, a few rounds that stay under the limit), a sleep
-with no check after it, any command run in the background (`run_in_background`: the host wakes the agent when it
-ends), the Monitor tool (an until-condition there is the right way to wait for a file), and text that only names
-these (echo, a commit message, a heredoc into a file). Shell text handed on (`bash -c '..'`, `sh -c`, `eval`) is
-read the same way.
-
+            look at a file or a process: ls, stat, find, pgrep, pidof, ps, kill -0, a file test (`[ -f x ]`,
+            `test -e`, `[[ -s x ]]`), and grep, rg, tail, head, cat, wc, jq when they do not read a pipe;
+  waits     a while or until loop with no counter waits without end when a round sleeps loopSleepSeconds (default
+            5) or more, and for a CI check with any sleep at all; a loop with rounds (`for x in a b c`, `$(seq 1
+            40)`, `{1..40}`, a counter test `[ $n -lt 3 ]` or `(( n < 3 ))`) when its sleeps add up to more than
+            maxSleepSeconds (default 120; a count it cannot read is one round); top-level sleeps over that, then a
+            check (`sleep 300; gh run view 1`);
+  or        `gh run watch`, `gh pr checks --watch`, and `watch -n N <check>` (a loop of N s rounds).
+Lets through: a retry loop (a command tried again after a sleep, with no check inside that loop, even when the same
+call reads a file before or after it), short waits (a loop of 1 s sleeps for a local server, a few rounds that stay
+under the limit), a sleep with no check after it, a counter test (`[ $n -lt 3 ]` is a bound, not a check), any
+command run in the background (`run_in_background`: the host wakes the agent when it ends), the Monitor tool (an
+until-condition there is the right way to wait for a file), and text that only names these (echo, a commit message,
+a heredoc into a file, a comment; a quoted "#1150" is no comment). Shell text handed on (`bash -c '..'`, `sh -c`,
+`sudo -u x bash -c`, `eval`, `bash <<EOF`, `cat <<EOF | bash`) is read the same way.
+Known gaps (misses, on purpose: a false refusal costs more): a count it cannot read (`$(seq 1 $N)`, `[ $n -lt $MAX
+]`, C-style `for ((..))`) is one round; a script file it does not open; a loop built with a function.
 Settings (machine file, pollLoop): enabled (default true), maxSleepSeconds (120), loopSleepSeconds (5).
 Fail open: a broken settings part, a lib that cannot load, broken input or its own error lets the command run, with
 one line saying so. Exit 2 (refuse) only answers a wait it found. Tests: fork-kit/agent-guards/tests/poll-loop.test.py
@@ -48,19 +53,32 @@ OPS = ('&&', '||', ';;', '|&', '>>', '<<', ';', '&', '|', '(', ')', '<', '>', '\
 PUNCT = set('();<>|&\n')
 SEPARATORS = {'&&', '||', ';;', '|&', ';', '&', '|', '(', ')', '\n'}
 KEYWORDS = {'then', 'do', 'else', 'elif', 'if', '!', '{', '}', 'time'}
-WRAPPERS = {'sudo', 'env', 'nice', 'ionice', 'nohup', 'command', 'builtin', 'exec', 'stdbuf', 'setsid', 'heavy',
-            'chronic', 'unbuffer'}
+# wrappers that run the command after them, with the options of theirs that take a value
+WRAPPERS = {'sudo': {'-u', '-g', '-C', '-D', '-h', '-p', '-r', '-t', '-U', '-T', '--user', '--group', '--host',
+                     '--prompt', '--chdir', '--role', '--type', '--other-user', '--command-timeout', '--close-from'},
+            'env': {'-u', '-C', '--unset', '--chdir'}, 'nice': {'-n', '--adjustment'},
+            'ionice': {'-c', '-n', '-p', '-P', '-u', '--class', '--classdata'}, 'stdbuf': {'-i', '-o', '-e'},
+            'timeout': {'-s', '-k', '--signal', '--kill-after'},
+            'nohup': set(), 'command': set(), 'builtin': set(), 'exec': {'-a'}, 'setsid': set(), 'heavy': set(),
+            'chronic': set(), 'unbuffer': set()}
 SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
-LOCAL_CHECKS = {'test', '[', '[[', 'ls', 'stat', 'grep', 'egrep', 'fgrep', 'rg', 'tail', 'head', 'cat', 'wc', 'find',
-                'jq', 'pgrep', 'pidof', 'ps'}
+LOOKS = {'ls', 'stat', 'find', 'pgrep', 'pidof', 'ps'}            # always a look at a file or a process
+READERS = {'grep', 'egrep', 'fgrep', 'rg', 'tail', 'head', 'cat', 'wc', 'jq'}   # a look, unless they read a pipe
+TESTS = {'test', '[', '[['}
+FILE_TESTS = {'-e', '-f', '-s', '-d', '-p', '-r', '-w', '-x', '-L', '-h', '-S', '-b', '-c', '-N', '-O', '-G', '-nt',
+              '-ot', '-ef'}
+NUMBER_TESTS = {'-lt', '-le', '-gt', '-ge', '-eq', '-ne'}
 GH_CHECKS = {'run', 'pr', 'api', 'workflow', 'release'}
+WATCH_FLAGS_WITH_VALUE = {'-n', '--interval', '-q', '--equexit', '-s', '--shell'}
 HEREDOC = re.compile(r'<<(-?)\s*(["\']?)([A-Za-z_][A-Za-z0-9_]*)\2')
+INTO_SHELL = re.compile(r'\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\b')
+COUNTER = re.compile(r'\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|[A-Za-z_][A-Za-z0-9_]*|-?\d+')
 DEPTH = 8
 
 
 def strip_heredocs(text):
     """The text without the bodies of heredocs that go to anything but a shell (a brief written to a file is text,
-    not commands); a heredoc into bash or sh keeps its body, which is then read as commands."""
+    not commands); a heredoc into bash or sh (`bash <<EOF`, `cat <<EOF | bash`) keeps its body, read as commands."""
     out, lines, i = [], text.split('\n'), 0
     while i < len(lines):
         line = lines[i]
@@ -68,7 +86,7 @@ def strip_heredocs(text):
         i += 1
         for m in HEREDOC.finditer(line):
             before = line[:m.start()].split()
-            if before and os.path.basename(before[-1]) in SHELLS:
+            if before and os.path.basename(before[-1]) in SHELLS or INTO_SHELL.search(line[m.end():]):
                 continue
             tabs, delim = m.group(1), m.group(3)
             while i < len(lines) and (lines[i].lstrip('\t') if tabs else lines[i]) != delim:
@@ -77,24 +95,50 @@ def strip_heredocs(text):
     return '\n'.join(out)
 
 
+def strip_comments(text):
+    """The text without its shell comments: a # that starts a word, outside quotes, to the end of its line (a quoted
+    "#1150" is a word, not a comment)."""
+    out, i, n, quote, prev = [], 0, len(text), None, '\n'
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == '\\' and quote == '"' and i + 1 < n:
+                out.append(c + text[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c == '\\' and i + 1 < n:
+            out.append(c + text[i + 1])
+            prev = text[i + 1]
+            i += 2
+            continue
+        elif c in '\'"':
+            quote = c
+        elif c == '#' and prev in ' \t\n;&|()':
+            j = text.find('\n', i)
+            if j < 0:
+                break
+            i = j
+            continue
+        out.append(c)
+        prev = c
+        i += 1
+    return ''.join(out)
+
+
 def tokens(text):
-    lex = shlex.shlex(strip_heredocs(text), posix=True, punctuation_chars='();<>|&\n')
+    lex = shlex.shlex(strip_comments(strip_heredocs(text)), posix=True, punctuation_chars='();<>|&\n')
     lex.whitespace, lex.commenters, lex.whitespace_split = ' \t\r', '', True
-    out, comment = [], False          # a comment: from a word that starts with # to the end of its line
+    out = []
     for t in lex:
         if t and set(t) <= PUNCT:
             while t:
                 op = next(o for o in OPS + (t[0],) if t.startswith(o))
                 t = t[len(op):]
-                if comment and op != '\n':
-                    continue
-                comment = False
                 out.append(op)
-        elif not comment:
-            if t.startswith('#'):
-                comment = True
-            else:
-                out.append(t)
+        else:
+            out.append(t)
     return out
 
 
@@ -124,24 +168,41 @@ def rounds(words):
     return 1
 
 
+def frame(kind, n=1):
+    """One loop being read (or the top): its rounds, the sleep of one round, and the checks made inside it."""
+    return {'kind': kind, 'n': n, 'sleep': 0.0, 'ci': [], 'local': [], 'bound': None}
+
+
 class Reading:
-    """What one command does: its sleeps (bounded total, and the longest round of an endless loop), its checks."""
+    """What one command does. A wait is a loop that both sleeps and checks inside the same loop (its condition
+    counts), or a check after top-level sleeps. A check elsewhere in the command (an `ls` before a retry loop, a
+    `cat` of its log after it) does not make a retry loop a wait."""
 
     def __init__(self, settings):
         self.s = settings
-        self.ci, self.local, self.watch = [], [], []
+        self.found = []        # (what it checks, why it is a wait, 'ci' or 'local')
+        self.watch = []
+        self.top_slept = 0.0   # the plain sleeps at the top so far (not inside a loop)
+        self.stack = [frame('top')]
 
     def read(self, text, depth=0):
-        """(bounded sleep seconds, endless round sleep or 0, any endless loop with a sleep at all)."""
         if depth > DEPTH:
-            return 0, 0, False
-        ts = tokens(text)
-        frames = [{'kind': 'top', 'n': 1, 'sleep': 0.0, 'endless': 0.0, 'any': False}]
-        i, at_cmd = 0, True
+            return
+        ts, base = tokens(text), len(self.stack)
+        i, at_cmd, piped = 0, True, False
         while i < len(ts):
             t = ts[i]
+            if t == '(' and i + 1 < len(ts) and ts[i + 1] == '(' and not (i and ts[i - 1].endswith('$')):
+                j = i + 2                      # (( n < 3 )): arithmetic; a comparison with a number bounds a loop
+                while j + 1 < len(ts) and not (ts[j] == ')' and ts[j + 1] == ')'):
+                    j += 1
+                inner = ts[i + 2:j]
+                if any(x in ('<', '>') for x in inner):
+                    self._bound([x.lstrip('=') for x in inner])
+                i, at_cmd, piped = j + 2, False, False
+                continue
             if t in SEPARATORS:
-                at_cmd = True
+                at_cmd, piped = True, t in ('|', '|&')
                 i += 1
                 continue
             if t in ('<', '>', '>>', '<<'):
@@ -149,7 +210,7 @@ class Reading:
                 continue
             if not at_cmd:
                 if t == '$' and i + 1 < len(ts) and ts[i + 1] == '(':
-                    at_cmd = True
+                    at_cmd, piped = True, False
                     i += 2
                     continue
                 i += 1
@@ -162,7 +223,7 @@ class Reading:
                 i += 2
                 continue
             if word in ('while', 'until'):
-                frames.append({'kind': 'while', 'n': math.inf, 'sleep': 0.0, 'endless': 0.0, 'any': False})
+                self.stack.append(frame('while', math.inf))
                 i += 1
                 continue
             if word == 'for':
@@ -175,111 +236,163 @@ class Reading:
                     while j < len(ts) and ts[j] not in (';', '\n', 'do'):
                         words.append(ts[j])
                         j += 1
-                frames.append({'kind': 'for', 'n': rounds(words) if words else 1, 'sleep': 0.0, 'endless': 0.0,
-                               'any': False})
+                self.stack.append(frame('for', rounds(words) if words else 1))
                 i = j
                 continue
-            if word == 'done' and len(frames) > 1:
-                self._close(frames)
-                i += 1
-                at_cmd = False
+            if word == 'done' and len(self.stack) > base:
+                self._close()
+                i, at_cmd = i + 1, False
                 continue
             args, j = [], i + 1
             while j < len(ts) and ts[j] not in SEPARATORS:
                 args.append(ts[j])
                 j += 1
-            frames[-1]['sleep'] += self._command(word, args, frames, depth)
+            self._command(word, args, piped, depth)
             i, at_cmd = j, False
-        while len(frames) > 1:
-            self._close(frames)
-        top = frames[0]
-        return top['sleep'], top['endless'], top['any']
+        while len(self.stack) > max(base, 1):
+            self._close()
 
-    def _close(self, frames):
-        f = frames.pop()
-        up = frames[-1]
-        if f['kind'] == 'while':
-            if f['sleep'] > 0:
-                up['endless'] = max(up['endless'], f['sleep'], f['endless'])
-                up['any'] = True
-            else:
-                up['endless'] = max(up['endless'], f['endless'])
-                up['any'] = up['any'] or f['any']
+    def _in_loop(self):
+        return len(self.stack) > 1
+
+    def _sleep(self, amount):
+        if self._in_loop():
+            self.stack[-1]['sleep'] += amount
         else:
-            up['sleep'] += f['sleep'] * f['n']
-            up['endless'] = max(up['endless'], f['endless'])
-            up['any'] = up['any'] or f['any']
+            self.top_slept += amount
 
-    def _command(self, word, args, frames, depth):
-        """The bounded sleep of one simple command (0 for any other); notes its checks; reads handed-on text."""
-        while word in WRAPPERS or word == 'timeout':
-            if word == 'timeout':
-                while args and args[0].startswith('-'):
-                    args = args[1:]
-                args = args[1:]
-            else:
-                while args and (args[0].startswith('-') or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', args[0], re.S)):
-                    args = args[1:]
+    def _check(self, kind, name):
+        if self._in_loop():
+            self.stack[-1][kind].append(name)
+        if self.top_slept > self.s['maxSleepSeconds']:
+            slept = 'without end' if math.isinf(self.top_slept) else f'{self.top_slept:g} s'
+            self.found.append((name, f'it sleeps {slept} first (more than {self.s["maxSleepSeconds"]} s), then '
+                                     'checks', kind))
+
+    def _bound(self, words):
+        """A counter test (`[ $n -lt 3 ]`, `(( n < 3 ))`) bounds the innermost while/until loop: its number is the
+        rounds, or one round when it is not a plain number."""
+        f = self.stack[-1]
+        if f['kind'] != 'while':
+            return
+        nums = [int(w) for w in words if re.fullmatch(r'-?\d+', w)]
+        n = max([abs(x) for x in nums] or [1])
+        f['bound'] = max(f['bound'] or 0, n)
+
+    def _close(self):
+        f = self.stack.pop()
+        up = self.stack[-1]
+        n = f['bound'] if f['kind'] == 'while' and f['bound'] is not None else f['n']
+        checks = sorted(set(f['ci'] + f['local']))
+        kind = 'ci' if f['ci'] else 'local'
+        if checks and f['sleep'] > 0:
+            if math.isinf(n):
+                if f['sleep'] >= self.s['loopSleepSeconds'] or f['ci']:
+                    self.found.append((', '.join(checks), f'it loops with no end, sleeping {f["sleep"]:g} s a round',
+                                       kind))
+            elif f['sleep'] * n > self.s['maxSleepSeconds']:
+                total = 'without end' if math.isinf(f['sleep']) else f'{f["sleep"] * n:g} s'
+                self.found.append((', '.join(checks), f'its sleeps add up to {total} (more than '
+                                                      f'{self.s["maxSleepSeconds"]} s)', kind))
+        if len(self.stack) > 1:
+            up['sleep'] += f['sleep'] * n if f['sleep'] else 0
+        up['ci'] += f['ci']
+        up['local'] += f['local']
+
+    def _command(self, word, args, piped, depth):
+        """Notes the sleep and the checks of one simple command, and reads text it hands to a shell."""
+        while word in WRAPPERS:
+            takes = WRAPPERS[word]
+            while args and (args[0].startswith('-') or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', args[0], re.S)):
+                a = args.pop(0)
+                if a == '--':
+                    break
+                if a in takes and args:
+                    args.pop(0)
+            if word == 'timeout' and args:
+                args = args[1:]                # its duration
             if not args:
-                return 0
+                return
             word, args = os.path.basename(args[0]), args[1:]
         if word == 'sleep':
-            return sum(seconds(a, self.s['loopSleepSeconds']) for a in args if not a.startswith('-')) or 0
-        if word in SHELLS:
+            self._sleep(sum(seconds(a, self.s['loopSleepSeconds']) for a in args if not a.startswith('-')) or 0)
+        elif word in SHELLS:
             for k, a in enumerate(args):
                 if re.fullmatch(r'-[a-z]*c[a-z]*', a) and k + 1 < len(args):
-                    return self._handed(args[k + 1], frames, depth)
-            return 0
-        if word == 'eval':
-            return self._handed(' '.join(args), frames, depth)
-        if word == 'gh':
+                    self.read(args[k + 1], depth + 1)
+                    break
+        elif word == 'eval':
+            self.read(' '.join(args), depth + 1)
+        elif word == 'watch':              # `watch -n 60 gh pr checks 1`: a loop with its interval as the sleep
+            interval = 2.0
+            while args and args[0].startswith('-'):
+                a = args.pop(0)
+                if a in ('-n', '--interval') and args:
+                    interval = seconds(args.pop(0), interval)
+                elif a.startswith('--interval='):
+                    interval = seconds(a.partition('=')[2], interval)
+                elif re.fullmatch(r'-n\d+(?:\.\d*)?', a):
+                    interval = seconds(a[2:], interval)
+                elif a in WATCH_FLAGS_WITH_VALUE and args:
+                    args.pop(0)
+            if args:
+                self.stack.append(frame('while', math.inf))
+                self._sleep(interval)
+                self.read(' '.join(shlex.quote(a) if len(args) > 1 else a for a in args), depth + 1)
+                self._close()
+        elif word == 'gh':
             sub = [a for a in args if not a.startswith('-')]
-            rest = args
             if sub and sub[0] in GH_CHECKS:
-                if (sub[:2] == ['run', 'watch']) or (sub[:2] == ['pr', 'checks'] and
-                                                     any(a == '--watch' or a.startswith('--watch=') for a in rest)):
+                if sub[:2] == ['run', 'watch'] or (sub[:2] == ['pr', 'checks'] and
+                                                   any(a == '--watch' or a.startswith('--watch=') for a in args)):
                     self.watch.append('gh ' + ' '.join(sub[:2]))
-                self.ci.append('gh ' + ' '.join(sub[:2]))
+                self._check('ci', 'gh ' + ' '.join(sub[:2]))
         elif word in ('curl', 'wget'):
-            (self.ci if any('github.com' in a for a in args) else self.local).append(word)
+            self._check('ci' if any('github.com' in a for a in args) else 'local', word)
         elif word == 'kill':
             if '-0' in args:
-                self.local.append('kill -0')
-        elif word in LOCAL_CHECKS:
-            self.local.append(word)
-        return 0
-
-    def _handed(self, text, frames, depth):
-        sleep, endless, anysleep = self.read(text, depth + 1)
-        frames[-1]['endless'] = max(frames[-1]['endless'], endless)
-        frames[-1]['any'] = frames[-1]['any'] or anysleep
-        return sleep
+                self._check('local', 'kill -0')
+        elif word in TESTS:
+            if any(a in FILE_TESTS for a in args):
+                self._check('local', word)
+            elif any(a in NUMBER_TESTS for a in args):
+                k = next(k for k, a in enumerate(args) if a in NUMBER_TESTS)
+                if k and k + 1 < len(args) and COUNTER.fullmatch(args[k - 1]) and COUNTER.fullmatch(args[k + 1]):
+                    self._bound([args[k - 1], args[k + 1]])
+        elif word in LOOKS or (word in READERS and not piped):
+            self._check('local', word)
 
 
 def verdict(command, settings):
-    """None, or (what it checks, why it counts as a wait)."""
+    """None, or (what it checks, why it counts as a wait, 'ci' or 'local')."""
     r = Reading(settings)
-    sleep, endless, anysleep = r.read(command)
-    checks = sorted(set(r.ci + r.local))
+    r.read(command)
     if r.watch:
-        return ', '.join(sorted(set(r.watch))), 'it waits for CI to finish'
-    if not checks:
+        return ', '.join(sorted(set(r.watch))), 'it waits for CI to finish', 'ci'
+    if not r.found:
         return None
-    if endless >= settings['loopSleepSeconds'] or (r.ci and anysleep):
-        return ', '.join(checks), f'it loops with no end, sleeping {endless:g} s a round'
-    if sleep > settings['maxSleepSeconds']:
-        total = 'without end' if math.isinf(sleep) else f'{sleep:g} s'
-        return ', '.join(checks), f'its sleeps add up to {total} (more than {settings["maxSleepSeconds"]} s)'
-    return None
+    return next((f for f in r.found if f[2] == 'ci'), r.found[0])
 
 
-def reason(what, why, settings):
+def reason(what, why, kind, settings):
+    way = ('To wait for CI or a pull request: push and stop (or watch_pull_request); you are told when it ends.'
+           if kind == 'ci' else
+           'To wait for a job, a file or a process: run the job with run_in_background and wait with '
+           't3_background_wait, or use Monitor with an until-condition; you are woken when it ends.')
     return (f'Refused by {NAME}: this command waits by sleeping and checking again ({what}; {why}). Each new check '
-            'is a model turn that sends the whole context again, and the loop overshoots the end. To wait for a '
-            'background command: run it with run_in_background and wait with t3_background_wait (or Monitor with '
-            'an until-condition). To wait for CI or a pull request: push and stop (or watch_pull_request); you are '
-            f'told when it ends. Short waits (sleeps under {settings["maxSleepSeconds"]} s in all, or under '
-            f'{settings["loopSleepSeconds"]} s a round in a local loop) are not refused.')
+            f'is a model turn that sends the whole context again, and the loop overshoots the end. {way} Not '
+            'refused: a retry loop (a command tried again after a sleep, with no status check inside the loop), '
+            f'and short waits (under {settings["maxSleepSeconds"]} s of sleep in all, or under '
+            f'{settings["loopSleepSeconds"]} s a round in a local loop).')
+
+
+def _first(text, event):
+    """True when this session has not had this notice yet (the kit's lib; a lib that cannot load: always)."""
+    try:
+        from agent_guards import config
+        return config.first_notice(text, event)
+    except BaseException:   # noqa: BLE001
+        return True
 
 
 def _problem_out(problem, event):
@@ -290,6 +403,8 @@ def _problem_out(problem, event):
         sys.stderr.write(text + '\n')
     except Exception:  # noqa: BLE001
         pass
+    if not _first(text, event):
+        return
     out = {'systemMessage': text}
     if isinstance(event, dict) and event.get('hook_event_name') == 'PreToolUse':
         out['hookSpecificOutput'] = {'hookEventName': 'PreToolUse', 'additionalContext': text}

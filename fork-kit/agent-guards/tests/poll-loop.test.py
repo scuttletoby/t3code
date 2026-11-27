@@ -5,7 +5,7 @@ machine file (its defaults) and, in Configured, with one. Its settings entry is 
 
   python3 -I -B fork-kit/agent-guards/tests/poll-loop.test.py
 """
-import io, json, os, shutil, subprocess, sys, tempfile, time, unittest
+import io, json, os, shutil, subprocess, sys, tempfile, time, unittest, uuid
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +41,33 @@ REFUSED = [
     'eval "sleep 200; gh pr view 3"',
     'timeout 600 bash -c "until test -f x; do sleep 10; done"',
     'cd /work && (sleep 400; cat result.txt)',
+    # fix round 1 (#1151 code lens): bypasses that passed before
+    'echo "# x"; while ! gh pr checks 1; do sleep 60; done',
+    'gh pr comment 5 -b "#1150 done"; while ! gh pr checks 5; do sleep 60; done',
+    "sudo -u bob bash -c 'while ! gh pr checks 1; do sleep 60; done'",
+    'cat <<EOF | bash\nwhile ! gh pr checks 1; do sleep 60; done\nEOF',
+    'watch -n 60 gh pr checks 1',
+    "watch -n60 'gh run view 9 --json status'",
+    # counted waits still count
+    'n=0; while ! gh pr checks 5 && [ $n -lt 100 ]; do n=$((n+1)); sleep 60; done',
+    'while (( n < 50 )); do test -f /work/done && break; n=$((n+1)); sleep 10; done',
+    'for i in 1 2 3; do gh pr checks 5 && break; sleep 60; done',
+]
+# fix round 1 (#1151 code lens): retry loops it refused before
+RETRIES = [
+    'n=0; while [ $n -lt 3 ]; do git fetch origin && break; n=$((n+1)); sleep 10; done',
+    'for i in 1 2 3; do npm ci && break; sleep 60; done; cat npm-debug.log',
+    'ls dist; for i in 1 2 3 4 5; do rsync -a dist/ host:/srv && break; sleep 30; done',
+    'for i in 1 2 3; do npm ci && break; sleep 60; done',
+    'n=0; while true; do git push && break; n=$((n+1)); [ $n -ge 3 ] && exit 1; sleep 30; done',
+    'until git pull; [ $n -lt 3 ]; do n=$((n+1)); sleep 30; done',
+    'for i in $(seq 1 5); do make 2>&1 | grep -q ok && break; sleep 60; done',
+    'while (( n < 3 )); do ./deploy && break; n=$((n+1)); sleep 30; done; tail -5 deploy.log',
+]
+# known gaps, pinned so a change is seen: a count it cannot read is one round
+GAPS = [
+    'for i in $(seq 1 $N); do gh pr checks 1 && break; sleep 60; done',
+    'while [ $n -lt $MAX ]; do test -f x && break; n=$((n+1)); sleep 60; done',
 ]
 PASSED = [
     # ordinary short sleeps inside a real script run
@@ -81,6 +108,20 @@ class Reads(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertIsNotNone(G.verdict(cmd, DEFAULTS))
 
+    def test_retry_loops_and_known_gaps_pass(self):
+        for cmd in RETRIES + GAPS:
+            with self.subTest(cmd):
+                self.assertIsNone(G.verdict(cmd, DEFAULTS))
+
+    def test_the_way_out_fits_the_wait(self):
+        ci = G.reason(*G.verdict('while ! gh pr checks 1; do sleep 60; done', DEFAULTS), DEFAULTS)
+        self.assertIn('push and stop', ci)
+        self.assertNotIn('t3_background_wait', ci)
+        local = G.reason(*G.verdict('until test -f x; do sleep 10; done', DEFAULTS), DEFAULTS)
+        self.assertIn('t3_background_wait', local)
+        self.assertNotIn('push and stop', local)
+        self.assertIn('retry loop', local)
+
     def test_short_sleeps_single_checks_and_mentions_pass(self):
         for cmd in PASSED:
             with self.subTest(cmd):
@@ -110,7 +151,11 @@ class Hook(unittest.TestCase):
         r = self.hook(bash('for i in $(seq 1 40); do grep -q DONE "$F" && break; sleep 30; done'))
         self.assertEqual((r.returncode, r.stdout), (2, ''))
         self.assertTrue(r.stderr.startswith('Refused by poll-loop-guard: '), r.stderr)
-        for said in ('run_in_background', 't3_background_wait', 'Monitor', 'push and stop', 'watch_pull_request'):
+        for said in ('run_in_background', 't3_background_wait', 'Monitor', 'retry loop'):
+            self.assertIn(said, r.stderr)
+        r = self.hook(bash('while ! gh pr checks 1; do sleep 60; done'))
+        self.assertEqual(r.returncode, 2)
+        for said in ('push and stop', 'watch_pull_request'):
             self.assertIn(said, r.stderr)
 
     def test_passed_is_exit_0_and_silent(self):
@@ -157,7 +202,7 @@ class Hook(unittest.TestCase):
 
     def test_it_is_fast(self):
         """Under 50 ms a call on average once loaded (the start of Python itself is not counted)."""
-        cmds = REFUSED + PASSED
+        cmds = REFUSED + PASSED + RETRIES + GAPS
         start = time.perf_counter()
         for _ in range(5):
             for cmd in cmds:
@@ -170,8 +215,23 @@ class Configured(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix='poll-loop-config-')
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def run_hook(self, cmd, section=None, text=None):
-        return fx.run_hook('poll-loop-guard', bash(cmd), fx.machine_file(self.tmp, section, text))
+    def run_hook(self, cmd='sleep 300; gh run view 1', section=None, text=None, sid=None):
+        event = dict(bash(cmd), session_id=uuid.uuid4().hex if sid is None else sid)
+        return fx.run_hook('poll-loop-guard', event, fx.machine_file(self.tmp, section, text),
+                           env=dict(os.environ, HOME=self.tmp))
+
+    def test_a_broken_file_is_said_once_a_session(self):
+        """#1151: one notice per hook per session, not one on every call; stderr (not read by the agent) keeps it."""
+        broken = {'text': '{"version": 1, "agent-guards": {"pollLoop": {"ena'}
+        first = self.run_hook(sid='one', **broken)
+        again = self.run_hook(sid='one', **broken)
+        other = self.run_hook(sid='two', **broken)
+        self.assertIn('systemMessage', json.loads(first.stdout))
+        self.assertEqual((again.returncode, again.stdout), (0, ''))
+        self.assertIn('built-in defaults used', again.stderr)
+        self.assertIn('systemMessage', json.loads(other.stdout))
+        nosid = self.run_hook(sid='', **broken)
+        self.assertIn('systemMessage', json.loads(nosid.stdout))
 
     def test_the_off_switch_lets_everything_through(self):
         r = self.run_hook('sleep 300; gh run view 1', {'pollLoop': {'enabled': False}})

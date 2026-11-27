@@ -4,7 +4,7 @@ systemMessage the agent sees) and on stderr. Each hook reads only its own part, 
 
   python3 -I -B fork-kit/agent-guards/tests/config.test.py
 """
-import json, os, shutil, subprocess, sys, tempfile, unittest
+import json, os, shutil, subprocess, sys, tempfile, unittest, uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guards_fixture as fx  # noqa: E402
@@ -159,7 +159,8 @@ class Hooks(unittest.TestCase):
         for hook in fx.wiring.HOOKS:
             for ev in (QUIET_EVENT, pre):
                 with self.subTest(hook=hook, event=ev['hook_event_name']):
-                    r = fx.run_hook(hook, ev, machine, env=self.env)
+                    # a new session each: the speed hooks say it once a session (#1151)
+                    r = fx.run_hook(hook, dict(ev, session_id=uuid.uuid4().hex), machine, env=self.env)
                     self.assertEqual(r.returncode, 0, r.stderr)
                     self.assertIn(f'{hook}: the machine file\'s "agent-guards" section cannot be used', r.stderr)
                     self.assertIn('built-in defaults used', r.stderr)
