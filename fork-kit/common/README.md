@@ -72,7 +72,7 @@ daily check reports the missing channel.
 | Key              | Default  | What                                                                   |
 | ---------------- | -------- | ---------------------------------------------------------------------- |
 | `command`        | required | a program (absolute path) and its arguments                            |
-| `timeoutSeconds` | 60       | 5 to 600; then the command is stopped and the alert counts as not sent |
+| `timeoutSeconds` | 60       | 5 to 120; then the command is stopped and the alert counts as not sent |
 
 The command gets the alert's text on stdin and, in a plain environment (`PATH=/usr/sbin:/usr/bin:/sbin:/bin`,
 `LANG=C.UTF-8`, nothing else of the kit's), `FORK_KIT_ALERT_KIT` (the kit's folder name), `FORK_KIT_ALERT_EVENT`
@@ -81,6 +81,11 @@ may add its own names of the same. Exit 0 is sent; anything else is a failed ale
 reports. **No secrets in its arguments:** every user can read a running program's arguments in `/proc`; an
 argument that looks like a token (`ghp_...`, `github_pat_...`, `sk-...`, `xox...-`, a long hex or base64 run) is
 refused. Keep the secret in a root-only file (mode 600) the command reads.
+
+`timeoutSeconds` stops at 120 because kits alert from systemd units with a time limit: an alert that hangs must
+not use up a unit's time, or the run is killed before it saves that the alert failed. A kit also caps all the
+alerts of one run together (update-policy: 150 s a run, 75 s for its exposure alert); an alert with nothing left
+of that is not sent and counts as failed.
 
 A broken section (no `command`, an unknown key, a relative program, a token in it) is refused like any other
 section: never taken for "no channel". After writing it, send a test alert through a kit that alerts

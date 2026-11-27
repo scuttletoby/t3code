@@ -18,7 +18,8 @@ Shape: {"version": 1, "<kit folder name>": {...}, ...}, camelCase keys. Rules, a
   wrong type is refused, with the reason named. A kit that works without settings (heavy's memory queue) asks with
   optional=True: then a missing file or section is None, and every other rule still refuses.
 
-Tools never write it. Kits call read_section() and then fields() for each object in their section.
+Tools never write it. Kits call read_section() and then fields() for each object in their section; a kit that needs
+several sections reads the file once (read_file()) and asks it for each.
 Plain Python 3 standard library; each kit's installer copies this file into its version folder.
 """
 import errno, json, os, re, stat, sys
@@ -152,16 +153,37 @@ def read_protected_text(path, owner_uid=0):
         raise MachineFileError(f'{path}: cannot be read ({e.strerror or e})') from None
 
 
-def read_section(kit, path=None, owner_uid=0, optional=False):
-    """The kit's section (a dict). Raises MachineFileError for every rule above. `path` and `owner_uid` are for
-    tests; shipped commands use the default path and root. optional=True: None when the file or the section is not
-    there (a link, a bad owner or a bad mode on the way is still refused)."""
+class MachineFile:
+    """One read of the machine file: its sections, each checked only when a kit asks for it (read_file)."""
+
+    def __init__(self, path, data):
+        self.path, self.data = path, data
+
+    def section(self, kit, optional=False):
+        """The kit's section (a dict); optional=True: None when the file has none. Raises MachineFileError."""
+        if self.data is None or kit not in self.data:
+            if optional:
+                return None
+            if self.data is None:
+                raise MachineFileError(f'{self.path}: not there (the owner writes it; see fork-kit/common/README.md)')
+            raise MachineFileError(f'{self.path}: no "{kit}" section')
+        section = self.data[kit]
+        if not isinstance(section, dict):
+            raise MachineFileError(f'{self.path}: "{kit}" must be a JSON object')
+        _check_no_secrets(section, f'{self.path}: {kit}')
+        return section
+
+
+def read_file(path=None, owner_uid=0, optional=False):
+    """The machine file, read and parsed once (a MachineFile: .section(kit) checks one section). Raises
+    MachineFileError for every rule above. optional=True: a file that is not there reads as one with no sections (a
+    link, a bad owner or a bad mode on the way is still refused)."""
     path = path or default_path()
     try:
         text = _read(path, owner_uid)
     except FileNotFoundError:
         if optional:        # the file or a folder on its way is not there; the folders that are were checked
-            return None
+            return MachineFile(path, None)
         raise MachineFileError(f'{path}: not there (the owner writes it; see fork-kit/common/README.md)') from None
     except OSError as e:
         raise MachineFileError(f'{path}: cannot be read ({e.strerror or e})') from None
@@ -181,15 +203,14 @@ def read_section(kit, path=None, owner_uid=0, optional=False):
                                f'update the kit')
     if version < 1:
         raise MachineFileError(f'{path}: bad version {version}')
-    if kit not in data:
-        if optional:
-            return None
-        raise MachineFileError(f'{path}: no "{kit}" section')
-    section = data[kit]
-    if not isinstance(section, dict):
-        raise MachineFileError(f'{path}: "{kit}" must be a JSON object')
-    _check_no_secrets(section, f'{path}: {kit}')
-    return section
+    return MachineFile(path, data)
+
+
+def read_section(kit, path=None, owner_uid=0, optional=False):
+    """The kit's section (a dict). Raises MachineFileError for every rule above. `path` and `owner_uid` are for
+    tests; shipped commands use the default path and root. optional=True: None when the file or the section is not
+    there (a link, a bad owner or a bad mode on the way is still refused)."""
+    return read_file(path, owner_uid, optional).section(kit, optional)
 
 
 def fields(obj, spec, where):

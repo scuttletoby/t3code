@@ -19,7 +19,7 @@ decide() is the whole policy and is pure (a test hands in the clock, the state a
 State: /var/lib/update-policy/state.json, written whole through a rename. Missing, broken or from another version:
 read as empty (said in the journal); the worst it costs is one more look or one more alert.
 """
-import contextlib, datetime, fcntl, json, os
+import contextlib, datetime, fcntl, json, os, time
 
 import alert as alert_channel
 
@@ -33,6 +33,11 @@ PENDING_PKGS = '/run/reboot-required.pkgs'
 CONFIG_NOTE_SECONDS = 3600
 APT_ALERT_SECONDS = 86400
 MISSED_AFTER = datetime.timedelta(minutes=10)
+# seconds: all the alerts of one run together (tick, booted, baseline, test-alert). The tick and the boot run have
+# 5 minutes (TimeoutStartSec): alerts that hang must leave the run time to save the state (that they failed, so the
+# baseline reports it) and to restart. One alert may take the channel's timeoutSeconds (at most alert.MAX_TIMEOUT);
+# what is left of this is all the next one gets, and with too little left it is not sent (and counts as failed).
+ALERT_BUDGET = 150
 BOOT_ID = '/proc/sys/kernel/random/boot_id'
 WINDOW_KEYS = ('window', 'windowEnd', 'lastLook', 'busy', 'alerted', 'noted')
 
@@ -169,6 +174,14 @@ class Machine:
 
     def __init__(self, host, log):
         self.host, self.log = host, log
+        self.alert_budget = self.alert_left = ALERT_BUDGET
+
+    def limit_alerts(self, seconds):
+        """A run with less time than ALERT_BUDGET for its alerts (exposure-alert, an ExecStopPost=)."""
+        self.alert_budget, self.alert_left = min(self.alert_budget, seconds), min(self.alert_left, seconds)
+
+    def monotonic(self):
+        return time.monotonic()
 
     def p(self, path):
         return self.host.p(path)
@@ -225,10 +238,20 @@ class Machine:
 
     def alert(self, command, event, text, timeout=alert_channel.TIMEOUT):
         """Runs the alert command with the text on stdin; None or why it failed. Its environment is the shared
-        channel's (FORK_KIT_ALERT_*) and this kit's own names of the same (UPDATE_POLICY_EVENT and _HOST)."""
+        channel's (FORK_KIT_ALERT_*) and this kit's own names of the same (UPDATE_POLICY_EVENT and _HOST). It gets
+        at most what is left of this run's alert_budget: the run ends well inside its unit's time limit, however
+        many alerts hang."""
+        timeout = min(timeout, int(self.alert_left))
+        if timeout < alert_channel.MIN_TIMEOUT:
+            return (f'not sent: the alerts of this run already took their {self.alert_budget} s '
+                    f'(an alert command that does not answer?)')
         env = alert_channel.environment('update-policy', event)
         env.update(UPDATE_POLICY_EVENT=event, UPDATE_POLICY_HOST=env['FORK_KIT_ALERT_HOST'])
-        code, _out, err = self.host.run(command, timeout=timeout, stdin=text + '\n', env=env)
+        start = self.monotonic()
+        try:
+            code, _out, err = self.host.run(command, timeout=timeout, stdin=text + '\n', env=env)
+        finally:
+            self.alert_left -= max(self.monotonic() - start, 0)
         return None if code == 0 else (err.strip() or f'exit {code}')[:300]
 
     # state

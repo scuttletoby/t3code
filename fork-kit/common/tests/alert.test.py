@@ -53,14 +53,15 @@ class Alert(unittest.TestCase):
         self.write({'alert': {'command': ['/usr/local/bin/notify', '--topic', 'machine']}})
         self.assertEqual(self.read(), {'command': ['/usr/local/bin/notify', '--topic', 'machine'],
                                        'timeoutSeconds': 60})
-        self.write({'alert': {'command': ['/usr/local/bin/notify'], 'timeoutSeconds': 600}})
-        self.assertEqual(self.read()['timeoutSeconds'], 600)
+        self.write({'alert': {'command': ['/usr/local/bin/notify'], 'timeoutSeconds': 120}})
+        self.assertEqual(self.read()['timeoutSeconds'], 120)
 
     def test_a_broken_section_is_refused_never_taken_for_no_channel(self):
         for bad, words in (({}, '"command" is missing'), ({'command': []}, 'must name a program'),
                            ({'command': ['notify']}, 'absolute path'), ({'command': ['/x', 3]}, 'list of strings'),
                            ({'command': ['/x', 'a\0b']}, 'list of strings'),
-                           ({'command': ['/x'], 'timeoutSeconds': 4}, 'from 5 to 600'),
+                           ({'command': ['/x'], 'timeoutSeconds': 4}, 'from 5 to 120'),
+                           ({'command': ['/x'], 'timeoutSeconds': 600}, 'from 5 to 120'),
                            ({'command': ['/x'], 'timeoutSeconds': True}, 'must be int'),
                            ({'command': ['/x'], 'retries': 2}, 'unknown key'),
                            ({'command': '/usr/local/bin/notify'}, 'must be list'),
@@ -98,9 +99,10 @@ class Alert(unittest.TestCase):
 
 MUTATIONS = {
     'no section is no channel': (
-        "    if section is None:\n        return None\n", "", 'test_no_machine_file_or_no_section_is_no_channel'),
+        "    return None if section is None else machine_file", "    return machine_file",
+        'test_no_machine_file_or_no_section_is_no_channel'),
     'the section is checked': (
-        "    return machine_file.fields(section, SPEC, ", "    return section or machine_file.fields(section, SPEC, ",
+        "else machine_file.fields(section, SPEC, ", "else section or machine_file.fields(section, SPEC, ",
         'test_a_broken_section_is_refused_never_taken_for_no_channel'),
     'token-like arguments are refused': (
         "        if any(r.search(x) for r in TOKEN_RES):", "        if False:",

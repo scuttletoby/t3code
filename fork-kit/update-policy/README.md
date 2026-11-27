@@ -159,7 +159,7 @@ restart is pending; `baseline` reports it).
 | `timeZone`                | required        | an IANA name (`Europe/London`, `UTC`); the window follows its daylight saving time    |
 | `windowMinutes`           | 120             | how long the window lasts (5 to 720)                                                  |
 | `retryMinutes`            | 15              | how often it looks again while busy (5 to 240; the timer ticks every 5 minutes)       |
-| `alertCommand`            | `[]`            | this kit's own alert command; none: the machine's alert channel (below)               |
+| `alertCommand`            | `[]`            | this kit's own alert command; `[]` (none): the machine's alert channel (below)        |
 | `alertOnBoot`             | `false`         | also alert `back-up` after the kit's restart                                          |
 | `containerUsers`          | `[]`            | users whose rootless Docker counts                                                    |
 | `systemDocker`            | `true`          | the system Docker's containers count                                                  |
@@ -177,14 +177,17 @@ restart is pending; `baseline` reports it).
 **The alert command** is the machine's [alert channel](../common/README.md#the-alert-channel) (the machine
 file's `"alert"` section, which every kit that alerts shares), unless `alertCommand` names one of this kit's own:
 that one wins, so a file from before the channel works as before. With neither, alerts go only to the journal,
-and the baseline check says so every day. `update-policy test-alert` (as root) sends one alert, event `test`,
+and the baseline check says so every day. `"alertCommand": []` used to mean "the journal only, on purpose"; it now
+means "use the shared channel", and there is no way to turn alerts off for this kit alone. `update-policy test-alert` (as root) sends one alert, event `test`,
 through the same command and says which one took it: run it after writing the machine file.
 
 It gets the text on stdin and `UPDATE_POLICY_EVENT` (`restart-pending`, `live-restart-pending`, `restart-failed`,
 `apt-restarts`, `back-up`, `drift`, `exposure`, `test`) and `UPDATE_POLICY_HOST` in a plain environment, with the
 channel's names of the same (`FORK_KIT_ALERT_KIT` is `update-policy`, `FORK_KIT_ALERT_EVENT`,
 `FORK_KIT_ALERT_HOST`); it runs as root from `/`, for at most the channel's `timeoutSeconds` (60 with
-`alertCommand`). Exit 0 is sent. A failure goes to the journal, fails the
+`alertCommand`), and all the alerts of one run together for at most 150 s (75 s for `exposure-alert`, which runs
+under the exposure unit's 90 s stop limit), well inside the units' 5 minutes: alerts that hang still leave the tick
+time to save that they failed and to restart. An alert with nothing left of that is not sent and counts as failed. Exit 0 is sent. A failure goes to the journal, fails the
 unit, and is drift in the next baseline check until an alert goes out again. **No secrets in its arguments:**
 every user can read a running program's arguments in `/proc`. Put a token in a root-only file (mode 600) that the
 command reads; an argument that looks like one (`ghp_...`, `github_pat_...`, `sk-...`, `xox...-`, a long hex or

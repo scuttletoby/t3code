@@ -29,6 +29,9 @@ EPSS_URL = 'https://epss.empiricalsecurity.com/epss_scores-current.csv.gz'
 CACHE = '/var/cache/update-policy-exposure'
 REPORT = 'report.json'
 MAX_LINES = 40
+# seconds for exposure-alert's one alert: it runs as the exposure unit's ExecStopPost=, which systemd stops after
+# TimeoutStopSec (90 s by default, and the unit sets none)
+ALERT_BUDGET = 75
 # absolute minimums of a feed's entries (a real one holds far more: noble's OVAL ~540k, KEV ~1,800, EPSS ~410k)
 FLOORS = {'oval': 1000, 'kev': 500, 'epss': 100_000}
 # kernel packages: judged by the running kernel only, never by what else is installed
@@ -460,6 +463,7 @@ def alert(m, read_settings, cache, now=None, max_age=datetime.timedelta(hours=6)
     """`update-policy exposure-alert` (as root, after the unprivileged check): sends the report's lines (and notes)
     through the alert command. A report that is missing, not a plain file, broken or old is itself one line."""
     from updatepolicy import tick
+    m.limit_alerts(ALERT_BUDGET)
     now = now or datetime.datetime.now(UTC)
     try:
         s = read_settings()

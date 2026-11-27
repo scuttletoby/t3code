@@ -4,18 +4,53 @@ rule in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/update-policy/tests/tick.test.py
 """
-import datetime, json, os, shutil, sys, tempfile, unittest
+import datetime, functools, json, os, re, shutil, sys, tempfile, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fixture as fx  # noqa: E402
 from fixture import at, settings, tick, window  # noqa: E402
+import alert  # noqa: E402
+from updatepolicy import exposure  # noqa: E402
 
 MIN = datetime.timedelta(minutes=1)
 # a fake GitHub token for the alertCommand refusal, built at run time so the source holds no token-shaped string
 # (the secret scan's generic-api-key rule; the first push held it whole, allowed by value in .gitleaks.toml)
 FAKE_GH_TOKEN = 'ghp' + '_' + 'abcdefgh' + '12345678'
 SINCE = at('2026-11-23 06:40')
+HANG = '/usr/local/bin/notify-hangs'
+# seconds a run needs besides its alerts: the look, apt-config, the last look and systemctl reboot (60 s of its own)
+REST_OF_THE_RUN = 120
+
+
+def unit_seconds(name, key, default=None):
+    """A time limit of one of the kit's systemd units, in seconds ('5min', '90s', '300')."""
+    with open(os.path.join(fx.KIT, 'systemd', name)) as f:
+        found = re.search(rf'^{key}=([0-9]+)(min|s)?$', f.read(), re.M)
+    if not found:
+        return default
+    return int(found.group(1)) * (60 if found.group(2) == 'min' else 1)
+
+
+def largest_alert_timeout():
+    """The largest timeoutSeconds the machine file's "alert" section accepts."""
+    check = alert.SPEC['timeoutSeconds'][2]
+    return max(v for v in range(1, 3601) if check(v) is None)
+
+
+def hang_alerts(m, host):
+    """The alert command HANG never answers: each run of it takes its whole timeout on a fake clock (returned: a
+    list holding the seconds gone). m runs the real Machine.alert."""
+    clock, run = [0], host.run
+
+    def hanging(argv, timeout=20, **kw):
+        if argv[0] == HANG:
+            clock[0] += timeout
+            return None, '', f'{argv[0]}: no answer within {timeout} s'
+        return run(argv, timeout=timeout, **kw)
+    host.run, m.monotonic = hanging, lambda: clock[0]
+    m.alert = functools.partial(tick.Machine.alert, m)
+    return clock
 PENDING = tick.Pending(SINCE, ['linux-image-6.8.0-50-generic'])
 
 
@@ -238,7 +273,7 @@ class Settings(unittest.TestCase):
         s = settings.read(self.machine_file({'update-policy': base}), owner_uid=uid)
         self.assertEqual((s['alertCommand'], s['alertSource']), ([], None))       # neither: the journal only
         for bad, words in (({'command': []}, 'must name a program'), ({'command': ['notify']}, 'absolute path'),
-                           ({}, '"command" is missing'), ({'command': ['/x'], 'timeoutSeconds': 1}, '5 to 600'),
+                           ({}, '"command" is missing'), ({'command': ['/x'], 'timeoutSeconds': 121}, '5 to 120'),
                            ({'command': ['/x'], 'retries': 3}, 'unknown key'),
                            ({'command': ['/usr/bin/notify', FAKE_GH_TOKEN]}, 'token')):
             with self.subTest(bad=bad), self.assertRaises(settings.MachineFileError) as e:
@@ -354,6 +389,27 @@ class TickOnHost(fx.HostCase):
         self.assertEqual(self.state()['lastAlertError'], 'exit 7')
         self.assertEqual(self.m.reboots, [])
 
+    def test_hanging_alerts_leave_the_tick_time_to_save_that_they_failed(self):
+        """With the largest timeout the machine file allows, two alerts that hang in one tick (apt restarts by
+        itself, then the restart fails) still leave the tick inside update-policy.service's time limit with the
+        failure in the state, so the baseline reports it and the next tick does not send the same alert again."""
+        limit = unit_seconds('update-policy.service', 'TimeoutStartSec')
+        s = settings.check({'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}, 'test',
+                           {'command': [HANG], 'timeoutSeconds': largest_alert_timeout()})
+        self.pending(SINCE)
+        self.host.answers['apt-config'] = (0, 'Unattended-Upgrade::Automatic-Reboot "true";\n', '')
+        self.m.reboot_error = 'Access denied'
+        clock, writes, write = hang_alerts(self.m, self.host), [], self.m.write_state
+        self.m.write_state = lambda st: writes.append(clock[0]) or write(st)
+        self.assertEqual(self.tick(s), 1)
+        self.assertGreaterEqual(self.m.log.text().count('the alert command failed'), 2)
+        self.assertLessEqual(clock[0] + REST_OF_THE_RUN, limit)
+        self.assertTrue(writes)
+        self.assertLessEqual(max(writes) + REST_OF_THE_RUN, limit)
+        state = self.state()
+        self.assertIn('aptAlertAt', state)                        # sent (and failed): not again on the next tick
+        self.assertTrue(state['lastAlertError'])                  # the baseline reports it
+
     def test_no_alert_command_alerts_go_to_the_journal(self):
         self.pending(SINCE)
         self.assertEqual(self.tick(fx.make_settings(role='live')), 0)
@@ -465,6 +521,25 @@ class Cli(fx.HostCase):
         self.host.answers['/usr/local/bin/notify'] = (3, '', 'no network')
         self.assertEqual(m.alert(['/usr/local/bin/notify'], 'drift', 'x'), 'no network')
 
+    def test_the_alert_budgets_fit_inside_the_units_time_limits(self):
+        """One alert at the largest timeout fits a run's budget; the budget and the rest of the run fit each unit
+        that alerts; exposure-alert (an ExecStopPost=, under TimeoutStopSec: 90 s by default) has its own."""
+        self.assertLessEqual(largest_alert_timeout(), tick.ALERT_BUDGET)
+        for unit in ('update-policy.service', 'update-policy-boot.service', 'update-policy-baseline.service'):
+            with self.subTest(unit=unit):
+                self.assertLessEqual(tick.ALERT_BUDGET + REST_OF_THE_RUN, unit_seconds(unit, 'TimeoutStartSec'))
+        stop = unit_seconds('update-policy-exposure.service', 'TimeoutStopSec', default=90)
+        self.assertLessEqual(exposure.ALERT_BUDGET + 10, stop)
+        m = fx.FakeMachine(self.host, at('2026-11-24 07:00'))
+        clock = hang_alerts(m, self.host)
+        m.limit_alerts(exposure.ALERT_BUDGET)
+        s = settings.check({'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}, 'test',
+                           {'command': [HANG], 'timeoutSeconds': largest_alert_timeout()})
+        for _ in range(3):
+            self.assertTrue(tick.send_alert(m, s, 'exposure', 'x'))
+        self.assertLessEqual(clock[0], exposure.ALERT_BUDGET)
+        self.assertIn('not sent: the alerts of this run already took their 75 s', m.log.text())
+
     def test_test_alert_says_which_channel_took_it(self):
         base = {'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}
         m = fx.FakeMachine(self.host, at('2026-11-24 08:00'))
@@ -492,6 +567,9 @@ MUTATIONS = {
     'the shared alert channel is the fallback': (
         'settings', "    if not out['alertCommand'] and channel:", "    if False:",
         'Settings.test_the_shared_alert_channel_is_used_when_the_kit_has_no_command_of_its_own'),
+    'all the alerts of a run share one budget': (
+        'tick', "        timeout = min(timeout, int(self.alert_left))", "        pass",
+        'TickOnHost.test_hanging_alerts_leave_the_tick_time_to_save_that_they_failed'),
     'the alert runs with its channel timeout': (
         'tick', "timeout=s.get('alertTimeout') or alert_channel.TIMEOUT)", "timeout=None)",
         'TickOnHost.test_the_alert_goes_out_with_the_channel_timeout'),
@@ -524,7 +602,7 @@ MUTATIONS = {
         'tick', "    m.write_state(st)\n    if restart:", "    if restart:",
         'TickOnHost.test_the_state_is_written_before_the_restart'),
     'token-looking alert arguments are refused': (
-        'settings', "        if any(r.search(x) for r in TOKEN_RES):", "        if False:",
+        'settings', "    return alert.command_problem(value) if value else None", "    return None",
         'Settings.test_role_quiet_hour_and_time_zone_are_required_and_checked'),
     'a restart that did not come is reported': (
         'tick', "    if (asked and st.get('restartBoot') == boot", "    if (False and st.get('restartBoot') == boot",

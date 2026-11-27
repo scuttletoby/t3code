@@ -58,15 +58,8 @@ def _between(low, high):
 
 
 def _absolute_command(value):
-    if not value:
-        return None
-    if not all(isinstance(x, str) and x and '\0' not in x for x in value):
-        return 'must be a list of strings'
-    for x in value[1:]:
-        if any(r.search(x) for r in TOKEN_RES):
-            return ('an argument looks like a token or key: every user can read the arguments while the command runs; '
-                    'keep the secret in a root-only file the command reads')
-    return None if os.path.isabs(value[0]) else 'its first string must be an absolute path to a program'
+    """The kit's own alertCommand: none ([]) is fine, else the shared channel's rule (alert.command_problem)."""
+    return alert.command_problem(value) if value else None
 
 
 def _users(value):
@@ -195,8 +188,9 @@ def read(path=None, owner_uid=0):
     """The checked section. The shared "alert" section is read only when the kit has no alertCommand of its own, and
     a broken one is then refused like a broken key of this section."""
     where = f'{path or machine_file.default_path()}: {SECTION}'
-    section = machine_file.read_section(SECTION, path=path, owner_uid=owner_uid)
-    channel = None if section.get('alertCommand') else alert.read(path=path, owner_uid=owner_uid)
+    machine = machine_file.read_file(path=path, owner_uid=owner_uid)          # one read for both sections
+    section = machine.section(SECTION)
+    channel = None if section.get('alertCommand') else alert.from_file(machine)
     return check(section, where, channel)
 
 
