@@ -13,6 +13,17 @@ nothing.
 
 ## After ci/v14
 
+### checkout-state: a lint for checkout state a self-hosted runner keeps (#932)
+
+New action. It fails a workflow whose jobs on a self-hosted runner could leave checkout state in the shared work
+folder (a sparse or partial clone, `clean: false`), and asks for a reviewed config entry for each action or reusable
+workflow from another repository such a job uses. It fails closed (exit 2) on no PyYAML, no workflow file under its
+root, and a config that cannot be read, is a broken link or has a key it does not know. The fleet-route README and
+the fleet-watch example now say to drop their sparse checkout (or run git-clean first) on a self-hosted label.
+
+**Upgrade:** a project with its own copy of this lint keeps its config file (same format), runs the action, and
+deletes its copy.
+
 ### pr-queue, head-check: merge as GitHub's update does; a cancelled re-run no longer hides an old base's red (#924, #1033)
 
 The queue and head-check now merge with `merge.directoryRenames=false` (was `true`), which is how GitHub's update branch

@@ -79,6 +79,7 @@
 .github/scripts/fork-upstream-files-check.test.cjs
 .github/scripts/fork-vitest-gc-check.test.cjs
 .github/scripts/fork-workflow-triggers.test.cjs
+fork-ci/actions/checkout-state/checkout_state.test.py unittest
 fork-ci/actions/ci-demand/ci_demand.test.py ~17s unittest
 fork-ci/actions/doc-check/doc_check.test.py unittest
 fork-ci/actions/docs-scope/docs-scope.test.py ~12s unittest

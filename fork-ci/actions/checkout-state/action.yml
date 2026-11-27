@@ -1,0 +1,26 @@
+name: checkout-state
+description: >-
+  Fails when a job on a self-hosted runner could leave checkout state (a sparse or partial clone, an
+  unclean checkout) in the runner's shared work folder for the next job. Reads the checkout's
+  workflows and local composite actions; actions and reusable workflows from other repositories
+  need a reviewed entry in the config. Usage: README.md next to this file.
+inputs:
+  config:
+    description: >-
+      The JSON config, a path in the checkout. Empty: <root>/.github/checkout-state.json if it is
+      there, else no config (every action from another repository on a shared runner is refused).
+    required: false
+    default: ""
+  root:
+    description: The repository to scan, a path relative to the workspace (default the workspace).
+    required: false
+    default: "."
+runs:
+  using: composite
+  steps:
+    # Only code from this action's folder (the caller's pinned SHA) runs; the checkout is only read (no git call).
+    - shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        ROOT: ${{ inputs.root }}
+      run: exec python3 -I "$GITHUB_ACTION_PATH/checkout_state.py" --root "$ROOT" ${CONFIG:+--config "$CONFIG"}
