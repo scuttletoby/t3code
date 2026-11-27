@@ -57,8 +57,10 @@ const IMPORT_SPECIFIER = /\b(?:from|import|require)\s*\(?\s*["']([^"'\n]+)["']/d
 // An import whose target is computed (`import(name)`, a template, `import.meta.glob`): not followed.
 const COMPUTED_IMPORT = /\b(?:import|require)\s*\(\s*(?!["'\s])|\bimport\.meta\.glob\b/g;
 // `import { A, type B as C } from "x"` and `export { A } from "x"`: the names a static clause takes.
+// Group 1 is a `type` keyword that makes the whole statement type-only (`type ,` is a name). The
+// clause never runs into another statement's `import`/`export` (code without semicolons).
 const IMPORT_CLAUSE =
-  /\b(?:import|export)\s+(?:type\s+)?([\w$*{}\s,]*?)\s*from\s*["']([^"'\n]+)["']/dg;
+  /\b(?:import|export)\s+(type\s+(?![\s,]))?((?:(?!\b(?:import|export)\b)[\w$*{}\s,])*?)\s*from\s*["']([^"'\n]+)["']/dg;
 const REEXPORT =
   /\bexport\s+(?:type\s+)?(\*(?:\s+as\s+([\w$]+))?|\{[^}]*\})\s*from\s*["']([^"'\n]+)["']/dg;
 const DEPENDENCY_FIELDS = [
@@ -105,7 +107,7 @@ function traceSchema(tree) {
         `${file}: a comment, string or template in it does not end, so its imports cannot be read.`,
       );
     }
-    const names = importedNames(source);
+    const { names, typeOnly } = importedNames(source);
     for (const match of source.code.matchAll(COMPUTED_IMPORT)) {
       ctx.unresolved(
         file,
@@ -114,6 +116,8 @@ function traceSchema(tree) {
       );
     }
     for (const match of source.code.matchAll(IMPORT_SPECIFIER)) {
+      // A type-only import or export is erased at compile time, so it cannot change the schema.
+      if (typeOnly.has(match.indices[1][0])) continue;
       const specifier = source.group(match, 1);
       const reached = resolveImport(ctx, file, specifier, names.get(specifier));
       // A test-path file that schema code imports ships with it, so it is guarded too.
@@ -358,36 +362,47 @@ function workspacePackages(tree) {
 }
 
 /**
- * Per specifier, the names static clauses take from it; `*` for a namespace or a clause it cannot
- * read. A specifier with no entry (dynamic import, require, side-effect import) takes everything.
+ * Names static clauses take per specifier (`*`: namespace or unreadable; none: takes all), and in
+ * `typeOnly` the specifier offsets of type-only statements, which the closure does not follow.
  * @param {ReturnType<typeof lex>} source
- * @returns {Map<string, Set<string>>}
+ * @returns {{ names: Map<string, Set<string>>, typeOnly: Set<number> }}
  */
 function importedNames(source) {
   const names = new Map();
+  const typeOnly = new Set();
   for (const match of source.code.matchAll(IMPORT_CLAUSE)) {
-    const clause = match[1];
-    const specifier = source.group(match, 2);
-    const set = names.get(specifier) ?? new Set();
-    names.set(specifier, set);
+    const [, typeKeyword, clause] = match;
+    const specifier = source.group(match, 3);
     const braces = clause.match(/\{([^}]*)\}/);
     const outside = clause
       .replace(/\{[^}]*\}/, "")
       .replace(/,/g, " ")
       .trim();
-    if (/\*/.test(outside)) set.add("*");
-    else if (outside) set.add("default");
-    for (const part of braces ? braces[1].split(",") : []) {
-      const name = part
-        .trim()
-        .replace(/^type\s+/, "")
-        .split(/\s+as\s+/)[0]
-        .trim();
-      if (name) set.add(name);
+    // `import type from "x"` takes the default export, bound to the name `type`.
+    const defaultNamedType = typeKeyword !== undefined && clause.trim() === "";
+    const parts = (braces ? braces[1].split(",") : [])
+      .map((part) => part.trim().split(/\s+/))
+      .filter((tokens) => tokens[0] !== "");
+    // `type A` and `type A as B` are type-only; `type as B` is the value `type`, renamed.
+    const valueParts = parts.filter(
+      (tokens) =>
+        tokens[0] !== "type" || tokens.length === 1 || (tokens.length === 3 && tokens[1] === "as"),
+    );
+    if (typeKeyword !== undefined && !defaultNamedType) {
+      typeOnly.add(match.indices[3][0]);
+      continue;
     }
-    if (!braces && !outside) set.add("*");
+    const set = names.get(specifier) ?? new Set();
+    names.set(specifier, set);
+    if (defaultNamedType) set.add("default");
+    else if (/\*/.test(outside)) set.add("*");
+    else if (outside) set.add("default");
+    for (const tokens of valueParts) set.add(tokens[0]);
+    // No value name (`{}`, `{ type A }`): verbatimModuleSyntax keeps `import {} from "x"`, which
+    // runs x, so it is followed as a side-effect import is.
+    if (!outside && !defaultNamedType && valueParts.length === 0) set.add("*");
   }
-  return names;
+  return { names, typeOnly };
 }
 
 /**
