@@ -119,6 +119,10 @@
           "digest": "d70f3343194f687c"
         },
         {
+          "name": "Build CLI single-executable",
+          "digest": "d52321d613ac2dc0"
+        },
+        {
           "name": "Open the seeded thread in the built desktop app",
           "digest": "ef43acf89154cc0d"
         },
@@ -185,7 +189,7 @@
         },
         {
           "name": "Test release checks",
-          "digest": "f90a484690b87700"
+          "digest": "68583c4b4f5ed44c"
         },
         {
           "name": "Finish installing browser secret helper build libraries",
