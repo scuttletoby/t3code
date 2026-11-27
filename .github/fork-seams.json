@@ -257,15 +257,10 @@
       "added": [
         "import * as BackgroundWait from \"../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
         "const ended = yield* BackgroundWait.read(providerThread, input.taskIds, matched); // Fork: background wait (F7)",
-        "if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)"
-      ],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import * as ModelPolicyBackstop from \"../fork/modelPolicyBackstop.ts\"; // Fork: model policy backstop",
-          "Effect.andThen(ModelPolicyBackstop.checkAgentCommand(command, orchestrator)), // Fork: model policy backstop"
-        ]
-      }
+        "if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)",
+        "import * as ModelPolicyBackstop from \"../fork/modelPolicyBackstop.ts\"; // Fork: model policy backstop",
+        "Effect.andThen(ModelPolicyBackstop.checkAgentCommand(command, orchestrator)), // Fork: model policy backstop"
+      ]
     },
     "apps/server/src/orchestration-v2/ProviderTurnStartService.ts": {
       "why": "MCP profiles part 2: a Claude turn its MCP profile refuses never reached Claude, like the other refusals in this list.",

@@ -39,7 +39,12 @@ export type PolicyRoute =
   /** Claude's own Agent tool (claudeAgentModelPolicy.ts). */
   | "Agent"
   /** Claude's Skill tool, for a skill that runs in a sub-agent or names a model (same file). */
-  | "Skill";
+  | "Skill"
+  /**
+   * Any other thread command an agent's MCP call dispatches with a model, or a fork onto its
+   * source's model (the backstop, modelPolicyBackstop.ts).
+   */
+  | "agent command";
 
 /** Where the call names its model, for the refusal's hint. */
 const FIELDS: Record<PolicyRoute, string> = {
@@ -50,6 +55,8 @@ const FIELDS: Record<PolicyRoute, string> = {
   Agent: "the Agent call's model, with one of its efforts in effort",
   Skill:
     "the skill's frontmatter: model, with one of its efforts in effort (or use a skill that runs inline and names neither)",
+  "agent command":
+    "the call's model (a thread fork runs on its source thread's model: start the thread with t3_thread_launch or delegate_task and a model from the rows instead)",
 };
 
 /** Where the call names its model alone, and its options. */
@@ -60,6 +67,7 @@ const MODEL_FIELD: Record<PolicyRoute, string> = {
   t3_thread_configure: "modelSelection.model",
   Agent: "model",
   Skill: "the skill's frontmatter model",
+  "agent command": "the call's model",
 };
 const OPTIONS_FIELD: Record<PolicyRoute, string> = {
   delegate_task: "target.options",
@@ -68,6 +76,7 @@ const OPTIONS_FIELD: Record<PolicyRoute, string> = {
   t3_thread_configure: "modelSelection.options",
   Agent: "the call",
   Skill: "the skill's frontmatter",
+  "agent command": "the call's options",
 };
 
 /** What the agent does to fix a refused pick, per the verdict's `fix`. */
@@ -340,7 +349,23 @@ export interface PickCheckOptions {
    * keeps one line per agent pick as asked, and the paced line says what ran instead.
    */
   readonly logAs?: string;
+  /**
+   * False for the backstop's own check: it reads one command of the call, so it must not mark the
+   * call as checked by its route (the call's next command is read too).
+   */
+  readonly marksCall?: boolean;
 }
+
+/**
+ * The MCP calls whose route checked its own picks (by the request's scope, a new object for each
+ * request): the backstop (modelPolicyBackstop.ts) leaves their commands alone, so a pick is
+ * checked, and logged, once.
+ */
+const routeCheckedCalls = new WeakSet<McpInvocationContext.McpInvocationScope>();
+
+/** Whether this call's route checked its picks itself. */
+export const routeCheckedCall = (scope: McpInvocationContext.McpInvocationScope): boolean =>
+  routeCheckedCalls.has(scope);
 
 /**
  * The check of one pick, on the server settings of the service that builds it: it reads the
@@ -360,6 +385,10 @@ export const makePickCheck = Effect.gen(function* () {
     readPick: Effect.Effect<ServerPick | undefined>,
     options: PickCheckOptions = {},
   ) {
+    if (options.marksCall !== false) {
+      const scope = yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext);
+      if (Option.isSome(scope)) routeCheckedCalls.add(scope.value);
+    }
     if (Option.isNone(settings)) return undefined;
     const policy = Option.getOrUndefined(
       yield* settings.value.getSettings.pipe(
@@ -401,7 +430,7 @@ export const makePickCheck = Effect.gen(function* () {
  * The registry's providers, or none in a host built without it (a pick then has no driver, so
  * every row naming its model must allow it).
  */
-const currentProviders = Effect.serviceOption(ProviderRegistry.ProviderRegistry).pipe(
+export const currentProviders = Effect.serviceOption(ProviderRegistry.ProviderRegistry).pipe(
   Effect.flatMap(
     Option.match({
       onNone: () => Effect.succeed([] as ReadonlyArray<ServerProvider>),

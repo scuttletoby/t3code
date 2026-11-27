@@ -256,6 +256,7 @@ describe("the answer for a pick, per policy state", () => {
     assert.include(text("create_threads"), "target.model");
     assert.include(text("t3_thread_launch"), "modelSelection.model");
     assert.include(text("t3_thread_configure"), "modelSelection.model");
+    assert.include(text("agent command"), "source thread's model");
   });
 });
 
