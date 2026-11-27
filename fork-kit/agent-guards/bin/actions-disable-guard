@@ -32,8 +32,9 @@ How it reads a command (by parsing, not by pattern):
      Every other use is refused: a command word the guard does not know (taskset, chrt, unshare, sg, screen, tmux,
      at, expect, make, a project tool, a word from a variable), inline code or a script in any other language
      (python -c, node -e, a .py file), an HTTP client without a flag table, gh under an alias or an extension.
-     A guarded word in a comment is no code (#1057): comments are left out of Python (its tokenizer) and JS (whole
-     `//` lines) code that runs, and of the shell files read for CLAUDE_CODE_SIMPLE; other languages are read whole.
+     A shell comment in a file read for CLAUDE_CODE_SIMPLE (~/.bashrc, a sourced file) is no command (#1057), as
+     the shell reads it. The command's own text and Python, JS and other code are read whole, comments too: a
+     command can read its own comments ($BASH_EXECUTION_STRING), and a guess at another language's is a way past.
   4. Known command words only widen what passes; an unknown word never hides what follows it. The words behind it
      are read as a command of their own (`taskset 1 bash -c ..`), its quoted arguments as shell text
      (`sg users -c '..'`), and gh is still gh under a name the command gives it (`ln -s /usr/bin/gh g; ./g ..`).
@@ -2153,9 +2154,6 @@ def file_reason_now(path, ctx, force_shell):
         if not f['text']:   # changed under the guard since it was cached
             return unread(path, any_file=force_shell)
         tok = f['named']
-        if tok and file_lang(path, f['bang']):   # it names a guarded word: in code, or only in a comment (#1057)?
-            f = facts(path, ctx, ('named', 'code'))
-            tok = f['code'] if f['text'] else tok
         return tok and reason(f'{redact(os.path.basename(path))}: a script that names {tok}. The guard reads shell '
                               'scripts only, not code in other languages, so it cannot prove this one is harmless',
                               CODE_HINT + ' Run tests of this guard through a test runner that is handed their folder.')
@@ -2197,9 +2195,8 @@ def shebang(text):
 # One file per user: {"v": CACHE_VERSION, "guard": the stat of this guard file, "files": {path: entry}, "gh": {dirs:
 # entry}}. A file entry: {"sig": [dev, inode, size, mtime_ns, ctime_ns], "t": unix time of the reading, "text": true,
 # "own": byte-equal to this guard, "bang": the `#!` program or null without a `#!` line, "named": the guarded token
-# it names or null (only once it was looked for), "code": the same with the comments of its language left out}.
-# A gh entry: {"sig": [the sig or null (no file) per config.yml], "t", "aliases", "risky", "odd"}: gh_config_now()
-# of those files. Every entry is checked on use; a cache that is
+# it names or null (only once it was looked for)}. A gh entry: {"sig": [the sig or null (no file) per config.yml],
+# "t", "aliases", "risky", "odd"}: gh_config_now() of those files. Every entry is checked on use; a cache that is
 # not this user's own plain file, is too big, broken, from another guard file or version, counts as no cache.
 # Same-user code can forge it, as it can edit this guard: best effort against mistakes, not a wall (see the top).
 CACHE_FILE = 'cache-v1.json'
@@ -2300,7 +2297,7 @@ def file_entry_ok(e, now):
     labels = {label for label, _ in TOKENS}
     return isinstance(e, dict) and is_sig(e.get('sig')) and fresh(e.get('t'), now) and e.get('text') is True \
         and type(e.get('own')) is bool and (e.get('bang') is None or type(e.get('bang')) is str) \
-        and all(k not in e or e[k] is None or (type(e[k]) is str and e[k] in labels) for k in ('named', 'code'))
+        and ('named' not in e or e['named'] is None or (type(e['named']) is str and e['named'] in labels))
 
 
 def gh_entry_ok(e, now):
@@ -2358,21 +2355,17 @@ def cache_disk(ctx):
 def facts(path, ctx, need=()):
     """What the guard knows of a file: {'text': whether read_text() gives it, and then 'own' (byte-equal to this
     guard), 'bang' (the `#!` program, None without a `#!` line), 'named' (the guarded token it names, with 'named' in
-    need), 'code' (the same with its comments left out, with 'code' in need), '_body' (the text, with 'body' in
-    need)}. From this run's memo, else the cache, else the file."""
+    need), '_body' (the text, with 'body' in need)}. From this run's memo, else the cache, else the file."""
     memo = ctx.setdefault('memo', {})
     key = ('facts', path)
     f = memo.get(key)
     if f is None:
         f = cached_facts(path, ctx) or fresh_facts(path, ctx)
         memo[key] = f
-    if f['text'] and '_body' not in f and ('body' in need or any(k in need and k not in f for k in ('named', 'code'))):
+    if f['text'] and '_body' not in f and ('body' in need or ('named' in need and 'named' not in f)):
         f = memo[key] = fresh_facts(path, ctx)
     if f['text'] and 'named' in need and 'named' not in f:
         f['named'] = named(f['_body'])
-    if f['text'] and 'code' in need and 'code' not in f:   # #1057: a guarded word in a comment is no code
-        lang = file_lang(path, f['bang'])
-        f['code'] = named(uncomment(f['_body'], lang) if lang else f['_body'])
     return f
 
 
@@ -2387,7 +2380,7 @@ def cached_facts(path, ctx):
     e = disk['files'].get(path) if disk else None
     if not file_entry_ok(e, time.time()) or e['sig'] != file_sig(path):
         return None
-    return {k: e[k] for k in ('text', 'own', 'bang', 'named', 'code') if k in e}
+    return {k: e[k] for k in ('text', 'own', 'bang', 'named') if k in e}
 
 
 _OWN_SIZE = []
@@ -2824,76 +2817,12 @@ def named(text):
     return None
 
 
-# Comments are no code (#1057): a guarded word in one is not refused. Only where the language is known for sure:
-# shell text (the shell's own reading, Lex), Python (its tokenizer: a `#` in a string stays) and JavaScript (whole
-# lines that start with `//`: a `//` after code may be in a string or a regex). Code the guard cannot place (perl,
-# ruby, a file whose name and `#!` line disagree, a word with a part the guard cannot read, a heredoc the shell
-# expands first) is read whole, as before.
-JS_RUNNERS = {'node', 'nodejs', 'deno', 'bun'}
-JS_EXT = ('.js', '.mjs', '.cjs', '.ts', '.mts', '.cts')
-
-
-def code_lang(word):
-    """'python' or 'js': the comment syntax of the code the program `word` runs; None for any other."""
-    w = os.path.basename(word or '')
-    return 'python' if re.match(r'^(?:python|pypy)[\d.]*$', w) else 'js' if w in JS_RUNNERS else None
-
-
-def file_lang(path, bang):
-    """The language of a script file by its name and its `#!` program, only when they agree; else None."""
-    ext = os.path.splitext(path)[1].lower()
-    kinds = {'python' if ext in ('.py', '.pyw') else 'js' if ext in JS_EXT else None} if ext else set()
-    if bang:
-        kinds.add(code_lang(bang))
-    return kinds.pop() if len(kinds) == 1 else None
-
-
-def uncomment(text, lang):
-    """text without the comments of its language ('shell', 'python', 'js'); text itself for any other, and for
-    Python the tokenizer cannot read (broken code is read whole)."""
-    if lang == 'shell':
-        return Lex(text).uncommented()
-    if lang == 'js':
-        return '\n'.join(x for x in text.split('\n') if not x.lstrip().startswith('//'))
-    if lang != 'python':
-        return text
-    import io, tokenize
-    lines = text.splitlines(True)
-    try:
-        notes = [t for t in tokenize.generate_tokens(io.StringIO(text).readline) if t.type == tokenize.COMMENT]
-    except (SyntaxError, tokenize.TokenError, ValueError):
-        return text
-    for t in reversed(notes):   # one comment per line at most, to its end
-        (row, col), _ = t.start, t.end
-        line = lines[row - 1]
-        lines[row - 1] = line[:col] + line[len(line.rstrip('\r\n')):]
-    return ''.join(lines)
-
-
-def code_words(toks, h):
-    """The command's words with the inline code of a Python or JS interpreter uncommented (`python3 -c CODE`,
-    `node -e CODE`, `node --eval=CODE`, `deno eval CODE`); the words as they are for any other command."""
-    lang = code_lang(toks[h]) if h is not None else None
-    if not lang:
-        return toks
-    out, code_next = list(toks), False
-    for i in range(h + 1, len(toks)):
-        a = toks[i]
-        if code_next:
-            out[i], code_next = (a if hidden(a) else uncomment(a, lang)), False
-            continue
-        if lang == 'python':
-            m = re.match(r'^-[bBdEhiIOPqsSuvx]*c(.*)$', a, re.S)
-        elif os.path.basename(toks[h]) == 'deno' and a == 'eval':
-            code_next = True
-            continue
-        else:
-            m = re.match(r'^(?:-[ep]|-pe|-ep|--eval|--print)(?:=(.*))?$', a, re.S)
-        if m and m.group(1):
-            out[i] = a if hidden(a) else a[:m.start(1)] + uncomment(m.group(1), lang)
-        elif m:
-            code_next = True
-    return out
+def shell_uncomment(text):
+    """Shell text without its comments, as the shell itself reads them (#1057): a guarded word in a `#` comment
+    of a file the shell reads for CLAUDE_CODE_SIMPLE (~/.bashrc, a sourced file) is no command. Not for the command
+    itself (it can read its own comments from $BASH_EXECUTION_STRING), nor for Python, JS or other code: a guess at
+    another language's comments is a way past the guard (#1108)."""
+    return Lex(text).uncommented()
 
 
 REFUSE_TAG = "this machine's refuseScripts"   # in the label refuse_script_named() gives
@@ -3788,14 +3717,14 @@ def start_files(ctx):
         text = read_named(f, ctx)
         if text is None:
             return f'the command reads {f}, which the guard cannot read, and it may set {NO_HOOKS_ENV}'
-        if NO_HOOKS_ENV.lower() in uncomment(text, 'shell').lower():
+        if NO_HOOKS_ENV.lower() in shell_uncomment(text).lower():
             return f'the command reads {f}, which names {NO_HOOKS_ENV}'
     if re.search(r'(?<![\w$])(?:BASH_ENV|ENV)=', ctx.get('all') or ''):
         return f'the command sets BASH_ENV or ENV: a file the shell reads first may set {NO_HOOKS_ENV}'
     home = ctx['env'].get('HOME') or ''
     for name in START_FILES if os.path.isabs(home) else ():
         text = read_text(os.path.join(home, name))
-        if text and NO_HOOKS_ENV.lower() in uncomment(text, 'shell').lower():
+        if text and NO_HOOKS_ENV.lower() in shell_uncomment(text).lower():
             return f'~/{name} names {NO_HOOKS_ENV}'
     return None
 
@@ -3997,11 +3926,7 @@ def segment_reason(toks, ctx, loose):
                              f'run it as a command of its own. As shell: {what}')
         if r:
             return r
-    stdin = ctx.get('stdin') or ''
-    # `python3 - <<'E'`: stdin is code, and its comments are no code (#1057); stdin a script reads is data
-    lang = code_lang(toks[h]) if h is not None and stdin and not SHELL_VALUE.search(stdin) \
-        and stdin_runs(toks, ctx.get('writes'), loose) else None
-    own, fed = named(' '.join(code_words(toks, h))), named(uncomment(stdin, lang))
+    own, fed = named(' '.join(toks)), named(ctx.get('stdin') or '')
     if h is None:
         if own and exported(toks, flow):
             flow['env'] = own
@@ -4953,8 +4878,7 @@ def decide_text(text, ctx, scan_raw=True):
             kind = 'code' if kind == 'data' and no_cmd and group_code else kind
             # python3 - < f, node < f, perl < f: a refuse-script line in code an interpreter runs (also a script it
             # gets as data unless it is an allow-listed data reader: ends_text), as for a shell
-            lang = code_lang(variants[0][h0]) if h0 is not None and not SHELL_VALUE.search(body) else None
-            tok = kind == 'code' and (named(uncomment(body, lang)) or REFUSE_SCRIPTS and (
+            tok = kind == 'code' and (named(body) or REFUSE_SCRIPTS and (
                 stdin_runs(variants[0], how, loose) or how or not ends_text(variants, c)) and refuse_script_named(body))
             if tok:
                 return unproven(tok, 'in inline code (a heredoc into an interpreter, or a script in another '
@@ -4982,8 +4906,7 @@ def decide(cmd, cwd, env, budget=None, use_id=None, saves=None):
     (cache_save catches it) must not leave the marker's reads with no time limit."""
     if not cmd or (QUICK and quick_pass(cmd) and not quick_shadowed(cmd, cwd, env)):
         return None
-    ctx = {'cwd': cwd or os.getcwd(), 'env': env, 'depth': 0, 'raw': cmd, 'all': uncomment(cmd, 'shell'), 'memo': {},
-           'flow': {},
+    ctx = {'cwd': cwd or os.getcwd(), 'env': env, 'depth': 0, 'raw': cmd, 'all': cmd, 'memo': {}, 'flow': {},
            'stop_at': None if budget is None else time.monotonic() + budget, 'cache': {}}
     try:
         why = decide_text(cmd, ctx) or flow_reason(ctx['flow'])
