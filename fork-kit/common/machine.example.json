@@ -1,5 +1,9 @@
 {
   "version": 1,
+  "alert": {
+    "command": ["/srv/example/bin/notify-owner", "--topic", "machine"],
+    "timeoutSeconds": 60
+  },
   "heavy": {
     "sweep": {
       "stop": false,
@@ -167,7 +171,6 @@
     "timeZone": "Europe/London",
     "windowMinutes": 120,
     "retryMinutes": 15,
-    "alertCommand": ["/srv/example/bin/notify-owner", "--topic", "updates"],
     "alertOnBoot": false,
     "containerUsers": ["example-agent"],
     "systemDocker": true,

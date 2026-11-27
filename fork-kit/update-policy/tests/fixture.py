@@ -73,7 +73,7 @@ class FakeMachine(tick.Machine):
         self.clock = clock
         self.boot = at('2026-11-20 00:00')
         self.boot_ids = ['boot-1']
-        self.reboots, self.alerts = [], []
+        self.reboots, self.alerts, self.alert_calls = [], [], []
         self.reboot_error = None
         self.alert_error = None
 
@@ -90,8 +90,9 @@ class FakeMachine(tick.Machine):
         self.reboots.append(why)
         return self.reboot_error
 
-    def alert(self, command, event, text):
+    def alert(self, command, event, text, timeout=None):
         self.alerts.append((event, text))
+        self.alert_calls.append((command, event, timeout))
         return self.alert_error
 
 

@@ -4,18 +4,53 @@ rule in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/update-policy/tests/tick.test.py
 """
-import datetime, json, os, sys, unittest
+import datetime, functools, json, os, re, shutil, sys, tempfile, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fixture as fx  # noqa: E402
 from fixture import at, settings, tick, window  # noqa: E402
+import alert  # noqa: E402
+from updatepolicy import exposure  # noqa: E402
 
 MIN = datetime.timedelta(minutes=1)
 # a fake GitHub token for the alertCommand refusal, built at run time so the source holds no token-shaped string
 # (the secret scan's generic-api-key rule; the first push held it whole, allowed by value in .gitleaks.toml)
 FAKE_GH_TOKEN = 'ghp' + '_' + 'abcdefgh' + '12345678'
 SINCE = at('2026-11-23 06:40')
+HANG = '/usr/local/bin/notify-hangs'
+# seconds a run needs besides its alerts: the look, apt-config, the last look and systemctl reboot (60 s of its own)
+REST_OF_THE_RUN = 120
+
+
+def unit_seconds(name, key, default=None):
+    """A time limit of one of the kit's systemd units, in seconds ('5min', '90s', '300')."""
+    with open(os.path.join(fx.KIT, 'systemd', name)) as f:
+        found = re.search(rf'^{key}=([0-9]+)(min|s)?$', f.read(), re.M)
+    if not found:
+        return default
+    return int(found.group(1)) * (60 if found.group(2) == 'min' else 1)
+
+
+def largest_alert_timeout():
+    """The largest timeoutSeconds the machine file's "alert" section accepts."""
+    check = alert.SPEC['timeoutSeconds'][2]
+    return max(v for v in range(1, 3601) if check(v) is None)
+
+
+def hang_alerts(m, host):
+    """The alert command HANG never answers: each run of it takes its whole timeout on a fake clock (returned: a
+    list holding the seconds gone). m runs the real Machine.alert."""
+    clock, run = [0], host.run
+
+    def hanging(argv, timeout=20, **kw):
+        if argv[0] == HANG:
+            clock[0] += timeout
+            return None, '', f'{argv[0]}: no answer within {timeout} s'
+        return run(argv, timeout=timeout, **kw)
+    host.run, m.monotonic = hanging, lambda: clock[0]
+    m.alert = functools.partial(tick.Machine.alert, m)
+    return clock
 PENDING = tick.Pending(SINCE, ['linux-image-6.8.0-50-generic'])
 
 
@@ -214,6 +249,37 @@ class Settings(unittest.TestCase):
                                            'https://ntfy.example/updates', '--key-file=/etc/notify/key'])
         self.assertEqual(len(s['alertCommand']), 6)
 
+    def machine_file(self, content):
+        folder = tempfile.mkdtemp(prefix='update-policy-machine-')
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        os.chmod(folder, 0o755)
+        path = os.path.join(folder, 'machine.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(dict(content, version=1), f)
+        os.chmod(path, 0o644)
+        return path
+
+    def test_the_shared_alert_channel_is_used_when_the_kit_has_no_command_of_its_own(self):
+        base = {'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}
+        shared = {'command': ['/usr/local/bin/notify-all', '--topic', 'machine'], 'timeoutSeconds': 30}
+        uid = os.getuid()
+        s = settings.read(self.machine_file({'update-policy': base, 'alert': shared}), owner_uid=uid)
+        self.assertEqual((s['alertCommand'], s['alertTimeout'], s['alertSource']),
+                         (shared['command'], 30, 'alert'))
+        own = dict(base, alertCommand=['/usr/local/bin/notify-owner'])
+        s = settings.read(self.machine_file({'update-policy': own, 'alert': shared}), owner_uid=uid)
+        self.assertEqual((s['alertCommand'], s['alertTimeout'], s['alertSource']),
+                         (['/usr/local/bin/notify-owner'], 60, 'update-policy'))     # its own wins
+        s = settings.read(self.machine_file({'update-policy': base}), owner_uid=uid)
+        self.assertEqual((s['alertCommand'], s['alertSource']), ([], None))       # neither: the journal only
+        for bad, words in (({'command': []}, 'must name a program'), ({'command': ['notify']}, 'absolute path'),
+                           ({}, '"command" is missing'), ({'command': ['/x'], 'timeoutSeconds': 121}, '5 to 120'),
+                           ({'command': ['/x'], 'retries': 3}, 'unknown key'),
+                           ({'command': ['/usr/bin/notify', FAKE_GH_TOKEN]}, 'token')):
+            with self.subTest(bad=bad), self.assertRaises(settings.MachineFileError) as e:
+                settings.read(self.machine_file({'update-policy': base, 'alert': bad}), owner_uid=uid)
+            self.assertIn(words, str(e.exception))       # a broken section is never taken for "no channel"
+
     def test_the_example_machine_file_section_parses(self):
         with open(os.path.join(fx.COMMON, 'machine.example.json')) as f:
             section = json.load(f)[settings.SECTION]
@@ -323,12 +389,40 @@ class TickOnHost(fx.HostCase):
         self.assertEqual(self.state()['lastAlertError'], 'exit 7')
         self.assertEqual(self.m.reboots, [])
 
+    def test_hanging_alerts_leave_the_tick_time_to_save_that_they_failed(self):
+        """With the largest timeout the machine file allows, two alerts that hang in one tick (apt restarts by
+        itself, then the restart fails) still leave the tick inside update-policy.service's time limit with the
+        failure in the state, so the baseline reports it and the next tick does not send the same alert again."""
+        limit = unit_seconds('update-policy.service', 'TimeoutStartSec')
+        s = settings.check({'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}, 'test',
+                           {'command': [HANG], 'timeoutSeconds': largest_alert_timeout()})
+        self.pending(SINCE)
+        self.host.answers['apt-config'] = (0, 'Unattended-Upgrade::Automatic-Reboot "true";\n', '')
+        self.m.reboot_error = 'Access denied'
+        clock, writes, write = hang_alerts(self.m, self.host), [], self.m.write_state
+        self.m.write_state = lambda st: writes.append(clock[0]) or write(st)
+        self.assertEqual(self.tick(s), 1)
+        self.assertGreaterEqual(self.m.log.text().count('the alert command failed'), 2)
+        self.assertLessEqual(clock[0] + REST_OF_THE_RUN, limit)
+        self.assertTrue(writes)
+        self.assertLessEqual(max(writes) + REST_OF_THE_RUN, limit)
+        state = self.state()
+        self.assertIn('aptAlertAt', state)                        # sent (and failed): not again on the next tick
+        self.assertTrue(state['lastAlertError'])                  # the baseline reports it
+
     def test_no_alert_command_alerts_go_to_the_journal(self):
         self.pending(SINCE)
         self.assertEqual(self.tick(fx.make_settings(role='live')), 0)
         self.assertEqual(self.m.alerts, [])
-        self.assertIn('alert live-restart-pending (no alertCommand in the machine file): restart pending',
-                      self.m.log.text())
+        self.assertIn('alert live-restart-pending (no alert channel in the machine file: no "alert" section and no '
+                      'alertCommand): restart pending', self.m.log.text())
+
+    def test_the_alert_goes_out_with_the_channel_timeout(self):
+        self.pending(SINCE)
+        channel = {'command': ['/usr/local/bin/notify-all'], 'timeoutSeconds': 20}
+        s = settings.check({'role': 'live', 'quietHour': '05:00', 'timeZone': 'UTC'}, 'test', channel)
+        self.assertEqual(self.tick(s), 0)
+        self.assertEqual(self.m.alert_calls, [(['/usr/local/bin/notify-all'], 'live-restart-pending', 20)])
 
     def test_no_machine_file_never_restarts_and_says_so_once_an_hour(self):
         broken = settings.MachineFileError('/etc/fork-kit/machine.json: no "update-policy" section')
@@ -410,7 +504,7 @@ class Cli(fx.HostCase):
         def broken():
             raise settings.MachineFileError('/etc/fork-kit/machine.json: not there')
         with mock.patch('builtins.print'):
-            for cmd in ('idle', 'status', 'baseline'):
+            for cmd in ('idle', 'status', 'baseline', 'test-alert'):
                 self.assertEqual(fx.cli.main([cmd], host=self.host, read_settings=broken), 1, cmd)
 
     def test_alert_command_gets_the_text_on_stdin_and_the_event(self):
@@ -420,12 +514,65 @@ class Cli(fx.HostCase):
         argv, stdin, env = self.host.calls[-1]
         self.assertEqual((argv, stdin, env['UPDATE_POLICY_EVENT']), (['/usr/local/bin/notify', '--topic', 'x'],
                                                                       'two\nlines\n', 'drift'))
-        self.assertEqual(sorted(env), ['LANG', 'PATH', 'UPDATE_POLICY_EVENT', 'UPDATE_POLICY_HOST'])
+        self.assertEqual(sorted(env), ['FORK_KIT_ALERT_EVENT', 'FORK_KIT_ALERT_HOST', 'FORK_KIT_ALERT_KIT', 'LANG',
+                                       'PATH', 'UPDATE_POLICY_EVENT', 'UPDATE_POLICY_HOST'])
+        self.assertEqual((env['FORK_KIT_ALERT_KIT'], env['FORK_KIT_ALERT_EVENT']), ('update-policy', 'drift'))
+        self.assertEqual(env['FORK_KIT_ALERT_HOST'], env['UPDATE_POLICY_HOST'])
         self.host.answers['/usr/local/bin/notify'] = (3, '', 'no network')
         self.assertEqual(m.alert(['/usr/local/bin/notify'], 'drift', 'x'), 'no network')
 
+    def test_the_alert_budgets_fit_inside_the_units_time_limits(self):
+        """One alert at the largest timeout fits a run's budget; the budget and the rest of the run fit each unit
+        that alerts; exposure-alert (an ExecStopPost=, under TimeoutStopSec: 90 s by default) has its own."""
+        self.assertLessEqual(largest_alert_timeout(), tick.ALERT_BUDGET)
+        for unit in ('update-policy.service', 'update-policy-boot.service', 'update-policy-baseline.service'):
+            with self.subTest(unit=unit):
+                self.assertLessEqual(tick.ALERT_BUDGET + REST_OF_THE_RUN, unit_seconds(unit, 'TimeoutStartSec'))
+        stop = unit_seconds('update-policy-exposure.service', 'TimeoutStopSec', default=90)
+        self.assertLessEqual(exposure.ALERT_BUDGET + 10, stop)
+        m = fx.FakeMachine(self.host, at('2026-11-24 07:00'))
+        clock = hang_alerts(m, self.host)
+        m.limit_alerts(exposure.ALERT_BUDGET)
+        s = settings.check({'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}, 'test',
+                           {'command': [HANG], 'timeoutSeconds': largest_alert_timeout()})
+        for _ in range(3):
+            self.assertTrue(tick.send_alert(m, s, 'exposure', 'x'))
+        self.assertLessEqual(clock[0], exposure.ALERT_BUDGET)
+        self.assertIn('not sent: the alerts of this run already took their 75 s', m.log.text())
+
+    def test_test_alert_says_which_channel_took_it(self):
+        base = {'role': 'dev', 'quietHour': '05:00', 'timeZone': 'UTC'}
+        m = fx.FakeMachine(self.host, at('2026-11-24 08:00'))
+        cases = ((settings.check(dict(base, alertCommand=['/usr/local/bin/own']), 'test',
+                                 {'command': ['/usr/local/bin/shared'], 'timeoutSeconds': 60}),
+                  None, 0, 'sent through the update-policy alertCommand'),
+                 (settings.check(base, 'test', {'command': ['/usr/local/bin/shared'], 'timeoutSeconds': 60}),
+                  None, 0, 'sent through the machine file\'s "alert" section'),
+                 (settings.check(base, 'test', {'command': ['/usr/local/bin/shared'], 'timeoutSeconds': 60}),
+                  'exit 7', 1, 'and it failed: exit 7'),
+                 (settings.check(base, 'test'), None, 1, 'no alert channel'))
+        for s, error, code, words in cases:
+            with self.subTest(words=words), mock.patch('builtins.print') as out, \
+                    mock.patch.object(fx.cli, 'make', lambda host=None: (self.host, m)):
+                m.alert_error, sent = error, len(m.alert_calls)
+                self.assertEqual(fx.cli.main(['test-alert'], host=self.host, read_settings=lambda: s), code)
+                self.assertIn(words, out.call_args_list[-1].args[0])
+                self.assertEqual(len(m.alert_calls) - sent, 0 if words == 'no alert channel' else 1)
+        self.assertEqual([c[0] for c in m.alert_calls],
+                         [['/usr/local/bin/own'], ['/usr/local/bin/shared'], ['/usr/local/bin/shared']])
+        self.assertEqual({c[1] for c in m.alert_calls}, {'test'})
+
 
 MUTATIONS = {
+    'the shared alert channel is the fallback': (
+        'settings', "    if not out['alertCommand'] and channel:", "    if False:",
+        'Settings.test_the_shared_alert_channel_is_used_when_the_kit_has_no_command_of_its_own'),
+    'all the alerts of a run share one budget': (
+        'tick', "        timeout = min(timeout, int(self.alert_left))", "        pass",
+        'TickOnHost.test_hanging_alerts_leave_the_tick_time_to_save_that_they_failed'),
+    'the alert runs with its channel timeout': (
+        'tick', "timeout=s.get('alertTimeout') or alert_channel.TIMEOUT)", "timeout=None)",
+        'TickOnHost.test_the_alert_goes_out_with_the_channel_timeout'),
     'live never restarts': (
         'tick', "    if s['role'] not in settings_mod.RESTARTS:\n        if 'live' not in alerted:",
         "    if False:\n        if 'live' not in alerted:",
@@ -455,7 +602,7 @@ MUTATIONS = {
         'tick', "    m.write_state(st)\n    if restart:", "    if restart:",
         'TickOnHost.test_the_state_is_written_before_the_restart'),
     'token-looking alert arguments are refused': (
-        'settings', "        if any(r.search(x) for r in TOKEN_RES):", "        if False:",
+        'settings', "    return alert.command_problem(value) if value else None", "    return None",
         'Settings.test_role_quiet_hour_and_time_zone_are_required_and_checked'),
     'a restart that did not come is reported': (
         'tick', "    if (asked and st.get('restartBoot') == boot", "    if (False and st.get('restartBoot') == boot",
