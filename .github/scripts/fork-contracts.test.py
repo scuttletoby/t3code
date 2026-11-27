@@ -4893,6 +4893,9 @@ RECORDS_REFUSED = {
     # A test that did not really run.
     "a test that failed": (set_row("fork-kit/k1.test.py", {**PY_OK, "status": 1}), {},
                            "fork-kit/k1.test.py failed (exit 1)"),
+    "a test stopped at its time limit (says so, not exit None)": (set_row(
+        "fork-kit/k1.test.py", {**PY_OK, "status": None, "timed_out": 240}), {},
+        "fork-kit/k1.test.py timed out after 240 s"),
     "a test that ran zero tests": (set_row("fork-kit/k1.test.py", PY_NONE), {},
                                    "fork-kit/k1.test.py ran no test (0 found, 0 skipped)"),
     "a test that skipped all its tests (both declared)": (

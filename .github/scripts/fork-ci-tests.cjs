@@ -3,6 +3,7 @@
 // (only fork-tests.yml, or as RUN_ELSEWHERE says). Unlisted, runner-less, or gone-once-listed tests fail.
 // Arguments pick a part by path prefix (`fork-kit/`, `!fork-kit/`; none: all), FORK_CI_TEST_SHARD one shard of it.
 const childProcess = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -245,6 +246,28 @@ function readShard(env = process.env) {
   if (!match || Number(match[1]) > Number(match[2]))
     throw new Error(`FORK_CI_TEST_SHARD="${value}": expected <index>/<count>, 1 <= index <= count`);
   return { index: Number(match[1]), count: Number(match[2]) };
+}
+
+// A test file's time limit in seconds: FORK_CI_TEST_LIMIT when set, else LIMIT_TIMES its weight, at least LIMIT_FLOOR.
+// Under the jobs' limits, so a hung test fails with its file named and its output shown. A setting that is not a
+// positive number, or is over LIMIT_MAX (a longer setTimeout fires at once), throws, so a typo cannot lift every
+// limit. The largest weight the list takes (99999 s) stays under it.
+const LIMIT_FLOOR = 240;
+const LIMIT_TIMES = 3;
+const LIMIT_MAX = Math.floor((2 ** 31 - 1) / 1000);
+function fileLimit(weight, env = process.env) {
+  const value = env.FORK_CI_TEST_LIMIT ?? "";
+  if (value !== "") {
+    const seconds = Number(value);
+    if (!/^\d+(?:\.\d+)?$/.test(value) || !(seconds > 0))
+      throw new Error(`FORK_CI_TEST_LIMIT="${value}": expected a number of seconds above 0`);
+    if (seconds > LIMIT_MAX)
+      throw new Error(
+        `FORK_CI_TEST_LIMIT="${value}": at most ${LIMIT_MAX} s (the longest timer Node keeps)`,
+      );
+    return seconds;
+  }
+  return Math.max(LIMIT_FLOOR, LIMIT_TIMES * (weight ?? 0));
 }
 
 // Whether `file` is in the part the arguments name: under one of the `<prefix>` ones (any, when there are none),
@@ -611,7 +634,12 @@ function countTests(file, stdout, stderr, lines = [], how = {}) {
 function recordProblems(record) {
   const problems = [];
   const name = record.key;
-  if (record.status !== 0) problems.push(`${name} failed (exit ${record.status})`);
+  if (record.status !== 0)
+    problems.push(
+      record.timed_out
+        ? `${name} timed out after ${record.timed_out} s`
+        : `${name} failed (exit ${record.status})`,
+    );
   if (record.tests === null)
     problems.push(
       `${name}: its output shows no test count${record.note ? ` (${record.note})` : ""}, so no test is known to ` +
@@ -668,6 +696,8 @@ function record(key, file, run, result, allowed, format = null) {
     vars: run?.vars ?? [],
     only: run?.only ?? null,
     status: result.status,
+    // The limit in seconds a test was stopped at (status null), else null.
+    timed_out: result.timed_out ?? null,
     seconds: Number(result.seconds),
     format: counts?.format ?? null,
     tests: counts?.tests ?? null,
@@ -843,10 +873,51 @@ function readCounts(file) {
     });
 }
 
+// The last lines of a test's output a failure repeats outside its group (GitHub shows a group folded), each cut to
+// TAIL_WIDTH, between stop-commands markers so a test's own `::error` line there is not a second annotation.
+const TAIL_LINES = 20;
+const TAIL_WIDTH = 500;
+function tailText(text) {
+  const tail = text.trimEnd().split("\n").slice(-TAIL_LINES);
+  const token = `fork-ci-tail-${crypto.randomUUID()}`;
+  const lines = tail.map((line) =>
+    line.length > TAIL_WIDTH ? `${line.slice(0, TAIL_WIDTH)}...` : line,
+  );
+  return {
+    count: tail.length,
+    text: `::stop-commands::${token}\n${lines.join("\n")}\n::${token}::`,
+  };
+}
+// Each test runs in its own process group (detached), so its limit stops what it started too. Those groups are not
+// in this script's group, so a stop of this script (Ctrl-C, a cancel) passes on to them.
+const groups = new Set();
+let passingStops = false;
+function passStopsOn() {
+  if (passingStops) return;
+  passingStops = true;
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"])
+    process.once(sig, () => {
+      for (const pid of groups) signalGroup(pid, "SIGTERM");
+      process.kill(process.pid, sig);
+    });
+}
+function signalGroup(pid, sig) {
+  try {
+    process.kill(-pid, sig);
+    return true;
+  } catch {
+    return false;
+  }
+}
+// After a test's time limit: SIGTERM, then SIGKILL this long after, then the test counts as ended this long after that
+// even if it has not (a process as root this user cannot signal).
+const KILL_GRACE_MS = 5000;
+
 // Runs one test file (`run`: one of its own runs), its stdout and stderr shown together as one group when it ends, and
 // each also kept on its own (countTests()), with a Python or node test's counts (`unittest`, readCounts()) from a file
 // of this run only: a new folder each time, made here (so a run as root adds to a file this user owns), then removed.
-function runTest(file, run = null) {
+// `limit`: seconds (fileLimit()) after which the test is stopped and fails as timed out; none without one.
+function runTest(file, run = null, { limit = null } = {}) {
   const countsDir = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-counts-"));
   const counts = path.join(countsDir, "counts.jsonl");
   fs.writeFileSync(counts, "", { flag: "wx", mode: 0o644 });
@@ -854,11 +925,14 @@ function runTest(file, run = null) {
   const [cmd, ...args] = argv;
   const started = Date.now();
   return new Promise((resolve) => {
+    passStopsOn();
     const child = childProcess.spawn(cmd, args, {
       cwd: ROOT,
       env,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
     });
+    if (child.pid) groups.add(child.pid);
     const output = [];
     const stdout = [];
     const stderr = [];
@@ -871,24 +945,36 @@ function runTest(file, run = null) {
       stderr.push(chunk);
     });
     let ended = false;
+    let timedOut = false;
+    const timers = [];
     const done = (status, signal) => {
       if (ended) return;
       ended = true;
+      groups.delete(child.pid);
+      for (const timer of timers) clearTimeout(timer);
       // Stop reading pipes a left-behind process still holds, so they do not keep this script alive.
       child.stdout.destroy();
       child.stderr.destroy();
+      if (timedOut) child.unref(); // a process it could not stop must not keep this script alive either
       const seconds = ((Date.now() - started) / 1000).toFixed(1);
       const label = run ? ` --run ${runLabel(run)}`.trimEnd() : "";
+      const text = Buffer.concat(output);
       process.stdout.write(`::group::${file}${label} (${seconds} s)\n`);
-      process.stdout.write(Buffer.concat(output));
+      process.stdout.write(text);
       process.stdout.write("\n::endgroup::\n");
-      if (status !== 0)
-        console.log(`::error file=${file}::${file}${label} failed (exit ${status ?? signal})`);
+      if (timedOut) status = null;
+      if (status !== 0) {
+        const why = timedOut ? `timed out after ${limit} s` : `failed (exit ${status ?? signal})`;
+        console.log(`::error file=${file}::${file}${label} ${why}`);
+        const tail = tailText(text.toString("utf8"));
+        console.log(`Last ${tail.count} line(s) of ${file}${label}:\n${tail.text}`);
+      }
       const unittest = readCounts(counts);
       fs.rmSync(countsDir, { recursive: true, force: true });
       resolve({
         file,
         status,
+        timed_out: timedOut ? limit : null,
         seconds,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
@@ -902,6 +988,28 @@ function runTest(file, run = null) {
     child.on("close", done);
     // A process the test left behind may hold the pipes open: the test is done when it exits.
     child.on("exit", (status, signal) => setTimeout(() => done(status, signal), 5000).unref());
+    // A test that never ends (a thread, a child or a read that waits for ever) is stopped at its limit and fails.
+    // The whole group (a process as root in it this user cannot signal: the test's own process at least).
+    const stop = (sig) => {
+      if (!signalGroup(child.pid, sig))
+        try {
+          child.kill(sig);
+        } catch {}
+    };
+    if (limit !== null)
+      timers.push(
+        setTimeout(() => {
+          timedOut = true;
+          output.push(
+            Buffer.from(
+              `\nfork-ci-tests: ${file} did not end within ${limit} s: stopping it (SIGTERM, then SIGKILL)\n`,
+            ),
+          );
+          stop("SIGTERM");
+          timers.push(setTimeout(() => stop("SIGKILL"), KILL_GRACE_MS));
+          timers.push(setTimeout(() => done(null, "timeout"), 2 * KILL_GRACE_MS));
+        }, limit * 1000),
+      );
   });
 }
 
@@ -931,7 +1039,7 @@ async function runOwn(args, { runTest: run = runTest } = {}) {
   }
   const results = [];
   for (const how of own.runs) {
-    const result = await run(file, how);
+    const result = await run(file, how, { limit: fileLimit(entry.weight) });
     results.push(record(runKey(file, how), file, how, result, [], entry.format));
   }
   let failed = results.filter((r) => r.status !== 0).length;
@@ -1000,7 +1108,10 @@ async function main(
   const mine = shard(result.run, entries, index, count);
   const jobs = jobCount();
   const started = now();
-  const runs = await runAll(order(mine, entries), jobs, (file) => run(file));
+  const limits = new Map(mine.map((file) => [file, fileLimit(weight.get(file))]));
+  const runs = await runAll(order(mine, entries), jobs, (file) =>
+    run(file, null, { limit: limits.get(file) }),
+  );
   const seconds = (now() - started) / 1000;
   const judged = judge(runs, weight);
   const { speed } = judged;
@@ -1100,6 +1211,7 @@ async function main(
 
 module.exports = {
   plan,
+  fileLimit,
   jsCode,
   readList,
   order,
