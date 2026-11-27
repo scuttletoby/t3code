@@ -353,11 +353,7 @@ class LauncherTest(unittest.TestCase):
         hook = self.stand_in('actions-disable-guard')
         with open(hook, 'rb') as f:
             source = f.read()
-        pyc = importlib.util.cache_from_source(hook)
-        os.makedirs(os.path.dirname(pyc))
-        with open(pyc, 'wb') as f:   # the header of a checked hash-based .pyc (PEP 552), then the code
-            f.write(importlib.util.MAGIC_NUMBER + (3).to_bytes(4, 'little') + importlib.util.source_hash(source)
-                    + marshal.dumps(compile('print("FROM-PYC")', hook, 'exec')))
+        pyc = self.pyc(hook, 3, source, 'print("FROM-PYC")')   # a checked hash-based .pyc (PEP 552)
         self.assertEqual(self.via(hook, event('pnpm test')).stdout, b'FROM-PYC\n')
         with open(hook, 'a') as f:
             f.write('# changed after install\n')
@@ -365,6 +361,7 @@ class LauncherTest(unittest.TestCase):
         # and the real thing: py_compile's checked hash .pyc of the file as it is now is taken (its code is named
         # after the file it was compiled from; the source compiled here is named after the path the hook was given)
         py_compile.compile(hook, cfile=pyc, doraise=True, invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
+        os.chmod(pyc, 0o644)   # as the installer does (py_compile takes the source's mode, which follows the umask)
         link = os.path.join(self.tmp, 'links', 'actions-disable-guard')
         os.makedirs(os.path.dirname(link))
         os.symlink(hook, link)
@@ -386,12 +383,15 @@ class LauncherTest(unittest.TestCase):
 
     @staticmethod
     def pyc(path, flags, source, text):
-        """A hash-based .pyc (PEP 552) for `path`: flags 3 checked, 1 unchecked; `text` is its code."""
+        """A hash-based .pyc (PEP 552) for `path`: flags 3 checked, 1 unchecked; `text` is its code. Mode 0644, as
+        the installer writes it (kit_install.bytecode_files), whatever the umask: under a umask of 0002 a new file
+        is group-writable, and hook_code rightly never uses such a .pyc."""
         pyc = importlib.util.cache_from_source(path)
         os.makedirs(os.path.dirname(pyc), exist_ok=True)
         with open(pyc, 'wb') as f:
             f.write(importlib.util.MAGIC_NUMBER + flags.to_bytes(4, 'little') + importlib.util.source_hash(source)
                     + marshal.dumps(compile(text, path, 'exec')))
+        os.chmod(pyc, 0o644)
         return pyc
 
     def test_through_the_bin_folder_of_links_only_the_version_copys_checked_pyc_runs(self):
