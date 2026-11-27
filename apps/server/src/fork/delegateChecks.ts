@@ -39,6 +39,7 @@ import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
 import * as LaunchMcpProfile from "./launchMcpProfile.ts";
 import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
 import * as PlacementAdvice from "./placementAdvice.ts";
+import { readPlacementForThisOs } from "./placementRead.ts";
 import * as RemoteTaskPrompts from "./remoteTaskPrompts.ts";
 
 /** A checked delegation target (the same shape as the service's resolved target). */
@@ -543,7 +544,9 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
     result: BeforeWorkspaceResult,
   ) {
     const settings = yield* serverSettings.getSettings.pipe(Effect.option);
-    if (Option.isNone(settings) || settings.value.placement.mode === "off") return result;
+    if (Option.isNone(settings) || (yield* readPlacementForThisOs(settings.value)).mode === "off") {
+      return result;
+    }
     const runtimeMode = yield* resolveRuntimeMode(
       input.parent.thread.runtimeMode,
       input.runtimeMode,

@@ -14,6 +14,7 @@ import {
   type ServerSettings as Settings,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -36,13 +37,26 @@ const hereId = EnvironmentId.make("environment:here");
 const boxId = EnvironmentId.make("environment:box");
 const KEY = "github.com/example/widgets";
 
-const settingsIn = (mode: PlacementMode): Settings => ({
+/** What this machine's settings say besides the mode: its labels, never groups, project needs. */
+interface Placed {
+  readonly labels?: ReadonlyArray<string>;
+  readonly never?: ReadonlyArray<ReadonlyArray<string>>;
+  readonly needs?: ReadonlyArray<string>;
+}
+
+const settingsIn = (mode: PlacementMode, placed: Placed = {}): Settings => ({
   ...DEFAULT_SERVER_SETTINGS,
-  placement: { ...DEFAULT_PLACEMENT_SETTINGS, mode },
+  ...(placed.needs === undefined ? {} : { placementNeeds: placed.needs }),
+  placement: {
+    ...DEFAULT_PLACEMENT_SETTINGS,
+    mode,
+    labels: placed.labels ?? [],
+    never: placed.never ?? [],
+  },
 });
 
-const input = (mode: PlacementMode): PlacementAdvice.AdviceInput => ({
-  settings: settingsIn(mode),
+const input = (mode: PlacementMode, placed: Placed = {}): PlacementAdvice.AdviceInput => ({
+  settings: settingsIn(mode, placed),
   projectId: ProjectId.make("project:widgets"),
   runtimeMode: "full-access",
   driverKind: "codex" as PlacementAdvice.AdviceInput["driverKind"],
@@ -72,6 +86,8 @@ interface There {
   readonly facts?: unknown;
   readonly projects?: ReadonlyArray<string>;
   readonly driverKind?: string;
+  /** How long its facts read takes (none: at once), as a slot gate's status read may. */
+  readonly factsDelay?: Duration.Input;
 }
 
 const forwardingTo = (there: There | "never", calls: Array<string>) =>
@@ -79,31 +95,39 @@ const forwardingTo = (there: There | "never", calls: Array<string>) =>
     call: ((_scope: unknown, tool: { readonly name: string }) => {
       calls.push(tool.name);
       if (there === "never") return Effect.never;
-      switch (tool.name) {
-        case "t3_environment_read":
-          return Effect.succeed(there.facts);
-        case "t3_project_list":
-          return Effect.succeed({
-            projects: (there.projects ?? [KEY]).map((canonicalKey) => ({
-              repositoryIdentity: { canonicalKey },
-            })),
-            nextCursor: null,
-          });
-        case "orchestrator_capabilities":
-          return Effect.succeed({
-            providers: [
-              {
-                driverKind: there.driverKind ?? "codex",
-                canRunChildTask: true,
-                models: [{ id: "GPT-5.4" }],
-              },
-            ],
-          });
-        default:
-          return Effect.die(`unexpected tool ${tool.name}`);
-      }
+      return answer(there, tool.name).pipe(
+        there.factsDelay === undefined || tool.name !== "t3_environment_read"
+          ? (effect) => effect
+          : Effect.delay(there.factsDelay),
+      );
     }) as never,
   });
+
+const answer = (there: There, tool: string): Effect.Effect<unknown> => {
+  switch (tool) {
+    case "t3_environment_read":
+      return Effect.succeed(there.facts);
+    case "t3_project_list":
+      return Effect.succeed({
+        projects: (there.projects ?? [KEY]).map((canonicalKey) => ({
+          repositoryIdentity: { canonicalKey },
+        })),
+        nextCursor: null,
+      });
+    case "orchestrator_capabilities":
+      return Effect.succeed({
+        providers: [
+          {
+            driverKind: there.driverKind ?? "codex",
+            canRunChildTask: true,
+            models: [{ id: "GPT-5.4" }],
+          },
+        ],
+      });
+    default:
+      return Effect.die(`unexpected tool ${tool}`);
+  }
+};
 
 const linksTo = (enabled = true) =>
   Layer.mock(PeerLinks.PeerLinks)({
@@ -130,13 +154,15 @@ const hereServices = (
   options: {
     readonly noSample?: boolean;
     readonly resolve?: Effect.Effect<never>;
+    /** This machine's settings (its own facts read reads them, as `advise` is given them). */
+    readonly placed?: Placed;
   } = {},
 ) =>
   Layer.mergeAll(
     Layer.mock(SlotGate.SlotGate)({}),
     Layer.mock(ServerSettings.ServerSettingsService)({
       getSettings: Effect.succeed({
-        ...DEFAULT_SERVER_SETTINGS,
+        ...settingsIn("advise", options.placed),
         agentSlots: { ...DEFAULT_SERVER_SETTINGS.agentSlots, enabled: false },
       }),
     }),
@@ -161,10 +187,11 @@ const adviseWith = (
   mode: PlacementMode,
   layer: Layer.Layer<never>,
   withScope: McpInvocationContext.McpInvocationScope | null = scope,
+  placed: Placed = {},
 ) =>
   Effect.gen(function* () {
     const { advise } = yield* PlacementAdvice.make();
-    const advice = advise(input(mode));
+    const advice = advise(input(mode, placed));
     return yield* withScope === null
       ? advice
       : advice.pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, withScope));
@@ -235,8 +262,71 @@ describe("fork placement advice (P6)", () => {
       yield* TestClock.adjust(PlacementAdvice.LINKED_READ_TIMEOUT);
       const advice = yield* Fiber.join(fiber);
       assert.include(advice, "a worktree child would run here.");
-      assert.include(advice, `Build box (${boxId}): H1 The machine did not answer now.`);
+      assert.include(
+        advice,
+        `Build box (${boxId}): H1 The machine did not answer now. ${PlacementAdvice.NOTE_SLOW}`,
+      );
       assert.notInclude(advice, PlacementAdvice.NOTE_TIMED_OUT);
+    }),
+  );
+
+  it.effect(
+    "a linked machine whose read takes 6 s (a slot gate's read) still answers in time",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const calls: Array<string> = [];
+        const layer = Layer.mergeAll(
+          hereServices({ noSample: true }),
+          linksTo(),
+          forwardingTo({ facts: goodFacts, factsDelay: "6 seconds" }, calls),
+        );
+        const fiber = yield* adviseWith("advise", layer).pipe(Effect.forkChild);
+        // A second at a time, so the reads start their waits before the clock passes them.
+        for (let second = 0; second < 7; second++) yield* TestClock.adjust("1 second");
+        const advice = yield* Fiber.join(fiber);
+        assert.include(advice, `a worktree child would run on Build box (${boxId}).`);
+      }),
+  );
+
+  it.effect("this machine's labels meet the project's needs, and fire its never groups", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const gpu = { labels: ["gpu"], needs: ["gpu"] };
+      const fits = yield* adviseWith("advise", hereServices({ placed: gpu }), scope, gpu);
+      assert.include(fits, "a worktree child would run here.");
+      // No labels set (an older file, or none typed yet): the need is not met.
+      const unlabelled = yield* adviseWith("advise", hereServices(), scope, { needs: ["gpu"] });
+      assert.include(
+        unlabelled,
+        `No machine fits. this machine (${hereId}): H6 The machine lacks what the project needs: gpu.`,
+      );
+      const never = { labels: ["gpu", "prod"], never: [["prod", "gpu"]] };
+      const refused = yield* adviseWith("advise", hereServices({ placed: never }), scope, never);
+      assert.include(refused, "no machine fits a worktree child");
+      assert.include(refused, "H5 The machine has all of a never group: prod + gpu.");
+    }),
+  );
+
+  it.effect("a linked machine's own labels decide its needs; a raw id is never the name", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const labelled = (labels: ReadonlyArray<string>) =>
+        Layer.mergeAll(
+          hereServices(),
+          linksTo(),
+          forwardingTo(
+            { facts: { ...goodFacts, placement: { ...goodFacts.placement, labels } } },
+            [],
+          ),
+        );
+      const needs = { needs: ["gpu"] };
+      const there = yield* adviseWith("advise", labelled(["gpu"]), scope, needs);
+      assert.include(there, `a worktree child would run on Build box (${boxId}).`);
+      assert.include(there, `Build box (${boxId}) passes every hard rule`);
+      const none = yield* adviseWith("advise", labelled([]), scope, needs);
+      assert.include(none, `Build box (${boxId}): H6`);
+      assert.notInclude(none, `${boxId}: H6`, "named by label, not by raw id");
     }),
   );
 
@@ -260,6 +350,7 @@ describe("fork placement advice (P6)", () => {
         null,
       );
       assert.include(noCaller, PlacementAdvice.NOTE_NO_CALLER);
+      assert.match(PlacementAdvice.NOTE_NO_CALLER, /^[A-Z]/u, "a sentence after a full stop");
       const noLinks = yield* adviseWith("advise", hereServices());
       assert.include(noLinks, PlacementAdvice.NOTE_LINKS_MISSING);
       assert.deepStrictEqual(calls, [], "no linked machine was asked");
@@ -279,13 +370,29 @@ describe("fork placement advice (P6)", () => {
     }),
   );
 
+  it.effect("a hanging identity read drops only the linked checkouts; the advice still comes", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const layer = Layer.mergeAll(
+        hereServices({ resolve: Effect.never }),
+        linksTo(),
+        forwardingTo({ facts: goodFacts }, []),
+      );
+      const fiber = yield* adviseWith("advise", layer).pipe(Effect.forkChild);
+      yield* TestClock.adjust(PlacementAdvice.LOCAL_READ_TIMEOUT);
+      const advice = yield* Fiber.join(fiber);
+      assert.include(advice, "a worktree child would run here.");
+      assert.include(advice, `Build box (${boxId}): H7`);
+    }),
+  );
+
   it.effect("advice that takes too long is cut off with a note", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(NOW);
       const layer = Layer.mergeAll(
-        // This project's identity read hangs: no per-machine window bounds it.
-        hereServices({ resolve: Effect.never }),
-        linksTo(),
+        hereServices(),
+        // Outside every window of its own: the last-resort bound cuts it.
+        Layer.mock(PeerLinks.PeerLinks)({ enabled: Effect.never }),
         forwardingTo("never", []),
       );
       const fiber = yield* adviseWith("advise", layer).pipe(Effect.forkChild);
@@ -315,12 +422,17 @@ describe("fork placement advice text", () => {
     const none: PlacementResult = {
       kind: "none",
       mode: "enforce",
-      reason: "No machine fits.",
-      verdicts: [verdict("a", true, null)],
+      reason: "No machine fits. a: H4: Busy. b: H4: Busy.",
+      verdicts: [verdict("a", true, null), verdict("b", false, null)],
     };
     assert.strictEqual(
       PlacementAdvice.adviceText(none, names, "Asked: none."),
-      `${PlacementAdvice.NOTE_PREFIX} ${PlacementAdvice.NOTE_ENFORCE_NOT_BUILT} no machine fits a worktree child, so placing would refuse it. No machine fits. Asked: none. ${PlacementAdvice.NOTE_SHARED_STAYS}`,
+      `${PlacementAdvice.NOTE_PREFIX} ${PlacementAdvice.NOTE_ENFORCE_NOT_BUILT} no machine fits a worktree child, so placing would refuse it. No machine fits. this machine (a): H4 Busy; Build box (b): H4 Busy. Asked: none. ${PlacementAdvice.NOTE_SHARED_STAYS}`,
+    );
+    // Without verdicts (two machines share an id, say) the engine's reason is all there is.
+    assert.include(
+      PlacementAdvice.adviceText({ ...none, reason: "Two ids clash.", verdicts: [] }, names),
+      "so placing would refuse it. Two ids clash.",
     );
   });
 
@@ -335,7 +447,7 @@ describe("fork placement advice text", () => {
     };
     assert.strictEqual(
       PlacementAdvice.adviceText(picked, names),
-      `${PlacementAdvice.NOTE_PREFIX} a worktree child would run on Build box (b). b passes every hard rule. Left out: this machine (a): H4 Busy. ${PlacementAdvice.NOTE_SHARED_STAYS}`,
+      `${PlacementAdvice.NOTE_PREFIX} a worktree child would run on Build box (b). Build box (b) passes every hard rule. Left out: this machine (a): H4 Busy. ${PlacementAdvice.NOTE_SHARED_STAYS}`,
     );
   });
 });

@@ -57,8 +57,11 @@ export const ResultFields = {
   fileLinks: Schema.optionalKey(Schema.String),
 };
 
-/** The gate's own read waits up to `COUNT_READ_TIMEOUT`; one second more, then it is unread. */
-const USAGE_READ_TIMEOUT = Duration.sum(SlotGate.COUNT_READ_TIMEOUT, Duration.seconds(1));
+/**
+ * The gate's own read waits up to `COUNT_READ_TIMEOUT`; one second more, then it is unread. The
+ * longest this machine's `read` takes, so a reader of another machine's facts waits longer.
+ */
+export const USAGE_READ_TIMEOUT = Duration.sum(SlotGate.COUNT_READ_TIMEOUT, Duration.seconds(1));
 
 /**
  * The host sample's own limit (a Linux read is a few files; macOS runs `vm_stat`). Longer, and the
