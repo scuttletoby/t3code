@@ -88,6 +88,7 @@ class Installer:
     PACKAGE = None          # 'cleaner': lib/<PACKAGE>/<module>.py for each of MODULES; each is imported by the self-test
     MODULES = ()
     HELP = None             # ('bin/fork-cleaner', 'fork-cleaner daily'): its --help must print that text
+    BYTECODE = ()           # Python files of the copy (relative) whose bytecode the copy carries: see bytecode_files()
     HAS_CONFIG = False      # write <etc>/config.json from config()
     KIT_STEPS = ()          # the kit's own steps, after `links`
     PROGRAM = None          # the kit's installer file (its __file__): install refuses a release whose one differs
@@ -168,6 +169,31 @@ class Installer:
     def source_files(self):
         mods = tuple(f'lib/{self.PACKAGE}/{name}.py' for name in self.MODULES) if self.PACKAGE else ()
         return tuple(self.SOURCE_FILES) + mods
+
+    def bytecode_files(self):
+        """{bytecode file: its Python file}, relative to the copy, for BYTECODE. A Python program started as a script
+        compiles its whole file on every start (a script's bytecode is never cached), and a hook runs on every call;
+        loaded through importlib it uses __pycache__/<name>.<tag>.pyc beside the file. The copy carries that file,
+        root-owned and in the manifest like every other file, checked against the source's hash on every load
+        (CHECKED_HASH), so a copy that does not match is never used: it is compiled as before. The tag is the one of
+        the Python running the install: a hook run by another Python finds no .pyc of its own and compiles the source
+        (slower, same answer) until the next install."""
+        import importlib.util
+        return {os.path.normpath(importlib.util.cache_from_source(rel)): rel for rel in self.BYTECODE}
+
+    def write_bytecode(self, folder):
+        """Compile BYTECODE in `folder` (a new copy); [(relative path, its bytes)]. The loader names the code after
+        the file it loads it for, so the folder it was compiled in does not show anywhere."""
+        import py_compile
+        out = []
+        for pyc, rel in sorted(self.bytecode_files().items()):
+            path = os.path.join(folder, pyc)
+            py_compile.compile(os.path.join(folder, rel), cfile=path, doraise=True,
+                               invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
+            os.chmod(path, 0o644)
+            with open(path, 'rb') as f:
+                out.append((pyc, f.read()))
+        return out
 
     @staticmethod
     def source_base(source, rel):
@@ -360,7 +386,8 @@ class Installer:
         version in use is the one it was. Refused when a self-test fails."""
         versions = self.p(self.VERSIONS)
         dest = os.path.join(versions, sha)
-        files = self.source_files()
+        sources = self.source_files()
+        files = sources + tuple(self.bytecode_files())   # what the manifest of a whole copy lists
         if os.path.lexists(dest) and os.path.isdir(dest) and not os.path.islink(dest) \
                 and not self.tree_problems(dest) and set(read_manifest(dest)) == set(files):
             problems = self.self_test(dest)
@@ -373,7 +400,7 @@ class Installer:
         tmp = tempfile.mkdtemp(prefix=f'.tmp-{sha[:12]}-', dir=versions)
         try:
             lines = []
-            for rel in sorted(files):
+            for rel in sorted(sources):
                 dst = os.path.join(tmp, rel)
                 os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
                 data = self.read_source(source, rel)
@@ -381,6 +408,7 @@ class Installer:
                     f.write(data)
                 os.chmod(dst, 0o755 if rel in self.EXECUTABLE else 0o644)
                 lines.append(f'{hashlib.sha256(data).hexdigest()}  {rel}')
+            lines += [f'{hashlib.sha256(data).hexdigest()}  {rel}' for rel, data in self.write_bytecode(tmp)]
             with open(os.path.join(tmp, 'MANIFEST.sha256'), 'w', encoding='utf-8') as f:
                 f.write('\n'.join(lines) + '\n')
             os.chmod(os.path.join(tmp, 'MANIFEST.sha256'), 0o644)

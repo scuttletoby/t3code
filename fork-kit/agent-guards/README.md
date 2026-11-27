@@ -32,9 +32,9 @@ work on the machine. The settings entry does both (`agent-guards hooks` prints i
 
 ```sh
 # closed
-g=/usr/local/bin/actions-disable-guard; [ -r "$g" ] && [ -s "$g" ] || { echo "actions-disable-guard: $g is missing or empty: every Bash and Monitor command is refused until it is back" >&2; exit 2; }; /usr/bin/python3 -IB "$g" || { echo "actions-disable-guard: the guard failed (exit $?): the command is refused" >&2; exit 2; }
+g=/usr/local/bin/actions-disable-guard; [ -r "$g" ] && [ -s "$g" ] || { echo "actions-disable-guard: $g is missing or empty: every Bash and Monitor command is refused until it is back" >&2; exit 2; }; f=/usr/local/bin/agent-guards-fast; [ -r "$f" ] && [ -s "$f" ] || f=; /usr/bin/python3 -IBS ${f:+"$f"} "$g" || { echo "actions-disable-guard: the guard failed (exit $?): the command is refused" >&2; exit 2; }
 # open
-g=/usr/local/bin/capacity-pipe-guard; [ -r "$g" ] || { echo "capacity-pipe-guard: $g is missing: hook skipped, commands are NOT checked" >&2; exit 1; }; exec /usr/bin/python3 -IB "$g"
+g=/usr/local/bin/capacity-pipe-guard; [ -r "$g" ] || { echo "capacity-pipe-guard: $g is missing: hook skipped, commands are NOT checked" >&2; exit 1; }; f=/usr/local/bin/agent-guards-fast; [ -r "$f" ] && [ -s "$f" ] || f=; exec /usr/bin/python3 -IBS ${f:+"$f"} "$g"
 ```
 
 A hook that runs past its timeout is ended by Claude Code. For the open hooks the call then goes on. The
@@ -42,6 +42,25 @@ A hook that runs past its timeout is ended by Claude Code. For the open hooks th
 call. Claude Code honours `onFailure` from version 2.1.295 on; an older one ignores it, and there a hook that fails
 or times out lets the call run, so run 2.1.295 or later. The guard also answers by itself within 5 s of its start (it
 refuses when it runs out of time with a guarded word unread), well inside its 10 s.
+
+**The fast path** (#1094). Every Bash call runs actions-disable-guard, capacity-pipe-guard and memory-index-guard.
+A Python script is compiled on every start, and actions-disable-guard is 5,000 lines: ~55 ms a call on an idle
+machine, far more under memory pressure, up to the timeout that refuses the call. So their entries start the hook
+through `agent-guards-fast` (bin/, [lib/agent_guards/fast.py](lib/agent_guards/fast.py)) when it is there. It reads
+the event and passes the call itself only where the hook surely passes it without a word (the guard's own fast exit
+for a command of plain words, [quick.py](lib/agent_guards/quick.py), a checked copy of it; no capacity command's
+name in the text; no Write to a `MEMORY.md`, an index unchanged since the session's state file). Everything else,
+and anything odd (a broken event, a machine file problem to report), runs the hook file on the same event. Its
+bytecode is the one the installer wrote in the version copy (`versions/<sha>/bin/__pycache__/`, in the manifest): the
+link `/usr/local/bin/<hook>` is resolved first, and only a checked-hash `.pyc` of exactly that file's text, owned
+like it and writable by no one else, is used (`fast.hook_code`); a `.pyc` beside the link is never looked at.
+Anything else is compiled from the source as before: same answers, ~30 ms slower for actions-disable-guard. That
+includes bytecode of another Python: the installer compiles with the Python that runs it (`/usr/bin/python3` by its
+first line), so an install run by another one, or a Python upgrade, means compiling from source until the next
+`agent-guards-install install`. Reading the event and the fast check have 3 s (an alarm, as the guard's own read
+has); past that the hook answers on its own clock (the guard refuses at its 5 s budget). Without
+`agent-guards-fast`, or with an empty one, the entry runs the hook as before. Python runs with `-S` (no site; the
+hooks use the standard library only). `tests/fast.test.py` runs the hooks' test cases both ways.
 
 **Tools.** The Bash and Monitor tools both run shell text (`tool_input.command`), so the command hooks match both.
 `agent-guards check` fails a hook that is wired for Bash only (MISSING ... Monitor).
@@ -213,4 +232,5 @@ kit. They cover each hook's refuse and pass cases, and what happens when state i
 machine file that is missing, empty, garbled or not root-owned; a log or state folder that is missing or not
 writable; two hooks at once; very long commands; and commands that only mention a guarded word (echo, a heredoc
 into a file, a commit message). The settings entries are run as `/bin/sh -c` with the hook missing and with the
-hook failing.
+hook failing. `tests/fast.test.py` runs the hooks' cases through the fast path and through the hook, and expects the
+same answer.
