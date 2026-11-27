@@ -3,7 +3,12 @@
  * hides a T3 tool outside the calling thread's groups from `tools/list`, refuses it on `tools/call`
  * and keeps it out of `tool_search` (through the light filter in mcpT3ToolFilter.ts).
  */
-import { MCP_T3_UNGROUPED_TOOLS, type McpT3ToolGroup, type ThreadId } from "@t3tools/contracts";
+import {
+  MCP_PROFILE_ASSISTANT,
+  MCP_T3_UNGROUPED_TOOLS,
+  type McpT3ToolGroup,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -33,7 +38,7 @@ import { WorkflowToolkit } from "../mcp/toolkits/workflow/tools.ts";
 import { WaitsToolkit } from "../mcp/toolkits/waits/tools.ts";
 import { WorktreeToolkit } from "../mcp/toolkits/worktree/tools.ts";
 import { makeThreadMcpProfilesById } from "./claudeMcpProfile.ts";
-import { MCP_T3_TOOL_NOT_ALLOWED, mcpT3ToolGroup } from "./mcpProfile.ts";
+import { MCP_T3_TOOL_NOT_ALLOWED, mcpT3ToolGroup, mcpT3ToolNarrowGroups } from "./mcpProfile.ts";
 import { installFillerDelegateServer } from "./fillerDelegate.ts";
 import { LENS_REPORT_OFF, LENS_REPORT_TOOL } from "./reviewRules/lensReport.ts";
 import { installLensStartServer } from "./reviewRules/lensStartServer.ts";
@@ -103,6 +108,25 @@ export const T3_TOOL_GROUPS: ReadonlyMap<string, ToolGroup> = (() => {
   return groups;
 })();
 
+/**
+ * The narrow groups (`read`, `start`, `message`) each T3 tool is in, by its name, besides its own
+ * group. A name two toolkits give different narrow groups is in none, so they never widen it.
+ */
+export const T3_TOOL_NARROW_GROUPS: ReadonlyMap<string, ReadonlyArray<McpT3ToolGroup>> = (() => {
+  const narrow = new Map<string, ReadonlyArray<McpT3ToolGroup>>();
+  const seen = new Set<string>();
+  for (const [folder, toolkit] of TOOLKITS) {
+    for (const name of Object.keys(toolkit.tools)) {
+      const groups = mcpT3ToolNarrowGroups(folder, name);
+      const known = narrow.get(name) ?? [];
+      const same = known.length === groups.length && known.every((g) => groups.includes(g));
+      narrow.set(name, !seen.has(name) || same ? groups : []);
+      seen.add(name);
+    }
+  }
+  return narrow;
+})();
+
 /** True when the set lets the thread see and call the T3 tool `name`. */
 function t3ToolAllowed(set: T3ToolSet, name: string): boolean {
   // `all` is today's behaviour: every tool, also one this table does not know.
@@ -111,7 +135,9 @@ function t3ToolAllowed(set: T3ToolSet, name: string): boolean {
   // The tools every profile keeps, matched by name and by the toolkit they are in.
   if (group === "ungrouped") return MCP_T3_UNGROUPED_TOOLS.includes(name);
   if (set._tag === "Refused" || set.groups === "all") return false;
-  return group !== undefined && group !== MCP_T3_TOOL_NOT_ALLOWED && set.groups.has(group);
+  if (group === undefined || group === MCP_T3_TOOL_NOT_ALLOWED) return false;
+  const groups = set.groups;
+  return groups.has(group) || (T3_TOOL_NARROW_GROUPS.get(name) ?? []).some((g) => groups.has(g));
 }
 
 /** Why the call was refused, in plain words, with what fixes it. */
@@ -124,6 +150,10 @@ function t3ToolRefusal(set: T3ToolSet, name: string): string {
     // Fail closed, but name the real cause: no profile setting can add a tool with no group. (A
     // name the server does not have never gets here: upstream refuses it before this rule.)
     return `T3 refused "${name}": this tool has no T3 tool group, so MCP profile "${set.name}" cannot keep it. This is a T3 bug, not a setting to change: report it.`;
+  }
+  if (set.name === MCP_PROFILE_ASSISTANT) {
+    // The built-in cannot be changed: the assistant only reads, starts and messages.
+    return `T3 refused "${name}": it is in the "${group}" T3 tool group, and this thread's MCP profile "${MCP_PROFILE_ASSISTANT}" keeps only the read, start and message tools of T3, never this one. Tell the user what you would do, so they can do it themselves or in another thread.`;
   }
   return `T3 refused "${name}": it is in the "${group}" T3 tool group, which this thread's MCP profile "${set.name}" leaves out. Ask the user to add "${group}" to that profile's t3Tools in Settings, or to pick a profile that has it for this thread; it applies from the thread's next turn.`;
 }
@@ -268,4 +298,9 @@ export const layer = McpServer.visibility(
   { global: true },
 );
 
-export const __testing = { t3ToolRefusal, clearRefused: () => refused.clear(), makeVisible };
+export const __testing = {
+  t3ToolAllowed,
+  t3ToolRefusal,
+  clearRefused: () => refused.clear(),
+  makeVisible,
+};

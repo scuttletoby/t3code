@@ -532,6 +532,62 @@ it.effect("a scheduled run is refused when its new thread would get more than th
   ),
 );
 
+/** What a save by the assistant recorded before the split: its three whole groups. */
+const OLD_ASSISTANT = {
+  name: "assistant",
+  servers: [],
+  t3Tools: ["orchestration", "threads", "projects"],
+  builtinTools: "none",
+};
+/** NARROW_PROJECT's threads get the whole groups (the old assistant's), or the built-in assistant. */
+const whole = (projectProfile: string) => ({
+  ...NARROWED,
+  mcpProfiles: {
+    ...NARROWED.mcpProfiles,
+    whole: { servers: [], t3Tools: ["orchestration", "threads", "projects"], builtinTools: "none" },
+  },
+  projectSettingsOverrides: { [NARROW_PROJECT]: { mcpProfile: projectProfile } },
+});
+
+it.effect("a task the assistant saved before the split reads as today's assistant (#980)", () =>
+  held(
+    Effect.gen(function* () {
+      const world = newWorld();
+      yield* withService(NARROWED, world, (service) =>
+        asCaller(service.upsert(task("task:old-assistant"))),
+      );
+      // The record as a save by the assistant wrote it before the split.
+      const record = yield* readRecord;
+      const entry = record!.tasks["task:old-assistant"]!;
+      yield* writeRecord(
+        JSON.stringify({
+          ...record,
+          tasks: { ...record!.tasks, "task:old-assistant": { ...entry, profile: OLD_ASSISTANT } },
+        }),
+      );
+      // Its runs would start threads with the whole groups: wider than the assistant now.
+      yield* withService(whole("whole"), world, () =>
+        Effect.gen(function* () {
+          yield* scheduledPass(world);
+          const after = yield* row("task:old-assistant");
+          expect(after?.last_run_status).toBe("failed");
+          expect(after?.last_run_error).toContain(
+            'Not run: this task was saved by a thread whose MCP profile is "assistant", and the thread this run would start in its project gets "whole"',
+          );
+          expect(world.launched).toHaveLength(0);
+        }),
+      );
+      // Threads there within today's assistant: the same record runs.
+      yield* withService(whole("assistant"), world, () =>
+        Effect.gen(function* () {
+          yield* scheduledPass(world);
+          expect(world.launched).toHaveLength(1);
+        }),
+      );
+    }),
+  ),
+);
+
 const AGENT_NO_RECORD = "Not run: an agent made this task, and no MCP profile is recorded for it";
 const OWNER_SAVES = "The owner saves it once in the T3 app to allow it.";
 

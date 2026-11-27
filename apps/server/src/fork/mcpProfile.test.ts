@@ -11,6 +11,7 @@ import {
   isEveryMcpTool,
   resolveMcpProfile,
   isWithinMcpProfile,
+  readCarried,
 } from "./mcpProfile.ts";
 
 /** The settings as a load decodes them from a settings file's JSON. */
@@ -662,13 +663,13 @@ describe('builtinTools "none" (assistant)', () => {
     );
   });
 
-  it("the built-in assistant: no servers or built-in tools, three groups; a child keeps it", () => {
+  it("the built-in assistant: no servers or built-in tools, read, start and message; a child keeps it", () => {
     const picked = fromFile({ mcpThreadProfiles: { a1: "assistant" } });
     const own = resolved(resolveMcpProfile(picked, [top("a1")]));
     expect([own.name, own.source]).toEqual(["assistant", "thread-pick"]);
     expect(own.profile).toEqual({
       servers: [],
-      t3Tools: ["orchestration", "threads", "projects"],
+      t3Tools: ["read", "start", "message"],
       builtinTools: "none",
     });
     const sub = resolved(resolveMcpProfile(picked, [child("c1"), top("a1")]));
@@ -691,7 +692,7 @@ describe('builtinTools "none" (assistant)', () => {
 describe("the assistant thread is never wider than the assistant profile (#953)", () => {
   const ASSISTANT_SET = {
     servers: [],
-    t3Tools: ["orchestration", "threads", "projects"],
+    t3Tools: ["read", "start", "message"],
     builtinTools: "none",
   };
   const roles = { assistant: "a1", orchestrators: {} };
@@ -718,7 +719,7 @@ describe("the assistant thread is never wider than the assistant profile (#953)"
 
   it("its own pick stands when it is within assistant; other threads are not touched", () => {
     const settings = fromFile({
-      mcpProfiles: { tiny: { servers: [], t3Tools: ["threads"], builtinTools: "none" } },
+      mcpProfiles: { tiny: { servers: [], t3Tools: ["read"], builtinTools: "none" } },
       threadRoles: roles,
       mcpThreadProfiles: { a1: "tiny" },
     });
@@ -742,5 +743,83 @@ describe("the assistant thread is never wider than the assistant profile (#953)"
     expect(refused(resolveMcpProfile(shadowed, [top("a1")])).profileName).toBe("assistant");
     const missing = fromFile({ threadRoles: roles, mcpThreadProfiles: { a1: "gone" } });
     expect(refused(resolveMcpProfile(missing, [top("a1")])).problem).toBe("missing");
+  });
+});
+
+describe("the narrow groups read, start and message (#980)", () => {
+  const WHOLE = ["orchestration", "threads", "projects"] as const;
+  const set = (t3Tools: "all" | ReadonlyArray<string>) =>
+    ({ servers: [], t3Tools }) as Parameters<typeof isWithinMcpProfile>[0];
+
+  it("a narrow group is within the whole groups its tools are in, never the other way", () => {
+    expect(isWithinMcpProfile(set(["read", "start", "message"]), set(WHOLE))).toBe(true);
+    expect(isWithinMcpProfile(set(["message"]), set(["orchestration"]))).toBe(true);
+    // `read` has tools in all three: two of them do not cover it.
+    expect(isWithinMcpProfile(set(["read"]), set(["orchestration", "threads"]))).toBe(false);
+    expect(isWithinMcpProfile(set(WHOLE), set(["read", "start", "message"]))).toBe(false);
+    expect(isWithinMcpProfile(set(["threads"]), set(["read"]))).toBe(false);
+  });
+
+  it("an existing profile with the whole groups keeps them; its child keeps a narrow default", () => {
+    const settings = fromFile({
+      mcpProfiles: {
+        whole: { servers: [], t3Tools: [...WHOLE] },
+        reader: { servers: [], t3Tools: ["read"] },
+      },
+      mcpThreadProfiles: { w1: "whole" },
+      mcpSubagentProfile: "reader",
+    });
+    const own = resolved(resolveMcpProfile(settings, [top("w1")]));
+    expect(own.profile.t3Tools).toEqual([...WHOLE]);
+    const sub = resolved(resolveMcpProfile(settings, [child("c1"), top("w1")]));
+    expect([sub.name, sub.profile.t3Tools, sub.narrowedByParent]).toEqual([
+      "reader",
+      ["read"],
+      false,
+    ]);
+  });
+
+  it("the assistant thread with a whole-group pick is cut to read, start and message", () => {
+    const settings = fromFile({
+      mcpProfiles: { whole: { servers: [], t3Tools: [...WHOLE], builtinTools: "none" } },
+      threadRoles: { assistant: "a1", orchestrators: {} },
+      mcpThreadProfiles: { a1: "whole" },
+    });
+    const own = resolved(resolveMcpProfile(settings, [top("a1")]));
+    expect([own.name, own.source, own.profile.t3Tools]).toEqual([
+      "assistant",
+      "assistant-role",
+      ["read", "start", "message"],
+    ]);
+  });
+
+  it("a carried assistant recorded before the split is re-narrowed as it is read", () => {
+    const old = {
+      name: "assistant",
+      servers: [],
+      t3Tools: [...WHOLE],
+      builtinTools: "none",
+    };
+    expect(readCarried(old)).toEqual({
+      ok: true,
+      name: "assistant",
+      profile: { servers: [], t3Tools: ["read", "start", "message"], builtinTools: "none" },
+    });
+    // A delegated task that carries it gets no more than today's assistant.
+    const there = resolved(resolveMcpProfile(fromFile({}), [child("task")], old));
+    expect(there.profile.t3Tools).toEqual(["read", "start", "message"]);
+    // An older build's own profile named assistant is cut the same way, never widened.
+    expect(readCarried({ name: "assistant", servers: "all", t3Tools: ["issues"] })).toEqual({
+      ok: true,
+      name: "assistant",
+      profile: { servers: [], t3Tools: [], builtinTools: "none" },
+    });
+    // Another name is read as it was carried.
+    const docs = { name: "docs", servers: [], t3Tools: [...WHOLE] };
+    expect(readCarried(docs)).toEqual({
+      ok: true,
+      name: "docs",
+      profile: { servers: [], t3Tools: [...WHOLE] },
+    });
   });
 });

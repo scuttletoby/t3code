@@ -69,6 +69,8 @@ const SETTINGS = {
     prs: { servers: "all", t3Tools: ["pull-requests"] },
     waits: { servers: "all", t3Tools: ["waits"] },
     none: { servers: "all", t3Tools: [] },
+    // The built-in assistant's groups before the split: an existing profile like it.
+    whole: { servers: "all", t3Tools: ["orchestration", "threads", "projects"] },
   },
   mcpSubagentProfile: "waits",
   mcpThreadProfiles: {
@@ -76,6 +78,8 @@ const SETTINGS = {
     "thread-waits": "waits",
     "thread-none": "none",
     "thread-gone": "gone",
+    "thread-assistant": "assistant",
+    "thread-whole": "whole",
   },
 };
 
@@ -114,6 +118,8 @@ const STORED = [
   appThread("thread-waits"),
   appThread("thread-none"),
   appThread("thread-gone"),
+  appThread("thread-assistant"),
+  appThread("thread-whole"),
   // Its own role default is `waits` (mcpSubagentProfile), cut down to its parent's `prs`.
   appThread("thread-child", "thread-prs"),
 ];
@@ -132,7 +138,7 @@ const scopeFor = (token: string): McpInvocationContext.McpThreadInvocationScope 
   issuedAt: 1,
 });
 
-const TOKENS = ["all", "prs", "waits", "none", "gone", "child", "deleted"];
+const TOKENS = ["all", "prs", "waits", "none", "gone", "child", "deleted", "assistant", "whole"];
 
 /** Every `waits.list` the server ran: a call that reached the handler. */
 let listed = 0;
@@ -473,6 +479,117 @@ describe("the T3 tool filter on /mcp", () => {
 const drive = <A>(fiber: Fiber.Fiber<A>, millis: number) =>
   TestClock.adjust(millis).pipe(Effect.andThen(Fiber.join(fiber)));
 
+/** Every T3 tool the built-in `assistant` may use: read, start and message. */
+const ASSISTANT_TOOLS = [
+  // read: changes nothing
+  "orchestrator_capabilities",
+  "task_status",
+  "t3_background_wait",
+  "list_scheduled_tasks",
+  "t3_thread_list",
+  "t3_thread_read",
+  "t3_thread_wait",
+  "t3_environment_links",
+  "t3_thread_search",
+  "t3_submit_output",
+  "t3_project_list",
+  "t3_project_read",
+  // start
+  "delegate_task",
+  "create_threads",
+  "t3_thread_launch",
+  // message
+  "t3_thread_send",
+  // every profile keeps these
+  "request_secret",
+  "send_to_user",
+  "tool_search",
+];
+
+/** Tools of the assistant's old whole groups that change or remove things: never the assistant's. */
+const DESTRUCTIVE_TOOLS = [
+  "t3_project_delete",
+  "t3_project_clone",
+  "t3_project_create",
+  "t3_project_update",
+  "t3_thread_interrupt",
+  "t3_thread_update",
+  "t3_thread_configure",
+  "t3_thread_transfer",
+  "t3_thread_organize",
+  "t3_queue",
+  "t3_pending_request",
+  "task_cancel",
+  "t3_workflow_stop",
+  "t3_environment_link",
+  "t3_environment_unlink",
+  "schedule_task",
+  "delete_scheduled_task",
+  "run_scheduled_task_now",
+];
+
+describe("the assistant's tools: read, start and message only (#980)", () => {
+  it.effect("tools/list: the assistant sees exactly its tools, none of the destructive ones", () =>
+    withServer(({ list }) =>
+      Effect.gen(function* () {
+        const all = yield* list("all");
+        // The server registers them all, so the checks below are not empty.
+        expect(DESTRUCTIVE_TOOLS.filter((name) => !all.includes(name))).toEqual([]);
+        expect(ASSISTANT_TOOLS.filter((name) => !all.includes(name))).toEqual([]);
+        expect((yield* list("assistant")).toSorted()).toEqual(ASSISTANT_TOOLS.toSorted());
+      }),
+    ),
+  );
+
+  it.effect("tools/call: a tool outside the three groups is refused, with a plain reason", () =>
+    withServer(({ call }) =>
+      Effect.gen(function* () {
+        for (const name of DESTRUCTIVE_TOOLS) {
+          const refused = yield* call("assistant", name, {});
+          expect(refused.error?.code, name).toBe(-32001);
+        }
+        expect((yield* call("assistant", "t3_project_delete", {})).error?.message).toBe(
+          'T3 refused "t3_project_delete": it is in the "projects" T3 tool group, and this thread\'s MCP profile "assistant" keeps only the read, start and message tools of T3, never this one. Tell the user what you would do, so they can do it themselves or in another thread.',
+        );
+        // Outside the old whole groups too.
+        expect((yield* call("assistant", "wait_list")).error?.code).toBe(-32001);
+      }),
+    ),
+  );
+
+  it.effect("tool_search: the assistant finds no destructive tool", () =>
+    withServer(({ call }) =>
+      Effect.gen(function* () {
+        const found = (reply: RpcReply) =>
+          (
+            (reply.result?.structuredContent as { tools?: ReadonlyArray<{ name: string }> })
+              ?.tools ?? []
+          ).map((tool) => tool.name);
+        const query = "delete project clone interrupt configure";
+        expect(found(yield* call("all", "tool_search", { query }))).toContain("t3_project_delete");
+        const assistant = found(yield* call("assistant", "tool_search", { query }));
+        expect(assistant.filter((name) => DESTRUCTIVE_TOOLS.includes(name))).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("an existing profile with the whole groups keeps every tool it had", () =>
+    withServer(({ list }) =>
+      Effect.gen(function* () {
+        const all = yield* list("all");
+        const whole = ["orchestration", "threads", "projects", "ungrouped"];
+        const expected = all.filter((name) =>
+          whole.includes(McpT3ToolRule.T3_TOOL_GROUPS.get(name) ?? ""),
+        );
+        expect(yield* list("whole")).toEqual(expected);
+        for (const name of [...DESTRUCTIVE_TOOLS, ...ASSISTANT_TOOLS]) {
+          expect(expected, name).toContain(name);
+        }
+      }),
+    ),
+  );
+});
+
 describe("lens_start and lens_report: off means off (review rules, fork issue #888)", () => {
   const LENSES = [
     { name: "lens_start", off: LensStartVisibility.LENS_START_OFF, input: { pr: 7 } },
@@ -659,6 +776,30 @@ describe("the T3 tool table", () => {
       expect(McpT3ToolRule.T3_TOOL_GROUPS.get("request_secret")).toBe("ungrouped");
       expect(McpT3ToolRule.T3_TOOL_GROUPS.get("send_to_user")).toBe("ungrouped");
       expect(McpT3ToolRule.T3_TOOL_GROUPS.get("tool_search")).toBe("ungrouped");
+    }),
+  );
+});
+
+describe("the assistant's tools, without a socket (#980)", () => {
+  it.effect("the built-in's groups keep exactly its tools; the whole groups keep every one", () =>
+    Effect.sync(() => {
+      const allowed = (groups: ReadonlyArray<string>) =>
+        [...McpT3ToolRule.T3_TOOL_GROUPS.keys()]
+          .filter((name) =>
+            McpT3ToolRule.__testing.t3ToolAllowed(
+              { _tag: "Groups", name: "p", groups: new Set(groups as never) },
+              name,
+            ),
+          )
+          .toSorted();
+      expect(allowed(["read", "start", "message"])).toEqual(ASSISTANT_TOOLS.toSorted());
+      const whole = allowed(["orchestration", "threads", "projects"]);
+      for (const name of [...DESTRUCTIVE_TOOLS, ...ASSISTANT_TOOLS]) {
+        expect(whole, name).toContain(name);
+      }
+      expect(allowed(["message"])).toEqual(
+        ["request_secret", "send_to_user", "t3_thread_send", "tool_search"].toSorted(),
+      );
     }),
   );
 });

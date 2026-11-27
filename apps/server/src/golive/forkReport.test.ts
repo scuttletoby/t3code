@@ -1143,7 +1143,8 @@ describe("__fork-report settings", () => {
     placement: "placement: settings only so far; nothing reads them yet (later placement rows)",
     placementNeeds:
       "placement: settings only so far; nothing reads them yet (later placement rows)",
-    threadRoles: "calm sidebar: settings only so far; nothing reads them yet",
+    threadRoles:
+      "pointers only: the calm sidebar shows them, and the assistant pointer only narrows (that thread gets at most the profile assistant)",
     assistant: "only offers Make assistant; the assistant is the threadRoles.assistant thread",
   };
 
