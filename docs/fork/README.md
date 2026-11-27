@@ -52,6 +52,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.usagePacing`](#serverusagepacing)                                   | `{}`                                    | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)     |
 | [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                                 | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)     |
 | [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                                    | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)     |
+| [`server.accountOrder`](#serveraccountorder)                                 | `[]`                                    | yes | [#881](https://github.com/scuttletoby/t3code/issues/881)   |
 | [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)     |
 | [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                                    | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)     |
 | [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260)   |
@@ -207,6 +208,28 @@ listed is held instead. Empty: no effort is ever lowered.
 
 Set: **Settings → Fork**, section Plan usage pacing, under Advanced, "Lower effort when ahead of pace" (pairs like `high=medium`; a level no
 model on the server offers is refused), or in `settings.json`: `"usagePacingLowerEffort": { "high": "medium" }`.
+
+### `server.accountOrder`
+
+The accounts a delegated task moves through when its own is at its limit, first to last. When a
+task the agent named no instance for would start on an account that is spent (a window whose usage
+is current is at or over 100 minus its `usagePacing` reserve, as the pacer releases it over the
+window's last 12 hours), it starts on the first account in the order that has room and can run the
+same model, options and runtime mode, and the reply says so in one line. Empty: nothing moves.
+
+- Only accounts of the same provider, never another instance of the same login (it shares the
+  limits), and never one the project turned off.
+- An account whose usage is not current (stale past the refresher's bound, its reset time passed
+  with no reading since, never read) takes no work. An account marked `noLimits` counts as having
+  room, so an API key listed last is a deliberate last stop.
+- With no account in the order able to take it, the task starts as asked, with a note naming each
+  account and why. Holding it is the pacing gate's call (`usagePacingGate`), which runs after the
+  order on wherever the order left the task.
+- An instance the agent named itself is never moved.
+
+Set: **Settings → Fork**, section Plan usage pacing, "Account order", or in `settings.json`:
+`"accountOrder": ["claude_main", "claude_second"]`. A bad entry or a repeat is dropped on read (no
+work moves to it), a value that is not a list reads as empty; a save with either is refused.
 
 ### `server.waitFor`
 

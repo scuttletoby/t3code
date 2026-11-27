@@ -202,3 +202,65 @@ export function parseLowerEffort(
   }
   return { value };
 }
+
+export interface AccountOrderRow {
+  readonly instanceId: ProviderInstanceId;
+  readonly label: string;
+  /** On this server now; an id left in the order for a removed account is still listed, to clear it. */
+  readonly known: boolean;
+}
+
+/** The order's accounts as rows, by display name where the server has the account. */
+export function accountOrderRows(
+  providers: ReadonlyArray<{
+    readonly instanceId: ProviderInstanceId;
+    readonly displayName?: string | undefined;
+  }>,
+  order: ReadonlyArray<ProviderInstanceId>,
+): ReadonlyArray<AccountOrderRow> {
+  return order.map((instanceId) => {
+    const provider = providers.find((candidate) => candidate.instanceId === instanceId);
+    return {
+      instanceId,
+      label: provider?.displayName ?? instanceId,
+      known: provider !== undefined,
+    };
+  });
+}
+
+/** The server's accounts not in the order yet, once each, to add at its end. */
+export function accountOrderAddable(
+  providers: ReadonlyArray<{
+    readonly instanceId: ProviderInstanceId;
+    readonly displayName?: string | undefined;
+  }>,
+  order: ReadonlyArray<ProviderInstanceId>,
+): ReadonlyArray<{ readonly instanceId: ProviderInstanceId; readonly label: string }> {
+  const seen = new Set<string>(order);
+  return providers.flatMap((provider) => {
+    if (seen.has(provider.instanceId)) return [];
+    seen.add(provider.instanceId);
+    return [
+      { instanceId: provider.instanceId, label: provider.displayName ?? provider.instanceId },
+    ];
+  });
+}
+
+/** The order with the entry at `index` moved one place up (-1) or down (+1); unchanged at an end. */
+export function moveInAccountOrder(
+  order: ReadonlyArray<ProviderInstanceId>,
+  index: number,
+  delta: -1 | 1,
+): ReadonlyArray<ProviderInstanceId> {
+  const to = index + delta;
+  if (index < 0 || index >= order.length || to < 0 || to >= order.length) return order;
+  const next = [...order];
+  [next[index], next[to]] = [next[to]!, next[index]!];
+  return next;
+}
+
+/** "First claude_a, then claude_b", or "Off" for an empty order. */
+export function accountOrderSummary(rows: ReadonlyArray<AccountOrderRow>): string {
+  if (rows.length === 0) return "Off";
+  return rows.map((row, index) => `${index === 0 ? "First" : "then"} ${row.label}`).join(", ");
+}

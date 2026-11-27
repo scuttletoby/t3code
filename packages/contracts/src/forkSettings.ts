@@ -49,6 +49,8 @@ import {
   StopFinishedChildrenSettingsPatch,
 } from "./stopFinishedChildren.ts";
 import {
+  AccountOrder,
+  AccountOrderFromSettingsFile,
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   UsagePacingFromSettingsFile,
   UsagePacingGateMode,
@@ -97,6 +99,8 @@ export const ForkServerSettingsFields = {
   usagePacingLowerEffort: UsagePacingLowerEffort.pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
+  /** Accounts new delegated work moves through when its own is spent; empty moves nothing. */
+  accountOrder: AccountOrderFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   /** Waits (`wait_for`); off by default. */
   waitFor: WaitForSettings.pipe(
     Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(WaitForSettings)({}))),
@@ -164,6 +168,8 @@ export const ForkServerSettingsPatchFields = {
   ),
   usagePacingGate: Schema.optionalKey(UsagePacingGateMode),
   usagePacingLowerEffort: Schema.optionalKey(UsagePacingLowerEffort),
+  /** Strict: a save refuses an id that is not an instance id, or one listed twice. */
+  accountOrder: Schema.optionalKey(AccountOrder),
   waitFor: Schema.optionalKey(WaitForSettingsPatch),
   /** Strict: a save refuses a bad check (reading the file drops it with a warning). */
   waitChecks: Schema.optionalKey(WaitChecks),
@@ -221,6 +227,8 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   usagePacingGate: "replace",
   // A level left out of the patch is removed.
   usagePacingLowerEffort: "replace",
+  // The order is one list: a save replaces it whole.
+  accountOrder: "replace",
   waitFor: "merge-fields",
   // A check left out of the patch is removed.
   waitChecks: "replace",
