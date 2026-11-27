@@ -41,8 +41,8 @@ class GardenerInstaller(kit_install.Installer):
     LIBEXEC = '/usr/local/libexec/gardener'
     LINKS = {'/usr/local/bin/gardener': 'bin/gardener',
              '/usr/local/sbin/gardener-install': 'sbin/gardener-install'}
-    CHECKS = ('checks/context-budget', 'checks/facts', 'checks/install-drift', 'checks/review-tiers',
-              'checks/workflows-off', 'checks/worktrees')
+    CHECKS = ('checks/context-budget', 'checks/facts', 'checks/install-drift', 'checks/machine-tools',
+              'checks/review-tiers', 'checks/workflows-off', 'checks/worktrees')
     # the gate's own code, imported by review-tiers, never copied into the kit's source (GATE_SOURCE)
     GATE = ('gate/config.py', 'gate/lens.py', 'gate/review_config.py', 'gate/review_glob.py', 'gate/review_judge.py',
             'gate/review.vectors.json')

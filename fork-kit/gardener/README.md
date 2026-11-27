@@ -157,6 +157,31 @@ All report only, and none needs root. Options as in each script's header.
 - **install-drift**: each fork kit's install record (`/etc/<kit>/installed.tsv`) against the files and links on
   the machine, as the user that runs it (paths it cannot read are one note, not drift). With `release` (a commit),
   kits on another release.
+- **machine-tools**: the tools the machine needs and the ones it runs without a source. Each of `tools`
+  (`{path, source}`, a path absolute or `~/...`) that is not there is an error (`machine-tools.missing`) that names
+  where it comes from. A machine that is set up again or moved is told what it still lacks. Each entry of the
+  `scan` folders (default `~/.local/bin`, `~/.config/systemd/user`, `/usr/local/bin`, `/usr/local/sbin`,
+  `/usr/local/libexec`, `/etc/systemd/system`; `[]` scans none) needs a source:
+  - a kit's install record (the 3- and 6-column rows install-drift reads, and pc-agents' `sha256<TAB>path` rows);
+  - a link to a file committed in a git checkout (one `git ls-files` per checkout);
+  - a link into the distribution's own folders (`/usr`, `/lib`, but not `/usr/local`);
+  - a `tools` entry.
+
+  Anything else is one warning per entry:
+  - `no-source`: put there by hand, with no review, tests or history;
+  - `untracked`: in a checkout, but not committed;
+  - `broken-link`;
+  - `unknown-source`: in a checkout git cannot read (a worktree whose main checkout is gone, an empty `.git` folder,
+    another user's checkout). It fails closed: such an entry is never taken as committed.
+
+  `ignore`: entry names (globs) that need no source (default: snapd's generated `snap-*` and `snap.*` units, and
+  `__pycache__`). Only the `.wants`, `.requires`, `.upholds` and `.d` folders of unit folders, a
+  mask (a unit linked to `/dev/null`) and a unit linked to another unit in the same folder (not a subfolder) are not
+  entries of their own. Every path option (`tools` paths, `scan`) is absolute or `~/...`, and `tools` must be a list:
+  anything else exits 1. Each finding's `where` is a machine path, so the report issue only
+  counts them; the local report names each one. The [machine move](../../docs/fork/machine-move.md) template starts
+  from this list. Never fixes.
+
 - **review-tiers**: merged pull requests (last `days`, 7) of the project's own repository (`repo`; there is no
   option for another one) that had less review than their tier asks for. Without options it judges by the merge
   gate's own `review` block in the queue config (`queueConfig`, default `.github/pr-queue.json`, read from git at

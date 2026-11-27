@@ -1587,6 +1587,8 @@ switch.
 - [updates.md](updates.md): update defaults, how a test pins them, the nightly sync runbook,
   `serve --hold-work`.
 - [anchor-machine.md](anchor-machine.md): one machine for new work, with upstream load balancing.
+- [machine-move.md](machine-move.md): runbook template for moving an agent machine to new hardware
+  (inventory, set-up, caches, the switch).
 - [gate-trust.md](gate-trust.md): what the head gate proves, and the owner's steps.
 - [host-tools.md](host-tools.md): design for agents on a person's own computer (no code yet).
 - [playtest.md](playtest.md): the playtest adapter contract (steps, environment, exit codes).
