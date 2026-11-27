@@ -21,6 +21,7 @@ import * as DelegatedOrphanScan from "./delegatedResults/DelegatedOrphanScan.ts"
 import * as DelegatedResultReminder from "./delegatedResults/DelegatedResultReminder.ts";
 import * as FactsCommands from "./factsCommand.ts";
 import * as FillerDelegate from "./fillerDelegate.ts";
+import * as FleetUsage from "./fleetUsage/fleetUsage.ts";
 import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
@@ -55,7 +56,7 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
  * In server.ts's `layerRuntimeCoreDependenciesBase`: usage pacer and history, slot gate, usage
  * refresher, handoff service (beside upstream's idle compaction worker), run records, result
  * reminder, finished children's session stop, the `threadRoles` save check's thread lookup, the
- * facts read's `factsCommand` runs, and the work panel's shared runs read.
+ * facts read's `factsCommand` runs, the work panel's shared runs read and the fleet usage round.
  */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
@@ -69,6 +70,8 @@ export const layerRuntimeServices = Layer.mergeAll(
   FactsCommands.layer,
   // fork.workPanel: the shared GitHub runs read of the thread side panel (fork issue 1136).
   WorkPanel.layer,
+  // fork.fleetUsage: the fleet's usage round, shared by every reader for a minute (fork issue 1146).
+  FleetUsage.layer,
 );
 
 /**

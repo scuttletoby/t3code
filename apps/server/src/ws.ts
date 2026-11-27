@@ -305,6 +305,7 @@ import {
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
 import * as AgentSessionImporter from "./project/AgentSessionImporter.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
+import * as ForkFleetUsage from "./fork/fleetUsage/fleetUsage.ts"; // Fork (fleet usage)
 import { requestUrl } from "./requestUrl.ts";
 import * as ForkWorkPanel from "./fork/workPanel/workPanel.ts"; // Fork (work panel)
 
@@ -2882,6 +2883,7 @@ export const layerWsRpc = (
             maxFiles: config.traceMaxFiles,
           }),
         [WS_METHODS.serverGetProcessDiagnostics]: (_input) => processDiagnostics.read,
+        "fork.fleetUsage": (input) => ForkFleetUsage.read(input), // Fork (fleet usage)
         [WS_METHODS.serverGetHostResources]: (_input) => hostResources.read,
         "fork.workPanel": (input) => ForkWorkPanel.read(input), // Fork (work panel)
         [WS_METHODS.serverGetProcessResourceHistory]: (input) =>

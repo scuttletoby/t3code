@@ -67,6 +67,7 @@ import {
 export * from "./assistant.ts";
 export * from "./forkEnvironmentFileLinks.ts";
 export * from "./forkFeatures.ts";
+export * from "./forkFleetUsage.ts";
 export * from "./forkOwnerQuestions.ts";
 export * from "./forkWorkPanel.ts";
 export * from "./handoff.ts";
