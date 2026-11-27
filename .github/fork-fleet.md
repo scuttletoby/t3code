@@ -46,7 +46,9 @@ A repository variable. If it is unset or empty, the mode is `auto`.
 
 The route calls no API and reads no secret. In `auto` it reads only the pools'
 heartbeat variables (`FLEET_BEACON_PC`, `FLEET_BEACON_VM`), which each
-dispatcher writes: `{"at": <unix time>, "free": <free slots>}`.
+dispatcher writes: `{"at": <unix time>, "free": <free slots>}`. `free` counts only
+slots with memory for them: how many of the config's biggest job (`memory_mb`) fit
+on the host together, so a pool is never sent more jobs of a run than it can start.
 
 ## The trust rule
 
@@ -525,9 +527,13 @@ runners' network (step 1b, the launcher, step 6) is what keeps jobs off its
 services and its LAN. Steps 1b to 3 each run in a subshell with
 `set -euo pipefail`, so the first failing command stops that step (and leaves
 your shell open). Re-install the files (step 3) after any change on `main` to
-the script, the config, the hook or the launcher, then
-`systemctl restart t3code-fleet-dispatcher`. Until then, the host keeps the old
-rule.
+the script, the config, the hook or the launcher. Each dispatcher (the vm
+pool's `t3code-fleet-dispatcher` and each desk pool's, such as
+`t3code-fleet-dispatcher-pc`) sees its config, its script or its token change on
+disk after its next pass and exits; `Restart=always` starts it again with the
+new files `RestartSec` (30 s) later, so no unit keeps an old `slots` or `launch`.
+To make it at once: `systemctl restart t3code-fleet-dispatcher t3code-fleet-dispatcher-pc`.
+The launcher and the hook are read again by every start already.
 
 ```sh
 # 1. One runner user per slot (the vm pool has 2): no home, no sudo, no docker group, no lingering, no cron or at.
@@ -626,6 +632,17 @@ chmod 600 /etc/fork-fleet/launch.conf
 # (/home, /root, /mnt, /media, /srv are refused, also through a symlink), never under a folder others (its group or all) may write.
 # Never an /etc entry that holds secrets, nor a folder of one (the walls' mounts fails: issue #370).
 # JOB_PATHS (fork-fleet-job-paths.txt beside the launcher): the system paths every job sees; leave it.
+# Each job unit's own limits, so a job that runs away is held or killed alone, never the host's own work (the
+# defaults fit this host; add a line only to change one):
+#   JOB_MEMORY_MAX_MB   MemoryMax: above it the kernel kills the job. Empty (default): MemTotal minus RESERVE_MB,
+#                       shared by the RUNNER_USERS (each slot's share: all jobs together never reach the reserve).
+#                       Under 1024 starts nothing. Keep it at least the biggest job's memory_mb in fork-fleet.json.
+#   JOB_MEMORY_HIGH_MB  MemoryHigh: above it the job is slowed and its memory taken back. Empty: 90% of MemoryMax.
+#   JOB_SWAP_MAX_MB     MemorySwapMax (0): a job never fills the host's swap.
+#   JOB_CPU_WEIGHT      CPUWeight, 1 to 10000 (50): half a normal unit's CPU share when the host is busy.
+#   JOB_CPU_QUOTA       CPUQuota in percent, 100 = one CPU (empty: no cap).
+#   JOB_OOM_SCORE_ADJUST  OOMScoreAdjust, 1 to 1000 (500): should the host itself run out of memory, the kernel
+#                       kills a job before any of the host's own processes. OOMPolicy=kill: then the whole job.
 
 # 5. The dispatcher, for the vm pool only.
 cat > /etc/systemd/system/t3code-fleet-dispatcher.service <<'EOF'
@@ -638,6 +655,13 @@ After=network-online.target
 ExecStart=/usr/bin/python3 -I /opt/fork-fleet/fork-fleet.py --config /opt/fork-fleet/fork-fleet.json dispatch --pool vm
 Restart=always
 RestartSec=30
+# The dispatcher and its launcher need no home, no shared /tmp, no kernel modules or logs and no clock. The runners'
+# namespaces (ip netns, under /run) still reach the host: systemd's default MountFlags=shared sends them back.
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -979,6 +1003,27 @@ gh variable list -R scuttletoby/t3code
 gh api repos/scuttletoby/t3code/actions/permissions/fork-pr-contributor-approval --jq .approval_policy
 ```
 
+## Rollback (the fleet off, every job hosted again)
+
+```sh
+# 1. Every job runs hosted at once: in github mode no job asks for a fleet label.
+gh variable set CI_RUNNERS -R scuttletoby/t3code --body github
+# 2. On the host: the dispatchers (the vm pool's and each desk pool's) and the template refresh stop for good.
+systemctl disable --now t3code-fleet-dispatcher t3code-fleet-dispatcher-pc t3code-fleet-refresh.timer
+# 3. The heartbeats, one per dispatched pool in fork-fleet.json. A stale one is read as down after
+#    beacon_fresh_seconds anyway; deleted, nothing of the fleet is left in the repository's variables.
+gh variable delete FLEET_BEACON_PC -R scuttletoby/t3code
+gh variable delete FLEET_BEACON_VM -R scuttletoby/t3code
+# 4. One-job runners a stopped dispatcher left registered (offline): a running dispatcher deletes them itself,
+#    a stopped one cannot. List them, then delete each by its id.
+gh api repos/scuttletoby/t3code/actions/runners --paginate \
+  --jq '.runners[] | select(.name | test("^fleet-(pc|vm)-t3code-")) | "\(.id) \(.name) \(.status)"'
+gh api -X DELETE repos/scuttletoby/t3code/actions/runners/ID      # for each id listed
+```
+
+To switch the fleet on again, set `CI_RUNNERS` back (step 1 of the owner steps)
+and enable the units: each dispatcher writes its heartbeat on its first pass.
+
 ## Real-runner check (before the fleet takes the fork's jobs)
 
 The tests model the runner. This check runs the real one. Use a **throwaway
@@ -1004,9 +1049,11 @@ Set it up on the workspace machine next to the real install, with its own paths:
   `python3 -I /opt/fork-fleet-proof/fork-fleet.py --config /opt/fork-fleet-proof/fork-fleet.json dispatch --token-file /etc/fork-fleet-proof/token --lock-dir /run/fork-fleet-proof`.
 
 The proof repository's `.github/workflows/fork-tests.yml` needs two jobs. The
-first writes `labels=["fleet-proof-t3code","fleet-proof-t3code-lint-<16 hex>-a${{ github.run_attempt }}"]`
-with a random hex. The second, `lint`, has
-`runs-on: ${{ fromJSON(needs.<first>.outputs.labels) }}` and these steps:
+first writes `label=fleet-proof-t3code-lint-<16 hex>` with a random hex, and no
+attempt. The second, `lint`, adds the attempt itself, as `fork-tests.yml` does:
+`runs-on: ${{ fromJSON(format('["fleet-proof-t3code","{0}-a{1}"]', needs.<first>.outputs.label, github.run_attempt)) }}`.
+A re-run of `lint` alone does not run the first job again (it keeps that job's
+outputs), so only `lint`'s own `runs-on` sees the new attempt. `lint` has these steps:
 
 - `echo job ran`;
 - a step that must fail. It tries to write the template through its copy:
@@ -1046,8 +1093,11 @@ Then check each of these:
    nothing for it. Push to `main` while it waits: the dispatcher holds that run's
    `lint` back and logs which job blocks it. Cancel both.
 4. **A re-run gets a runner of its own attempt.** Re-run only the `lint` job of
-   the first run, as the owner. Its label ends in `-a2`, it gets a new runner,
-   and the gate logs `attempt 2`.
+   the first run, as the owner (`gh run rerun RUN --job JOB_ID`). Its label ends
+   in `-a2`, the dispatcher starts a new runner for it, and the gate logs
+   `attempt 2`. On the fork itself, `fork-tests.yml` keeps such a re-run on the
+   fleet only in fleet mode: in auto mode the route is a run old
+   (`fleet_attempt` is not the new attempt), so the re-run runs hosted.
 5. **A cancelled run's idle runner takes no re-run.** Stop the dispatcher. Push,
    so `lint` queues with a label ending in `-a1`, and cancel the run. Start a
    runner by hand for it, as in check 2, but with `FORK_FLEET_RUN=<that run>`
