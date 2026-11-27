@@ -455,15 +455,19 @@
       }
     },
     "apps/web/src/components/ChatView.tsx": {
-      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts).",
+      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts). A thread whose playtest session is on shows the Playtest chip with its End button in the composer's banners (playtest F5, #889): one hook call and its items spread into both banner lists (fork/playtest/usePlaytestChipItems.tsx).",
       "added": [],
       "announced": {
-        "since": "2026-11-21",
+        "since": "2026-11-27",
         "added": [
           "import { useForkHandoffWaitingItems } from \"./fork/handoff/useForkHandoffWaitingItems\"; // Fork (HO5)",
           "const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)",
           "...forkHandoffWaitingItems, // Fork (HO5)",
-          "...forkHandoffWaitingItems, // Fork (HO5)"
+          "...forkHandoffWaitingItems, // Fork (HO5)",
+          "import { useForkPlaytestItems } from \"./fork/playtest/usePlaytestChipItems\"; // Fork (playtest)",
+          "const forkPlaytestItems = useForkPlaytestItems(routeThreadRef); // Fork (playtest)",
+          "...forkPlaytestItems, // Fork (playtest)",
+          "...forkPlaytestItems, // Fork (playtest)"
         ]
       }
     },
