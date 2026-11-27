@@ -17,6 +17,9 @@ Each run derives every test file's inputs from the checkout (never a cache, so t
   - shell and JavaScript files it reaches (.sh, .bash, .mjs, .cjs, .js, or such a #! line): every word that names a
     file of the repository, relative to the file or the root, followed the same way; a folder word takes in the
     folder, unless the file is inside it.
+  - follow_calls (config): in a large shared module, what a plain top-level function names counts only when the
+    function is reached: module-level code, a class, a decorated def, a reached function or another of the test's
+    inputs says its name; a name it cannot work out (getattr by a variable, globals(), sys.modules) counts it whole.
 A test file runs when a changed path is one of its inputs or lies under one of its input folders. A deleted path
 counts as present, so a test that still names a deleted or renamed module or file is chosen (and fails).
 
@@ -43,6 +46,10 @@ Reads $GITHUB_SHA and $GITHUB_EVENT_PATH (as docs-scope does) unless --changed g
 for a local check or a measure, never in CI). Prints why, writes the chosen test files (one per line, config order) to
 --out (default $RUNNER_TEMP/test-select.txt), and writes all=true|false, count=<n>, total=<n>, list=<file> and
 reason=<one line> to $GITHUB_OUTPUT. Exit 1 only when the config cannot be read (no test list: the job goes red).
+
+  python3 -I test_select.py --check-config --runs 'tests/test_*.py' [--runs GLOB]...
+Checks that the config's tests are exactly the files the full run runs (this script's matching, each tracked file
+once, also with an unmerged index): exit 0 when they are, 1 naming each file when not.
 """
 import argparse, ast, json, os, posixpath, re, shlex, subprocess, sys
 
@@ -52,7 +59,7 @@ sys.path.insert(0, os.path.join(HERE, '..', 'docs-scope'))
 import docs_scope   # noqa: E402  (the same release: the change as docs-scope computes it, and its glob rule)
 
 DEFAULT_CONFIG = '.github/test-select.json'
-KEYS = {'tests', 'always_all', 'always_run', 'import_roots', 'inputs'}
+KEYS = {'tests', 'always_all', 'always_run', 'import_roots', 'inputs', 'follow_calls'}
 BUILTIN_ALL = (('.github/workflows/**', 'a workflow file (how the tests run, which release judges them)'),)
 SCRIPT_EXT = ('.sh', '.bash', '.mjs', '.cjs', '.js')
 LISTING_CALLS = {'os.walk', 'os.listdir', 'os.scandir', 'glob.glob', 'glob.iglob', 'shutil.copytree', 'listdir',
@@ -77,6 +84,11 @@ RECURSIVE = re.compile(r'-[A-Za-z]*[rR][A-Za-z]*\Z|--(dereference-)?recursive\Z'
 SHELL_LISTING = re.compile(r'(?:^|[;&|(`\n])\s*(?:sudo\s+)?(?:%s)\s' % '|'.join(sorted(LIST_COMMANDS)))
 PY_DASH_M = re.compile(r'(?:^|[\s/])python[\d.]*(?:\s+-[A-Za-z]+)*\s+-m\s+([A-Za-z_][\w.]*)')
 SCRIPT_DIR = re.compile(r'dirname\b[^\n]*?(\$0\b|\$\{0\}|BASH_SOURCE)|\$\{BASH_SOURCE(?:\[0\])?%/\*\}')
+IDENT = re.compile(r'[A-Za-z_]\w*')
+# follow_calls: a file that calls one of these, or reads a name it cannot work out off an object, can reach any
+# function of a followed module (the module then counts whole for that test).
+REFLECT_CALLS = {'globals', 'locals', 'vars', 'eval', 'exec', 'dir', 'getmembers', 'getmembers_static'}
+NAME_CALLS = {'getattr', 'setattr', 'hasattr', 'delattr'}
 ASSIGN = re.compile(r'^[ \t]*(?:export[ \t]+|local[ \t]+|readonly[ \t]+|declare[ \t]+(?:-\w+[ \t]+)*)?([A-Za-z_]\w*)=(.*)$',
                     re.M)
 
@@ -222,6 +234,43 @@ def last_name(node):
     return None
 
 
+def identifiers(tree):
+    """Every name a piece of code says (follow_calls): variables, attributes, imports, keywords, words in strings."""
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            out.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, ast.alias):
+            out.update(IDENT.findall(n.name))
+            out.add(n.asname or '')
+        elif isinstance(n, ast.keyword) and n.arg:
+            out.add(n.arg)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+            out.update(IDENT.findall(n.value))
+    return out - {''}
+
+
+def reflection(tree, rel):
+    """Why code can reach a function by a name it cannot work out (globals(), getattr(m, name), m.__dict__,
+    sys.modules), or None."""
+    for n in ast.walk(tree):
+        why = None
+        if isinstance(n, ast.Call):
+            f = last_name(n.func)
+            if f in REFLECT_CALLS:
+                why = f'{f}()'
+            elif f in NAME_CALLS and (len(n.args) < 2 or not (isinstance(n.args[1], ast.Constant) and
+                                                             isinstance(n.args[1].value, str))):
+                why = f'{f}() by a name it cannot work out'
+        elif isinstance(n, ast.Attribute) and n.attr in ('__dict__', 'modules'):
+            why = f'.{n.attr}'
+        if why:
+            return f'{rel}:{getattr(n, "lineno", "?")}: {why}'
+    return None
+
+
 class PyFile:
     """One Python file's imports, sys.path entries and named paths, worked out once per run."""
 
@@ -238,6 +287,8 @@ class PyFile:
             raise AllTests(f'cannot parse {rel} ({type(e).__name__}: {str(e)[:120]}), a test input')
         self.tree, self.parents, self.memo = tree, {}, {}
         self.always = []   # why every test that reaches this file runs (an input it cannot place)
+        self.owner = {}   # (kind, value) -> the top-level functions (None: module-level code) that name it
+        self._calls = None
         self.scope, self.up, self.globals = {}, {}, {}   # node -> its scope; scope -> the scope around it
         stack, nodes = [(tree, None)], []
         while stack:   # (no recursion: a long a + b + c chain is deep)
@@ -363,7 +414,47 @@ class PyFile:
         for node in nodes:
             if isinstance(node, ast.expr) and self.maximal(node):
                 for v in self.ev(node):
-                    self.paths.add(v)
+                    self.own('paths', v, node)
+
+    def own(self, kind, value, node):
+        """Add a named path or a listed folder, with the code that names it (follow_calls)."""
+        getattr(self, kind).add(value)
+        self.owner.setdefault((kind, value), set()).add(self.unit_of(node))
+
+    @staticmethod
+    def unit(stmt):
+        """A top-level function follow_calls can leave out: a plain def. A class (its body runs on import), a
+        decorated def (a decorator may register it), a dunder (__getattr__ runs on any attribute) always count."""
+        return isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and not stmt.decorator_list and \
+            not (stmt.name.startswith('__') and stmt.name.endswith('__'))
+
+    def unit_of(self, node):
+        """The top-level function whose body holds node, or None (code that runs on import, or not placed)."""
+        chain = [node]
+        while self.parents.get(chain[-1]) is not None and self.parents[chain[-1]] is not self.tree:
+            chain.append(self.parents[chain[-1]])
+        top = chain[-1]
+        if self.parents.get(top) is not self.tree or len(chain) < 2 or not self.unit(top):
+            return None
+        return top.name if any(chain[-2] is s for s in top.body) else None   # not a default or an annotation
+
+    def calls(self):
+        """follow_calls: ({top-level function: the names its body says}, the names the rest of the file says, why
+        a name it reaches cannot be worked out or None). A name is any identifier: of a variable, an attribute, an
+        import, or a word in a string ('tools.big.f' in mock.patch, a `python -c` line)."""
+        if self._calls is None:
+            units, top = {}, set()
+            for stmt in self.tree.body:
+                if self.unit(stmt):
+                    body = units.setdefault(stmt.name, set())
+                    for s in stmt.body:
+                        body |= identifiers(s)
+                    for part in (stmt.args, stmt.returns):
+                        top |= identifiers(part) if part is not None else set()
+                else:
+                    top |= identifiers(stmt)
+            self._calls = (units, top, reflection(self.tree, self.rel))
+        return self._calls
 
     def module_paths(self, node, name):
         """python -m name, runpy.run_module(name): the files that module can be, from the working directory."""
@@ -372,9 +463,10 @@ class PyFile:
                 self.mark(node, 'runs a module by a name it cannot work out (python -m, runpy)')   # everywhere
                 continue
             base = v.replace('.', '/')
-            self.paths.update({base + '.py', base + '/__init__.py', base + '/__main__.py'})
             parts = base.split('/')
-            self.paths.update('/'.join(parts[:i]) + '/__init__.py' for i in range(1, len(parts)))
+            for path in [base + '.py', base + '/__init__.py', base + '/__main__.py'] + [
+                    '/'.join(parts[:i]) + '/__init__.py' for i in range(1, len(parts))]:
+                self.own('paths', path, node)
 
     def dash_m(self, node):
         """[sys.executable, '-m', name] (or 'python3'): the module it runs. ['find', d, ...]: a folder it lists."""
@@ -452,7 +544,7 @@ class PyFile:
                     if isinstance(w, str) and os.path.normpath(w) == self.repo.root:   # (a tool's cwd: its caller's)
                         self.mark(node, f'lists the working directory ({cmd}): it can read any file', own=True)
                         continue
-                    self.dirs_listed.add(w)
+                    self.own('dirs_listed', w, node)
 
     def shell_listing(self, node, text):
         """A shell line in a string ('find docs -name x', 'grep -rl x docs | sort'): the folders it lists."""
@@ -600,7 +692,9 @@ class PyFile:
     def mark(self, node, why, own=False):
         """An input it cannot place. own: it counts only in the test file itself (a tool may list or build paths from
         what its caller passes, mostly temporary folders in a test; the trace check catches a real miss there)."""
-        self.always.append(('own' if own else 'always', f'{self.rel}:{getattr(node, "lineno", "?")}: {why}'))
+        m = ('own' if own else 'always', f'{self.rel}:{getattr(node, "lineno", "?")}: {why}')
+        self.always.append(m)
+        self.owner.setdefault(('always', m), set()).add(self.unit_of(node))
 
     # which expressions are whole paths (not a part of a bigger path expression)
     def maximal(self, node):
@@ -660,7 +754,7 @@ class PyFile:
                 if v == UNKNOWN or isinstance(v, Tail) and not v.rest.startswith('/'):
                     self.mark(node, 'lists a folder it cannot work out', own=True)
                 elif v not in (TEMP, CAPPED):
-                    self.dirs_listed.add(v)
+                    self.own('dirs_listed', v, node)
 
     def imported(self, alias, attr, depth):
         """The value an import gives a name: from m import NAME (attr None), or import m then m.attr; the module-level
@@ -952,9 +1046,10 @@ def concat(a, b):
 # ---------------------------------------------------------------- inputs of a test file
 
 class Graph:
-    def __init__(self, repo, import_roots=(), declared=None):
+    def __init__(self, repo, import_roots=(), declared=None, follow=()):
         self.repo = repo
         self.declared = declared or {}   # {test file: (globs it reads, why)}: the config's inputs
+        self.follow = set(follow)   # the config's follow_calls: modules whose functions count only when reached
         self.import_roots = [os.path.join(repo.root, r) for r in import_roots]
         self.py, self.text, self.text_always, self.memo = {}, {}, {}, {}
         self.building = set()
@@ -1126,14 +1221,18 @@ class Graph:
             return []   # the standard library, or third-party: no file of the repository
         return None
 
-    def named_inputs(self, rel, kind):
-        """The inputs one file names (paths, listed folders, words), resolved once per run."""
-        key = ('named', rel)
+    def named_inputs(self, rel, kind, units=None):
+        """The inputs one file names (paths, listed folders, words), resolved once per run. units (follow_calls):
+        only what module-level code and these top-level functions name; None: the whole file."""
+        key = ('named', rel, units)
         if key not in self.memo:
             if kind == 'py':
                 pf = self.pyfile(rel)
-                named, base = [(v, False) for v in pf.paths] + [(v, True) for v in pf.dirs_listed], pf.dir
-                out = set(pf.always)
+                keep = lambda k, v: units is None or any(   # noqa: E731
+                    u is None or u in units for u in pf.owner.get((k, v), (None,)))
+                named = [(v, False) for v in pf.paths if keep('paths', v)] + \
+                    [(v, True) for v in pf.dirs_listed if keep('dirs_listed', v)]
+                base, out = pf.dir, {m for m in pf.always if keep('always', m)}
             else:
                 named = [(w, False) for w in self.words(rel)]
                 base = os.path.join(self.repo.root, posixpath.dirname(rel))
@@ -1156,37 +1255,52 @@ class Graph:
             raise self.memo[key]
         return self.memo[key]
 
-    def _inputs(self, test):
-        files, dirs, globs, todo, search, done, unfound = {test}, set(), set(), [test], set(), set(), []
-        always = set()
-        while todo:
-            rel = todo.pop()
-            if rel in done:
+    def reached(self, module, closure):
+        """follow_calls: the top-level functions of `module` this test's other files can reach (frozenset), or None
+        (the whole module: a name it cannot work out). A function is reached when module-level code (or a class, a
+        decorated def) or a reached function says its name, or any other file of the test's inputs says it (in
+        code, a string or a script's text); never by a call graph that could miss a way in."""
+        units, said, why = self.pyfile(module).calls()
+        if why:
+            return None
+        said = set(said)
+        for rel in sorted(closure):
+            if rel == module or rel not in self.repo.tracked:
                 continue
-            done.add(rel)
-            if rel not in self.repo.tracked:
-                continue   # deleted by the change: an input with nothing in it to follow
             kind = self.kind_of(rel)
             if kind == 'py':
-                pf = self.pyfile(rel)
-                new = pf.syspath - search
-                if new:   # sys.path is one list for the whole process: every file is looked at again with it
-                    search |= new
-                    todo += sorted(done)
-                    done.clear()
-                    unfound.clear()
-                    continue
-                for level, name, names, line in pf.imports:
-                    got = self.module(level, name, names, pf, search)
-                    if got is None:
-                        unfound.append(f'{rel}:{line}: import {"." * level}{name}')
-                        continue
-                    for m in got:
-                        files.add(m)
-                        todo.append(m)
-            elif kind != 'text':
-                continue
-            for k, r in self.named_inputs(rel, kind):
+                bodies, top, why = self.pyfile(rel).calls()
+                if why:
+                    return None
+                said |= top
+                for body in bodies.values():
+                    said |= body
+            elif kind == 'text':
+                said |= set(IDENT.findall(self.words_text(rel)))
+        out, todo = set(), [n for n in said if n in units]
+        while todo:
+            n = todo.pop()
+            if n not in out:
+                out.add(n)
+                todo += [m for m in units[n] if m in units]
+        return frozenset(out)
+
+    def words_text(self, rel):
+        key = ('text', rel)
+        if key not in self.memo:
+            try:
+                with open(os.path.join(self.repo.root, rel), 'rb') as f:
+                    self.memo[key] = f.read().decode('utf-8', 'surrogateescape')
+            except OSError:
+                self.memo[key] = ''
+        return self.memo[key]
+
+    def _inputs(self, test):
+        files, dirs, globs, todo, search, done, unfound = {test}, set(), set(), [test], set(), set(), []
+        always, deferred, applied = set(), set(), {}
+
+        def take(rel, named):
+            for k, r in named:
                 if k == 'file':
                     files.add(r)
                     todo.append(r)
@@ -1198,6 +1312,46 @@ class Graph:
                     continue
                 else:
                     (dirs if k == 'dir' else globs).add(r)
+        while todo:
+            while todo:
+                rel = todo.pop()
+                if rel in done:
+                    continue
+                done.add(rel)
+                if rel not in self.repo.tracked:
+                    continue   # deleted by the change: an input with nothing in it to follow
+                kind = self.kind_of(rel)
+                if kind == 'py':
+                    pf = self.pyfile(rel)
+                    new = pf.syspath - search
+                    if new:   # sys.path is one list for the whole process: every file is looked at again with it
+                        search |= new
+                        todo += sorted(done)
+                        done.clear()
+                        unfound.clear()
+                        deferred.clear()
+                        applied.clear()
+                        continue
+                    for level, name, names, line in pf.imports:
+                        got = self.module(level, name, names, pf, search)
+                        if got is None:
+                            unfound.append(f'{rel}:{line}: import {"." * level}{name}')
+                            continue
+                        for m in got:
+                            files.add(m)
+                            todo.append(m)
+                    if rel in self.follow and rel != test:
+                        deferred.add(rel)   # what it names: once the files that can call it are known (below)
+                        continue
+                elif kind != 'text':
+                    continue
+                take(rel, self.named_inputs(rel, kind))
+            # follow_calls: what a followed module's reached functions name; that may bring in files that reach more
+            for rel in sorted(deferred):
+                units = self.reached(rel, done)
+                if applied.get(rel, False) != units:
+                    applied[rel] = units
+                    take(rel, self.named_inputs(rel, 'py', units))
         globs.update(self.declared.get(test, ((), ''))[0])
         if unfound:
             raise AllTests(f'{unfound[0]}: a module of that name is in the repository, but not where this import '
@@ -1309,7 +1463,7 @@ def load_config(root, path):
     if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t for t in tests):
         raise SystemExit(f'test-select: {path}: "tests" must be a list of globs')
     pairs = {}
-    for key in ('always_all', 'always_run'):
+    for key in ('always_all', 'always_run', 'follow_calls'):
         always = c.get(key, [])
         if not isinstance(always, list) or not all(
                 isinstance(a, dict) and set(a) == {'glob', 'why'} and all(isinstance(v, str) and v for v in a.values())
@@ -1325,7 +1479,58 @@ def load_config(root, path):
             and isinstance(a['why'], str) and a['why'] and isinstance(a['reads'], list)
             and all(isinstance(g, str) and g for g in a['reads']) for a in inputs):
         raise SystemExit(f'test-select: {path}: "inputs" must be a list of {{"test", "reads": [globs], "why"}}')
-    return tests, pairs['always_all'], roots, pairs['always_run'], [(a['test'], a['reads'], a['why']) for a in inputs]
+    return (tests, pairs['always_all'], roots, pairs['always_run'], [(a['test'], a['reads'], a['why']) for a in inputs],
+            pairs['follow_calls'])
+
+
+def follow_of(follow_calls, tracked, path=DEFAULT_CONFIG):
+    """{module: why} for the config's follow_calls: repository Python files whose top-level functions count only
+    for the tests that can reach them. A glob that names no tracked .py file fails the step (a renamed module must be
+    renamed there too)."""
+    out = {}
+    for g, why in follow_calls:
+        rx = docs_scope.glob_re(g)
+        hits = sorted(f for f in tracked if f.endswith('.py') and rx.match(f))
+        if not hits:
+            raise SystemExit(f'test-select: {path}: follow_calls {g!r} names no Python file of the repository')
+        for f in hits:
+            out.setdefault(f, why)
+    return out
+
+
+def tracked_files(root):
+    """The repository's files, each once: `git ls-files` lists an unmerged file once per stage (three times during a
+    conflict). A file in the index but gone from disk is still one (a test input that cannot be read then runs every
+    test)."""
+    return set(git('ls-files', '-z', cwd=root).split('\0')) - {''}
+
+
+def check_config(root, config_path, runs):
+    """(ok, lines): do the config's tests name exactly the files the full run runs (globs or paths from the root,
+    matched the way the selector matches)? A file the full run runs that the config misses is never picked on a pull
+    request; one the config names that the full run does not run is picked and never run."""
+    tracked = tracked_files(root)
+    tests, always, import_roots, always_run, inputs, follow_calls = load_config(root, config_path)
+    every = universe(tests, tracked)
+    always_run_of(always_run, every, config_path)
+    declared_of(inputs, every, config_path)
+    follow_of(follow_calls, tracked, config_path)
+    full, lines = [], []
+    for g in runs:
+        rx = docs_scope.glob_re(g)
+        hits = sorted(f for f in tracked if rx.match(f))
+        if not hits:
+            lines.append(f'the full run\'s {g!r} matches no file of the repository')
+        full += [h for h in hits if h not in full]
+    missed = [f for f in full if f not in every]
+    extra = [t for t in every if t not in full]
+    lines += [f'{f}: the full run runs it, but the config\'s tests do not name it (no pull request would pick it)'
+              for f in missed]
+    lines += [f'{t}: the config\'s tests name it, but the full run does not run it' for t in extra]
+    ok = not lines
+    head = (f'config ok: its tests name the {len(every)} files the full run runs' if ok else
+            f'config does not match the full run: {len(missed)} missed, {len(extra)} not run')
+    return ok, [head] + lines
 
 
 def always_run_of(always_run, every, path=DEFAULT_CONFIG):
@@ -1378,9 +1583,10 @@ def universe(tests, tracked):
     return out
 
 
-def decide(root, config_path, tests, always, changed, tracked, import_roots=(), always_run=None, declared=None):
+def decide(root, config_path, tests, always, changed, tracked, import_roots=(), always_run=None, declared=None,
+           follow=()):
     """(chosen test files, reason lines). always_run: {test file: why}, chosen on every pull request; declared:
-    declared_of()."""
+    declared_of(); follow: follow_of()."""
     lines = []
     if not changed:
         raise AllTests('the change touches no file')
@@ -1390,7 +1596,7 @@ def decide(root, config_path, tests, always, changed, tracked, import_roots=(), 
             if docs_scope.glob_re(g).match(c):
                 raise AllTests(f'{c} changed ({why})')
     repo = Repo(root, tracked, changed)
-    graph = Graph(repo, import_roots, declared)
+    graph = Graph(repo, import_roots, declared, follow)
     chosen = []
     for t in tests:
         if t in (always_run or {}):
@@ -1416,19 +1622,32 @@ def decide(root, config_path, tests, always, changed, tracked, import_roots=(), 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     p.add_argument('--config', default=DEFAULT_CONFIG)
-    p.add_argument('--event', required=True)
+    p.add_argument('--event', help='the event name (required unless --check-config)')
     p.add_argument('--changed', help='a file with the changed paths, one per line (local use; CI reads git)')
     p.add_argument('--root', default='.')
     p.add_argument('--out', default='')
+    p.add_argument('--check-config', action='store_true',
+                   help='check that the config\'s tests are exactly what --runs names, then exit (0: they are)')
+    p.add_argument('--runs', action='append', default=[],
+                   help='with --check-config: a glob or path the full run runs (repeat for each)')
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     if not docs_scope.plain_path(a.config):
         raise SystemExit(f'test-select: the config path {a.config!r} must be a plain repository path')
-    tracked = set(git('ls-files', '-z', cwd=root).split('\0')) - {''}
-    tests, always, import_roots, always_run, inputs = load_config(root, a.config)
+    if a.check_config:
+        if not a.runs:
+            raise SystemExit('test-select: --check-config needs --runs (what the full run runs)')
+        ok, lines = check_config(root, a.config, a.runs)
+        print('\n'.join(docs_scope.shown(x) for x in lines))
+        return 0 if ok else 1
+    if not a.event:
+        raise SystemExit('test-select: --event is required')
+    tracked = tracked_files(root)
+    tests, always, import_roots, always_run, inputs, follow_calls = load_config(root, a.config)
     every = universe(tests, tracked)
     always_run = always_run_of(always_run, every, a.config)
     declared = declared_of(inputs, every, a.config)
+    follow = follow_of(follow_calls, tracked, a.config)
     try:
         if a.event != 'pull_request':
             raise AllTests(f'a {a.event} run runs every test')
@@ -1446,7 +1665,8 @@ def main(argv=None):
             finally:
                 os.chdir(cwd)
             changed = sorted({r[0] for r in rows})
-        chosen, lines = decide(root, a.config, every, always, changed, tracked, import_roots, always_run, declared)
+        chosen, lines = decide(root, a.config, every, always, changed, tracked, import_roots, always_run, declared,
+                               follow)
         everything = False
         head = (f'selected {len(chosen)} of {len(every)} test files' if chosen else
                 f'no tool test touched: 0 of {len(every)} test files take in the {len(changed)} changed paths')

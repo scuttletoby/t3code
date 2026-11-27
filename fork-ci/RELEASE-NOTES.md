@@ -24,6 +24,18 @@ the fleet-watch example now say to drop their sparse checkout (or run git-clean 
 **Upgrade:** a project with its own copy of this lint keeps its config file (same format), runs the action, and
 deletes its copy.
 
+### test-select: follow_calls, --check-config; the trace check keeps a cut-off run's results (#935)
+
+A new config key, `follow_calls`, names large shared Python modules whose top-level functions count only for the tests
+that can reach them (by name; a name it cannot work out counts the whole module). `--check-config --runs GLOB...`
+checks that the config's tests are exactly what the full run runs, with the selector's own matching and each tracked
+file once (also during a merge conflict): a project's own copy of that check can go. The trace check prints each test's
+result as its trace ends, also writes it to a `report` file (the trace action's new `report` output), and on a cancel
+or timeout kills every traced test at once and ends with a `cut off` line (exit 1). Its README example now says why a
+skip read failed and uploads the report with `if: always()`.
+
+**Upgrade:** none needed. To use the report, add the README's upload step after the trace step.
+
 ### pr-queue, head-check: merge as GitHub's update does; a cancelled re-run no longer hides an old base's red (#924, #1033)
 
 The queue and head-check now merge with `merge.directoryRenames=false` (was `true`), which is how GitHub's update branch

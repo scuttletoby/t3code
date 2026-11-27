@@ -9,16 +9,18 @@ miss: fix test-select (a general rule) or name the test in the config's `always_
 to see and fix: on a schedule or after each push to the default branch, never as the gate of a pull request.
 
   python3 -I trace_check.py --config .github/test-select.json [--run 'python3 -I -B {test}'] [--jobs 2]
-      [--only GLOB]... [--root .]
+      [--only GLOB]... [--root .] [--report FILE]
 Needs strace on PATH and ptrace of its own children (kernel.yama.ptrace_scope 0 or 1; no root). Without strace, or
 when a test's trace does not show its own file read, the check fails (it never passes unchecked). A test that fails,
 errs or skips tests under the trace is "not checked" (what it did not run, it did not touch) and fails the check too:
 run it as the test job does (same runner, env). Not seen: a folder it lists (the files it then reads are), files read
 through a process that is not its child (a server already running), and files read through git (git reads .git).
-Exit 0: no miss; 1: a miss, a test not traced or not checked, or no test to trace.
+Each test's lines print (and go to --report) as its trace ends. SIGTERM or SIGINT (a cancelled or timed-out job)
+kills every traced test's process group at once and ends with a "cut off" line: what finished stays reported.
+Exit 0: no miss; 1: a miss, a test not traced or not checked, no test to trace, or a run cut off.
 """
-import argparse, codecs, os, posixpath, re, shlex, shutil, subprocess, sys, tempfile
-from concurrent.futures import ThreadPoolExecutor
+import argparse, codecs, os, posixpath, re, shlex, shutil, signal, subprocess, sys, tempfile, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -93,6 +95,31 @@ def touched(log, root):
     return out
 
 
+RUNNING, STOP = set(), threading.Event()   # the traced tests' processes; set when the job is cancelled
+LOCK = threading.Lock()
+
+
+class Cut(Exception):
+    """The run was stopped (SIGTERM, SIGINT: a cancelled or timed-out job)."""
+
+
+def stop(signum, frame):
+    """A cancelled or timed-out job: kill every traced test now (its whole process group: strace, the test and what it
+    started), so the runner never waits on them; main() then reports what finished."""
+    STOP.set()
+    with LOCK:
+        for p in list(RUNNING):
+            with_group(p, signal.SIGKILL)
+    raise Cut(signal.Signals(signum).name)
+
+
+def with_group(p, sig):
+    try:
+        os.killpg(p.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 SKIPPED = re.compile(rb'\bskipped=(\d+)|\b(\d+) skipped\b')   # unittest's "OK (skipped=2)", pytest's "2 skipped"
 
 
@@ -105,11 +132,27 @@ def trace(root, test, run, keep):
     try:
         cmd = ['strace', '-f', '-qq', '-z', '-y', '-s', '4096', '--seccomp-bpf', '-e', 'trace=' + CALLS, '-o', log, '--',
                'sh', '-c', run.replace('{test}', shlex.quote(test))]
-        try:
-            r = subprocess.run(cmd, cwd=root, stdin=subprocess.DEVNULL, stdout=fd, stderr=subprocess.STDOUT,
-                               timeout=3600)
+        try:   # its own process group, so a cancel (stop) kills everything it started
+            with LOCK:   # (a stop between the check and the start would miss it)
+                if STOP.is_set():
+                    return {}, 'no trace: the run was stopped'
+                p = subprocess.Popen(cmd, cwd=root, stdin=subprocess.DEVNULL, stdout=fd, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+                RUNNING.add(p)
+            try:
+                p.wait(timeout=3600)
+            except subprocess.TimeoutExpired:
+                with_group(p, signal.SIGKILL)
+                p.wait()
+                raise
+            finally:
+                with LOCK:
+                    RUNNING.discard(p)
+            r = p
         finally:
             os.close(fd)
+        if STOP.is_set() and r.returncode == -signal.SIGKILL:   # stopped (a cancel): half a trace says nothing
+            return {}, 'no trace: the run was stopped'
         with open(out, 'rb') as f:
             f.seek(max(0, os.path.getsize(out) - 65536))
             said = f.read()
@@ -154,16 +197,19 @@ def main(argv=None):
     p.add_argument('--run', default='python3 -I -B {test}', help='how one test runs; {test} is its path')
     p.add_argument('--jobs', type=int, default=2)
     p.add_argument('--only', action='append', default=[], help='trace only the tests matching this glob')
+    p.add_argument('--report', default='',
+                   help='also write each line here as it is known (kept when the run is cut off)')
     a = p.parse_args(argv)
     if not shutil.which('strace'):
         print('trace-check: strace is not on PATH; nothing was checked (install strace on the runner)')
         return 1
     root = os.path.realpath(a.root)
-    tracked = set(ts.git('ls-files', '-z', cwd=root).split('\0')) - {''}
-    tests, always, import_roots, always_run, inputs = ts.load_config(root, a.config)
+    tracked = ts.tracked_files(root)
+    tests, always, import_roots, always_run, inputs, follow_calls = ts.load_config(root, a.config)
     every = ts.universe(tests, tracked)
     always_run = ts.always_run_of(always_run, every, a.config)
     declared = ts.declared_of(inputs, every, a.config)
+    follow = ts.follow_of(follow_calls, tracked, a.config)
     if a.only:
         every = [t for t in every if any(docs_scope.glob_re(g).match(t) for g in a.only)]
     if not every:   # a check of nothing never passes
@@ -171,45 +217,74 @@ def main(argv=None):
         return 1
     rules = [(a.config, 'the test-select config')] + list(ts.BUILTIN_ALL) + always
     repo = ts.Repo(root, tracked)
-    graph = ts.Graph(repo, import_roots, declared)
-    print(f'trace-check: tracing {len(every)} tests, {max(1, a.jobs)} at once', flush=True)
-    keep = tempfile.mkdtemp(prefix='trace-check-')
-    misses, broken = [], []
-    try:
-        with ThreadPoolExecutor(max(1, a.jobs)) as pool:
-            traces = dict(zip(every, pool.map(lambda t: trace(root, t, a.run, keep), every)))
-    finally:
-        shutil.rmtree(keep, ignore_errors=True)
-    for t in every:
-        got, note = traces[t]
+    graph = ts.Graph(repo, import_roots, declared, follow)
+    STOP.clear()
+    report = open(a.report, 'w', encoding='utf-8') if a.report else None
+    if report and os.environ.get('GITHUB_OUTPUT'):
+        with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+            f.write(f'report={os.path.abspath(a.report)}\n')
+    misses, broken, done = [], [], []
+
+    def say(line):
+        print(line, flush=True)
+        if report:
+            report.write(docs_scope.shown(line) + '\n')
+            report.flush()
+
+    def judge(t, got, note):
+        """Print one test's result as soon as its trace ends (a cut-off run keeps what finished)."""
+        done.append(t)
         if note:   # still judged by what it touched; but never clean
-            print(f'{t}: {note}')
+            say(f'{t}: {note}')
             broken.append(t)
             if not got:
-                continue
+                return
         try:
             graph.inputs(t)
         except ts.AllTests as e:
-            print(f'{t}: every test runs when it is reached ({e})')
+            say(f'{t}: every test runs when it is reached ({e})')
         seen = {}
         for path, what in got.items():
             rel = repo.rel(path) if path.startswith(root + '/') else None
             if rel in tracked and rel not in seen:
                 seen[rel] = what
         if t not in seen:   # the run command never ran it: nothing was measured
-            print(f'{t}: the trace never shows the test file read (does --run run it?)')
+            say(f'{t}: the trace never shows the test file read (does --run run it?)')
             if t not in broken:
                 broken.append(t)
-            continue
+            return
         for rel, what in sorted(seen.items()):
             if not picks(a.config, rules, always_run, graph, t, rel):
                 misses.append((t, rel, what))
-        print(f'{t}: {len(seen)} tracked files touched')
-    for t, rel, what in misses:
-        print(f'miss: {t} {what} {rel}; a pull request that changes only {rel} would not run it')
-    print(f'trace-check: {len(every)} tests, {len(misses)} misses, {len(broken)} not traced or not checked '
-          f'(failed or skipped under the trace)')
-    return 1 if misses or broken else 0
+                say(f'miss: {t} {what} {rel}; a pull request that changes only {rel} would not run it')
+        say(f'{t}: {len(seen)} tracked files touched')
+
+    say(f'trace-check: tracing {len(every)} tests, {max(1, a.jobs)} at once')
+    keep = tempfile.mkdtemp(prefix='trace-check-')
+    old = {s: signal.signal(s, stop) for s in (signal.SIGTERM, signal.SIGINT)}
+    cut = None
+    pool = ThreadPoolExecutor(max(1, a.jobs))
+    try:
+        futures = {pool.submit(trace, root, t, a.run, keep): t for t in every}
+        for f in as_completed(futures):
+            judge(futures[f], *f.result())
+    except Cut as e:
+        cut = str(e)
+    finally:
+        STOP.set()   # (also on an error: no test starts after it)
+        pool.shutdown(wait=True, cancel_futures=True)
+        for s, h in old.items():
+            signal.signal(s, h)
+        shutil.rmtree(keep, ignore_errors=True)
+    if cut:
+        say(f'trace-check: cut off by {cut} after {len(done)} of {len(every)} tests; {len(misses)} misses so far '
+            f'(the rest not checked)')
+    else:
+        say(f'trace-check: {len(every)} tests, {len(misses)} misses, {len(broken)} not traced or not checked '
+            f'(failed or skipped under the trace)')
+    if report:
+        report.close()
+    return 1 if misses or broken or cut else 0
 
 
 if __name__ == '__main__':
