@@ -1239,13 +1239,19 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
         say(f'{name}: started for {tag}, attempt {run.get("run_attempt")}')
 
     # Heartbeats: what `route` may count on, per pool, with the reason when it is nothing.
+    # `free` is how many of the biggest job fit on top of the runners started this pass, not only whether one does:
+    # route hands a pool up to `free` jobs of one run, and a job that is routed but never starts costs the run the
+    # watch's cancel (stuck_seconds) and a hosted re-run of all of it. At most `slots` fits calls per pool and pass.
     t = now()
     biggest = max(memory.values())
     for p in pools:
         why = down.get(p['name']) or closed.get(p['name'])
-        free = 0 if why else max(p['slots'] - active[p['name']] - pending[p['name']], 0)
-        if free and not host(p, 'fits', biggest + started_mb[p['name']]):
-            free, why = 0, down.get(p['name'])
+        slots = 0 if why else max(p['slots'] - active[p['name']] - pending[p['name']], 0)
+        free = 0
+        while free < slots and host(p, 'fits', (free + 1) * biggest + started_mb[p['name']]):
+            free += 1
+        if p['name'] in down:
+            free, why = 0, down[p['name']]
         beat = {'at': int(t), 'free': free}
         if why:
             beat['why'] = why[:300]
@@ -1297,11 +1303,29 @@ def take_locks(lock_dir, names):
     return fds
 
 
+def file_marks(paths):
+    """What tells that one of these files changed: (device, inode, size, mtime) each, None for one that is gone."""
+    out = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+            out.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
+        except OSError:
+            out.append(None)
+    return out
+
+
 def cmd_dispatch(cfg, args, sleep=time.sleep):
+    """Passes until stopped. A dispatcher reads its config, its token and this script once, at start: when any of
+    them changes on disk (host step 3 installs new files, a new token), it exits 0 after the pass, and its unit's
+    Restart=always starts it again with them. So a config change reaches every dispatcher unit on the host (the vm
+    pool's and each desk pool's) without a restart by hand, and no unit keeps an old slots or launch."""
     names = args.pool or [p['name'] for p in dispatched(cfg)]
     unknown = sorted(set(names) - {p['name'] for p in dispatched(cfg)})
     if unknown:
         raise ValueError(f'no pool {", ".join(unknown)} with a dispatcher in the config')
+    watched = [getattr(args, 'config', CONFIG), os.path.abspath(__file__), args.token_file]
+    marks = file_marks(watched)
     token = read_token(args.token_file)
     locks = take_locks(args.lock_dir, names)
     gh = GitHub(token, cfg['repository'])
@@ -1319,6 +1343,14 @@ def cmd_dispatch(cfg, args, sleep=time.sleep):
                 os.close(fd)
             return 0
         sleep(cfg['dispatch']['every_seconds'])
+        now_marks = file_marks(watched)
+        if now_marks != marks:
+            changed = [path for path, a, b in zip(watched, marks, now_marks) if a != b]
+            say(f'fork-fleet: {", ".join(changed)} changed since this dispatcher started: it exits so that its unit '
+                '(Restart=always) starts it again with the new files')
+            for fd in locks:
+                os.close(fd)
+            return 0
 
 
 # ---------------------------------------------------------------- main
