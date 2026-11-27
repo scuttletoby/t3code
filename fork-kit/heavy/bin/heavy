@@ -1262,15 +1262,12 @@ def self_check():
 
 
 def kit_module(name):
-    """lib/<name>.py of this kit, loaded only when a verb or option needs it (plain heavy never does)."""
-    import importlib.machinery, importlib.util
-    kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    path = os.path.join(kit, 'lib', name + '.py')
-    loader = importlib.machinery.SourceFileLoader(name, path)
-    spec = importlib.util.spec_from_loader(name, loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    """lib/<name>.py of this kit, loaded only when a verb or option needs it (plain heavy never does), by the kit's
+    one loader (lib/kit_load.py, #800 item 5)."""
+    lib = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib')
+    sys.path[:0] = [] if lib in sys.path else [lib]
+    import kit_load
+    return kit_load.load(name, f'lib/{name}.py', __file__)
 
 
 def job_options(argv):

@@ -45,7 +45,7 @@ LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-inst
 KEPT = {WRAPPER: (REPLACED, 'heavy'), CAPACITY: (KEPT_CAPACITY, 't3-capacity')}   # where a plain old file goes
 
 SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'lib/heavy_queue.py',
-                'lib/heavy_measure.py', 'common/machine_file.py', 'systemd/heavy-sweep.service',
+                'lib/heavy_measure.py', 'lib/kit_load.py', 'common/machine_file.py', 'systemd/heavy-sweep.service',
                 'systemd/heavy-sweep.timer', 'lib/heavy_facts.py', 'lib/capacity_rule.py', 'lib/capacity_readings.py',
                 'bin/t3-capacity', 'bin/agent-slots', 'common/free_contract.py', 'capacity/capacity-rule.json',
                 'capacity/capacity-format.json', 'capacity/capacity-vectors.json')
