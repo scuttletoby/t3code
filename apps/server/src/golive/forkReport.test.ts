@@ -14,6 +14,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   FORK_PROJECT_SCOPED_KEYS,
   FORK_SERVER_SETTING_KEYS,
+  forkFeaturesWhere,
   ForkProjectOverrideFields,
   type ManagedPolicyDocument,
 } from "@t3tools/contracts";
@@ -1233,7 +1234,8 @@ describe("__fork-report settings", () => {
 
       expect(report.settings.parseWarning).not.toBeNull();
       expect(report.problems.map((problem) => problem.code)).toEqual(["settings-unreadable"]);
-      expect(report.fork.featuresOn).toEqual([]);
+      // As the load's fallback: a file that does not parse may hold a policy, so it fails closed.
+      expect(report.fork.featuresOn).toEqual(["modelPolicy"]);
       expect(report.ok).toBe(false);
     }
   });
@@ -1292,6 +1294,10 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCryptoLayer.layer))(
         (home) => NodeFS.writeFileSync(settingsPathOf(home), '{ "agentSlots": { "enabled": 1 } }'),
       ],
       [
+        "legacy provider keys the load refuses",
+        (home) => NodeFS.writeFileSync(settingsPathOf(home), '{ "providers": 5 }'),
+      ],
+      [
         "comments and a trailing comma",
         (home) =>
           NodeFS.writeFileSync(settingsPathOf(home), '{ // c\n "waitFor": { "enabled": true },\n}'),
@@ -1331,6 +1337,13 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCryptoLayer.layer))(
         expect(report.settings.parseWarning !== null).toBe(loadIgnoredFile);
         expect(report.fork.features.waitFor).toBe(loaded.waitFor.enabled ? "on" : "off");
         expect(report.fork.features.agentSlots).toBe(loaded.agentSlots.enabled ? "on" : "off");
+        // Each fork feature where the load has it, the fallback's model policy included.
+        expect(report.fork.featuresWhere).toEqual(
+          Object.fromEntries(
+            Object.entries(forkFeaturesWhere(loaded)).filter(([, places]) => places.length > 0),
+          ),
+        );
+        expect(report.fork.settings.automaticUpdates).toBe(loaded.automaticUpdates);
       }),
     );
 

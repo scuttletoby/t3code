@@ -25,6 +25,7 @@ import {
   parseSettingsFileText,
   settingsFileLegacyKeysUnreadable,
 } from "../serverSettings.ts";
+import { afterLoadFailure } from "../fork/modelPolicyFile.ts";
 import { decodeSettingsFileSilently, readSettingsFile } from "../fork/settingsFileRead.ts";
 import { type ManagedSettings, unmanagedSettings } from "../policy/managedSettings.ts";
 import { isProcessAlive } from "../serverRuntimeState.ts";
@@ -482,11 +483,26 @@ function readSettings(
           : parseWarning,
     });
   }
-  // As the load: the policy's defaults (with updates off when the file does not decode, as it may
-  // hold an opt-out), then its locks laid over whatever was read.
-  const unlocked =
+  // As the load, then the policy's locks laid over whatever was read. A file the load ignores (or
+  // one that cannot be read) gets the fallback of upstream's private decodeSettingsFile in
+  // serverSettings.ts; the test "settings warning matches the server's load" holds the two alike.
+  const unlocked: ServerSettings =
     parseWarning !== null
-      ? { ...managed.defaults, automaticUpdates: false }
+      ? {
+          ...managed.defaults,
+          continueThreadsAfterServerUpdate: false,
+          automaticUpdates: false,
+          usageHistoryRetentionDays: "unlimited",
+          requireConnectDeviceApproval: true,
+          enablePreviewTunnel: false,
+          enableAgentBrowserAccess: false,
+          defaultRuntimeMode: "approval-required",
+          modelPolicy: afterLoadFailure(
+            decoded ?? Exit.fail(readError),
+            raw ?? "",
+            managed.defaults,
+          ),
+        }
       : decoded !== undefined && Exit.isSuccess(decoded)
         ? decoded.value
         : managed.defaults;

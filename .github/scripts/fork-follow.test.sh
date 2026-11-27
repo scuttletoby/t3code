@@ -450,6 +450,9 @@ while IFS= read -r step; do
 done <<< "$(sed -n 's/^`\(git [^`]*\)`$/\1/p' "$root/report.md")"
 check "plan: the stage report's steps move main to the candidate and keep the old series as a tag" \
   eval '((stage_ok)) && [[ "$(series)" == "$stage_cand" ]] && git -C "$root/gh/me/t3code.git" rev-parse -q --verify "refs/tags/fork-follow/pre-v0.1.11-${old_run:0:12}" > /dev/null'
+# As the advance job: the synced tag before main moves, so main's push run stays off the fleet.
+check "plan: the stage report's steps tag the candidate fork-follow/synced/<sha> before moving main" \
+  eval '[[ "$(git -C "$root/gh/me/t3code.git" rev-parse -q --verify "refs/tags/fork-follow/synced/$stage_cand")" == "$stage_cand" ]] && (( $(grep -n "refs/tags/fork-follow/synced/" "$root/report.md" | cut -d: -f1) < $(grep -n "origin .*:refs/heads/main" "$root/report.md" | cut -d: -f1) ))'
 (cd "$root/work" && RUN_SHA="$old_run" REPORT="$root/report.md" GITHUB_OUTPUT="$root/plan.out" \
   bash "$dir/fork-follow.sh") > "$root/out" 2>&1
 check "plan: release path, the run's commit has other release workflows -> stage, not release" \
@@ -1395,8 +1398,8 @@ check "workflow: advance's if: is a conjunction (no top-level ||) of the plan's 
 # swallow one (continue-on-error, || true, || :, ; true, set +e, a trap, an if:, another shell, BASH_ENV).
 check "workflow: the move step runs only when the checks before it passed (no if:)" \
   eval 'awk "/- name: Move the series branch/ { s = 1; next } s && /^      - / { exit } s && /^        if:/ { bad = 1 } END { exit bad }" <<< "$advance_job"'
-check "workflow: action none deletes a leftover candidate branch" \
-  eval 'grep -q "fork-follow-push.sh cleanup" <<< "$(grep -B2 -A3 "action == .none." "$workflow")"'
+check "workflow: action none or release deletes a leftover candidate branch" \
+  eval 'grep -q "fork-follow-push.sh cleanup" <<< "$(grep -B2 -A3 "action == .none. || steps.plan.outputs.action == .release." "$workflow")"'
 check "workflow: the last sweep reports runs since the run began" \
   eval 'grep -q "SINCE: \${{ needs.guard.outputs.started }}" <<< "$(sed -n "/^  report:/,\$p" "$workflow")"'
 # Each job that reads FORK_PUSH_TOKEN runs in the Environment that holds it, named as in env.

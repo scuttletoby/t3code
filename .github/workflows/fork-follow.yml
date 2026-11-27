@@ -260,9 +260,10 @@ jobs:
           REPORT: ${{ runner.temp }}/reports/push-workflows.md
         run: bash .github/scripts/fork-workflows.sh
 
-      # Nothing waits for a candidate when the series head is already released.
+      # Nothing waits for a candidate when the series head is released, or is released from main
+      # now (a staged candidate that main was moved to).
       - name: Delete a leftover candidate branch
-        if: steps.plan.outputs.action == 'none'
+        if: steps.plan.outputs.action == 'none' || steps.plan.outputs.action == 'release'
         env:
           FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
         run: bash .github/scripts/fork-follow-push.sh cleanup

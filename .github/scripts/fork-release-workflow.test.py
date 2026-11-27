@@ -203,10 +203,27 @@ check("assemble checks SHA256SUMS has a line for every file the publish job uplo
       f"publish uploads {sorted(shipped)}, the check reads {loop.group(1) if loop else None}")
 
 # The server bundle check skips dist/client, which names this repository on every Actions build.
-bundle_steps = [s for s in steps(jobs["build_bundle"]) if "apps/server/dist" in str(s.get("run", ""))]
+bundle_steps = [s for s in steps(jobs["build_bundle"]) if "check-bundle" in str(s.get("run", ""))]
 check("the server bundle is checked through check-bundle (without dist/client)",
       [str(s.get("run", "")).strip() for s in bundle_steps]
       == ["bash .github/scripts/fork-release.sh check-bundle apps/server/dist"])
+
+# What upstream's release.yml does to the bundle between building and uploading it, the fork does
+# too: release-desktop.yml (shared) expects it, as with the staged web asset manifest (#42806).
+def between(names, first, last):
+    return names[names.index(first) + 1 : names.index(last)] if first in names and last in names else None
+
+
+upstream_bundle = (yaml.safe_load((root / ".github/workflows/release.yml").read_text())["jobs"]
+                   .get("build_bundle", {}))
+up_names = [s.get("name") for s in steps(upstream_bundle)]
+fork_names = [s.get("name") for s in steps(jobs["build_bundle"])]
+up_between = between(up_names, "Build JS bundle", "Upload JS bundle")
+fork_between = between(fork_names, "Build JS bundle", "Upload JS bundle") or []
+missing = [n for n in (up_between or []) if n not in fork_between]
+check("build_bundle runs every step upstream's release.yml runs between building and uploading the bundle",
+      up_between is not None and not missing, f"missing: {missing}" if up_between is not None
+      else "release.yml's build_bundle has no 'Build JS bundle' then 'Upload JS bundle'")
 
 # The build names this fork through the setting scripts/lib/release-repository.ts reads.
 build = next((s for s in steps(jobs["build_bundle"]) if s.get("name") == "Build JS bundle"), {})

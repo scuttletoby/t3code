@@ -405,7 +405,8 @@ changed_release_workflows() { # lists the release workflow files that differ bet
 stage_report() { # stage_report CANDIDATE TAG CHANGED
   # A release publishes only commits on main (fork-release.sh on-main, and the pc-agents kit checks
   # the build attestation's ref), so the candidate is released from main, by this workflow: main is
-  # moved to it first, as the advance job does (the old series kept as a tag), then a new run has the
+  # moved to it first, as the advance job does (the old series kept as a tag, the candidate tagged
+  # fork-follow/synced/ so main's push run stays off the fleet), then a new run has the
   # candidate's own release workflows and plans "release".
   {
     printf '%s\n' \
@@ -420,6 +421,7 @@ stage_report() { # stage_report CANDIDATE TAG CHANGED
       printf '%s\n' "The candidate is on the branch fork-follow/candidate. Move main to it as this workflow's advance does (the old series kept as a tag), then start a new run: it has the candidate's release workflows, releases it from main and disables the upstream workflows that the push started." \
         "\`git fetch origin fork-follow/candidate main\`" \
         "\`git push origin $head:refs/tags/fork-follow/pre-$2-${head:0:12}\`" \
+        "\`git push origin $1:refs/tags/fork-follow/synced/$1\`" \
         "\`git push --force-with-lease=main:$head origin $1:refs/heads/main\`" \
         "\`gh workflow run fork-follow.yml --repo $REPOSITORY\`"
     fi
