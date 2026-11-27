@@ -11,13 +11,45 @@ import type {
   ForkWorkPanelAnswer,
   ServerProviderUsageWindow,
 } from "@t3tools/contracts";
+import { AsyncResult } from "effect/reactivity";
+
+import { formatAge } from "./workPanel.logic";
 
 /** What one machine of the fleet gave for its `fork.workPanel` read. */
 export type MachineAnswer =
   | { readonly kind: "unreachable" }
   | { readonly kind: "pending" }
   | { readonly kind: "failed" }
-  | { readonly kind: "answered"; readonly answer: ForkWorkPanelAnswer };
+  | {
+      readonly kind: "answered";
+      readonly answer: ForkWorkPanelAnswer;
+      /** When the client received it (its own clock), which ages it whatever the server's skew. */
+      readonly receivedAt?: number;
+    };
+
+/**
+ * A machine's read as of now. A failed refresh is `failed` even when an older answer is kept
+ * (`AsyncResult.getOrElse` would hand back that old success as if it were current).
+ */
+export function machineAnswerOf(
+  result: AsyncResult.AsyncResult<ForkWorkPanelAnswer, unknown>,
+): MachineAnswer {
+  if (result._tag === "Failure") return { kind: "failed" };
+  if (result._tag === "Success") {
+    return { kind: "answered", answer: result.value, receivedAt: result.timestamp };
+  }
+  return { kind: "pending" };
+}
+
+/** An answer older than three refreshes (a minute each) is not current: it is shown as unknown. */
+const ANSWER_STALE_MS = 3 * 60_000;
+
+/** Why an answer is not shown, or `null` when it is current at `now`. */
+export function staleReason(at: number, now: number): string | null {
+  return now - at > ANSWER_STALE_MS
+    ? `This machine's last answer is ${formatAge(now - at)} old; it has not answered since.`
+    : null;
+}
 
 export interface FleetMachine {
   readonly environmentId: EnvironmentId;
@@ -48,7 +80,7 @@ const unknown = (reason: string): ForkCapacityPart => ({
   source: SOURCE_NONE,
 });
 
-export function machineCapacity(machine: FleetMachine): MachineCapacity {
+export function machineCapacity(machine: FleetMachine, now: number): MachineCapacity {
   const base = {
     environmentId: machine.environmentId,
     label: machine.label,
@@ -64,7 +96,10 @@ export function machineCapacity(machine: FleetMachine): MachineCapacity {
           ? REASON_FAILED
           : status.answer.capacity === undefined
             ? REASON_OLD_VERSION
-            : null;
+            : staleReason(
+                status.receivedAt ?? status.answer.capacity.factsAt ?? status.answer.answeredAt,
+                now,
+              );
   if (reason !== null || status.kind !== "answered" || status.answer.capacity === undefined) {
     const part = unknown(reason ?? REASON_OLD_VERSION);
     return { ...base, agents: part, memoryMb: part, memoryFloorMb: null };
@@ -116,7 +151,7 @@ export function agentsTotalText(total: FleetTotal): string {
   return `Agents: ${total.used} of ${allowed} in use${unknownNote(total.unknown)}`;
 }
 
-function formatGb(mb: number): string {
+export function formatGb(mb: number): string {
   return `${(mb / 1024).toFixed(mb >= 10 * 1024 ? 0 : 1)} GB`;
 }
 
@@ -142,22 +177,28 @@ export function partShare(part: ForkCapacityPart): number | null {
 }
 
 export const SOURCE_CI_RUNNERS =
-  "Busy: runs running in the repository's shared read. Free: GitHub does not report the hosted runners' concurrency cap, and the fleet starts a runner for each job (#13), so no count of free runners exists.";
+  "Busy: runs running in this thread's repositories (the queue lines above), not the whole fleet's. Free: GitHub does not report the hosted runners' concurrency cap, and the fleet starts a runner for each job (#13), so no count of free runners exists.";
 
 /** CI runners: busy from the repo queue lines that answered; free is never known. */
 export function ciRunnersText(lines: ReadonlyArray<ForkRepoQueue>): string {
   const counted = lines.filter((line) => line.state === "answered" && line.running !== undefined);
-  if (counted.length === 0) return "CI runners: unknown";
+  if (counted.length === 0) return "CI runners (this thread's repositories): unknown";
   const busy = counted.reduce((sum, line) => sum + (line.running ?? 0), 0);
-  return `CI runners: ${busy} busy · free unknown`;
+  return `CI runners (this thread's repositories): ${busy} busy · free unknown`;
+}
+
+/** One window kind's room left: `null` with a note when it is not known now. */
+export interface UsageLeft {
+  readonly left: number | null;
+  readonly note: string | null;
 }
 
 /** One provider account's room left: session and weekly, each unknown when not reported. */
 export interface UsageAccountView {
   readonly key: string;
   readonly name: string;
-  readonly session: number | null;
-  readonly weekly: number | null;
+  readonly session: UsageLeft;
+  readonly weekly: UsageLeft;
   readonly reason: string | null;
 }
 
@@ -165,35 +206,65 @@ interface LimitAccountLike {
   readonly key: string;
   readonly driver: string;
   readonly displayName: string | null;
-  readonly email: string | undefined;
   readonly limits: {
+    readonly checkedAt?: string | undefined;
     readonly windows: ReadonlyArray<ServerProviderUsageWindow>;
     readonly unavailable?: { readonly message?: string | undefined } | undefined;
   };
 }
 
-const leftOf = (windows: ReadonlyArray<ServerProviderUsageWindow>, kind: "session" | "weekly") => {
-  const window = windows.find((candidate) => candidate.kind === kind);
-  return window === undefined
-    ? null
-    : Math.round(100 - Math.max(0, Math.min(100, window.usedPercent)));
+/** Limits read longer ago than this are not shown: the provider status has not been read since. */
+const USAGE_STALE_MS = 30 * 60_000;
+export const NOTE_RESET = "reset since the last read";
+
+/**
+ * The tightest window of `kind` (Claude reports several weekly ones: all models and per model),
+ * leaving out a window whose reset time has passed, since its percentage was read before it.
+ */
+const leftOf = (
+  windows: ReadonlyArray<ServerProviderUsageWindow>,
+  kind: "session" | "weekly",
+  now: number,
+): UsageLeft => {
+  const ofKind = windows.filter((window) => window.kind === kind);
+  if (ofKind.length === 0) return { left: null, note: null };
+  const current = ofKind.filter((window) => {
+    const resetsAt = window.resetsAt === undefined ? Number.NaN : Date.parse(window.resetsAt);
+    return !(Number.isFinite(resetsAt) && resetsAt <= now);
+  });
+  if (current.length < ofKind.length) return { left: null, note: NOTE_RESET };
+  const left = Math.min(
+    ...current.map((window) => Math.round(100 - Math.max(0, Math.min(100, window.usedPercent)))),
+  );
+  return { left, note: null };
 };
 
+const UNKNOWN_LEFT: UsageLeft = { left: null, note: null };
+
+/** Each account by its label only: the panel may be screenshotted, so no e-mail. */
 export function usageAccounts(
   accounts: ReadonlyArray<LimitAccountLike>,
+  now: number,
 ): ReadonlyArray<UsageAccountView> {
   return accounts.map((account) => {
     const unavailable = account.limits.unavailable;
-    const windows = unavailable === undefined ? account.limits.windows : [];
+    const checkedAt =
+      account.limits.checkedAt === undefined ? Number.NaN : Date.parse(account.limits.checkedAt);
+    const reason =
+      unavailable !== undefined
+        ? (unavailable.message ?? "The provider did not report its limits.")
+        : !Number.isFinite(checkedAt)
+          ? "The provider status gives no read time."
+          : now - checkedAt > USAGE_STALE_MS
+            ? `Last read ${formatAge(now - checkedAt)} ago.`
+            : null;
+    const windows = reason === null ? account.limits.windows : [];
     return {
       key: account.key,
-      name: [account.displayName ?? account.driver, account.email].filter(Boolean).join(" · "),
-      session: leftOf(windows, "session"),
-      weekly: leftOf(windows, "weekly"),
-      reason:
-        unavailable !== undefined
-          ? (unavailable.message ?? "The provider did not report its limits.")
-          : null,
+      name: account.displayName ?? account.driver,
+      session: reason === null ? leftOf(windows, "session", now) : UNKNOWN_LEFT,
+      weekly: reason === null ? leftOf(windows, "weekly", now) : UNKNOWN_LEFT,
+      reason,
     };
   });
 }

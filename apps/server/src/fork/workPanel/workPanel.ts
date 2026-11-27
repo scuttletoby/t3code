@@ -69,8 +69,8 @@ const subtreeLinks = (threadId: string, shells: ReadonlyArray<OrchestrationV2Thr
 };
 
 /**
- * The answer: CI for `threadId`'s family (none without one), given its shells and the shared
- * cache, and this machine's capacity when `readCapacity` is given.
+ * The answer: with `threadId`, CI for its family, given its shells and the shared cache; without
+ * it, this machine's capacity (when `readCapacity` is given).
  */
 export const makeRead = (
   readFamily: (
@@ -80,13 +80,10 @@ export const makeRead = (
   readCapacity?: Effect.Effect<ForkMachineCapacity>,
 ) =>
   Effect.fn("ForkWorkPanel.read")(function* (input: ForkWorkPanelInput) {
-    const [family, capacity] = yield* Effect.all(
-      [
-        input.threadId === undefined ? Effect.succeed(null) : readFamily(input.threadId),
-        readCapacity ?? Effect.undefined,
-      ],
-      { concurrency: 2 },
-    );
+    // CI with a thread, capacity without one: never both, so neither waits on the other.
+    const family = input.threadId === undefined ? null : yield* readFamily(input.threadId);
+    const capacity =
+      input.threadId === undefined && readCapacity !== undefined ? yield* readCapacity : undefined;
     const shells = family ?? [];
     const links = input.threadId === undefined ? [] : subtreeLinks(input.threadId, shells);
     const byRepo = new Map<string, { host: string; repository: string; count: number }>();
@@ -184,13 +181,13 @@ export const layer = Layer.effect(
     const gate = yield* SlotGate.SlotGate;
     const settings = yield* ServerSettings.ServerSettingsService;
     const host = yield* Effect.serviceOption(HostResources.HostResources);
-    const readCapacity = EnvironmentFacts.read.pipe(
+    const readCapacity = EnvironmentFacts.readWithSlotLimit.pipe(
       Effect.provideService(SlotGate.SlotGate, gate),
       Effect.provideService(ServerSettings.ServerSettingsService, settings),
       Option.isSome(host)
         ? Effect.provideService(HostResources.HostResources, host.value)
         : (effect) => effect,
-      Effect.map(capacityFromFacts),
+      Effect.map(({ facts, slotLimit }) => capacityFromFacts(facts, slotLimit)),
     );
     const readFamily = (threadId: ThreadId) =>
       threads.readShellSnapshot({ familyOf: threadId }).pipe(

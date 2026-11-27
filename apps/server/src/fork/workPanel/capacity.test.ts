@@ -5,7 +5,7 @@ import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 
 import { REASON_GATE_UNREAD, REASON_SLOTS_OFF } from "../environmentFacts.ts";
-import { capacityFromFacts, REASON_NO_HOST_READ } from "./capacity.ts";
+import { capacityFromFacts, REASON_NO_HOST_READ, REASON_OVER_LIMIT } from "./capacity.ts";
 import { makeRepoQueueCache } from "./repoQueue.ts";
 import { makeRead } from "./workPanel.ts";
 
@@ -58,6 +58,29 @@ describe("capacityFromFacts", () => {
     }
   });
 
+  it("more agents than a lowered limit: the gate's limit, not a clamped total", () => {
+    // Lowered to 4 while 6 run: slotsFree is clamped at 0, so used + slotsFree would read 6 of 6.
+    const capacity = capacityFromFacts(
+      {
+        placement: {
+          labels: [],
+          available: false,
+          reason: "Every machine slot is in use.",
+          runningAgents: 6,
+          slotsFree: 0,
+          factsAt: 1,
+        },
+      },
+      4,
+    );
+    assert.deepStrictEqual([capacity.agents.used, capacity.agents.total], [6, 4]);
+    assert.strictEqual(capacity.agents.reason, REASON_OVER_LIMIT);
+  });
+
+  it("no time from any source: no made-up facts time", () => {
+    assert.isFalse("factsAt" in capacityFromFacts({}));
+  });
+
   it("no host read: memory unknown", () => {
     const capacity = capacityFromFacts({
       placement: { labels: [], available: true, runningAgents: 0, slotsFree: 1, factsAt: 1 },
@@ -67,8 +90,20 @@ describe("capacityFromFacts", () => {
   });
 });
 
-describe("the work panel read for another machine of the fleet", () => {
-  it.effect("no thread: only the capacity, without reading threads or GitHub", () =>
+describe("the work panel's two reads", () => {
+  it.effect("with a thread: CI only, so a slow capacity read never holds it back", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(5);
+      const cache = yield* makeRepoQueueCache(() =>
+        Effect.succeed({ _tag: "Unreachable", reason: "unused" } as const),
+      );
+      const read = makeRead(() => Effect.succeed([]), cache, Effect.never);
+      const answer = yield* read({ threadId: "t1" as never });
+      assert.deepStrictEqual(answer, { answeredAt: 5, repoQueues: [], pullRequests: [] });
+    }),
+  );
+
+  it.effect("without a thread: only the capacity, without reading threads or GitHub", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(5);
       let calls = 0;

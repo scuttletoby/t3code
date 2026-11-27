@@ -39,7 +39,6 @@ vi.mock(import("../../../browser/useOpenLink"), () => ({
 vi.mock(import("./workPanelAtom"), () => ({
   forkWorkPanelAtom: (() => Atom.make(state.result)) as never,
   forkFleetAtom: (() => Atom.make(state.fleet)) as never,
-  fleetKey: () => "fleet",
   useForkUsageAccounts: (() => state.accounts) as never,
 }));
 
@@ -339,7 +338,7 @@ describe("the capacity bar", () => {
     await using screen = await render(panel());
     await expect
       .element(screen.getByTestId("fork-work-panel-ci-runners"))
-      .toHaveTextContent("CI runners: 2 busy · free unknown");
+      .toHaveTextContent("CI runners (this thread's repositories): 2 busy · free unknown");
   });
 
   it("usage: each account's session and weekly room left; a missing one is unknown", async () => {
@@ -351,8 +350,11 @@ describe("the capacity bar", () => {
           key: "a",
           driver: "claudeAgent",
           displayName: "Claude",
-          email: undefined,
-          limits: { windows: [{ id: "s", kind: "session", label: "5h", usedPercent: 38 }] },
+          email: "person@example.com",
+          limits: {
+            checkedAt: new Date(NOW - MINUTE).toISOString(),
+            windows: [{ id: "s", kind: "session", label: "5h", usedPercent: 38 }],
+          },
         },
       ],
     });
@@ -363,6 +365,8 @@ describe("the capacity bar", () => {
     const weekly = screen.getByTestId("fork-work-panel-usage-weekly");
     await expect.element(weekly).toHaveAttribute("data-state", "unknown");
     await expect.element(weekly).toHaveTextContent("Weeklyunknown");
+    // A label only: the panel may be screenshotted.
+    expect(screen.container.textContent).not.toContain("person@example.com");
   });
 
   it("no account reports limits: says unknown", async () => {

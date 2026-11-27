@@ -14,8 +14,9 @@ import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./
 export const FORK_WORK_PANEL_METHOD = "fork.workPanel" as const;
 
 /**
- * With `threadId`, the server reads that thread's family (its root, forks and sub-agents) for CI;
- * without it (another machine of the fleet), only its capacity.
+ * With `threadId`, the server reads that thread's family (its root, forks and sub-agents) for CI
+ * only; without it, only the machine's capacity. Two reads, so a slow slot gate never holds back
+ * the CI answer.
  */
 export const ForkWorkPanelInput = Schema.Struct({ threadId: Schema.optionalKey(ThreadId) });
 export type ForkWorkPanelInput = typeof ForkWorkPanelInput.Type;
@@ -85,7 +86,8 @@ export const ForkMachineCapacity = Schema.Struct({
   memoryMb: ForkCapacityPart,
   /** The free memory the slot gate keeps, in MB; `null`: none set. */
   memoryFloorMb: Schema.optionalKey(Schema.NullOr(NonNegativeInt)),
-  factsAt: NonNegativeInt,
+  /** When the facts were read (ms); absent when no source gave a time. */
+  factsAt: Schema.optionalKey(NonNegativeInt),
 });
 export type ForkMachineCapacity = typeof ForkMachineCapacity.Type;
 

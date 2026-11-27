@@ -77,11 +77,7 @@ function WorkPanelBody(props: {
   return (
     <ThreadDetailsSection headingId="fork-work-panel-heading" title="Work" data-fork-work-panel>
       <div className="flex flex-col gap-1.5 px-2.5 text-xs">
-        <CapacityBar
-          environmentId={props.environmentId}
-          threadId={props.threadId}
-          repoQueues={lines}
-        />
+        <CapacityBar environmentId={props.environmentId} repoQueues={lines} />
         <p className="text-2xs font-medium text-muted-foreground">CI</p>
         {pullRequests.length === 0 ? (
           <p className="text-muted-foreground">
