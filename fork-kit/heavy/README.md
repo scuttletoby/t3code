@@ -805,7 +805,7 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | ---------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `/usr/local/bin/heavy`                                     | link to `current/bin/heavy`                                               |
 | `/usr/local/sbin/heavy-install`                            | link to `current/sbin/heavy-install`                                      |
-| `/usr/local/bin/t3-capacity`                               | link to `current/bin/t3-capacity`                                         |
+| `/usr/local/bin/t3-capacity`                               | link to `versions/<sha>/bin/t3-capacity` of the release in use            |
 | `/usr/local/libexec/heavy/versions/<sha>/`                 | the code of one release, with `MANIFEST.sha256` (root 755)                |
 | `/usr/local/libexec/heavy/current`                         | link to the release in use (switched in one step)                         |
 | `/usr/local/libexec/heavy/replaced/`                       | a plain `/usr/local/bin/heavy` from before the kit, put back on uninstall |
@@ -849,8 +849,9 @@ note and again in its closing `installed release` line), until it is run once wi
 keeps the copy in `/usr/local/libexec/heavy-kept/`, links the kit's, and later runs keep the link without the
 option). A link there that the kit did not make is left alone the same way; with `--replace-t3-capacity` it is
 refused (remove it by hand first: there is no file to keep). A host whose own installer wrote that copy first changes it to stop writing
-that path and to run `heavy-install` (or check that the path is the link to
-`/usr/local/libexec/heavy/current/bin/t3-capacity`): a copy over the link would land in the release's own folder
+that path and to run `heavy-install` (or check that the path is the kit's link, to
+`/usr/local/libexec/heavy/versions/<sha>/bin/t3-capacity`; releases before #933 linked
+`/usr/local/libexec/heavy/current/bin/t3-capacity`, which still counts as the kit's): a copy over the link would land in the release's own folder
 (`heavy-install self-check` then says `changed since install`), and one written beside it and renamed over it puts
 a plain copy back (`heavy --self-check` says the link differs and warns about the copy).
 
@@ -862,7 +863,10 @@ a plain copy back (`heavy --self-check` says the link differs and warns about th
   one is made again. The old `/usr/local/bin/heavy` and `/usr/local/bin/t3-capacity` keep working until the links
   step, which copies each to its kept folder before its link replaces it in one rename. The sweep's units are
   written only after that, so a timer never runs before the release it needs is in use. Running the same line again
-  finishes the job.
+  finishes the job, and removes a temporary link (`<path>.new-link`) a stopped run left. Uninstall puts each kept
+  copy back over the kit's link in one rename (never a moment without the command), then removes what a stopped run
+  left: a `.restore` copy, a `.new-link`, a half-kept `heavy-kept/*.tmp`, and `heavy-kept/` once it is empty or its
+  copy is back.
 - **Rollback:** the timer's service runs `/usr/local/libexec/heavy/current/lib/heavy_sweep.py` (the sweep of the
   release in use, never an older `heavy` without the `sweep` verb), and only when that file exists. Before going
   back to a release without the sweep, run the newer installer with `--no-sweep-timer`; if you did not, the
@@ -875,12 +879,16 @@ a plain copy back (`heavy --self-check` says the link differs and warns about th
 - **Rollback past the memory queue:** remove the `queue` key from the machine file's `heavy` section first. A
   release from before the queue does not know it: its sweep refuses the whole machine file and says which key. That
   release cannot be changed from here, so the order is the guard: key out, then the older release.
-- **Rollback past the `t3-capacity` link:** an older installer leaves `/usr/local/bin/t3-capacity` as it is, a link
-  to `current/bin/t3-capacity`; every release since `heavy facts` has that file. Before going back further, run
+- **Rollback past the `t3-capacity` link:** the link names the release's own folder
+  (`versions/<sha>/bin/t3-capacity`), not `current`, and no installer removes another release's folder on install.
+  So after a rollback, also to a release without `bin/t3-capacity` (ci/v20 or older), `t3-capacity` still runs: the
+  newer release's copy, until the next install of a newer release switches the link (#933). An older installer that
+  links `t3-capacity` itself (ci/v23 up to the release before #933) sees this link as not its own: it leaves it as it
+  is with a note, and refuses `--replace-t3-capacity`. To leave the kit, run the newest
   `heavy-install uninstall` (it puts the old copy back). The old copy is kept in `/usr/local/libexec/heavy-kept/`,
   outside `/usr/local/libexec/heavy` and `/etc/heavy`, because an older installer's uninstall deletes those two
-  folders whole (and puts the newest file of `replaced/` back as `heavy`). That older uninstall does not know the
-  `t3-capacity` link, so it leaves it broken (every `t3-capacity N && …` gate then fails): run this release's
+  folders whole (and puts the newest file of `replaced/` back as `heavy`). The uninstall of any release before #933
+  does not know this link, so it leaves it broken (every `t3-capacity N && …` gate then fails): run this release's
   `sbin/heavy-install uninstall` from its source folder, as root, which removes the broken link and puts the kept
   copy back, or install again.
 - **Old state:** a plain-file `/usr/local/bin/heavy` (the one-line wrapper from before) is kept and put back by
