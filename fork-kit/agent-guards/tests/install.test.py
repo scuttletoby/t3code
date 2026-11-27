@@ -87,6 +87,35 @@ class Install(fx.FakeHost):
             self.assertTrue(self.is_file(f'/usr/local/bin/{hook}'), hook)
         self.assertEqual(self.run_main('self-check')[0], 0)
 
+    def test_the_copy_carries_the_bytecode_of_the_fast_path(self):
+        """#1094: the fast path runs the hooks from bytecode, so the copy holds a checked-hash .pyc of each file of
+        BYTECODE, made for that file's text, in the manifest (the self-check finds one changed), and the fast path is
+        linked beside the hooks."""
+        import importlib.util
+        self.assertEqual(self.install()[0], 0)
+        self.assertTrue(self.is_file(f'/usr/local/bin/{wiring.FAST}'))
+        folder = self.resolve('/usr/local/libexec/agent-guards/current')
+        with open(os.path.join(folder, 'MANIFEST.sha256')) as f:
+            listed = {line.split('  ', 1)[1] for line in f.read().splitlines() if line}
+        rels = [f'bin/{h}' for h in wiring.FAST_HOOKS] + ['lib/agent_guards/fast.py', 'lib/agent_guards/quick.py',
+                                                          'lib/agent_guards/config.py']
+        for rel in rels:
+            with self.subTest(rel):
+                pyc = os.path.normpath(importlib.util.cache_from_source(rel))
+                self.assertIn(pyc, listed)
+                with open(os.path.join(folder, rel), 'rb') as f:
+                    source = f.read()
+                with open(os.path.join(folder, pyc), 'rb') as f:
+                    head = f.read(16)
+                self.assertEqual(head, importlib.util.MAGIC_NUMBER + (3).to_bytes(4, 'little')
+                                 + importlib.util.source_hash(source))
+        self.assertEqual(self.install()[0], 0)                       # again: the same copy, nothing made again
+        with open(os.path.join(folder, os.path.normpath(importlib.util.cache_from_source(rels[0]))), 'ab') as f:
+            f.write(b'x')
+        code, out, _err = self.run_main('self-check')
+        self.assertNotEqual(code, 0)
+        self.assertIn('changed since install', out)
+
     def test_settings_writes_the_drop_in_with_every_hook(self):
         code, out, err = self.install('--settings')
         self.assertEqual(code, 0, err)

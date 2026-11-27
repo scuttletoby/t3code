@@ -1,0 +1,20 @@
+#!/usr/bin/python3 -IBS
+"""agent-guards-fast HOOK_FILE: the fast path of the kit's per-call hooks (lib/agent_guards/fast.py).
+
+Run by the settings entries of actions-disable-guard, capacity-pipe-guard and memory-index-guard (`agent-guards
+hooks`): it passes a call the hook surely passes, and runs the hook file on the same event for everything else.
+Without its lib part it runs the hook file as before. Part of fork-kit/agent-guards (README.md there).
+"""
+import os, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+try:
+    from agent_guards import fast
+except Exception:   # noqa: BLE001 - no lib part: the hook as before, compiled and read in full
+    fast = None
+if fast is None and len(sys.argv) > 1:
+    import runpy
+    sys.argv = sys.argv[1:]
+    runpy.run_path(sys.argv[0], run_name='__main__')
+    sys.exit(0)
+sys.exit(fast.main(sys.argv[1:]) if fast else 1)
