@@ -13,7 +13,17 @@ the self-check are made from it:
 
 Every other tool passes untouched. This is version 0 of the fork's model policy: a hook on the agent's side. The T3
 server checks an agent's pick too, against its own setting (`modelPolicy`, **Settings → Fork → Model policy**, #731):
-`delegate_task`, `create_threads`, `t3_thread_launch` and `t3_thread_configure`. Give both the same rows.
+`delegate_task`, `create_threads`, `t3_thread_launch` and `t3_thread_configure`, and a thread fork
+(`t3_thread_transfer`) by its backstop. Give both the same rows.
+
+**Left to the T3 server once it is locked.** Those five tools (`SERVER_CHECKED_TOOLS`) pass the hook untouched while
+T3's managed policy (`/etc/t3code/policy.json` on Linux, `/Library/Application Support/T3Code/policy.json` on macOS)
+locks `modelPolicy`, so an agent cannot turn the server's check off and each pick is checked once. The hook reads that
+file on every call, under the same rules as its own policy file, and fails closed: it keeps checking the five tools
+when the file is missing, not root-owned, writable by group or others, behind a link, not JSON, not locked, locked
+without a mode and rows, locked at a mode below the hook's (`advise` under an `enforce` hook, or `off`), or locked
+with a row or effort no row of the hook's policy covers. `model-guard --self-check` prints which way it goes. The
+lock step is in [docs/fork/model-policy.md](../../docs/fork/model-policy.md).
 
 Linux, Python 3 standard library only. No state: the hook reads the machine file and the policy again on every call.
 

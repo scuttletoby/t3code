@@ -64,6 +64,7 @@ class Guard(unittest.TestCase):
         self.policy_path = os.path.join(self.dir, 'policy.json')
         self.machine({'policyFile': self.policy_path})
         self.policy(POLICY)
+        self.t3_path = os.path.join(self.dir, 't3-policy.json')   # T3's managed policy: none until a test writes it
         self.records = []   # the owner's record (the system log outside tests)
 
     def close(self):
@@ -85,7 +86,7 @@ class Guard(unittest.TestCase):
         out = io.StringIO()
         text = raw if raw is not None else json.dumps({'tool_name': tool, 'tool_input': tool_input or {}})
         self.assertEqual(self.m.run_hook(io.StringIO(text), out, self.machine_path, os.getuid(),
-                                           record=self.records.append), 0)
+                                           record=self.records.append, t3_policy=self.t3_path), 0)
         return json.loads(out.getvalue())['hookSpecificOutput'] if out.getvalue() else None
 
     def refused(self, tool, tool_input=None, *parts, raw=None):
@@ -202,6 +203,84 @@ class Guard(unittest.TestCase):
     def test_enforce_with_no_rows_refuses_every_pick(self):
         self.policy({'mode': 'enforce', 'allow': []})
         self.refused('Agent', {'model': 'large', 'effort': 'high'}, 'none (every pick is refused)')
+
+    # ---- the tools the T3 server checks, while T3's managed policy locks its policy
+
+    def t3_lock(self, mode='enforce', rows=None, locked=True, file_mode=0o644):
+        """T3's managed policy, locking modelPolicy at `mode` with `rows` (rows within the guard's by default)."""
+        rows = rows if rows is not None else [{'driver': 'claudeAgent', 'model': 'example-large-1',
+                                               'efforts': ['high']}]
+        self.write(self.t3_path, {'schemaVersion': 1, 'organization': 'Owner', 'settings': {
+            'modelPolicy': {'value': {'mode': mode, 'allow': rows}, 'locked': locked}}})
+        os.chmod(self.t3_path, file_mode)
+
+    OUTSIDE = {'task': 'x', 'target': {'model': 'other', 'options': {'effort': 'high'}}}
+
+    def test_a_server_route_is_left_to_t3_while_its_managed_policy_locks_it(self):
+        """The T3 server checks these routes against the locked policy, which an agent cannot change: the guard's
+        copy of the check would only repeat it. Every other checked tool stays the guard's."""
+        self.t3_lock()
+        for tool in ('delegate_task', 'create_threads', 't3_thread_launch', 't3_thread_configure',
+                     't3_thread_transfer'):
+            self.assertIsNone(self.hook(f'mcp__t3-code__{tool}', self.OUTSIDE), tool)
+        self.passed('mcp__t3-code__delegate_task', self.delegate(GOOD_TARGET))
+        self.refused('Agent', {'model': 'other', 'effort': 'high'}, "model 'other'")
+        self.refused('mcp__t3-code__t3_project_create', {'defaultModelSelection': {'model': 'other'}}, "'other'")
+        self.refused('mcp__t3-code__schedule_task', {'model': 'other'}, 'takes no model')
+        # A lock at a stricter mode than the guard's counts too.
+        self.policy(dict(POLICY, mode='advise'))
+        self.assertIsNone(self.hook('mcp__t3-code__delegate_task', self.OUTSIDE))
+
+    def test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes(self):
+        """Fail closed: each state where an agent could turn the server's check off, or where it would allow more
+        than the guard does, keeps the guard's own check. The allowed pick passes in each."""
+        tool = 'mcp__t3-code__delegate_task'
+        link = os.path.join(self.dir, 'elsewhere.json')
+        states = {
+            'missing': lambda: None,
+            'not locked': lambda: self.t3_lock(locked=False),
+            'writable by others': lambda: self.t3_lock(file_mode=0o666),
+            'a link': lambda: (self.t3_lock(), os.rename(self.t3_path, link), os.symlink(link, self.t3_path)),
+            'not JSON': lambda: self.write(self.t3_path, '{"settings":'),
+            'no modelPolicy': lambda: self.write(self.t3_path, {'schemaVersion': 1, 'settings': {}}),
+            'no rows': lambda: self.write(self.t3_path, {'settings': {'modelPolicy': {
+                'value': {'mode': 'enforce'}, 'locked': True}}}),
+            'locked at advise': lambda: self.t3_lock(mode='advise'),
+            'locked at off': lambda: self.t3_lock(mode='off'),
+            'a row the guard lacks': lambda: self.t3_lock(rows=[{'driver': 'claudeAgent', 'model': 'other',
+                                                                 'efforts': ['high']}]),
+            'an effort the guard lacks': lambda: self.t3_lock(rows=[{'driver': 'claudeAgent',
+                                                                     'model': 'example-large-1',
+                                                                     'efforts': ['high', 'max']}]),
+        }
+        for state, make in states.items():
+            with self.subTest(state=state):
+                for path in (self.t3_path, link):
+                    if os.path.lexists(path):
+                        os.unlink(path)
+                make()
+                self.refused(tool, self.OUTSIDE, "model 'other'")
+                self.passed(tool, self.delegate(GOOD_TARGET))
+
+    def test_a_lock_file_root_does_not_own_is_no_lock(self):
+        self.t3_lock()
+        self.assertIsNone(self.m.server_lock(POLICY, self.t3_path, os.getuid()))
+        self.assertIn('not usable', self.m.server_lock(POLICY, self.t3_path, os.getuid() + 1))
+
+    def test_the_self_check_says_who_checks_the_server_routes(self):
+        """The owner sees whether the lock step is done: without it the guard checks the server's routes too."""
+        lock = self.dir + self.m.t3_policy_path()
+        def check():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.m.self_check(self.machine_path, os.getuid(), prefix=self.dir)
+            return out.getvalue()
+        self.assertIn('T3 server routes (delegate_task, create_threads', check())
+        self.assertIn('checked here too', check())
+        os.makedirs(os.path.dirname(lock), mode=0o755, exist_ok=True)
+        self.t3_path = lock
+        self.t3_lock()
+        self.assertIn('left to T3, whose managed policy locks modelPolicy', check())
 
     # ---- delegate_task, create_threads, t3_thread_launch, t3_thread_configure
 
@@ -2074,6 +2153,25 @@ class Command(unittest.TestCase):
 
 # rule: (text in lib/model_guard.py, what it becomes, the test that must then fail)
 MUTATIONS = {
+    'the self-check names the lock': ("'left to T3, whose managed policy locks modelPolicy' if why is None",
+                                      "'left to T3, whose managed policy locks modelPolicy' if False",
+                                      'test_the_self_check_says_who_checks_the_server_routes'),
+    'server routes left to a locked T3 policy': ('    if kind in SERVER_CHECKED_TOOLS and lock is not None and lock(policy) is None:\n        return None\n', '',
+        'test_a_server_route_is_left_to_t3_while_its_managed_policy_locks_it'),
+    'only a server route is left to T3': ('    if kind in SERVER_CHECKED_TOOLS and lock', '    if lock',
+        'test_a_server_route_is_left_to_t3_while_its_managed_policy_locks_it'),
+    'the lock must say locked': ("entry.get('locked') is not True", 'False',
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the lock must have a mode and rows': ("if locked_mode not in MODES or not isinstance(value.get('allow'), list):", 'if False:',
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the lock must be at least as strict': ('if MODES.index(locked_mode) < MODES.index(mode):', 'if False:',
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the locked rows must be within the guard rows': ('    if wider is not None:\n', '    if False:\n',
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the locked efforts must be within the guard row': (" and all(e in h['efforts'] for e in efforts)", '',
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the lock file is read as a protected file': ('machine_file.read_protected_text(path, owner_uid=owner_uid)', "open(path, encoding='utf-8').read()",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
     'broken policy fails closed': ("        _record(record, payload, reason)\n        return _out('deny', reason)",
                                    "        _record(record, payload, reason)\n        return _out(None, reason)",
                                    'test_missing_policy_file_refuses_and_names_it'),
@@ -2209,7 +2307,7 @@ MUTATIONS = {
                       'test_refusals_and_advise_notes_are_recorded'),
     'a failing record changes nothing': ('    except Exception:  # noqa: BLE001', '    except ZeroDivisionError:  # noqa: BLE001',
                                          'test_a_record_that_fails_never_changes_the_answer'),
-    'the hook records to the system log': ('owner_uid=0, record=syslog_record)', 'owner_uid=0, record=None)',
+    'the hook records to the system log': ('owner_uid=0, record=syslog_record, t3_policy=None)', 'owner_uid=0, record=None, t3_policy=None)',
                                            'test_the_default_record_is_the_system_log'),
     'Workflow: of[ is a member access': ("and (prev[1] != 'of' or k - 1 in of_words)", '',
                                          'test_workflow_of_and_keyword_properties_before_a_bracket'),

@@ -166,7 +166,7 @@ fork-kit/heavy/tests/sweep.test.py ~37s unittest
 fork-kit/heavy/tests/heavy.test.py run by .github/workflows/fork-tests.yml unittest
 fork-kit/homelab/tests/check.test.py unittest
 fork-kit/homelab/tests/lease.test.py unittest
-fork-kit/model-guard/tests/guard.test.py unittest
+fork-kit/model-guard/tests/guard.test.py ~14s unittest
 fork-kit/model-guard/tests/install.test.py ~21s unittest
 fork-kit/pc-agents/tests/check.test.py ~32s unittest
 fork-kit/pc-agents/tests/linux.test.py ~60s unittest

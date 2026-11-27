@@ -98,6 +98,13 @@ CLAUDE_TOOLS = {'Agent': 'agent', 'Task': 'agent', 'Workflow': 'workflow', 'Remo
 T3_TOOLS = ('delegate_task', 'create_threads', 't3_thread_launch', 't3_thread_configure', 't3_thread_transfer',
             't3_thread_send', 't3_thread_send_attachments', 'schedule_task', 't3_project_create',
             't3_project_update')
+# T3 tools the T3 server checks against its own modelPolicy (each route's own check, and the backstop for a fork).
+# The hook leaves them to the server only while T3's managed policy locks that policy (server_lock below).
+SERVER_CHECKED_TOOLS = ('delegate_task', 'create_threads', 't3_thread_launch', 't3_thread_configure',
+                        't3_thread_transfer')
+# T3's managed policy file: root-owned, read by T3 at start (packages/shared/src/managedPolicyFile.ts); a locked
+# setting there wins over the settings file an agent can write
+T3_POLICY_PATHS = {'linux': '/etc/t3code/policy.json', 'darwin': '/Library/Application Support/T3Code/policy.json'}
 # RemoteTrigger actions that only read
 REMOTE_READ_ACTIONS = ('list', 'get', 'list_runs', 'get_run_log')
 # the policy versions this kit reads
@@ -884,10 +891,61 @@ def _record(record, payload, text):
         pass
 
 
-def decide(payload, load, record=None):
+def t3_policy_path(platform=None):
+    """Where T3 reads its managed policy file on this platform, or None where the hook cannot read one."""
+    platform = platform or sys.platform
+    return next((p for name, p in T3_POLICY_PATHS.items() if platform.startswith(name)), None)
+
+
+def _wider_row(t3_rows, rows):
+    """The first row T3's locked policy allows that no row of the guard's policy covers (same driver and model, and
+    no effort the guard's row does not list), or None."""
+    for r in t3_rows:
+        efforts = r.get('efforts') if isinstance(r, dict) else None
+        if not any(isinstance(r, dict) and h['driver'] == r.get('driver') and h['model'] == r.get('model')
+                   and (efforts is None or (isinstance(efforts, list) and h['efforts'] is not None
+                                            and all(e in h['efforts'] for e in efforts)))
+                   for h in rows):
+            return r
+    return None
+
+
+def server_lock(policy, path=None, owner_uid=0):
+    """None when T3's managed policy locks modelPolicy at the guard policy's mode or stricter, with no row the
+    guard's rows do not cover, so the T3 server checks the tools in SERVER_CHECKED_TOOLS at least as the guard would
+    and an agent cannot turn that off; else why not. Fails closed: a file that is missing, not root-owned, writable
+    by group or others, behind a link, unreadable or not this shape counts as no lock."""
+    mode = policy['mode']
+    path = path or t3_policy_path()
+    if path is None:
+        return 'this platform has no T3 managed policy file the guard reads'
+    try:
+        document = json.loads(machine_file.read_protected_text(path, owner_uid=owner_uid))
+    except PolicyError as e:
+        return f'T3\'s managed policy is not usable here ({e})'
+    except ValueError as e:
+        return f'{path}: not JSON ({e})'
+    entry = (document.get('settings') if isinstance(document, dict) else None) or {}
+    entry = entry.get('modelPolicy') if isinstance(entry, dict) else None
+    if not isinstance(entry, dict) or entry.get('locked') is not True:
+        return f'{path} does not lock modelPolicy'
+    value = entry.get('value')
+    locked_mode = value.get('mode') if isinstance(value, dict) else None
+    if locked_mode not in MODES or not isinstance(value.get('allow'), list):
+        return f'{path} locks a modelPolicy without a mode and allow rows'
+    if MODES.index(locked_mode) < MODES.index(mode):
+        return f'{path} locks modelPolicy at {locked_mode}, below this policy\'s {mode}'
+    wider = _wider_row(value['allow'], policy['allow'])
+    if wider is not None:
+        return f'{path} allows {json.dumps(wider)}, which no row of this policy covers'
+    return None
+
+
+def decide(payload, load, record=None, lock=None):
     """The hook's answer (a dict to print) or None (no output: the call goes on as without the hook).
     `load()` returns (machine section, policy) or raises PolicyError. Never returns 'allow': a passing call still
-    goes through the session's own permission rules. `record(line)` gets every refusal and every advise note."""
+    goes through the session's own permission rules. `record(line)` gets every refusal and every advise note.
+    `lock(policy)` is server_lock: None leaves a tool the T3 server checks to the server."""
     tool = payload.get('tool_name') if isinstance(payload, dict) else None
     kind = tool_kind(tool)
     if kind is None:
@@ -900,6 +958,8 @@ def decide(payload, load, record=None):
         _record(record, payload, reason)
         return _out('deny', reason)
     if policy['mode'] == 'off':
+        return None
+    if kind in SERVER_CHECKED_TOOLS and lock is not None and lock(policy) is None:
         return None
     problems, matched = check_call(kind, payload.get('tool_input'), policy['allow'])
     notes = '; '.join(f'{r["model"]} is for {r["useFor"]}' for r in matched if r['useFor'])
@@ -915,7 +975,7 @@ def decide(payload, load, record=None):
     return _out(context=f'model-guard (advise mode, nothing refused): enforce would refuse this {tool} call: {why}')
 
 
-def run_hook(stdin, stdout, machine_path=None, owner_uid=0, record=syslog_record):
+def run_hook(stdin, stdout, machine_path=None, owner_uid=0, record=syslog_record, t3_policy=None):
     try:
         payload = json.loads(stdin.read())
     except ValueError as e:
@@ -927,7 +987,8 @@ def run_hook(stdin, stdout, machine_path=None, owner_uid=0, record=syslog_record
         _record(record, None, reason)
         out = _out('deny', reason)
     else:
-        out = decide(payload, lambda: load_policy(machine_path, owner_uid), record)
+        out = decide(payload, lambda: load_policy(machine_path, owner_uid), record,
+                     lambda policy: server_lock(policy, t3_policy, owner_uid))
     if out:
         stdout.write(json.dumps(out) + '\n')
     return 0
@@ -1323,6 +1384,10 @@ def self_check(machine_path=None, owner_uid=0, prefix=''):
         problems += offer_problems
         for note in offer_notes:
             print(f'note: {note}')
+        t3 = t3_policy_path()
+        why = server_lock(policy, prefix + t3, owner_uid) if t3 else server_lock(policy, None, owner_uid)
+        print(f'T3 server routes ({", ".join(SERVER_CHECKED_TOOLS)}): '
+              + ('left to T3, whose managed policy locks modelPolicy' if why is None else f'checked here too: {why}'))
     try:
         files = managed_files(prefix + managed_dir(), owner_uid)
     except PolicyError as e:
