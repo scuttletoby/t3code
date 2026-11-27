@@ -8,6 +8,8 @@ first checks that the hook file is there, so a missing hook fails the way its ki
                          empty Python file would answer nothing, which lets the call run). It answers itself within 5 s of
                          its start; should Claude Code still cut it off at its timeout, the entry's
                          "onFailure": "block" refuses the call (without it a timed-out hook lets the call run).
+  leak-guard             fails CLOSED the same way: a personal detail posted to a public repo cannot be taken
+                         back (an edit keeps its history).
   capacity-pipe-guard,   fail OPEN: exit 1, which Claude Code shows as a hook error and then runs the call. These
   memory-index-guard,    guard mistakes, not attacks; refusing every call because a helper is gone would stop all
   bg-guard, agent-slots, work on the machine.
@@ -34,8 +36,9 @@ MANAGED_DIR = '/etc/claude-code'                  # Claude Code's managed settin
 DROP_IN = f'{MANAGED_DIR}/managed-settings.d/{DROP_IN_NAME}'
 
 HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard', 'bg-guard', 'agent-slots',
-         'facts-hook', 'poll-loop-guard', 'read-size-guard', 'batch-nudge')
-CLOSED = {'actions-disable-guard'}               # a missing or failed hook refuses
+         'facts-hook', 'poll-loop-guard', 'read-size-guard', 'batch-nudge',
+         'leak-guard')
+CLOSED = {'actions-disable-guard', 'leak-guard'}   # a missing or failed hook refuses
 FAST = 'agent-guards-fast'                       # the fast path (bin/agent-guards-fast), linked beside the hooks
 FAST_HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard')   # run on every Bash call
 WHAT_IS_LOST = {
@@ -48,6 +51,7 @@ WHAT_IS_LOST = {
     'poll-loop-guard': 'hook skipped, wait loops and self-kills are NOT checked',
     'read-size-guard': 'hook skipped, Read sizes are NOT checked',
     'batch-nudge': 'hook skipped, no batching hint',
+    'leak-guard': 'every Bash and Monitor command is refused until it is back',
 }
 # (event, matcher or None, [(hook, timeout)]): one settings entry each, in this order
 ENTRIES = (
@@ -56,6 +60,7 @@ ENTRIES = (
     ('PreToolUse', 'Bash|Monitor', [('capacity-pipe-guard', 10)]),
     ('PreToolUse', 'Bash', [('poll-loop-guard', 5)]),
     ('PreToolUse', 'Read', [('read-size-guard', 5)]),
+    ('PreToolUse', 'Bash|Monitor', [('leak-guard', 10)]),
     ('PostToolUse', 'Write|Edit|MultiEdit|Bash|Monitor', [('memory-index-guard', 5)]),
     ('PostToolUse', 'Read|Grep|Glob|LS|NotebookRead|Bash', [('batch-nudge', 5)]),
     ('UserPromptSubmit', None, [('agent-slots', 5)]),

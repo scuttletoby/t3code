@@ -1,0 +1,287 @@
+#!/usr/bin/python3 -IB
+"""Claude Code PreToolUse hook (Bash, Monitor): refuse a post or a push whose text matches a private pattern.
+Part of fork-kit/agent-guards (README.md there: install, settings entry, the machine file's "agent-guards" section).
+
+Why: a public fork must hold nothing personal (names, addresses, machine names, private paths). A scan found old PR
+text and a commit trailer that did; the rule was only a line in the agents' instructions (#892).
+
+What it reads, for a command that posts or pushes (a `gh` command, `git commit|push|tag|notes|merge|commit-tree`,
+or curl/wget/http naming github): the whole command text (with its heredocs), every file the command names (a
+--body-file, `-F f`, `-F key=@f`, `< f`, `git commit -F f`), and for `git push` every commit that is on no remote
+yet (`git log --branches --tags --not --remotes`): its message, author and committer, and its added lines and file
+paths. A match with any line of the pattern file refuses the command. The answer names the line number only, never
+the pattern or the text: the refusal itself must not leak.
+
+The pattern file (leakGuard.patternsFile, default /etc/fork-kit/leak-patterns; format in lib/agent_guards/leak.py)
+is private and never in a repo. No file: nothing to check, the command runs (`agent-guards self-check` says so). A
+file that cannot be used whole (unreadable, a line that is no valid pattern): every post or push is refused until it
+is fixed. Other commands always run.
+
+Fails closed: the settings entry refuses the call when this file is missing or the hook fails, as for
+actions-disable-guard: a leak cannot be taken back (an edit keeps the old text in GitHub's history). Like the other
+guards it stops mistakes, not a hostile agent (text built at run time, a program it does not know). It writes
+nothing. Tests: fork-kit/agent-guards/tests/leak-guard.test.py
+"""
+import json, os, re, shlex, subprocess, sys, time
+
+NAME = 'leak-guard'
+START = time.monotonic()
+BUDGET = 8.0          # the settings entry gives 10 s; past this it refuses a push it could not read whole
+MAX_NAMED = 5_000_000  # a named file bigger than this is not read (an upload, an archive)
+TOOLS = {'Bash', 'Monitor'}
+WRAPPERS = {'sudo', 'env', 'command', 'exec', 'nohup', 'time', 'nice', 'timeout', 'stdbuf', 'setsid', 'doas', 'xargs'}
+GIT_POSTS = {'commit', 'push', 'tag', 'notes', 'merge', 'commit-tree'}
+NET = {'curl', 'wget', 'http', 'https', 'xh'}
+PREFIX = f'Refused by {NAME}: '
+FIX = (' Take the personal detail out (a name, an address, a machine name, a private path) and run it again. The '
+       'rule (#892): nothing personal goes into the public fork, its PRs, issues, comments or commits. Text posted '
+       'to GitHub keeps its history: an edit does not remove it, so it must not get there.')
+
+
+def _settings():
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        return config.load('leakGuard')
+    except BaseException as e:   # noqa: BLE001 - the guard works without its config
+        return ({'patternsFile': '/etc/fork-kit/leak-patterns', 'maxPushBytes': 20_000_000},
+                f'cannot load the kit\'s config code ({type(e).__name__}: {e})')
+
+
+SETTINGS, SETTINGS_PROBLEM = _settings()
+
+
+def words(line):
+    try:
+        lx = shlex.shlex(line, posix=True, punctuation_chars=';&|()<>')
+        lx.whitespace_split = True
+        lx.commenters = '#'
+        return list(lx)
+    except ValueError:   # an unclosed quote: the plain words
+        return line.split()
+
+
+def lines_and_bodies(text):
+    """(command lines, heredoc bodies): a line after `<<WORD` up to WORD is text, not a command."""
+    cmds, bodies, ends = [], [], []
+    for line in text.split('\n'):
+        if ends:
+            if line.strip() == ends[0] or line.lstrip('\t') == ends[0]:
+                ends.pop(0)
+            else:
+                bodies.append(line)
+            continue
+        cmds.append(line)
+        ends += [m.group(2) for m in re.finditer(r'<<-?\s*([\'"]?)([\w.-]+)\1', line)]
+    return cmds, bodies
+
+
+def segments(text):
+    """The simple commands of the text's command lines, as word lists."""
+    cmds, _ = lines_and_bodies(text)
+    out, cur = [], []
+    for w in words('\n'.join(cmds).replace('\n', ' ; ')):
+        if w in (';', '&', '&&', '|', '||', '|&', '(', ')', '{', '}', '$('):
+            if cur:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append(w)
+    return out + ([cur] if cur else [])
+
+
+def command_word(seg):
+    """(index of the command word, its name) after NAME=value and wrappers, or (None, '')."""
+    i = 0
+    while i < len(seg):
+        w = seg[i]
+        if re.match(r'^[A-Za-z_]\w*=', w) or w.startswith('-') or re.match(r'^\d+[smhd]?$', w):
+            i += 1
+            continue
+        base = os.path.basename(w)
+        if base in WRAPPERS:
+            i += 1
+            continue
+        return i, base
+    return None, ''
+
+
+def git_sub(args):
+    """The git subcommand after git's own flags, and the folder of `-C dir` (or None)."""
+    i, where = 0, None
+    while i < len(args):
+        a = args[i]
+        if a == '-C' and i + 1 < len(args):
+            where = os.path.join(where or '', args[i + 1]) if where else args[i + 1]
+            i += 2
+        elif a in ('-c', '--git-dir', '--work-tree', '--namespace') and i + 1 < len(args):
+            i += 2
+        elif a.startswith('-'):
+            i += 1
+        else:
+            return a, where
+    return '', where
+
+
+def posts(seg):
+    """('gh'|'git'|'net', its args) for a command that posts or pushes, else None."""
+    h, name = command_word(seg)
+    if h is None:
+        return None
+    args = seg[h + 1:]
+    if name == 'gh':
+        return 'gh', args
+    if name == 'git' and git_sub(args)[0] in GIT_POSTS:
+        return 'git', args
+    if name in NET and any('github' in a.lower() for a in args):
+        return 'net', args
+    return None
+
+
+def named_files(args, cwd):
+    """The files a command names that are there: words, `key=@f`, `@f`, `--flag=f`."""
+    out = []
+    for a in args:
+        for cand in {a, a.split('=', 1)[-1], a.split('=@', 1)[-1], a.lstrip('@')}:
+            if not cand or cand == '-' or '\0' in cand:
+                continue
+            p = os.path.join(cwd, os.path.expanduser(cand))
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) <= MAX_NAMED and p not in out:
+                    out.append(p)
+            except OSError:
+                pass
+    return out
+
+
+def read(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return f.read(MAX_NAMED)
+    except OSError:
+        return ''
+
+
+def left():
+    return BUDGET - (time.monotonic() - START)
+
+
+def git(where, *args):
+    """stdout of a git command that runs no program of the repo (no pager, no external diff, no textconv, no
+    fsmonitor), within the time left; raises on failure or when it is out of time."""
+    cmd = ['git', '-C', where, '-c', 'core.fsmonitor=false', '-c', 'core.pager=cat', '--no-pager', *args]
+    env = {k: v for k, v in os.environ.items() if k not in ('GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'PAGER')}
+    r = subprocess.run(cmd, capture_output=True, timeout=max(left(), 0.1), env=env, stdin=subprocess.DEVNULL)
+    if r.returncode:
+        raise RuntimeError(f'git {args[0]} failed (exit {r.returncode})')
+    return r.stdout.decode('utf-8', 'replace')
+
+
+def push_reason(where, pats):
+    """Why the commits on no remote yet may not be pushed, or None."""
+    span = ['--branches', '--tags', '--not', '--remotes']
+    try:
+        meta = git(where, 'log', '--format=%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x01', *span)
+        for entry in filter(str.strip, meta.split('\x01')):
+            sha, *fields = entry.strip('\n').split('\x00')
+            n = pats.first('\n'.join(fields))
+            if n:
+                return f'commit {sha[:12]} (its message, author or committer) matches line {n} of the pattern file'
+        diff = git(where, 'log', '-p', '--no-ext-diff', '--no-textconv', '--no-color', '--format=%x01%H', *span)
+    except subprocess.TimeoutExpired:
+        return f'the commits to push could not be read within {BUDGET:g} s; push fewer at once'
+    except (OSError, RuntimeError) as e:
+        return f'the commits to push could not be read ({e}); run the push where `git log` works'
+    if len(diff.encode()) > SETTINGS['maxPushBytes']:
+        return f'the commits to push hold more than {SETTINGS["maxPushBytes"]} bytes of changes; push fewer at once'
+    for chunk in diff.split('\x01'):
+        sha, _, rest = chunk.partition('\n')
+        added = '\n'.join(x[1:] for x in rest.split('\n') if x.startswith('+'))
+        n = pats.first(added)
+        if n:
+            return f'commit {sha[:12]} adds a line or a file path that matches line {n} of the pattern file'
+    return None
+
+
+def decide(cmd, cwd, pats):
+    """None to let the command run, else the reason (no pattern and no matched text in it)."""
+    found = [(seg, p) for seg in segments(cmd) for p in [posts(seg)] if p]
+    if not found:
+        return None
+    if pats.problem:
+        return (f'{pats.problem} ({pats.path}), so no post or push can be checked; it is refused until the owner '
+                'fixes the file.')
+    if not pats.rows:
+        return None
+    text = cmd
+    for seg in segments(cmd):   # a folder the command only runs in (`cd DIR`, `git -C DIR`) is posted nowhere
+        h, name = command_word(seg)
+        places = seg[h + 1:h + 2] if name == 'cd' else [git_sub(seg[h + 1:])[1] or ''] if name == 'git' else []
+        for place in filter(None, places):
+            text = text.replace(place, '')
+    n = pats.first(text)
+    if n:
+        return f'the command text matches line {n} of the pattern file ({pats.path}).'
+    here = cwd
+    for seg in segments(cmd):   # `cd dir && git push`: the folder the push runs in
+        h, name = command_word(seg)
+        if name == 'cd' and h is not None and len(seg) > h + 1:
+            here = os.path.join(here, os.path.expanduser(seg[h + 1]))
+            continue
+        p = posts(seg)
+        if not p:
+            continue
+        kind, args = p
+        for f in named_files(args + [w for i, w in enumerate(seg) if i and seg[i - 1] in ('<', '<<<')], here):
+            n = pats.first(read(f)) or pats.first(f)
+            if n:
+                return f'the file {os.path.basename(f)} that the command posts matches line {n} of the pattern file.'
+        sub, where = git_sub(args) if kind == 'git' else ('', None)
+        if sub == 'push':
+            why = push_reason(os.path.join(here, os.path.expanduser(where)) if where else here, pats)
+            if why:
+                return why + f' ({pats.path}).'
+    return None
+
+
+def main(argv=None):
+    """Exit 2 with the reason on stderr refuses; 0 lets the command run."""
+    if (sys.argv[1:] if argv is None else argv):
+        sys.stderr.write(f'usage: {NAME} (hook: PreToolUse JSON on stdin; its settings entry: `agent-guards hooks`)\n')
+        return 1
+    try:
+        event = json.loads(sys.stdin.read())
+        cmd = (event.get('tool_input') or {}).get('command') if event.get('tool_name') in TOOLS else None
+        why = None
+        if isinstance(cmd, str) and cmd:
+            from agent_guards import leak
+            why = decide(cmd, event.get('cwd') or os.getcwd(), leak.load(SETTINGS['patternsFile']))
+    except BaseException as e:   # noqa: BLE001 - closed: the entry turns this exit into a refusal
+        sys.stderr.write(f'{PREFIX}the guard failed ({type(e).__name__}); the command is refused.\n')
+        return 2
+    if why:
+        sys.stderr.write(PREFIX + why + FIX + '\n')
+        if SETTINGS_PROBLEM:
+            sys.stderr.write(_problem_text() + '\n')
+        return 2
+    if SETTINGS_PROBLEM:   # the call runs; the agent and the owner see the problem
+        sys.stderr.write(_problem_text() + '\n')
+        try:
+            from agent_guards import config
+            out = config.notice(NAME, SETTINGS_PROBLEM, event, None)
+        except BaseException:   # noqa: BLE001 - no lib
+            out = {'systemMessage': _problem_text()}
+        print(json.dumps(out))
+    return 0
+
+
+def _problem_text():
+    try:
+        from agent_guards import config
+        return config.problem_text(NAME, SETTINGS_PROBLEM)
+    except BaseException:   # noqa: BLE001 - no lib
+        return f'{NAME}: {SETTINGS_PROBLEM}; built-in defaults used. Tell the owner.'
+
+
+if __name__ == '__main__':
+    sys.exit(main())

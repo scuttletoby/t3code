@@ -1,0 +1,91 @@
+#!/usr/bin/python3 -IB
+"""leak-scan: report the PR, issue, comment, release and commit text of a GitHub repo that matches a private leak
+pattern (leak-guard's pattern file). Report only: it changes nothing on GitHub. Part of fork-kit/agent-guards.
+
+  leak-scan --repo OWNER/REPO [--commits 300] [--patterns FILE]
+
+Reads, through `gh api` (the caller's gh login): every issue and PR (title and body), issue and PR comments, PR
+review comments, releases (name and notes), and the newest --commits commits of the default branch (message,
+author and committer). Not read: PR review bodies, wiki pages, the edit history of a text (GitHub keeps it: an
+edited text still shows its old version there).
+
+Each match is one line, `MATCH <url> (<what>): pattern line <n>`, naming the line number of the pattern file,
+never the pattern or the text. Exit 0: nothing found; 1: matches; 2: it could not read the repo or the patterns.
+Run it on a schedule as the agents' user (README: Leak guard). Tests: tests/leak-guard.test.py
+"""
+import argparse, json, os, subprocess, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from agent_guards import config, leak  # noqa: E402
+
+PROG = 'leak-scan'
+LISTS = (   # (endpoint, jq that gives [url, what, text] lines)
+    ('issues?state=all&per_page=100',
+     '.[] | [.html_url, (if .pull_request then "PR" else "issue" end) + " title and body",'
+     ' (.title // "") + "\\n" + (.body // "")]'),
+    ('issues/comments?per_page=100', '.[] | [.html_url, "comment", (.body // "")]'),
+    ('pulls/comments?per_page=100', '.[] | [.html_url, "review comment", (.body // "")]'),
+    ('releases?per_page=100', '.[] | [.html_url, "release", (.name // "") + "\\n" + (.body // "")]'),
+)
+COMMITS_JQ = ('.[] | [.html_url, "commit message, author or committer", .commit.message + "\\n" + '
+              '(.commit.author.name // "") + "\\n" + (.commit.author.email // "") + "\\n" + '
+              '(.commit.committer.name // "") + "\\n" + (.commit.committer.email // "")]')
+
+
+def gh_lines(gh, path, jq, paginate=True):
+    cmd = [gh, 'api', *(['--paginate'] if paginate else []), path, '--jq', jq]
+    r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600)
+    if r.returncode:
+        raise RuntimeError(f'`gh api {path.split("?")[0]}` failed (exit {r.returncode}): '
+                           f'{r.stderr.strip()[-300:]}')
+    for line in r.stdout.splitlines():
+        if line.strip():
+            row = json.loads(line)
+            if isinstance(row, list) and len(row) == 3:
+                yield row
+
+
+def scan(repo, pats, gh='gh', commits=300, say=print):
+    """(matches, texts read)."""
+    found = read = 0
+    rows = [r for path, jq in LISTS for r in gh_lines(gh, f'repos/{repo}/{path}', jq)]
+    page = 1
+    while (page - 1) * 100 < commits:
+        got = list(gh_lines(gh, f'repos/{repo}/commits?per_page=100&page={page}', COMMITS_JQ, paginate=False))
+        rows += got[:commits - (page - 1) * 100]
+        if len(got) < 100:
+            break
+        page += 1
+    for url, what, text in rows:
+        read += 1
+        n = pats.first(str(text or ''))
+        if n:
+            found += 1
+            say(f'MATCH {url} ({what}): pattern line {n}')
+    return found, read
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog=PROG, description='Report GitHub text that matches a private leak pattern.')
+    p.add_argument('--repo', required=True, help='OWNER/REPO')
+    p.add_argument('--commits', type=int, default=300, help='newest commits of the default branch to read')
+    p.add_argument('--patterns', help='the pattern file (default: leakGuard.patternsFile of the machine file)')
+    p.add_argument('--gh', default='gh', help=argparse.SUPPRESS)   # tests: a stand-in gh
+    a = p.parse_args(argv)
+    path = a.patterns or config.load('leakGuard')[0]['patternsFile']
+    pats = leak.load(path)
+    if not pats.present or pats.problem or not pats.rows:
+        print(f'{PROG}: {pats.problem or "no patterns"} ({path}): nothing scanned', file=sys.stderr)
+        return 2
+    try:
+        found, read = scan(a.repo, pats, a.gh, max(a.commits, 0))
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+        print(f'{PROG}: {a.repo}: {e}', file=sys.stderr)
+        return 2
+    print(f'{PROG}: {a.repo}: {found} match(es) in {read} texts' + (
+        ' (old text: delete it and post it again without the detail; an edit keeps the old version)' if found else ''))
+    return 1 if found else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

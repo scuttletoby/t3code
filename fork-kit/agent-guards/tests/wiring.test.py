@@ -50,7 +50,7 @@ class Entries(unittest.TestCase):
         self.assertEqual(sorted((e, x.get('matcher'), [h['timeout'] for h in x['hooks']])
                                 for e, xs in wiring.hooks().items() for x in xs),
                          sorted([('PreToolUse', 'Write|Edit|MultiEdit', [5]), ('PreToolUse', 'Bash|Monitor', [10]),
-                                 ('PreToolUse', 'Bash|Monitor', [10]),
+                                 ('PreToolUse', 'Bash|Monitor', [10]), ('PreToolUse', 'Bash|Monitor', [10]),
                                  ('PreToolUse', 'Bash', [5]), ('PreToolUse', 'Read', [5]),
                                  ('PostToolUse', 'Write|Edit|MultiEdit|Bash|Monitor', [5]),
                                  ('PostToolUse', 'Read|Grep|Glob|LS|NotebookRead|Bash', [5]),
@@ -101,7 +101,7 @@ class Entries(unittest.TestCase):
         for _event, entries in wiring.hooks().items():
             for e in entries:
                 for h in e['hooks']:
-                    closed = 'actions-disable-guard' in h['command']
+                    closed = any(f'/{c};' in h['command'] for c in wiring.CLOSED)
                     self.assertEqual(h.get('onFailure'), 'block' if closed else None, h['command'])
 
     def test_find_matches_whole_names_only(self):
@@ -176,7 +176,7 @@ class Entries(unittest.TestCase):
                     if hook in wiring.CLOSED:
                         self.assertEqual(r.returncode, 2, r.stderr)   # lens A nit: empty refuses too
                         self.assertIn('is missing or empty' if name == 'empty'
-                                      else 'actions-disable-guard: the guard failed (exit', r.stderr)
+                                      else f'{hook}: the guard failed (exit', r.stderr)
                         if name != 'empty':
                             self.assertIn('the command is refused', r.stderr)
                     else:
@@ -220,7 +220,7 @@ class Check(unittest.TestCase):
     def test_the_kit_entries_pass(self):
         code, lines = self.run_check(self.settings)
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 21, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 22, '\n'.join(lines))
         self.assertEqual(lines[-1], 'check: test settings: OK')
         # lens A nit: the hooks ran with HOME in check's own temporary folder; nothing (log, cache, state) is
         # written in the caller's HOME

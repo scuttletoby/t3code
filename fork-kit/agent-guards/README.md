@@ -1,6 +1,6 @@
 # agent-guards: Claude Code hooks that guard every agent on a machine
 
-Nine Claude Code hooks, a lookup command and ready-made commands for agents ([below](#ready-made-commands)). Each hook stops one mistake that agents made on a shared machine, at
+Ten Claude Code hooks, a lookup command, a scan and ready-made commands for agents ([below](#ready-made-commands)). Each hook stops one mistake that agents made on a shared machine, at
 the moment they make it. A line in the agents' instructions did not stop any of them. The hooks are general: a project gives only its facts
 (file paths, a command name, a budget) in the machine file's `"agent-guards"` section.
 
@@ -20,6 +20,7 @@ Linux, Python 3 standard library only. One file per hook in [bin/](bin/), the sh
 | `poll-loop-guard`       | PreToolUse (`Bash`), 5 s                                                                             | A foreground loop that checks CI, a pull request, a file or a job and sleeps inside that same loop, too long (`while ! gh pr checks 12; do sleep 60; done`, `sleep 300; gh run view`, `gh run watch`, `watch -n 60 gh ...`); a retry loop with no check inside it passes; the reason names the wait tool that fits (CI: push and stop or `watch_pull_request`; a job or a file: `run_in_background` + `t3_background_wait`, or Monitor with an until-condition); also (foreground or background) a `pkill -f P`, `kill $(pgrep -f P)` or `pgrep -f P | xargs kill` whose pattern is in the command's own text, which kills the shell running it (exit 143/144); the reason says to bracket a letter (`'[v]itest'`) or kill by PID | Passes (exit 1, "wait loops and self-kills are NOT checked") |
 | `read-size-guard`       | PreToolUse (`Read`), 5 s                                                                             | A Read with no offset and no limit whose text (its first 2000 lines) is over `readSize.maxChars` characters; the reason says `grep -n`, then Read that range, or `allow_large: true` for a whole file that is really needed                                                                                                                                                                                                                                                                                                                          | Passes (exit 1, "Read sizes are NOT checked")                                                                                                                              |
 | `batch-nudge`           | PostToolUse (`Read\|Grep\|Glob\|LS\|NotebookRead\|Bash`), 5 s                                        | Nothing; it adds one line of context after every `batchNudge.afterTurns` turns in a row that each made one read-only call: put the next independent reads in one call                                                                                                                                                                                                                                                                                                                                                                                | Passes (exit 1, "no batching hint")                                                                                                                                        |
+| `leak-guard`            | PreToolUse (`Bash\|Monitor`), 10 s, `onFailure: block`                                               | A post or a push (`gh`, `git commit\|push\|tag`, curl to github) whose text, named files or outgoing commits match a line of the private pattern file: nothing personal in the public fork. See [LEAK.md](LEAK.md)                                                                                                                                                                                                                                                                                                                                   | **Refuses** (exit 2), as `actions-disable-guard`                                                                                                                           |
 
 How each hook answers is what Claude Code reads: PreToolUse refuses with exit 2 and the reason on stderr. PostToolUse
 and Stop block with `{"decision": "block", "reason": ...}` on stdout. UserPromptSubmit and SessionStart add `additionalContext`; PreCompact
@@ -28,8 +29,9 @@ Exit 0 with nothing on stdout means pass. The messages and exit codes are the sa
 moved into this kit, so an agent sees no change. Each hook's file says what it reads and what it does not, and where
 its tests are.
 
-**Why one fails closed and the others open.** `actions-disable-guard` guards against a step that cannot be undone
-by an agent (Actions turned off on a repo). If it is gone or broken, refusing every Bash command is the safe answer,
+**Why two fail closed and the others open.** `actions-disable-guard` guards against a step that cannot be undone
+by an agent (Actions turned off on a repo), and `leak-guard` against one that cannot be taken back at all (a
+personal detail posted to a public repo keeps its edit history). If one is gone or broken, refusing every Bash command is the safe answer,
 and the message says so. The other eight guard mistakes or only add context. Refusing every call because a helper is gone would stop all
 work on the machine. The settings entry does both (`agent-guards hooks` prints it):
 
@@ -196,6 +198,8 @@ says so the same loud way, once a session for each hook, #1151), and so does a l
 | `batchNudge.tailBytes`         | `1048576`                                        | Bytes at the end of the session's transcript it reads                                                                                                 |
 | `batchNudge.readOnlyTools`     | `["Read", "Grep", "Glob", "LS", "NotebookRead"]` | Tools whose call counts as a quick read                                                                                                               |
 | `batchNudge.readOnlyCommands`  | `cat`, `grep`, `sed`, `git`, ... (config.py)     | Bash commands that only read (no redirection to a file, no `sed -i`, no `find -delete`; git only with a read subcommand)                              |
+| `leakGuard.patternsFile`       | `/etc/fork-kit/leak-patterns`                    | The private pattern file ([LEAK.md](LEAK.md)); never inside a repo                                                                                    |
+| `leakGuard.maxPushBytes`       | `20000000`                                       | A push with more changes than this is refused unread (push fewer at once)                                                                             |
 
 Paths are absolute or start with `~/` (the home of the user the hook runs as). An example is in
 [machine.example.json](../common/machine.example.json).
@@ -258,7 +262,7 @@ sh fork-kit-bootstrap.sh --kit agent-guards --repo OWNER/FORK --sha RELEASE_SHA 
 
 The installer ([sbin/agent-guards-install](sbin/agent-guards-install), on the shared
 [kit_install.py](../common/kit_install.py)) copies the release to `/usr/local/libexec/agent-guards/versions/<sha>/`,
-self-tests the copy, and links `/usr/local/bin/<hook>`, `/usr/local/bin/agent-guards` and `/usr/local/bin/facts` to it. It is safe to run
+self-tests the copy, and links `/usr/local/bin/<hook>`, `/usr/local/bin/agent-guards`, `/usr/local/bin/facts` and `/usr/local/bin/leak-scan` to it. It is safe to run
 again and to stop at any step. `facts` is a common name: when `/usr/local/bin/facts` is something other than the kit's
 link, the installer leaves it alone and says so (a warning; the install goes on, and uninstall does not remove it or
 wait for it to stop running). Installing a release from before `facts` was added leaves `/usr/local/bin/facts` as a

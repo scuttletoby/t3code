@@ -16,6 +16,7 @@ problem in its answer (systemMessage, and additionalContext where the event take
     "bgGuard":        {"skipSessionsFiles": [], "maxBlocks": 3, "stateDir": "~/.local/state/bg-guard"},
     "agentSlots":     {"sessionsFile": "", "queue": "", "readyHeading": "## Ready", "maxAlive": 10,
                        "processName": "claude", "note": ""},
+    "leakGuard":      {"patternsFile": "/etc/fork-kit/leak-patterns", "maxPushBytes": 20000000},
     "facts":          {"dirs": [], "staleDays": 30, "maxRows": 60, "indexLines": 40, "indexChars": 4000,
                        "projects": [{"match": "github.com/owner/repo", "dirs": ["/srv/repo-facts"], "text": "",
                                      "name": "repo"}],
@@ -150,6 +151,10 @@ SPEC = {
         'maxAlive': (int, 10, _positive),
         'processName': (str, 'claude', lambda v: None if COMMAND_RE.match(v) else 'must be a process name'),
         'note': (str, '', None),
+    },
+    'leakGuard': {
+        'patternsFile': (str, '/etc/fork-kit/leak-patterns', _path),
+        'maxPushBytes': (int, 20_000_000, _positive),
     },
     'facts': {
         'dirs': (list, [], _paths),

@@ -47,6 +47,28 @@ def root_ways(user):
     return out
 
 
+def leak_notes(path, notes):
+    """leak-guard's pattern file: there or not, usable, out of every checkout, not writable by the agents. Its
+    problems (the notes are added to `notes`); never a pattern."""
+    from agent_guards import leak
+    pats = leak.load(path)
+    if not pats.present:
+        notes.append(f'leak-guard: no pattern file at {path}: posts and pushes are NOT checked for personal details '
+                     '(README: Leak guard)')
+        return []
+    if pats.problem:
+        return [f'leak-guard: {pats.problem} ({path}): every post and push is refused until it is fixed']
+    out = []
+    repo = leak.in_checkout(path)
+    if repo:
+        out.append(f'leak-guard: the pattern file {path} is inside the git checkout {repo}: move it out, it must '
+                   'never be committed')
+    if os.access(path, os.W_OK) and os.geteuid() != 0:
+        notes.append(f'WARNING: leak-guard: this user can change the pattern file {path} (an agent could weaken it)')
+    notes.append(f'leak-guard: {len(pats.rows)} pattern(s) in {path}')
+    return out
+
+
 def self_check(bin_dir, drop_in, links_dir=None):
     from agent_guards import approval, config, wiring
     links_dir = links_dir or wiring.BIN
@@ -101,6 +123,7 @@ def self_check(bin_dir, drop_in, links_dir=None):
     for way in root_ways(user) if user != 'root' else ():
         notes.append(f'WARNING: {way}: an agent of that user can become root, and then write the managed settings, '
                      'the machine file and the approval file; the hooks do not hold against it')
+    problems += leak_notes(settings['leakGuard']['patternsFile'], notes)
     for hook, s in settings.items():
         notes.append(f'{hook}: {json.dumps(s, sort_keys=True)}')
     for n in notes:
