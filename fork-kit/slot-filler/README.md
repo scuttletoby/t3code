@@ -16,11 +16,12 @@ uses):
 - `POST /api/fork/delegate` `{parentThreadId, requestId, wake?, task}` where `task` is `delegate_task`'s input
   (task text, title, `target: {environmentId?, providerInstanceId, model, options}`, role, isolation). It returns
   `{state: "started", taskId, childThreadId}` or `{state: "refused", code, message}`. When the parent has no run,
-  the route sends it one short queued message (once per request id and half hour) so it gets one, then starts the
-  task in that run. All of `delegate_task`'s checks apply (slot gate, environments, providers). The route looks the
+  the route sends it one short queued message (once per parent, request id and half hour) so it gets one, then
+  starts the task in that run. All of `delegate_task`'s checks apply (slot gate, environments, providers). The route looks the
   `requestId` up first: one that already started returns its task whatever the parent's state now, so asking
   again never starts a second one. One whose start was refused for good answers `request_rejected` (use a new id).
   A remote start also needs a parent run, so an idle parent takes one short wake turn per start (this uses usage).
+  With `lookupOnly: true` it only answers what the id started (`not_found` when nothing yet), and never starts.
 - `GET /api/fork/delegate?parentThreadId=...` answers `{children, parentSettled}`: the parent's children
   `{taskId, title, status, live, environmentId, childThreadId, providerInstanceId, model}`, and whether the parent
   was settled by hand.
@@ -127,22 +128,33 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
   every run until the item started or left the queue. Before asking T3 it writes `stateDir/inflight/<id>.json`
   with that id. The next run asks again with the same id, and T3 looks it up before any refusal: it answers with
   the task it already started (even if the parent is idle or the slots are full by now), or starts it now. So a
-  start is never lost and never doubled. Only `request_rejected` (T3 refused that id for good) gets a new id. If the started record was written before the stop, it only finishes the
+  start is never lost and never doubled. Only `request_rejected` (T3 refused that id for good) gets a new id;
+  its backoff count stays.
+- **An unclear answer:** a refusal T3 gives before it dispatches (`slots_full`, `parent_not_active`,
+  `usage_pacing_hold`, `provider_unavailable`, ...) means nothing started. Any other answer (`orchestration_error`,
+  such as a linked machine that stopped answering after it launched the thread, or a code the filler does not
+  know) may hide a start there. The marker then stays on that machine, it counts as a slot there, and the item is
+  asked again only there (same request id, after its backoff) until that machine answers with a task or a clear
+  refusal. Only then is another machine tried.
+- **A stop and then a handover:** the marker and request file keep their parent. A left-over start whose parent is
+  not the configured one is only looked up there (`lookupOnly`). It is never started again: when it is not found,
+  the item waits with a note to check that thread's children and then delete the marker. If the started record was written before the stop, it only finishes the
   move. The queue file moves only after T3 returned a task id. Every file it writes is written atomically.
 - **T3 down or the token bad:** the run stops at its first call, logs it once, and keeps everything. When T3 answers
   again it logs that and carries on.
 - **Machine offline or environment unlinked:** T3 refuses the start (`environment_*`, `slots_full`, ...). The filler
   logs the refusal once, removes the marker (nothing was started), keeps the item, and tries the next allowed machine
-  or the next run. Each refusal doubles that item's wait (1 minute, then 2, 4, ... up to 15), logged as "backing off
-  after N refusal(s) (last: code) until T", so a refusal the server checks after the wake does not wake the parent
-  every minute. A child on an environment no machine names still counts, under no machine.
+  or the next run. Each clear refusal doubles that item's wait on that machine (1 minute, then 2, 4, ... up to 15),
+  logged as "<machine> backing off after N refusal(s) (last: code) until T", so a refusal the server checks after the
+  wake does not wake the parent every minute, and a machine that keeps refusing does not hold back a free one. A
+  wait more than 15 minutes ahead (the clock was set back) is cut to 15 minutes. A child on an environment no machine names still counts, under no machine.
 - **Meter missing or old:** that machine is skipped for that account, with a log line.
 - **Brief deleted:** the item is refused and kept until the brief is back.
 - **PR closed:** `pr-green` and `pr-merged` items wait with a log line ("closed without a merge"). Delete them
   by hand.
 - **Parent thread gone:** the run stops, logs it and starts nothing.
 - **Parent handed over:** a parent settled by hand is taken as handed over to a new orchestrator. The run stops
-  with "set parentThreadId to the orchestrator that runs now" and starts nothing.
+  before it asks anything (left-over starts too) with "set parentThreadId to the orchestrator that runs now".
 - **Empty, broken or incomplete queue file:** refused with the reason, logged once, and kept.
 - **Missing queue folder, empty queue:** nothing to do.
 - **Recovery starts even if caps are now full:** the route's own slot gate still refuses it.

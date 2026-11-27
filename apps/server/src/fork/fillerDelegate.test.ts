@@ -156,6 +156,20 @@ describe("a slot filler start", () => {
     }),
   );
 
+  it.effect("a look-up only: the started task or not_found, nothing asked and no wake", () =>
+    Effect.gen(function* () {
+      const lookup = { ...input, lookupOnly: true };
+      const none = world([started], { parentGone: true });
+      const answer = yield* FillerDelegate.runFillerStart(none.value, lookup);
+      expect(answer.type === "refused" && answer.code).toBe("not_found");
+      expect(none.asked).toEqual([]);
+      expect(none.wakes).toEqual([]);
+      const found = world([idle], { existing: [started] });
+      expect(yield* FillerDelegate.runFillerStart(found.value, lookup)).toEqual(started);
+      expect(found.asked).toEqual([]);
+    }),
+  );
+
   it.effect("a gone parent: nothing asked", () =>
     Effect.gen(function* () {
       const w = world([started], { parentGone: true });
@@ -367,7 +381,9 @@ describe("the slot filler routes in the server's router", () => {
           type: "message.dispatch",
           threadId: parentId,
         });
-        expect(store.dispatched[0]!.commandId).toMatch(/^slot-filler:wake:item-1:1:\d+$/);
+        expect(store.dispatched[0]!.commandId).toMatch(
+          /^slot-filler:wake:thread:filler-parent:item-1:1:\d+$/,
+        );
         expect(
           store.calls.every((c) => c.mode === "async" && c.clientRequestId === "item-1:1"),
         ).toBe(true);
@@ -401,6 +417,27 @@ describe("the slot filler routes in the server's router", () => {
           expect(store.dispatched).toHaveLength(1);
         }),
       ),
+  );
+
+  // A start left under an old parent after a handover is only looked up, never started there.
+  it.effect("a look-up only: 409 not_found before a start, the task after it, never a start", () =>
+    provided(
+      Effect.gen(function* () {
+        const store: Store = { shell: { activeRunId: "run:1" }, dispatched: [], calls: [] };
+        const server = yield* serve(store);
+        const before = yield* server.post(operate, { ...input, lookupOnly: true });
+        expect(before.status).toBe(409);
+        expect(JSON.parse(before.text).code).toBe("not_found");
+        expect(store.calls).toEqual([]);
+        const first = yield* server.post(operate, input);
+        store.shell = { activeRunId: null, settled: true };
+        const after = yield* server.post(operate, { ...input, lookupOnly: true });
+        expect(after.status).toBe(200);
+        expect(JSON.parse(after.text).taskId).toBe(JSON.parse(first.text).taskId);
+        expect(store.calls).toHaveLength(1);
+        expect(store.dispatched).toEqual([]);
+      }),
+    ),
   );
 
   it.effect("a request id whose dispatch was rejected: 409 request_rejected, nothing asked", () =>

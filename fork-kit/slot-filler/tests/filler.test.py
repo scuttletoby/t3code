@@ -56,6 +56,11 @@ class FakeApi:
         if self.down:
             raise sf.ApiError('POST /api/fork/delegate: connection refused')
         self.starts.append(body)
+        if body.get('lookupOnly'):
+            rid = body['requestId']
+            if rid in self.by_request:
+                return {'state': 'started', 'taskId': self.by_request[rid], 'childThreadId': 'thread-x'}
+            return {'state': 'refused', 'code': 'not_found', 'message': 'nothing started under this id yet'}
         if self.refuse_next:
             code, msg = self.refuse_next.pop(0)
             return {'state': 'refused', 'code': code, 'message': msg}
@@ -287,7 +292,7 @@ class Caps(Base):
 
     def test_refusals_back_off_doubling_under_one_request_id(self):
         self.cfg['machines']['local']['maxAgents'] = 0
-        self.w.api.refuse['env-north'] = ('usage_paced', 'the account is paced')
+        self.w.api.refuse['env-north'] = ('usage_pacing_hold', 'the account is paced')
         self.item('w1')
         at = lambda s: (lambda: NOW + datetime.timedelta(seconds=s))
         for t in (0, 30, 61, 120, 181):
@@ -296,10 +301,10 @@ class Caps(Base):
         # tries at 0 s, 61 s (after 60 s) and 181 s (after 120 s); none between
         self.assertEqual(len(self.w.api.starts), 3)
         self.assertEqual(len({b['requestId'] for b in self.w.api.starts}), 1)   # so the wake goes once
-        req = json.load(open(os.path.join(self.state, 'requests', 'w1.json')))
-        self.assertEqual((req['refusals'], req['lastCode']), (3, 'usage_paced'))
-        self.assertTrue(any('waiting w1: backing off after 1 refusal(s) (last: usage_paced) until 2026-11-21T12:01:00Z'
-                            in l for l in self.log_lines()))
+        req = json.load(open(os.path.join(self.state, 'requests', 'w1.json')))['machines']['north']
+        self.assertEqual((req['refusals'], req['lastCode']), (3, 'usage_pacing_hold'))
+        self.assertTrue(any('north backing off after 1 refusal(s) (last: usage_pacing_hold) until '
+                            '2026-11-21T12:01:00Z' in l for l in self.log_lines()))
         self.w.api.refuse.clear()
         self.w.now = at(181 + 240)
         self.run_filler()
@@ -317,6 +322,55 @@ class Caps(Base):
         self.assertEqual(len(ids), 2)
         self.assertNotEqual(ids[0], ids[1])
         self.assertEqual(self.started_ids(), ['w1'])
+
+    def test_an_offline_machine_does_not_hold_back_a_free_one(self):
+        # north keeps refusing; local is full until 2 minutes in, then has room: the item starts there at once
+        self.w.api.refuse['env-north'] = ('provider_unavailable', 'north is offline')
+        self.w.api.live = [{'taskId': f'old-{i}', 'status': 'running', 'live': True, 'environmentId': None}
+                           for i in range(3)]
+        self.item('w1', kind='other')
+        for s in (0, 60):
+            self.w.now = lambda s=s: NOW + datetime.timedelta(seconds=s)
+            self.run_filler()
+        self.w.api.live = []
+        self.w.now = lambda: NOW + datetime.timedelta(seconds=120)
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+
+    def test_two_refusals_in_one_run_count_once_per_machine(self):
+        self.w.api.refuse['env-north'] = ('usage_pacing_hold', 'paced')
+        self.w.api.refuse[None] = ('usage_pacing_hold', 'paced')
+        self.item('w1', kind='other')
+        self.run_filler()
+        self.assertEqual(len(self.w.api.starts), 2)
+        self.w.now = lambda: NOW + datetime.timedelta(seconds=60)      # one refusal each: 60 s, both asked again
+        self.run_filler()
+        self.assertEqual(len(self.w.api.starts), 4)
+
+    def test_a_wait_set_far_ahead_is_capped(self):
+        # a refusal while the clock ran a year ahead, then the clock is set right: the wait is at most 15 minutes
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.item('w1')
+        ahead = (NOW + datetime.timedelta(days=365)).timestamp()
+        wait = {'refusals': 1, 'lastCode': 'usage_pacing_hold', 'nextAt': ahead}
+        self.write('state/requests/w1.json', json.dumps(dict(wait, requestId='w1:1', machines={'local': wait})))
+        self.run_filler()
+        self.assertEqual(self.started_ids(), [])
+        self.w.now = lambda: NOW + datetime.timedelta(minutes=15, seconds=1)
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+
+    def test_a_request_id_refused_for_good_keeps_its_backoff(self):
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.w.api.refuse_next = [('usage_pacing_hold', 'paced'), ('usage_pacing_hold', 'paced'),
+                                  ('request_rejected', 'refused at its dispatch')]
+        self.item('w1')
+        for s in (0, 60, 180):
+            self.w.now = lambda s=s: NOW + datetime.timedelta(seconds=s)
+            self.run_filler()
+        req = json.load(open(os.path.join(self.state, 'requests', 'w1.json')))
+        self.assertEqual(req['machines']['local']['refusals'], 3)          # the third wait: 4 minutes
+        self.assertNotEqual(req['requestId'], self.w.api.starts[0]['requestId'])
 
     def test_a_parent_settled_by_hand_stops_the_run(self):
         self.w.api.settled = True
@@ -474,6 +528,95 @@ class StopsHalfWay(Base):
         self.assertEqual(self.started_ids(), ['w1'])
         self.assertEqual(json.load(open(os.path.join(self.q, 'started', 'w1.json')))['taskId'], 'task-1')
 
+    def lose_remote_answer(self):
+        """north launches the thread, then the link stops answering (no record here yet); asked again with the same
+        request id, north answers with that thread (its launch dedupes on the request id)."""
+        real = self.w.api.start
+        launched = {}
+
+        def start(body):
+            env = body['task']['target'].get('environmentId')
+            rid = body['requestId']
+            if env == 'env-north' and not body.get('lookupOnly'):
+                if rid not in launched:
+                    launched[rid] = True
+                    self.w.api.starts.append(body)
+                    return {'state': 'refused', 'code': 'orchestration_error',
+                            'message': 'The linked environment stopped answering.'}
+                self.w.api.by_request.setdefault(rid, 'remote-task')
+            return real(body)
+        self.w.api.start = start
+        return launched
+
+    def test_an_unclear_remote_answer_never_starts_on_another_machine(self):
+        # The code lens's case: 1 thread on north (unrecorded) + 1 local task. Now: one child, on north.
+        self.cfg['machines']['north']['maxAgents'] = 2
+        launched = self.lose_remote_answer()
+        self.item('w1', kind='other', machines=['north', 'local'])
+        self.run_filler()
+        self.assertEqual([b['task']['target'].get('environmentId') for b in self.w.api.starts], ['env-north'])
+        self.assertEqual(self.started_ids(), [])
+        self.assertEqual(len(os.listdir(os.path.join(self.state, 'inflight'))), 1)   # pinned to north
+        self.assertTrue(any('no clear answer for w1 on north' in l for l in self.log_lines()))
+        self.w.now = lambda: NOW + datetime.timedelta(seconds=30)                    # backing off: nothing asked
+        self.run_filler()
+        self.assertEqual(len(self.w.api.starts), 1)
+        self.w.now = lambda: NOW + datetime.timedelta(seconds=61)
+        self.run_filler()
+        self.assertEqual(len(launched) + len([b for b in self.w.api.starts
+                                              if b['task']['target'].get('environmentId') is None]), 1)
+        self.assertEqual(json.load(open(os.path.join(self.q, 'started', 'w1.json')))['machine'], 'north')
+
+    def test_an_unclear_answer_then_a_clear_refusal_moves_on(self):
+        self.cfg['machines']['north']['maxAgents'] = 2
+        self.w.api.refuse_next = [('orchestration_error', 'stopped answering'), ('slots_full', 'north is full')]
+        self.item('w1', kind='other', machines=['north', 'local'])
+        self.run_filler()
+        self.w.now = lambda: NOW + datetime.timedelta(seconds=61)
+        self.run_filler()       # north answers clearly (nothing started there), so local is tried in this run
+        self.assertEqual([b['task']['target'].get('environmentId') for b in self.w.api.starts],
+                         ['env-north', 'env-north', None])
+        self.assertEqual(self.started_ids(), ['w1'])
+
+    def test_a_settled_parent_stops_before_a_left_over_start_is_asked(self):
+        self.item('w1')
+        real = self.w.api.start
+        self.w.api.start = lambda body: (_ for _ in ()).throw(Crash())
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.w.api.start = real
+        self.w.api.settled = True
+        self.assertEqual(self.run_filler(), 1)
+        self.assertEqual(self.w.api.starts, [])
+
+    def test_a_left_over_start_of_an_old_parent_is_only_looked_up(self):
+        # started under thread-orch, answer lost, then the config names a new orchestrator
+        self.item('w1')
+        self.w.api.crash_after_start = True
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.cfg['parentThreadId'] = 'thread-new'
+        self.run_filler()
+        self.assertEqual([(b['parentThreadId'], bool(b.get('lookupOnly'))) for b in self.w.api.starts],
+                         [('thread-orch', False), ('thread-orch', True)])
+        self.assertEqual(self.started_ids(), ['w1'])
+        self.assertEqual(len(self.w.api.by_request), 1)
+
+    def test_an_unstarted_start_of_an_old_parent_is_never_started(self):
+        self.item('w1')
+        real = self.w.api.start
+        self.w.api.start = lambda body: (_ for _ in ()).throw(Crash())
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.w.api.start = real
+        self.cfg['parentThreadId'] = 'thread-new'
+        self.run_filler()
+        self.run_filler()
+        self.assertTrue(all(b.get('lookupOnly') for b in self.w.api.starts))
+        self.assertEqual(self.w.api.by_request, {})
+        self.assertEqual(len(os.listdir(os.path.join(self.state, 'inflight'))), 1)
+        self.assertTrue(any('under the old parent thread-orch' in l for l in self.log_lines()))
+
     def test_a_crash_before_the_start_starts_it_once_later(self):
         self.item('w1')
         real = self.w.api.start
@@ -511,9 +654,10 @@ class StopsHalfWay(Base):
         self.assertEqual(self.run_filler(), 1)
         self.assertEqual(len(os.listdir(os.path.join(self.state, 'inflight'))), 1)
         self.assertEqual(sum('stopped this run' in l for l in self.log_lines()), 1)
-        self.assertEqual(sum('asking again for w1' in l for l in self.log_lines()), 1)
+        self.assertEqual(sum('asking again for w1' in l for l in self.log_lines()), 0)   # the parent check comes first
         self.w.api.down = False
         self.assertEqual(self.run_filler(), 0)
+        self.assertEqual(sum('asking again for w1' in l for l in self.log_lines()), 1)
         self.assertEqual(self.started_ids(), ['w1'])
         self.assertTrue(any(l.endswith('T3 answers again') for l in self.log_lines()))
 
@@ -696,14 +840,33 @@ MUTATIONS = {
         "p['green'] = any(r.get('conclusion') == 'success' for r in runs)",
         'ReadyWhen.test_pr_green_on_its_current_head'),
     'one request id per item': (
-        "        req = self.read_request(iid)\n        if req is None:\n", "        req = None\n        if req is None:\n",
+        "        req = self.read_request(iid)\n        if req is None or", "        req = None\n        if req is None or",
         'StopsHalfWay.test_a_lost_answer_then_a_refused_retry_never_starts_twice'),
     'refusals back off': (
         "wait = min(BACKOFF_MAX_S, BACKOFF_FIRST_S * 2 ** (n - 1))", "wait = 0",
         'Caps.test_refusals_back_off_doubling_under_one_request_id'),
     'request_rejected gets a new id': (
-        "        if code == 'request_rejected':\n", "        if False:\n",
+        "        if code == 'request_rejected':\n            req['requestId']", "        if False:\n            req['requestId']",
         'Caps.test_a_request_id_refused_for_good_is_replaced'),
+    'an unclear answer pins the machine': (
+        "        if code in DEFINITE:\n", "        if True:\n",
+        'StopsHalfWay.test_an_unclear_remote_answer_never_starts_on_another_machine'),
+    'a clear refusal frees the item': (
+        "    'usage_pacing_hold', 'slots_full',", "    'usage_pacing_hold',",
+        'StopsHalfWay.test_an_unclear_answer_then_a_clear_refusal_moves_on'),
+    'an old parent is only looked up': (
+        "        look_only = parent != self.cfg['parentThreadId']\n", "        look_only = False\n",
+        'StopsHalfWay.test_an_unstarted_start_of_an_old_parent_is_never_started'),
+    'settled before recovery': (
+        "        children = self.children()     #", "        self.recover(); children = self.children()     #",
+        'StopsHalfWay.test_a_settled_parent_stops_before_a_left_over_start_is_asked'),
+    'a far wait is capped': (
+        "        if nxt - now > BACKOFF_MAX_S:\n", "        if False:\n",
+        'Caps.test_a_wait_set_far_ahead_is_capped'),
+    'backoff per machine': (
+        "                backoff = self.waiting_on(it['id'], name)\n",
+        "                backoff = self.waiting_on(it['id'], 'local') or self.waiting_on(it['id'], 'north')\n",
+        'Caps.test_an_offline_machine_does_not_hold_back_a_free_one'),
     'token file mode': (
         "                if mode & 0o077:\n", "                if False:\n",
         'Caps.test_the_token_file_must_be_private'),

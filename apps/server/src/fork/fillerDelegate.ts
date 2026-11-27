@@ -117,6 +117,8 @@ export const FillerStartInput = Schema.Struct({
   requestId: RequestId,
   /** The message an idle parent gets so it has a run; a default names the task's title. */
   wake: Schema.optional(Schema.String),
+  /** Only say what this request id started (`not_found` when nothing yet); never starts or wakes. */
+  lookupOnly: Schema.optional(Schema.Boolean),
   task: OrchestratorMcpDelegateTaskInput,
 });
 export type FillerStartInput = typeof FillerStartInput.Type;
@@ -184,6 +186,12 @@ export const runFillerStart = Effect.fn("FillerDelegate.start")(function* (
     return refused(
       "request_rejected",
       `request ${input.requestId} was refused for good when it was dispatched; nothing started: use a new request id`,
+    );
+  }
+  if (input.lookupOnly === true) {
+    return refused(
+      "not_found",
+      `request ${input.requestId} has no task under this parent yet (a remote start may still record)`,
     );
   }
   const settle = (answer: StartAnswer) =>
@@ -472,7 +480,9 @@ const makeWorld = (
   wake: Effect.fn("FillerDelegate.wake")(
     function* (parent: FillerParent, requestId: string, text: string) {
       const window = Math.floor((yield* Clock.currentTimeMillis) / WAKE_WINDOW_MS);
-      const commandId = CommandId.make(`slot-filler:wake:${requestId}:${window}`);
+      const commandId = CommandId.make(
+        `slot-filler:wake:${parent.threadId}:${requestId}:${window}`,
+      );
       const sent = yield* receipts.getByCommandId(commandId);
       if (Option.isSome(sent) && sent.value.status !== "rejected") return "sent" as const;
       const slot = yield* admitSend(gate, {
@@ -486,7 +496,7 @@ const makeWorld = (
         type: "message.dispatch",
         commandId,
         threadId: parent.threadId,
-        messageId: MessageId.make(`message:slot-filler:${requestId}:${window}`),
+        messageId: MessageId.make(`message:slot-filler:${parent.threadId}:${requestId}:${window}`),
         text,
         attachments: [],
         dispatchMode: { type: "queue_after_active" },

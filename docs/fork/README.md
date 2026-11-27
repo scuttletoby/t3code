@@ -395,8 +395,9 @@ browser request (one with `Origin`) gets a plain `404`.
   Every check of `delegate_task` applies: the slot gate, the model policy, linked environments,
   providers. The `requestId` is looked up first (and again after a refusal): one that
   already started answers with its task whatever the parent's state, so a caller that lost the answer
-  asks again safely; one refused for good at its dispatch answers `request_rejected`. A parent with no
-  active run then gets one short queued message (`wake`, sent once per request id and half hour) so it
+  asks again safely; one refused for good at its dispatch answers `request_rejected`. With `lookupOnly: true` it
+  stops there (`not_found` when nothing started yet). A parent with no
+  active run then gets one short queued message (`wake`, sent once per parent, request id and half hour) so it
   has one; the start waits up to 40 s for that run. It answers `200` `{state: "started", taskId,
   childThreadId}`, or `{state: "refused", code, message}` with `404` (`parent_missing`), `409` (any
   other refusal, such as `slots_full`) or `400` (a bad body).
