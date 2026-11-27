@@ -1,0 +1,64 @@
+name: nightly-lock
+description: >-
+  Runs a heavy command while it holds a machine-wide lock, so long and short heavy steps on one
+  shared CI machine (a weekly mutation run, a nightly soak) never run at the same time; a `first`
+  caller goes before every caller that waits without it. The wait is bounded and a give-up names
+  the holder. Usage: README.md next to this file.
+inputs:
+  run:
+    description: "The bash script to run while holding the lock (bash -eo pipefail, in the job's working folder)."
+    required: true
+  first:
+    description: "'true': the short step, let in before every caller without it. 'false' (default) otherwise."
+    required: false
+    default: "false"
+  wait:
+    description: Wait at most this many seconds for the lock. Set exactly one of wait and until.
+    required: false
+    default: ""
+  until:
+    description: "Wait at most until this epoch second (already passed: nothing runs, exit 75)."
+    required: false
+    default: ""
+  name:
+    description: >-
+      The lock's name; every step that shares the lock passes the same. Files NAME.lock,
+      NAME-first.lock and NAME.holder in `dir`.
+    required: false
+    default: nightly
+  dir:
+    description: The folder of the lock files, on the machine (default /tmp); made if missing.
+    required: false
+    default: /tmp
+outputs:
+  gave_up:
+    description: >-
+      Set only when the wait ran out (exit 75, nothing ran): one line saying why and who held the
+      lock. Empty when the command ran (whatever its exit code) or the step failed otherwise.
+    value: ${{ steps.lock.outputs.gave_up }}
+runs:
+  using: composite
+  steps:
+    # Python is the step's own process (exec), so the runner's cancel signal reaches it, and it passes the signal to
+    # the command's process group and holds the lock until all of it has ended. Only this action's folder runs.
+    - id: lock
+      shell: bash
+      env:
+        RUN: ${{ inputs.run }}
+        FIRST: ${{ inputs.first }}
+        WAIT: ${{ inputs.wait }}
+        UNTIL: ${{ inputs.until }}
+        NAME: ${{ inputs.name }}
+        DIR: ${{ inputs.dir }}
+      run: |
+        args=(--name "$NAME" --dir "$DIR" --github-output)
+        case "$FIRST" in
+          true) args+=(--first) ;;
+          false) ;;
+          *) echo "::error::nightly-lock: first must be 'true' or 'false', not '$FIRST'"; exit 2 ;;
+        esac
+        if [ -n "$WAIT" ] && [ -n "$UNTIL" ] || [ -z "$WAIT$UNTIL" ]; then
+          echo "::error::nightly-lock: set exactly one of wait and until"; exit 2
+        fi
+        if [ -n "$WAIT" ]; then args+=(--wait "$WAIT"); else args+=(--until "$UNTIL"); fi
+        exec python3 -I "$GITHUB_ACTION_PATH/nightly_lock.py" "${args[@]}" -- bash -eo pipefail -c "$RUN"

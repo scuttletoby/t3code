@@ -1,0 +1,71 @@
+name: mutation-report
+description: >-
+  Reports a mutation run's kill rate per module beside its baseline and its last runs, in the job
+  summary and one rolling GitHub issue with a trend table (closing it never restarts the trend), and
+  opens one red issue while a module has no score. Usage: README.md next to this file.
+inputs:
+  results:
+    description: Results JSON files or folders, one per line (a missing one is no result, so its modules are red).
+    required: true
+  baseline:
+    description: The baseline JSON file (changed only by a pull request).
+    required: true
+  expect:
+    description: Targets JSON files whose modules must have a result, one per line.
+    required: true
+  config:
+    description: The JSON config (issue titles and labels), a path in the checkout. Empty, the defaults.
+    required: false
+    default: ""
+  issue:
+    description: "'true' (default): write the rolling and red issues. 'false': the summary and the files only."
+    required: false
+    default: "true"
+  suggest:
+    description: Optional. Write this run's numbers as a baseline file here (to copy into a pull request).
+    required: false
+    default: ""
+  out:
+    description: Optional. Also write the report here.
+    required: false
+    default: ""
+  trend:
+    description: Optional. Write the kept runs (the trend) here as JSON, for the run's artifact.
+    required: false
+    default: ""
+  token:
+    description: A token that can read and write the repository's issues (issues write).
+    required: false
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    # Only this action's folder runs; the files it reads are data. Exit 1: a module without a score, a broken
+    # baseline or config, or GitHub not read or written; a rate below its baseline is not a failure.
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        RESULTS: ${{ inputs.results }}
+        BASELINE: ${{ inputs.baseline }}
+        EXPECT: ${{ inputs.expect }}
+        CONFIG: ${{ inputs.config }}
+        ISSUE: ${{ inputs.issue }}
+        SUGGEST: ${{ inputs.suggest }}
+        OUT: ${{ inputs.out }}
+        TREND: ${{ inputs.trend }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        args=(--baseline "$BASELINE" --run-url "$RUN_URL")
+        while IFS= read -r line; do [ -n "$line" ] && args+=(--results "$line"); done <<< "$RESULTS"
+        while IFS= read -r line; do [ -n "$line" ] && args+=(--expect "$line"); done <<< "$EXPECT"
+        case "$ISSUE" in
+          true) args+=(--issue) ;;
+          false) ;;
+          *) echo "::error::mutation-report: issue must be 'true' or 'false', not '$ISSUE'"; exit 2 ;;
+        esac
+        [ -n "$CONFIG" ] && args+=(--config "$CONFIG")
+        [ -n "$SUGGEST" ] && args+=(--suggest "$SUGGEST")
+        [ -n "$OUT" ] && args+=(--out "$OUT")
+        [ -n "$TREND" ] && args+=(--trend "$TREND")
+        [ -n "${GITHUB_STEP_SUMMARY:-}" ] && args+=(--summary "$GITHUB_STEP_SUMMARY")
+        exec python3 -I "$GITHUB_ACTION_PATH/mutation_report.py" "${args[@]}"
