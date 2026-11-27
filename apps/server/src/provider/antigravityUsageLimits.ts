@@ -34,6 +34,8 @@ const SUMMARY_WINDOW_MINS = new Map([
   ["weekly", 7 * 24 * 60],
 ]);
 const MANUAL_REDIRECT: RequestInit = { redirect: "manual" };
+const SHARED_KEYRING_MESSAGE =
+  "Antigravity keeps one Google sign-in for every profile on this machine, and T3 has more than one Antigravity profile, so it cannot tell whose limits it would show.";
 const TokenFile = Schema.Struct({
   client_id: Schema.NonEmptyString,
   client_secret: Schema.NonEmptyString,
@@ -335,6 +337,17 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     "antigravity-oauth-token",
   );
   const readKeyringSecret = input.readKeyringSecret ?? readCliKeyringSecret(platform, architecture);
+  // The CLI keeps a Google sign-in in one keyring entry for the whole machine, even with the SSH
+  // bypass (macOS 1.5.x). Read it for a Google account instance only when this is T3's sole
+  // Antigravity profile, so the entry cannot hold another profile's sign-in.
+  const isOnlyProfile = fs.readDirectory(path.dirname(input.profileDirectory)).pipe(
+    Effect.map((names) =>
+      names
+        .filter((name) => !name.startsWith("."))
+        .every((name) => name === path.basename(input.profileDirectory)),
+    ),
+    Effect.orElseSucceed(() => false),
+  );
   let cached:
     | { fingerprint: string; account: string; accessToken: string; expiresAt: number }
     | undefined;
@@ -359,12 +372,18 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     let projectId: string | undefined;
     if (!(yield* fs.exists(tokenPath))) {
       cached = undefined;
-      // Google account instances bypass the keyring, whose one entry every profile shares.
-      const stored = (yield* fs.exists(cliTokenPath))
-        ? yield* fs.readFileString(cliTokenPath)
-        : input.authMethod === "oauth-business"
-          ? yield* readKeyringSecret
-          : undefined;
+      let stored: string | undefined;
+      if (yield* fs.exists(cliTokenPath)) {
+        stored = yield* fs.readFileString(cliTokenPath);
+      } else if (input.authMethod === "oauth-business" || (yield* isOnlyProfile)) {
+        stored = yield* readKeyringSecret;
+      } else {
+        return makeUnavailableUsageLimits({
+          checkedAt,
+          reason: "probeFailed",
+          message: SHARED_KEYRING_MESSAGE,
+        });
+      }
       if (stored === undefined) {
         return makeUnavailableUsageLimits({
           checkedAt,

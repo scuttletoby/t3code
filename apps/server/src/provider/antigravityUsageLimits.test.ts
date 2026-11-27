@@ -74,11 +74,18 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     keyringSecret?: string;
     /** Reads the OS keyring instead of `keyringSecret`. */
     nativeKeyring?: boolean;
+    /** Another Antigravity profile beside this one, which shares the keyring entry. */
+    otherProfile?: boolean;
   } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const profileDirectory = yield* fs.makeTempDirectoryScoped();
+  // Profiles sit side by side under one folder, as resolveAntigravityInstanceDirectories lays them out.
+  const profilesDirectory = yield* fs.makeTempDirectoryScoped();
+  const profileDirectory = path.join(profilesDirectory, "profile-a");
+  yield* fs.makeDirectory(profileDirectory);
+  yield* fs.writeFileString(path.join(profilesDirectory, ".DS_Store"), "");
+  if (options.otherProfile) yield* fs.makeDirectory(path.join(profilesDirectory, "profile-b"));
   yield* fs.makeDirectory(path.join(profileDirectory, "antigravity-acp"));
   const tokenPath = path.join(profileDirectory, "antigravity-acp", "acp_token.json");
   const writeToken = (refreshToken: string) =>
@@ -93,6 +100,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     );
   if (!options.missingToken) yield* writeToken(options.refreshToken ?? "refresh-a");
   const requests: Array<{ url: string; body: string }> = [];
+  let keyringReads = 0;
   const http = HttpClient.make((request, url, _signal, fiber) =>
     Effect.sync(() => {
       const init = Context.getOrUndefined(fiber.context, FetchHttpClient.RequestInit);
@@ -140,9 +148,16 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   const usage = yield* makeAntigravityUsageProbe({
     profileDirectory,
     authMethod: options.authMethod ?? "oauth-personal",
-    ...(options.nativeKeyring ? {} : { readKeyringSecret: Effect.succeed(options.keyringSecret) }),
+    ...(options.nativeKeyring
+      ? {}
+      : {
+          readKeyringSecret: Effect.sync(() => {
+            keyringReads++;
+            return options.keyringSecret;
+          }),
+        }),
   }).pipe(Effect.provideService(HttpClient.HttpClient, http));
-  return { ...usage, requests, writeToken, tokenPath };
+  return { ...usage, requests, writeToken, tokenPath, keyringReads: () => keyringReads };
 });
 
 describe("Antigravity subscription limits", () => {
@@ -691,20 +706,38 @@ describe("Antigravity subscription limits", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
-  it.effect("reads a Gemini Enterprise keyring sign-in and reports when it has expired", () =>
+  it.effect("reads the shared keyring sign-in only when no other profile can own it", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
       const keyringSecret = (expiry: string) =>
         JSON.stringify({ token: { access_token: "access-token", refresh_token: "r", expiry } });
-      // Google account instances keep their own sign-in; the shared entry belongs to another app.
-      const personal = yield* fixture({
+      // Beside another profile, the machine-wide entry may hold that profile's sign-in.
+      const shared = yield* fixture({
         missingToken: true,
+        otherProfile: true,
         keyringSecret: keyringSecret("2026-10-09T14:00:00Z"),
       });
-      expect((yield* personal.probe).unavailable?.message).toBe(
-        "Sign in with Google to see Antigravity limits.",
-      );
-      expect(personal.requests).toEqual([]);
+      const sharedLimits = yield* shared.probe;
+      expect(sharedLimits.unavailable?.reason).toBe("probeFailed");
+      expect(sharedLimits.unavailable?.message).toMatch(/more than one Antigravity profile/);
+      expect(shared.requests).toEqual([]);
+      // Not even read: macOS may ask the user to allow access to an entry T3 cannot use.
+      expect(shared.keyringReads()).toBe(0);
+
+      // The only profile owns the entry: the macOS 1.5.x CLI saves its sign-in there even over SSH.
+      const personal = yield* fixture({
+        missingToken: true,
+        userId: "google-user-1",
+        keyringSecret: keyringSecret("2026-10-09T14:00:00Z"),
+      });
+      const personalLimits = yield* personal.probe;
+      expect(personalLimits.unavailable).toBeUndefined();
+      expect(personalLimits.windows).toHaveLength(4);
+      expect(personal.keyringReads()).toBe(1);
+      expect(personal.requests.some((request) => request.url.endsWith("/token"))).toBe(false);
+      expect(
+        personal.requests.find((request) => request.url.includes("/v1internal:"))?.url,
+      ).toMatch(/^https:\/\/daily-cloudcode-pa\./);
 
       const signedIn = yield* fixture({
         authMethod: "oauth-business",
