@@ -13,7 +13,7 @@ import type {
 } from "@t3tools/contracts";
 import { AsyncResult } from "effect/reactivity";
 
-import { formatAge } from "./workPanel.logic";
+import { formatAge, staleReason } from "./workPanel.logic";
 
 /** What one machine of the fleet gave for its `fork.workPanel` read. */
 export type MachineAnswer =
@@ -39,16 +39,6 @@ export function machineAnswerOf(
     return { kind: "answered", answer: result.value, receivedAt: result.timestamp };
   }
   return { kind: "pending" };
-}
-
-/** An answer older than three refreshes (a minute each) is not current: it is shown as unknown. */
-const ANSWER_STALE_MS = 3 * 60_000;
-
-/** Why an answer is not shown, or `null` when it is current at `now`. */
-export function staleReason(at: number, now: number): string | null {
-  return now - at > ANSWER_STALE_MS
-    ? `This machine's last answer is ${formatAge(now - at)} old; it has not answered since.`
-    : null;
 }
 
 export interface FleetMachine {

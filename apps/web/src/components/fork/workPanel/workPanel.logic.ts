@@ -3,6 +3,7 @@
  * already holds and the server's `fork.workPanel` answer. A part with no answer says unknown and
  * why; it never shows a guessed count.
  */
+/* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
 import { AsyncResult } from "effect/reactivity";
 import type {
   ForkPullRequestRuns,
@@ -231,6 +232,13 @@ export function repoQueueSourceText(line: ForkRepoQueue, now: number): string {
 /** An answer received longer ago than three refreshes (a minute each) is not current. */
 const ANSWER_STALE_MS = 3 * 60_000;
 
+/** Why an answer received at `at` is not shown at `now`, or `null` while it is current. */
+export function staleReason(at: number, now: number): string | null {
+  return now - at > ANSWER_STALE_MS
+    ? `This machine's last answer is ${formatAge(now - at)} old; it has not answered since.`
+    : null;
+}
+
 export const REASON_SERVER_UNANSWERED =
   "This machine did not answer the work panel's read (it may be offline or run an older version).";
 const REASON_SERVER_PENDING = "Waiting for this machine's first answer.";
@@ -249,11 +257,7 @@ export function currentAnswer(
   if (result._tag === "Failure") return { answer: null, reason: REASON_SERVER_UNANSWERED };
   if (result._tag !== "Success") return { answer: null, reason: REASON_SERVER_PENDING };
   const age = clientNow - result.timestamp;
-  if (age > ANSWER_STALE_MS) {
-    return {
-      answer: null,
-      reason: `This machine's last answer is ${formatAge(age)} old; it has not answered since.`,
-    };
-  }
+  const stale = staleReason(result.timestamp, clientNow);
+  if (stale !== null) return { answer: null, reason: stale };
   return { answer: result.value, serverNow: result.value.answeredAt + Math.max(0, age) };
 }
