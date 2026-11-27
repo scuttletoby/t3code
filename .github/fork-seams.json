@@ -396,24 +396,16 @@
       ]
     },
     "packages/shared/src/agentAwareness.ts": {
-      "why": "A handoff write turn that ends failed (a provider error) is as quiet as one that completes: the fork marks it stop-requested (fork/handoff/handoffShell.ts), and the relay drops it the way it already drops a completed one, so no alert sounds while the fork's handoff follows (fork issue #836).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "if (phase === \"failed\" && thread.latestRunStopRequested === true) return null; // Fork: a quiet handoff write turn (fork/handoff)"
-        ]
-      }
+      "why": "A handoff write turn that ends failed (a provider error) is as quiet as one that completes: the fork marks it stop-requested (fork/handoff/handoffShell.ts), and the relay drops it the way it already drops a completed one, so no alert sounds while the fork's handoff follows (fork issue #836). Upstream sets the same mark on any run that was asked to stop (a person's Stop, a parent agent's stop, the handoff's write-turn timeout), so such a run that ends failed is quiet too, as it already was when it completed.",
+      "added": [
+        "if (phase === \"failed\" && thread.latestRunStopRequested === true) return null; // Fork: a quiet handoff write turn (fork/handoff)"
+      ]
     },
     "apps/web/src/components/ThreadNotificationCoordinator.tsx": {
-      "why": "The browser's alert for a failed run skips a run marked stop-requested, as its completion alert already does: a handoff write turn that ends failed stays quiet (fork/handoff/handoffShell.ts marks it; fork issue #836).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-22",
-        "added": [
-          "if (status === \"failed\" && rawThread.latestRunStopRequested === true) status = \"ready\"; // Fork: a quiet handoff write turn (fork/handoff)"
-        ]
-      }
+      "why": "The browser's alert for a failed run skips a run marked stop-requested, as its completion alert already does: a handoff write turn that ends failed stays quiet (fork/handoff/handoffShell.ts marks it; fork issue #836). Upstream sets the same mark on any run that was asked to stop (a person's Stop, a parent agent's stop, the handoff's write-turn timeout), so such a run that ends failed is quiet too, as it already was when it completed.",
+      "added": [
+        "if (status === \"failed\" && rawThread.latestRunStopRequested === true) status = \"ready\"; // Fork: a quiet handoff write turn (fork/handoff)"
+      ]
     },
     "apps/web/src/components/threadActionMenu.logic.ts": {
       "why": "The thread menu gets \"Hand off now\" (handoff, HO5): one more menu id, one optional state field the menu's callers fill, and the item spread into the list; the item and its rules are in fork/handoff/handoffMenu.ts. The thread menu gets the MCP profile entry (MCP profile design PR 3): the thread's effective profile and, for a client that may change settings, the owner's pick or clear. One more menu id type, one optional state field the menu's callers fill, and the entry spread into the list before Copy; the entry and its rules are in fork/mcpProfile/threadMcpProfile.logic.ts.",

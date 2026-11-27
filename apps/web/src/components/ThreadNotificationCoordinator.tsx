@@ -268,6 +268,7 @@ export function startThreadNotifications(
       const thread = presentThreadShell(environmentId, rawThread, subagentRequest);
       let status = resolveSidebarThreadStatus(thread);
       if (status === "ready" && thread.latestRun?.status === "failed") status = "failed";
+      if (status === "failed" && rawThread.latestRunStopRequested === true) status = "ready"; // Fork: a quiet handoff write turn (fork/handoff)
       const needsAttention =
         status === "input" ||
         status === "request" ||
