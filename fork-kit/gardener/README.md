@@ -162,19 +162,23 @@ All report only, and none needs root. Options as in each script's header.
   where it comes from. A machine that is set up again or moved is told what it still lacks. Each entry of the
   `scan` folders (default `~/.local/bin`, `~/.config/systemd/user`, `/usr/local/bin`, `/usr/local/sbin`,
   `/usr/local/libexec`, `/etc/systemd/system`; `[]` scans none) needs a source:
-  - a kit's install record (as install-drift reads them);
-  - a link to a file committed in a git checkout;
+  - a kit's install record (the 3- and 6-column rows install-drift reads, and pc-agents' `sha256<TAB>path` rows);
+  - a link to a file committed in a git checkout (one `git ls-files` per checkout);
   - a link into the distribution's own folders (`/usr`, `/lib`, but not `/usr/local`);
   - a `tools` entry.
 
   Anything else is one warning per entry:
   - `no-source`: put there by hand, with no review, tests or history;
   - `untracked`: in a checkout, but not committed;
-  - `broken-link`.
+  - `broken-link`;
+  - `unknown-source`: in a checkout git cannot read (a worktree whose main checkout is gone, an empty `.git` folder,
+    another user's checkout). It fails closed: such an entry is never taken as committed.
 
   `ignore`: entry names (globs) that need no source (default: snapd's generated `snap-*` and `snap.*` units, and
-  `__pycache__`). The `.wants`, `.requires` and `.d` folders of unit folders, and a unit linked to another unit in
-  the same folder, are not entries of their own. Each finding's `where` is a machine path, so the report issue only
+  `__pycache__`). Only the `.wants`, `.requires`, `.upholds` and `.d` folders of unit folders, a
+  mask (a unit linked to `/dev/null`) and a unit linked to another unit in the same folder (not a subfolder) are not
+  entries of their own. Every path option (`tools` paths, `scan`) is absolute or `~/...`, and `tools` must be a list:
+  anything else exits 1. Each finding's `where` is a machine path, so the report issue only
   counts them; the local report names each one. The [machine move](../../docs/fork/machine-move.md) template starts
   from this list. Never fixes.
 

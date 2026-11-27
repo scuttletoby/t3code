@@ -51,6 +51,15 @@ capped, in the copy-ahead. Warm the rest on purpose after the switch.**
     machine and the expensive part to download again;
   - `~/.gradle/wrapper/dists/`: the Gradle distributions the wrappers fetched.
 
+  Gradle writes some files in `modules-2` in place while it builds (its `metadata-*` stores, under the `*.lock`
+  files left out below), so a copy taken while OLD builds can be torn: rsync makes each file whole on NEW, not
+  consistent with the rest. Copy ahead as often as you like, but take **the last copy-ahead run with no Gradle
+  running on OLD**: hold the builds and stop the daemons first (`./gradlew --stop` in a project, or stop every
+  `GradleDaemon` process of the agent's user), then copy, then let builds run again. That run copies again each
+  file that changed since an earlier run, so it also mends what an earlier run tore. Dependency verification
+  (`gradle/verification-metadata.xml`), where a project has it, catches a torn jar or POM but not a torn metadata
+  store, so it does not replace this stopped run.
+
   Leave out the lock files and Gradle's own housekeeping:
 
   ```
@@ -78,7 +87,8 @@ capped, in the copy-ahead. Warm the rest on purpose after the switch.**
   - A copy that stops half-way leaves only whole files: rsync writes each file under a temporary name and renames
     it at the end. Run it again.
   - A copy over an existing cache adds the files that are missing and never deletes any (no `--delete`).
-  - Gradle checks what it reads from `modules-2` against the stored checksums. A broken file is downloaded again.
+  - A broken copy is not repaired by Gradle on its own: without dependency verification a torn jar or metadata
+    file fails the build. Recovery: delete the copied `~/.gradle/caches/modules-2/` on NEW and warm (below).
 
 Other build caches (npm, pnpm, pip, Maven) follow the same rule: copy the content-addressed download store ahead
 if it fits under the cap, and never copy a tool's per-version or per-path state.
