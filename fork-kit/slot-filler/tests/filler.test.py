@@ -1,0 +1,660 @@
+"""slot-filler: slot counting, caps, capacity, usage, ready-when, starts that stop half-way, quiet repeat runs, and
+broken queue files. No network, no GitHub, no T3: a fake world (the route, gh, the capacity command, the clock).
+
+  python3 -I -B fork-kit/slot-filler/tests/filler.test.py
+
+RedCheck breaks each rule in a copy of bin/slot-filler and shows its test then fails.
+"""
+import datetime, fcntl, importlib.machinery, importlib.util, json, os, shutil, subprocess, sys, tempfile, unittest
+
+THIS = os.path.abspath(__file__)
+KIT = os.path.dirname(os.path.dirname(THIS))
+BIN = os.environ.get('SLOT_FILLER_BIN') or os.path.join(KIT, 'bin', 'slot-filler')
+UTC = datetime.timezone.utc
+NOW = datetime.datetime(2026, 11, 21, 12, 0, 0, tzinfo=UTC)
+HEAD = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'
+HEAD2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+HEAD3 = 'cccccccccccccccccccccccccccccccccccccccc'
+
+
+def load():
+    loader = importlib.machinery.SourceFileLoader('slot_filler', BIN)
+    spec = importlib.util.spec_from_loader('slot_filler', loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+sf = load()
+
+
+class Crash(Exception):
+    """The filler is killed at this point."""
+
+
+class FakeApi:
+    """The /api/fork/delegate route: the same request id gives the same task (as the server does)."""
+
+    def __init__(self):
+        self.live = []          # children the parent already has
+        self.by_request = {}    # requestId -> taskId
+        self.starts = []        # every POST body
+        self.refuse = {}        # environmentId -> (code, message)
+        self.down = False
+        self.crash_after_start = False
+
+    def children(self, parent):
+        if self.down:
+            raise sf.ApiError('GET /api/fork/delegate: connection refused')
+        return list(self.live)
+
+    def start(self, body):
+        if self.down:
+            raise sf.ApiError('POST /api/fork/delegate: connection refused')
+        self.starts.append(body)
+        env = body['task']['target'].get('environmentId')
+        if env in self.refuse:
+            code, msg = self.refuse[env]
+            return {'state': 'refused', 'code': code, 'message': msg}
+        rid = body['requestId']
+        if rid not in self.by_request:
+            self.by_request[rid] = f'task-{len(self.by_request) + 1}'
+            self.live.append({'taskId': self.by_request[rid], 'status': 'running', 'live': True,
+                              'environmentId': env})
+        if self.crash_after_start:
+            self.crash_after_start = False
+            raise Crash()
+        return {'state': 'started', 'taskId': self.by_request[rid], 'childThreadId': 'thread-' + self.by_request[rid]}
+
+
+class FakeWorld:
+    def __init__(self):
+        self.api = FakeApi()
+        self.prs = {}           # n -> {'state', 'headRefOid', 'checks': [..]}
+        self.gh_calls = []
+        self.gh_down = False
+        self.capacity = {}      # command tuple -> (rc, out)
+        self.now = lambda: NOW
+
+    def gh(self, args):
+        self.gh_calls.append(args)
+        if self.gh_down:
+            raise RuntimeError('gh: could not connect')
+        if args[0] == 'pr':
+            p = self.prs[int(args[2])]
+            return {'state': p['state'], 'headRefOid': p['headRefOid']}
+        for n, p in self.prs.items():
+            if f'/commits/{p["headRefOid"]}/' in args[1]:
+                return p.get('checks', [])
+        return []
+
+    def run(self, args):
+        return self.capacity.get(tuple(args), (0, 'available=5000MB swapfree=4000MB\nOK\n'))
+
+
+def green(head=HEAD):
+    return {'state': 'OPEN', 'headRefOid': head, 'checks': [{'id': 2, 'status': 'completed', 'conclusion': 'success'}]}
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix='slot-filler-test-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.q = os.path.join(self.tmp, 'queue')
+        self.state = os.path.join(self.tmp, 'state')
+        self.caches = os.path.join(self.tmp, 'caches')
+        os.makedirs(self.q)
+        os.makedirs(self.caches)
+        self.rules = self.write('rules/lens-rules.md', 'Lens rules.\n')
+        self.cfg = {
+            'queueDir': self.q, 'stateDir': self.state, 'parentThreadId': 'thread-orch', 'repo': 'example/app',
+            'lensRules': self.rules,
+            'defaults': {'account': 'claudeAgent', 'model': 'claude-opus-5-5', 'effort': 'high'},
+            'usage': {'maxUsedPercent': 95, 'maxAgeMinutes': 90, 'cacheDir': self.caches,
+                      'remoteAccounts': {'env-north': {'claudeAgent': 'claude-north'}}},
+            'machines': {
+                'local': {'maxAgents': 3, 'maxWriters': 2,
+                          'capacity': {'writer': {'command': ['cap', '3072']},
+                                       'default': {'command': ['cap'],
+                                                   'free': {'availableMb': 1024, 'swapfreeMb': 1024}}}},
+                'north': {'environmentId': 'env-north', 'maxAgents': 2, 'maxWriters': 1},
+            },
+        }
+        self.cfg['log'] = os.path.join(self.state, 'filler.log')
+        self.w = FakeWorld()
+        self.meter('claudeAgent', 40)
+        self.meter('claude-north', 40)
+
+    # --- helpers ---
+    def write(self, rel, text):
+        path = os.path.join(self.tmp, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(text)
+        return path
+
+    def meter(self, name, used, age_min=5, windows=None):
+        checked = (NOW - datetime.timedelta(minutes=age_min)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        win = windows if windows is not None else [{'id': 'five_hour', 'label': '5h', 'usedPercent': used,
+                                                    'resetsAt': '2026-11-21T14:00:00Z'}]
+        with open(os.path.join(self.caches, name + '.json'), 'w') as f:
+            json.dump({'usageLimits': {'checkedAt': checked, 'windows': win}}, f)
+
+    def item(self, iid, kind='writer', priority=0, mtime=None, **extra):
+        brief = self.write(f'briefs/{iid}.md', f'Brief for {iid}.\n')
+        it = {'id': iid, 'title': f'Task {iid}', 'kind': kind, 'brief': brief, 'priority': priority}
+        it.update(extra)
+        path = os.path.join(self.q, iid + '.json')
+        with open(path, 'w') as f:
+            json.dump(it, f)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def run_filler(self):
+        return sf.run_once(self.cfg, self.w)
+
+    def log_lines(self):
+        try:
+            with open(self.cfg['log']) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def started_ids(self):
+        d = os.path.join(self.q, 'started')
+        return sorted(n[:-5] for n in os.listdir(d)) if os.path.isdir(d) else []
+
+    def snapshot(self):
+        out = {}
+        for root, _dirs, files in os.walk(self.tmp):
+            for n in files:
+                p = os.path.join(root, n)
+                st = os.stat(p)
+                with open(p, 'rb') as f:
+                    out[p] = (f.read(), st.st_mtime_ns)
+        return out
+
+
+class SlotCounting(Base):
+    def test_live_children_count_per_machine_and_settled_ones_do_not(self):
+        f = sf.Filler(self.cfg, self.w)
+        os.makedirs(os.path.join(self.q, 'started'))
+        with open(os.path.join(self.q, 'started', 'lens-a.json'), 'w') as fh:
+            json.dump({'id': 'lens-a', 'kind': 'lens', 'taskId': 't-lens'}, fh)
+        with open(os.path.join(self.q, 'started', 'w-a.json'), 'w') as fh:
+            json.dump({'id': 'w-a', 'kind': 'writer', 'taskId': 't-writer'}, fh)
+        counts = f.count([
+            {'taskId': 't-lens', 'status': 'running', 'live': True, 'environmentId': None},
+            {'taskId': 't-writer', 'status': 'waiting', 'live': True, 'environmentId': None},
+            {'taskId': 't-other', 'status': 'running', 'live': True, 'environmentId': 'env-north'},  # not ours
+            {'taskId': 't-done', 'status': 'completed', 'live': False, 'environmentId': None},
+            {'taskId': 't-gone', 'status': 'running', 'live': True, 'environmentId': 'env-unlinked'},
+        ])
+        self.assertEqual(counts['local'], {'agents': 2, 'writers': 1})
+        self.assertEqual(counts['north'], {'agents': 1, 'writers': 1})   # unknown kind counts as a writer
+        self.assertEqual(counts[None], {'agents': 1, 'writers': 1})      # an environment no machine names
+
+    def test_children_already_running_take_their_slots(self):
+        self.w.api.live = [{'taskId': f'x{i}', 'status': 'running', 'live': True, 'environmentId': None}
+                           for i in range(3)]
+        self.item('w1')
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        self.assertTrue(any('waiting w1: no machine has room (local full (3/3 agents)' in l for l in self.log_lines()))
+
+
+class Caps(Base):
+    def test_starts_by_priority_until_every_machine_is_full(self):
+        for i, p in enumerate((5, 9, 1, 7)):
+            self.item(f'w{i}', priority=p, mtime=1000 + i)
+        self.item('l0', kind='lens', priority=0)
+        self.item('l1', kind='lens', priority=0)
+        self.run_filler()
+        starts = [(b['task']['title'], b['task']['target'].get('environmentId')) for b in self.w.api.starts]
+        # local: 2 writers (9, 7) + 1 lens; north: 1 writer (5) + 1 lens; the writer with priority 1 waits
+        self.assertEqual(starts, [('Task w1', None), ('Task w3', None), ('Task w0', 'env-north'),
+                                  ('Task l0', None), ('Task l1', 'env-north')])
+        self.assertEqual(sorted(self.started_ids()), ['l0', 'l1', 'w0', 'w1', 'w3'])
+        self.assertTrue(os.path.exists(os.path.join(self.q, 'w2.json')))
+        self.assertEqual(len(self.w.api.starts), 5)
+        self.assertTrue(any(l.endswith('waiting w2: no machine has room (local has no writer slot (2/2 writers); '
+                                       'north has no writer slot (1/1 writers))') for l in self.log_lines()))
+
+    def test_the_start_asks_for_the_model_effort_parent_and_machine(self):
+        self.item('w1', machines=['north'], role='worker', isolation='worktree')
+        self.run_filler()
+        b = self.w.api.starts[0]
+        self.assertEqual(b['parentThreadId'], 'thread-orch')
+        self.assertEqual(b['task']['target'], {'providerInstanceId': 'claudeAgent', 'model': 'claude-opus-5-5',
+                                               'options': [{'id': 'effort', 'value': 'high'}],
+                                               'environmentId': 'env-north'})
+        self.assertIn('Brief for w1.', b['task']['task'])   # another machine: the brief goes inline
+        self.assertEqual((b['task']['role'], b['task']['isolation']), ('worker', 'worktree'))
+        rec = json.load(open(os.path.join(self.q, 'started', 'w1.json')))
+        self.assertEqual((rec['taskId'], rec['machine']), ('task-1', 'north'))
+        self.assertFalse(os.path.exists(os.path.join(self.q, 'w1.json')))
+
+    def test_a_local_start_names_the_brief_and_a_long_inline_brief_is_refused(self):
+        self.item('w1', machines=['local'])
+        self.item('w2', machines=['north'])
+        with open(os.path.join(self.tmp, 'briefs', 'w2.md'), 'w') as fh:
+            fh.write('x' * (sf.MAX_INLINE + 1))
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+        task = self.w.api.starts[0]['task']['task']
+        self.assertIn(f'Read {os.path.join(self.tmp, "briefs", "w1.md")} fully', task)
+        self.assertNotIn('Brief for w1.', task)
+        self.assertTrue(any('refused w2 on north: brief' in l and 'is over 100000 characters' in l
+                            for l in self.log_lines()))
+        self.assertEqual(os.listdir(os.path.join(self.state, 'inflight')), [])
+        self.assertTrue(os.path.exists(os.path.join(self.q, 'w2.json')))
+
+    def test_writer_capacity_command_and_the_read_only_memory_rule(self):
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.w.capacity[('cap', '3072')] = (1, 'available=2000MB swapfree=900MB\nNOT OK\n')
+        self.w.capacity[('cap',)] = (1, 'reservations: none\navailable=1500MB swapfree=1100MB load=9\nNOT OK\n')
+        self.item('w1')
+        self.item('l1', kind='lens')
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['l1'])   # rc 1, but available and swapfree >= 1024 MB
+        self.assertTrue(any('local capacity NOT OK (cap 3072)' in l for l in self.log_lines()))
+        self.w.capacity[('cap',)] = (0, 'available=900MB swapfree=3000MB\nOK\n')
+        self.item('l2', kind='lens')
+        self.run_filler()
+        self.assertTrue(any('local low on memory (available=900MB' in l for l in self.log_lines()))
+        self.assertEqual(self.started_ids(), ['l1'])
+
+    def test_a_server_refusal_is_logged_once_and_the_item_kept(self):
+        self.cfg['machines']['local']['maxAgents'] = 0
+        self.w.api.refuse['env-north'] = ('slots_full', 'north has no free slot')
+        self.item('w1')
+        self.run_filler()
+        self.run_filler()
+        self.assertTrue(os.path.exists(os.path.join(self.q, 'w1.json')))
+        self.assertEqual(os.listdir(os.path.join(self.state, 'inflight')), [])
+        self.assertEqual(sum('refused w1 on north: slots_full' in l for l in self.log_lines()), 1)
+
+    def test_a_gone_parent_stops_the_run(self):
+        self.w.api.refuse[None] = ('parent_missing', 'no such thread')
+        self.item('w1', priority=2)
+        self.item('w2', priority=1)
+        self.assertEqual(self.run_filler(), 1)
+        self.assertEqual(len(self.w.api.starts), 1)
+        self.assertTrue(any('stopped this run: the parent thread is gone' in l for l in self.log_lines()))
+
+
+class Usage(Base):
+    def test_full_or_old_meters_skip_the_machine(self):
+        self.meter('claudeAgent', 95)
+        self.meter('claude-north', 10, age_min=91)
+        self.item('w1')
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        line = [l for l in self.log_lines() if 'waiting w1' in l][0]
+        self.assertIn('claudeAgent is full (5h 95%)', line)
+        self.assertIn('usage reading for claude-north is 91 min old', line)
+
+    def test_windows_of_other_models_and_past_resets_do_not_count(self):
+        self.meter('claudeAgent', 0, windows=[
+            {'id': 'seven_day_fable', 'usedPercent': 100, 'resetsAt': '2026-11-25T00:00:00Z'},
+            {'id': 'five_hour', 'usedPercent': 99, 'resetsAt': '2026-11-21T11:00:00Z'},
+            {'id': 'seven_day', 'usedPercent': 60, 'resetsAt': '2026-11-25T00:00:00Z'}])
+        self.item('w1', machines=['local'])
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+        self.item('w2', machines=['local'], model='claude-fable-5-2')
+        self.run_filler()
+        self.assertTrue(any('waiting w2' in l and 'claudeAgent is full' in l for l in self.log_lines()))
+
+    def test_a_missing_meter_or_mapping_skips_and_a_guard_config_is_read(self):
+        os.remove(os.path.join(self.caches, 'claude-north.json'))
+        self.cfg['usage']['remoteAccounts'] = {}
+        self.cfg['machines']['local']['maxAgents'] = 0
+        self.item('w1')
+        self.run_filler()
+        self.assertTrue(any('claudeAgent on north has no meter mapping' in l for l in self.log_lines()))
+        guard = self.write('guard.json', json.dumps({'maxUsedPercent': 95, 'maxAgeMinutes': 90,
+                                                     'cacheDir': self.caches,
+                                                     'remoteAccounts': {'env-north': {'claudeAgent': 'claude-north'}}}))
+        self.cfg['usage'] = {'guardConfig': guard}
+        self.run_filler()
+        self.assertTrue(any('no usage reading for claude-north' in l for l in self.log_lines()))
+        self.meter('claude-north', 10)
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+
+
+class ReadyWhen(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg['machines']['north']['maxAgents'] = 0
+
+    def test_pr_green_on_its_current_head(self):
+        self.w.prs[7] = {'state': 'OPEN', 'headRefOid': HEAD,
+                         'checks': [{'id': 1, 'status': 'completed', 'conclusion': 'success'},
+                                    {'id': 2, 'status': 'in_progress', 'conclusion': None}]}
+        self.item('w1', readyWhen={'type': 'pr-green', 'pr': 7})
+        self.run_filler()
+        self.assertEqual(self.started_ids(), [])   # the newest run is still going
+        self.assertTrue(any('waiting w1: PR #7 fork-ci-result not green on a1b2c3d' in l for l in self.log_lines()))
+        self.w.prs[7] = green()
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+
+    def test_pr_merged_closed_and_unreadable(self):
+        self.w.prs[8] = {'state': 'OPEN', 'headRefOid': HEAD}
+        self.w.prs[9] = {'state': 'CLOSED', 'headRefOid': HEAD}
+        self.item('m8', readyWhen={'type': 'pr-merged', 'pr': 8})
+        self.item('m9', readyWhen={'type': 'pr-merged', 'pr': 9})
+        self.item('g9', readyWhen={'type': 'pr-green', 'pr': 9})
+        self.run_filler()
+        lines = self.log_lines()
+        self.assertTrue(any('waiting m8: PR #8 not merged yet' in l for l in lines))
+        self.assertTrue(any('waiting m9: PR #9 is closed without a merge' in l for l in lines))
+        self.assertTrue(any('waiting g9: PR #9 is closed' in l for l in lines))
+        self.w.prs[8]['state'] = 'MERGED'
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['m8'])
+        self.w.gh_down = True
+        self.item('m10', readyWhen={'type': 'pr-merged', 'pr': 10})
+        self.run_filler()
+        self.assertTrue(any('waiting m10: PR #10 unreadable (gh: could not connect)' in l for l in self.log_lines()))
+
+    def test_a_head_pinned_item_waits_when_the_head_moves(self):
+        self.w.prs[7] = green(HEAD2)
+        self.item('l1', kind='lens', readyWhen={'type': 'pr-green', 'pr': 7, 'head': HEAD})
+        self.run_filler()
+        self.assertEqual(self.started_ids(), [])
+        self.assertTrue(any('PR #7 head moved from a1b2c3d to bbbbbbb' in l for l in self.log_lines()))
+
+    def test_no_readiness_means_ready_and_gh_is_asked_once_per_pr(self):
+        self.w.prs[7] = green()
+        self.item('w1')
+        self.item('l1', kind='lens', readyWhen={'type': 'pr-green', 'pr': 7})
+        self.item('l2', kind='lens', readyWhen={'type': 'pr-green', 'pr': 7})
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['l1', 'l2', 'w1'])
+        self.assertEqual(len(self.w.gh_calls), 2)   # one pr view, one check-runs read
+
+
+class StopsHalfWay(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg['machines']['north']['maxAgents'] = 0
+
+    def test_a_crash_after_the_start_never_starts_twice(self):
+        self.item('w1')
+        self.w.api.crash_after_start = True
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.assertTrue(os.path.exists(os.path.join(self.q, 'w1.json')))   # not moved: no task id came back
+        self.assertEqual(len(os.listdir(os.path.join(self.state, 'inflight'))), 1)
+        self.w.now = lambda: NOW + datetime.timedelta(minutes=1)          # the next run, a minute later
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+        self.assertEqual(len(self.w.api.by_request), 1)                    # one task in T3
+        self.assertEqual({b['requestId'] for b in self.w.api.starts}, set(self.w.api.by_request))
+        self.assertEqual(os.listdir(os.path.join(self.state, 'inflight')), [])
+        self.assertEqual(json.load(open(os.path.join(self.q, 'started', 'w1.json')))['taskId'], 'task-1')
+
+    def test_a_crash_before_the_start_starts_it_once_later(self):
+        self.item('w1')
+        real = self.w.api.start
+        self.w.api.start = lambda body: (_ for _ in ()).throw(Crash())
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.w.api.start = real
+        self.run_filler()
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+        self.assertEqual(len(self.w.api.starts), 1)
+
+    def test_a_crash_after_the_record_finishes_without_asking(self):
+        self.item('w1')
+        self.w.api.crash_after_start = True
+        with self.assertRaises(Crash):
+            self.run_filler()
+        intent = json.load(open(os.path.join(self.state, 'inflight', 'w1.json')))
+        os.makedirs(os.path.join(self.q, 'started'))
+        with open(os.path.join(self.q, 'started', 'w1.json'), 'w') as fh:
+            json.dump(dict(intent['item'], taskId='task-1', requestId=intent['requestId']), fh)
+        asks = len(self.w.api.starts)
+        self.run_filler()
+        self.assertEqual(len(self.w.api.starts), asks)
+        self.assertFalse(os.path.exists(os.path.join(self.q, 'w1.json')))
+        self.assertTrue(any('finished w1: it was started and recorded before a stop' in l for l in self.log_lines()))
+
+    def test_t3_down_keeps_the_marker_and_logs_once(self):
+        self.item('w1')
+        self.w.api.crash_after_start = True
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.w.api.down = True
+        self.assertEqual(self.run_filler(), 1)
+        self.assertEqual(self.run_filler(), 1)
+        self.assertEqual(len(os.listdir(os.path.join(self.state, 'inflight'))), 1)
+        self.assertEqual(sum('stopped this run' in l for l in self.log_lines()), 1)
+        self.assertEqual(sum('asking again for w1' in l for l in self.log_lines()), 1)
+        self.w.api.down = False
+        self.assertEqual(self.run_filler(), 0)
+        self.assertEqual(self.started_ids(), ['w1'])
+        self.assertTrue(any(l.endswith('T3 answers again') for l in self.log_lines()))
+
+    def test_a_queue_file_deleted_mid_start_drops_the_intent(self):
+        self.item('w1')
+        self.w.api.start = lambda body: (_ for _ in ()).throw(Crash())
+        with self.assertRaises(Crash):
+            self.run_filler()
+        os.remove(os.path.join(self.q, 'w1.json'))
+        self.run_filler()
+        self.assertEqual(os.listdir(os.path.join(self.state, 'inflight')), [])
+        self.assertTrue(any('dropped the intent for w1' in l for l in self.log_lines()))
+
+    def test_a_second_run_while_one_holds_the_lock_does_nothing(self):
+        self.item('w1')
+        os.makedirs(self.state, exist_ok=True)
+        fd = os.open(os.path.join(self.state, 'filler.lock'), os.O_RDWR | os.O_CREAT)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            self.assertEqual(self.run_filler(), 0)
+        finally:
+            os.close(fd)
+        self.assertEqual(self.w.api.starts, [])
+
+
+class Quiet(Base):
+    def test_a_second_run_with_nothing_new_writes_nothing(self):
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.cfg['machines']['local']['maxAgents'] = 1
+        self.w.prs[7] = {'state': 'OPEN', 'headRefOid': HEAD, 'checks': []}
+        self.item('w1')
+        self.item('w2')
+        self.item('w3', readyWhen={'type': 'pr-green', 'pr': 7})
+        self.write('queue/bad.json', '{')
+        self.write('queue/lens-watch/pr7.json', json.dumps({'pr': 7, 'lenses': [{'lens': 'code'}]}))
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+        before, lines = self.snapshot(), self.log_lines()
+        self.run_filler()
+        self.run_filler()
+        self.assertEqual(self.log_lines(), lines)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_reason_that_changes_is_logged_again(self):
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.w.prs[7] = {'state': 'OPEN', 'headRefOid': HEAD, 'checks': []}
+        self.item('w1', readyWhen={'type': 'pr-merged', 'pr': 7})
+        self.run_filler()
+        self.w.prs[7]['state'] = 'CLOSED'
+        self.run_filler()
+        self.run_filler()
+        waits = [l for l in self.log_lines() if 'waiting w1' in l]
+        self.assertEqual(len(waits), 2)
+
+
+class BrokenQueueFiles(Base):
+    def test_empty_broken_and_incomplete_files_are_refused_and_kept(self):
+        self.write('queue/empty.json', '')
+        self.write('queue/notjson.json', '{"id": ')
+        self.write('queue/list.json', '[1, 2]')
+        self.write('queue/wrongid.json', json.dumps({'id': 'other', 'title': 't', 'kind': 'writer', 'brief': '/x'}))
+        self.write('queue/nokind.json', json.dumps({'id': 'nokind', 'title': 't', 'brief': self.rules}))
+        self.write('queue/nobrief.json', json.dumps({'id': 'nobrief', 'title': 't', 'kind': 'writer',
+                                                     'brief': os.path.join(self.tmp, 'gone.md')}))
+        self.write('blank.md', '')
+        self.write('queue/blankbrief.json', json.dumps({'id': 'blankbrief', 'title': 't', 'kind': 'writer',
+                                                        'brief': os.path.join(self.tmp, 'blank.md')}))
+        self.write('queue/badready.json', json.dumps({'id': 'badready', 'title': 't', 'kind': 'writer',
+                                                      'brief': self.rules, 'readyWhen': {'type': 'pr-green'}}))
+        self.write('queue/badmachine.json', json.dumps({'id': 'badmachine', 'title': 't', 'kind': 'writer',
+                                                        'brief': self.rules, 'machines': ['south']}))
+        names = sorted(os.listdir(self.q))
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        self.assertEqual(sorted(n for n in os.listdir(self.q) if n.endswith('.json')), names)
+        lines = self.log_lines()
+        for name, why in (('empty', 'empty file'), ('notjson', 'not JSON'), ('list', 'not a JSON object'),
+                          ('wrongid', '"id" must equal the file name'), ('nokind', '"kind" must be one of'),
+                          ('nobrief', 'is missing'), ('blankbrief', 'is empty'), ('badready', '"readyWhen" must'),
+                          ('badmachine', '"machines" must list')):
+            self.assertTrue(any(f'refused {name}.json: ' in l and why in l and l.endswith('; kept') for l in lines),
+                            name)
+        self.run_filler()
+        self.assertEqual(self.log_lines(), lines)
+
+    def test_a_brief_deleted_after_queueing_is_refused_until_it_returns(self):
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.item('w1')
+        brief = os.path.join(self.tmp, 'briefs', 'w1.md')
+        os.rename(brief, brief + '.away')
+        self.run_filler()
+        self.assertEqual(self.started_ids(), [])
+        os.rename(brief + '.away', brief)
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+
+    def test_missing_queue_folder_and_bad_config(self):
+        shutil.rmtree(self.q)
+        self.assertEqual(self.run_filler(), 0)
+        self.assertEqual(self.w.api.starts, [])
+        cfg = self.write('cfg.json', '{"queueDir": "/q"}')
+        with self.assertRaises(sf.ConfigError):
+            sf.load_config(cfg)
+        r = subprocess.run([sys.executable, '-I', '-B', BIN, '--config', cfg], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('"stateDir" is required', r.stderr)
+
+    def test_an_item_whose_id_was_already_started_is_refused(self):
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.item('w1')
+        self.run_filler()
+        self.item('w1')
+        self.run_filler()
+        self.assertEqual(len(self.w.api.starts), 1)
+        self.assertTrue(any('refused w1.json: started/w1.json exists' in l for l in self.log_lines()))
+
+
+class Lenses(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg['machines']['local']['maxAgents'] = 10
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.write('queue/lens-watch/pr7.json', json.dumps(
+            {'pr': 7, 'lenses': [{'lens': 'code', 'focus': 'the state question'}, {'lens': 'security'}],
+             'priority': 3}))
+
+    def test_green_ci_renders_and_starts_one_lens_item_per_lens(self):
+        self.w.prs[7] = {'state': 'OPEN', 'headRefOid': HEAD, 'checks': []}
+        self.run_filler()
+        self.assertEqual(self.started_ids(), [])
+        self.w.prs[7] = green()
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['lens-7-code-a1b2c3d', 'lens-7-security-a1b2c3d'])
+        body = self.w.api.starts[0]['task']
+        self.assertEqual(body['role'], 'review')
+        brief = open(os.path.join(self.q, 'briefs', 'lens-7-code-a1b2c3d.md')).read()
+        self.assertIn(f'PR #7 at head {HEAD}, lens code. Focus: the state question.', brief)
+        self.assertIn(f'Read {self.rules} fully and follow it.', brief)
+        self.run_filler()
+        self.assertEqual(len(self.w.api.starts), 2)
+
+    def test_a_new_head_is_a_new_round_and_rounds_stop_at_the_limit(self):
+        for h in (HEAD, HEAD2, HEAD3):
+            self.w.prs[7] = green(h)
+            self.run_filler()
+        self.assertEqual(self.started_ids(), ['lens-7-code-a1b2c3d', 'lens-7-code-bbbbbbb',
+                                              'lens-7-security-a1b2c3d', 'lens-7-security-bbbbbbb'])
+        self.assertTrue(any('not rendering lens-7-code-ccccccc: 2 rounds' in l for l in self.log_lines()))
+
+    def test_a_broken_watch_file_or_missing_rules_is_refused(self):
+        self.write('queue/lens-watch/bad.json', '{"pr": "seven"}')
+        os.remove(self.rules)
+        self.w.prs[7] = green()
+        self.run_filler()
+        lines = self.log_lines()
+        self.assertTrue(any('refused lens-watch/bad.json' in l for l in lines))
+        self.assertTrue(any('waiting lens-watch/pr7.json: the lens rules file' in l for l in lines))
+        self.assertEqual(self.started_ids(), [])
+
+
+MUTATIONS = {
+    'settled children free their slot': (
+        "if not c.get('live', c.get('status') not in SETTLED):", "if False:",
+        'SlotCounting.test_live_children_count_per_machine_and_settled_ones_do_not'),
+    'writer cap': (
+        "if kind == 'writer' and c['writers'] >=", "if False and c['writers'] >=",
+        'Caps.test_starts_by_priority_until_every_machine_is_full'),
+    'priority order': (
+        "items.sort(key=lambda x: (-x[0]['priority'], x[1], x[0]['id']))", "items.sort(key=lambda x: x[0]['id'])",
+        'Caps.test_starts_by_priority_until_every_machine_is_full'),
+    'usage full': (
+        "if (w.get('usedPercent') or 0) >= maxp:", "if (w.get('usedPercent') or 0) > 200:",
+        'Usage.test_full_or_old_meters_skip_the_machine'),
+    'usage age': (
+        "if age > (u.get('maxAgeMinutes') or 90):", "if age > 100000:",
+        'Usage.test_full_or_old_meters_skip_the_machine'),
+    'green on the newest run': (
+        "p['green'] = bool(newest and newest.get('status') == 'completed' and newest.get('conclusion') == 'success')",
+        "p['green'] = any(r.get('conclusion') == 'success' for r in runs)",
+        'ReadyWhen.test_pr_green_on_its_current_head'),
+    'marker reuses the request id': (
+        "        if os.path.exists(mk):\n            intent = read_json(mk)\n        else:\n",
+        "        if True:\n",
+        'StopsHalfWay.test_a_crash_after_the_start_never_starts_twice'),
+    'notes stay quiet': (
+        "        if self.notes.get(key) != line:\n", "        if True:\n",
+        'Quiet.test_a_second_run_with_nothing_new_writes_nothing'),
+    'broken files are refused': (
+        "        if not text.strip():\n            return None, 'empty file'\n", "",
+        'BrokenQueueFiles.test_empty_broken_and_incomplete_files_are_refused_and_kept'),
+    'lens rounds': (
+        "if len(rounds) >= int(lw.get('maxRounds', 2)):", "if False:",
+        'Lenses.test_a_new_head_is_a_new_round_and_rounds_stop_at_the_limit'),
+}
+
+
+class RedCheck(unittest.TestCase):
+    def test_each_rule_has_a_test_that_fails_without_it(self):
+        with open(os.path.join(KIT, 'bin', 'slot-filler')) as f:
+            source = f.read()
+        for rule, (text, broken, test) in MUTATIONS.items():
+            with self.subTest(rule=rule):
+                self.assertEqual(source.count(text), 1, f'{rule}: the text is not in bin/slot-filler exactly once')
+                tmp = tempfile.mkdtemp(prefix='slot-filler-red-')
+                try:
+                    copy = os.path.join(tmp, 'slot-filler')
+                    with open(copy, 'w') as f:
+                        f.write(source.replace(text, broken))
+                    r = subprocess.run([sys.executable, '-I', '-B', THIS, test], capture_output=True, text=True,
+                                       timeout=300, env=dict(os.environ, SLOT_FILLER_BIN=copy),
+                                       stdin=subprocess.DEVNULL)
+                    self.assertIn('Ran 1 test', r.stderr, f'{rule}: {test} did not run:\n{r.stderr[-800:]}')
+                    self.assertNotEqual(r.returncode, 0, f'{test} still passes with {rule!r} broken')
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

@@ -549,11 +549,11 @@ FORK_CONFIG = '.github/fork-pr-queue.json'
 NOT_GATE = ('.github/fork-ci-tests.txt',)
 # fork-kit folders that are gate settings (#82): review is the lens-format checker and the lens skill (what a lens
 # report must say to count), gh-apps keeps the gate App's key and mints its tokens (the gate-trust design). The
-# other kits run machines and agents (placement-facts: example scripts a machine runs for its facts), and the merge
-# gate reads none of them.
+# other kits run machines and agents (placement-facts: example scripts a machine runs for its facts; slot-filler:
+# starts queued agent tasks into free slots), and the merge gate reads none of them.
 GATE_KITS = ('gh-apps', 'review')
 OTHER_KITS = ('.gitignore', 'README.md', 'agent-guards', 'cleaner', 'common', 'desk', 'gardener', 'golive', 'heavy',
-              'model-guard', 'pc-agents', 'placement-facts', 'schedule-kick', 'update-policy')
+              'model-guard', 'pc-agents', 'placement-facts', 'schedule-kick', 'slot-filler', 'update-policy')
 
 
 class ForkConfig(unittest.TestCase):

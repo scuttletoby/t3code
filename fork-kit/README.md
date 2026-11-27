@@ -27,6 +27,7 @@ Every kit follows the same pattern:
 | [placement-facts](placement-facts/README.md) | Example `factsCommand` programs for placement (Linux, macOS, Windows): busy file, busy programs, battery, `gpu`, `ci-runner`; no installer, copied by hand                                                                 |
 | [review](review/README.md)                   | A review skill for the merge gate: lenses picked by changed paths, the state question, a comment format checked against the gate's parser, a model eval; no installer, used from a checkout                                |
 | [schedule-kick](schedule-kick/README.md)     | `schedule-kick`: start scheduled GitHub workflows on time by `workflow_dispatch` when no run exists for the slot; timer every 5 minutes (Linux, systemd)                                                                   |
+| [slot-filler](slot-filler/README.md)         | `slot-filler`: start queued agent tasks (writers, lenses rendered when CI goes green) into free slots per machine, within caps, capacity and usage meters; timer every minute (Linux, systemd)                             |
 | [update-policy](update-policy/README.md)     | Restart only when idle at the quiet hour (dev, personal), alert only (live); daily baseline and exposure (KEV, EPSS) checks that report only drift and what needs action (Linux, Debian/Ubuntu, systemd)                   |
 
 [common](common/README.md) is code the kits share, copied into each kit's version folder: the loader of the one
