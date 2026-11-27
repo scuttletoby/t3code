@@ -468,9 +468,12 @@ export function lensEntries(
   history: Array<[string, string | null]>;
   entries: Map<string, LensEntry>;
   notLens: Array<[string, string]>;
+  /** Every post with a lens header, as its entry would be, with its lens key, in post order: the newest is in `entries`. */
+  headers: Array<LensEntry & { readonly key: string }>;
 } {
   const history: Array<[string, string | null]> = [];
   const entries = new Map<string, LensEntry>();
+  const headers: Array<LensEntry & { readonly key: string }> = [];
   const notLens: Array<[string, string]> = [];
   posts.forEach((post, i) => {
     if (skip(post)) return;
@@ -500,12 +503,14 @@ export function lensEntries(
     }
     if (!header) return;
     history.push(header);
+    const why = post.unread ? FLAGS_UNREAD : hidden ? HIDDEN : post.edited ? EDITED : null;
+    const entry: LensEntry = { at, sha: why ? null : header[1], why, name: header[0], body };
+    headers.push({ ...entry, key });
     const was = entries.get(key);
     if (was && olderThan(at, was.at)) return;
-    const why = post.unread ? FLAGS_UNREAD : hidden ? HIDDEN : post.edited ? EDITED : null;
-    entries.set(key, { at, sha: why ? null : header[1], why, name: header[0], body });
+    entries.set(key, entry);
   });
-  return { history, entries, notLens };
+  return { history, entries, notLens, headers };
 }
 
 /** lens.Review.lens_scan on posts that count, with the repository's override prefix. */

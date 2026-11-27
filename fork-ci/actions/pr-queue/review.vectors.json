@@ -1,5 +1,5 @@
 {
-  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a lens report, one with the lens marker, that is not one valid read is a `comment without a first-line lens header` entry that reads nothing, and so is a post without the marker that looks like a report and holds an open finding (a blocker or major, or NOT SAFE, as review_judge.read_findings reads it); `not_lens`, when there is one: [where, why] of each post that looks like a report but has no lens marker, so is no lens report, as lens.Review.not_lens_reports names them). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). `reads`: posts as in `scans` (each by its `author`, else `someone`; an override comment is `<override_prefix> <sha>: ...`), the `head`, the reads that are its change merged with the base (`same`) and `override_authors`, under the `basic` rules in enforce with findings judged: lens.Review.lens_reads (each lens key's sha), the keys head_check.review_rounds fails until that lens posts again (`again`: UNREAD, or a report with no findings section) and whether head_check.verdict with the `required` lenses and the rounds pass (`passes`); T3's lens_start reads the same (lensStart.ts), and its vectors hold no finding in a report that counts and stay under the round cap. `unicode`: `refused` is what T3 refuses on a runtime that assigns those code points (a letter, number, mark, format character or space there): a new symbol reads alike on both sides. Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
+  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a lens report, one with the lens marker, that is not one valid read is a `comment without a first-line lens header` entry that reads nothing, and so is a post without the marker that looks like a report and holds an open finding (a blocker or major, or NOT SAFE, as review_judge.read_findings reads it); `not_lens`, when there is one: [where, why] of each post that looks like a report but has no lens marker, so is no lens report, as lens.Review.not_lens_reports names them). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). `reads`: posts as in `scans` (each by its `author`, else `someone`; an override comment is `<override_prefix> <sha>: ...`), the `head`, the reads that are its change merged with the base (`same`) and `override_authors`, under the `basic` rules in enforce with findings judged: lens.Review.lens_reads (each lens key's sha), the keys head_check.review_rounds fails until that lens posts again (`again`: UNREAD, or a report with no findings section) and whether head_check.verdict with the `required` lenses and the rounds pass (`passes`); T3's lens_start reads the same (lensStart.ts), and its vectors hold no finding in a report that counts and stay under the round cap. `unicode`: `refused` is what T3 refuses on a runtime that assigns those code points (a letter, number, mark, format character or space there), as written or as an HTML number reference writes it (`&#x1C89;`; only the findings rules, which fold the text, read a reference): a new symbol reads alike on both sides. Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
   "config_path": ".github/pr-queue.json",
   "override_prefix": "override for head",
   "globs": [
@@ -4170,6 +4170,25 @@
         "again": [],
         "passes": true
       }
+    },
+    {
+      "name": "a report with a major and no blocker line is judged, not posted again",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nstate: fine\nmajor: x"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "again": [],
+        "passes": false
+      }
     }
   ],
   "linear": [
@@ -4497,6 +4516,14 @@
       "refused": ["U+1C89"]
     },
     {
+      "name": "a letter new in Unicode 16 written as an HTML number reference before a label",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\n&#x1C89;major: x",
+      "findings": [["major", "major: x"]],
+      "section": true,
+      "unassigned": ["U+1C89"],
+      "refused": ["U+1C89"]
+    },
+    {
       "name": "a code point unassigned in every version",
       "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: x 󠂀",
       "findings": [["major", "major: x 󠂀"]],
@@ -4519,6 +4546,22 @@
       "section": true,
       "unassigned": ["U+1FAE9"],
       "refused": []
+    },
+    {
+      "name": "an outlined Latin letter new in Unicode 16 (NFKC makes it a letter) starts a label",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\n𜳢ajor: x",
+      "findings": [],
+      "section": false,
+      "unassigned": ["U+1CCE2"],
+      "refused": ["U+1CCE2"]
+    },
+    {
+      "name": "a mark new in Unicode 16 before a label",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nࢗmajor: x",
+      "findings": [["major", "major: x"]],
+      "section": true,
+      "unassigned": ["U+0897"],
+      "refused": ["U+0897"]
     }
   ]
 }

@@ -69,11 +69,14 @@ export function fold(text: string | null | undefined): string {
   return folded(text ?? "");
 }
 
-/** fold, remembered (pyText.memo). */
+/**
+ * fold, remembered (pyText.memo). The Unicode check runs again on the text the HTML references write: `&#x1C89;` is
+ * read as U+1C89, so it drifts as the letter itself does.
+ */
 const folded = memo((text) => {
-  const t = htmlUnescape(nfkc(text))
-    .replace(/\\([!-/:-@[-`{-~])/gu, "$1")
-    .replace(/\p{Cf}/gu, "");
+  const unescaped = htmlUnescape(nfkc(text));
+  pyUnicodeCheck(unescaped);
+  const t = unescaped.replace(/\\([!-/:-@[-`{-~])/gu, "$1").replace(/\p{Cf}/gu, "");
   return Array.from(t, (ch) => {
     const k = CONFUSABLE_FROM.indexOf(ch);
     return k < 0 ? ch : CONFUSABLE_TO[k]!;
