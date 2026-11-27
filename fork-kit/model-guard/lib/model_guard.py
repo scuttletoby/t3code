@@ -26,7 +26,7 @@ The policy is a JSON file {"mode": "off" | "advise" | "enforce", "allow": [rows]
 
 Plain Python 3 standard library. No state: the files are read again on every call.
 """
-import hashlib, json, os, re, stat, sys
+import hashlib, json, os, re, stat, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 for _common in (os.path.join(HERE, 'common'), os.path.join(os.path.dirname(HERE), 'common')):
@@ -100,8 +100,7 @@ T3_TOOLS = ('delegate_task', 'create_threads', 't3_thread_launch', 't3_thread_co
             't3_project_update')
 # T3 tools the T3 server checks against its own modelPolicy (each route's own check, and the backstop for a fork).
 # The hook leaves them to the server only while T3's managed policy locks that policy (server_lock below).
-SERVER_CHECKED_TOOLS = ('delegate_task', 'create_threads', 't3_thread_launch', 't3_thread_configure',
-                        't3_thread_transfer')
+SERVER_CHECKED_TOOLS = ('delegate_task', 'create_threads')
 # T3's managed policy file: root-owned, read by T3 at start (packages/shared/src/managedPolicyFile.ts); a locked
 # setting there wins over the settings file an agent can write
 T3_POLICY_PATHS = {'linux': '/etc/t3code/policy.json', 'darwin': '/Library/Application Support/T3Code/policy.json'}
@@ -314,6 +313,7 @@ def load_policy(machine_path=None, owner_uid=0):
         'policyFile': (str, machine_file.REQUIRED, absolute),
         'allowOtherHooks': (bool, False, None),
         't3ModelManifests': (list, None, paths),   # read by the self-check only (#600)
+        't3ServerStates': (list, None, paths),     # each T3 home's userdata/server-runtime.json (server_lock)
     }, f'{machine_path}: {KIT}')
     text = machine_file.read_protected_text(cfg['policyFile'], owner_uid)
     return cfg, parse_policy(text, cfg['policyFile'])
@@ -897,47 +897,117 @@ def t3_policy_path(platform=None):
     return next((p for name, p in T3_POLICY_PATHS.items() if platform.startswith(name)), None)
 
 
+def _covers(h, r):
+    """Whether the guard's row h allows at least every pick T3's locked row r allows. A row without efforts allows
+    only a pick that names no effort, on both sides; a row with efforts refuses such a pick, so r without efforts is
+    covered only by h without efforts, and r with efforts only by h listing each of them."""
+    if h['driver'] != r.get('driver') or h['model'] != r.get('model'):
+        return False
+    efforts = r.get('efforts')
+    if efforts is None:
+        return h['efforts'] is None
+    return isinstance(efforts, list) and h['efforts'] is not None and all(e in h['efforts'] for e in efforts)
+
+
 def _wider_row(t3_rows, rows):
-    """The first row T3's locked policy allows that no row of the guard's policy covers (same driver and model, and
-    no effort the guard's row does not list), or None."""
+    """The first row T3's locked policy allows that no row of the guard's policy covers, or None."""
     for r in t3_rows:
-        efforts = r.get('efforts') if isinstance(r, dict) else None
-        if not any(isinstance(r, dict) and h['driver'] == r.get('driver') and h['model'] == r.get('model')
-                   and (efforts is None or (isinstance(efforts, list) and h['efforts'] is not None
-                                            and all(e in h['efforts'] for e in efforts)))
-                   for h in rows):
+        if not isinstance(r, dict) or not any(_covers(h, r) for h in rows):
             return r
     return None
 
 
-def server_lock(policy, path=None, owner_uid=0):
+def process_started(pid):
+    """When the process started, in seconds since the epoch (as st_mtime), or None when that cannot be read."""
+    try:
+        if sys.platform.startswith('linux'):
+            with open(f'/proc/{int(pid)}/stat', encoding='ascii') as f:
+                ticks = int(f.read().rsplit(')', 1)[1].split()[19])
+            with open('/proc/stat', encoding='ascii') as f:
+                boot = next(int(line.split()[1]) for line in f if line.startswith('btime '))
+            return boot + ticks / os.sysconf('SC_CLK_TCK')
+        if sys.platform == 'darwin':
+            out = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(int(pid))], capture_output=True, text=True,
+                                 timeout=5, env={'LC_ALL': 'C'}).stdout.strip()
+            return time.mktime(time.strptime(out, '%a %b %d %H:%M:%S %Y')) if out else None
+    except (OSError, ValueError, IndexError, StopIteration, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def _server_loaded(state_path, lock_path, changed):
+    """None when the T3 server whose runtime state is at state_path runs, loaded its policy from lock_path, and
+    started after the lock last changed (T3 reads its managed policy only at start); else why not."""
+    try:
+        with open(state_path, 'rb') as f:
+            state = json.loads(f.read(1 << 20).decode('utf-8'))
+    except (OSError, ValueError) as e:
+        return f'{state_path}: no running T3 server can be read there ({e})'
+    pid = state.get('pid') if isinstance(state, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not _alive(pid):
+        return f'{state_path}: no T3 server is running there'
+    loaded = state.get('managedPolicy')
+    if not isinstance(loaded, dict) or not isinstance(loaded.get('source'), str) \
+            or os.path.realpath(loaded['source']) != os.path.realpath(lock_path):
+        return f'{state_path}: the running T3 server did not load {lock_path}; restart T3 first'
+    started = process_started(pid)
+    if started is None or started <= changed:
+        return f'{state_path}: the running T3 server started before {lock_path} last changed; restart T3 first'
+    return None
+
+
+def server_lock(policy, path=None, owner_uid=0, servers=None):
     """None when T3's managed policy locks modelPolicy at the guard policy's mode or stricter, with no row the
-    guard's rows do not cover, so the T3 server checks the tools in SERVER_CHECKED_TOOLS at least as the guard would
-    and an agent cannot turn that off; else why not. Fails closed: a file that is missing, not root-owned, writable
-    by group or others, behind a link, unreadable or not this shape counts as no lock."""
+    guard's rows do not cover, and every T3 server named in `servers` (the runtime state files from the machine
+    file's t3ServerStates) loaded it, so the T3 server checks the tools in SERVER_CHECKED_TOOLS at least as the guard
+    would and an agent cannot turn that off; else why not. Fails closed: a file that is missing, not root-owned,
+    writable by group or others, behind a link, unreadable or not this shape counts as no lock, and so does a lock
+    no named server has loaded yet (T3 reads it at start), or no server named at all."""
     mode = policy['mode']
     path = path or t3_policy_path()
     if path is None:
         return 'this platform has no T3 managed policy file the guard reads'
     try:
         document = json.loads(machine_file.read_protected_text(path, owner_uid=owner_uid))
+        st = os.stat(path)
     except PolicyError as e:
         return f'T3\'s managed policy is not usable here ({e})'
     except ValueError as e:
         return f'{path}: not JSON ({e})'
+    except OSError as e:
+        return f'{path}: cannot be read ({e})'
     entry = (document.get('settings') if isinstance(document, dict) else None) or {}
     entry = entry.get('modelPolicy') if isinstance(entry, dict) else None
     if not isinstance(entry, dict) or entry.get('locked') is not True:
         return f'{path} does not lock modelPolicy'
     value = entry.get('value')
     locked_mode = value.get('mode') if isinstance(value, dict) else None
-    if locked_mode not in MODES or not isinstance(value.get('allow'), list):
-        return f'{path} locks a modelPolicy without a mode and allow rows'
+    # T3 reads a policy without allow as one with no rows, which refuses every pick
+    allow = value.get('allow', []) if isinstance(value, dict) else None
+    if locked_mode not in MODES or not isinstance(allow, list):
+        return f'{path} locks a modelPolicy T3 cannot read (it needs a mode and a list of allow rows)'
     if MODES.index(locked_mode) < MODES.index(mode):
         return f'{path} locks modelPolicy at {locked_mode}, below this policy\'s {mode}'
-    wider = _wider_row(value['allow'], policy['allow'])
+    wider = _wider_row(allow, policy['allow'])
     if wider is not None:
         return f'{path} allows {json.dumps(wider)}, which no row of this policy covers'
+    if not servers:
+        return ('the machine file names no T3 server (t3ServerStates), so the guard cannot tell that a running T3 '
+                'loaded the lock')
+    for state_path in servers:
+        not_loaded = _server_loaded(state_path, path, max(st.st_mtime, st.st_ctime))
+        if not_loaded is not None:
+            return not_loaded
     return None
 
 
@@ -945,7 +1015,7 @@ def decide(payload, load, record=None, lock=None):
     """The hook's answer (a dict to print) or None (no output: the call goes on as without the hook).
     `load()` returns (machine section, policy) or raises PolicyError. Never returns 'allow': a passing call still
     goes through the session's own permission rules. `record(line)` gets every refusal and every advise note.
-    `lock(policy)` is server_lock: None leaves a tool the T3 server checks to the server."""
+    `lock(cfg, policy)` is server_lock: None leaves a tool the T3 server checks to the server."""
     tool = payload.get('tool_name') if isinstance(payload, dict) else None
     kind = tool_kind(tool)
     if kind is None:
@@ -959,7 +1029,7 @@ def decide(payload, load, record=None, lock=None):
         return _out('deny', reason)
     if policy['mode'] == 'off':
         return None
-    if kind in SERVER_CHECKED_TOOLS and lock is not None and lock(policy) is None:
+    if kind in SERVER_CHECKED_TOOLS and lock is not None and lock(cfg, policy) is None:
         return None
     problems, matched = check_call(kind, payload.get('tool_input'), policy['allow'])
     notes = '; '.join(f'{r["model"]} is for {r["useFor"]}' for r in matched if r['useFor'])
@@ -988,7 +1058,7 @@ def run_hook(stdin, stdout, machine_path=None, owner_uid=0, record=syslog_record
         out = _out('deny', reason)
     else:
         out = decide(payload, lambda: load_policy(machine_path, owner_uid), record,
-                     lambda policy: server_lock(policy, t3_policy, owner_uid))
+                     lambda cfg, policy: server_lock(policy, t3_policy, owner_uid, cfg.get('t3ServerStates')))
     if out:
         stdout.write(json.dumps(out) + '\n')
     return 0
@@ -1385,7 +1455,7 @@ def self_check(machine_path=None, owner_uid=0, prefix=''):
         for note in offer_notes:
             print(f'note: {note}')
         t3 = t3_policy_path()
-        why = server_lock(policy, prefix + t3, owner_uid) if t3 else server_lock(policy, None, owner_uid)
+        why = server_lock(policy, prefix + t3 if t3 else None, owner_uid, cfg['t3ServerStates'])
         print(f'T3 server routes ({", ".join(SERVER_CHECKED_TOOLS)}): '
               + ('left to T3, whose managed policy locks modelPolicy' if why is None else f'checked here too: {why}'))
     try:

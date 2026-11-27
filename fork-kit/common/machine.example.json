@@ -86,7 +86,8 @@
   },
   "model-guard": {
     "policyFile": "/etc/fork-kit/model-policy.json",
-    "t3ModelManifests": ["/srv/example/t3-home/userdata/model-manifest.json"]
+    "t3ModelManifests": ["/srv/example/t3-home/userdata/model-manifest.json"],
+    "t3ServerStates": ["/srv/example/t3-home/userdata/server-runtime.json"]
   },
   "agent-guards": {
     "actionsDisable": {
