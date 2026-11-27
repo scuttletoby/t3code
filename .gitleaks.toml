@@ -146,6 +146,18 @@ condition = "AND"
 paths = ['''^fork-kit/heavy/tests/sweep\.test\.py$''']
 regexes = ['''^admin\x3ahunter3$''']
 
+# The fixed fence token of the handoff message test in an old pull request head (#1055): commit
+# 4bb4067a of PR #1021 (closed; the work merged as #1025 with another constant) held a fixed 32-hex
+# stand-in for randomFenceToken as `TOKEN = "..."`, which generic-api-key reads as a key. It is a
+# test's fence marker, never a credential. GitHub still serves that head by id, so the daily sweep
+# reads it. Only that rule, only that file, only this exact value (its 11th character as \x61 so
+# this file does not match itself).
+[[allowlists]]
+description = "handoff message test: the fixed fence token of an old PR head (#1055)"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^apps/server/src/fork/handoff/handoffMessage\.test\.ts$''']
+regexes = ['''^0123456789\x61bcdef0123456789abcdef$''']
 [[rules]]
 id = "1password-secret-key"
 description = "Uncovered a possible 1Password secret key, potentially compromising access to secrets in vaults."

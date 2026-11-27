@@ -1187,6 +1187,11 @@ repo_pr fake-wait2-elsewhere apps/server/src/holdWork.boot.ts "$fake_wait2"
 repo_pr fake-curl fork-kit/heavy/tests/sweep.test.py "$fake_curl"
 repo_pr fake-curl-elsewhere fork-kit/heavy/sweep.py "$fake_curl"
 repo_pr fake-curl-other fork-kit/heavy/tests/sweep.test.py "${fake_curl/hunter3/hunter4}"
+# #1055: the fixed fence token of an old handoff test head, in its own file only.
+fake_fence="$(printf 'const %s = "%s";\n' TOKEN "0123456789abcdef""0123456789abcdef")"
+repo_pr fake-fence apps/server/src/fork/handoff/handoffMessage.test.ts "$fake_fence"
+repo_pr fake-fence-elsewhere apps/server/src/fork/handoff/handoffMessage.ts "$fake_fence"
+repo_pr fake-fence-other apps/server/src/fork/handoff/handoffMessage.test.ts "${fake_fence/cdef\"/cde1\"}"
 # The file itself (deleted and added again, so the PR's diff holds all of it) passes its own rules.
 git checkout -q -b own-file "$repo_base"
 if [[ -f .gitleaks.toml ]]; then
@@ -1208,11 +1213,12 @@ BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse lock-version)" \
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
   BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse lock-token)" \
     check "repository settings: a token after 1.0.0- in pnpm-lock.yaml is found" 1
-  for branch in fake-wait fake-wait2-service fake-wait2-hold fake-wait-hold fake-curl; do
+  for branch in fake-wait fake-wait2-service fake-wait2-hold fake-wait-hold fake-curl fake-fence; do
     BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse "$branch")" \
       check "repository settings: the fake value of an old PR head in its own test file is not a finding (#482, $branch)" 0
   done
-  for branch in fake-wait-elsewhere fake-wait-other fake-wait2-other fake-wait2-elsewhere fake-curl-elsewhere fake-curl-other; do
+  for branch in fake-wait-elsewhere fake-wait-other fake-wait2-other fake-wait2-elsewhere fake-curl-elsewhere fake-curl-other \
+    fake-fence-elsewhere fake-fence-other; do
     BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse "$branch")" \
       check "repository settings: that value in another file, or another value there, is found (#482, $branch)" 1
   done
