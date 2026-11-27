@@ -20,6 +20,7 @@ import * as ActivityProbe from "./activityProbe.ts";
 import * as DelegatedOrphanScan from "./delegatedResults/DelegatedOrphanScan.ts";
 import * as DelegatedResultReminder from "./delegatedResults/DelegatedResultReminder.ts";
 import * as FactsCommands from "./factsCommand.ts";
+import * as FillerDelegate from "./fillerDelegate.ts";
 import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
@@ -108,6 +109,8 @@ export const layerRoutes = Layer.mergeAll(
   RemoteTaskPrompts.layer,
   // A parent here whose task on a linked machine waits there on a prompt: woken once per prompt.
   RemoteTaskPromptWakes.layer,
+  // POST/GET /api/fork/delegate: the slot filler starts and counts a thread's children; a session token only.
+  FillerDelegate.layer,
 );
 
 /**

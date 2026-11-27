@@ -34,6 +34,7 @@ import { WaitsToolkit } from "../mcp/toolkits/waits/tools.ts";
 import { WorktreeToolkit } from "../mcp/toolkits/worktree/tools.ts";
 import { makeThreadMcpProfilesById } from "./claudeMcpProfile.ts";
 import { MCP_T3_TOOL_NOT_ALLOWED, mcpT3ToolGroup } from "./mcpProfile.ts";
+import { installFillerDelegateServer } from "./fillerDelegate.ts";
 import { installLensStartServer } from "./reviewRules/lensStartServer.ts";
 import {
   LENS_START_OFF,
@@ -254,6 +255,8 @@ export const layer = McpServer.visibility(
       ? yield* environment.value.getEnvironmentId.pipe(Effect.option)
       : Option.none();
     yield* installLensStartServer(yield* McpServer.McpServer, Option.getOrUndefined(here));
+    // Fork: the slot filler's starts (fork/fillerDelegate.ts) go through it too.
+    yield* installFillerDelegateServer(yield* McpServer.McpServer, Option.getOrUndefined(here));
     return yield* makeVisible;
   }).pipe(Effect.withSpan("McpT3ToolRule.make")),
   { global: true },

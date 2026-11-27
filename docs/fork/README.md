@@ -382,6 +382,29 @@ idempotent. It runs at most 90 s per delivery (the delivery is tried again after
 GitHub or thread does not stall other waits. Like the gate, lens_start skips a review or inline
 comment that is not submitted yet, and dates an inline comment by when it was published.
 
+### Slot filler route (`/api/fork/delegate`)
+
+Lets a program start a delegated task as a given parent thread, so a script (fork-kit/slot-filler)
+fills free agent slots and the parent is still woken by each child's end (#870). There is no setting:
+the route needs a session token with `orchestration:read` and `orchestration:operate`
+(`t3 auth session issue --scopes orchestration:read,orchestration:operate --token-only`), and a
+browser request (one with `Origin`) gets a plain `404`.
+
+- `POST /api/fork/delegate` `{parentThreadId, requestId, wake?, task}` runs the server's own
+  `delegate_task` (async) with `task` as its input, as the parent thread, the way `lens_start` does.
+  Every check of `delegate_task` applies: the slot gate, the model policy, linked environments,
+  providers. The `requestId` is looked up first (and again after a refusal): one that
+  already started answers with its task whatever the parent's state, so a caller that lost the answer
+  asks again safely; one refused for good at its dispatch answers `request_rejected`. With `lookupOnly: true` it
+  stops there (`not_found` when nothing started yet). A parent with no
+  active run then gets one short queued message (`wake`, sent once per parent, request id and half hour) so it
+  has one; the start waits up to 40 s for that run. It answers `200` `{state: "started", taskId,
+  childThreadId}`, or `{state: "refused", code, message}` with `404` (`parent_missing`), `409` (any
+  other refusal, such as `slots_full`) or `400` (a bad body).
+- `GET /api/fork/delegate?parentThreadId=...` (`orchestration:read`) answers `{children,
+  parentSettled}`: the parent's children (`taskId, title, status, live, environmentId, childThreadId,
+  providerInstanceId, model`) and whether it was settled by hand.
+
 ### `server.modelPolicy`
 
 Which models (and efforts) agents may pick, per provider driver. `mode` is `off` (agents pick any
