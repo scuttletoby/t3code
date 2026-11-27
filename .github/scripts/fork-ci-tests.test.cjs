@@ -16,6 +16,8 @@ const {
   runSpeed,
   weightNote,
   judge,
+  prChanges,
+  weightOnlyWarns,
   expectedSeconds,
   slowNote,
   findTests,
@@ -669,6 +671,7 @@ function runScript(tests, jobs, args = [], list = Object.keys(tests).join("\n"),
     "GITHUB_RUN_ID",
     "GITHUB_RUN_ATTEMPT",
     "GITHUB_JOB",
+    "GITHUB_EVENT_NAME",
   ]) {
     delete env[name];
     if (extra[name] !== undefined) env[name] = extra[name];
@@ -2773,5 +2776,169 @@ test("--run of a failing own run fails, and its record says so", () => {
     assert.equal(Object.values(readRecords(records))[0].results[0].status, 4);
   } finally {
     cleanup();
+  }
+});
+
+// main() in this process on a scratch copy, each test taking the seconds `took` gives it, with `changes` as the paths
+// the pull request changes (null: a push to main or a release run).
+async function mainWith(list, took, changes) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-main-"));
+  const script = path.join(root, ".github/scripts/fork-ci-tests.cjs");
+  fs.mkdirSync(path.dirname(script), { recursive: true });
+  fs.copyFileSync(require.resolve("./fork-ci-tests.cjs"), script);
+  fs.writeFileSync(path.join(root, ".github/fork-ci-tests.txt"), list.join("\n") + "\n");
+  for (const line of list) {
+    fs.mkdirSync(path.join(root, path.dirname(line.split(" ")[0])), { recursive: true });
+    fs.writeFileSync(path.join(root, line.split(" ")[0]), "exit 0\n");
+  }
+  const saved = { ...process.env };
+  const exitCode = process.exitCode;
+  const log = console.log;
+  const out = [];
+  Object.assign(process.env, { FORK_CI_TEST_JOBS: "1" });
+  for (const name of ["FORK_CI_TEST_SHARD", "FORK_CI_TEST_RECORDS", "GITHUB_STEP_SUMMARY"])
+    delete process.env[name];
+  console.log = (...args) => out.push(args.join(" "));
+  try {
+    process.exitCode = undefined;
+    await require(script).main(["fork-ci/"], {
+      runTest: async (file) => took(file),
+      now: () => 0,
+      changes: () => changes,
+    });
+    return { out: out.join("\n"), exitCode: process.exitCode };
+  } finally {
+    console.log = log;
+    process.exitCode = exitCode;
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const WEIGHTED = ["fork-ci/slow.test.sh ~20s", "fork-ci/other.test.sh ~5s"];
+// slow.test.sh takes 56 s against its ~20s on a slow runner; other.test.sh is on time.
+const SLOW_RUNNER = (file) => ({
+  file,
+  status: 0,
+  seconds: file.includes("slow") ? "56.0" : "5.0",
+});
+const OVER =
+  /fork-ci\/slow\.test\.sh took 56 s, its weight is ~20s: make it "~56s" in \.github\/fork-ci-tests\.txt/;
+
+test("a weight note fails a push to main or a release run (no pull request changes)", async () => {
+  const run = await mainWith(WEIGHTED, SLOW_RUNNER, null);
+  assert.equal(run.exitCode, 1, run.out);
+  assert.match(run.out, new RegExp(`^::error file=fork-ci/slow\\.test\\.sh::${OVER.source}$`, "m"));
+});
+
+test("on a pull request that changes neither the test nor the list, a weight note only warns", async () => {
+  for (const changes of [["apps/server/src/fork/a.ts"], []]) {
+    const run = await mainWith(WEIGHTED, SLOW_RUNNER, changes);
+    assert.equal(run.exitCode, undefined, run.out);
+    assert.doesNotMatch(run.out, /::error/);
+    assert.match(
+      run.out,
+      new RegExp(
+        `^::warning file=fork-ci/slow\\.test\\.sh::${OVER.source} \\(a warning only: `,
+        "m",
+      ),
+    );
+  }
+});
+
+test("a pull request that changes the test or the weight list still fails on its weight note", async () => {
+  for (const changes of [["fork-ci/slow.test.sh"], [".github/fork-ci-tests.txt", "apps/a.ts"]]) {
+    const run = await mainWith(WEIGHTED, SLOW_RUNNER, changes);
+    assert.equal(run.exitCode, 1, `${changes}: ${run.out}`);
+    assert.match(
+      run.out,
+      new RegExp(`^::error file=fork-ci/slow\\.test\\.sh::${OVER.source}$`, "m"),
+    );
+  }
+});
+
+test("a warned weight note hides neither a failed test nor the note of a test the pull request changed", async () => {
+  // runTest prints a failed test's error itself; main() still fails the part on it.
+  const broken = await mainWith(
+    [...WEIGHTED, "fork-ci/broken.test.sh ~5s"],
+    (file) => ({ ...SLOW_RUNNER(file), status: file.includes("broken") ? 1 : 0 }),
+    ["apps/a.ts"],
+  );
+  assert.equal(broken.exitCode, 1, broken.out);
+  assert.match(broken.out, /^::warning file=fork-ci\/slow\.test\.sh::/m);
+  const touched = await mainWith([...WEIGHTED, "fork-ci/slow-too.test.sh ~20s"], SLOW_RUNNER, [
+    "fork-ci/slow-too.test.sh",
+  ]);
+  assert.equal(touched.exitCode, 1, touched.out);
+  assert.match(touched.out, /^::warning file=fork-ci\/slow\.test\.sh::/m);
+  assert.match(touched.out, /^::error file=fork-ci\/slow-too\.test\.sh::.*make it "~56s"/m);
+});
+
+test("weightOnlyWarns: only with a pull request's changes that name neither the test nor the list", () => {
+  assert.equal(weightOnlyWarns("fork-ci/a.test.sh", null), false);
+  assert.equal(weightOnlyWarns("fork-ci/a.test.sh", undefined), false);
+  assert.equal(weightOnlyWarns("fork-ci/a.test.sh", []), true);
+  assert.equal(weightOnlyWarns("fork-ci/a.test.sh", ["fork-ci/b.test.sh"]), true);
+  assert.equal(weightOnlyWarns("fork-ci/a.test.sh", ["fork-ci/a.test.sh"]), false);
+  assert.equal(weightOnlyWarns("fork-ci/a.test.sh", [".github/fork-ci-tests.txt"]), false);
+});
+
+test("prChanges: a pull request's merge commit gives its paths; any other run, or no merge commit, gives null", () => {
+  const called = [];
+  const never = (args) => {
+    called.push(args);
+    return "";
+  };
+  for (const event of ["push", "workflow_dispatch", "workflow_call", "merge_group", undefined])
+    assert.equal(prChanges({ GITHUB_EVENT_NAME: event }, never), null, String(event));
+  assert.deepEqual(called, []);
+  const failing = () => {
+    throw new Error("fatal: ambiguous argument 'HEAD^2'");
+  };
+  assert.equal(prChanges({ GITHUB_EVENT_NAME: "pull_request" }, failing), null);
+
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-pr-"));
+  const git = (args) =>
+    childProcess.execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "core.quotePath=false",
+        ...args,
+      ],
+      { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+  const write = (file, text) => {
+    fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+    fs.writeFileSync(path.join(repo, file), text);
+  };
+  try {
+    git(["init", "-q", "-b", "main"]);
+    write("fork-ci/a.test.sh", "exit 0\n");
+    git(["add", "-A"]);
+    git(["commit", "-q", "-m", "base"]);
+    git(["checkout", "-q", "-b", "topic"]);
+    write("apps/web/a.ts", "x\n");
+    git(["mv", "fork-ci/a.test.sh", "fork-ci/b.test.sh"]);
+    git(["add", "-A"]);
+    git(["commit", "-q", "-m", "change"]);
+    assert.equal(prChanges({ GITHUB_EVENT_NAME: "pull_request" }, git), null); // no merge commit
+    git(["checkout", "-q", "main"]);
+    write("docs/base.md", "moved on\n");
+    git(["add", "-A"]);
+    git(["commit", "-q", "-m", "main moved on"]);
+    git(["merge", "-q", "--no-ff", "-m", "merge", "topic"]);
+    assert.deepEqual(prChanges({ GITHUB_EVENT_NAME: "pull_request" }, git).toSorted(), [
+      "apps/web/a.ts",
+      "fork-ci/a.test.sh",
+      "fork-ci/b.test.sh",
+    ]);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
   }
 });

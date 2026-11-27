@@ -1,10 +1,7 @@
-// Fork only: prints `fork_only=true` and upstream's gates for an empty change (all false) when every path
-// this pull request changes is fork-owned (.github/fork-owned-paths.txt). When only some are, it prints
-// `fork_only=false` and upstream's gates for the other paths alone: no app job reads a fork-owned path, so
-// those paths must not make upstream's detector run every job (it does for any path it does not know).
-// Else just `fork_only=false` (the detector's own answer stands). Fails closed and never exits non-zero.
-// Run by fork-tests.yml's `changes` job from the merge commit:
-//   node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT"   (tests: fork-owned-paths.test.py)
+// Fork only: all changed paths fork-owned (.github/fork-owned-paths.txt) prints `fork_only=true` and every gate
+// false; some prints `fork_only=false` and upstream's gates for the other paths alone (no app job reads a fork-owned
+// one); none, or any error, prints just `fork_only=false`. Never exits non-zero. Run by fork-tests.yml's `changes` job
+// from the merge commit: node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT" (fork-owned-paths.test.py).
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const { decide, readWorkspace } = require("./ci-changes.cjs");

@@ -612,6 +612,9 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.changes.outputs.sha }}
+          # Two commits: on a pull request, the merge commit and its base, so fork-ci-tests.cjs can see which files
+          # the pull request changes (a weight note on a test it did not touch only warns).
+          fetch-depth: 2
           sparse-checkout: |
             /.github/
             /docs/fork/
