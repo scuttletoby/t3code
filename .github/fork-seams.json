@@ -646,15 +646,11 @@
       ]
     },
     "apps/server/src/provider/Drivers/AntigravityDriver.ts": {
-      "why": "Antigravity limits come from the CLI's own `/usage` report since upstream stopped reading Google's internal quota API (upstream pull request 43026). The fork's overlay (fork/antigravityUsage) wraps the instance's snapshot service with one spread after upstream's snapshot line, reusing the driver's spawn setup; announced here, added by the feature pull request.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import * as ForkLimits from \"../../fork/antigravityUsage/antigravityLimits.ts\"; // Fork: limits",
-          "...(yield* ForkLimits.overlay(provider.snapshot, settings, prepareSpawn, processEnvironment)),"
-        ]
-      }
+      "why": "Antigravity limits come from the CLI's own `/usage` report since upstream stopped reading Google's internal quota API (upstream pull request 43026). The fork's overlay (fork/antigravityUsage) wraps the instance's snapshot service with one spread after upstream's snapshot line, reusing the driver's spawn setup.",
+      "added": [
+        "import * as ForkLimits from \"../../fork/antigravityUsage/antigravityLimits.ts\"; // Fork: limits",
+        "...(yield* ForkLimits.overlay(provider.snapshot, settings, prepareSpawn, processEnvironment)),"
+      ]
     },
     "packages/contracts/src/rpc.ts": {
       "why": "The work panel (fork issue 1136) reads one fork RPC, `fork.workPanel`, defined in the fork file forkWorkPanel.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket.",
