@@ -1,5 +1,6 @@
-// Fork: a chat file link naming an environment downloads from that environment's own connection.
-import { EnvironmentId } from "@t3tools/contracts";
+// Fork: a chat file link naming an environment downloads, previews media and opens in the files
+// viewer through that environment's own connection.
+import { AuthFilesystemReadScope, EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { AsyncResult, type Atom } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
 
@@ -14,6 +15,7 @@ const state = vi.hoisted(() => ({
   search: vi.fn(),
   download: vi.fn(),
   connected: new Set<string>(),
+  noFileRead: false,
   savedAtom: null as unknown,
 }));
 
@@ -39,11 +41,17 @@ vi.mock(import("../../state/session"), async (original) => {
   const { AuthStandardClientScopes } = await import("@t3tools/contracts");
   const granted = new Set<string>(AuthStandardClientScopes);
   const hasScope = (environmentId: unknown, scope: string) =>
-    environmentId !== null && granted.has(scope);
+    environmentId !== null &&
+    granted.has(scope) &&
+    !(state.noFileRead && environmentId === "env-there" && scope === AuthFilesystemReadScope);
   return {
     ...(await original()),
     useEnvironmentScope: hasScope as never,
     readEnvironmentScope: hasScope as never,
+    usePreparedConnection: ((environmentId: string | null) =>
+      environmentId !== null && state.connected.has(environmentId)
+        ? { _tag: "Some", value: { httpBaseUrl: `https://${environmentId}.example/` } }
+        : { _tag: "None" }) as never,
     readPreparedConnection: ((environmentId: string) =>
       state.connected.has(environmentId)
         ? { httpBaseUrl: `https://${environmentId}.example/` }
@@ -68,12 +76,18 @@ vi.mock(import("../../remoteOpen"), async (original) => ({
   ...(await original()),
   useRemoteOpenResolution: () => ({ state: { mode: "local-exec" }, isResolved: true }) as never,
 }));
+vi.mock(import("../../state/filesystem"), async (original) => ({
+  ...(await original()),
+  useFilesystemReadAccess: (() => ({ canReadFiles: !state.noFileRead })) as never,
+}));
 vi.mock(import("../media/mediaContent"), async (original) => ({
   ...(await original()),
   downloadFile: state.download,
 }));
 
 import ChatMarkdown from "../ChatMarkdown";
+import { selectThreadRightPanelState, useRightPanelStore } from "../../rightPanelStore";
+import { ForkEnvironmentFilePanel } from "./forkEnvironmentFilePanel";
 import { toastManager } from "../ui/toast";
 
 const HERE = EnvironmentId.make("env-here");
@@ -83,6 +97,7 @@ function setup(
   saved: ReadonlyArray<[string, { label: string; phase: string }]> = [],
 ) {
   state.connected = new Set(connected);
+  state.noFileRead = false;
   appAtomRegistry.set(
     state.savedAtom as Atom.Writable<Map<string, unknown>>,
     new Map(
@@ -189,4 +204,130 @@ it("leaves a plain path link as it was", async () => {
   await act(async () => chips(screen.container)[0]!.click());
   expect(state.createAssetUrl).not.toHaveBeenCalled();
   expect(state.download).not.toHaveBeenCalled();
+});
+
+// In a thread, a click previews media or opens the files viewer, both on the link's
+// environment; the files viewer reads only through that environment, and only with file read there.
+const THREAD = { environmentId: HERE, threadId: ThreadId.make("thread-here") };
+const BUILD_BOX: [string, { label: string; phase: string }] = [
+  "env-there",
+  { label: "Build box", phase: "connected" },
+];
+
+const renderInThread = (text: string, onImageExpand = vi.fn()) =>
+  render(
+    <AppAtomRegistryProvider>
+      <ChatMarkdown
+        cwd="/tmp/project"
+        threadRef={THREAD}
+        text={text}
+        onImageExpand={onImageExpand}
+      />
+    </AppAtomRegistryProvider>,
+  );
+
+it("previews an image on another environment, signed by that environment, on click only", async () => {
+  setup(["env-there"], [BUILD_BOX]);
+  const onImageExpand = vi.fn();
+  await using screen = await renderInThread(
+    "[shot.png](/t3-environment/env-there/srv/shot.png)",
+    onImageExpand,
+  );
+  expect(state.createAssetUrl).not.toHaveBeenCalled();
+  await act(async () => chips(screen.container)[0]!.click());
+  await vi.waitFor(() => expect(onImageExpand).toHaveBeenCalledOnce());
+  expect(state.createAssetUrl).toHaveBeenCalledWith({
+    environmentId: "env-there",
+    input: {
+      resource: { _tag: "media-file", threadId: "environment-file-link", path: "/srv/shot.png" },
+    },
+  });
+  expect(onImageExpand.mock.calls[0]![0].images[0].src).toBe(
+    "https://env-there.example/api/assets/token/app.log",
+  );
+  expect(state.download).not.toHaveBeenCalled();
+});
+
+it("previews nothing and asks nothing when the image's environment is not connected", async () => {
+  setup([], [BUILD_BOX]);
+  const onImageExpand = vi.fn();
+  const toast = vi.spyOn(toastManager, "add");
+  await using screen = await renderInThread(
+    "[shot.png](/t3-environment/env-there/srv/shot.png)",
+    onImageExpand,
+  );
+  await act(async () => chips(screen.container)[0]!.click());
+  await vi.waitFor(() => expect(toast).toHaveBeenCalled());
+  expect(String((toast.mock.calls.at(-1)![0] as { description?: unknown }).description)).toContain(
+    "Build box, which this device is not connected to",
+  );
+  toast.mockRestore();
+  expect(state.createAssetUrl).not.toHaveBeenCalled();
+  expect(onImageExpand).not.toHaveBeenCalled();
+});
+
+it("opens any other file in the thread's files viewer under its link path", async () => {
+  setup(["env-there"], [BUILD_BOX]);
+  await using screen = await renderInThread("[app.log](/t3-environment/env-there/srv/app.log:12)");
+  await act(async () => chips(screen.container)[0]!.click());
+  const panel = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, THREAD);
+  expect(panel.activeSurfaceId).toBe("file:/t3-environment/env-there/srv/app.log");
+  expect(state.createAssetUrl).not.toHaveBeenCalled();
+  expect(state.download).not.toHaveBeenCalled();
+});
+
+const renderPanel = (relativePath: string) =>
+  render(
+    <AppAtomRegistryProvider>
+      <ForkEnvironmentFilePanel
+        surface={{
+          id: `file:${relativePath}`,
+          kind: "file",
+          relativePath,
+          revealLine: null,
+          revealRequestId: 1,
+        }}
+      />
+    </AppAtomRegistryProvider>,
+  );
+
+it("the files viewer reads a normal file through its environment's connection", async () => {
+  setup(["env-there"], [BUILD_BOX]);
+  await using screen = await renderPanel("/t3-environment/env-there/srv/app.log");
+  await vi.waitFor(() =>
+    expect(state.createAssetUrl).toHaveBeenCalledWith({
+      environmentId: "env-there",
+      input: {
+        resource: {
+          _tag: "media-file",
+          threadId: "environment-file-link",
+          path: "/srv/app.log",
+          disposition: "attachment",
+        },
+      },
+    }),
+  );
+  expect(
+    state.createAssetUrl.mock.calls.every(([call]) => call.environmentId === "env-there"),
+  ).toBe(true);
+  expect(screen.container.textContent).toContain("File on Build box");
+});
+
+it("the files viewer reads nothing without file read on that environment", async () => {
+  setup(["env-there"], [BUILD_BOX]);
+  state.noFileRead = true;
+  await using screen = await renderPanel("/t3-environment/env-there/srv/app.log");
+  expect(screen.container.querySelector("[role=alert]")?.textContent).toBe(
+    "This device may not read files on Build box.",
+  );
+  expect(state.createAssetUrl).not.toHaveBeenCalled();
+});
+
+it("the files viewer reads nothing from an environment this device is not connected to", async () => {
+  setup([], [BUILD_BOX]);
+  await using screen = await renderPanel("/t3-environment/env-there/srv/app.log");
+  expect(screen.container.querySelector("[role=alert]")?.textContent).toContain(
+    "Build box, which this device is not connected to",
+  );
+  expect(state.createAssetUrl).not.toHaveBeenCalled();
 });
