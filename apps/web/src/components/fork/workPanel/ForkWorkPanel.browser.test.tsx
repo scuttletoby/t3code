@@ -17,6 +17,8 @@ const state = vi.hoisted(() => ({
   enabled: false,
   shells: [] as Array<unknown>,
   result: null as unknown,
+  fleet: [] as Array<unknown>,
+  accounts: [] as Array<unknown>,
   open: vi.fn(async (_url: string) => {}),
   updateClient: vi.fn(async (_patch: unknown) => {}),
 }));
@@ -36,6 +38,9 @@ vi.mock(import("../../../browser/useOpenLink"), () => ({
 }));
 vi.mock(import("./workPanelAtom"), () => ({
   forkWorkPanelAtom: (() => Atom.make(state.result)) as never,
+  forkFleetAtom: (() => Atom.make(state.fleet)) as never,
+  fleetKey: () => "fleet",
+  useForkUsageAccounts: (() => state.accounts) as never,
 }));
 
 import { ForkWorkPanel } from "./ForkWorkPanel";
@@ -99,9 +104,17 @@ const panel = (density = "full") => (
   <ForkWorkPanel environmentId={"env" as never} threadId={"parent" as never} density={density} />
 );
 
-const setUp = (input: { enabled: boolean; result: unknown; shells?: Array<unknown> }) => {
+const setUp = (input: {
+  enabled: boolean;
+  result: unknown;
+  shells?: Array<unknown>;
+  fleet?: Array<unknown>;
+  accounts?: Array<unknown>;
+}) => {
   state.enabled = input.enabled;
   state.result = input.result;
+  state.fleet = input.fleet ?? [];
+  state.accounts = input.accounts ?? [];
   state.shells = input.shells ?? [
     shell("parent", null, [link(1)]),
     shell("child", "parent", [
@@ -260,6 +273,102 @@ describe("the work panel", () => {
     setUp({ enabled: true, result: AsyncResult.success(answer()) });
     await using screen = await render(panel("compact"));
     expect(screen.container.querySelector("[data-fork-work-panel]")).toBeNull();
+  });
+});
+
+const GB = 1024;
+const withCapacity = answer({
+  capacity: {
+    agents: { state: "answered", used: 3, total: 8, source: "This machine's agent slot gate." },
+    memoryMb: { state: "answered", used: 6 * GB, total: 16 * GB, source: "Host sampler." },
+    memoryFloorMb: 2 * GB,
+    factsAt: NOW,
+  },
+});
+const fleetMachine = (id: string, status: unknown) => ({
+  environmentId: id,
+  label: `Machine ${id}`,
+  isThisMachine: id === "env",
+  status,
+});
+
+describe("the capacity bar", () => {
+  it("one bar split per machine; an unreachable and an old machine are grey and unknown", async () => {
+    setUp({
+      enabled: true,
+      result: AsyncResult.success(withCapacity),
+      fleet: [
+        fleetMachine("env", { kind: "answered", answer: withCapacity }),
+        fleetMachine("off", { kind: "unreachable" }),
+        fleetMachine("old", { kind: "answered", answer: answer() }),
+      ],
+    });
+    await using screen = await render(panel());
+    await expect
+      .element(screen.getByTestId("fork-work-panel-agents"))
+      .toHaveTextContent("Agents: 3 of 8 in use · 2 machines unknown");
+    await expect
+      .element(screen.getByTestId("fork-work-panel-memory"))
+      .toHaveTextContent("Memory free: 10 GB of 16 GB · 2 machines unknown");
+    const segments = screen.getByRole("listitem", { name: /^Machine / }).elements();
+    expect(segments.map((segment) => segment.getAttribute("data-state"))).toEqual([
+      "answered",
+      "unknown",
+      "unknown",
+    ]);
+    await userEvent.click(screen.getByRole("button", { name: "Per machine" }));
+    const rows = screen.getByTestId("fork-work-panel-machine").elements();
+    expect(rows[0]!.textContent).toContain("Agents 3 of 8 in use");
+    expect(rows[1]!.textContent).toContain("Not connected to this machine.");
+    expect(rows[2]!.textContent).toContain("This machine's version does not report capacity.");
+    expect(rows.slice(1).map((row) => row.getAttribute("data-state"))).toEqual([
+      "unknown",
+      "unknown",
+    ]);
+  });
+
+  it("an empty fleet: unknown, never 0 or 100", async () => {
+    setUp({ enabled: true, result: AsyncResult.success(answer()), fleet: [] });
+    await using screen = await render(panel());
+    await expect.element(screen.getByTestId("fork-work-panel-no-fleet")).toBeVisible();
+    expect(screen.container.querySelector("[data-testid=fork-work-panel-agents]")).toBeNull();
+  });
+
+  it("CI runners: busy from the repo line, free unknown", async () => {
+    setUp({ enabled: true, result: AsyncResult.success(answer()) });
+    await using screen = await render(panel());
+    await expect
+      .element(screen.getByTestId("fork-work-panel-ci-runners"))
+      .toHaveTextContent("CI runners: 2 busy · free unknown");
+  });
+
+  it("usage: each account's session and weekly room left; a missing one is unknown", async () => {
+    setUp({
+      enabled: true,
+      result: AsyncResult.success(answer()),
+      accounts: [
+        {
+          key: "a",
+          driver: "claudeAgent",
+          displayName: "Claude",
+          email: undefined,
+          limits: { windows: [{ id: "s", kind: "session", label: "5h", usedPercent: 38 }] },
+        },
+      ],
+    });
+    await using screen = await render(panel());
+    await expect
+      .element(screen.getByTestId("fork-work-panel-usage-session"))
+      .toHaveTextContent("Session62% left");
+    const weekly = screen.getByTestId("fork-work-panel-usage-weekly");
+    await expect.element(weekly).toHaveAttribute("data-state", "unknown");
+    await expect.element(weekly).toHaveTextContent("Weeklyunknown");
+  });
+
+  it("no account reports limits: says unknown", async () => {
+    setUp({ enabled: true, result: AsyncResult.success(answer()) });
+    await using screen = await render(panel());
+    await expect.element(screen.getByTestId("fork-work-panel-no-usage")).toBeVisible();
   });
 });
 

@@ -59,7 +59,9 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
  */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
-  SlotGate.layer,
+  // fork.workPanel: the thread side panel's shared GitHub runs read and this machine's capacity,
+  // which reads this one slot gate (fork issue 1136).
+  WorkPanel.layer.pipe(Layer.provideMerge(SlotGate.layer)),
   HeadlessUsageRefresher.layer,
   HandoffService.layer,
   RunRecorder.layer,
@@ -67,8 +69,6 @@ export const layerRuntimeServices = Layer.mergeAll(
   StopFinishedChildren.layer,
   ThreadRoleTargets.layer,
   FactsCommands.layer,
-  // fork.workPanel: the shared GitHub runs read of the thread side panel (fork issue 1136).
-  WorkPanel.layer,
 );
 
 /**

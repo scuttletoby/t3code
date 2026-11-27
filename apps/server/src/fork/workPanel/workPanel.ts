@@ -4,9 +4,11 @@
  * server without it answers no lines (unknown in the panel). Built in forkLayers.ts.
  */
 import {
+  type ForkMachineCapacity,
   type ForkWorkPanelAnswer,
   type ForkWorkPanelInput,
   type OrchestrationV2ThreadShell,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -17,6 +19,10 @@ import * as Option from "effect/Option";
 
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ProcessRunner from "../../processRunner.ts";
+import * as HostResources from "../../resourceTelemetry/HostResources.ts";
+import * as ServerSettings from "../../serverSettings.ts";
+import * as SlotGate from "../../slots/SlotGate.ts";
+import * as EnvironmentFacts from "../environmentFacts.ts";
 import {
   threadPullRequestsOf,
   visibleThreadPullRequests,
@@ -28,6 +34,7 @@ import {
   pullRequestRuns,
   repoQueueKey,
 } from "./repoQueue.ts";
+import { capacityFromFacts } from "./capacity.ts";
 
 /** The most repositories one read shows: those with the most linked pull requests first. */
 const MAX_REPOSITORIES_PER_READ = 3;
@@ -61,16 +68,27 @@ const subtreeLinks = (threadId: string, shells: ReadonlyArray<OrchestrationV2Thr
     .flatMap((shell) => visibleThreadPullRequests(threadPullRequestsOf(shell)));
 };
 
-/** The answer for `threadId` and the threads under it, given its family's shells and the cache. */
+/**
+ * The answer: CI for `threadId`'s family (none without one), given its shells and the shared
+ * cache, and this machine's capacity when `readCapacity` is given.
+ */
 export const makeRead = (
   readFamily: (
-    input: ForkWorkPanelInput,
+    threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationV2ThreadShell> | null>,
   cache: Effect.Success<ReturnType<typeof makeRepoQueueCache>>,
+  readCapacity?: Effect.Effect<ForkMachineCapacity>,
 ) =>
   Effect.fn("ForkWorkPanel.read")(function* (input: ForkWorkPanelInput) {
-    const shells = (yield* readFamily(input)) ?? [];
-    const links = subtreeLinks(input.threadId, shells);
+    const [family, capacity] = yield* Effect.all(
+      [
+        input.threadId === undefined ? Effect.succeed(null) : readFamily(input.threadId),
+        readCapacity ?? Effect.undefined,
+      ],
+      { concurrency: 2 },
+    );
+    const shells = family ?? [];
+    const links = input.threadId === undefined ? [] : subtreeLinks(input.threadId, shells);
     const byRepo = new Map<string, { host: string; repository: string; count: number }>();
     for (const link of links) {
       const key = repoQueueKey(link.host, link.repository);
@@ -96,6 +114,7 @@ export const makeRead = (
       answeredAt: yield* Clock.currentTimeMillis,
       repoQueues: lines,
       pullRequests,
+      ...(capacity === undefined ? {} : { capacity }),
     } satisfies ForkWorkPanelAnswer;
   });
 
@@ -160,14 +179,27 @@ export const layer = Layer.effect(
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const runner = yield* ProcessRunner.ProcessRunner;
     const cache = yield* makeRepoQueueCache(ghRunsSource(runner));
-    const readFamily = (input: ForkWorkPanelInput) =>
-      threads.readShellSnapshot({ familyOf: input.threadId }).pipe(
+    // The facts placement reads, with the services they read only if they are there, asked for
+    // here so a server wired without the gate or the settings is a type error.
+    const gate = yield* SlotGate.SlotGate;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const host = yield* Effect.serviceOption(HostResources.HostResources);
+    const readCapacity = EnvironmentFacts.read.pipe(
+      Effect.provideService(SlotGate.SlotGate, gate),
+      Effect.provideService(ServerSettings.ServerSettingsService, settings),
+      Option.isSome(host)
+        ? Effect.provideService(HostResources.HostResources, host.value)
+        : (effect) => effect,
+      Effect.map(capacityFromFacts),
+    );
+    const readFamily = (threadId: ThreadId) =>
+      threads.readShellSnapshot({ familyOf: threadId }).pipe(
         Effect.flatten,
         Effect.map((snapshot) => snapshot.threads),
         // The thread cannot be read: no lines, which the panel shows as unknown.
         Effect.orElseSucceed(() => null),
       );
-    return ForkWorkPanel.of({ read: makeRead(readFamily, cache) });
+    return ForkWorkPanel.of({ read: makeRead(readFamily, cache, readCapacity) });
   }),
 );
 

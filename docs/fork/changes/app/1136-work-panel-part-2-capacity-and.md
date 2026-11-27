@@ -1,0 +1,5 @@
+- Change: Work panel, part 2: capacity and usage. Above the CI part, one bar for the fleet's agent sessions in use of those allowed (each machine's slot gate), split per machine, the memory free (host sampler), CI runners busy (free is unknown), and each provider account's session and weekly room left. A machine that is unreachable, silent or too old is grey and unknown.
+- Why: See how full the setup is before starting more work.
+- Setting: `client.workPanelEnabled`
+- Default: off
+- PR: [#1136](https://github.com/scuttletoby/t3code/issues/1136)

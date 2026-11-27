@@ -1,7 +1,7 @@
 /**
- * Fork (work panel, fork issue 1136): CI for this thread in its side panel, right after its
- * sub-agents. One repository queue line, then each pull request linked to this thread or a thread
- * under it. Shows nothing while the client fork setting `workPanelEnabled` is off (the default).
+ * Fork (work panel, fork issue 1136): capacity and CI for this thread in its side panel, right
+ * after its sub-agents: the capacity bar and usage (CapacityBar.tsx), one repository queue line,
+ * then each pull request linked to this thread or a thread under it. Shows nothing while the client fork setting `workPanelEnabled` is off (the default).
  * Upstream's ThreadDetailsPanel.tsx renders it with one seam line, passing its own props.
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
@@ -29,6 +29,7 @@ import {
   runsByPullRequest,
   type PullRequestCi,
 } from "./workPanel.logic";
+import { CapacityBar } from "./CapacityBar";
 import { forkWorkPanelAtom } from "./workPanelAtom";
 
 const REASON_SERVER_SKIPPED = "This machine did not read this repository.";
@@ -76,6 +77,11 @@ function WorkPanelBody(props: {
   return (
     <ThreadDetailsSection headingId="fork-work-panel-heading" title="Work" data-fork-work-panel>
       <div className="flex flex-col gap-1.5 px-2.5 text-xs">
+        <CapacityBar
+          environmentId={props.environmentId}
+          threadId={props.threadId}
+          repoQueues={lines}
+        />
         <p className="text-2xs font-medium text-muted-foreground">CI</p>
         {pullRequests.length === 0 ? (
           <p className="text-muted-foreground">
