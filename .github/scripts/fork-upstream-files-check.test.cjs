@@ -87,7 +87,8 @@ function workflowProblems(workflow) {
   );
   expect(CONFIG_LINE.test(body), "the list is not the step's UPSTREAM_FILES line");
   expect(
-    /^ {8}if: \$\{\{ !cancelled\(\) \}\}$/m.test(body),
+    // A copy (a title or body edit) skips it; nothing else may.
+    /^ {8}if: \$\{\{ !cancelled\(\) && env\.ONLY_COPY != 'true' \}\}$/m.test(body),
     "the step is skipped when the schema step refuses",
   );
   expect(
@@ -114,7 +115,14 @@ test("a workflow that drops, skips or mis-feeds the check fails the contract", (
   const workflow = fs.readFileSync(WORKFLOW, "utf8");
   const mutants = {
     "no list": workflow.replace(CONFIG_LINE, ""),
-    "no if": workflow.replace(/^ {8}if: \$\{\{ !cancelled\(\) \}\}\n/m, ""),
+    "no if": workflow.replace(
+      /^ {8}if: \$\{\{ !cancelled\(\) && env\.ONLY_COPY != 'true' \}\}\n/m,
+      "",
+    ),
+    "skipped unless a copy": workflow.replace(
+      /^( {6}- name: Refuse changes to upstream files[^\n]*\n {8}if: \$\{\{ )!cancelled\(\) && /m,
+      "$1",
+    ),
     "base for head": workflow.replace(
       /"\$BASE_SHA" "\$HEAD_SHA" "\$UPSTREAM_FILES"/,
       '"$HEAD_SHA" "$HEAD_SHA" "$UPSTREAM_FILES"',

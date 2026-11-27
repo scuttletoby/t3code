@@ -23,9 +23,24 @@ GIT_ENV = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TER
            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.invalid'}
 
 
-def job(name, status='completed', conclusion='success'):
-    return {'name': name, 'status': status, 'conclusion': conclusion,
-            'html_url': f'https://github.invalid/job/{abs(hash(name)) % 1000}'}
+def job(name, status='completed', conclusion='success', steps=None):
+    j = {'name': name, 'status': status, 'conclusion': conclusion,
+         'html_url': f'https://github.invalid/job/{abs(hash(name)) % 1000}'}
+    return j if steps is None else {**j, 'steps': steps}
+
+
+def step(name, status='completed', conclusion='success'):
+    return {'name': name, 'status': status, 'conclusion': conclusion}
+
+
+# The check job's steps (fork-checks.yml): a real check skips the copy step; a copy runs only it.
+def real_steps(status='completed', conclusion='success'):
+    return [step('Set up job'), step(fcr.COPY_STEP, 'completed', 'skipped'),
+            step('Refuse schema and migration changes', status, conclusion)]
+
+
+def copy_steps(status='completed', conclusion='success'):
+    return [step('Set up job'), step(fcr.COPY_STEP, status, conclusion)]
 
 
 REPO_ID, OTHER_ID = 101, 202   # GitHub's ids of this repository (o/r) and of another one
@@ -40,10 +55,12 @@ def pr(number, ref='feature', repo_id=REPO_ID):
                                                          'url': 'https://api.github.invalid/repos/o/r'}}}
 
 
-def wr(rid, jobs, path=WF, event='pull_request_target', status='completed', prs=(7,), head_repo='o/r', branch='feature'):
+def wr(rid, jobs, path=WF, event='pull_request_target', status='completed', prs=(7,), head_repo='o/r', branch='feature',
+       conclusion=None):
     """A run of fork-checks.yml on SHA; by default one of pull request #7 (PR_ENV) from this repository's branch
-    `feature`. prs: numbers (entries from that branch) or whole entries."""
-    return {'id': rid, 'path': path, 'event': event, 'status': status, 'jobs': jobs, 'head_branch': branch,
+    `feature`. prs: numbers (entries from that branch) or whole entries. conclusion: the run's own."""
+    return {'id': rid, 'path': path, 'event': event, 'status': status, 'conclusion': conclusion, 'jobs': jobs,
+            'head_branch': branch,
             'pull_requests': [p if isinstance(p, dict) else pr(p, branch) for p in prs],
             'head_repository': {'full_name': head_repo, 'id': REPO_ID if head_repo == 'o/r' else OTHER_ID}}
 
@@ -212,6 +229,68 @@ class Check(unittest.TestCase):
                            ([wr(3, [job(CFG['check'])]), wr(9, [job(CFG['check'], 'completed', 'cancelled')])], 1)):
             code, out, _ = check(Fake([runs]))
             self.assertEqual(code, want, f'{[r["id"] for r in runs]}: {out}')
+
+    def test_a_newer_run_that_skipped_every_job_is_passed_over(self):
+        # A title or body edit (`edited`, base unchanged) skips the check, so that run ends "skipped" (#1090): the
+        # newest run that checked decides, red or green, and the skipped run's jobs are never asked for.
+        def edit(rid):
+            return wr(rid, [job(CFG['check'], 'completed', 'skipped'), job(CFG['outside_check'], 'completed', 'skipped')],
+                      conclusion='skipped')
+        for older, want in ((wr(3, [job(CFG['check'], 'completed', 'failure')], conclusion='failure'), 1),
+                            (wr(3, [job(CFG['check'])], conclusion='success'), 0),
+                            (wr(3, [job(CFG['check'], 'completed', 'cancelled')], conclusion='cancelled'), 1)):
+            fake = Fake([[edit(9), edit(8), older]])
+            code, out, _ = check(fake)
+            self.assertEqual(code, want, out)
+            self.assertNotIn('skipped (', out)
+            asked = ' '.join(fake.paths)
+            self.assertIn('actions/runs/3/jobs', asked)
+            self.assertNotIn('actions/runs/9/jobs', asked)
+            self.assertNotIn('actions/runs/8/jobs', asked)
+            self.assertLessEqual(len(fake.paths), fcr.API_CALLS_PER_POLL)
+
+    def test_a_newer_skipped_run_waits_for_an_older_run_still_going(self):
+        going = wr(3, [job(CFG['check'], 'in_progress', None)], status='in_progress')
+        code, out, clock = check(Fake([[wr(9, [job(CFG['check'], 'completed', 'skipped')], conclusion='skipped'), going],
+                                       [wr(9, [job(CFG['check'], 'completed', 'skipped')], conclusion='skipped'),
+                                        wr(3, [job(CFG['check'])], conclusion='success')]]))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(clock.slept), 1)
+
+    def test_when_every_run_skipped_every_job_the_newest_decides_and_fails(self):
+        skipped = [wr(rid, [job(CFG['check'], 'completed', 'skipped')], conclusion='skipped') for rid in (9, 3)]
+        fake = Fake([skipped])
+        code, out, clock = check(fake)
+        self.assertEqual(code, 1, out)
+        self.assertIn('was skipped', out)
+        self.assertIn('actions/runs/9/jobs', ' '.join(fake.paths))
+        self.assertEqual(clock.slept, [])
+
+    def test_a_run_that_is_still_going_or_ended_otherwise_is_not_passed_over(self):
+        # Only a finished run whose own conclusion is "skipped" is passed over; a newer run in any other state decides.
+        for newer in (wr(9, [job(CFG['check'], 'completed', 'failure')], conclusion='failure'),
+                      wr(9, [job(CFG['check'], 'completed', 'cancelled')], conclusion='cancelled'),
+                      wr(9, [], status='completed', conclusion='failure')):
+            code, out, _ = check(Fake([[newer, wr(3, [job(CFG['check'])], conclusion='success')]]))
+            self.assertEqual(code, 1, out)
+
+    def test_a_skipped_check_in_a_run_not_yet_finished_waits(self):
+        # The check is marked skipped before its run is marked completed: still going, not a failure (the run may yet
+        # end "skipped" and be passed over).
+        older = wr(3, [job(CFG['check'])], conclusion='success')
+        code, out, clock = check(Fake([
+            [wr(9, [job(CFG['check'], 'completed', 'skipped')], status='in_progress'), older],
+            [wr(9, [job(CFG['check'], 'completed', 'skipped')], conclusion='skipped'), older]]))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(clock.slept), 1)
+
+    def test_a_copy_decides_like_a_real_check(self):
+        # fork-ci-result reads the newest run, a copy too: it ended as the real check did.
+        for conclusion, want in (('success', 0), ('failure', 1)):
+            code, out, _ = check(Fake([[wr(9, [job(CFG['check'], 'completed', conclusion, copy_steps('completed',
+                                                                                                    conclusion))]),
+                                        wr(3, [job(CFG['check'], steps=real_steps())])]]))
+            self.assertEqual(code, want, out)
 
     def test_reads_the_latest_attempt_only(self):
         fake = Fake([[wr(1, [job(CFG['check'])])]])
@@ -481,6 +560,127 @@ class Check(unittest.TestCase):
         with open(CONFIG) as f:
             cfg = json.load(f)['fork_checks']
         self.assertEqual(fcr.config_problems(cfg), [])
+
+
+
+COPY_ENV = {'HEAD_SHA': SHA, 'DEFAULT_SHA': BASE, 'PR_NUMBER': '7', 'GITHUB_RUN_ID': '20', 'GITHUB_REPOSITORY': 'o/r'}
+
+
+def copy_check(fake, cfg=CFG, **env):
+    clock, out, asked = Clock(), [], []
+
+    def config(sha):
+        asked.append(sha)
+        if isinstance(cfg, Exception):
+            raise cfg
+        return dict(cfg)
+    code = fcr.copy({**COPY_ENV, **env}, fake, config, clock.now, clock.sleep, out.append)
+    return code, '\n'.join(out), clock, asked
+
+
+def real(rid, status='completed', conclusion='success'):
+    return wr(rid, [job(CFG['check'], status, conclusion if status == 'completed' else None,
+                        real_steps(status, conclusion if status == 'completed' else None))],
+              status=status, conclusion=conclusion if status == 'completed' else None)
+
+
+def copied(rid, status='completed', conclusion='success'):
+    return wr(rid, [job(CFG['check'], status, conclusion if status == 'completed' else None,
+                        copy_steps(status, conclusion if status == 'completed' else None))],
+              status=status, conclusion=conclusion if status == 'completed' else None)
+
+
+class Copy(unittest.TestCase):
+    """--copy: fork-checks.yml's check job on a title or body edit ends as the newest earlier real check (#1134)."""
+
+    def test_copies_the_newest_earlier_real_check(self):
+        for older, want in ((real(3), 0), (real(3, conclusion='failure'), 1), (real(3, conclusion='cancelled'), 1)):
+            code, out, clock, asked = copy_check(Fake([[older]]))
+            self.assertEqual(code, want, out)
+            self.assertEqual(clock.slept, [])
+            self.assertEqual(asked, [BASE])   # the config of DEFAULT_SHA
+
+    def test_a_base_change_that_went_red_stays_red_after_a_body_edit(self):
+        # The #1134 blocker: passed against the side branch (3), failed against main after the retarget (5); a body
+        # edit (this run, 20) must not read as passed.
+        code, out, _, _ = copy_check(Fake([[real(5, conclusion='failure'), real(3)]]))
+        self.assertEqual(code, 1, out)
+        self.assertIn('ended failure', out)
+
+    def test_this_run_and_later_runs_are_not_read(self):
+        fake = Fake([[real(25, conclusion='failure'), copied(20), real(3)]])
+        code, out, _, _ = copy_check(fake)
+        self.assertEqual(code, 0, out)
+        asked = ' '.join(fake.paths)
+        self.assertNotIn('actions/runs/25/', asked)
+        self.assertNotIn('actions/runs/20/', asked)
+
+    def test_earlier_copies_are_passed_over(self):
+        # A copy copies a real check, never another copy (a copy that timed out must not stand for the real check).
+        for copies, older, want in (([copied(9, conclusion='failure')], real(3), 0),
+                                    ([copied(9), copied(8)], real(3, conclusion='failure'), 1),
+                                    ([copied(9, 'in_progress')], real(3), 0)):
+            code, out, _, _ = copy_check(Fake([[*copies, older]]))
+            self.assertEqual(code, want, out)
+
+    def test_waits_for_the_real_check_still_running(self):
+        code, out, clock, _ = copy_check(Fake([[copied(9, 'in_progress'), real(3, 'in_progress')], [real(3)]]))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(clock.slept, [CFG['poll_seconds']])
+
+    def test_a_job_that_cannot_be_told_apart_waits_while_it_runs_and_fails_once_ended(self):
+        # Its copy step still queued (a real job lists it queued too), or no steps yet: never passed over.
+        queued = wr(9, [job(CFG['check'], 'in_progress', None,
+                            [step('Set up job'), step(fcr.COPY_STEP, 'queued', None)])], status='in_progress')
+        code, out, clock, _ = copy_check(Fake([[queued, real(3)], [real(9, conclusion='failure'), real(3)]]))
+        self.assertEqual((code, len(clock.slept)), (1, 1), out)
+        for ended in (wr(9, [job(CFG['check'], 'completed', 'success', [])]), wr(9, [job(CFG['check'])])):
+            code, out, _, _ = copy_check(Fake([[ended, real(3)]]))
+            self.assertEqual(code, 1, out)
+            self.assertIn('not clearly a real check', out)
+
+    def test_a_real_check_of_an_older_fork_checks_yml_is_copied(self):
+        # Runs made before this change have no copy step: a job with steps but none of that name is real.
+        old = wr(3, [job(CFG['check'], steps=[step('Set up job'), step('Refuse schema and migration changes')])])
+        code, out, _, _ = copy_check(Fake([[old]]))
+        self.assertEqual(code, 0, out)
+
+    def test_nothing_to_copy_fails_at_once(self):
+        for runs in ([], [copied(9)], [wr(4, [job(CFG['check'], steps=real_steps())], prs=(8,))],
+                     [wr(3, [job(CFG['check'], steps=real_steps())], event='pull_request')]):
+            code, out, clock, _ = copy_check(Fake([runs]))
+            self.assertEqual((code, clock.slept), (1, []), out)
+            self.assertIn('nothing to copy', out)
+
+    def test_a_finished_run_without_the_check_fails(self):
+        code, out, _, _ = copy_check(Fake([[wr(9, [], conclusion='failure'), real(3)]]))
+        self.assertEqual(code, 1, out)
+
+    def test_never_finishing_fails_after_the_cap(self):
+        code, out, clock, _ = copy_check(Fake([[real(3, 'in_progress')]]))
+        self.assertEqual(code, 1, out)
+        self.assertIn('did not finish', out)
+        self.assertLessEqual(sum(clock.slept), fcr.COPY_WAIT_SECONDS)
+
+    def test_api_errors_fail_closed(self):
+        code, out, _, _ = copy_check(Fake([[real(3)]], errors=[fcr.Fatal('HTTP 403 on x')]))
+        self.assertEqual(code, 1, out)
+        code, out, clock, _ = copy_check(Fake([[real(3)]], errors=[fcr.Transient('HTTP 502 on x'), None]))
+        self.assertEqual((code, len(clock.slept)), (0, 1), out)
+        fake = Fake([[real(3)]], errors=[fcr.Transient('HTTP 502 on x')] * 1000)
+        code, out, _, _ = copy_check(fake)
+        self.assertEqual(code, 1, out)
+        self.assertIn('HTTP 502', out)
+
+    def test_bad_input_or_config_fails(self):
+        for env in ({'HEAD_SHA': 'x'}, {'DEFAULT_SHA': ''}, {'PR_NUMBER': ''}, {'GITHUB_RUN_ID': 'x'},
+                    {'GITHUB_REPOSITORY': ''}):
+            code, out, _, _ = copy_check(Fake([[real(3)]]), **env)
+            self.assertEqual(code, 1, (env, out))
+        code, out, _, _ = copy_check(Fake([[real(3)]]), cfg=fcr.ConfigError('no file'))
+        self.assertEqual(code, 1, out)
+        code, out, _, _ = copy_check(Fake([[real(3)]]), cfg={**CFG, 'poll_seconds': 0})
+        self.assertEqual(code, 1, out)
 
 
 class BaseConfig(unittest.TestCase):
