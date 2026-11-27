@@ -309,7 +309,7 @@ class Install(unittest.TestCase):
                 shutil.copy2(os.path.join(KIT, 'bin', 'heavy'), old_release + '/bin/heavy')
                 os.unlink(self.path('/usr/local/libexec/heavy/current'))
                 os.symlink(f'/usr/local/libexec/heavy/versions/{SHA2}', self.path('/usr/local/libexec/heavy/current'))
-                self.assertFalse(os.path.exists(self.path('/usr/local/bin/t3-capacity')))   # the documented gap
+                self.assertFalse(os.path.exists(self.resolve('/usr/local/bin/t3-capacity')))   # the documented gap
                 code, out, err = self.install() if mend == 'install' else self.run_main('uninstall')
                 self.assertEqual(code, 0, err)
                 if mend == 'install':                                 # rolling forward again: the usual line

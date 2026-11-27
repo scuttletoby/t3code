@@ -887,8 +887,8 @@ a plain copy back (`heavy --self-check` says the link differs and warns about th
   `/usr/local/bin/t3-capacity` alone. If the older install ran first, either line mends it: this release's install
   (rolling forward) or its uninstall. The old copy is kept in `/usr/local/libexec/heavy-kept/`, outside
   `/usr/local/libexec/heavy` and `/etc/heavy`, because an older installer's uninstall deletes those two folders whole
-  (and puts the newest file of `replaced/` back as `heavy`). That older uninstall does not know the `t3-capacity`
-  link, so it leaves it broken: run this release's `sbin/heavy-install uninstall` from its source folder, as root,
+  (and puts the newest file of `replaced/` back as `heavy`). An uninstall from ci/v22 or older does not know the
+  `t3-capacity` link, so it leaves it broken: run this release's `sbin/heavy-install uninstall` from its source folder, as root,
   which removes the broken link and puts the kept copy back, or install again.
 - **Old state:** a plain-file `/usr/local/bin/heavy` (the one-line wrapper from before) is kept and put back by
   uninstall; a plain `/usr/local/bin/t3-capacity` (a host's own copy) is left alone, or with `--replace-t3-capacity`
