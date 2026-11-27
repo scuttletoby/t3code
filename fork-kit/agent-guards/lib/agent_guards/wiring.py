@@ -13,6 +13,11 @@ first checks that the hook file is there, so a missing hook fails the way its ki
   bg-guard, agent-slots, work on the machine.
   facts-hook
 
+actions-disable-guard, capacity-pipe-guard and memory-index-guard run on every Bash call, so their entries start
+the hook through agent-guards-fast (FAST) when that file is there: it passes what the hook surely passes and runs the
+hook file on the same event for everything else, from bytecode the installer wrote (agent_guards.fast). Without it
+the entry runs the hook file as before. Python starts with -S (no site: the hooks use the standard library only).
+
 The same entries go in the managed settings drop-in the installer writes (--settings) or, by hand, in any settings
 file (`agent-guards hooks`). Monitor runs shell text like Bash, so every hook that reads a command reads it for
 Monitor too.
@@ -27,6 +32,8 @@ DROP_IN = f'{MANAGED_DIR}/managed-settings.d/{DROP_IN_NAME}'
 HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard', 'bg-guard', 'agent-slots',
          'facts-hook')
 CLOSED = {'actions-disable-guard'}               # a missing or failed hook refuses
+FAST = 'agent-guards-fast'                       # the fast path (bin/agent-guards-fast), linked beside the hooks
+FAST_HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard')   # run on every Bash call
 WHAT_IS_LOST = {
     'actions-disable-guard': 'every Bash and Monitor command is refused until it is back',
     'capacity-pipe-guard': 'hook skipped, commands are NOT checked',
@@ -51,12 +58,15 @@ ENTRIES = (
 def command(hook, bin_dir=BIN, python='/usr/bin/python3'):
     """The shell command of one hook's settings entry."""
     path = f'{bin_dir}/{hook}'
+    # f: the fast path when it is there and not empty (an older install, a missing or empty file: the hook as before)
+    fast, run = ((f'f={bin_dir}/{FAST}; [ -r "$f" ] && [ -s "$f" ] || f=; ', f'{python} -IBS ${{f:+"$f"}} "$g"')
+                 if hook in FAST_HOOKS else ('', f'{python} -IB "$g"'))
     if hook in CLOSED:
         return (f'g={path}; [ -r "$g" ] && [ -s "$g" ] || {{ echo "{hook}: $g is missing or empty: {WHAT_IS_LOST[hook]}" >&2; exit 2; }}; '
-                f'{python} -IB "$g" || {{ echo "{hook}: the guard failed (exit $?): the command is refused" >&2; '
+                f'{fast}{run} || {{ echo "{hook}: the guard failed (exit $?): the command is refused" >&2; '
                 'exit 2; }')
     return (f'g={path}; [ -r "$g" ] || {{ echo "{hook}: $g is missing: {WHAT_IS_LOST[hook]}" >&2; exit 1; }}; '
-            f'exec {python} -IB "$g"')
+            f'{fast}exec {run}')
 
 
 def hooks(bin_dir=BIN, python='/usr/bin/python3'):

@@ -28,6 +28,16 @@ config.MACHINE_PATH, config.OWNER_UID = machine, int(uid)
 sys.argv = [hook] + sys.argv[5:]
 runpy.run_path(hook, run_name='__main__')
 '''
+# the same through the fast path (bin/agent-guards-fast, lib/agent_guards/fast.py), with the config set the same way
+FAST_RUNNER = '''import sys
+lib, machine, uid, hook = sys.argv[1:5]
+sys.path.insert(0, lib)
+from agent_guards import config
+config.MACHINE_PATH, config.OWNER_UID = machine, int(uid)
+from agent_guards import fast
+sys.exit(fast.main([hook] + sys.argv[5:]))
+'''
+VIA = None   # 'fast': run_hook starts every hook through the fast path (tests/fast.test.py runs suites both ways)
 # argv: a stand-in Claude Code that runs "$@" as a child (not exec: `; exit $?` after it) and nothing else
 STAND_IN = '"$@"; exit $?'
 # argv: run argv[1:] with no `claude` above it: the middle process ends at once, so the one below it is re-parented
@@ -90,8 +100,8 @@ def run_hook(name, event, machine=NO_MACHINE, env=None, cwd=None, timeout=60, ar
     stand-in Claude Code with nothing else under it (parent='claude'), or it has no `claude` above it (parent=None).
     The whole process group is killed afterwards; past `timeout` that raises subprocess.TimeoutExpired."""
     text = event if isinstance(event, str) else json.dumps(event)
-    argv = [sys.executable, '-I', '-B', '-c', RUNNER, LIB, machine, str(os.geteuid()), hook or os.path.join(BIN, name),
-            *args]
+    argv = [sys.executable, '-I', '-B', '-c', FAST_RUNNER if VIA == 'fast' else RUNNER, LIB, machine,
+            str(os.geteuid()), hook or os.path.join(BIN, name), *args]
     if parent == 'claude':
         argv, exe = ['claude', '-c', STAND_IN, 'claude', *argv], '/bin/sh'
     elif parent is None:

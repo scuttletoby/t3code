@@ -56,7 +56,9 @@ class Entries(unittest.TestCase):
                                  ('SessionStart', None, [5]), ('PreCompact', None, [5])]))
         for _e, _m, cmd in wiring.commands_in({'hooks': wiring.hooks()}):
             self.assertIn('/usr/local/bin/', cmd)
-            self.assertIn('/usr/bin/python3 -IB "$g"', cmd)
+            fast = any(f'g=/usr/local/bin/{h};' in cmd for h in wiring.FAST_HOOKS)
+            self.assertIn('/usr/bin/python3 -IBS ${f:+"$f"} "$g"' if fast else '/usr/bin/python3 -IB "$g"', cmd)
+            self.assertEqual('f=/usr/local/bin/agent-guards-fast; [ -r "$f" ] && [ -s "$f" ] || f=; ' in cmd, fast)
         self.assertTrue(wiring.ours(json.loads(wiring.drop_in_text())))
         self.assertFalse(wiring.ours({'hooks': wiring.hooks(), 'permissions': {}}))
         self.assertFalse(wiring.ours({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': '/x/other'}]}]}}))
@@ -119,6 +121,32 @@ class Entries(unittest.TestCase):
                 gone = 'is missing or empty' if hook in wiring.CLOSED else 'is missing'
                 self.assertIn(f'{hook}: {self.bin}/{hook} {gone}: {wiring.WHAT_IS_LOST[hook]}', r.stderr)
                 self.stand_in(hook)
+
+    def fast_stand_in(self, text=None):
+        """<bin>/agent-guards-fast: the fast path with the stand-ins' config (no machine file), or that text."""
+        path = os.path.join(self.bin, wiring.FAST)
+        with open(path, 'w') as f:
+            f.write(text if text is not None else
+                    f'import sys\nsys.argv[1:1] = [{fx.LIB!r}, {fx.NO_MACHINE!r}, "{os.geteuid()}"]\n' + fx.FAST_RUNNER)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+    def test_the_fast_path_answers_as_the_hook_and_is_left_out_when_it_is_not_there(self):
+        """#1094: with agent-guards-fast there, without it, and with an empty one (which would answer nothing and
+        let every call run): the same answers."""
+        cases = [('actions-disable-guard', dict(BASH, tool_input={'command': 'gh workflow disable 1 -R a/b'})),
+                 ('actions-disable-guard', BASH), ('actions-disable-guard', dict(BASH, tool_input={'command': 'make'})),
+                 ('capacity-pipe-guard', dict(BASH, tool_input={'command': 't3-capacity 1 | tail'})),
+                 ('capacity-pipe-guard', BASH), ('memory-index-guard', dict(BASH, hook_event_name='PostToolUse'))]
+        before = [(r.returncode, fx.answer(r)) for r in (self.sh(h, e) for h, e in cases)]
+        self.assertEqual([a for _c, a in before], ['refused', 'passed', 'passed', 'refused', 'passed', 'passed'])
+        for text in (None, ''):
+            self.fast_stand_in(text)
+            with self.subTest(fast='empty' if text == '' else 'there'):
+                self.assertEqual([(r.returncode, fx.answer(r)) for r in (self.sh(h, e) for h, e in cases)], before)
+        self.fast_stand_in('import sys\nprint("FAST", sys.argv[1:])\n')   # it is what runs, with the hook file
+        r = self.sh('capacity-pipe-guard', BASH)
+        self.assertEqual(r.stdout, f"FAST ['{self.bin}/capacity-pipe-guard']\n")
+        self.assertNotIn('FAST', self.sh('bg-guard', BASH).stdout)   # the other hooks do not use it
 
     def test_a_hook_that_cannot_be_read_counts_as_missing(self):
         if os.geteuid() == 0:
