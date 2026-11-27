@@ -13,10 +13,7 @@ import { isAbsolutePath } from "@t3tools/shared/path";
 
 import type { RemoteOpenHost } from "../../remoteOpen";
 
-export type ForkMarkdownFileMenuAction =
-  | "open-in-panel"
-  | "open-full-size"
-  | "copy-path-only";
+export type ForkMarkdownFileMenuAction = "open-in-panel" | "open-full-size" | "copy-path-only";
 
 export interface ForkMarkdownFileMenuInput {
   hasLine: boolean;

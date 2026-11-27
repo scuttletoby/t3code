@@ -127,6 +127,12 @@ import * as WorkspaceFolders from "../workspace/WorkspaceFolders.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as WorkspacePreviewRevisions from "../assets/WorkspacePreviewRevisions.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
+import * as FeatureFlags from "@t3tools/shared/FeatureFlags";
+import * as FeedbackStore from "../feedback/FeedbackStore.ts";
+// oxlint-disable-next-line t3code/no-layout-command-approval-writes -- an empty stand-in for the routes layer upstream's ws.test.ts builds; nothing here writes an approval.
+import * as LayoutCommandApprovalWrites from "../workspace/LayoutCommandApprovalWrites.ts";
+import * as WorkflowRuntime from "../workflows/WorkflowRuntime.ts";
+import * as Workflows from "../workflows/Workflows.ts";
 
 const assetsCreateUrlOnly = WsRpcGroup.omit(
   ...[...WsRpcGroup.requests.keys()].filter(
@@ -223,6 +229,12 @@ const layerStubbedServices = Layer.mergeAll(
   Layer.mock(TaskFolders.TaskFolders)({}),
   Layer.mock(WorkspaceFileSystem.WorkspaceFileSystem)({}),
   Layer.mock(WorktreeSetupTracker.WorktreeSetupTracker)({}),
+  // Services upstream's routes need since v0.1.14 (as in upstream's ws.test.ts).
+  Layer.mock(FeedbackStore.FeedbackStore)({}),
+  Layer.mock(LayoutCommandApprovalWrites.LayoutCommandApprovalWrites)({}),
+  Layer.mock(WorkflowRuntime.WorkflowDefinitions)({}),
+  Workflows.layerDisabled,
+  FeatureFlags.layerTest(),
 );
 
 const layerRealAssetServices = Layer.mergeAll(

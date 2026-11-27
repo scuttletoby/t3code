@@ -415,6 +415,27 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
     },
   );
 
+  // Upstream's target check (pullRequestTarget.ts) refuses a repository written with its host.
+  it.effect("a repository named with its host refuses the new wait in the target's words", () => {
+    const host = fakeHost();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+      const filePath = yield* storePath;
+      const service = yield* makeService(filePath, yield* makePrJudge());
+
+      const refused = yield* refusal(
+        service,
+        prWait({ number: 7, repository: "github.com/acme/widgets" }),
+      );
+      assert.deepStrictEqual(refused, {
+        code: "invalid",
+        message: "Pass repository as owner/repo, without the host.",
+      });
+      assert.deepStrictEqual(host.reads, []);
+    }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+  });
+
   it.effect("a missing login refuses a new wait but is only a failed read of a stored one", () => {
     const host = fakeHost();
     return Effect.gen(function* () {

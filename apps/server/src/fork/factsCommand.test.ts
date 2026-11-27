@@ -146,8 +146,9 @@ describe("factsCommand: checked again on the host that runs it", () => {
     const realLookup = (dir: string) =>
       Effect.gen(function* () {
         const real = yield* SpawnExecutableResolution;
-        return (command: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv) =>
-          real(command.replace("C:\\tools\\", `${dir}/`), platform, env)?.replace(
+        // Upstream's resolver may answer with a promise.
+        return async (command: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv) =>
+          (await real(command.replace("C:\\tools\\", `${dir}/`), platform, env))?.replace(
             `${dir}/`,
             "C:\\tools\\",
           );

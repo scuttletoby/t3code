@@ -883,7 +883,11 @@ const make = Effect.gen(function* () {
 
     if (yield* readConfigExists) {
       // Fork: what the read renames or drops is logged through the server's logger.
-      yield* logSettingsFileRead(yield* readRawConfig, managed.withDefaults, decodePersistedSettings);
+      yield* logSettingsFileRead(
+        yield* readRawConfig,
+        managed.withDefaults,
+        decodePersistedSettings,
+      );
       const file = decodeSettingsFile(yield* readRawConfig, managed);
       if (file.legacy !== undefined) {
         legacyProviders = file.legacy.providers;

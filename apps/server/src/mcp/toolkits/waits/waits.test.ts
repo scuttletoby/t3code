@@ -701,6 +701,7 @@ it.layer(NodeServices.layer)("wait tools", (it) => {
           const all = server.tools.map(({ tool }) => ({
             name: tool.name,
             description: tool.description ?? "",
+            inputSchema: tool.inputSchema, // upstream's searchable tools carry their schema
           }));
           assert.deepStrictEqual(
             all.map((tool) => tool.name),

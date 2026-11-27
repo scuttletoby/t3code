@@ -53,6 +53,7 @@ import * as RuntimeLayer from "../orchestration-v2/runtimeLayer.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ModelManifest from "../provider/ModelManifest.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -414,6 +415,12 @@ const layerRuntimeTest = Layer.mergeAll(
   Layer.provide(Layer.mock(ProjectService.ProjectService)({ getById: () => Effect.succeedNone })),
   // Upstream's runtime layer now needs task folders and the model manifest (as in its own test).
   Layer.provide(Layer.merge(layerNoTaskFolders, ModelManifest.layerTest)),
+  // And, since v0.1.14, the setup script runner (this test runs no setup script).
+  Layer.provide(
+    Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
+      runForThread: () => Effect.succeed({ status: "no-script" } as const),
+    }),
+  ),
   Layer.provide(layerPlatformTest),
 );
 

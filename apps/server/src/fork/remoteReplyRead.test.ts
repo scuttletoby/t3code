@@ -30,6 +30,7 @@ import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as PeerLinks from "../peer/PeerLinks.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 
 const box = "environment-box" as EnvironmentId;
@@ -137,12 +138,13 @@ const unreadableAnswer = {
 };
 
 /**
- * An older version's thread of 250 items, read over pages: its first page (after position -1) has
+ * An older version's thread of 250 items, read over pages: its first page (after position 0) has
  * no reply, and its last page (after position 199) has it. Any other page is not expected.
  */
 const olderPagedAnswer = (input: { readonly afterPosition?: number }) => {
   const thread = { ...olderAnswer.thread, itemCount: 250 };
-  if (input.afterPosition === -1) {
+  // Upstream's scan starts after position 0, the thread's first message, which older peers need.
+  if (input.afterPosition === 0) {
     return { ...olderAnswer, thread, items: [], nextPosition: 99, hasMore: true };
   }
   if (input.afterPosition === 199) {
@@ -249,6 +251,8 @@ const followTask = (answer: unknown, options: { readonly betaOff?: boolean } = {
               getOpenRemoteDelegatedTasks: Effect.succeed([{ parentThreadId, taskId }]),
             }),
             Layer.mock(ProjectService.ProjectService)({}),
+            // Upstream's launch reads the providers to check an agent's mode pick.
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
             Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({}),
             Layer.mock(ServerEnvironment.ServerEnvironment)({
               getEnvironmentId: Effect.succeed("environment-here" as EnvironmentId),

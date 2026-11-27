@@ -33,6 +33,7 @@ import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as PeerLinks from "../peer/PeerLinks.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 
 const box = "environment-box" as EnvironmentId;
@@ -222,6 +223,8 @@ const makeHarness = (
             forwarding,
             threads,
             Layer.mock(PeerLinks.PeerLinks)({ get: () => Effect.succeedNone }),
+            // Upstream's launch reads the providers to check an agent's mode pick.
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
             Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
             Layer.mock(ProjectService.ProjectService)({
               getById: () => Effect.succeedSome({ workspaceRoot: "/srv/app" } as never),

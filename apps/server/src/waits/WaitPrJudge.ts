@@ -56,6 +56,9 @@ function targetProblem(error: PullRequestTargetError, registering: boolean): Jud
       return remoteProblem(NO_REMOTE, registering);
     case "PullRequestUrlUnavailableError":
       return remoteProblem(NO_URL_SHAPE, registering);
+    // The wait names a repository the host cannot read as owner/repo: no later read can fix it.
+    case "PullRequestRepositoryInvalidError":
+      return permanent(error.message);
     // A wait always has repository and number and never a url, so these cannot happen.
     case "PullRequestTargetIncompleteError":
     case "PullRequestUrlInvalidError":

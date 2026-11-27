@@ -28,9 +28,7 @@ import {
   shouldUseMarkdownFileBrowserPrimaryAction,
 } from "./MarkdownFileLink.logic";
 import { reportMarkdownActionFailure } from "./markdownActionFailure";
-import {
-  useForkMarkdownFileLongPress,
-} from "./forkMarkdownFileLinkActions"; // Fork
+import { useForkMarkdownFileLongPress } from "./forkMarkdownFileLinkActions"; // Fork
 import { forkMarkdownFileMenu } from "./forkMarkdownFileLinkMenu"; // Fork
 import { WorkspaceEntryTooltip } from "./WorkspaceEntryIcon";
 
