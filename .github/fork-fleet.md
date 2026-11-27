@@ -655,12 +655,10 @@ After=network-online.target
 ExecStart=/usr/bin/python3 -I /opt/fork-fleet/fork-fleet.py --config /opt/fork-fleet/fork-fleet.json dispatch --pool vm
 Restart=always
 RestartSec=30
-# The dispatcher and its launcher need no home, no shared /tmp, no kernel modules or logs and no clock. The runners'
-# namespaces (ip netns, under /run) still reach the host: systemd's default MountFlags=shared sends them back.
-ProtectHome=yes
-PrivateTmp=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
+# The dispatcher and its launcher never set the clock. Nothing that gives the unit a mount namespace of its own
+# (ProtectHome, PrivateTmp, ProtectKernelModules, ProtectKernelLogs): the launcher makes each runner's network
+# namespace with `ip netns add`, a mount under /run/netns, and a mount made in such a unit never reaches the host,
+# so systemd could not find /run/netns/fork-fleet-USER for the job unit (NetworkNamespacePath) and no job starts.
 ProtectClock=yes
 
 [Install]
@@ -801,7 +799,10 @@ exits 75: it may or may not have run, and the next pass's `active` tells.
 
 **One dispatcher per desk pool.** Run each desk pool's dispatcher as its own
 unit (a copy of step 5's unit named `t3code-fleet-dispatcher-POOL`, with
-`dispatch --pool POOL`), never in the vm pool's unit: one dispatcher serves its
+`dispatch --pool POOL`, and with `ProtectHome=yes`, `PrivateTmp=yes`,
+`ProtectKernelModules=yes` and `ProtectKernelLogs=yes` beside `ProtectClock=yes`:
+a desk pool's launch only talks to the desk socket, so it makes no namespace the
+host must see), never in the vm pool's unit: one dispatcher serves its
 pools one after another, and a desktop that answers each verb just inside its
 time could hold a pass for minutes, so the vm pool would wait behind the least
 trusted machine. A second dispatcher for a pool that one already serves refuses
