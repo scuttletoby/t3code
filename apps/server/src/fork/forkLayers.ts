@@ -53,10 +53,9 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
 
 /**
  * In server.ts's `layerRuntimeCoreDependenciesBase`: usage pacer and history, slot gate, usage
- * refresher, handoff service (built beside upstream's idle compaction worker), run records, result
- * reminder, the stop of finished children's sessions, the `threadRoles` save check's thread
- * lookup, which every settings write reaches, the facts read's `factsCommand` runs, and the work
- * panel's shared runs read.
+ * refresher, handoff service (beside upstream's idle compaction worker), run records, result
+ * reminder, finished children's session stop, the `threadRoles` save check's thread lookup, the
+ * facts read's `factsCommand` runs, and the work panel's shared runs read.
  */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
