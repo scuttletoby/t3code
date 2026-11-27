@@ -19,14 +19,15 @@ later, for `zoneinfo`); nothing to install but the kit.
 
 ## Commands
 
-| Command                  | What                                                                                    |
-| ------------------------ | --------------------------------------------------------------------------------------- |
-| `update-policy tick`     | one tick of the restart policy; `update-policy.timer` runs it every 5 minutes, as root  |
-| `update-policy idle`     | looks only: `idle`, or one `busy:` line per reason; exit 0 idle, 75 busy (`--json` too) |
-| `update-policy baseline` | the daily check: prints only drift and alerts with it; exit 0 none, 1 drift             |
-| `update-policy booted`   | after a boot (`update-policy-boot.service`): says once that the kit's restart came back |
-| `update-policy status`   | the role, the window, a pending restart and what the last ticks saw                     |
-| `update-policy exposure` | the daily exposure check (below): prints only what needs action; exit 0 none, 1 any     |
+| Command                    | What                                                                                    |
+| -------------------------- | --------------------------------------------------------------------------------------- |
+| `update-policy tick`       | one tick of the restart policy; `update-policy.timer` runs it every 5 minutes, as root  |
+| `update-policy idle`       | looks only: `idle`, or one `busy:` line per reason; exit 0 idle, 75 busy (`--json` too) |
+| `update-policy baseline`   | the daily check: prints only drift and alerts with it; exit 0 none, 1 drift             |
+| `update-policy booted`     | after a boot (`update-policy-boot.service`): says once that the kit's restart came back |
+| `update-policy status`     | the role, the window, a pending restart and what the last ticks saw                     |
+| `update-policy exposure`   | the daily exposure check (below): prints only what needs action; exit 0 none, 1 any     |
+| `update-policy test-alert` | one test alert (`test`) through the alert channel; says which one took it; exit 0 sent  |
 
 Run them as root: they read every user's cgroups, containers and sockets. Everything they say goes to stdout,
 which is the journal under the units (`journalctl -u update-policy`).
@@ -134,7 +135,6 @@ restart is pending; `baseline` reports it).
     "timeZone": "Europe/London",
     "windowMinutes": 120,
     "retryMinutes": 15,
-    "alertCommand": ["/usr/local/bin/notify-owner", "--topic", "updates"],
     "alertOnBoot": false,
     "containerUsers": ["agent"],
     "systemDocker": true,
@@ -159,7 +159,7 @@ restart is pending; `baseline` reports it).
 | `timeZone`                | required        | an IANA name (`Europe/London`, `UTC`); the window follows its daylight saving time    |
 | `windowMinutes`           | 120             | how long the window lasts (5 to 720)                                                  |
 | `retryMinutes`            | 15              | how often it looks again while busy (5 to 240; the timer ticks every 5 minutes)       |
-| `alertCommand`            | `[]`            | a program (absolute path) and its arguments; none: alerts go only to the journal      |
+| `alertCommand`            | `[]`            | this kit's own alert command; `[]` (none): the machine's alert channel (below)        |
 | `alertOnBoot`             | `false`         | also alert `back-up` after the kit's restart                                          |
 | `containerUsers`          | `[]`            | users whose rootless Docker counts                                                    |
 | `systemDocker`            | `true`          | the system Docker's containers count                                                  |
@@ -174,9 +174,20 @@ restart is pending; `baseline` reports it).
 | `baseline.sshUsers`       | `["root"]`      | users whose ssh login from outside is checked with `sshd -T -C` (Match blocks)        |
 | `exposure.*`              |                 | the exposure check: see its section                                                   |
 
-**The alert command** gets the text on stdin and `UPDATE_POLICY_EVENT` (`restart-pending`,
-`live-restart-pending`, `restart-failed`, `apt-restarts`, `back-up`, `drift`) and `UPDATE_POLICY_HOST` in a plain
-environment; it runs as root from `/`, at most 60 seconds. Exit 0 is sent. A failure goes to the journal, fails the
+**The alert command** is the machine's [alert channel](../common/README.md#the-alert-channel) (the machine
+file's `"alert"` section, which every kit that alerts shares), unless `alertCommand` names one of this kit's own:
+that one wins, so a file from before the channel works as before. With neither, alerts go only to the journal,
+and the baseline check says so every day. `"alertCommand": []` used to mean "the journal only, on purpose"; it now
+means "use the shared channel", and there is no way to turn alerts off for this kit alone. `update-policy test-alert` (as root) sends one alert, event `test`,
+through the same command and says which one took it: run it after writing the machine file.
+
+It gets the text on stdin and `UPDATE_POLICY_EVENT` (`restart-pending`, `live-restart-pending`, `restart-failed`,
+`apt-restarts`, `back-up`, `drift`, `exposure`, `test`) and `UPDATE_POLICY_HOST` in a plain environment, with the
+channel's names of the same (`FORK_KIT_ALERT_KIT` is `update-policy`, `FORK_KIT_ALERT_EVENT`,
+`FORK_KIT_ALERT_HOST`); it runs as root from `/`, for at most the channel's `timeoutSeconds` (60 with
+`alertCommand`), and all the alerts of one run together for at most 150 s (75 s for `exposure-alert`, which runs
+under the exposure unit's 90 s stop limit), well inside the units' 5 minutes: alerts that hang still leave the tick
+time to save that they failed and to restart. An alert with nothing left of that is not sent and counts as failed. Exit 0 is sent. A failure goes to the journal, fails the
 unit, and is drift in the next baseline check until an alert goes out again. **No secrets in its arguments:**
 every user can read a running program's arguments in `/proc`. Put a token in a root-only file (mode 600) that the
 command reads; an argument that looks like one (`ghp_...`, `github_pat_...`, `sk-...`, `xox...-`, a long hex or
@@ -209,7 +220,9 @@ nothing else; exit 1 when there is any, and the alert command gets the lines (`d
   for every connection and, with `sshd -T -C user=USER,host=outside.invalid,addr=203.0.113.1`, for each of
   `sshUsers` connecting from outside, so a `Match` block that turns passwords back on is seen (no sshd: nothing
   checked);
-- no disk of `diskPaths` fuller than `diskPercent`.
+- no disk of `diskPaths` fuller than `diskPercent`;
+- the machine has an alert channel (the `"alert"` section, or `alertCommand`): without one, every alert, this
+  check's own included, goes only to the journal.
 
 A fact it cannot read is drift ("cannot read ..."), never a pass; a check that breaks is one such line, and the
 others still run.
@@ -323,12 +336,12 @@ runs as root, so the alert command can read a root-only file. It needs no secret
 
 As root, from a commit on the fork's protected `ci-release` branch (the shared
 [bootstrap](../common/bootstrap.sh) refuses anything else). Placeholders in CAPITALS. Write the machine file's
-`update-policy` section first.
+`update-policy` section (and its `"alert"` section) first.
 
 ```
 curl -fsSL https://raw.githubusercontent.com/FORK_OWNER/FORK/RELEASE_SHA/fork-kit/common/bootstrap.sh -o /root/fork-kit-bootstrap.sh
 sh /root/fork-kit-bootstrap.sh --kit update-policy --repo FORK_OWNER/FORK --sha RELEASE_SHA --timer
-update-policy status && update-policy idle; update-policy baseline
+update-policy status && update-policy idle; update-policy test-alert; update-policy baseline
 ```
 
 `--timer` takes restarts over in an order that never leaves the machine with neither policy:

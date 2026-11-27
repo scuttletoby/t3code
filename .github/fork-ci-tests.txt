@@ -122,6 +122,7 @@ fork-kit/cleaner/tests/install.test.py ~11s unittest
 fork-kit/cleaner/tests/report.test.py unittest
 fork-kit/cleaner/tests/scratch.test.py unittest
 fork-kit/cleaner/tests/worktrees.test.py ~43s unittest
+fork-kit/common/tests/alert.test.py unittest
 fork-kit/common/tests/free_contract.test.py ~6s unittest
 fork-kit/common/tests/kit_install.test.py ~125s unittest
 fork-kit/common/tests/machine_file.test.py unittest

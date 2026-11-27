@@ -7,7 +7,7 @@ the installer and shows its test then fails.
 
   python3 -I -B fork-kit/update-policy/tests/install.test.py
 """
-import json, os, shutil, sys, unittest
+import json, os, shutil, subprocess, sys, unittest
 from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -87,6 +87,18 @@ class Install(fx.FakeHost):
         self.assertEqual(self.run_main('self-check')[0], 1)
         self.assertEqual(self.install()[0], 0)                           # run again: put right
         self.assertEqual(self.run_main('self-check')[0], 0)
+
+    def test_the_installed_copy_runs_from_its_own_folder(self):
+        """Every module the command imports is in the version folder (SOURCE_FILES): the copy never reads the
+        checkout it was installed from."""
+        self.assertEqual(self.install()[0], 0)
+        current = self.path(os.readlink(self.path('/usr/local/libexec/update-policy/current')))    # versions/<sha>
+        r = subprocess.run([sys.executable, '-I', '-B', '-c',
+                            'import runpy, sys; sys.argv = ["update-policy", "--help"]; '
+                            f'runpy.run_path({os.path.join(current, "bin", "update-policy")!r}, run_name="__main__")'],
+                           capture_output=True, text=True, timeout=60, cwd=self.root, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        self.assertIn('test-alert', r.stdout)
 
     def test_runs_again_with_the_timer_and_changes_nothing(self):
         self.assertEqual(self.install('--timer')[0], 0)
