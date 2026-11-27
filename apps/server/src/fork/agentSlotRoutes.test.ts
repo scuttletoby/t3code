@@ -11,6 +11,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   type OrchestrationV2ThreadShell,
   OrchestratorMcpFailure,
+  PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   ProviderInstanceId,
   RunId,
   ScheduledTask,
@@ -108,7 +109,23 @@ interface Options {
   /** Shared across boots, so a restart test sees what the first boot started. */
   readonly started?: Array<string>;
   readonly prompts?: Array<Prompt>;
+  /** With `slots`: each list of line keys the scheduled runs ask the gate to leave, in order. */
+  readonly leaves?: Array<ReadonlyArray<string>>;
 }
+
+/** The gate `layer` builds, each list of keys it is asked to leave noted in `leaves` first. */
+const spyLeaves = <E, R>(
+  layer: Layer.Layer<SlotGate.SlotGate, E, R>,
+  leaves: Array<ReadonlyArray<string>>,
+) =>
+  Layer.effect(
+    SlotGate.SlotGate,
+    Effect.map(SlotGate.SlotGate, (gate) => ({
+      ...gate,
+      leave: (keys: ReadonlyArray<string>) =>
+        Effect.sync(() => leaves.push(keys)).pipe(Effect.andThen(gate.leave(keys))),
+    })),
+  ).pipe(Layer.provide(layer));
 
 /**
  * Upstream's scheduled task service, its scheduler's work run by hand, on the store the caller
@@ -124,6 +141,7 @@ const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Op
     const started: Array<string> = options.started ?? [];
     const prompts: Array<Prompt> = options.prompts ?? [];
     const bound = options.bound ?? { instanceId: INSTANCE, running: false };
+    const leaves = options.leaves;
     const workers = new Map<string, Effect.Effect<void>>();
     const base = Layer.mergeAll(
       NodePlatformCrypto.layer,
@@ -189,6 +207,7 @@ const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Op
             base,
             slotGateOver(options.slots, INSTANCE).pipe(
               Layer.provide(Layer.mergeAll(settings, NodeServices.layer)),
+              (gateLayer) => (leaves === undefined ? gateLayer : spyLeaves(gateLayer, leaves)),
             ),
           );
     return yield* Effect.gen(function* () {
@@ -1770,6 +1789,138 @@ describe("a scheduled run or webhook delivery that waits keeps its place in the 
             yield* settle;
             yield* notesWorker;
             assert.deepEqual(yield* lineOf(gate), []);
+          }),
+        { slots },
+      );
+    },
+  );
+
+  it.effect(
+    "a stored delivery's worker frees its own place, not one stored for a new task with its id (#941)",
+    () => {
+      const slots = slotWorld([BUSY]);
+      const leaves: Array<ReadonlyArray<string>> = [];
+      return withService(
+        ({ service, sql, started, prompts, webhookWorker, gate }) =>
+          Effect.gen(function* () {
+            yield* TestClock.setTime(START);
+            const { task } = yield* service.upsert(
+              yield* taskInput({ schedule: { type: "webhook" } }),
+            );
+            const first = yield* service.triggerWebhook(webhookRequest(task));
+            if (first._tag !== "accepted") return assert.fail(`not accepted: ${first._tag}`);
+            // Refused and stored; its worker takes it and waits in its place.
+            yield* settle;
+            yield* workerRounds(webhookWorker, 1);
+            assert.deepEqual(yield* lineOf(gate), [`webhook-delivery:${first.deliveryId}`]);
+            // While it waits, its task is deleted and a new one saved with the same id. A delivery
+            // for the new task is stored with its own place in line: put in by hand here, as one
+            // that comes in as the first one's run ends (until then the id counts as running).
+            yield* service.delete({ id: task.id } as never);
+            yield* TestClock.adjust("1 second");
+            const { task: again } = yield* service.upsert(
+              yield* taskInput({
+                id: task.id,
+                prompt: "Review the new task's pull requests.",
+                schedule: { type: "webhook" },
+              }),
+            );
+            const second = "delivery:new-task";
+            const request = JSON.stringify({
+              method: "POST",
+              path: `/api/hooks/${again.id}`,
+              query: "",
+              headers: { "content-type": "application/json" },
+              bodyText: "{}",
+            });
+            yield* sql`INSERT INTO scheduled_task_webhook_pending
+              (delivery_id, task_id, coalesce_key, due_at, state, task_json, request_json, delivery_ids_json)
+              VALUES (${second}, ${again.id}, '', ${yield* Clock.currentTimeMillis}, 'dispatching',
+                ${JSON.stringify(again)}, ${request}, json_array(${second}))`;
+            const asked = yield* Option.getOrThrow(gate).acquire({
+              callerThreadId: null,
+              targetInstanceId: INSTANCE,
+              intoThreadId: undefined,
+              place: { key: `webhook-delivery:${second}` },
+            });
+            assert.equal(asked.type, "refuse");
+            assert.deepEqual(yield* lineOf(gate), [
+              `webhook-delivery:${first.deliveryId}`,
+              `webhook-delivery:${second}`,
+            ]);
+            // The first delivery's wait sees its task gone and ends; its worker frees its own
+            // place only, never the place of the delivery stored after it.
+            leaves.length = 0;
+            yield* TestClock.adjust(AgentSlotRoutes.WEBHOOK_SLOT_RETRY);
+            yield* settle;
+            assert.notInclude(leaves.flat(), `webhook-delivery:${second}`);
+            assert.include(leaves.flat(), `webhook-delivery:${first.deliveryId}`);
+            assert.deepEqual(yield* lineOf(gate), [`webhook-delivery:${second}`]);
+            // The second delivery runs once, on the new task, when a slot frees.
+            slots.running = [];
+            yield* until(() => started.length === 1, "the new task's delivery started");
+            assert.include(prompts[0]?.text ?? "", "Review the new task's pull requests.");
+            yield* workerRounds(webhookWorker, 2);
+            assert.lengthOf(started, 1);
+          }),
+        { slots, leaves },
+      );
+    },
+  );
+
+  /** How the worker removes a stored delivery before its run, set up after it was stored. */
+  const REMOVED_BEFORE_RUN = [
+    {
+      name: "payload not prepared",
+      error: "The pending webhook payload could not be prepared.",
+      spoil: (harness: Harness, task: ScheduledTask, deliveryId: string) =>
+        harness.sql`UPDATE scheduled_task_webhook_pending SET request_json = 'not json'
+          WHERE delivery_id = ${deliveryId} AND task_id = ${task.id}`.pipe(Effect.asVoid),
+    },
+    {
+      name: "prompt too long",
+      error: "The filled-in prompt is too long.",
+      // The owner saves a prompt too long to send while it waits: the worker renders that one.
+      spoil: (harness: Harness, task: ScheduledTask) =>
+        harness.service
+          .upsert({ ...task, prompt: "x".repeat(PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1) } as never)
+          .pipe(Effect.asVoid),
+    },
+  ] as const;
+
+  it.effect.each(REMOVED_BEFORE_RUN)(
+    "$name: a stored delivery its worker removes before its run leaves its place at once (#941)",
+    ({ spoil, error }) => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        (harness) =>
+          Effect.gen(function* () {
+            const { service, sql, started, webhookWorker, gate } = harness;
+            yield* TestClock.setTime(START);
+            const { task } = yield* service.upsert(
+              yield* taskInput({ schedule: { type: "webhook" } }),
+            );
+            const accepted = yield* service.triggerWebhook(webhookRequest(task));
+            if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
+            yield* settle;
+            // Refused and stored: its place from that ask waits for the worker.
+            assert.deepEqual(yield* lineOf(gate), [`webhook-delivery:${accepted.deliveryId}`]);
+            yield* spoil(harness, task, accepted.deliveryId);
+            // The worker removes it without a run; its place goes with it, not at the sweep
+            // (no sweep runs here).
+            yield* webhookWorker;
+            yield* settle;
+            assert.deepEqual(yield* pendingStates(sql, task.id), []);
+            const [ended] = yield* sql<{ outcome: string; error: string | null }>`
+              SELECT outcome, error FROM scheduled_task_webhook_deliveries
+              WHERE delivery_id = ${accepted.deliveryId}`;
+            assert.equal(ended?.outcome, "dispatch_failed");
+            assert.include(ended?.error ?? "", error);
+            assert.deepEqual(yield* lineOf(gate), []);
+            // A start that asks next takes the slot as it frees: nothing ended holds it back.
+            slots.running = [];
+            assert.equal((yield* laterWaiter(gate)).type, "allow");
+            assert.deepEqual(started, []);
           }),
         { slots },
       );
