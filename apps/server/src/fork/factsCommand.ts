@@ -1,7 +1,7 @@
 /**
- * Fork (placement row P4, the runner's checks): runs `placement.factsCommand` on the
- * machine whose settings name it. P4 wires it into this machine's facts read and adds the example
- * scripts; nothing calls it before that. Threat notes: docs/fork/README.md, `server.placement`.
+ * Fork (placement row P4): runs `placement.factsCommand` on the machine whose settings name it, for
+ * that machine's facts read (`environmentFacts.ts`). Threat notes: docs/fork/README.md,
+ * `server.placement`; example scripts: fork-kit/placement-facts.
  */
 import {
   canonicalPlacementLabels,
@@ -10,8 +10,11 @@ import {
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import * as Cache from "effect/Cache";
+import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import * as ProcessRunner from "../processRunner.ts";
@@ -136,3 +139,34 @@ export const runFactsCommand = Effect.fn("FactsCommand.run")(function* (factsCom
     labels: labels.slice(0, FACTS_COMMAND_LABELS_MAX),
   } satisfies FactsCommandResult;
 });
+
+/** One answer serves every facts read in this window: senders ask each machine per placed task. */
+export const FACTS_COMMAND_CACHE_TTL = Duration.seconds(15);
+
+/**
+ * This server's `factsCommand` runs: one run per command at a time, its answer kept for
+ * {@link FACTS_COMMAND_CACHE_TTL}. A run every reader stops waiting for is stopped and kept by none.
+ */
+export class FactsCommands extends Context.Service<
+  FactsCommands,
+  { readonly run: (factsCommand: string) => Effect.Effect<FactsCommandResult> }
+>()("t3/fork/factsCommand/FactsCommands") {}
+
+/** Its span shows a boot built it (holdWork.boot.test.ts); without it every read says "no process runner". */
+export const make = Effect.gen(function* () {
+  const runner = yield* ProcessRunner.ProcessRunner;
+  const cache = yield* Cache.make({
+    capacity: 4,
+    timeToLive: FACTS_COMMAND_CACHE_TTL,
+    lookup: (factsCommand: string) =>
+      runFactsCommand(factsCommand).pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, runner),
+      ),
+  });
+  return FactsCommands.of({
+    run: Effect.fn("FactsCommands.run")((factsCommand: string) => Cache.get(cache, factsCommand)),
+  });
+}).pipe(Effect.withSpan("FactsCommands.make"));
+
+/** Needs a process spawner; in `forkLayers.layerRuntimeServices`. */
+export const layer = Layer.effect(FactsCommands, make).pipe(Layer.provide(ProcessRunner.layer));

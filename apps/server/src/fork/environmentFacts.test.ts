@@ -1,5 +1,5 @@
 /**
- * Fork (placement design row P3, facts out): `t3_environment_read` on this machine returns
+ * Fork (placement design rows P3 and P4, facts out): `t3_environment_read` on this machine returns
  * `hostResources` (an upstream pull request's field) and the fork's `placement`, through upstream's real
  * environment handlers. A linked machine's read is in `environmentFacts.linked.test.ts`.
  */
@@ -11,6 +11,7 @@ import {
   ServerSettings,
   ThreadId,
 } from "@t3tools/contracts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -32,6 +33,7 @@ import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as Settings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as EnvironmentFacts from "./environmentFacts.ts";
+import { type FactsCommandResult, FactsCommands } from "./factsCommand.ts";
 
 const environmentId = EnvironmentId.make("environment:facts");
 const threadId = ThreadId.make("thread:facts");
@@ -65,6 +67,8 @@ interface World {
    * read it (upstream's read fails the whole call when its own settings read fails).
    */
   readonly settings?: ServerSettings | "unreadable";
+  /** This server's `factsCommand` runs; `"missing"`: no runner here. Default: never asked. */
+  readonly facts?: ((factsCommand: string) => Effect.Effect<FactsCommandResult>) | "missing";
 }
 
 const settingsGoneAfterFirstRead = () => {
@@ -117,6 +121,11 @@ const layerWorld = (world: World) =>
     world.usage === "missing"
       ? Layer.empty
       : Layer.mock(SlotGate.SlotGate)({ usage: world.usage ?? Effect.succeed(usageOf(1)) }),
+    world.facts === "missing"
+      ? Layer.empty
+      : Layer.mock(FactsCommands)({
+          run: world.facts ?? (() => Effect.die("factsCommand runs only when one is set")),
+        }),
   );
 
 /** Calls the tool as the MCP server does: the handler's result, then its JSON encoding. */
@@ -299,5 +308,138 @@ it.effect("this machine's read says how to link a file on it from another enviro
     const result = yield* readFacts({});
     expect(result.fileLinks).toBe(ENVIRONMENT_FILE_LINK_AGENT_HINT);
     expect(result.fileLinks).toContain("/t3-environment/<environmentId>/<absolute path>");
+  }),
+);
+
+const withPlacement = (placement: Record<string, unknown>) =>
+  fromFile({ agentSlots: { enabled: true, maxPerMachine: 3, minFreeMemoryMb: 512 }, placement });
+
+it.effect("labels are this machine's setting and its factsCommand's lines, canonical", () =>
+  Effect.gen(function* () {
+    const asked: Array<string> = [];
+    const { placement } = yield* readFacts({
+      settings: withPlacement({ labels: ["owner-logins", "GPU"], factsCommand: "/opt/facts" }),
+      facts: (command) =>
+        Effect.sync(() => {
+          asked.push(command);
+          return { available: true, labels: ["gpu", "ci-runner"] };
+        }),
+    });
+    expect(asked).toEqual(["/opt/facts"]);
+    expect(placement).toEqual({
+      labels: ["owner-logins", "gpu", "ci-runner"],
+      available: true,
+      runningAgents: 1,
+      slotsFree: 2,
+      memoryFloorMb: 512,
+      freeMemoryMb: 4096,
+      factsAt: 0,
+    });
+  }),
+);
+
+it.effect("no factsCommand set: the labels alone, nothing runs, even with no runner here", () =>
+  Effect.gen(function* () {
+    const settings = withPlacement({ labels: ["gpu"] });
+    for (const facts of [undefined, "missing"] as const) {
+      const { placement } = yield* readFacts({ settings, ...(facts ? { facts } : {}) });
+      expect(placement).toMatchObject({ labels: ["gpu"], available: true, slotsFree: 2 });
+      expect(placement).not.toHaveProperty("reason");
+    }
+  }),
+);
+
+it.effect("a factsCommand that says busy makes the machine not available, with its reason", () =>
+  Effect.gen(function* () {
+    const { placement } = yield* readFacts({
+      settings: withPlacement({ labels: ["gpu"], factsCommand: "/opt/facts" }),
+      facts: () =>
+        Effect.succeed({ available: false, reason: "factsCommand exited with code 1: in a game" }),
+    });
+    // The slot counts stay: they are still true; only the answer changes.
+    expect(placement).toEqual({
+      labels: ["gpu"],
+      available: false,
+      reason: "factsCommand exited with code 1: in a game",
+      runningAgents: 1,
+      slotsFree: 2,
+      memoryFloorMb: 512,
+      freeMemoryMb: 4096,
+      factsAt: 0,
+    });
+  }),
+);
+
+it.effect("a full machine whose factsCommand also says no keeps both reasons, slots first", () =>
+  Effect.gen(function* () {
+    const { placement } = yield* readFacts({
+      settings: withPlacement({ factsCommand: "/opt/facts" }),
+      usage: Effect.succeed(usageOf(3)),
+      facts: () => Effect.succeed({ available: false, reason: "factsCommand did not answer" }),
+    });
+    expect(placement).toMatchObject({
+      available: false,
+      reason: `${EnvironmentFacts.REASON_FULL} factsCommand did not answer`,
+      slotsFree: 0,
+    });
+  }),
+);
+
+it.effect("slots off, factsCommand says no: not available, the command's reason", () =>
+  Effect.gen(function* () {
+    const { placement } = yield* readFacts({
+      settings: fromFile({ placement: { factsCommand: "/opt/facts" } }),
+      usage: Effect.die("not asked"),
+      facts: () => Effect.succeed({ available: false, reason: "factsCommand exited with code 2" }),
+    });
+    expect(placement).toEqual({
+      labels: [],
+      available: false,
+      reason: "factsCommand exited with code 2",
+      factsAt: 0,
+    });
+  }),
+);
+
+it.effect("a factsCommand with no runner here, or a run that dies, is never free", () =>
+  Effect.gen(function* () {
+    const settings = withPlacement({ labels: ["gpu"], factsCommand: "/opt/facts" });
+    const missing = yield* readFacts({ settings, facts: "missing" });
+    expect(missing.placement).toMatchObject({
+      labels: ["gpu"],
+      available: false,
+      reason: EnvironmentFacts.REASON_FACTS_RUNNER_MISSING,
+    });
+    const died = yield* readFacts({ settings, facts: () => Effect.die("spawn crashed") });
+    expect(died.placement).toMatchObject({
+      labels: [],
+      available: false,
+      reason: EnvironmentFacts.REASON_FACTS_UNREAD,
+      slotsFree: 2,
+    });
+  }),
+);
+
+it.effect(
+  "a factsCommand this OS cannot run is not available with the problem; it never runs",
+  () =>
+    Effect.gen(function* () {
+      const { placement } = yield* readFacts({
+        settings: withPlacement({ labels: ["gpu"], factsCommand: "C:\\tools\\facts.exe" }),
+      }).pipe(Effect.provideService(HostProcess.Platform, "linux"));
+      expect(placement).toMatchObject({ labels: [], available: false, slotsFree: 2 });
+      expect(placement?.reason).toMatch(
+        /^This machine's placement setting is not valid on it, so it reads as not available: .*factsCommand/u,
+      );
+    }),
+);
+
+it.effect("a placement setting the file could not read is not available, never free", () =>
+  Effect.gen(function* () {
+    const { placement } = yield* readFacts({
+      settings: withPlacement({ labels: ["gpu"], mode: "sometimes" }),
+    });
+    expect(placement).toMatchObject({ labels: [], available: false });
+    expect(placement?.reason).toContain("placement setting is not valid");
   }),
 );

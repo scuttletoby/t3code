@@ -161,6 +161,7 @@ fork-kit/pc-agents/tests/check.test.py ~32s unittest
 fork-kit/pc-agents/tests/linux.test.py ~60s unittest
 fork-kit/pc-agents/tests/setup.test.py ~153s unittest
 fork-kit/pc-agents/tests/update.test.py ~66s unittest
+fork-kit/placement-facts/tests/scripts.test.py unittest
 fork-kit/review/tests/comments.test.py unittest
 fork-kit/review/tests/eval.test.py unittest
 fork-kit/review/tests/plan.test.py unittest

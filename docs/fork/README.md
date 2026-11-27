@@ -542,9 +542,9 @@ saves them; they are not the setting's default, so a file without rows keeps mea
 
 ### `server.placement`
 
-What this machine has, and how it places delegated work on linked machines. Only the settings are in
-the fork so far; nothing reads them yet (later placement rows add the facts, the rules and the
-wiring). Fields, each with its default:
+What this machine has, and how it places delegated work on linked machines. This machine's facts
+read (`t3_environment_read`, below) reads `labels` and runs `factsCommand`; the placing rows add
+the rest. Fields, each with its default:
 
 - `mode`: `off` (an agent picks a machine as upstream's do), `advise` or `enforce`.
 - `labels`: `[]`. What this machine has, as free words (`"gpu"`, `"ci-runner"`, `"owner-logins"`):
@@ -564,7 +564,9 @@ wiring). Fields, each with its default:
   refuses every `factsCommand`: its lookup would try `facts.exe` plus each PATHEXT ending, so a
   `facts.exe.CMD` planted after the check could run through a shell. A failed run's reason is the
   first line of its error output, else of its output. The runner is in the fork
-  (`apps/server/src/fork/factsCommand.ts`); placement row P4 wires it into the facts read.
+  (`apps/server/src/fork/factsCommand.ts`); one run serves every facts read for 15 seconds (reads
+  at the same time share it). Example programs for Linux, macOS and Windows:
+  [fork-kit/placement-facts](../../fork-kit/placement-facts/README.md).
 - `never`: `[]`. Label groups that must not meet on one machine, such as
   `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
   lower-casing (`["GPU", "gpu"]` is one label, so not a group).
@@ -1490,14 +1492,18 @@ upstream's, for this machine and for a linked one (the read is forwarded there a
   the fork adds no lines to those files (its tests are in fork test files instead), and the tool's
   dependency on the sampler (the fork's file finds it, and the slot gate, without one, so no
   upstream test needs a new mock).
-- `placement`: `labels` (facts typed once in that machine's Settings, such as owner logins; no
-  setting holds them yet, so they are empty until placement row P2 adds it), `available` and
-  `reason`, and, from the agent slot gate's own status read (the one `wait_list` shows):
+- `placement`: `labels` (that machine's `placement.labels`, then each line its `factsCommand`
+  printed, trimmed, lower-cased and without repeats), `available` and `reason`, and, from the
+  agent slot gate's own status read (the one `wait_list` shows):
   `runningAgents` (running, starting or holding a slot), `slotsFree` (`null`: no machine limit),
   `memoryFloorMb` (`agentSlots.minFreeMemoryMb`, `null`: none) and `freeMemoryMb`. `factsAt` is
   when they were read. `available` is `false` when every machine slot is in use or free memory is
-  below the floor. With `agentSlots` off it is `true`, with a reason and no counts: the machine sets
-  no limit and does not count its agents.
+  below the floor, or when the machine's own word is no: its `factsCommand` said not available
+  (row P4; a non-zero exit, no answer within 5 seconds, or no process runner on that server), or
+  its `placement` setting is not valid there (then `labels` is empty too). Each "no" keeps its
+  reason, the slot gate's first; the counts stay. With `agentSlots` off it is `true`, with a
+  reason and no counts: the machine sets no limit and does not count its agents. With no
+  `factsCommand` set, only the slots decide.
 
 When the slot gate cannot be read (its count read fails or takes longer than its own limit, the
 gate is not running, or the settings cannot be read), `placement` says `available: false` with a
@@ -1506,7 +1512,13 @@ older T3 leaves both fields out, which means "no facts", never a failed read. Th
 own limit (2 seconds), and it and the slot count are read at the same time. With agent slots off, a
 slow sampler leaves out `hostResources` without delaying `placement`. With them on, the gate's own
 count reads the same sample for its memory floor, so a hung sampler also gives `placement` "not
-available" (the gate could not count) after 6 seconds, the same answer the gate gives at launch. Facts are never stored: each read measures again.
+available" (the gate could not count) after 6 seconds, the same answer the gate gives at launch. Facts are never stored: each read measures again, except a `factsCommand` answer, which is kept
+in memory for 15 seconds (a restart forgets it, and a run every reader stopped waiting for is
+stopped and kept by none). `factsAt` is the time of the read, so a cached `factsCommand` answer
+in it can be up to about 15 seconds older. A slow `factsCommand` delays the read by up to its 5
+seconds, or about 6 for a program that ignores the stop (it is killed one second after it); it
+runs beside the slot and host reads. Its answer is read when its output closes, so a program that
+leaves a background child holding the output reads "did not answer within 5 seconds".
 The gate's status read does its own clean-up first (it drops used-up slot holds of waits, the same
 step `wait_list` runs); the facts read gives that status read at most 6 seconds (the gate's own
 count limit plus one), so a read can take that long on a busy machine, and it changes nothing but
