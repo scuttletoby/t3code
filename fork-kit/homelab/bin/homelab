@@ -1,0 +1,8 @@
+#!/usr/bin/python3 -IB
+"""homelab: the homelab kit (lib/homelabkit). Checks the home lab's machines and leases shared test machines.
+-I: no environment variable, user site folder or current folder changes what Python loads. The code is loaded
+only from this file's real folder."""
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from homelabkit import main  # noqa: E402
+sys.exit(main.main(sys.argv[1:]))

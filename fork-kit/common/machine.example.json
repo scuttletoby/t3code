@@ -199,6 +199,18 @@
       ]
     }
   },
+  "homelab": {
+    "machines": [
+      { "name": "test-a", "host": "test-a.lan.example", "port": 22, "note": "shared test machine" },
+      { "name": "test-b", "host": "192.0.2.20" }
+    ],
+    "leases": {
+      "dir": "/var/lib/fork-kit/homelab/leases",
+      "defaultMinutes": 60,
+      "maxMinutes": 480
+    },
+    "checkTimeoutSeconds": 3
+  },
   "desk": {
     "pool": "pc",
     "host": "fleet-host.example",
