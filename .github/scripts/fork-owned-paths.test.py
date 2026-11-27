@@ -268,6 +268,13 @@ check("workflow: the step runs the script into the job's outputs",
 sparse = changes["steps"][0]["with"]["sparse-checkout"].split()
 check("workflow: `changes` checks out the list and the script",
       {"/.github/fork-owned-paths.txt", "/.github/scripts/fork-owned-paths.cjs", "/.github/scripts/ci-changes.cjs"} <= set(sparse))
+# The script reads the workspace (pnpm-workspace.yaml and each package's package.json) to narrow a partly fork-owned
+# change, here and in this test, which runs in the `workflows` job: both checkouts must hold those files.
+WORKSPACE = {"/pnpm-workspace.yaml", "/*/package.json", "/*/*/package.json"}
+check("workflow: `changes` checks out the workspace the script narrows with", WORKSPACE <= set(sparse), str(sparse))
+tests_sparse = jobs["workflows"]["steps"][0]["with"]["sparse-checkout"].split()
+check("workflow: `workflows`, which runs this test, checks out that workspace too", WORKSPACE <= set(tests_sparse),
+      str(sorted(WORKSPACE - set(tests_sparse))))
 
 
 def ctx(event, release=False, fork_only_out=None, detect=None, status="success", base="main"):
