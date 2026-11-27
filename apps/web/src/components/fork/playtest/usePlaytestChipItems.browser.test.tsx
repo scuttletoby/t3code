@@ -16,6 +16,8 @@ const state = vi.hoisted(() => ({
   end: vi.fn(),
   toast: vi.fn(),
   canOperate: true,
+  readFails: false,
+  endAnswer: null as unknown,
 }));
 
 vi.mock(import("../../../state/session"), async (original) => ({
@@ -37,10 +39,12 @@ vi.mock(import("./playtestApi"), () => ({
   onPrimaryEnvironment: () => true,
   readPlaytestSession: ((ref: ScopedThreadRef) => {
     state.read(ref);
-    return Promise.resolve(state.session);
+    // A failed call is "not known", as the real read answers it.
+    return Promise.resolve(state.readFails ? undefined : state.session);
   }) as never,
   endPlaytest: ((ref: ScopedThreadRef) => {
     state.end(ref);
+    if (state.endAnswer !== null) return Promise.resolve(state.endAnswer);
     // The server ends it; the next read finds none.
     const ended = state.session === null ? null : { ...state.session, state: "ended" as const };
     state.session = null;
@@ -52,7 +56,8 @@ vi.mock(import("./playtestApi"), () => ({
   }) as never,
 }));
 
-const { useForkPlaytestItems, playtestChipItem } = await import("./usePlaytestChipItems");
+const { useForkPlaytestItems, playtestChipItem, nextChipRead } =
+  await import("./usePlaytestChipItems");
 
 /** Well under the 10 s poll: the chip must go on the re-read, not on the next poll. */
 const QUICKER_THAN_POLL = 2_000;
@@ -176,5 +181,60 @@ describe("playtest chip (F5)", () => {
     const title = screen.getByText("Playtest ending: staging");
     await expect.element(title).toHaveAccessibleDescription("try the new jump · 3 rounds so far");
     state.session = null;
+  });
+
+  it("a read that fails keeps the chip and its End, and the next good read decides", async () => {
+    try {
+      state.updatedAt = "2026-11-27T15:00:00.000Z";
+      state.session = session();
+      state.read.mockClear();
+      await using screen = await render(<Chip threadRef={REF} />, { router: false });
+      await expect.element(screen.getByText("Playtest on: staging")).toBeVisible();
+
+      state.readFails = true;
+      state.updatedAt = "2026-11-27T15:01:00.000Z";
+      await screen.rerender(<Chip threadRef={REF} />);
+      await vi.waitFor(() => expect(state.read).toHaveBeenCalledTimes(2));
+      await expect.element(screen.getByRole("button", { name: "End" })).toBeVisible();
+
+      state.readFails = false;
+      state.session = null;
+      state.updatedAt = "2026-11-27T15:02:00.000Z";
+      await screen.rerender(<Chip threadRef={REF} />);
+      await expect
+        .element(screen.getByText("Playtest on: staging"), { timeout: QUICKER_THAN_POLL })
+        .not.toBeInTheDocument();
+    } finally {
+      state.readFails = false;
+    }
+  });
+
+  it("keeps polling through failed reads while it may, and a good read decides", () => {
+    const shown = session();
+    expect(nextChipRead(undefined, 0)).toEqual({ kind: "keep", failed: 1, poll: true });
+    expect(nextChipRead(undefined, 4)).toEqual({ kind: "keep", failed: 5, poll: true });
+    // Six in a row: the poll rests until the thread changes; the chip stays as it was.
+    expect(nextChipRead(undefined, 5)).toEqual({ kind: "keep", failed: 6, poll: false });
+    expect(nextChipRead(null, 3)).toEqual({ kind: "set", session: null, poll: false });
+    expect(nextChipRead(shown, 3)).toEqual({ kind: "set", session: shown, poll: true });
+  });
+
+  it("End whose release could not start says the target was not released", async () => {
+    state.updatedAt = "2026-11-27T16:00:00.000Z";
+    state.session = session();
+    state.endAnswer = { outcome: "ended-unreleased", session: null };
+    state.toast.mockClear();
+    try {
+      await using screen = await render(<Chip threadRef={REF} />, { router: false });
+      await userEvent.click(screen.getByRole("button", { name: "End" }));
+      await vi.waitFor(() =>
+        expect(state.toast).toHaveBeenCalledWith(
+          expect.objectContaining({ title: "Playtest ended, target not released" }),
+        ),
+      );
+    } finally {
+      state.endAnswer = null;
+      state.session = null;
+    }
   });
 });

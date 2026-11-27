@@ -144,8 +144,11 @@ agent's note and how many rounds ran.
 
 The chip goes when the session ends any other way (the agent's `end`, idle, time limit, claim gone,
 thread gone). It is read again whenever the thread changes and every 10 seconds while it shows.
-A read that fails, an older server without the chip's routes, or a thread on another environment
-than the app's own server shows no chip. The routes are `GET /api/fork/playtest/state?threadId=`
+A read that fails keeps the chip as it was and reads again (up to six
+failures in a row, then at the thread's next change); an older server without the chip's
+routes, or a thread on another environment than the app's own server, shows no chip. An End whose
+release could not even start says so: the session ended, but T3 did not give the target back (its
+claim expires by itself). The routes are `GET /api/fork/playtest/state?threadId=`
 (read scope) and `POST /api/fork/playtest/end` with `{ "threadId": … }` (operate scope). They send only
 what the chip shows: no worktree, no step output and no problem text, just whether a release has
 failed.

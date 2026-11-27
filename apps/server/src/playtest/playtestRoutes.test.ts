@@ -176,4 +176,19 @@ describe("playtest chip routes (F5)", () => {
       ]);
     }),
   );
+
+  it("says a release failed only for a release's own problem", () => {
+    const ending = (problem: string) =>
+      chipSessionOf({ ...session("thread-a", "ending"), running: "release", problem })
+        .releaseProblem;
+    // A renew problem kept from before End, or a failed claim's: the first release still runs.
+    expect(ending("renew: exit 1")).toBe(false);
+    expect(ending("claim: boom")).toBe(false);
+    expect(ending("release: exit 1")).toBe(true);
+    // Not ending: no release has run yet, whatever the problem says.
+    expect(
+      chipSessionOf({ ...session("thread-a", "active"), problem: "release: exit 1" })
+        .releaseProblem,
+    ).toBe(false);
+  });
 });

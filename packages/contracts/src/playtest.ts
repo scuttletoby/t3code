@@ -476,11 +476,18 @@ export const PlaytestRouteState = Schema.Struct({ session: Schema.NullOr(Playtes
 export type PlaytestRouteState = typeof PlaytestRouteState.Type;
 
 /**
- * What a press of End did: as the tool's `end` (`ended`, `nothing-to-end`, `release-failed`), or
- * `unavailable` when T3 could not try (its playtest file cannot be read now), with why.
+ * What a press of End did: as the tool's `end` (`ended`, `nothing-to-end`, `release-failed`),
+ * `ended-unreleased` when it ended but its release could not even start (the claim expires on the
+ * target by itself), or `unavailable` when T3 could not try (its playtest file cannot be read now).
  */
 export const PlaytestRouteEndAnswer = Schema.Struct({
-  outcome: Schema.Literals(["ended", "nothing-to-end", "release-failed", "unavailable"]),
+  outcome: Schema.Literals([
+    "ended",
+    "ended-unreleased",
+    "nothing-to-end",
+    "release-failed",
+    "unavailable",
+  ]),
   session: Schema.NullOr(PlaytestChipSession),
   message: Schema.optionalKey(Schema.String),
 });

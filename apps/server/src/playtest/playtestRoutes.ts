@@ -22,7 +22,12 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import { Playtest } from "./PlaytestLayer.ts";
-import type { PlaytestService, PlaytestSessionView } from "./PlaytestService.ts";
+import {
+  type PlaytestService,
+  type PlaytestSessionView,
+  RELEASE_COULD_NOT_RUN,
+  RELEASE_PROBLEM,
+} from "./PlaytestService.ts";
 
 const noStore = { headers: { "cache-control": "no-store" } };
 const decodeThreadId = Schema.decodeUnknownOption(ThreadId);
@@ -67,7 +72,9 @@ export function chipSessionOf(session: PlaytestSessionView): PlaytestChipSession
       ? {}
       : { lastRound: { number: round.number, state: round.state, step: round.step } }),
     ...(session.running === undefined ? {} : { running: session.running }),
-    releaseProblem: session.state === "ending" && session.problem !== undefined,
+    // Only a failed release: a renew or claim problem left from before End is not one.
+    releaseProblem:
+      session.state === "ending" && (session.problem?.startsWith(RELEASE_PROBLEM) ?? false),
   };
 }
 
@@ -110,7 +117,12 @@ export const handleEnd = Effect.fn("fork.playtest.end")(function* (
   if (Option.isNone(body)) return badRequest();
   const answer = yield* playtest.end({ threadId: body.value.threadId, reason: "person" }).pipe(
     Effect.map((result): PlaytestRouteEndAnswer => ({
-      outcome: result.outcome,
+      // Ended, but its release could not even start: T3 did not give the target back.
+      outcome:
+        result.outcome === "ended" &&
+        (result.session?.problem?.startsWith(RELEASE_COULD_NOT_RUN) ?? false)
+          ? "ended-unreleased"
+          : result.outcome,
       session: result.session === null ? null : chipSessionOf(result.session),
     })),
     Effect.catchCauseIf(

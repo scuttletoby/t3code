@@ -14,6 +14,7 @@ import {
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/http";
 
@@ -27,6 +28,7 @@ import {
   OTHER_THREAD,
   ran,
   settingsWith,
+  step,
   THREAD,
 } from "./PlaytestService.testkit.ts";
 
@@ -103,6 +105,50 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
           assert.isNotNull(((yield* state(OTHER_THREAD)) as { session: unknown }).session);
           yield* service.end({ threadId: OTHER_THREAD, reason: "agent" });
           assert.deepStrictEqual(yield* state(OTHER_THREAD), { session: null });
+        }),
+      ),
+    );
+
+    it.live("End whose release cannot start says the target was not released", () =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          const fs = yield* FileSystem.FileSystem;
+          const releaseProgram = `${fx.root}/release.sh`;
+          yield* fs.copyFile(fx.script, releaseProgram);
+          yield* fs.chmod(releaseProgram, 0o755);
+          const service = yield* makeService(
+            fx,
+            yield* settingsWith(
+              adapter(fx, dir, { release: { ...step(fx, dir), argv: [releaseProgram, dir] } }),
+            ),
+          );
+          const client = Context.get(
+            yield* Layer.build(
+              HttpRouter.serve(
+                HttpRouter.add("POST", PLAYTEST_END_PATH, handleEnd(auth, service)),
+                { disableListenLog: true, disableLogger: true },
+              ).pipe(Layer.provideMerge(NodeHttpServer.layerTest)),
+            ),
+            HttpClient.HttpClient,
+          );
+          yield* service.start({ threadId: THREAD, target: "dev-1", note: "" });
+          // The adapter's release program went away after the session started.
+          yield* fs.remove(releaseProgram);
+
+          const answer = yield* client
+            .execute(
+              HttpClientRequest.post(PLAYTEST_END_PATH).pipe(
+                HttpClientRequest.bodyText(
+                  JSON.stringify({ threadId: THREAD }),
+                  "application/json",
+                ),
+              ),
+            )
+            .pipe(Effect.flatMap((response) => response.json));
+          assert.deepInclude(answer, { outcome: "ended-unreleased" });
+          assert.notInclude(yield* ran(dir), "release:0");
         }),
       ),
     );

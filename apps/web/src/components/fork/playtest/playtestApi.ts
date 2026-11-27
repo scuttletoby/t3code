@@ -47,13 +47,14 @@ async function primaryFetch(
 }
 
 /**
- * The thread's session that is on, or null: none, the last one ended, another environment, an
- * older server without the route, or a failed call. A chip is never shown on a guess.
+ * The thread's session that is on; null: none, the last one ended, another environment, or an
+ * older server without the route (404); undefined: not known now (a failed call), so the chip
+ * keeps what it showed and reads again.
  */
 export async function readPlaytestSession(
   threadRef: ScopedThreadRef,
   signal?: AbortSignal,
-): Promise<PlaytestChipSession | null> {
+): Promise<PlaytestChipSession | null | undefined> {
   if (!onPrimaryEnvironment(threadRef)) return null;
   try {
     const response = await primaryFetch(PLAYTEST_STATE_PATH, {
@@ -61,11 +62,12 @@ export async function readPlaytestSession(
       searchParams: { threadId: threadRef.threadId },
       ...(signal ? { signal } : {}),
     });
-    if (!response.ok) return null;
+    if (response.status === 404) return null;
+    if (!response.ok) return undefined;
     const state = (await response.json()) as PlaytestRouteState;
     return state.session ?? null;
   } catch {
-    return null;
+    return undefined;
   }
 }
 

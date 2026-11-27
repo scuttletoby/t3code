@@ -105,6 +105,13 @@ function endAnswerText(answer: PlaytestRouteEndAnswer): {
         title: "Playtest ended",
         description: "The target is released. The worktree and its changes are kept.",
       };
+    case "ended-unreleased":
+      return {
+        type: "error",
+        title: "Playtest ended, target not released",
+        description:
+          "The release step could not start, so T3 did not give the target back; its claim expires by itself.",
+      };
     case "nothing-to-end":
       return { type: "info", title: "This playtest had already ended" };
     case "release-failed":
@@ -120,6 +127,27 @@ function endAnswerText(answer: PlaytestRouteEndAnswer): {
         ...(answer.message === undefined ? {} : { description: answer.message }),
       };
   }
+}
+
+/** Failed reads in a row after which the poll rests until the thread changes (the chip stays). */
+const MAX_FAILED_READS = 6;
+
+/**
+ * After a read: one that could not answer (`undefined`) keeps the chip as it was and reads again
+ * (up to {@link MAX_FAILED_READS} in a row), so a network blip neither hides End nor stops the
+ * poll. A good read decides, and the poll goes on while a chip shows.
+ */
+export function nextChipRead(
+  read: PlaytestChipSession | null | undefined,
+  failedBefore: number,
+):
+  | { readonly kind: "keep"; readonly failed: number; readonly poll: boolean }
+  | { readonly kind: "set"; readonly session: PlaytestChipSession | null; readonly poll: boolean } {
+  if (read === undefined) {
+    const failed = failedBefore + 1;
+    return { kind: "keep", failed, poll: failed < MAX_FAILED_READS };
+  }
+  return { kind: "set", session: read, poll: read !== null };
 }
 
 const NONE: ReadonlyArray<ComposerBannerStackItem> = [];
@@ -146,11 +174,17 @@ export function useForkPlaytestItems(
     if (key === null || environmentId === null || threadId === null || changed === null) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let failed = 0;
     const readOnce = async () => {
       const next = await readPlaytestSession({ environmentId, threadId }, controller.signal);
       if (controller.signal.aborted) return;
-      setRead({ key, session: next });
-      if (next !== null) timer = setTimeout(() => void readOnce(), PLAYTEST_CHIP_POLL_MS);
+      const decided = nextChipRead(next, failed);
+      if (decided.kind === "keep") failed = decided.failed;
+      else {
+        failed = 0;
+        setRead({ key, session: decided.session });
+      }
+      if (decided.poll) timer = setTimeout(() => void readOnce(), PLAYTEST_CHIP_POLL_MS);
     };
     // A read that finds no session stops the polling; a shown chip keeps it going.
     void readOnce();
