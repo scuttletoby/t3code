@@ -534,6 +534,7 @@ KITS = {"agent-guards": ("kit_install", "sbin/agent-guards-install", "kit"),
         "pc-agents": ("own", "sbin/pc-agents", "top")}
 # fork-kit folders that install nothing on a host
 NO_INSTALLER = {"common": "the code and the bootstrap the kits share", "review": "a skill an agent reads",
+                "homelab": "used from a checkout until its installer is added (#857)",
                 "placement-facts": "example scripts a person copies",
                 "slot-filler": "one script and a timer a person sets up from its README"}
 # What each kind of failure asks for
