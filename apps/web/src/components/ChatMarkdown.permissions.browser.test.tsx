@@ -543,16 +543,10 @@ it.each([
     });
     expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", undefined);
 
-    // Upstream opens the menu from the key itself and cancels the key, so the browser
-    // sends no contextmenu of its own after it.
-    const menuKey = new KeyboardEvent("keydown", {
-      bubbles: true,
-      cancelable: true,
-      key: "ContextMenu",
-    });
-    await act(async () => {
-      screen.anchor().dispatchEvent(menuKey);
-    });
+    // Upstream opens the menu from the key and cancels it, so no browser contextmenu follows.
+    const init = { bubbles: true, cancelable: true, key: "ContextMenu" };
+    const menuKey = new KeyboardEvent("keydown", init);
+    await act(async () => void screen.anchor().dispatchEvent(menuKey));
     expect(menuKey.defaultPrevented).toBe(true);
     expect(state.choose).toHaveBeenCalledTimes(2);
   },

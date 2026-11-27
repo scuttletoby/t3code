@@ -671,7 +671,7 @@
     "apps/server/src/terminal/Manager.ts": 2,
     "apps/server/vite.config.ts": 2,
     "apps/web/src/cloud/linkEnvironment.test.ts": 34,
-    "apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx": 241,
+    "apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx": 238,
     "apps/web/src/components/ChatMarkdown.tsx": 17,
     "apps/web/src/components/chat/MarkdownFileLink.tsx": 23,
     "apps/web/src/components/media/mediaContent.ts": 8,
