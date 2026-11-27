@@ -19,6 +19,7 @@ import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
 import * as DelegatedOrphanScan from "./delegatedResults/DelegatedOrphanScan.ts";
 import * as DelegatedResultReminder from "./delegatedResults/DelegatedResultReminder.ts";
+import * as FactsCommands from "./factsCommand.ts";
 import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
@@ -51,8 +52,8 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
 /**
  * In server.ts's `layerRuntimeCoreDependenciesBase`: usage pacer and history, slot gate, usage
  * refresher, handoff service (built beside upstream's idle compaction worker), run records, result
- * reminder, the stop of finished children's sessions, and the `threadRoles` save check's thread
- * lookup, which every settings write reaches.
+ * reminder, the stop of finished children's sessions, the `threadRoles` save check's thread
+ * lookup, which every settings write reaches, and the facts read's `factsCommand` runs.
  */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
@@ -63,6 +64,7 @@ export const layerRuntimeServices = Layer.mergeAll(
   DelegatedResultReminder.layer,
   StopFinishedChildren.layer,
   ThreadRoleTargets.layer,
+  FactsCommands.layer,
 );
 
 /**
