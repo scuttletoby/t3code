@@ -644,6 +644,55 @@
         "record, // Fork: the model policy reads context, model and effort from it",
         "export { parseSkillFrontmatter }; // Fork: one frontmatter read for skills and the model policy"
       ]
+    },
+    "packages/contracts/src/rpc.ts": {
+      "why": "The work panel (fork issue 1136) reads one fork RPC, `fork.workPanel`, defined in the fork file forkWorkPanel.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import { WsForkWorkPanelRpc } from \"./forkWorkPanel.ts\"; // Fork (work panel)",
+          "WsForkWorkPanelRpc, // Fork (work panel)"
+        ]
+      }
+    },
+    "apps/server/src/auth/RpcAuthorization.ts": {
+      "why": "Every RPC in the group declares its scope (RpcAuthorization.test.ts holds the map to the group): the work panel's `fork.workPanel` (fork issue 1136) is a read, like upstream's host resources read.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": ["\"fork.workPanel\": AuthOrchestrationReadScope, // Fork (work panel)"]
+      }
+    },
+    "apps/server/src/observability/RpcInstrumentation.ts": {
+      "why": "Every RPC in the group names its span category: the work panel's `fork.workPanel` (fork issue 1136) is a server read.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": ["\"fork.workPanel\": \"server\", // Fork (work panel)"]
+      }
+    },
+    "apps/server/src/ws.ts": {
+      "why": "The work panel's `fork.workPanel` handler (fork issue 1136) is one line that hands the request to the fork file fork/workPanel/workPanel.ts, which reads its own service only if it is there, so upstream's handler requirements and ws tests do not change.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import * as ForkWorkPanel from \"./fork/workPanel/workPanel.ts\"; // Fork (work panel)",
+          "\"fork.workPanel\": (input) => ForkWorkPanel.read(input), // Fork (work panel)"
+        ]
+      }
+    },
+    "apps/web/src/components/chat/ThreadDetailsPanel.tsx": {
+      "why": "The work panel (fork issue 1136) sits in the thread's side panel right after its sub-agents (ThreadRelationshipsPanel): one import and one element, which renders nothing while the client fork setting workPanelEnabled is off (components/fork/workPanel).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import { ForkWorkPanel } from \"../fork/workPanel/ForkWorkPanel\"; // Fork (work panel)",
+          "<ForkWorkPanel {...props} density={density} />"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
