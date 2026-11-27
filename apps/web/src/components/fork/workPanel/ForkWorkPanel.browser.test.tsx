@@ -167,7 +167,8 @@ describe("the work panel", () => {
     const queue = screen.getByTestId("fork-work-panel-repo-queue");
     await expect.element(queue).toHaveAttribute("data-state", "unknown");
     expect(queue.element().textContent).toContain("unknown: GitHub refused the read");
-    expect(queue.element().getAttribute("title")).toContain("Next read in 20 min");
+    // Where the line comes from, and when the server reads again.
+    expect(queue.element().textContent).toContain("Next read in 20 min");
     const rows = screen.getByTestId("fork-work-panel-pr").elements();
     expect(rows.map((row) => row.getAttribute("data-source"))).toEqual(["snapshot", "watch"]);
   });
