@@ -32,6 +32,7 @@ fork-kit/
 !.github/scripts/fork-test-shards.cjs
 !.github/scripts/fork-vitest-gc-check.cjs
 !.github/fork-fleet.json
+!.github/fork-upstream-mobile-eas-preview-fork.yml
 
 # The fork's changes list; fork-changes-list.test.cjs (the `workflows` job) checks it against forkDefaults.ts.
 FORK_CHANGES.md

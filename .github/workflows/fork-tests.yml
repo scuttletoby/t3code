@@ -1116,13 +1116,24 @@ jobs:
         if: matrix.shard == 1
         run: python3 -B .github/scripts/stage-preview-bundle.test.py
 
-      # Upstream's ci.yml runs the first five plus workflow-credentials; the fork leaves that one
-      # out, because it reads mobile-eas-preview-fork.yml, a workflow the fork deletes
-      # (fork-removed-workflows.txt). The fork adds thread-transfer-report, which upstream runs
-      # from a workflow_run of its CI (disabled in the fork).
+      # workflow-credentials (below) reads mobile-eas-preview-fork.yml, a workflow the fork deletes
+      # (fork-removed-workflows.txt): upstream's copy, .github/fork-upstream-mobile-eas-preview-fork.yml
+      # (from the follow's base tag), goes back for the test only, and out again after it. A follow
+      # that changes upstream's file refreshes the copy:
+      # git show <tag>:.github/workflows/mobile-eas-preview-fork.yml > .github/fork-upstream-mobile-eas-preview-fork.yml
+      - name: Put back upstream's mobile-eas-preview-fork.yml for the release checks
+        if: matrix.shard == 1
+        run: cp .github/fork-upstream-mobile-eas-preview-fork.yml .github/workflows/mobile-eas-preview-fork.yml
+
+      # Upstream's ci.yml runs the first six; the fork adds thread-transfer-report, which upstream
+      # runs from a workflow_run of its CI (disabled in the fork).
       - name: Test release checks
         if: matrix.shard == 1
-        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/mobile-ios-preview-record.test.cjs .github/scripts/test-delta.test.cjs .github/scripts/thread-transfer-report.test.cjs
+        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/mobile-ios-preview-record.test.cjs .github/scripts/test-delta.test.cjs .github/scripts/workflow-credentials.test.cjs .github/scripts/thread-transfer-report.test.cjs
+
+      - name: Take upstream's mobile-eas-preview-fork.yml out again
+        if: ${{ always() && matrix.shard == 1 }}
+        run: rm -f .github/workflows/mobile-eas-preview-fork.yml
 
       - name: Finish installing browser secret helper build libraries
         if: steps.shard.outputs.any == 'true'

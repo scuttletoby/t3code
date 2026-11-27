@@ -78,6 +78,12 @@ export interface OptionCase {
   readonly why: string;
   /** The fix the refusal gives (its field names follow the route). */
   readonly fix: string;
+  /**
+   * Upstream's own refusal of the option on a t3_thread_launch that runs on this machine: upstream
+   * checks a launch's options against the model list first, in every policy mode,
+   * so the policy is not asked there. A launch sent to a linked machine is still checked here.
+   */
+  readonly launchHere: string;
 }
 
 const OPTION_FIX = "this option is not allowed while the model policy is on";
@@ -99,6 +105,7 @@ export const OPTION_CASES: ReadonlyArray<OptionCase> = [
     extra: { id: "effortLevel", value: "max" },
     why: unreadable("effortLevel", KIRO_MODEL),
     fix: OPTION_FIX,
+    launchHere: "Unknown option effortLevel; supported options: reasoningEffort.",
   },
   {
     name: "ACP: the session mode that mirrors the thought levels (hidden from the catalog)",
@@ -108,6 +115,7 @@ export const OPTION_CASES: ReadonlyArray<OptionCase> = [
     extra: { id: "_t3/session-mode", value: "max" },
     why: AGENT_WHY("_t3/session-mode"),
     fix: AGENT_FIX,
+    launchHere: "Unknown option _t3/session-mode; supported options: thought_level.",
   },
   {
     name: "Grok: the agent's native thought_level beside reasoningEffort",
@@ -117,6 +125,7 @@ export const OPTION_CASES: ReadonlyArray<OptionCase> = [
     extra: { id: "thought_level", value: "max" },
     why: unreadable("thought_level", GROK_MODEL),
     fix: OPTION_FIX,
+    launchHere: "Unknown option thought_level; supported options: reasoningEffort.",
   },
   {
     name: "Kiro: a model option applied after the allowed model",
@@ -126,6 +135,7 @@ export const OPTION_CASES: ReadonlyArray<OptionCase> = [
     extra: { id: "model", value: "model-in-no-row" },
     why: `the option model (beside ${KIRO_MODEL}) would change the model after this check`,
     fix: MODEL_FIX,
+    launchHere: "Unknown option model; supported options: reasoningEffort.",
   },
   {
     name: "ACP: a model option applied after the allowed model",
@@ -135,5 +145,6 @@ export const OPTION_CASES: ReadonlyArray<OptionCase> = [
     extra: { id: "model", value: "model-in-no-row" },
     why: `the option model (beside ${ACP_OPTION_MODEL}) would change the model after this check`,
     fix: MODEL_FIX,
+    launchHere: "Unknown option model; supported options: thought_level.",
   },
 ];

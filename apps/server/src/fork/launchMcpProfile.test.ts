@@ -812,8 +812,13 @@ describe("the model policy on t3_thread_launch: an option the policy cannot read
                 clientRequestId,
               }),
             );
-            expect(message, name).toContain(`Model policy refused this pick: ${testCase.why}`);
-            expect(message, name).toContain(testCase.fix);
+            if (environmentId === undefined) {
+              // Upstream refuses it first here (its option check), as with the policy off.
+              expect(message, name).toContain(testCase.launchHere);
+            } else {
+              expect(message, name).toContain(`Model policy refused this pick: ${testCase.why}`);
+              expect(message, name).toContain(testCase.fix);
+            }
           }
           expect([launched.length, forwarded.length], name).toEqual([0, 0]);
           const allowed = refusal(
@@ -831,31 +836,36 @@ describe("the model policy on t3_thread_launch: an option the policy cannot read
     }),
   );
 
-  it.effect("advise: the launch goes as today", () =>
+  it.effect("advise: the launch goes as with the policy off", () =>
     Effect.gen(function* () {
       for (const { route, caller, environmentId } of routes) {
-        const { forwarded, launched, launch } = harness(policy("advise"), {
-          caller,
-          providers: OPTION_CASE_PROVIDERS,
-        });
-        for (const testCase of OPTION_CASES) {
-          const message = refusal(
-            yield* launch({
-              environmentId,
-              modelSelection: {
-                instanceId: testCase.instanceId,
-                model: testCase.model,
-                options: [testCase.allowed, testCase.extra],
-              },
-              clientRequestId: testCase.name,
-            }),
+        for (const mode of ["advise", "off"]) {
+          const name = `${route} (${mode})`;
+          const { forwarded, launched, launch } = harness(policy(mode), {
+            caller,
+            providers: OPTION_CASE_PROVIDERS,
+          });
+          for (const testCase of OPTION_CASES) {
+            const message = refusal(
+              yield* launch({
+                environmentId,
+                modelSelection: {
+                  instanceId: testCase.instanceId,
+                  model: testCase.model,
+                  options: [testCase.allowed, testCase.extra],
+                },
+                clientRequestId: testCase.name,
+              }),
+            );
+            // Here upstream refuses an option the model list does not describe, in every
+            // mode; a launch sent to a linked machine is checked there.
+            if (environmentId === undefined) expect(message, name).toContain(testCase.launchHere);
+            else expect(message, name).toContain("sent there");
+          }
+          expect([launched.length, forwarded.length], name).toEqual(
+            environmentId === undefined ? [0, 0] : [0, OPTION_CASES.length],
           );
-          if (environmentId === undefined) expect(message, route).toBeUndefined();
-          else expect(message, route).toContain("sent there");
         }
-        expect((environmentId === undefined ? launched : forwarded).length, route).toBe(
-          OPTION_CASES.length,
-        );
       }
     }),
   );

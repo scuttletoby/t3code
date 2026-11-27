@@ -52,6 +52,8 @@ export const MCP_T3_TOOLKIT_GROUPS: Readonly<Record<string, McpT3ToolGroup | nul
   theme: "theme",
   html: "html",
   waits: "waits",
+  workflow: "workflows",
+  feedback: "feedback",
   message: null,
   toolSearch: null,
 };
