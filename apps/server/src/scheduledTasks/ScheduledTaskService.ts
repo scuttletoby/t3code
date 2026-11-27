@@ -2656,6 +2656,7 @@ export const layer = Layer.effect(
                   "The pending webhook payload could not be prepared.",
                 );
                 yield* releaseFailedDelivery(entry.delivery_id);
+                yield* runSlots.leaveStored(entry.delivery_id); // Fork: a delivery removed before its run leaves its place in line
                 yield* remove;
                 continue;
               }
@@ -2663,12 +2664,13 @@ export const layer = Layer.effect(
               if (rendered.prompt.trim().length > PROVIDER_SEND_TURN_MAX_INPUT_CHARS) {
                 yield* markDeliveryFailed(entry.delivery_id, PROMPT_TOO_LONG);
                 yield* releaseFailedDelivery(entry.delivery_id);
+                yield* runSlots.leaveStored(entry.delivery_id); // Fork: a delivery removed before its run leaves its place in line
               } else {
                 if (taskJson !== null)
                   yield* sql`UPDATE scheduled_task_webhook_pending SET task_json = ${taskJson} WHERE delivery_id = ${entry.delivery_id}`;
                 yield* sql`UPDATE scheduled_task_webhook_deliveries SET outcome = 'accepted', error = NULL, rendered_prompt = ${loggedWebhookPrompt(rendered.prompt)}, missing_fields_json = ${encodeMissingFieldsJson(rendered.missing)} WHERE delivery_id = ${entry.delivery_id}`;
                 if (!(yield* runWebhookDelivery(task, entry.delivery_id, rendered.prompt))) return;
-                if (yield* runSlots.keepStored(taskId)) continue; // Fork: a delivery saved while it waited runs again on the task as saved
+                if (yield* runSlots.keepStored(taskId, entry.delivery_id)) continue; // Fork: a delivery saved while it waited runs again on the task as saved
               }
               yield* remove;
             }
