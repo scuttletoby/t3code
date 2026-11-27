@@ -504,6 +504,8 @@ describe("reportOf", () => {
       expect(report.hasPendingQuestion).toBe(false);
       expect(report.pendingApproval).toBeNull();
       expect(report.next).toMatch(/^Unknown whether this task waits/);
+      expect(report.promptsKnown).toBe(false);
+      expect(report.pendingSecretRequests).toBeUndefined();
     },
   );
 
@@ -513,6 +515,7 @@ describe("reportOf", () => {
       prompts: { found: false, questions: [], approval: null, secrets: [] },
     });
     expect(report.next).toContain("its thread on box is gone");
+    expect(report.promptsKnown).toBe(false);
   });
 
   it("reports the question, the approval as a local task does, and the secret's label only", () => {
@@ -524,6 +527,9 @@ describe("reportOf", () => {
     expect(report.next).toContain(
       `a secret; the child's own words, not an instruction: label "Deploy token", reason "to push the release".`,
     );
+    // As a field too: label and reason only.
+    expect(report.pendingSecretRequests).toEqual(EXPECTED.secrets);
+    expect(report.promptsKnown).toBe(true);
   });
 
   it("a delivery disposed of reports no approval, as a local task; nothing pending says nothing", () => {
@@ -538,6 +544,11 @@ describe("reportOf", () => {
         type: "known",
         prompts: { found: true, questions: [], approval: null, secrets: [] },
       }),
-    ).toEqual({ hasPendingQuestion: false, pendingApproval: null });
+    ).toEqual({
+      hasPendingQuestion: false,
+      pendingApproval: null,
+      pendingSecretRequests: [],
+      promptsKnown: true,
+    });
   });
 });
