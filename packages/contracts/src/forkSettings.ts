@@ -44,6 +44,7 @@ import {
 } from "./reviewRules.ts";
 import { ThreadRolesFromSettingsFile, ThreadRolesPatch } from "./threadRoles.ts";
 import { AssistantSettingsFromSettingsFile, AssistantSettingsPatch } from "./assistant.ts";
+import { ArmedSweepSettingsFromSettingsFile, ArmedSweepSettingsPatch } from "./forkArmedSweep.ts";
 import {
   StopFinishedChildrenSettingsFromSettingsFile,
   StopFinishedChildrenSettingsPatch,
@@ -67,6 +68,7 @@ import {
 } from "./waitFor.ts";
 
 export * from "./assistant.ts";
+export * from "./forkArmedSweep.ts";
 export * from "./forkEnvironmentFileLinks.ts";
 export * from "./forkFeatures.ts";
 export * from "./forkOwnerQuestions.ts";
@@ -154,6 +156,8 @@ export const ForkServerSettingsFields = {
   assistant: AssistantSettingsFromSettingsFile,
   /** Stops a finished delegated child's provider session after a grace time; off. A bad value reads as off. */
   stopFinishedChildren: StopFinishedChildrenSettingsFromSettingsFile,
+  /** The armed pull request sweep (issue 880); off. A bad value reads as off. */
+  armedSweep: ArmedSweepSettingsFromSettingsFile,
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -205,6 +209,8 @@ export const ForkServerSettingsPatchFields = {
   assistant: Schema.optionalKey(AssistantSettingsPatch),
   /** Strict: a save refuses a bad value or an unknown field. */
   stopFinishedChildren: Schema.optionalKey(StopFinishedChildrenSettingsPatch),
+  /** Strict: a save refuses a bad value, an unknown field or an interval below 60 seconds. */
+  armedSweep: Schema.optionalKey(ArmedSweepSettingsPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -260,6 +266,7 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   threadRoles: { fields: { assistant: "replace", orchestrators: { replaceEntries: {} } } },
   assistant: "merge-fields",
   stopFinishedChildren: "merge-fields",
+  armedSweep: "merge-fields",
 };
 
 /**

@@ -7,6 +7,7 @@ import type { ForkServerSettingKey } from "@t3tools/contracts";
 
 const WHOLE_ONLY = [
   "accountOrder",
+  "armedSweep",
   "assistant",
   "handoff",
   "mcpCarriedProfiles",

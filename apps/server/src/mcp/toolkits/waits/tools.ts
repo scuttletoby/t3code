@@ -60,7 +60,7 @@ const WaitForTool = Tool.make("wait_for", {
 
 const WaitListTool = Tool.make("wait_list", {
   description:
-    'List this thread\'s waits (scope "project": every wait in the project), the configured checks and the current agent slot use.',
+    'List this thread\'s waits (scope "project": every wait in the project), the configured checks, the current agent slot use and, while the armed PR sweep runs, the armed pull requests that are not green (`armedSweep`).',
   parameters: WaitListInput,
   success: WaitListResult,
   failure: WaitsToolFailure,

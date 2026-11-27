@@ -30,6 +30,7 @@ const LABELS: Record<ForkFeature, string> = {
   accountOrder: "Account order",
   agentSlots: "Limit on running agents",
   stopFinishedChildren: "Stop finished sub-agents",
+  armedSweep: "Armed pull request sweep",
   waitFor: "Agent waits",
   modelPolicy: "Models agents may use",
   handoff: "Handoff instead of compaction",
@@ -46,6 +47,7 @@ const ORDER: ReadonlyArray<ForkFeature> = [
   "agentSlots",
   "stopFinishedChildren",
   "waitFor",
+  "armedSweep",
   "modelPolicy",
   "handoff",
   "reviewRules",
@@ -96,6 +98,9 @@ function targetStatuses(
     statuses.modelPolicy.detail = `On: ${settings.modelPolicy.mode}${
       "unreadable" in settings.modelPolicy ? " (unreadable)" : ""
     }`;
+  }
+  if (settings.armedSweep.mode === "dry") {
+    statuses.armedSweep.detail = "On: dry (lists, wakes no thread)";
   }
   return statuses;
 }

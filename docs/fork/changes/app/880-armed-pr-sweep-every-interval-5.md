@@ -1,0 +1,5 @@
+- Change: Armed PR sweep: every interval (5 minutes by default) T3 lists the open pull requests of the repositories it knows in one GitHub request and judges each with auto-merge on: a conflict, a red (after the run and its one automatic re-run), auto-merge turned off, closed without merging, or not green for 30 minutes wakes the top-level thread that links it (up the parent chain; the project's orchestrator when that thread is archived, or with `scope: all` for one no thread links) with one joined message, once per head and reason and at most 3 per head. `dry` only logs and lists; `wait_list` lists the armed pull requests that are not green in both modes.
+- Why: Armed pull requests sat red or conflicted for hours, the only signal a comment nobody read.
+- Setting: `server.armedSweep`
+- Default: off
+- PR: [#880](https://github.com/scuttletoby/t3code/issues/880)

@@ -6,6 +6,7 @@ import { Waits } from "../../../waits/WaitWorker.ts";
 import { assertSameLink } from "../../linkOrigin.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { assertTargetWithinLimits, type Caller, unavailable } from "../../threadAccess.ts";
+import { armedRowsFor } from "../../../fork/armedSweep/armedRows.ts";
 import { lensReportCall } from "../../../fork/reviewRules/lensReportTool.ts";
 import { lensStartCall } from "../../../fork/reviewRules/lensStartTool.ts";
 import { callingThread as threadOfCaller } from "./callingThread.ts";
@@ -47,12 +48,19 @@ const handlers = {
     Effect.gen(function* () {
       const { caller } = yield* callingThread();
       const waits = yield* Waits;
-      return yield* waits.list({
+      const result = yield* waits.list({
         threadId: caller.id,
         projectId: caller.projectId,
         scope: input.scope,
         includeEnded: input.includeEnded,
       });
+      // Fork (issue 880): the armed PR sweep's not-green pull requests, while it is dry or on.
+      const armedSweep = armedRowsFor({
+        threadId: caller.id,
+        projectId: caller.projectId,
+        scope: input.scope,
+      });
+      return armedSweep === undefined ? result : { ...result, armedSweep };
     }),
   ),
   // A named thread is checked as the thread tools check it; so is every thread that now holds

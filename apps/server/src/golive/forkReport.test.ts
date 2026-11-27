@@ -701,6 +701,7 @@ describe("__fork-report on old, newer and empty state", () => {
       modelPolicy: "off",
       activityProbe: "off",
       stopFinishedChildren: "off",
+      armedSweep: "off",
     });
     expect(report.ok).toBe(true);
   });
@@ -1493,6 +1494,7 @@ describe("__fork-report contract", () => {
       "accountOrder",
       "activityProbe",
       "agentSlots",
+      "armedSweep",
       "automaticUpdates",
       "handoff",
       "modelPolicy",
@@ -1507,6 +1509,7 @@ describe("__fork-report contract", () => {
         "accountOrder",
         "activityProbe",
         "agentSlots",
+        "armedSweep",
         "automaticUpdates",
         "automaticUpdatesQuietCommandSet",
         "headlessUsageRefreshIntervalMs",
