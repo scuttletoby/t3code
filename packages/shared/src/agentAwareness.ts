@@ -114,6 +114,7 @@ export function projectThreadAwarenessV2(
     return null;
   }
   if (phase === "completed" && thread.latestRunStopRequested === true) return null;
+  if (phase === "failed" && thread.latestRunStopRequested === true) return null; // Fork: a quiet handoff write turn (fork/handoff)
   // Resolve the phase first so live or waiting work stays visible after settlement.
   const runStatus = thread.activityRunStatus ?? thread.status;
   if (

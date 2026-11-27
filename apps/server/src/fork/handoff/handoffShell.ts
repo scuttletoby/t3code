@@ -45,7 +45,8 @@ function quietCandidate(threadId: ThreadId, messageId: string): string | null {
 /**
  * A run that may end quiet: a completed run, or a failed write turn marked `:fallback`, as the
  * fallback follows it with the reason. Unmarked (idle trigger) or a failed handoff run: nothing
- * follows, so it alerts. Upstream reads the mark for a failed run once its announced seam is in.
+ * follows, so it alerts. The relay and the browser read the mark for a failed run through seam
+ * lines.
  */
 const endsQuiet = (threadId: ThreadId, run: Pick<OrchestrationV2Run, "status" | "userMessageId">) =>
   run.status === "completed" ||
