@@ -165,6 +165,14 @@ export interface DelegateChecks {
   ) => Effect.Effect<Partial<RemoteTaskPrompts.StatusReport>>;
 }
 
+/**
+ * Upstream's `endsTaskWait` seat: a pending secret request of a task on a linked machine
+ * ends a blocking wait, as a question or approval does. Pure: it reads only the result.
+ */
+export const promptEndsWait = (
+  result: Pick<OrchestratorMcpDelegateTaskResult, "pendingSecretRequests">,
+): boolean => (result.pendingSecretRequests?.length ?? 0) > 0;
+
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
   new OrchestratorMcpFailure({ code, message });
 

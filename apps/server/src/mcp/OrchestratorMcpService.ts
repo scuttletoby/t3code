@@ -621,6 +621,7 @@ function isTerminalTaskStatus(
 
 function endsTaskWait(result: OrchestratorMcpDelegateTaskResult): boolean {
   return (
+    DelegateChecks.promptEndsWait(result) || // Fork: a secret request ends a wait
     result.hasPendingQuestion ||
     result.pendingApproval !== null ||
     isTerminalTaskStatus(result.status)

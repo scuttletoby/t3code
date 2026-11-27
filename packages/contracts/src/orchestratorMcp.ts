@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import { AuthMcpClientAccess } from "./auth.ts";
+import * as ForkOrchestratorMcp from "./forkOrchestratorMcp.ts"; // Fork: its result fields
 import {
   ContextTransferId,
   EnvironmentId,
@@ -258,6 +259,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   usagePacingNote: Schema.optional(Schema.String).annotate({
     description: "What usage pacing did with this task (moved it, lowered its effort, or why not).",
   }),
+  ...ForkOrchestratorMcp.ForkDelegateTaskResultFields,
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
 
