@@ -3,8 +3,13 @@
  * GitHub is asked at most once a minute in all, later on a low budget, a refusal or no answer.
  * A pull request's CI comes from the same read (its head's runs): no call of its own.
  */
+// Each repository is read three ways in turn (the latest runs, then the queued and the running
+// ones, which also find a re-run of a run older than the latest page), one call a minute for the
+// whole server. So one panel's three repositories are each read fully every nine minutes, within
+// `STALE_MS`; more repositories in view at once make lines go unknown for part of each cycle.
 import type { ForkPullRequestRuns, ForkRepoQueue, ThreadPullRequestLink } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -30,6 +35,10 @@ const DOWN_WAITS_MS = [2 * 60_000, 4 * 60_000, 8 * 60_000, 15 * 60_000] as const
 /** Repositories kept in the cache; the one read longest ago goes first. */
 const MAX_REPOSITORIES = 20;
 
+/** The three reads of a repository: the latest page, and every queued and every running run. */
+const READ_KINDS = ["latest", "queued", "in_progress"] as const;
+type ReadKind = (typeof READ_KINDS)[number];
+
 /** What GitHub (or the way to it) gave for one read. */
 export type GitHubRunsAnswer =
   | {
@@ -46,6 +55,8 @@ export type GitHubRunsSource = (input: {
   readonly host: string;
   readonly repository: string;
   readonly perPage: number;
+  /** Only runs with this status; absent: the latest runs of every status. */
+  readonly status?: "queued" | "in_progress";
 }) => Effect.Effect<GitHubRunsAnswer>;
 
 const WorkflowRun = Schema.Struct({
@@ -57,7 +68,15 @@ const WorkflowRun = Schema.Struct({
   status: Schema.optional(Schema.NullOr(Schema.String)),
   conclusion: Schema.optional(Schema.NullOr(Schema.String)),
   created_at: Schema.String,
+  // A re-run keeps `created_at`; its own start is `run_started_at`.
+  run_started_at: Schema.optional(Schema.NullOr(Schema.String)),
   html_url: Schema.optional(Schema.NullOr(Schema.String)),
+  head_repository: Schema.optional(
+    Schema.NullOr(Schema.Struct({ full_name: Schema.optional(Schema.NullOr(Schema.String)) })),
+  ),
+  pull_requests: Schema.optional(
+    Schema.NullOr(Schema.Array(Schema.Struct({ number: Schema.optional(Schema.Number) }))),
+  ),
 });
 const decodeRuns = Schema.decodeUnknownOption(
   Schema.fromJsonString(Schema.Struct({ workflow_runs: Schema.Array(WorkflowRun) })),
@@ -65,11 +84,17 @@ const decodeRuns = Schema.decodeUnknownOption(
 
 /** The part of a run the panel counts. */
 interface Run {
+  readonly id: number;
   readonly workflow: string;
   readonly headBranch: string | null;
   readonly headSha: string | null;
+  /** `owner/name` of the head's repository; another fork's for a pull request from a fork. */
+  readonly headRepository: string | null;
+  /** The pull requests GitHub ties the run to (none for one from a fork). */
+  readonly pullRequests: ReadonlyArray<number>;
   readonly kind: "queued" | "running" | "failed" | "passed" | "other";
-  readonly createdAt: number;
+  /** When this attempt started: `run_started_at`, else `created_at` (a re-run keeps that one). */
+  readonly at: number;
   readonly url: string | null;
 }
 
@@ -94,15 +119,21 @@ export const parseRuns = (body: string): ReadonlyArray<Run> | null =>
     onNone: () => null,
     onSome: ({ workflow_runs }) =>
       workflow_runs.flatMap((run): ReadonlyArray<Run> => {
-        const createdAt = Date.parse(run.created_at);
-        if (!Number.isFinite(createdAt)) return [];
+        const started = run.run_started_at == null ? Number.NaN : Date.parse(run.run_started_at);
+        const at = Number.isFinite(started) ? started : Date.parse(run.created_at);
+        if (!Number.isFinite(at)) return [];
         return [
           {
+            id: run.id,
             workflow: String(run.workflow_id ?? run.name ?? run.id),
             headBranch: run.head_branch ?? null,
             headSha: run.head_sha ?? null,
+            headRepository: run.head_repository?.full_name ?? null,
+            pullRequests: (run.pull_requests ?? []).flatMap((pr) =>
+              pr.number === undefined ? [] : [pr.number],
+            ),
             kind: runKind(run.status ?? null, run.conclusion ?? null),
-            createdAt,
+            at,
             url: run.html_url ?? null,
           },
         ];
@@ -113,11 +144,15 @@ const oldestQueued = (runs: ReadonlyArray<Run>) =>
   runs
     .filter((run) => run.kind === "queued")
     .reduce<Run | null>(
-      (oldest, run) => (oldest === null || run.createdAt < oldest.createdAt ? run : oldest),
+      (oldest, run) => (oldest === null || run.at < oldest.at ? run : oldest),
       null,
     );
 
-/** A pull request's head runs: the latest run of each workflow on its head commit, else branch. */
+/**
+ * A pull request's head runs: the latest run of each workflow on its head commit; without a
+ * watched commit, the runs GitHub ties to it, or its branch in its own repository (a branch of the
+ * same name in another fork is not its).
+ */
 export const pullRequestRuns = (
   runs: ReadonlyArray<Run>,
   link: Pick<ThreadPullRequestLink, "host" | "repository" | "number" | "snapshot" | "watch">,
@@ -127,13 +162,16 @@ export const pullRequestRuns = (
   const onHead = runs.filter((run) =>
     headSha !== null
       ? run.headSha === headSha
-      : headBranch !== null && run.headBranch === headBranch,
+      : run.pullRequests.includes(link.number) ||
+        (headBranch !== null &&
+          run.headBranch === headBranch &&
+          run.headRepository?.toLowerCase() === link.repository.toLowerCase()),
   );
   if (onHead.length === 0) return null;
   const latest = new Map<string, Run>();
   for (const run of onHead) {
     const kept = latest.get(run.workflow);
-    if (kept === undefined || run.createdAt > kept.createdAt) latest.set(run.workflow, run);
+    if (kept === undefined || run.at > kept.at) latest.set(run.workflow, run);
   }
   const heads = [...latest.values()];
   const count = (kind: Run["kind"]) => heads.filter((run) => run.kind === kind).length;
@@ -142,7 +180,7 @@ export const pullRequestRuns = (
     queued ??
     heads.find((run) => run.kind === "running") ??
     heads.find((run) => run.kind === "failed") ??
-    heads.toSorted((a, b) => b.createdAt - a.createdAt)[0] ??
+    heads.toSorted((a, b) => b.at - a.at)[0] ??
     null;
   return {
     host: link.host,
@@ -152,7 +190,7 @@ export const pullRequestRuns = (
     running: count("running"),
     failed: count("failed"),
     passed: count("passed"),
-    oldestQueuedAt: queued?.createdAt ?? null,
+    oldestQueuedAt: queued?.at ?? null,
     url: pick?.url ?? null,
   };
 };
@@ -160,6 +198,7 @@ export const pullRequestRuns = (
 interface Entry {
   readonly host: string;
   readonly repository: string;
+  readonly kind: ReadKind;
   readonly good: { readonly readAt: number; readonly runs: ReadonlyArray<Run> } | null;
   /** Why the latest read gave no counts; `null` once one did. */
   readonly problem: string | null;
@@ -173,6 +212,8 @@ interface CacheState {
   readonly nextCallAt: number;
   /** GitHub has not answered this many reads in a row. */
   readonly downStreak: number;
+  /** The call under way, if any: its repository and when it is done. */
+  readonly inFlight: { readonly repo: string; readonly done: Deferred.Deferred<void> } | null;
 }
 
 export const REASON_NOT_READ =
@@ -180,9 +221,12 @@ export const REASON_NOT_READ =
 export const REASON_NOT_GITHUB = "Only github.com repositories are read.";
 const REASON_BAD_NAME = "The repository name is not owner/name.";
 const REASON_STALE = "The last counts GitHub gave are more than 10 minutes old.";
+export const REASON_PARTIAL =
+  "Re-runs of runs older than the latest 100 are not read yet: they come in the next minutes.";
 
 const keyOf = (host: string, repository: string) =>
   `${host.toLowerCase()}\0${repository.toLowerCase()}`;
+const entryKey = (repo: string, kind: ReadKind) => `${repo}\0${kind}`;
 const REPOSITORY_NAME = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 const header = (headers: Readonly<Record<string, string>>, name: string) => {
@@ -287,64 +331,158 @@ export const repoQueueKey = keyOf;
 export const makeRepoQueueCache = Effect.fn("ForkWorkPanel.makeRepoQueueCache")(function* (
   source: GitHubRunsSource,
 ) {
-  const state = yield* Ref.make<CacheState>({ entries: new Map(), nextCallAt: 0, downStreak: 0 });
-  // One read at a time, so two viewers arriving together cannot both spend the minute's call.
+  const state = yield* Ref.make<CacheState>({
+    entries: new Map(),
+    nextCallAt: 0,
+    downStreak: 0,
+    inFlight: null,
+  });
+  // Held only to claim the minute's call, never during it, so a viewer whose answer is cached is
+  // never held up by another viewer's call.
   const lock = yield* Semaphore.make(1);
 
-  const callOnce = Effect.fn("ForkWorkPanel.repoQueue.call")(function* (
+  type Job = {
+    readonly host: string;
+    readonly repository: string;
+    readonly kind: ReadKind;
+    readonly start: number;
+    readonly downStreak: number;
+    readonly done: Deferred.Deferred<void>;
+  };
+
+  /** Claims the minute's call for the read that waited longest, marking it spent at once. */
+  const claim = Effect.fn("ForkWorkPanel.repoQueue.claim")(function* (
     wanted: ReadonlyArray<{ readonly host: string; readonly repository: string }>,
   ) {
     const now = yield* Clock.currentTimeMillis;
     const current = yield* Ref.get(state);
-    if (now < current.nextCallAt) return;
-    const due = wanted
-      .map((repo) => ({ repo, entry: current.entries.get(keyOf(repo.host, repo.repository)) }))
+    if (now < current.nextCallAt || current.inFlight !== null) return null;
+    const candidates = wanted.flatMap((repo, order) =>
+      READ_KINDS.map((kind, kindIndex) => {
+        const key = entryKey(keyOf(repo.host, repo.repository), kind);
+        return { repo, kind, key, order, kindIndex, entry: current.entries.get(key) };
+      }),
+    );
+    // A latest page with no counts yet first (the line needs it), then the read waiting longest.
+    const needed = (candidate: (typeof candidates)[number]) =>
+      candidate.kind === "latest" && candidate.entry?.good == null ? 0 : 1;
+    const due = candidates
       .filter(
         ({ entry }) =>
           entry === undefined || (entry.attemptedAt + FRESH_MS <= now && entry.retryAt <= now),
       )
-      .toSorted((a, b) => (a.entry?.attemptedAt ?? -1) - (b.entry?.attemptedAt ?? -1))[0];
-    if (due === undefined) return;
-    const { host, repository } = due.repo;
-    const answer = yield* source({ host, repository, perPage: RUNS_PER_READ });
-    const after = yield* Clock.currentTimeMillis;
-    const result = classifyAnswer(answer, after, current.downStreak);
+      .toSorted(
+        (a, b) =>
+          needed(a) - needed(b) ||
+          (a.entry?.attemptedAt ?? -1) - (b.entry?.attemptedAt ?? -1) ||
+          a.kindIndex - b.kindIndex ||
+          a.order - b.order,
+      )[0];
+    if (due === undefined) return null;
+    const done = yield* Deferred.make<void>();
+    const repo = keyOf(due.repo.host, due.repo.repository);
     yield* Ref.update(state, (latest) => {
       const entries = new Map(latest.entries);
-      const previous = entries.get(keyOf(host, repository));
-      entries.set(keyOf(host, repository), {
-        host,
-        repository,
-        good:
-          result._tag === "Runs" ? { readAt: after, runs: result.runs } : (previous?.good ?? null),
-        problem: result._tag === "Runs" ? null : result.reason,
-        attemptedAt: after,
-        retryAt: result._tag === "Problem" && result.scope === "repository" ? result.waitUntil : 0,
+      const previous = entries.get(due.key);
+      entries.set(due.key, {
+        host: due.repo.host,
+        repository: due.repo.repository,
+        kind: due.kind,
+        good: previous?.good ?? null,
+        problem: previous?.problem ?? null,
+        attemptedAt: now,
+        retryAt: previous?.retryAt ?? 0,
       });
-      while (entries.size > MAX_REPOSITORIES) {
-        const oldest = [...entries.entries()].toSorted(
-          (a, b) => a[1].attemptedAt - b[1].attemptedAt,
-        )[0];
-        if (oldest === undefined) break;
-        entries.delete(oldest[0]);
-      }
-      return {
-        entries,
-        nextCallAt:
-          result._tag === "Problem" && result.scope === "repository"
-            ? after + CALL_INTERVAL_MS
-            : result.waitUntil,
-        downStreak: result._tag === "Problem" && result.down ? latest.downStreak + 1 : 0,
-      };
+      return { ...latest, entries, nextCallAt: now + CALL_INTERVAL_MS, inFlight: { repo, done } };
     });
+    return {
+      host: due.repo.host,
+      repository: due.repo.repository,
+      kind: due.kind,
+      start: now,
+      downStreak: current.downStreak,
+      done,
+    } satisfies Job;
   });
+
+  /** The call and its record, whole: a viewer who leaves meanwhile does not cut it short. */
+  const call = Effect.fn("ForkWorkPanel.repoQueue.callGitHub")(
+    function* (job: Job) {
+      const answer = yield* source({
+        host: job.host,
+        repository: job.repository,
+        perPage: RUNS_PER_READ,
+        ...(job.kind === "latest" ? {} : { status: job.kind }),
+      });
+      const after = yield* Clock.currentTimeMillis;
+      const result = classifyAnswer(answer, after, job.downStreak);
+      const key = entryKey(keyOf(job.host, job.repository), job.kind);
+      yield* Ref.update(state, (latest) => {
+        const entries = new Map(latest.entries);
+        const previous = entries.get(key);
+        entries.set(key, {
+          host: job.host,
+          repository: job.repository,
+          kind: job.kind,
+          good:
+            result._tag === "Runs"
+              ? { readAt: after, runs: result.runs }
+              : (previous?.good ?? null),
+          problem: result._tag === "Runs" ? null : result.reason,
+          attemptedAt: job.start,
+          retryAt:
+            result._tag === "Problem" && result.scope === "repository" ? result.waitUntil : 0,
+        });
+        while (entries.size > MAX_REPOSITORIES * READ_KINDS.length) {
+          const oldest = [...entries.entries()].toSorted(
+            (a, b) => a[1].attemptedAt - b[1].attemptedAt,
+          )[0];
+          if (oldest === undefined) break;
+          entries.delete(oldest[0]);
+        }
+        // The minute counts from the call's start, so a viewer refreshing every minute is not
+        // pushed to every other minute; the longer waits count from its end.
+        const nextCallAt =
+          result._tag === "Runs"
+            ? result.lowBudget
+              ? result.waitUntil
+              : job.start + CALL_INTERVAL_MS
+            : result.scope === "repository"
+              ? job.start + CALL_INTERVAL_MS
+              : result.waitUntil;
+        return {
+          entries,
+          nextCallAt,
+          downStreak: result._tag === "Problem" && result.down ? latest.downStreak + 1 : 0,
+          inFlight: null,
+        };
+      });
+    },
+    (effect, job) =>
+      effect.pipe(
+        Effect.ensuring(
+          Ref.update(state, (latest) =>
+            latest.inFlight?.done === job.done ? { ...latest, inFlight: null } : latest,
+          ).pipe(Effect.andThen(Deferred.succeed(job.done, undefined))),
+        ),
+      ),
+  );
 
   const read: RepoQueueCache["read"] = Effect.fn("ForkWorkPanel.repoQueue.read")(
     function* (repositories) {
       const readable = repositories.filter(
         (repo) => repo.host.toLowerCase() === "github.com" && REPOSITORY_NAME.test(repo.repository),
       );
-      yield* lock.withPermits(1)(callOnce(readable));
+      const job = yield* lock.withPermits(1)(claim(readable));
+      if (job !== null) yield* Effect.forkDetach(call(job));
+      // Wait only for a call about one of this viewer's repositories (its own claim included).
+      const inFlight = (yield* Ref.get(state)).inFlight;
+      if (
+        inFlight !== null &&
+        readable.some((repo) => keyOf(repo.host, repo.repository) === inFlight.repo)
+      ) {
+        yield* Deferred.await(inFlight.done);
+      }
       const now = yield* Clock.currentTimeMillis;
       const { entries, nextCallAt } = yield* Ref.get(state);
       const runs = new Map<string, ReadonlyArray<Run>>();
@@ -356,38 +494,61 @@ export const makeRepoQueueCache = Effect.fn("ForkWorkPanel.makeRepoQueueCache")(
         if (!REPOSITORY_NAME.test(repo.repository)) {
           return { ...base, state: "unknown", reason: REASON_BAD_NAME };
         }
-        const entry = entries.get(keyOf(repo.host, repo.repository));
-        const next = Math.max(nextCallAt, entry?.retryAt ?? 0, now);
-        if (entry?.good == null) {
+        const repoKey = keyOf(repo.host, repo.repository);
+        const reads = READ_KINDS.flatMap((kind) => {
+          const entry = entries.get(entryKey(repoKey, kind));
+          return entry === undefined ? [] : [entry];
+        });
+        const latest = reads.find((entry) => entry.kind === "latest");
+        const problem =
+          reads.toSorted((a, b) => b.attemptedAt - a.attemptedAt).find((entry) => entry.problem)
+            ?.problem ?? null;
+        const next = Math.max(nextCallAt, ...reads.map((entry) => entry.retryAt), now);
+        if (latest?.good == null) {
           return {
             ...base,
             state: "unknown",
-            reason: entry?.problem ?? REASON_NOT_READ,
+            reason: problem ?? REASON_NOT_READ,
             nextReadAt: next,
           };
         }
-        if (entry.good.readAt + STALE_MS < now) {
+        if (latest.good.readAt + STALE_MS < now) {
           return {
             ...base,
             state: "unknown",
-            reason: entry.problem === null ? REASON_STALE : `${entry.problem} ${REASON_STALE}`,
-            readAt: entry.good.readAt,
+            reason: problem === null ? REASON_STALE : `${problem} ${REASON_STALE}`,
+            readAt: latest.good.readAt,
             nextReadAt: next,
           };
         }
-        const good = entry.good.runs;
-        runs.set(keyOf(repo.host, repo.repository), good);
-        const oldest = oldestQueued(good);
+        // Each run once, as the newest read saw it; a read older than STALE_MS is left out.
+        const byId = new Map<number, { readonly run: Run; readonly readAt: number }>();
+        for (const entry of reads) {
+          if (entry.good === null || entry.good.readAt + STALE_MS < now) continue;
+          for (const run of entry.good.runs) {
+            const kept = byId.get(run.id);
+            if (kept === undefined || entry.good.readAt > kept.readAt) {
+              byId.set(run.id, { run, readAt: entry.good.readAt });
+            }
+          }
+        }
+        const merged = [...byId.values()].map(({ run }) => run);
+        runs.set(repoKey, merged);
+        const oldest = oldestQueued(merged);
+        const missing = READ_KINDS.some(
+          (kind) => !reads.some((entry) => entry.kind === kind && entry.good !== null),
+        );
+        const reason = problem ?? (missing ? REASON_PARTIAL : null);
         return {
           ...base,
           state: "answered",
-          ...(entry.problem === null ? {} : { reason: entry.problem }),
-          readAt: entry.good.readAt,
-          queued: good.filter((run) => run.kind === "queued").length,
-          running: good.filter((run) => run.kind === "running").length,
-          oldestQueuedAt: oldest?.createdAt ?? null,
+          ...(reason === null ? {} : { reason }),
+          readAt: latest.good.readAt,
+          queued: merged.filter((run) => run.kind === "queued").length,
+          running: merged.filter((run) => run.kind === "running").length,
+          oldestQueuedAt: oldest?.at ?? null,
           oldestQueuedUrl: oldest?.url ?? null,
-          scanned: good.length,
+          scanned: merged.length,
           nextReadAt: next,
         };
       });

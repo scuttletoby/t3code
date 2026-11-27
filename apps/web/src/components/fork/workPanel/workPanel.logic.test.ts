@@ -2,7 +2,12 @@
 import type { ThreadId, ThreadPullRequestLink } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
+import * as Cause from "effect/Cause";
+import * as Option from "effect/Option";
+import { AsyncResult } from "effect/reactivity";
+
 import {
+  currentAnswer,
   familyPullRequests,
   formatAge,
   pullRequestCi,
@@ -135,5 +140,24 @@ describe("formatAge", () => {
     [125 * 60_000, "2 h 5 min"],
   ])("%d ms reads %s", (ms, text) => {
     expect(formatAge(ms)).toBe(text);
+  });
+});
+
+describe("currentAnswer", () => {
+  const now = Date.parse("2026-11-27T12:00:00Z");
+  const answer = { answeredAt: now - 60_000, repoQueues: [], pullRequests: [] };
+
+  it("a failed refresh is no answer, though AsyncResult keeps the older one", () => {
+    const failed = AsyncResult.failure<typeof answer, Error>(Cause.fail(new Error("x")), {
+      previousSuccess: Option.some(AsyncResult.success(answer)),
+    });
+    expect(AsyncResult.getOrElse(failed, () => null)).toBe(answer);
+    expect(currentAnswer(failed, now).answer).toBeNull();
+  });
+
+  it("ages the server's clock by the client's since the answer arrived, until it is stale", () => {
+    const received = AsyncResult.success(answer, { timestamp: now - 60_000 });
+    expect(currentAnswer(received, now)).toEqual({ answer, serverNow: now });
+    expect(currentAnswer(received, now + 3 * 60_000).answer).toBeNull();
   });
 });

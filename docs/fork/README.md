@@ -1525,16 +1525,23 @@ file without it reads as on. Settings → Fork → Issues page.
 Turns on the work panel on this device
 ([#1136](https://github.com/scuttletoby/t3code/issues/1136)): in a thread's side panel, right
 after its sub-agents, a CI part. It has one queue line per repository (workflow runs queued and
-running, counted over the latest 100 runs, and the oldest queued run's age and link), then each pull
-request linked to the thread or a thread under it: queued, running, failed and passed runs on its
-head, the oldest queued wait and a link to the run. These numbers come from one shared read per
-server (`fork.workPanel`, `apps/server/src/fork/workPanel`), kept only in memory. The server asks
-GitHub (with its `gh` login) at most once a minute in all, for every viewer and every repository. It
-waits for the budget's reset when less than a fifth of the rate limit is left or GitHub refuses a
-read for it, and 2, 4, 8 and then 15 minutes when GitHub does not answer. Counts older than 10
-minutes are not shown. A pull request the read has no runs for falls back to what the pull request
-watch saw (failed and passed checks, and whether checks are pending), then to its last sync. A part
-with no answer says unknown and why, never 0. Only github.com repositories are read. Off (the
+running, and the oldest queued run's age and link; a re-run is dated by its own start), then each
+pull request linked to the thread or a thread under it: queued, running, failed and passed runs on
+its head (its watched commit, else the runs GitHub ties to it or its branch in its own repository),
+the oldest queued wait and a link to the run. These numbers come from one shared read per server
+(`fork.workPanel`, `apps/server/src/fork/workPanel`), kept only in memory. The server asks GitHub
+(with its `gh` login) at most once a minute in all, for every viewer and every repository, counted
+from each call's start; a viewer who leaves mid-call does not free the minute. Each repository is
+read three ways in turn: its latest 100 runs, and every queued and every running run, which also
+finds a re-run of an older run. So one panel's three repositories (those of the thread and its
+sub-agents with the most pull requests) are each read fully every nine minutes; with more
+repositories in view at once, a line goes unknown for part of each cycle. It waits for the budget's
+reset when less than a fifth of the rate limit is left or GitHub refuses a read for it, and 2, 4, 8
+and then 15 minutes when GitHub does not answer. Counts older than 10 minutes are not shown. A pull
+request the read has no runs for falls back to what the pull request watch saw (failed and passed
+checks, and whether checks are pending), then to its last sync. A part with no answer says unknown
+and why, never 0: also a machine that answered before and then fails, or whose last answer arrived
+more than three minutes ago; the ages count on from when the answer arrived. Only github.com repositories are read. Off (the
 default): upstream's side panel. A client settings file without it reads as off.
 
 ### A setting the fork removed

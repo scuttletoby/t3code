@@ -39,11 +39,29 @@ class ForkWorkPanel extends Context.Service<
   { readonly read: (input: ForkWorkPanelInput) => Effect.Effect<ForkWorkPanelAnswer> }
 >()("t3/fork/workPanel/workPanel/ForkWorkPanel") {}
 
-/** The pull requests of a thread family's shells, live threads only. */
-const familyLinks = (shells: ReadonlyArray<OrchestrationV2ThreadShell>) =>
-  shells.flatMap((shell) => visibleThreadPullRequests(threadPullRequestsOf(shell)));
+/**
+ * The pull requests of `threadId` and every thread under it (by `lineage.parentThreadId`), as
+ * the panel lists them: a sibling's or the root's are not this thread's, so they take none of the
+ * repository reads.
+ */
+const subtreeLinks = (threadId: string, shells: ReadonlyArray<OrchestrationV2ThreadShell>) => {
+  const inTree = new Set([threadId]);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const shell of shells) {
+      const parent = shell.lineage?.parentThreadId;
+      if (parent != null && inTree.has(parent) && !inTree.has(shell.id)) {
+        inTree.add(shell.id);
+        grew = true;
+      }
+    }
+  }
+  return shells
+    .filter((shell) => inTree.has(shell.id))
+    .flatMap((shell) => visibleThreadPullRequests(threadPullRequestsOf(shell)));
+};
 
-/** The answer for `threadId`'s family, given its shells and the shared cache. */
+/** The answer for `threadId` and the threads under it, given its family's shells and the cache. */
 export const makeRead = (
   readFamily: (
     input: ForkWorkPanelInput,
@@ -52,7 +70,7 @@ export const makeRead = (
 ) =>
   Effect.fn("ForkWorkPanel.read")(function* (input: ForkWorkPanelInput) {
     const shells = (yield* readFamily(input)) ?? [];
-    const links = familyLinks(shells);
+    const links = subtreeLinks(input.threadId, shells);
     const byRepo = new Map<string, { host: string; repository: string; count: number }>();
     for (const link of links) {
       const key = repoQueueKey(link.host, link.repository);
@@ -106,7 +124,7 @@ export const parseGhIncludeOutput = (stdout: string): GitHubRunsAnswer | null =>
 
 /** The GitHub CLI as the source: the server's own `gh` login, as the fork's other reads use. */
 const ghRunsSource = (runner: ProcessRunner.ProcessRunner["Service"]): GitHubRunsSource =>
-  Effect.fn("ForkWorkPanel.ghRuns")(function* ({ host, repository, perPage }) {
+  Effect.fn("ForkWorkPanel.ghRuns")(function* ({ host, repository, perPage, status }) {
     const out = yield* runner
       .run({
         command: "gh",
@@ -117,7 +135,7 @@ const ghRunsSource = (runner: ProcessRunner.ProcessRunner["Service"]): GitHubRun
           host,
           "-X",
           "GET",
-          `repos/${repository}/actions/runs?per_page=${perPage}`,
+          `repos/${repository}/actions/runs?per_page=${perPage}${status === undefined ? "" : `&status=${status}`}`,
         ],
         timeout: GH_TIMEOUT,
         timeoutBehavior: "timedOutResult",

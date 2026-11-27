@@ -2,6 +2,7 @@
 // server's answer faked. Each test names the question it answers.
 import type { ForkWorkPanelAnswer, ThreadPullRequestLink } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { userEvent } from "vite-plus/test/browser";
@@ -37,7 +38,8 @@ vi.mock(import("./workPanelAtom"), () => ({
   forkWorkPanelAtom: (() => Atom.make(state.result)) as never,
 }));
 
-import { ForkWorkPanel, REASON_SERVER_UNANSWERED } from "./ForkWorkPanel";
+import { ForkWorkPanel } from "./ForkWorkPanel";
+import { REASON_SERVER_UNANSWERED } from "./workPanel.logic";
 import { WorkPanelSettings } from "../../settings/fork/WorkPanelSettings";
 
 const link = (number: number, over: Partial<ThreadPullRequestLink> = {}) =>
@@ -180,6 +182,65 @@ describe("the work panel", () => {
     await expect.element(queue).toBeVisible();
     expect(queue.element().textContent).toContain(`unknown: ${REASON_SERVER_UNANSWERED}`);
     expect(queue.element().textContent).not.toMatch(/\b0 queued/);
+  });
+
+  it("answered once, then the refresh fails: grey unknown, not the old counts", async () => {
+    setUp({
+      enabled: true,
+      result: AsyncResult.failure(Cause.fail(new Error("offline")), {
+        previousSuccess: Option.some(AsyncResult.success(answer())),
+      }),
+    });
+    await using screen = await render(panel());
+    const queue = screen.getByTestId("fork-work-panel-repo-queue");
+    await expect.element(queue).toHaveAttribute("data-state", "unknown");
+    expect(queue.element().textContent).toContain(REASON_SERVER_UNANSWERED);
+    expect(queue.element().textContent).not.toContain("3 queued");
+    const rows = screen.getByTestId("fork-work-panel-pr").elements();
+    expect(rows.map((row) => row.getAttribute("data-source"))).not.toContain("runs");
+  });
+
+  it("an answer received over three refreshes ago (a hung read): unknown with its age", async () => {
+    setUp({
+      enabled: true,
+      result: AsyncResult.success(answer({ answeredAt: NOW - 5 * MINUTE }), {
+        timestamp: NOW - 5 * MINUTE,
+      }),
+    });
+    await using screen = await render(panel());
+    const queue = screen.getByTestId("fork-work-panel-repo-queue");
+    await expect.element(queue).toHaveAttribute("data-state", "unknown");
+    expect(queue.element().textContent).toContain("last answer is 5 min old");
+  });
+
+  it("ages keep counting after the answer arrived", async () => {
+    // Received two minutes ago; GitHub had answered the server a minute before that.
+    setUp({
+      enabled: true,
+      result: AsyncResult.success(
+        answer({
+          answeredAt: NOW - 2 * MINUTE,
+          repoQueues: [
+            {
+              host: "github.com",
+              repository: "owner/repo",
+              state: "answered",
+              readAt: NOW - 3 * MINUTE,
+              queued: 3,
+              running: 2,
+              oldestQueuedAt: NOW - 14 * MINUTE,
+              scanned: 100,
+            },
+          ],
+        }),
+        { timestamp: NOW - 2 * MINUTE },
+      ),
+    });
+    await using screen = await render(panel());
+    const queue = screen.getByTestId("fork-work-panel-repo-queue");
+    await expect.element(queue).toBeVisible();
+    expect(queue.element().textContent).toContain("GitHub answered 3 min ago");
+    expect(queue.element().textContent).toContain("oldest queued 14 min");
   });
 
   it("no PRs: says so, with no queue line", async () => {

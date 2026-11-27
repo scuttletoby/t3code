@@ -3,6 +3,7 @@
  * already holds and the server's `fork.workPanel` answer. A part with no answer says unknown and
  * why; it never shows a guessed count.
  */
+import { AsyncResult } from "effect/reactivity";
 import type {
   ForkPullRequestRuns,
   ForkRepoQueue,
@@ -225,4 +226,34 @@ export function repoQueueSourceText(line: ForkRepoQueue, now: number): string {
       : ` Next read in ${formatAge(line.nextReadAt - now)}.`;
   const reason = line.state === "answered" && line.reason !== undefined ? ` ${line.reason}` : "";
   return `${read}${reason}${next}`;
+}
+
+/** An answer received longer ago than three refreshes (a minute each) is not current. */
+const ANSWER_STALE_MS = 3 * 60_000;
+
+export const REASON_SERVER_UNANSWERED =
+  "This machine did not answer the work panel's read (it may be offline or run an older version).";
+const REASON_SERVER_PENDING = "Waiting for this machine's first answer.";
+
+/**
+ * A machine's answer as of `clientNow`: none after a failed refresh (`getOrElse` keeps the old
+ * one) or one received over three refreshes ago. `serverNow` ages the answer time by the client
+ * clock since it arrived, so ages keep counting whatever either clock's skew.
+ */
+export function currentAnswer(
+  result: AsyncResult.AsyncResult<ForkWorkPanelAnswer, unknown>,
+  clientNow: number,
+):
+  | { readonly answer: ForkWorkPanelAnswer; readonly serverNow: number }
+  | { readonly answer: null; readonly reason: string } {
+  if (result._tag === "Failure") return { answer: null, reason: REASON_SERVER_UNANSWERED };
+  if (result._tag !== "Success") return { answer: null, reason: REASON_SERVER_PENDING };
+  const age = clientNow - result.timestamp;
+  if (age > ANSWER_STALE_MS) {
+    return {
+      answer: null,
+      reason: `This machine's last answer is ${formatAge(age)} old; it has not answered since.`,
+    };
+  }
+  return { answer: result.value, serverNow: result.value.answeredAt + Math.max(0, age) };
 }

@@ -8,7 +8,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { AsyncResult } from "effect/reactivity";
 import type { MouseEvent as ReactMouseEvent } from "react";
 
 import { useOpenLink } from "../../../browser/useOpenLink";
@@ -20,6 +19,7 @@ import { ThreadDetailsSection } from "../../chat/ThreadDetailsSection";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../ui/tooltip";
 import {
   CI_SOURCE_TEXT,
+  currentAnswer,
   familyPullRequests,
   pullRequestCi,
   pullRequestCiText,
@@ -31,9 +31,6 @@ import {
 } from "./workPanel.logic";
 import { forkWorkPanelAtom } from "./workPanelAtom";
 
-export const REASON_SERVER_UNANSWERED =
-  "This machine did not answer the work panel's read (it may be offline or run an older version).";
-const REASON_SERVER_PENDING = "Waiting for this machine's first answer.";
 const REASON_SERVER_SKIPPED = "This machine did not read this repository.";
 
 interface ForkWorkPanelProps {
@@ -59,22 +56,18 @@ function WorkPanelBody(props: {
     forkWorkPanelAtom({ environmentId: props.environmentId, input: { threadId: props.threadId } }),
   );
   const openLink = useOpenLink(scopeThreadRef(props.environmentId, props.threadId));
-  const answer = AsyncResult.getOrElse(result, () => null);
-  const missingReason =
-    answer !== null
-      ? REASON_SERVER_SKIPPED
-      : result._tag === "Failure"
-        ? REASON_SERVER_UNANSWERED
-        : REASON_SERVER_PENDING;
+  // The minute tick is UTC, truncated to the minute.
+  const clientNow = Date.parse(`${useNowMinute()}:00Z`);
+  const current = currentAnswer(result, clientNow);
+  const answer = current.answer;
+  const missingReason = current.answer !== null ? REASON_SERVER_SKIPPED : current.reason;
   const pullRequests = familyPullRequests(
     props.threadId,
     shells.filter((shell) => shell.environmentId === props.environmentId),
   );
   const lines = repoQueueLines(pullRequests, answer, missingReason);
   const runs = runsByPullRequest(answer);
-  // The minute tick is UTC, truncated to the minute.
-  const clientNow = Date.parse(`${useNowMinute()}:00Z`);
-  const serverNow = answer?.answeredAt ?? clientNow;
+  const serverNow = current.answer !== null ? current.serverNow : clientNow;
   const open = (url: string) => (event: ReactMouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
     void openLink(url, { event });
