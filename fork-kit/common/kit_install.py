@@ -175,7 +175,9 @@ class Installer:
         compiles its whole file on every start (a script's bytecode is never cached), and a hook runs on every call;
         loaded through importlib it uses __pycache__/<name>.<tag>.pyc beside the file. The copy carries that file,
         root-owned and in the manifest like every other file, checked against the source's hash on every load
-        (CHECKED_HASH), so a copy that does not match is never used: it is compiled as before."""
+        (CHECKED_HASH), so a copy that does not match is never used: it is compiled as before. The tag is the one of
+        the Python running the install: a hook run by another Python finds no .pyc of its own and compiles the source
+        (slower, same answer) until the next install."""
         import importlib.util
         return {os.path.normpath(importlib.util.cache_from_source(rel)): rel for rel in self.BYTECODE}
 

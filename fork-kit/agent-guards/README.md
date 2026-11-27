@@ -50,10 +50,17 @@ through `agent-guards-fast` (bin/, [lib/agent_guards/fast.py](lib/agent_guards/f
 the event and passes the call itself only where the hook surely passes it without a word (the guard's own fast exit
 for a command of plain words, [quick.py](lib/agent_guards/quick.py), a checked copy of it; no capacity command's
 name in the text; no Write to a `MEMORY.md`, an index unchanged since the session's state file). Everything else,
-and anything odd (a broken event, a machine file problem to report), runs the hook file on the same event, from the
-bytecode the installer wrote beside it (checked against the file's hash on each load; without it, compiled as
-before). Without `agent-guards-fast`, or with an empty one, the entry runs the hook as before. Python runs with `-S`
-(no site; the hooks use the standard library only). `tests/fast.test.py` runs the hooks' test cases both ways.
+and anything odd (a broken event, a machine file problem to report), runs the hook file on the same event. Its
+bytecode is the one the installer wrote in the version copy (`versions/<sha>/bin/__pycache__/`, in the manifest): the
+link `/usr/local/bin/<hook>` is resolved first, and only a checked-hash `.pyc` of exactly that file's text, owned
+like it and writable by no one else, is used (`fast.hook_code`); a `.pyc` beside the link is never looked at.
+Anything else is compiled from the source as before: same answers, ~30 ms slower for actions-disable-guard. That
+includes bytecode of another Python: the installer compiles with the Python that runs it (`/usr/bin/python3` by its
+first line), so an install run by another one, or a Python upgrade, means compiling from source until the next
+`agent-guards-install install`. Reading the event and the fast check have 3 s (an alarm, as the guard's own read
+has); past that the hook answers on its own clock (the guard refuses at its 5 s budget). Without
+`agent-guards-fast`, or with an empty one, the entry runs the hook as before. Python runs with `-S` (no site; the
+hooks use the standard library only). `tests/fast.test.py` runs the hooks' test cases both ways.
 
 **Tools.** The Bash and Monitor tools both run shell text (`tool_input.command`), so the command hooks match both.
 `agent-guards check` fails a hook that is wired for Bash only (MISSING ... Monitor).

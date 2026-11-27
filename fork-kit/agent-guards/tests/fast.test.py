@@ -9,7 +9,7 @@ itself (a pass), the full hook passes too; everywhere else it runs the hook file
 (a test runner handed the folder: this file loads actions-disable.test.py, full of the patterns that guard refuses.)
 """
 import importlib, importlib.machinery, importlib.util, inspect, json, marshal, os, py_compile, re, shutil, subprocess, sys
-import tempfile, time, types, unittest
+import signal, tempfile, threading, time, types, unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -72,6 +72,14 @@ def event(cmd, tool='Bash', cwd=None, **more):
     if cwd:
         ev['cwd'] = cwd
     return json.dumps(ev).encode()
+
+
+def slow_event(hook):
+    """An event the fast check of `hook` does not pass, so the hook runs."""
+    if hook == 'memory-index-guard':
+        return json.dumps({'hook_event_name': 'PreToolUse', 'tool_name': 'Write',
+                           'tool_input': {'file_path': '/x/MEMORY.md'}}).encode()
+    return event('t3-capacity 1 && x' if hook == 'capacity-pipe-guard' else 'pnpm test')
 
 
 class QuickCopyTest(unittest.TestCase):
@@ -354,25 +362,99 @@ class LauncherTest(unittest.TestCase):
         with open(hook, 'a') as f:
             f.write('# changed after install\n')
         self.assertIn(b'"command": "pnpm test"', self.via(hook, event('pnpm test')).stdout)
-        # and the real thing: py_compile's checked hash .pyc of the file as it is now is taken
+        # and the real thing: py_compile's checked hash .pyc of the file as it is now is taken (its code is named
+        # after the file it was compiled from; the source compiled here is named after the path the hook was given)
         py_compile.compile(hook, cfile=pyc, doraise=True, invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
-        r = subprocess.run([sys.executable, '-I', '-B', '-v', '-c', fx.FAST_RUNNER, fx.LIB, fx.NO_MACHINE,
-                            str(os.geteuid()), hook], input=event('pnpm test'), capture_output=True, timeout=60)
-        self.assertIn(f'# code object from {pyc!r}'.encode(), r.stderr)
+        link = os.path.join(self.tmp, 'links', 'actions-disable-guard')
+        os.makedirs(os.path.dirname(link))
+        os.symlink(hook, link)
+        self.assertEqual(fast.hook_code(link).co_filename, hook)
+        os.unlink(pyc)
+        self.assertEqual(fast.hook_code(link).co_filename, link)
+
+    def installed(self, name):
+        """The installed layout: versions/<sha>/bin/<hook> with the installer's .pyc (crafted: its code prints
+        FROM-PYC, so which one ran shows), and the bin folder of links the settings entry names (`"$g"`)."""
+        hook = self.stand_in(name, folder='versions/abc/bin')
+        with open(hook, 'rb') as f:
+            source = f.read()
+        self.pyc(hook, 3, source, 'print("FROM-PYC")')
+        link = os.path.join(self.tmp, 'usr-local-bin', name)
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        os.symlink(os.path.relpath(hook, os.path.dirname(link)), link)
+        return hook, link, source
+
+    @staticmethod
+    def pyc(path, flags, source, text):
+        """A hash-based .pyc (PEP 552) for `path`: flags 3 checked, 1 unchecked; `text` is its code."""
+        pyc = importlib.util.cache_from_source(path)
+        os.makedirs(os.path.dirname(pyc), exist_ok=True)
+        with open(pyc, 'wb') as f:
+            f.write(importlib.util.MAGIC_NUMBER + flags.to_bytes(4, 'little') + importlib.util.source_hash(source)
+                    + marshal.dumps(compile(text, path, 'exec')))
+        return pyc
+
+    def test_through_the_bin_folder_of_links_only_the_version_copys_checked_pyc_runs(self):
+        """Fix round 1 of #1119: the settings entry gives the link /usr/local/bin/<hook>. The bytecode used is the
+        installer's, beside the file the link points to; a .pyc planted beside the link (outside the manifest and the
+        self-check) never runs, whatever kind it is; an unchecked or writable one in the copy is not used either."""
+        for name in ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard'):
+            with self.subTest(name):
+                hook, link, source = self.installed(name)
+                for flags in (1, 3):   # Python takes an unchecked one as it is, a checked one if the source matches
+                    self.pyc(link, flags, source, 'print("PLANTED")')
+                    self.assertEqual(self.via(link, slow_event(name)).stdout, b'FROM-PYC\n')
+                self.pyc(hook, 1, source, 'print("FROM-PYC")')   # unchecked in the copy: the source runs
+                r = self.via(link, slow_event(name))
+                self.assertNotIn(b'PLANTED', r.stdout)
+                self.assertIn(b'"tool_name"', r.stdout)
+                os.chmod(self.pyc(hook, 3, source, 'print("FROM-PYC")'), 0o666)   # writable by others: the source
+                self.assertIn(b'"tool_name"', self.via(link, slow_event(name)).stdout)
+                os.unlink(importlib.util.cache_from_source(hook))   # none (another Python's tag): the source
+                self.assertIn(b'"tool_name"', self.via(link, slow_event(name)).stdout)
+                os.unlink(link)
+                os.symlink(os.path.join(self.tmp, 'versions', 'gone', name), link)   # dangling: no pass, a failure
+                r = self.via(link, slow_event(name))
+                self.assertEqual((r.returncode, r.stdout), (1, b''))
+                self.assertIn(b'FileNotFoundError', r.stderr)
 
     def test_a_slow_start_never_refuses_a_command_the_fast_path_passes(self):
-        """The event comes 5.5 s late (a machine under memory pressure): the guard started as before is out of
-        its 5 s and refuses; through the fast path the plain command passes (it never looks at the clock)."""
+        """The process is held up 5.5 s before it reads its event (a machine under memory pressure; the event is
+        waiting on stdin): past the guard's 5 s budget, the plain command still passes (the fast check never looks at
+        the clock)."""
         hook = os.path.join(fx.BIN, 'actions-disable-guard')
-        argv = [fx.LIB, fx.NO_MACHINE, str(os.geteuid()), hook]
-        procs = [subprocess.Popen([sys.executable, '-I', '-B', '-c', runner, *argv], stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
-                 for runner in (fx.RUNNER, fx.FAST_RUNNER)]
-        time.sleep(5.5)
-        (old, _), (new, _) = [p.communicate(event('ls -la', cwd=self.tmp), timeout=60) for p in procs]
-        self.assertIn(b'could not finish reading this command', old)
-        self.assertEqual((procs[1].returncode, new), (0, b''))
+        with subprocess.Popen([sys.executable, '-I', '-B', '-c', fx.FAST_RUNNER, fx.LIB, fx.NO_MACHINE,
+                               str(os.geteuid()), hook], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=self.env) as p:
+            os.kill(p.pid, signal.SIGSTOP)
+            p.stdin.write(event('ls -la', cwd=self.tmp))
+            p.stdin.close()
+            time.sleep(5.5)
+            os.kill(p.pid, signal.SIGCONT)
+            out, err = p.stdout.read(), p.stderr.read()
+            p.wait(timeout=60)
+        self.assertEqual((p.returncode, out), (0, b''), err)
 
+    def test_an_event_that_never_comes_gets_the_guards_own_refusal_in_time(self):
+        """Fix round 1 of #1119: the fast path reads stdin under its own alarm (FAST_BUDGET), as the guard does. A
+        stdin that is never closed goes to the guard, which refuses with its own message well inside the hook's
+        10 s (as it does when started as before), instead of hanging until Claude Code ends the hook."""
+        hook = os.path.join(fx.BIN, 'actions-disable-guard')
+        start = time.monotonic()
+        with subprocess.Popen([sys.executable, '-I', '-B', '-c', fx.FAST_RUNNER, fx.LIB, fx.NO_MACHINE,
+                               str(os.geteuid()), hook], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, env=self.env) as p:
+            p.stdin.write(b'{"tool_name": "Bash", ')   # half an event, and stdin stays open
+            p.stdin.flush()
+            stop = threading.Timer(15, p.kill)   # a fast path that waits on stdin for ever: no answer
+            stop.start()
+            self.addCleanup(stop.cancel)
+            out = p.stdout.read()
+            took = time.monotonic() - start
+            p.stdin.close()
+            p.wait(timeout=60)
+        self.assertIn(b'could not finish reading this command', out)
+        self.assertLess(took, 9.5)
 
 if __name__ == '__main__':
     unittest.main()
