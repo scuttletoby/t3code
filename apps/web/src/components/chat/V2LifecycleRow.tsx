@@ -67,6 +67,7 @@ import { getTriggerDisplayModelName } from "./providerIconUtils";
 import { ProviderInstanceIcon, providerTextColor } from "./ProviderInstanceIcon";
 import { cn } from "~/lib/utils";
 import { TimelineSystemDivider } from "./TimelineSystemDivider";
+import * as ForkHandoffDivider from "../fork/handoff/handoffDivider"; // Fork (HO5)
 import { subagentResumedSince } from "./V2LifecycleRow.logic";
 import { Button, InlineButton } from "../ui/button";
 import { T3Wordmark } from "../T3Wordmark";
@@ -645,6 +646,8 @@ function EnvironmentHandoffRow({
 /** Marks where `/clear` or an automation started a new provider session in this thread. */
 export function FreshSessionRow() {
   const gt = useGT();
+  const forkHandoffLabel = ForkHandoffDivider.useLabel(); // Fork (HO5)
+  if (forkHandoffLabel) return <TimelineSystemDivider label={forkHandoffLabel} icon={EraserIcon} />; // Fork (HO5)
   return <TimelineSystemDivider label={gt("New session")} icon={EraserIcon} />;
 }
 

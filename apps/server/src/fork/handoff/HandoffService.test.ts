@@ -15,6 +15,7 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
+  ProjectId,
   ProviderDriverKind,
   RunAttemptId,
   RunId,
@@ -121,6 +122,8 @@ const harness = (state: {
   projectProviderInstances?: Record<string, { readonly enabled: boolean }> | undefined;
   /** Instance ids upstream's registry does not have (removed); read at each lookup. */
   missing?: Set<string>;
+  /** The server's role pointers (none: no roles). */
+  threadRoles?: ServerSettingsValue["threadRoles"];
   /** The server's agent slot gate (none: a server without one). */
   gate?: Layer.Layer<SlotGate.SlotGate>;
   /**
@@ -289,6 +292,7 @@ const harness = (state: {
           ...DEFAULT_SERVER_SETTINGS,
           providerInstances: state.providerInstances ?? {},
           handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.settings },
+          threadRoles: state.threadRoles ?? DEFAULT_SERVER_SETTINGS.threadRoles,
           projectSettingsOverrides:
             state.project === undefined && state.projectProviderInstances === undefined
               ? {}
@@ -350,11 +354,14 @@ const harness = (state: {
           }),
       }),
     );
-    yield* HandoffService.make.pipe(
-      Effect.flatMap((service) => service.start()),
+    const service = yield* HandoffService.make.pipe(
+      Effect.tap((made) => made.start()),
       Effect.provide(dependencies),
       Effect.withTracer(tracer),
     );
+    /** A person's "Hand off now", and the thread's state for the menu and the chip. */
+    const ask = () => service.ask(threadId).pipe(Effect.withTracer(tracer));
+    const threadState = () => service.threadState(threadId).pipe(Effect.withTracer(tracer));
     /** Offers an event, then waits until the span `name` has ended `count` times in all. */
     const emit = (event: OrchestrationV2DomainEvent | null, name: string, count: number) =>
       Effect.gen(function* () {
@@ -365,7 +372,7 @@ const harness = (state: {
         if (event !== null) yield* Queue.offer(events, event);
         yield* Deferred.await(done);
       });
-    return { sent, emit, reads, events, commandRuns, ended, settleEffect };
+    return { sent, emit, reads, events, commandRuns, ended, settleEffect, ask, threadState };
   });
 
 /** For a test that hangs, not fails, when a check is gone: it ends in milliseconds when right. */
@@ -632,6 +639,45 @@ describe("HandoffService", () => {
         expect(messages(sent)).toHaveLength(sends);
         // Off for the thread reads nothing more than its settings.
         if (sends === 0) expect(reads.count).toBe(0);
+      }),
+  );
+
+  it.effect.each([
+    { holds: "assistant", settings: { roles: "handoff" }, sends: 1 },
+    { holds: "orchestrator", settings: { roles: "handoff" }, sends: 1 },
+    { holds: "no role", settings: { roles: "handoff" }, sends: 0 },
+    { holds: "another project's orchestrator", settings: { roles: "handoff" }, sends: 0 },
+    { holds: "orchestrator", settings: { mode: "handoff", roles: "compact" }, sends: 0 },
+    {
+      holds: "orchestrator",
+      settings: { roles: "compact", threads: { [threadId]: "handoff" } },
+      sends: 1,
+    },
+  ] as ReadonlyArray<{
+    holds: string;
+    settings: Partial<HandoffSettings>;
+    sends: number;
+  }>)(
+    "a thread holding a role takes the roles mode, its own mode first (HO6: $holds, sends $sends)",
+    ({ holds, settings, sends }) =>
+      Effect.gen(function* () {
+        const data = projection({ usedTokens: 400_000 });
+        const projectId = data.thread.projectId;
+        const threadRoles = {
+          assistant: holds === "assistant" ? threadId : null,
+          orchestrators:
+            holds === "orchestrator"
+              ? { [projectId]: threadId }
+              : holds === "another project's orchestrator"
+                ? { [ProjectId.make("project-other")]: threadId }
+                : {},
+        };
+        const state = { data, settings, threadRoles };
+        const { sent, emit } = yield* harness(state);
+        yield* emit(runUpdated(run()), "readThread", 1);
+        yield* settle;
+        yield* emit(null, "handOffWhenDue", 1);
+        expect(messages(sent)).toHaveLength(sends);
       }),
   );
 
@@ -2257,4 +2303,172 @@ describe("HandoffService, agent source", () => {
         expect(sent).toEqual([]);
       }),
   );
+
+  describe("Hand off now (HO5)", () => {
+    // Under the size backstop and the idle size: no turn end hands it off; only a person does.
+    const small = () => projection({ usedTokens: 50_000 });
+    const pressable = { mode: "handoff" } as const;
+    const pending = [
+      { id: RuntimeRequestId.make("request-1"), status: "pending" },
+    ] as unknown as OrchestrationV2ThreadProjection["runtimeRequests"];
+
+    it.effect("a press at a quiet thread hands off after the settle, with the turn end's ids", () =>
+      Effect.gen(function* () {
+        const state = { data: small(), settings: pressable };
+        const { sent, emit, ask } = yield* harness(state);
+        // The turn end's loop skips it (too small); the event's handler finishes first.
+        yield* emit(runUpdated(run()), "handOffWhenDue", 1);
+        yield* Effect.yieldNow;
+        expect(sent).toEqual([]);
+        expect(yield* ask()).toEqual({ kind: "started" });
+        yield* TestClock.adjust(HANDOFF_SETTLE_MS - 1);
+        expect(sent).toEqual([]);
+        yield* TestClock.adjust(1);
+        yield* emit(null, "handOffWhenDue", 2);
+        expect(messages(sent)).toMatchObject([
+          { commandId: `server:handoff:${threadId}:${runId}`, messageId: handoffMessageId },
+        ]);
+      }),
+    );
+
+    it.effect("a late update of the pressed run does not stop the press", () =>
+      Effect.gen(function* () {
+        const state = { data: small(), settings: pressable };
+        const { sent, emit, events, ask } = yield* harness(state);
+        yield* emit(runUpdated(run()), "handOffWhenDue", 1);
+        yield* Effect.yieldNow;
+        expect(yield* ask()).toEqual({ kind: "started" });
+        // A child's settlement re-reports run-1 inside the settle: a turn end's loop would skip it.
+        yield* Queue.offer(events, lateRun1());
+        yield* settle;
+        yield* emit(null, "handOffWhenDue", 2);
+        expect(messages(sent).map((one) => one.messageId)).toEqual([handoffMessageId]);
+      }),
+    );
+
+    it.effect("a second press, or a turn end at the same time, sends one handoff", () =>
+      Effect.gen(function* () {
+        const state = { data: small(), settings: { ...pressable, sizeTokens: 40_000 } };
+        const { sent, emit, ask } = yield* harness(state);
+        // The turn end is due by size (40K backstop) and settling; two presses come in meanwhile.
+        yield* emit(runUpdated(run()), "readThread", 1);
+        expect(yield* ask()).toEqual({ kind: "started" });
+        expect(yield* ask()).toEqual({ kind: "started" });
+        yield* settle;
+        yield* emit(null, "handOffWhenDue", 1);
+        // A press after it was sent: the latest run is the handoff's own, so nothing more.
+        state.data = {
+          ...state.data,
+          runs: [
+            ...state.data.runs,
+            run({ id: RunId.make("run-2"), ordinal: 2, userMessageId: handoffMessageId }),
+          ],
+        };
+        expect(yield* ask()).toEqual({ kind: "skip", reason: "last-run-handoff" });
+        yield* settle;
+        expect(messages(sent).map((message) => message.commandId)).toEqual([
+          `server:handoff:${threadId}:${runId}`,
+        ]);
+      }),
+    );
+
+    it.effect("a busy thread answers what it waits on and queues nothing", () =>
+      Effect.gen(function* () {
+        const state = {
+          data: { ...small(), runtimeRequests: pending },
+          settings: pressable,
+        };
+        const { sent, emit, ask, ended } = yield* harness(state);
+        expect(yield* ask()).toEqual({ kind: "wait", blockers: [{ kind: "request-pending" }] });
+        // Quiet again: nothing was queued, so nothing goes.
+        state.data = small();
+        yield* emit(threadChanged(state.data), "ask", 1);
+        yield* TestClock.adjust(10 * MINUTE_MS);
+        expect(sent).toEqual([]);
+        expect(ended.get("HandoffService.handOffWhenDue") ?? 0).toBe(0);
+      }),
+    );
+
+    it.effect("a press that finds the thread busy again inside the settle ends unsent", () =>
+      Effect.gen(function* () {
+        const state = { data: small(), settings: pressable };
+        const { sent, emit, ask } = yield* harness(state);
+        expect(yield* ask()).toEqual({ kind: "started" });
+        state.data = { ...small(), runtimeRequests: pending };
+        yield* emit(threadChanged(state.data), "handOffWhenDue", 1);
+        state.data = small();
+        yield* emit(threadChanged(state.data), "readThread", 3);
+        yield* TestClock.adjust(10 * MINUTE_MS);
+        expect(sent).toEqual([]);
+      }),
+    );
+
+    it.effect.each([
+      { name: "off for the thread", settings: {}, usedTokens: 50_000, answer: { kind: "off" } },
+      {
+        name: "under the smallest handoff size",
+        settings: pressable,
+        usedTokens: 10_000,
+        answer: { kind: "skip", reason: "too-small" },
+      },
+    ] as const)("$name: answers why and sends nothing", ({ settings, usedTokens, answer }) =>
+      Effect.gen(function* () {
+        const state = { data: projection({ usedTokens }), settings };
+        const { sent, ask, threadState } = yield* harness(state);
+        expect(yield* ask()).toEqual(answer);
+        expect((yield* threadState()).ask).toEqual(answer);
+        yield* TestClock.adjust(10 * MINUTE_MS);
+        expect(sent).toEqual([]);
+      }),
+    );
+
+    it.effect("the chip: what a due handoff waits on, gone once it no longer waits", () =>
+      Effect.gen(function* () {
+        const quiet = projection({ usedTokens: 160_000 });
+        const state = {
+          data: { ...quiet, runtimeRequests: pending },
+          settings: pressable as Partial<HandoffSettings>,
+        };
+        const { sent, emit, ended, threadState } = yield* harness(state);
+        /** Offers an event, then waits for `name` to end once more (the chip's reads count too). */
+        const next = (event: OrchestrationV2DomainEvent, name: string) =>
+          emit(event, name, (ended.get(name) ?? 0) + 1);
+        const read = "HandoffService.readThread";
+        expect((yield* threadState()).waitingOn).toEqual([]);
+        // The turn end's loop reads and waits; a change wakes it to read again, by when its first
+        // decision is in.
+        yield* next(runUpdated(run()), read);
+        yield* next(threadChanged(state.data), read);
+        expect(yield* threadState()).toMatchObject({
+          on: true,
+          usedTokens: 160_000,
+          ask: { kind: "wait", blockers: [{ kind: "request-pending" }] },
+          waitingOn: [{ kind: "request-pending" }],
+        });
+        // Quiet: the loop decides to hand off, which takes the chip, then checks the relay.
+        state.data = quiet;
+        yield* next(threadChanged(state.data), "HandoffRelayView.relayShowsFinish");
+        expect((yield* threadState()).waitingOn).toEqual([]);
+        yield* settle;
+        yield* emit(null, "handOffWhenDue", 1);
+        expect(messages(sent)).toHaveLength(1);
+        expect((yield* threadState()).waitingOn).toEqual([]);
+
+        // Waiting again for a later run, then switched off: the loop ends and takes its chip.
+        state.data = {
+          ...state.data,
+          runs: [run({ id: RunId.make("run-2"), ordinal: 2 })],
+          runtimeRequests: pending,
+        };
+        yield* next(runUpdated(run({ id: RunId.make("run-2"), ordinal: 2 })), read);
+        yield* next(threadChanged(state.data), read);
+        expect((yield* threadState()).waitingOn).toEqual([{ kind: "request-pending" }]);
+        state.settings = {};
+        yield* next(threadChanged(state.data), "HandoffService.handOffTimer");
+        state.settings = pressable;
+        expect((yield* threadState()).waitingOn).toEqual([]);
+        expect(messages(sent)).toHaveLength(1);
+      }),
+    );
+  });
 });

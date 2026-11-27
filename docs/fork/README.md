@@ -1387,7 +1387,9 @@ Only the person can change it; agents cannot. `mode` is `off` (the default: upst
 settings apply as they are), `handoff` (upstream's idle compaction then skips the thread, so
 only the handoff acts on it), or `compact` (the same as `off`, so one thread can opt out
 of its project's `handoff`). `threads` maps a thread id to a mode and wins over `mode` (at most
-500). `source` says who writes the handoff: `none` (the default: T3's state and the recent
+500). `roles` (not set by default) is the mode of a thread that holds a role in
+[`server.threadRoles`](#serverthreadroles): the assistant, or its own project's orchestrator. It wins
+over `mode`; a thread's own entry in `threads` wins over it. `source` says who writes the handoff: `none` (the default: T3's state and the recent
 conversation only), `agent` (the old session, in one turn; `instructions` replaces the built-in
 text) or `command` (a program given as `command`, run without a shell in the project folder; it
 must only read and be safe to run twice; its output is the handoff). Settings saved before `none`
@@ -1403,7 +1405,7 @@ program `env` finds on the `PATH`, and runners such as `make` or `npm` are refus
 against mistakes, not attacks: [handoff.md](handoff.md) lists what it does not catch. A command
 already stored is not checked again. The command gets a short list of the server's environment.
 
-In the app: **Settings → Fork**, section Handoff instead of compaction: the mode, each thread's own mode (added by thread
+In the app: **Settings → Fork**, section Handoff instead of compaction: the mode, the role threads' mode, each thread's own mode (added by thread
 id, shown with its title where this client knows the thread), and under Advanced the sizes, who
 writes the handoff (with its command) and the instructions. `modelSelection` has no row yet; a save
 there keeps it as stored.

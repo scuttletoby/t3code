@@ -11,6 +11,7 @@ import {
 } from "./chat/threadContextDrag";
 import { discardComposerDraft } from "../lib/discardComposerDraft";
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
+import * as ForkHandoffMenu from "./fork/handoff/handoffMenu"; // Fork (HO5)
 import { useAtomValue } from "@effect/atom-react";
 import * as Option from "effect/Option";
 import { Atom } from "effect/reactivity";
@@ -2733,6 +2734,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                 projectRef.projectId === thread.projectId,
             ),
           ) ?? null;
+        const forkHandoff = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)
         const clicked = await settlePromise(() =>
           api.contextMenu.show(
             buildThreadActionMenuItems({
@@ -2771,6 +2773,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                 titleRegeneration: configLoaded,
               },
               snoozePresets,
+              forkHandoff, // Fork (HO5)
             }),
             position,
             source,
@@ -2796,6 +2799,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           return;
         }
         switch (clicked.value) {
+          case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)
+            return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)
           case "filter-by-project":
             if (threadProjectGroup) {
               setProjectScopeKeys(

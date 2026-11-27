@@ -30,13 +30,17 @@ import { CommitTextField } from "./CommitTextField";
 import { BoundedNumberField, ForkAdvanced, ForkRow, OptionLines, useSubRowReset } from "./ForkRow";
 import {
   HANDOFF_MODE_OPTIONS,
+  HANDOFF_ROLES_INHERIT_LABEL,
+  type HandoffRolesChoice,
   boundHandoffTokens,
   formatArgvLines,
   handoffModeLabel,
+  handoffRolesLabel,
   handoffSourceProblem,
   handoffThreadRows,
   parseArgvLines,
   threadModeProblem,
+  withRolesMode,
   withThreadMode,
 } from "./handoffSettings.logic";
 import { defaultIs } from "./forkDefaultText.logic";
@@ -49,6 +53,42 @@ const SOURCE_LABELS: Record<HandoffSource, string> = {
   agent: "The old session",
   command: "A command",
 };
+
+/** HO6: the mode of a thread holding a role; "Same as above" leaves it to the mode. */
+function RolesSelect({
+  value,
+  onChange,
+}: {
+  readonly value: HandoffRolesChoice;
+  readonly onChange: (choice: HandoffRolesChoice) => void;
+}) {
+  return (
+    <Select
+      value={value}
+      onValueChange={(next) => {
+        if (next !== null && next !== value) onChange(next as HandoffRolesChoice);
+      }}
+    >
+      <SelectTrigger
+        size="sm"
+        className="w-full sm:w-32"
+        aria-label="Handoff mode for role threads"
+      >
+        <SelectValue>{handoffRolesLabel(value)}</SelectValue>
+      </SelectTrigger>
+      <SelectPopup align="end" alignItemWithTrigger={false}>
+        <SelectItem hideIndicator value="inherit">
+          {HANDOFF_ROLES_INHERIT_LABEL}
+        </SelectItem>
+        {HANDOFF_MODE_OPTIONS.map((option) => (
+          <SelectItem hideIndicator key={option.value} value={option.value}>
+            {option.label}
+          </SelectItem>
+        ))}
+      </SelectPopup>
+    </Select>
+  );
+}
 
 function ModeSelect({
   value,
@@ -166,6 +206,20 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
             value={shown.mode}
             label="Handoff mode"
             onChange={(mode) => save({ ...shown, mode })}
+          />
+        }
+      />
+      <ForkRow
+        {...searchableSetting("handoff-roles")}
+        // Not settingKeys: upstream's reset there would clear the project's whole override.
+        managedPaths={["handoff"]}
+        lockPaths={["handoff"]}
+        resetAction={subRowReset(["roles"], "Reset the role threads' mode to the environment's")}
+        description="The assistant and each project's orchestrator (the calm sidebar's roles) take this mode. A thread's own choice below still wins."
+        control={
+          <RolesSelect
+            value={shown.roles ?? "inherit"}
+            onChange={(choice) => save(withRolesMode(shown, choice))}
           />
         }
       />

@@ -67,6 +67,11 @@ const HandoffSettingsStruct = Schema.Struct({
   ),
   /** The new session's model and effort; not set uses the thread's current one, written out. */
   modelSelection: Schema.optionalKey(ModelSelection),
+  /**
+   * The mode of a thread that holds a role (`threadRoles`: the assistant, or its project's
+   * orchestrator); wins over `mode`, a thread's own mode wins over it. Not set: `mode`.
+   */
+  roles: Schema.optionalKey(HandoffMode),
 });
 
 const STRUCT_DEFAULTS = Schema.decodeSync(HandoffSettingsStruct)({});
@@ -137,17 +142,73 @@ export const HandoffSettingsFromSettingsFile = Schema.Unknown.pipe(
 /**
  * The handoff settings and mode of one thread: a project's value replaces the server's whole (a
  * bad one reads as off, never as the server's). A thread's own mode wins over every `mode`: the
- * project's entry for it first, then the server's.
+ * project's entry for it first, then the server's. Next, for a thread that holds a role
+ * (`holdsRole`), the settings' `roles`; else their `mode`.
  */
 export function resolveHandoffSettings(
   server: HandoffSettings,
   project: HandoffSettings | null | undefined,
   threadId: string,
+  holdsRole = false,
 ): { readonly settings: HandoffSettings; readonly mode: HandoffMode } {
   const settings = project ?? server;
   const own = (value: HandoffSettings | null | undefined) =>
     value !== null && value !== undefined && Object.hasOwn(value.threads, threadId)
       ? value.threads[threadId]
       : undefined;
-  return { settings, mode: own(project) ?? own(server) ?? settings.mode };
+  return {
+    settings,
+    mode: own(project) ?? own(server) ?? (holdsRole ? settings.roles : undefined) ?? settings.mode,
+  };
+}
+
+/**
+ * Whether a thread holds a role in `threadRoles`: it is the assistant, or its own project's
+ * orchestrator. The caller checks the thread is there and not archived (the handoff's read does).
+ */
+export function holdsThreadRole(
+  roles: {
+    readonly assistant: string | null;
+    readonly orchestrators: { readonly [projectId: string]: string };
+  },
+  thread: { readonly id: string; readonly projectId: string },
+): boolean {
+  return (
+    roles.assistant === thread.id ||
+    (Object.hasOwn(roles.orchestrators, thread.projectId) &&
+      roles.orchestrators[thread.projectId] === thread.id)
+  );
+}
+
+/** The web app's handoff routes (fork/handoff/handoffRoutes.ts on the server). */
+export const HANDOFF_STATE_PATH = "/api/fork/handoff/state";
+export const HANDOFF_NOW_PATH = "/api/fork/handoff/now";
+
+/** What keeps a due handoff from going: the "handoff waiting on" chip names each. */
+export type HandoffRouteBlocker =
+  | { readonly kind: "run-active" }
+  | { readonly kind: "request-pending" }
+  | { readonly kind: "child-result-waiting" }
+  | { readonly kind: "fork-or-merge" }
+  | { readonly kind: "background-work"; readonly detail: string }
+  | { readonly kind: "goal-active" };
+
+/**
+ * A press of "Hand off now", or what one would get: off, started (or already going), skipped with
+ * the decision's reason, or waiting on what keeps the thread busy (nothing is queued then).
+ */
+export type HandoffRouteAnswer =
+  | { readonly kind: "off" }
+  | { readonly kind: "started" }
+  | { readonly kind: "skip"; readonly reason: string }
+  | { readonly kind: "wait"; readonly blockers: ReadonlyArray<HandoffRouteBlocker> };
+
+/** A thread's handoff for the thread menu and the chip. */
+export interface HandoffRouteState {
+  readonly on: boolean;
+  /** The last turn's size; null when the provider reports none. */
+  readonly usedTokens: number | null;
+  readonly ask: HandoffRouteAnswer;
+  /** What a due handoff of the latest turn waits on now; empty when none waits. */
+  readonly waitingOn: ReadonlyArray<HandoffRouteBlocker>;
 }

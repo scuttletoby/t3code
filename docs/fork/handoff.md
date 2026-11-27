@@ -28,6 +28,37 @@ settings first: with a mode other than `handoff` it reads nothing more and sends
 Token counts are the provider's own last reading for the active session. A provider that reports
 none never hands off.
 
+## Threads with a role
+
+The assistant thread and each project's orchestrator (`server.threadRoles`, the calm sidebar's
+roles) can have their own mode: `roles` in the handoff settings, for example `handoff` while `mode`
+stays `off`, so only the long-running role threads hand off. A thread's own entry in `threads`
+still wins, and a project's value replaces the server's whole, its `roles` too. A role pointer to an
+archived or deleted thread changes nothing: that thread is not handed off anyway.
+
+The new session runs on `modelSelection`, else the thread's current model, as for every thread. The
+model policy (`server.modelPolicy`) checks agents' picks, not this one.
+
+## Hand off now
+
+A person can hand a thread off at once: **Hand off now** in the thread's menu (the sidebar's and the
+chat header's). The item shows only for a thread on the app's own server with handoff on for it. It
+is greyed out, naming what it waits on, while the thread is busy (a running turn, an approval or
+question, a child's result not read yet, a fork or merge, background work, an active goal), and
+hidden when a press would do nothing (just handed off or compacted, a newer turn running, under
+20,000 tokens). A press decides as a turn end would, but skips the size backstop and the idle wait.
+It settles first like any handoff and uses the same ids as the latest turn's own handoff, so a
+second press, or a press while that turn's handoff is going, sends one handoff. A press on a busy
+thread queues nothing: the toast says what it waits on, and the person may press again later.
+
+When a due handoff waits on a busy thread, a chip above the composer says "Handoff waiting on …"
+and goes once it no longer waits. The handoff's first message shows "Handoff N" in place of the
+"New session" divider.
+
+The app reads `GET /api/fork/handoff/state?threadId=` (read access) and presses with `POST
+/api/fork/handoff/now` and `{ "threadId": ... }` (operate access). A thread that cannot be read
+answers as off.
+
 ## One owner per thread
 
 With handoff on for a thread (mode `handoff`, from the server, its project or the thread's own
@@ -308,6 +339,8 @@ written out in full. The message says when no effort is set.
 - Timers, waits and the settle live in memory. After a server restart, the next turn end, or a late update of
   an older run, decides again, with a fresh settle. A crash between the send and the cancel leaves a queued handoff
   queued; it runs after the newer run.
+- A press of Hand off now lives in memory too: a restart before its settle ends forgets it, and
+  the person presses again.
 - The same run never hands off twice: the check before the send drops a second trigger, and every
   trigger for one run uses the same ids, so one that got past would replay the first. A cancelled
   handoff spends that run's ids; the next run's turn end decides. After a restart, a write turn
@@ -323,8 +356,9 @@ written out in full. The message says when no effort is set.
 - Fork code: `apps/server/src/fork/handoff/` (`HandoffService.ts`, `handoffDispatch.ts`,
   `handoffFacts.ts`, `handoffMessage.ts`, `handoffCommand.ts`, `handoffAgent.ts`, `handoffDecision.ts`,
   `handoffQuiet.ts`,
-  `handoffShell.ts`, `handoffRelayView.ts`). Settings:
-  `packages/contracts/src/handoff.ts`.
+  `handoffShell.ts`, `handoffRelayView.ts`, `handoffRoutes.ts`). Settings and the routes' shapes:
+  `packages/contracts/src/handoff.ts`. The app's parts: `apps/web/src/components/fork/handoff/`
+  (the menu item, the chip and the divider label), each joined to upstream's files by seam lines.
 - `Orchestrator.ts` stays upstream's (the fork check refuses edits to it). Every handoff send goes
   through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. The service starts from
   `ForkLayers.layerRuntimeServices` (`apps/server/src/fork/forkLayers.ts`), which `server.ts`

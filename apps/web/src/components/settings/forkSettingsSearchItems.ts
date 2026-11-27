@@ -150,6 +150,14 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     scope: "project-defaults",
   },
   {
+    id: "handoff-roles",
+    title: "Threads with a role",
+    to: FORK_PAGE,
+    searchTerms: ["handoff roles assistant orchestrator role thread mode"],
+    environmentOnly: true,
+    scope: "project-defaults",
+  },
+  {
     id: "handoff-threads",
     title: "Choice per thread",
     to: FORK_PAGE,

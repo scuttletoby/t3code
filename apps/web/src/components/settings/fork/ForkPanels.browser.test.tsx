@@ -146,6 +146,11 @@ describe("HandoffSettings", () => {
     await expect.element(threadId).toHaveValue("thread-1");
     state.update.mock.calls[1]![1]?.onSaved?.();
     await expect.element(threadId).toHaveValue("");
+
+    // HO6: the role threads' own mode.
+    await userEvent.click(screen.getByRole("combobox", { name: "Handoff mode for role threads" }));
+    await userEvent.click(page.getByRole("option", { name: "Handoff" }));
+    expect(state.update.mock.calls[2]![0]).toEqual({ handoff: { ...empty, roles: "handoff" } });
   });
 
   it("greys out every control of a locked handoff, the thread list and command too", async () => {
@@ -158,6 +163,7 @@ describe("HandoffSettings", () => {
     await expect.element(screen.getByText("Fix the login page")).toBeVisible();
     for (const selector of [
       '[aria-label="Handoff mode"]',
+      '[aria-label="Handoff mode for role threads"]',
       '[aria-label="Handoff mode for thread thread-1"]',
       '[aria-label="Remove the handoff mode of thread thread-1"]',
       '[aria-label="Thread id"]',

@@ -23,6 +23,7 @@ import * as FactsCommands from "./factsCommand.ts";
 import * as FillerDelegate from "./fillerDelegate.ts";
 import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
+import * as HandoffRoutes from "./handoff/handoffRoutes.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 import * as McpProfileTurnCheck from "./mcpProfileTurnCheck.ts";
 import * as PullRequestWatchSlot from "./pullRequestWatchSlot.ts";
@@ -106,6 +107,9 @@ export const layerRoutes = Layer.mergeAll(
   ActivityProbe.layer,
   // GET /api/fork/features: what this version does for a linked machine; its token only.
   ForkFeatures.layer,
+  // GET /api/fork/handoff/state and POST /api/fork/handoff/now: the thread menu's "Hand off now"
+  // and the "handoff waiting on" chip; a signed-in session only.
+  HandoffRoutes.layer,
   // Linked threads a parent here launched but whose task the last stop lost: one reminder each.
   DelegatedOrphanScan.layer,
   // GET /api/fork/task-prompts: a task's open prompts here, for its parent's machine; its token only.

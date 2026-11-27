@@ -44,6 +44,7 @@ import {
 } from "lucide-react";
 import { Button, InlineButton } from "../ui/button";
 import { FreshSessionRow, ModelSwitchRow } from "./V2LifecycleRow";
+import * as ForkHandoffDivider from "../fork/handoff/handoffDivider"; // Fork (HO5)
 import { useAssetUrlRefresh, useAssetUrls, useAssetUrlState } from "../../assets/assetUrls";
 import { AttachmentImage } from "../media/AttachmentImage";
 import { MediaVideoPlayer } from "../media/MediaVideoPlayer";
@@ -270,7 +271,10 @@ export function UserMessageRow({ row }: { row: Extract<TimelineRow, { kind: "mes
   const modelSwitch = item?.type === "user_message" ? item.modelSwitch : undefined;
   return (
     <>
-      {item?.type === "user_message" && item.freshContext ? <FreshSessionRow /> : null}
+      {/* Fork (HO5): a handoff's first message shows the handoff divider. */}
+      <ForkHandoffDivider.Scope row={row}>
+        {item?.type === "user_message" && item.freshContext ? <FreshSessionRow /> : null}
+      </ForkHandoffDivider.Scope>
       {modelSwitch ? (
         <ModelSwitchRow environmentId={ctx.activeThreadEnvironmentId} modelSwitch={modelSwitch} />
       ) : null}
