@@ -366,13 +366,13 @@
       ]
     },
     "packages/shared/src/agentAwareness.ts": {
-      "why": "A handoff write turn that ends failed (a provider error) is as quiet as one that completes: the fork marks it stop-requested (fork/handoff/handoffShell.ts), and the relay drops it the way it already drops a completed one, so no alert sounds while the fork's handoff follows (fork issue #836).",
+      "why": "A handoff write turn that ends failed (a provider error) is as quiet as one that completes: the fork marks it stop-requested (fork/handoff/handoffShell.ts), and the relay drops it the way it already drops a completed one, so no alert sounds while the fork's handoff follows (fork issue #836). Upstream sets the same mark on any run that was asked to stop (a person's Stop, a parent agent's stop, the handoff's write-turn timeout), so such a run that ends failed is quiet too, as it already was when it completed.",
       "added": [
         "if (phase === \"failed\" && thread.latestRunStopRequested === true) return null; // Fork: a quiet handoff write turn (fork/handoff)"
       ]
     },
     "apps/web/src/components/ThreadNotificationCoordinator.tsx": {
-      "why": "The browser's alert for a failed run skips a run marked stop-requested, as its completion alert already does: a handoff write turn that ends failed stays quiet (fork/handoff/handoffShell.ts marks it; fork issue #836).",
+      "why": "The browser's alert for a failed run skips a run marked stop-requested, as its completion alert already does: a handoff write turn that ends failed stays quiet (fork/handoff/handoffShell.ts marks it; fork issue #836). Upstream sets the same mark on any run that was asked to stop (a person's Stop, a parent agent's stop, the handoff's write-turn timeout), so such a run that ends failed is quiet too, as it already was when it completed.",
       "added": [
         "if (status === \"failed\" && rawThread.latestRunStopRequested === true) status = \"ready\"; // Fork: a quiet handoff write turn (fork/handoff)"
       ]
