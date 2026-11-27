@@ -36,6 +36,17 @@
         ]
       }
     },
+    "apps/server/src/issue/IssueService.ts": {
+      "why": "A project's .t3code/issues.json names the repositories its Issues page lists and its issue tools may write to, replacing the ones guessed from git remotes, so a fork checkout's upstream is neither listed nor writable (fork issue 887 row 2, owner decision in 830). One import and one pipe step after upstream's binding resolution; the file and its rule are in fork/issueRepos.ts, and a project without the file keeps upstream's guess.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import * as ForkIssueRepos from \"../fork/issueRepos.ts\"; // Fork (.t3code/issues.json)",
+          "Effect.flatMap(ForkIssueRepos.namedRepositories(project, registry)), // Fork (issues.json)"
+        ]
+      }
+    },
     "packages/client-runtime/package.json": {
       "why": "The calm sidebar's shared logic (fork file src/state/threadRoles.ts) is exported for the web and phone lists with one line; it is announced for the sidebar PR that first imports it. One line, since the four-line form's closing brace is a line upstream already has.",
       "added": [],
