@@ -3796,5 +3796,83 @@ class Pr1041Round2Test(Case):
                     'b{a,}sh d.txt', env=env)
 
 
+class Issue1057Test(Case):
+    """#1057: a guarded word inside a comment is no command. The shell text itself already skipped comments; the
+    readers that matched whole text did not: inline code (`python3 -c`, `node -e`), a Python or JS script file, a
+    heredoc into an interpreter, and the files read for CLAUDE_CODE_SIMPLE (a sourced file, ~/.bashrc). Each case
+    has its twin, the same words as code, which is still refused."""
+
+    def refused(self, *cmds):
+        for cmd in cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.decide(cmd), cmd)
+
+    def passes(self, *cmds):
+        for cmd in cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.decide(cmd), cmd)
+
+    def test_inline_code_comments_pass_the_code_is_refused(self):
+        self.passes("python3 -c '# never: gh workflow disable 1\nprint(1)'",
+                    "python3 -c $'# never: gh workflow disable 1\\nprint(1)'",
+                    "python3 -c 'print(1)  # not codex exec'",
+                    "python3 -Bc '# claude --bare'",
+                    "node -e '// never codex exec\nconsole.log(1)'",
+                    "node -e $'  // claude --bare\\nconsole.log(1)'",
+                    "node --eval='// codex exec'")
+        self.refused("python3 -c 'import os; os.system(\"gh workflow disable 1\")'",
+                     "python3 -c 'print(\"# gh workflow disable 1\")'",   # a string, not a comment
+                     "python3 -c $'x = 1\\nimport os; os.system(\"codex exec hi\")  # ok'",
+                     "python3 -c '# a comment\nimport os; os.system(\"codex exec\")'",
+                     "python3 -c 'print(1 # codex exec'",   # broken code: read whole
+                     "node -e 'require(\"child_process\").execSync(\"codex exec\")'",
+                     "node -e 'x = 1 // codex exec'",   # only whole-line // comments are dropped
+                     "node -e '/* codex exec */'",
+                     "perl -e '# codex exec'")           # other languages: read whole, as before
+
+    def test_script_file_comments_pass_the_code_is_refused(self):
+        self.write('notes.py', '# never run gh workflow disable 1 by hand\nprint(1)\n')
+        self.write('later.py', 'import subprocess\n# subprocess.run(["codex", "exec"])\nprint(1)\n')
+        self.write('ok.js', '#!/usr/bin/env node\n// do not run `claude --bare` here\nconsole.log(1)\n')
+        self.write('run.py', 'import subprocess\nsubprocess.run(["gh", "workflow", "disable", "1"])  # off\n')
+        self.write('str.py', 'cmd = """\n# gh workflow disable 1\n"""\nprint(cmd)\n')
+        self.write('run.js', 'require("child_process").execSync("codex exec")\n')
+        self.write('odd.js', '#!/usr/bin/python3\n# codex exec\n')   # .js run by python: no language, read whole
+        self.write('bare.txt', '# codex exec\n')                       # no language known: read whole
+        self.passes('python3 notes.py', 'python3 later.py', 'node ok.js', './ok.js')
+        self.refused('python3 run.py', 'python3 str.py', 'node run.js', 'python3 odd.js', 'python3 bare.txt')
+
+    def test_heredoc_into_an_interpreter(self):
+        self.passes("python3 - <<'E'\n# gh workflow disable 1\nprint(1)\nE",
+                    "node <<'E'\n// codex exec\nconsole.log(1)\nE")
+        self.refused("python3 - <<'E'\nimport os; os.system('gh workflow disable 1')\nE",
+                     "node <<'E'\nrequire('child_process').execSync('codex exec')\nE",
+                     # the shell expands an unquoted heredoc first: read whole
+                     "python3 - <<E\n# $(codex exec)\nprint(1)\nE", "python3 - <<E\n# `codex exec`\nE")
+
+    def test_start_files_and_sourced_files(self):
+        self.write('.bashrc', '# export CLAUDE_CODE_SIMPLE=1   (never: it turns the hooks off)\nalias ll="ls -l"\n')
+        self.write('vars.sh', 'X=1  # not CLAUDE_CODE_SIMPLE\n')
+        self.passes('claude -p hi', '. ./vars.sh; claude -p hi', 'ls # CLAUDE_CODE_SIMPLE=1\nclaude -p hi')
+        self.write('vars.sh', 'echo "# not a comment"; export CLAUDE_CODE_SIMPLE=1\n')
+        self.refused('. ./vars.sh; claude -p hi', 'CLAUDE_CODE_SIMPLE=1 claude -p hi',
+                     'export CLAUDE_CODE_SIMPLE=1 # set\nclaude -p hi')
+        self.write('.bashrc', 'cat > x <<E\n# CLAUDE_CODE_SIMPLE=1\nE\n')   # a heredoc body is no comment
+        self.refused('claude -p hi')
+        self.write('.bashrc', 'export CLAUDE_CODE_SIMPLE=1\n')
+        self.refused('claude -p hi')
+
+    def test_data_keeps_its_comments(self):
+        """A comment is only dropped where it is code that runs: text a command turns into code keeps it."""
+        self.write('notes.py', '# gh workflow disable 1\n')
+        self.write('later.js', '// codex exec\n')
+        self.refused("sed 's/^# //' notes.py | bash", "sed 's,^// ,,' later.js | sh")
+
+    def test_shell_comments_still_pass(self):
+        """The shell text itself: already right before #1057, kept so."""
+        self.passes('# never run gh workflow disable 1', 'ls  # claude --bare', '# codex exec\nls')
+        self.refused('ls\ngh workflow disable 1 # off', 'echo "#"; codex exec hi')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -65,6 +65,13 @@ hooks use the standard library only). `tests/fast.test.py` runs the hooks' test 
 **Tools.** The Bash and Monitor tools both run shell text (`tool_input.command`), so the command hooks match both.
 `agent-guards check` fails a hook that is wired for Bash only (MISSING ... Monitor).
 
+**Comments.** A guarded word in a comment is no command (`# never run gh workflow disable`, `// codex exec` in a
+`node -e`): the guard leaves out shell comments (as the shell reads them), Python comments (its own tokenizer, so a
+`#` in a string stays) and whole-line `//` comments in JS, wherever that text runs as code: the command, inline code,
+a script file whose name and `#!` line agree on the language, a quoted heredoc into an interpreter, and the files it
+reads for `CLAUDE_CODE_SIMPLE` (`~/.bashrc`, a sourced file). Code in other languages, Python the tokenizer cannot
+read, and text a command turns into code (`sed 's/^# //' notes.py | bash`) are read whole, as before.
+
 **Nested agent sessions.** Managed hooks run in every Claude Code session, a nested `claude -p` too, whatever its
 own settings say (`disableAllHooks` in a user's or a `--settings` file does not turn managed hooks off). A bare
 session (`claude --bare`, `CLAUDE_CODE_SIMPLE`) and Codex (`codex`, `codex exec`, `codex review` ...) run none of
