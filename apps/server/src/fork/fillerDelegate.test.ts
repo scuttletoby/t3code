@@ -12,6 +12,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Scope from "effect/Scope";
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServerRequest } from "effect/http";
@@ -30,14 +31,28 @@ const parent = { threadId: parentId, providerInstanceId: ProviderInstanceId.make
 const task = { task: "Read the brief.", title: "writer one" } as OrchestratorMcpDelegateTaskInput;
 const input = { parentThreadId: parentId, requestId: "item-1:1", task };
 
-/** A fake world: `answers` in order (the last repeats), what it was asked, the wakes sent. */
+/**
+ * A fake world: `answers` in order (the last repeats), what it was asked, the wakes sent. `existing` answers the
+ * look-ups in order (the last repeats); none by default.
+ */
 const world = (
   answers: ReadonlyArray<FillerDelegate.StartAnswer>,
-  options: { readonly parentGone?: boolean; readonly wake?: "sent" | "no_slot" } = {},
+  options: {
+    readonly parentGone?: boolean;
+    readonly wake?: "sent" | "no_slot";
+    readonly existing?: ReadonlyArray<FillerDelegate.Existing>;
+  } = {},
 ) => {
   const asked: Array<OrchestratorMcpDelegateTaskInput> = [];
   const wakes: Array<string> = [];
+  const lookups: Array<string> = [];
   const value: FillerDelegate.FillerWorld = {
+    existing: (_parent, requestId) =>
+      Effect.sync(() => {
+        lookups.push(requestId);
+        const list = options.existing ?? [{ type: "none" }];
+        return list[Math.min(lookups.length - 1, list.length - 1)]!;
+      }),
     parent: () => Effect.succeed(options.parentGone === true ? null : parent),
     delegate: (_parent, given) =>
       Effect.sync(() => {
@@ -51,7 +66,7 @@ const world = (
       }),
     pause: Effect.void,
   };
-  return { value, asked, wakes };
+  return { value, asked, wakes, lookups };
 };
 const started = { type: "started", taskId: "task-1", childThreadId: "thread:child" } as const;
 const idle = { type: "refused", code: "parent_not_active", message: "no run" } as const;
@@ -107,6 +122,40 @@ describe("a slot filler start", () => {
     }),
   );
 
+  it.effect(
+    "a retry whose task started: that task, before the parent or any refusal is checked",
+    () =>
+      Effect.gen(function* () {
+        // The lost-answer case: the parent has no run by now, and delegate_task would refuse.
+        const w = world([idle], { existing: [started], parentGone: true });
+        expect(yield* FillerDelegate.runFillerStart(w.value, input)).toEqual(started);
+        expect(w.asked).toEqual([]);
+        expect(w.wakes).toEqual([]);
+      }),
+  );
+
+  it.effect("a request id refused for good at its dispatch: request_rejected, nothing asked", () =>
+    Effect.gen(function* () {
+      const w = world([started], { existing: [{ type: "rejected" }] });
+      const answer = yield* FillerDelegate.runFillerStart(w.value, input);
+      expect(answer.type === "refused" && answer.code).toBe("request_rejected");
+      expect(w.asked).toEqual([]);
+    }),
+  );
+
+  it.effect("a refusal after the dispatch does not hide the start it made", () =>
+    Effect.gen(function* () {
+      const lost = {
+        type: "refused",
+        code: "orchestration_error",
+        message: "no projection",
+      } as const;
+      const w = world([lost], { existing: [{ type: "none" }, started] });
+      expect(yield* FillerDelegate.runFillerStart(w.value, input)).toEqual(started);
+      expect(w.lookups).toEqual(["item-1:1", "item-1:1"]);
+    }),
+  );
+
   it.effect("a gone parent: nothing asked", () =>
     Effect.gen(function* () {
       const w = world([started], { parentGone: true });
@@ -158,10 +207,24 @@ const layerFakeAuth = Layer.succeed(EnvironmentAuth.EnvironmentAuth, {
 
 interface Store {
   /** null: the parent is gone; else its run. */
-  shell: { activeRunId: string | null } | null;
-  dispatched: Array<unknown>;
+  shell: { activeRunId: string | null; settled?: boolean } | null;
+  dispatched: Array<{ readonly commandId: string }>;
   calls: Array<Record<string, unknown>>;
+  /** Tasks delegate_task started, by request id (their ids derived as the server derives them). */
+  tasks?: Map<string, string>;
+  /** Command ids whose receipt is "rejected". */
+  rejected?: Set<string>;
 }
+
+const liveChild = {
+  id: "task-live",
+  origin: "app_owned",
+  title: "w",
+  status: "running",
+  childThreadId: "thread:c",
+  providerInstanceId: "claudeAgent",
+  model: "claude-opus-5-5",
+};
 
 const layerStore = (store: Store) =>
   Layer.mergeAll(
@@ -175,23 +238,21 @@ const layerStore = (store: Store) =>
                 archivedAt: null,
                 providerInstanceId: "claudeAgent",
                 activeRunId: store.shell.activeRunId,
+                settledOverride: store.shell.settled === true ? "settled" : null,
               } as never),
         ),
       getThreadRecords: () =>
         Effect.succeed({
           subagents: [
-            {
-              id: "task-live",
-              origin: "app_owned",
-              title: "w",
-              status: "running",
-              childThreadId: "thread:c",
-              providerInstanceId: "claudeAgent",
-              model: "claude-opus-5-5",
-            },
+            liveChild,
+            ...[...(store.tasks ?? new Map<string, string>()).values()].map((id) => ({
+              ...liveChild,
+              id,
+              childThreadId: null,
+            })),
           ],
         } as never),
-      dispatch: (command: unknown) =>
+      dispatch: (command: { readonly commandId: string }) =>
         Effect.sync(() => {
           store.dispatched.push(command);
           // The wake starts the parent's run.
@@ -200,11 +261,21 @@ const layerStore = (store: Store) =>
         }),
     }),
     Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
-      getByCommandId: () => Effect.succeedNone,
+      getByCommandId: (commandId: string) =>
+        Effect.succeed(
+          store.rejected?.has(commandId) === true
+            ? Option.some({ status: "rejected" } as never)
+            : store.dispatched.some((c) => c.commandId === commandId)
+              ? Option.some({ status: "accepted" } as never)
+              : Option.none(),
+        ),
     }),
   );
 
-/** The MCP server's delegate_task: refused while the parent has no run, else one task per request id. */
+/**
+ * The MCP server's delegate_task, in its real order: refused while the parent has no run (checked before its own
+ * replay, even for a request that already started), else one task per request id.
+ */
 const fakeMcp = (store: Store): FillerDelegate.FillerMcp => ({
   callTool: (request) =>
     Effect.sync(() => {
@@ -216,13 +287,10 @@ const fakeMcp = (store: Store): FillerDelegate.FillerMcp => ({
           structuredContent: { code: "parent_not_active", message: "no run" },
         } as never;
       }
-      return {
-        content: [],
-        structuredContent: {
-          taskId: `task:${String(request.arguments.clientRequestId)}`,
-          childThreadId: null,
-        },
-      } as never;
+      const requestId = String(request.arguments.clientRequestId);
+      const taskId = FillerDelegate.fillerCommands(parentId, requestId)[0]!.taskId;
+      (store.tasks ??= new Map()).set(requestId, taskId);
+      return { content: [], structuredContent: { taskId, childThreadId: null } } as never;
     }),
 });
 
@@ -292,24 +360,64 @@ describe("the slot filler routes in the server's router", () => {
         const server = yield* serve(store);
         const first = yield* server.post(operate, input);
         expect(first.status).toBe(200);
-        expect(JSON.parse(first.text)).toEqual({
-          state: "started",
-          taskId: "task:item-1:1",
-          childThreadId: null,
-        });
+        const taskId = FillerDelegate.fillerCommands(parentId, "item-1:1")[0]!.taskId;
+        expect(JSON.parse(first.text)).toEqual({ state: "started", taskId, childThreadId: null });
         expect(store.dispatched).toHaveLength(1);
         expect(store.dispatched[0]).toMatchObject({
           type: "message.dispatch",
-          commandId: "slot-filler:wake:item-1:1",
           threadId: parentId,
         });
+        expect(store.dispatched[0]!.commandId).toMatch(/^slot-filler:wake:item-1:1:\d+$/);
         expect(
           store.calls.every((c) => c.mode === "async" && c.clientRequestId === "item-1:1"),
         ).toBe(true);
         // A repeat (the caller crashed before its record): the same task, no second wake.
+        const calls = store.calls.length;
         const again = yield* server.post(operate, input);
-        expect(JSON.parse(again.text).taskId).toBe("task:item-1:1");
+        expect(JSON.parse(again.text).taskId).toBe(taskId);
         expect(store.dispatched).toHaveLength(1);
+        // Looked up first: delegate_task is not asked again.
+        expect(store.calls).toHaveLength(calls);
+      }),
+    ),
+  );
+
+  // The lenses' double start: the answer was lost and the woken parent's run is over by the retry; delegate_task
+  // refuses parent_not_active before its replay, and the wake for this request was sent already.
+  it.live(
+    "a retry after a lost answer, with the parent idle again: the same task, no refusal",
+    () =>
+      provided(
+        Effect.gen(function* () {
+          const store: Store = { shell: { activeRunId: null }, dispatched: [], calls: [] };
+          const server = yield* serve(store);
+          const first = yield* server.post(operate, input);
+          expect(first.status).toBe(200);
+          store.shell = { activeRunId: null }; // the woken run ended
+          const again = yield* server.post(operate, input);
+          expect(again.status).toBe(200);
+          expect(JSON.parse(again.text).taskId).toBe(JSON.parse(first.text).taskId);
+          expect(store.tasks?.size).toBe(1);
+          expect(store.dispatched).toHaveLength(1);
+        }),
+      ),
+  );
+
+  it.effect("a request id whose dispatch was rejected: 409 request_rejected, nothing asked", () =>
+    provided(
+      Effect.gen(function* () {
+        const rejected = FillerDelegate.fillerCommands(parentId, "item-1:1")[0]!.commandId;
+        const store: Store = {
+          shell: { activeRunId: "run:1" },
+          dispatched: [],
+          calls: [],
+          rejected: new Set([rejected]),
+        };
+        const server = yield* serve(store);
+        const answer = yield* server.post(operate, input);
+        expect(answer.status).toBe(409);
+        expect(JSON.parse(answer.text).code).toBe("request_rejected");
+        expect(store.calls).toEqual([]);
       }),
     ),
   );
@@ -359,6 +467,10 @@ describe("the slot filler routes in the server's router", () => {
             model: "claude-opus-5-5",
           },
         ]);
+        expect(JSON.parse(listed.text).parentSettled).toBe(false);
+        store.shell = { activeRunId: null, settled: true };
+        const settled = yield* server.get({ authorization: "Bearer reader" });
+        expect(JSON.parse(settled.text).parentSettled).toBe(true);
         expect((yield* server.get({ authorization: "Bearer reader" }, "")).status).toBe(400);
         expect((yield* server.get({})).status).toBe(401);
         store.shell = null;

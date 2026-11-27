@@ -3,10 +3,14 @@
 
 Each run (one at a time: a flock; a second run exits at once):
  1. finishes what a stopped run left: an intent marker (state/inflight/<id>.json) is asked again with its request id,
-    which the server answers with the task it already started, if any; a start never runs twice;
+    which the server answers with the task it already started, if any; a start never runs twice. Each queue item
+    keeps ONE request id (state/requests/<id>.json) on every try until it starts or T3 refuses that id for good
+    (request_rejected), so a retry after a lost answer finds its task and an idle parent is woken once per item;
+    a refused item backs off (1, 2, 4 ... at most 15 minutes) and the log says why;
  2. renders lens items: a lens-watch file names a PR and its lenses; once the PR's CI check is green on its head,
     one lens item per lens and head is queued (at most maxRounds heads per lens);
- 3. counts the live children of the parent thread per machine from T3 itself (GET /api/fork/delegate);
+ 3. counts the live children of the parent thread per machine from T3 itself (GET /api/fork/delegate); a parent
+    settled by hand (handed over to a new orchestrator) stops the run with a note;
  4. starts the ready items, highest priority first, on the first allowed machine with room: the machine's caps
     (agents, writers), its capacity command, and the account's usage meter (skipped at >= maxUsedPercent or when
     older than maxAgeMinutes, as usage-guard does). Each start writes the intent marker first, then asks
@@ -28,6 +32,8 @@ DEFAULT_TASK = ('Act as the {kind} sub-agent for this task.\n\n'
 INLINE_TASK = ('Act as the {kind} sub-agent for this task. Your whole brief follows (from {brief}, a file on the '
                'machine that queued this task).\n\n{text}')
 MAX_INLINE = 100_000
+BACKOFF_FIRST_S = 60
+BACKOFF_MAX_S = 15 * 60
 DEFAULT_LENS_BRIEF = ('PR #{pr} at head {head}, lens {lens}.{focus}\n\n'
                       'Read {rules} fully and follow it. It is your whole brief.\n')
 
@@ -105,6 +111,10 @@ class Api:
     def _token(self):
         try:
             with open(self.token_file) as f:
+                mode = os.fstat(f.fileno()).st_mode & 0o777
+                if mode & 0o077:
+                    raise ApiError(f'token file {self.token_file} can be read by group or others (mode '
+                                   f'{mode:o}); run chmod 600 on it')
                 t = f.read().strip()
         except OSError as e:
             raise ApiError(f'token file {self.token_file} unreadable ({e.strerror})')
@@ -132,10 +142,11 @@ class Api:
             raise ApiError(f'{method} {path}: {e}')
 
     def children(self, parent):
+        """The answer: {'children': [...], 'parentSettled': bool}."""
         status, data = self._call('GET', '/api/fork/delegate?parentThreadId=' + urllib.request.quote(parent, safe=''))
         if status != 200:
             raise ApiError(f'parent thread {parent}: {data.get("code", status)}')
-        return data.get('children') or []
+        return data
 
     def start(self, body):
         return self._call('POST', '/api/fork/delegate', body)[1]
@@ -175,6 +186,7 @@ class Filler:
         self.state = cfg['stateDir']
         self.started_dir = os.path.join(self.q, 'started')
         self.inflight_dir = os.path.join(self.state, 'inflight')
+        self.requests_dir = os.path.join(self.state, 'requests')
         self.notes_path = os.path.join(self.state, 'notes.json')
         try:
             self.notes = read_json(self.notes_path)
@@ -505,13 +517,55 @@ class Filler:
     def marker(self, iid):
         return os.path.join(self.inflight_dir, iid + '.json')
 
+    def request_path(self, iid):
+        return os.path.join(self.requests_dir, iid + '.json')
+
+    def read_request(self, iid):
+        try:
+            req = read_json(self.request_path(iid))
+        except (OSError, ValueError):
+            return None
+        return req if isinstance(req, dict) and isinstance(req.get('requestId'), str) else None
+
+    def request_of(self, iid):
+        """The item's one request id, made on its first try and kept until it starts or is refused for good."""
+        req = self.read_request(iid)
+        if req is None:
+            req = {'requestId': f'{iid}:{int(self.w.now().timestamp())}', 'refusals': 0}
+            write_json(self.request_path(iid), req)
+        return req
+
+    def backing_off(self, iid):
+        """Why the item waits after refusals, or None."""
+        req = self.read_request(iid)
+        nxt = req and req.get('nextAt')
+        if not isinstance(nxt, (int, float)) or self.w.now().timestamp() >= nxt:
+            return None
+        at = iso(datetime.datetime.fromtimestamp(nxt, datetime.timezone.utc))
+        return f'backing off after {req.get("refusals")} refusal(s) (last: {req.get("lastCode")}) until {at}'
+
+    def refused(self, iid, code):
+        """After a refusal: request_rejected drops the id (a new one next try); others back off, doubling."""
+        if code == 'request_rejected':
+            try:
+                os.remove(self.request_path(iid))
+            except FileNotFoundError:
+                pass
+            return 'a new request id next try'
+        req = self.request_of(iid)
+        n = int(req.get('refusals') or 0) + 1
+        wait = min(BACKOFF_MAX_S, BACKOFF_FIRST_S * 2 ** (n - 1))
+        nxt = self.w.now().timestamp() + wait
+        write_json(self.request_path(iid), dict(req, refusals=n, lastCode=code, nextAt=nxt))
+        return f'next try after {iso(datetime.datetime.fromtimestamp(nxt, datetime.timezone.utc))}'
+
     def start(self, it, name):
         """'started' | 'refused' | raises ApiError (unknown: the marker stays, the next run asks again)."""
         mk = self.marker(it['id'])
         if os.path.exists(mk):
             intent = read_json(mk)
         else:
-            intent = {'requestId': f'{it["id"]}:{int(self.w.now().timestamp())}', 'machine': name,
+            intent = {'requestId': self.request_of(it['id'])['requestId'], 'machine': name,
                       'at': iso(self.w.now()), 'item': it}
         try:
             body = self.body(intent['item'], intent['machine'], intent['requestId'])
@@ -527,10 +581,13 @@ class Filler:
             self.finish(intent, ans)
             return 'started'
         if ans.get('state') == 'refused':
-            os.remove(mk)   # refused: nothing started for this request id
+            # Refused: nothing started under this id (the server looks a started one up first); the id stays.
+            os.remove(mk)
+            code = ans.get('code') or 'refused'
+            then = self.refused(it['id'], code)
             self.note(f'start/{it["id"]}/{intent["machine"]}', f'refused {it["id"]} on {intent["machine"]}: '
-                      f'{ans.get("code")}: {str(ans.get("message"))[:200]}')
-            return ans.get('code') or 'refused'
+                      f'{code}: {str(ans.get("message"))[:200]}; {then}')
+            return code
         raise ApiError(f'start of {it["id"]}: answer without a task id or refusal')
 
     def finish(self, intent, ans):
@@ -543,7 +600,14 @@ class Filler:
         except FileNotFoundError:
             pass
         os.remove(self.marker(it['id']))
+        self.forget_request(it['id'])
         self.log(f'started {it["id"]} on {intent["machine"]}: task {ans["taskId"]} ({it["kind"]}, "{it["title"][:80]}")')
+
+    def forget_request(self, iid):
+        try:
+            os.remove(self.request_path(iid))
+        except FileNotFoundError:
+            pass
 
     def recover(self):
         """Markers a stopped run left: ask again with the same request id (the server never starts it twice)."""
@@ -567,6 +631,7 @@ class Filler:
                 except FileNotFoundError:
                     pass
                 os.remove(path)
+                self.forget_request(iid)
                 self.log(f'finished {iid}: it was started and recorded before a stop')
                 continue
             if not os.path.exists(os.path.join(self.q, iid + '.json')):
@@ -580,8 +645,11 @@ class Filler:
     def run(self):
         self.recover()
         self.render_lenses()
-        children = self.w.api.children(self.cfg['parentThreadId'])
-        counts = self.count(children)
+        answer = self.w.api.children(self.cfg['parentThreadId'])
+        if answer.get('parentSettled') is True:
+            raise ApiError(f'the parent thread {self.cfg["parentThreadId"]} was settled by hand (handed over to a '
+                           'new orchestrator?): set parentThreadId to the orchestrator that runs now; nothing starts')
+        counts = self.count(answer.get('children') or [])
         items = []
         for path in self.queue_files():
             it, why = self.read_item(path)
@@ -594,10 +662,15 @@ class Filler:
                 continue
             items.append((it, os.path.getmtime(path)))
         items.sort(key=lambda x: (-x[0]['priority'], x[1], x[0]['id']))
+        queued = {os.path.basename(p)[:-5] for p in self.queue_files()}
+        if os.path.isdir(self.requests_dir):
+            for n in os.listdir(self.requests_dir):
+                if n.endswith('.json') and n[:-5] not in queued:
+                    self.forget_request(n[:-5])   # its queue file is gone
         full = set()
         for it, _ in items:
             key = f'item/{it["id"]}.json'
-            why = self.ready(it)
+            why = self.backing_off(it['id']) or self.ready(it)
             if why:
                 self.note(key, f'waiting {it["id"]}: {why}')
                 continue

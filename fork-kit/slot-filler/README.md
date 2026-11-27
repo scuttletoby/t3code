@@ -16,16 +16,20 @@ uses):
 - `POST /api/fork/delegate` `{parentThreadId, requestId, wake?, task}` where `task` is `delegate_task`'s input
   (task text, title, `target: {environmentId?, providerInstanceId, model, options}`, role, isolation). It returns
   `{state: "started", taskId, childThreadId}` or `{state: "refused", code, message}`. When the parent has no run,
-  the route sends it one short queued message (once per request id) so it gets one, then starts the task in that
-  run. All of `delegate_task`'s checks apply (slot gate, environments, providers). The same `requestId` always
-  returns the same task: asking again never starts a second one.
-- `GET /api/fork/delegate?parentThreadId=...` lists the parent's children: `{taskId, title, status, live,
-  environmentId, childThreadId, providerInstanceId, model}`.
+  the route sends it one short queued message (once per request id and half hour) so it gets one, then starts the
+  task in that run. All of `delegate_task`'s checks apply (slot gate, environments, providers). The route looks the
+  `requestId` up first: one that already started returns its task whatever the parent's state now, so asking
+  again never starts a second one. One whose start was refused for good answers `request_rejected` (use a new id).
+  A remote start also needs a parent run, so an idle parent takes one short wake turn per start (this uses usage).
+- `GET /api/fork/delegate?parentThreadId=...` answers `{children, parentSettled}`: the parent's children
+  `{taskId, title, status, live, environmentId, childThreadId, providerInstanceId, model}`, and whether the parent
+  was settled by hand.
 
 Both need a session token with the scopes `orchestration:read` and `orchestration:operate` (`POST`), or
 `orchestration:read` (`GET`). Issue one with the running server's binary:
 `t3 auth session issue --scopes orchestration:read,orchestration:operate --label slot-filler --token-only`, and keep
-it in a file only you can read (`server.tokenFile`).
+it in a file only you can read (`server.tokenFile`, mode `600`: the filler refuses a file group or others can read,
+without printing it).
 
 ## Queue
 
@@ -111,26 +115,34 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
   read longer ago than `maxAgeMinutes`, or is missing. Windows scoped to another model family and windows whose
   reset time has passed do not count: the same rules as the usage guard.
 - Children the filler did not start count as `unknownKindCountsAs` (default `writer`, the safe side).
+- Slots are counted only from this parent's children. Agents of other parents on the same machine are not seen
+  here; the server's own slot gate still counts them and refuses a start over its limit.
 
 ## The state question
 
 - **Runs again:** one run at a time (a lock in `stateDir`; a second run exits at once). A run with nothing new
   writes nothing: a waiting or refused item is logged once and again only when its reason changes
   (`stateDir/notes.json`).
-- **Stops half-way:** before asking T3 it writes `stateDir/inflight/<id>.json` with the request id. The next run
-  asks again with the same request id, and T3 answers with the task it already started, or starts it now. So a
-  start is never lost and never doubled. If the started record was written before the stop, it only finishes the
+- **Stops half-way:** each queue item gets one request id, kept in `stateDir/requests/<id>.json` and reused on
+  every run until the item started or left the queue. Before asking T3 it writes `stateDir/inflight/<id>.json`
+  with that id. The next run asks again with the same id, and T3 looks it up before any refusal: it answers with
+  the task it already started (even if the parent is idle or the slots are full by now), or starts it now. So a
+  start is never lost and never doubled. Only `request_rejected` (T3 refused that id for good) gets a new id. If the started record was written before the stop, it only finishes the
   move. The queue file moves only after T3 returned a task id. Every file it writes is written atomically.
 - **T3 down or the token bad:** the run stops at its first call, logs it once, and keeps everything. When T3 answers
   again it logs that and carries on.
 - **Machine offline or environment unlinked:** T3 refuses the start (`environment_*`, `slots_full`, ...). The filler
   logs the refusal once, removes the marker (nothing was started), keeps the item, and tries the next allowed machine
-  or the next run. A child on an environment no machine names still counts, under no machine.
+  or the next run. Each refusal doubles that item's wait (1 minute, then 2, 4, ... up to 15), logged as "backing off
+  after N refusal(s) (last: code) until T", so a refusal the server checks after the wake does not wake the parent
+  every minute. A child on an environment no machine names still counts, under no machine.
 - **Meter missing or old:** that machine is skipped for that account, with a log line.
 - **Brief deleted:** the item is refused and kept until the brief is back.
 - **PR closed:** `pr-green` and `pr-merged` items wait with a log line ("closed without a merge"). Delete them
   by hand.
 - **Parent thread gone:** the run stops, logs it and starts nothing.
+- **Parent handed over:** a parent settled by hand is taken as handed over to a new orchestrator. The run stops
+  with "set parentThreadId to the orchestrator that runs now" and starts nothing.
 - **Empty, broken or incomplete queue file:** refused with the reason, logged once, and kept.
 - **Missing queue folder, empty queue:** nothing to do.
 - **Recovery starts even if caps are now full:** the route's own slot gate still refuses it.

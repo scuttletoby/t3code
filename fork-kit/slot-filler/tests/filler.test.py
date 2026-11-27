@@ -33,30 +33,39 @@ class Crash(Exception):
 
 
 class FakeApi:
-    """The /api/fork/delegate route: the same request id gives the same task (as the server does)."""
+    """The /api/fork/delegate route, in the server's order: a request id that started returns its task first, then
+    refusals are checked, then one task per request id. `refuse_next` answers the next POSTs first, whatever they are
+    (a refusal from a server that does not look the id up first)."""
 
     def __init__(self):
         self.live = []          # children the parent already has
         self.by_request = {}    # requestId -> taskId
         self.starts = []        # every POST body
         self.refuse = {}        # environmentId -> (code, message)
+        self.refuse_next = []   # (code, message), one per POST
+        self.settled = False    # the parent was settled by hand
         self.down = False
         self.crash_after_start = False
 
     def children(self, parent):
         if self.down:
             raise sf.ApiError('GET /api/fork/delegate: connection refused')
-        return list(self.live)
+        return {'children': list(self.live), 'parentSettled': self.settled}
 
     def start(self, body):
         if self.down:
             raise sf.ApiError('POST /api/fork/delegate: connection refused')
         self.starts.append(body)
+        if self.refuse_next:
+            code, msg = self.refuse_next.pop(0)
+            return {'state': 'refused', 'code': code, 'message': msg}
         env = body['task']['target'].get('environmentId')
+        rid = body['requestId']
+        if rid in self.by_request:
+            return {'state': 'started', 'taskId': self.by_request[rid], 'childThreadId': 'thread-' + self.by_request[rid]}
         if env in self.refuse:
             code, msg = self.refuse[env]
             return {'state': 'refused', 'code': code, 'message': msg}
-        rid = body['requestId']
         if rid not in self.by_request:
             self.by_request[rid] = f'task-{len(self.by_request) + 1}'
             self.live.append({'taskId': self.by_request[rid], 'status': 'running', 'live': True,
@@ -276,6 +285,57 @@ class Caps(Base):
         self.assertEqual(os.listdir(os.path.join(self.state, 'inflight')), [])
         self.assertEqual(sum('refused w1 on north: slots_full' in l for l in self.log_lines()), 1)
 
+    def test_refusals_back_off_doubling_under_one_request_id(self):
+        self.cfg['machines']['local']['maxAgents'] = 0
+        self.w.api.refuse['env-north'] = ('usage_paced', 'the account is paced')
+        self.item('w1')
+        at = lambda s: (lambda: NOW + datetime.timedelta(seconds=s))
+        for t in (0, 30, 61, 120, 181):
+            self.w.now = at(t)
+            self.run_filler()
+        # tries at 0 s, 61 s (after 60 s) and 181 s (after 120 s); none between
+        self.assertEqual(len(self.w.api.starts), 3)
+        self.assertEqual(len({b['requestId'] for b in self.w.api.starts}), 1)   # so the wake goes once
+        req = json.load(open(os.path.join(self.state, 'requests', 'w1.json')))
+        self.assertEqual((req['refusals'], req['lastCode']), (3, 'usage_paced'))
+        self.assertTrue(any('waiting w1: backing off after 1 refusal(s) (last: usage_paced) until 2026-11-21T12:01:00Z'
+                            in l for l in self.log_lines()))
+        self.w.api.refuse.clear()
+        self.w.now = at(181 + 240)
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['w1'])
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'requests', 'w1.json')))
+
+    def test_a_request_id_refused_for_good_is_replaced(self):
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.w.api.refuse_next = [('request_rejected', 'refused at its dispatch')]
+        self.item('w1')
+        self.run_filler()
+        self.w.now = lambda: NOW + datetime.timedelta(minutes=1)
+        self.run_filler()
+        ids = [b['requestId'] for b in self.w.api.starts]
+        self.assertEqual(len(ids), 2)
+        self.assertNotEqual(ids[0], ids[1])
+        self.assertEqual(self.started_ids(), ['w1'])
+
+    def test_a_parent_settled_by_hand_stops_the_run(self):
+        self.w.api.settled = True
+        self.item('w1')
+        self.assertEqual(self.run_filler(), 1)
+        self.assertEqual(self.w.api.starts, [])
+        self.assertTrue(any('was settled by hand (handed over to a new orchestrator?)' in l for l in self.log_lines()))
+
+    def test_the_token_file_must_be_private(self):
+        path = self.write('token', 'secret-token-value\n')
+        api = sf.Api({'server': {'tokenFile': path}})
+        os.chmod(path, 0o644)
+        with self.assertRaises(sf.ApiError) as e:
+            api._token()
+        self.assertIn('can be read by group or others (mode 644); run chmod 600', str(e.exception))
+        self.assertNotIn('secret-token-value', str(e.exception))
+        os.chmod(path, 0o600)
+        self.assertEqual(api._token(), 'secret-token-value')
+
     def test_a_gone_parent_stops_the_run(self):
         self.w.api.refuse[None] = ('parent_missing', 'no such thread')
         self.item('w1', priority=2)
@@ -399,6 +459,21 @@ class StopsHalfWay(Base):
         self.assertEqual(os.listdir(os.path.join(self.state, 'inflight')), [])
         self.assertEqual(json.load(open(os.path.join(self.q, 'started', 'w1.json')))['taskId'], 'task-1')
 
+    def test_a_lost_answer_then_a_refused_retry_never_starts_twice(self):
+        # The lenses' case: T3 started it, the answer was lost, the retry is refused (the parent is idle by then).
+        self.item('w1')
+        self.w.api.crash_after_start = True
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.w.api.refuse_next = [('parent_not_active', 'no run')]
+        for minutes in (1, 2, 5):
+            self.w.now = lambda m=minutes: NOW + datetime.timedelta(minutes=m)
+            self.run_filler()
+        self.assertEqual(len(self.w.api.by_request), 1)                    # one task in T3
+        self.assertEqual(len({b['requestId'] for b in self.w.api.starts}), 1)
+        self.assertEqual(self.started_ids(), ['w1'])
+        self.assertEqual(json.load(open(os.path.join(self.q, 'started', 'w1.json')))['taskId'], 'task-1')
+
     def test_a_crash_before_the_start_starts_it_once_later(self):
         self.item('w1')
         real = self.w.api.start
@@ -451,6 +526,7 @@ class StopsHalfWay(Base):
         self.run_filler()
         self.assertEqual(os.listdir(os.path.join(self.state, 'inflight')), [])
         self.assertTrue(any('dropped the intent for w1' in l for l in self.log_lines()))
+        self.assertEqual(os.listdir(os.path.join(self.state, 'requests')), [])
 
     def test_a_second_run_while_one_holds_the_lock_does_nothing(self):
         self.item('w1')
@@ -619,10 +695,21 @@ MUTATIONS = {
         "p['green'] = bool(newest and newest.get('status') == 'completed' and newest.get('conclusion') == 'success')",
         "p['green'] = any(r.get('conclusion') == 'success' for r in runs)",
         'ReadyWhen.test_pr_green_on_its_current_head'),
-    'marker reuses the request id': (
-        "        if os.path.exists(mk):\n            intent = read_json(mk)\n        else:\n",
-        "        if True:\n",
-        'StopsHalfWay.test_a_crash_after_the_start_never_starts_twice'),
+    'one request id per item': (
+        "        req = self.read_request(iid)\n        if req is None:\n", "        req = None\n        if req is None:\n",
+        'StopsHalfWay.test_a_lost_answer_then_a_refused_retry_never_starts_twice'),
+    'refusals back off': (
+        "wait = min(BACKOFF_MAX_S, BACKOFF_FIRST_S * 2 ** (n - 1))", "wait = 0",
+        'Caps.test_refusals_back_off_doubling_under_one_request_id'),
+    'request_rejected gets a new id': (
+        "        if code == 'request_rejected':\n", "        if False:\n",
+        'Caps.test_a_request_id_refused_for_good_is_replaced'),
+    'token file mode': (
+        "                if mode & 0o077:\n", "                if False:\n",
+        'Caps.test_the_token_file_must_be_private'),
+    'settled parent stops': (
+        "        if answer.get('parentSettled') is True:\n", "        if False:\n",
+        'Caps.test_a_parent_settled_by_hand_stops_the_run'),
     'notes stay quiet': (
         "        if self.notes.get(key) != line:\n", "        if True:\n",
         'Quiet.test_a_second_run_with_nothing_new_writes_nothing'),
