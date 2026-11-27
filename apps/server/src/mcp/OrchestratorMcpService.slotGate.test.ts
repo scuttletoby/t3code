@@ -42,6 +42,7 @@ import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as FillerDelegate from "../fork/fillerDelegate.ts";
 import * as ActiveRunShells from "../slots/ActiveRunShells.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
@@ -597,6 +598,25 @@ describe("OrchestratorMcpService agent slot gate", () => {
       );
       assert.strictEqual(result._tag, "Success");
       assert.deepStrictEqual(world.dispatched, [{ instanceId: MAIN }]);
+    }),
+  );
+
+  it.effect("the command id is the one the slot filler looks a request up by", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const result = yield* delegate("filler-item:1").pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 2 }), roomy)),
+      );
+      assert.strictEqual(result._tag, "Success");
+      assert.isTrue(
+        world.accepted.has(
+          FillerDelegate.delegateCommandId(
+            scope.requestNamespace,
+            "filler-item:1",
+            "delegate-task",
+          ),
+        ),
+      );
     }),
   );
 

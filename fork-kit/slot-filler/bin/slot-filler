@@ -1,0 +1,845 @@
+#!/usr/bin/python3 -IB
+"""slot-filler: fills free agent slots from a queue folder, by code (fork issue #870). Run by a timer every minute.
+
+Each run (one at a time: a flock; a second run exits at once):
+ 1. asks T3 for the parent's children; a parent settled by hand (handed over to a new orchestrator) stops the run
+    with a note before anything is asked;
+ 2. finishes what a stopped run or an unclear answer left: an intent marker (state/inflight/<id>.json) is asked
+    again on its machine, with its request id and parent, which the server answers with the task it already
+    started, if any; a start never runs twice. A marker of an older parent is only looked up, never started. Each
+    queue item keeps ONE request id (state/requests/<id>.json) on every try until it starts or T3 refuses that id
+    for good (request_rejected), so a retry after a lost answer finds its task and an idle parent is woken once
+    per item. A clear refusal backs that machine off for the item (1, 2, 4 ... at most 15 minutes) and the next
+    machine may be tried; an unclear answer (orchestration_error, an unknown code) keeps the marker on that machine,
+    and no other machine is tried until that one answers clearly; the log says why;
+ 3. renders lens items: a lens-watch file names a PR and its lenses; once the PR's CI check is green on its head,
+    one lens item per lens and head is queued (at most maxRounds heads per lens); counts the live children of
+    the parent per machine (GET /api/fork/delegate), plus each start still without a clear answer;
+ 4. starts the ready items, highest priority first, on the first allowed machine with room: the machine's caps
+    (agents, writers), its capacity command, and the account's usage meter (skipped at >= maxUsedPercent or when
+    older than maxAgeMinutes, as usage-guard does). Each start writes the intent marker first, then asks
+    POST /api/fork/delegate (the server's own delegate_task as the parent thread), then moves the item to started/
+    with the task id, then removes the marker.
+Every decision is one log line; a waiting item is logged again only when its reason changes, so a run with nothing
+new writes nothing. A broken, empty or incomplete queue file is refused (logged) and kept where it is.
+
+The state question (what happens when it runs again, stops half-way, or meets old, empty or missing state) is
+answered in README.md. Config: README.md. Tests: tests/filler.test.py.
+"""
+import argparse, datetime, fcntl, json, os, re, subprocess, sys, time, urllib.error, urllib.request
+
+KINDS = ('writer', 'lens', 'other')
+ID_RE = re.compile(r'^[A-Za-z0-9._-]{1,100}$')
+SETTLED = ('completed', 'failed', 'cancelled', 'interrupted')
+DEFAULT_TASK = ('Act as the {kind} sub-agent for this task.\n\n'
+                'Read {brief} fully and do what it says. It is your whole brief.')
+INLINE_TASK = ('Act as the {kind} sub-agent for this task. Your whole brief follows (from {brief}, a file on the '
+               'machine that queued this task).\n\n{text}')
+MAX_INLINE = 100_000
+BACKOFF_FIRST_S = 60
+BACKOFF_MAX_S = 15 * 60
+# Refusals T3 gives before anything is dispatched: nothing started. Any other answer (orchestration_error, a linked
+# machine that stopped answering, a code this does not know) is unclear: the start may have happened there.
+DEFINITE = frozenset((
+    'capability_denied', 'parent_not_active', 'provider_unavailable', 'model_unavailable',
+    'runtime_mode_escalation_denied', 'interaction_mode_escalation_denied', 'task_not_found', 'thread_not_found',
+    'run_not_found', 'thread_not_sendable', 'invalid_request', 'thread_credential_required', 'target_required',
+    'usage_pacing_hold', 'slots_full', 'parent_missing', 'request_rejected', 'bad_request'))
+DEFAULT_LENS_BRIEF = ('PR #{pr} at head {head}, lens {lens}.{focus}\n\n'
+                      'Read {rules} fully and follow it. It is your whole brief.\n')
+
+
+def expand(p):
+    return os.path.expanduser(os.path.expandvars(p)) if isinstance(p, str) else p
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def iso(dt):
+    return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def write_json(path, data):
+    """Atomic: a crash leaves the old file or the new one, never half."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f'{path}.tmp-{os.getpid()}'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+class ConfigError(Exception):
+    pass
+
+
+def load_config(path):
+    try:
+        c = read_json(path)
+    except (OSError, ValueError) as e:
+        raise ConfigError(f'config {path} unreadable ({e})')
+    for k in ('queueDir', 'stateDir', 'parentThreadId', 'machines'):
+        if not c.get(k):
+            raise ConfigError(f'config {path}: "{k}" is required')
+    if not isinstance(c['machines'], dict) or not c['machines']:
+        raise ConfigError(f'config {path}: "machines" must name at least one machine')
+    for k in ('queueDir', 'stateDir', 'log', 'lensRules'):
+        if k in c:
+            c[k] = expand(c[k])
+    c.setdefault('log', os.path.join(c['stateDir'], 'filler.log'))
+    c.setdefault('defaults', {})
+    c.setdefault('usage', {})
+    return c
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The world: T3's route, GitHub, capacity commands, usage meters. Tests give fakes.
+
+class BriefTooLong(Exception):
+    pass
+
+
+class ApiError(Exception):
+    """No answer from T3 (down, 5xx, unreadable): nothing is known, so nothing more starts this run."""
+
+
+class Api:
+    def __init__(self, cfg):
+        s = cfg.get('server') or {}
+        self.url = (s.get('url') or 'http://127.0.0.1:3773').rstrip('/')
+        self.token_file = expand(s.get('tokenFile') or '~/.config/slot-filler/token')
+        self.timeout = float(s.get('timeoutSeconds') or 90)
+
+    def _token(self):
+        try:
+            with open(self.token_file) as f:
+                mode = os.fstat(f.fileno()).st_mode & 0o777
+                if mode & 0o077:
+                    raise ApiError(f'token file {self.token_file} can be read by group or others (mode '
+                                   f'{mode:o}); run chmod 600 on it')
+                t = f.read().strip()
+        except OSError as e:
+            raise ApiError(f'token file {self.token_file} unreadable ({e.strerror})')
+        if not t:
+            raise ApiError(f'token file {self.token_file} is empty')
+        return t
+
+    def _call(self, method, path, body=None):
+        req = urllib.request.Request(self.url + path, method=method,
+                                     data=None if body is None else json.dumps(body).encode(),
+                                     headers={'authorization': 'Bearer ' + self._token(),
+                                              'content-type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.status, json.loads(r.read() or b'{}')
+        except urllib.error.HTTPError as e:
+            try:
+                data = json.loads(e.read() or b'{}')
+            except ValueError:
+                data = {}
+            if e.code in (400, 404, 409) and isinstance(data, dict) and data.get('state') == 'refused':
+                return e.code, data
+            raise ApiError(f'{method} {path}: HTTP {e.code}')
+        except (OSError, ValueError) as e:
+            raise ApiError(f'{method} {path}: {e}')
+
+    def children(self, parent):
+        """The answer: {'children': [...], 'parentSettled': bool}."""
+        status, data = self._call('GET', '/api/fork/delegate?parentThreadId=' + urllib.request.quote(parent, safe=''))
+        if status != 200:
+            raise ApiError(f'parent thread {parent}: {data.get("code", status)}')
+        return data
+
+    def start(self, body):
+        return self._call('POST', '/api/fork/delegate', body)[1]
+
+
+def gh_json(cfg, args):
+    cmd = list(cfg.get('gh') or ['env', '-u', 'GH_TOKEN', '-u', 'GITHUB_TOKEN', 'gh']) + args
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:200] or f'gh exit {r.returncode}')
+    return json.loads(r.stdout or 'null')
+
+
+def run_cmd(args):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+class World:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.api = Api(cfg)
+        self.now = utc_now
+        self.gh = lambda args: gh_json(cfg, args)
+        self.run = run_cmd
+
+
+# ---------------------------------------------------------------------------------------------------------------
+
+class Filler:
+    def __init__(self, cfg, world):
+        self.cfg, self.w = cfg, world
+        self.q = cfg['queueDir']
+        self.state = cfg['stateDir']
+        self.started_dir = os.path.join(self.q, 'started')
+        self.inflight_dir = os.path.join(self.state, 'inflight')
+        self.requests_dir = os.path.join(self.state, 'requests')
+        self.notes_path = os.path.join(self.state, 'notes.json')
+        try:
+            self.notes = read_json(self.notes_path)
+            if not isinstance(self.notes, dict):
+                self.notes = {}
+        except (OSError, ValueError):
+            self.notes = {}
+        self.notes_seen = set()
+        self.notes_changed = False
+        self.pr_cache = {}
+
+    # --- log -------------------------------------------------------------------------------------------------
+    def log(self, line):
+        text = f'{iso(self.w.now())} {line}'
+        os.makedirs(os.path.dirname(self.cfg['log']) or '.', exist_ok=True)
+        with open(self.cfg['log'], 'a') as f:
+            f.write(text + '\n')
+
+    def note(self, key, line):
+        """A waiting or refused state: logged once, again only when it changes."""
+        self.notes_seen.add(key)
+        if self.notes.get(key) != line:
+            self.notes[key] = line
+            self.notes_changed = True
+            self.log(line)
+
+    def save_notes(self):
+        for k in [k for k in self.notes if k not in self.notes_seen]:
+            del self.notes[k]   # gone or started: a later return logs again
+            self.notes_changed = True
+        if self.notes_changed:
+            write_json(self.notes_path, self.notes)
+
+    # --- queue -----------------------------------------------------------------------------------------------
+    def queue_files(self):
+        try:
+            names = sorted(n for n in os.listdir(self.q) if n.endswith('.json'))
+        except FileNotFoundError:
+            return []
+        return [os.path.join(self.q, n) for n in names if os.path.isfile(os.path.join(self.q, n))]
+
+    def read_item(self, path):
+        """(item, None) or (None, why refused)."""
+        stem = os.path.basename(path)[:-5]
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError as e:
+            return None, f'unreadable ({e.strerror})'
+        if not text.strip():
+            return None, 'empty file'
+        try:
+            it = json.loads(text)
+        except ValueError as e:
+            return None, f'not JSON ({e})'
+        if not isinstance(it, dict):
+            return None, 'not a JSON object'
+        if it.get('id') != stem or not ID_RE.match(stem):
+            return None, f'"id" must equal the file name ({stem}) and use only letters, digits, . _ -'
+        if not isinstance(it.get('title'), str) or not it['title'].strip():
+            return None, '"title" is required'
+        if it.get('kind') not in KINDS:
+            return None, f'"kind" must be one of {", ".join(KINDS)}'
+        brief = expand(it.get('brief'))
+        if not isinstance(brief, str) or not os.path.isabs(brief):
+            return None, '"brief" must be an absolute path'
+        try:
+            if os.path.getsize(brief) == 0:
+                return None, f'brief {brief} is empty'
+        except OSError:
+            return None, f'brief {brief} is missing'
+        it['brief'] = brief
+        rw = it.get('readyWhen') or {'type': 'none'}
+        if rw.get('type') not in ('none', 'pr-green', 'pr-merged') or (
+                rw['type'] != 'none' and not (isinstance(rw.get('pr'), int) and rw['pr'] > 0)):
+            return None, '"readyWhen" must be {"type":"none"} or {"type":"pr-green"|"pr-merged","pr":<n>}'
+        it['readyWhen'] = rw
+        pr = it.get('priority', 0)
+        if isinstance(pr, bool) or not isinstance(pr, (int, float)):
+            return None, '"priority" must be a number'
+        it['priority'] = pr
+        machines = it.get('machines')
+        if machines is not None and (not isinstance(machines, list) or not machines
+                                     or any(m not in self.cfg['machines'] for m in machines)):
+            return None, f'"machines" must list names from the config ({", ".join(self.cfg["machines"])})'
+        return it, None
+
+    # --- GitHub ----------------------------------------------------------------------------------------------
+    def pr(self, n):
+        if n not in self.pr_cache:
+            repo = self.cfg.get('repo')
+            if not repo:
+                raise RuntimeError('config has no "repo" for PR checks')
+            d = self.w.gh(['pr', 'view', str(n), '-R', repo, '--json', 'state,headRefOid'])
+            self.pr_cache[n] = {'state': d.get('state'), 'head': d.get('headRefOid'), 'green': None}
+        return self.pr_cache[n]
+
+    def ci_green(self, n):
+        p = self.pr(n)
+        if p['green'] is None:
+            name = self.cfg.get('ciCheck', 'fork-ci-result')
+            runs = self.w.gh(['api', f'repos/{self.cfg["repo"]}/commits/{p["head"]}/check-runs?check_name={name}'
+                              '&filter=latest&per_page=20', '--jq', '[.check_runs[]|{id,status,conclusion}]']) or []
+            newest = max(runs, key=lambda r: r.get('id') or 0) if runs else None
+            p['green'] = bool(newest and newest.get('status') == 'completed' and newest.get('conclusion') == 'success')
+        return p['green']
+
+    def ready(self, it):
+        """None when ready, else why not."""
+        rw = it['readyWhen']
+        if rw['type'] == 'none':
+            return None
+        n = rw['pr']
+        try:
+            p = self.pr(n)
+            if rw['type'] == 'pr-merged':
+                if p['state'] == 'MERGED':
+                    return None
+                return f'PR #{n} is closed without a merge' if p['state'] == 'CLOSED' else f'PR #{n} not merged yet'
+            if p['state'] != 'OPEN':
+                return f'PR #{n} is {str(p["state"]).lower()}'
+            if rw.get('head') and rw['head'] != p['head']:
+                return f'PR #{n} head moved from {rw["head"][:7]} to {str(p["head"])[:7]}'
+            return None if self.ci_green(n) else f'PR #{n} {self.cfg.get("ciCheck", "fork-ci-result")} not green on {str(p["head"])[:7]}'
+        except Exception as e:  # noqa: BLE001 - GitHub down: wait, log it
+            return f'PR #{n} unreadable ({str(e)[:120]})'
+
+    # --- lens items ------------------------------------------------------------------------------------------
+    def render_lenses(self):
+        d = os.path.join(self.q, 'lens-watch')
+        try:
+            names = sorted(n for n in os.listdir(d) if n.endswith('.json'))
+        except FileNotFoundError:
+            return
+        rules = self.cfg.get('lensRules')
+        for name in names:
+            key = f'lens-watch/{name}'
+            try:
+                lw = read_json(os.path.join(d, name))
+                pr = lw['pr']
+                lenses = lw['lenses']
+                assert isinstance(pr, int) and pr > 0 and isinstance(lenses, list) and lenses
+                assert all(isinstance(x, dict) and ID_RE.match(str(x.get('lens', ''))) for x in lenses)
+            except Exception:  # noqa: BLE001
+                self.note(key, f'refused {key}: needs {{"pr": <n>, "lenses": [{{"lens": "code", "focus": "..."}}]}}; kept')
+                continue
+            if not rules or not os.path.isfile(rules):
+                self.note(key, f'waiting {key}: the lens rules file (config "lensRules") is missing')
+                continue
+            why = self.ready({'readyWhen': {'type': 'pr-green', 'pr': pr}})
+            if why:
+                self.note(key, f'waiting {key}: {why}')
+                continue
+            head = self.pr(pr)['head']
+            self.note(key, f'lens-watch {key}: PR #{pr} green on {head[:7]}')
+            for lens in lenses:
+                self.render_lens(lw, pr, head, lens, rules)
+
+    def render_lens(self, lw, pr, head, lens, rules):
+        prefix = f'lens-{pr}-{lens["lens"]}-'
+        iid = prefix + head[:7]
+        target = os.path.join(self.q, iid + '.json')
+        if os.path.exists(target) or os.path.exists(os.path.join(self.started_dir, iid + '.json')):
+            return
+        rounds = {n for d in (self.q, self.started_dir) if os.path.isdir(d)
+                  for n in os.listdir(d) if n.startswith(prefix) and n.endswith('.json')}
+        if len(rounds) >= int(lw.get('maxRounds', 2)):
+            self.note(f'lens-rounds/{prefix}', f'not rendering {iid}: {len(rounds)} rounds of lens {lens["lens"]} '
+                      f'for PR #{pr} already (maxRounds {lw.get("maxRounds", 2)})')
+            return
+        brief = os.path.join(self.q, 'briefs', iid + '.md')
+        focus = f' Focus: {lens["focus"]}.' if lens.get('focus') else ''
+        os.makedirs(os.path.dirname(brief), exist_ok=True)
+        with open(brief + '.tmp', 'w') as f:
+            f.write(DEFAULT_LENS_BRIEF.format(pr=pr, head=head, lens=lens['lens'], focus=focus, rules=rules))
+        os.replace(brief + '.tmp', brief)
+        item = {'id': iid, 'title': f'lens {lens["lens"]} #{pr} {head[:7]}', 'kind': 'lens', 'role': 'review',
+                'brief': brief, 'priority': lw.get('priority', 0),
+                'readyWhen': {'type': 'pr-green', 'pr': pr, 'head': head}}
+        for k in ('machines', 'account', 'model', 'effort'):
+            if k in lw:
+                item[k] = lw[k]
+        write_json(target, item)
+        self.log(f'queued {iid}: PR #{pr} green on {head[:7]}, lens {lens["lens"]} (from lens-watch)')
+
+    # --- slots -----------------------------------------------------------------------------------------------
+    def machine_of_env(self, env):
+        for name, m in self.cfg['machines'].items():
+            if (m.get('environmentId') or None) == (env or None):
+                return name
+        return None
+
+    def started_records(self):
+        out = {}
+        if os.path.isdir(self.started_dir):
+            for n in os.listdir(self.started_dir):
+                if n.endswith('.json'):
+                    try:
+                        r = read_json(os.path.join(self.started_dir, n))
+                        out[r.get('taskId')] = r
+                    except (OSError, ValueError):
+                        pass
+        return out
+
+    def count(self, children):
+        """{machine: {'agents': n, 'writers': n}} of live children; unknown machines under None."""
+        recs = self.started_records()
+        unknown_as = self.cfg.get('unknownKindCountsAs', 'writer')
+        counts = {name: {'agents': 0, 'writers': 0} for name in self.cfg['machines']}
+        for c in children:
+            if not c.get('live', c.get('status') not in SETTLED):
+                continue
+            m = self.machine_of_env(c.get('environmentId'))
+            slot = counts.setdefault(m, {'agents': 0, 'writers': 0})
+            slot['agents'] += 1
+            kind = (recs.get(c.get('taskId')) or {}).get('kind', unknown_as)
+            if kind == 'writer':
+                slot['writers'] += 1
+        return counts
+
+    def room(self, name, kind, counts):
+        m = self.cfg['machines'][name]
+        c = counts.get(name, {'agents': 0, 'writers': 0})
+        if c['agents'] >= int(m.get('maxAgents', 0)):
+            return f'{name} full ({c["agents"]}/{m.get("maxAgents", 0)} agents)'
+        if kind == 'writer' and c['writers'] >= int(m.get('maxWriters', m.get('maxAgents', 0))):
+            return f'{name} has no writer slot ({c["writers"]}/{m.get("maxWriters")} writers)'
+        return None
+
+    def capacity(self, name, kind):
+        """None when the machine's capacity check for this kind passes, else why not."""
+        cap = (self.cfg['machines'][name].get('capacity') or {})
+        rule = cap.get(kind, cap.get('default'))
+        if not rule:
+            return None
+        rc, out = self.w.run(list(rule['command']))
+        free = rule.get('free')
+        if free:
+            line = next((l for l in (out or '').splitlines() if 'available=' in l), '')
+            vals = dict(re.findall(r'(\w+)=(\d+)MB', line))
+            try:
+                ok = (int(vals['available']) >= int(free.get('availableMb', 0))
+                      and int(vals['swapfree']) >= int(free.get('swapfreeMb', 0)))
+            except (KeyError, ValueError):
+                return f'{name} capacity unreadable ({" ".join(rule["command"])})'
+            return None if ok else f'{name} low on memory ({line.strip()[:80]})'
+        return None if rc == 0 else f'{name} capacity NOT OK ({" ".join(rule["command"])})'
+
+    # --- usage -----------------------------------------------------------------------------------------------
+    def usage_cfg(self):
+        u = dict(self.cfg.get('usage') or {})
+        if u.get('guardConfig'):
+            try:
+                g = read_json(expand(u['guardConfig']))
+                for k in ('maxUsedPercent', 'maxAgeMinutes', 'cacheDir', 'remoteAccounts'):
+                    u.setdefault(k, g.get(k))
+            except (OSError, ValueError):
+                return None
+        return u
+
+    def usage(self, name, account, model):
+        """None when the account has usage left on that machine, else why not (as usage-guard decides)."""
+        if not account.startswith('claude'):
+            return None
+        u = self.usage_cfg()
+        if u is None:
+            return f'usage config {self.cfg["usage"].get("guardConfig")} unreadable'
+        env = self.cfg['machines'][name].get('environmentId')
+        meter = account
+        if env:
+            meter = ((u.get('remoteAccounts') or {}).get(env) or {}).get(account)
+            if not meter:
+                return f'{account} on {name} has no meter mapping (usage remoteAccounts)'
+        path = os.path.join(expand(u.get('cacheDir') or '~/.t3/caches'), meter + '.json')
+        try:
+            lim = read_json(path).get('usageLimits') or {}
+            checked = datetime.datetime.fromisoformat(lim['checkedAt'].replace('Z', '+00:00'))
+        except Exception:  # noqa: BLE001
+            return f'no usage reading for {meter}'
+        now = self.w.now()
+        fam = next((f for f in ('fable', 'opus', 'sonnet', 'haiku') if f in model.lower()), '')
+        maxp = u.get('maxUsedPercent') or 95
+        for w in lim.get('windows') or []:
+            wid = w.get('id', '')
+            scoped = next((f for f in ('fable', 'opus', 'sonnet', 'haiku') if f in wid), None)
+            if scoped and scoped != fam:
+                continue
+            try:
+                if w.get('resetsAt') and datetime.datetime.fromisoformat(w['resetsAt'].replace('Z', '+00:00')) <= now:
+                    continue
+            except ValueError:
+                pass
+            if (w.get('usedPercent') or 0) >= maxp:
+                return f'{meter} is full ({w.get("label", wid)} {w.get("usedPercent")}%)'
+        age = (now - checked).total_seconds() / 60
+        if age > (u.get('maxAgeMinutes') or 90):
+            return f'usage reading for {meter} is {age:.0f} min old'
+        return None
+
+    # --- start -----------------------------------------------------------------------------------------------
+    def target(self, it, name):
+        d = self.cfg['defaults']
+        target = {'providerInstanceId': it.get('account') or d.get('account', 'claudeAgent'),
+                  'model': it.get('model') or d.get('model', 'claude-opus-5-5'),
+                  'options': [{'id': 'effort', 'value': it.get('effort') or d.get('effort', 'high')}]}
+        if self.cfg['machines'].get(name, {}).get('environmentId'):
+            target['environmentId'] = self.cfg['machines'][name]['environmentId']
+        return target
+
+    def body(self, it, name, request_id, parent, lookup=False):
+        if lookup:
+            # only asks what this id started; the task text is not used
+            return {'parentThreadId': parent, 'requestId': request_id, 'lookupOnly': True,
+                    'task': {'task': 'lookup only', 'title': it['title'][:120], 'target': self.target(it, name)}}
+        m = self.cfg['machines'][name]
+        if m.get('inlineBrief', bool(m.get('environmentId'))):
+            # another machine cannot read this machine's files: the brief goes in the task text
+            with open(it['brief']) as f:
+                text = f.read(MAX_INLINE + 1)
+            if len(text) > MAX_INLINE:
+                raise BriefTooLong(f'brief {it["brief"]} is over {MAX_INLINE} characters for {name}')
+            prompt = INLINE_TASK.format(kind=it['kind'], brief=it['brief'], text=text)
+        else:
+            prompt = (self.cfg.get('taskTemplate') or DEFAULT_TASK).format(
+                kind=it['kind'], brief=it['brief'], title=it['title'], id=it['id'])
+        task = {'task': prompt, 'title': it['title'][:120], 'target': self.target(it, name)}
+        for k in ('role', 'isolation'):
+            if it.get(k):
+                task[k] = it[k]
+        return {'parentThreadId': parent, 'requestId': request_id,
+                'wake': f'[slot filler] Starting "{it["title"][:80]}" ({it["id"]}) on {name} as your child; '
+                        'nothing to do unless it fails.',
+                'task': task}
+
+    def marker(self, iid):
+        return os.path.join(self.inflight_dir, iid + '.json')
+
+    def request_path(self, iid):
+        return os.path.join(self.requests_dir, iid + '.json')
+
+    def read_request(self, iid):
+        try:
+            req = read_json(self.request_path(iid))
+        except (OSError, ValueError):
+            return None
+        return req if isinstance(req, dict) and isinstance(req.get('requestId'), str) else None
+
+    def new_request_id(self, iid, old=None):
+        rid = f'{iid}:{int(self.w.now().timestamp())}'
+        return rid if rid != old else f'{rid}.{os.getpid()}{int(time.monotonic_ns() % 1000000)}'
+
+    def request_of(self, iid, parent):
+        """The item's one request id under this parent, made on its first try and kept until it starts or is
+        refused for good; also each machine's backoff."""
+        req = self.read_request(iid)
+        if req is None or req.get('parentThreadId', parent) != parent:
+            machines = (req or {}).get('machines')
+            req = {'requestId': self.new_request_id(iid, (req or {}).get('requestId')), 'parentThreadId': parent,
+                   'machines': machines if isinstance(machines, dict) else {}}
+            write_json(self.request_path(iid), req)
+        return req
+
+    def waiting_on(self, iid, name):
+        """Why the item waits on this machine after refusals, or None. A wait set more than the longest backoff
+        ahead (the clock was set back) is cut to the longest backoff from now."""
+        req = self.read_request(iid) or {}
+        m = (req.get('machines') or {}).get(name)
+        nxt = m.get('nextAt') if isinstance(m, dict) else None
+        if not isinstance(nxt, (int, float)):
+            return None
+        now = self.w.now().timestamp()
+        if nxt - now > BACKOFF_MAX_S:
+            nxt = now + BACKOFF_MAX_S
+            write_json(self.request_path(iid), dict(req, machines=dict(req['machines'], **{name: dict(m, nextAt=nxt)})))
+        if now >= nxt:
+            return None
+        at = iso(datetime.datetime.fromtimestamp(nxt, datetime.timezone.utc))
+        return f'{name} backing off after {m.get("refusals")} refusal(s) (last: {m.get("lastCode")}) until {at}'
+
+    def refused(self, iid, name, code, parent):
+        """After a refusal or an unclear answer on one machine: that machine backs off for this item, doubling;
+        request_rejected (T3 refused that id for good) also gets a new id, and the count stays."""
+        req = self.request_of(iid, parent)
+        machines = dict(req.get('machines') or {})
+        m = machines.get(name) if isinstance(machines.get(name), dict) else {}
+        n = int(m.get('refusals') or 0) + 1
+        wait = min(BACKOFF_MAX_S, BACKOFF_FIRST_S * 2 ** (n - 1))
+        nxt = self.w.now().timestamp() + wait
+        machines[name] = {'refusals': n, 'lastCode': code, 'nextAt': nxt}
+        req = dict(req, machines=machines)
+        then = f'next try on {name} after {iso(datetime.datetime.fromtimestamp(nxt, datetime.timezone.utc))}'
+        if code == 'request_rejected':
+            req['requestId'] = self.new_request_id(iid, req['requestId'])
+            then += ', with a new request id'
+        write_json(self.request_path(iid), req)
+        return then
+
+    def start(self, it, name):
+        """'started' | 'unknown' (no clear answer: the marker stays, pinned to its machine) | a refusal code |
+        raises ApiError (no answer: the marker stays, the next run asks again)."""
+        mk = self.marker(it['id'])
+        current = self.cfg['parentThreadId']
+        if os.path.exists(mk):
+            intent = read_json(mk)
+        else:
+            intent = {'requestId': self.request_of(it['id'], current)['requestId'], 'parentThreadId': current,
+                      'machine': name, 'at': iso(self.w.now()), 'item': it}
+        parent = intent.get('parentThreadId') or current
+        machine, rid = intent['machine'], intent['requestId']
+        # A start left under another parent (a handover) is only looked up there, never started fresh.
+        look_only = parent != self.cfg['parentThreadId']
+        key = f'start/{it["id"]}/{machine}'
+        try:
+            body = self.body(intent['item'], machine, rid, parent, lookup=look_only)
+        except (OSError, BriefTooLong) as e:
+            # a left-over marker stays: what it asked may have started, so the item asks only there again
+            self.note(key, f'refused {it["id"]} on {machine}: {e}')
+            return 'brief'
+        if not os.path.exists(mk):
+            write_json(mk, intent)
+        ans = self.w.api.start(body)
+        if ans.get('state') == 'started' and ans.get('taskId'):
+            self.finish(intent, ans)
+            return 'started'
+        if ans.get('state') != 'refused':
+            raise ApiError(f'start of {it["id"]}: answer without a task id or refusal')
+        code = ans.get('code') or 'refused'
+        msg = str(ans.get('message'))[:200]
+        if look_only:
+            if code == 'request_rejected':
+                os.remove(mk)
+                self.log(f'dropped the intent for {it["id"]} under the old parent {parent}: refused there for good, '
+                         'nothing started')
+                return code
+            self.note(f'inflight/{it["id"]}', f'cannot tell whether {it["id"]} started on {machine} under the old '
+                      f'parent {parent} (request {rid}: {code}); it is looked up there each run and never started '
+                      f'again; check that thread\'s children, then delete {mk} to start it under {current}')
+            return 'unknown'
+        if code in DEFINITE:
+            # A clear refusal: nothing started under this id (the server looks a started one up first).
+            os.remove(mk)
+            then = self.refused(it['id'], machine, code, parent)
+            self.note(key, f'refused {it["id"]} on {machine}: {code}: {msg}; {then}')
+            return code
+        # No clear answer (a linked machine that stopped answering may have launched it): ask only there again.
+        then = self.refused(it['id'], machine, code, parent)
+        self.note(key, f'no clear answer for {it["id"]} on {machine}: {code}: {msg}; it may have started there: '
+                  f'asking again there with request {rid}, no other machine meanwhile; {then}')
+        return 'unknown'
+
+    def finish(self, intent, ans):
+        it = intent['item']
+        rec = dict(it, taskId=ans['taskId'], childThreadId=ans.get('childThreadId'), machine=intent['machine'],
+                   requestId=intent['requestId'], parentThreadId=intent.get('parentThreadId'),
+                   startedAt=iso(self.w.now()))
+        write_json(os.path.join(self.started_dir, it['id'] + '.json'), rec)
+        try:
+            os.remove(os.path.join(self.q, it['id'] + '.json'))
+        except FileNotFoundError:
+            pass
+        os.remove(self.marker(it['id']))
+        self.forget_request(it['id'])
+        self.log(f'started {it["id"]} on {intent["machine"]}: task {ans["taskId"]} ({it["kind"]}, "{it["title"][:80]}")')
+
+    def forget_request(self, iid):
+        try:
+            os.remove(self.request_path(iid))
+        except FileNotFoundError:
+            pass
+
+    def pinned(self):
+        """Left-over starts still without a clear answer: {item id: machine}."""
+        out = {}
+        if os.path.isdir(self.inflight_dir):
+            for n in os.listdir(self.inflight_dir):
+                try:
+                    out[n[:-5]] = read_json(os.path.join(self.inflight_dir, n))['machine']
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+        return out
+
+    def recover(self):
+        """Markers a stopped run (or an unclear answer) left: ask again on the same machine with the same request id
+        and parent (the server never starts it twice). True when there were any."""
+        if not os.path.isdir(self.inflight_dir):
+            return False
+        names = sorted(n for n in os.listdir(self.inflight_dir) if n.endswith('.json'))
+        for n in names:
+            path = os.path.join(self.inflight_dir, n)
+            try:
+                intent = read_json(path)
+                iid = intent['item']['id']
+                machine = intent['machine']
+            except (OSError, ValueError, KeyError, TypeError):
+                self.log(f'removed broken intent marker {n}')
+                os.remove(path)
+                continue
+            done = os.path.join(self.started_dir, iid + '.json')
+            if os.path.exists(done) and (read_json(done).get('requestId') == intent.get('requestId')):
+                try:
+                    os.remove(os.path.join(self.q, iid + '.json'))
+                except FileNotFoundError:
+                    pass
+                os.remove(path)
+                self.forget_request(iid)
+                self.log(f'finished {iid}: it was started and recorded before a stop')
+                continue
+            if not os.path.exists(os.path.join(self.q, iid + '.json')):
+                os.remove(path)
+                self.log(f'dropped the intent for {iid}: its queue file is gone (if it had started, T3 shows it)')
+                continue
+            if (intent.get('parentThreadId') or self.cfg['parentThreadId']) == self.cfg['parentThreadId']:
+                why = self.waiting_on(iid, machine)
+                if why:
+                    self.note(f'inflight/{iid}', f'waiting {iid}: its start on {machine} has no clear answer yet; '
+                              f'{why}')
+                    continue
+                self.note(f'inflight/{iid}', f'asking again for {iid} on {machine} (request {intent["requestId"]}) '
+                          'after a stop')
+            if self.start(intent['item'], machine) == 'parent_missing':
+                raise ApiError('the parent thread is gone; nothing more starts')
+        return bool(names)
+
+    # --- one run ---------------------------------------------------------------------------------------------
+    def children(self):
+        answer = self.w.api.children(self.cfg['parentThreadId'])
+        if answer.get('parentSettled') is True:
+            raise ApiError(f'the parent thread {self.cfg["parentThreadId"]} was settled by hand (handed over to a '
+                           'new orchestrator?): set parentThreadId to the orchestrator that runs now; nothing starts')
+        return answer.get('children') or []
+
+    def run(self):
+        children = self.children()     # a settled parent stops the run before anything is asked
+        if self.recover():
+            children = self.children()
+        self.render_lenses()
+        counts = self.count(children)
+        pinned = self.pinned()
+        for name in pinned.values():   # an unclear start may hold a slot there that T3 does not show yet
+            counts.setdefault(name, {'agents': 0, 'writers': 0})['agents'] += 1
+        items = []
+        for path in self.queue_files():
+            it, why = self.read_item(path)
+            name = os.path.basename(path)
+            if why:
+                self.note(f'item/{name}', f'refused {name}: {why}; kept')
+                continue
+            if os.path.exists(os.path.join(self.started_dir, name)):
+                self.note(f'item/{name}', f'refused {name}: started/{name} exists (already started); use a new id; kept')
+                continue
+            items.append((it, os.path.getmtime(path)))
+        items.sort(key=lambda x: (-x[0]['priority'], x[1], x[0]['id']))
+        queued = {os.path.basename(p)[:-5] for p in self.queue_files()}
+        if os.path.isdir(self.requests_dir):
+            for n in os.listdir(self.requests_dir):
+                if n.endswith('.json') and n[:-5] not in queued:
+                    self.forget_request(n[:-5])   # its queue file is gone
+        full = set()
+        for it, _ in items:
+            key = f'item/{it["id"]}.json'
+            if it['id'] in pinned:
+                self.note(key, f'waiting {it["id"]}: its start on {pinned[it["id"]]} has no clear answer yet; asked '
+                          'again only there')
+                continue
+            why = self.ready(it)
+            if why:
+                self.note(key, f'waiting {it["id"]}: {why}')
+                continue
+            allowed = it.get('machines') or list(self.cfg['machines'])
+            reasons = []
+            for name in allowed:
+                if name in full:
+                    reasons.append(f'{name} full')
+                    continue
+                backoff = self.waiting_on(it['id'], name)
+                if backoff:
+                    reasons.append(backoff)
+                    continue
+                r = (self.room(name, it['kind'], counts) or self.capacity(name, it['kind'])
+                     or self.usage(name, it.get('account') or self.cfg['defaults'].get('account', 'claudeAgent'),
+                                   it.get('model') or self.cfg['defaults'].get('model', 'claude-opus-5-5')))
+                if r:
+                    reasons.append(r)
+                    if self.room(name, 'other', counts):
+                        full.add(name)
+                    continue
+                got = self.start(it, name)
+                if got == 'started':
+                    counts.setdefault(name, {'agents': 0, 'writers': 0})['agents'] += 1
+                    if it['kind'] == 'writer':
+                        counts[name]['writers'] += 1
+                    break
+                if got == 'unknown':
+                    counts.setdefault(name, {'agents': 0, 'writers': 0})['agents'] += 1
+                    break
+                if got == 'parent_missing':
+                    raise ApiError('the parent thread is gone; nothing more starts')
+                if got == 'slots_full':
+                    full.add(name)
+                reasons.append(f'{name} refused {got}')
+            else:
+                self.note(key, f'waiting {it["id"]}: no machine has room ({"; ".join(reasons)})')
+            if len(full) == len(self.cfg['machines']):
+                break
+
+
+def run_once(cfg, world=None):
+    """One locked run: 0 done (or another run holds the lock), 1 stopped because T3 did not answer."""
+    os.makedirs(cfg['stateDir'], exist_ok=True)
+    fd = os.open(os.path.join(cfg['stateDir'], 'filler.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0   # another run is going
+        f = Filler(cfg, world or World(cfg))
+        try:
+            f.run()
+        except ApiError as e:
+            f.notes_seen.update(f.notes)   # nothing was looked at: keep every note, log only the stop
+            f.note('api', f'stopped this run: {e}')
+            f.save_notes()
+            return 1
+        if 'api' in f.notes:
+            f.log('T3 answers again')
+        f.save_notes()
+        return 0
+    finally:
+        os.close(fd)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description='Fill free agent slots from a queue folder (one run).')
+    ap.add_argument('--config', default=os.environ.get('SLOT_FILLER_CONFIG', '~/.config/slot-filler/config.json'))
+    a = ap.parse_args(argv)
+    try:
+        cfg = load_config(expand(a.config))
+    except ConfigError as e:
+        print(f'slot-filler: {e}', file=sys.stderr)
+        return 2
+    return run_once(cfg)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
