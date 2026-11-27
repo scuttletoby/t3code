@@ -1582,6 +1582,8 @@ switch.
 - [assistant.md](assistant.md): the assistant thread (setup, its profile, what it cannot do yet).
 - [run-records.md](run-records.md): one record per agent run (usage, time, labels) and the weekly
   summary.
+- [delegate-prepare.md](delegate-prepare.md): set up a checkout (merge, install, baseline tests)
+  by script before a delegated agent starts.
 - [`.github/fork-fleet.md`](../../.github/fork-fleet.md): the fleet runners and `CI_RUNNERS`.
 - [`fork-ci/README.md`](../../fork-ci/README.md) and [`fork-kit/README.md`](../../fork-kit/README.md):
   CI actions and host kits.
