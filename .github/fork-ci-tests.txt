@@ -64,6 +64,7 @@
 .github/scripts/fork-owned-reads.test.py run by .github/workflows/fork-tests.yml ok lines
 .github/scripts/fork-pr-queue-workflow.test.py ok lines
 .github/scripts/fork-ci-release.test.py ok lines
+.github/scripts/fork-ci-release-cleanup.test.py unittest
 .github/scripts/fork-changes-list.test.cjs
 .github/scripts/fork-release-workflow.test.py ok lines
 .github/scripts/fork-release.test.sh ~5s

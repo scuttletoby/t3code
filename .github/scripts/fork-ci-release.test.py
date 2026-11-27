@@ -10,6 +10,7 @@ refused half-way) is one block below.
 """
 import atexit
 import contextlib
+import fcntl
 import importlib.util
 import io
 import json
@@ -17,9 +18,12 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
+from stat import S_ISDIR
 
 import yaml
 
@@ -41,8 +45,42 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
-work = pathlib.Path(tempfile.mkdtemp(prefix="fork-ci-release-test-"))
+RUN_PREFIX, LOCK, OLD_AFTER = "fork-ci-release-test-", ".lock", 24 * 3600
+
+
+def sweep_old_runs(tmp):
+    """Remove the folders of earlier runs that never cleaned up (killed hard, a power cut): only a real folder of
+    this user, untouched for a day, whose lock no live run holds (folders from before the lock count as free)."""
+    for name in os.listdir(tmp) if os.path.isdir(tmp) else []:
+        path, lock = os.path.join(tmp, name), os.path.join(tmp, name, LOCK)
+        try:
+            st = os.lstat(path)
+            newest = max(st.st_mtime, os.lstat(lock).st_mtime) if os.path.lexists(lock) else st.st_mtime
+        except OSError:
+            continue
+        if (not name.startswith(RUN_PREFIX) or not S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
+                or time.time() - newest < OLD_AFTER):
+            continue
+        fd = None
+        try:
+            if os.path.lexists(lock):
+                fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises while a live run holds it
+            shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+sweep_old_runs(tempfile.gettempdir())
+work = pathlib.Path(tempfile.mkdtemp(prefix=RUN_PREFIX))
 atexit.register(shutil.rmtree, work, ignore_errors=True)   # its release copies are tens of MB per run
+run_lock = os.open(work / LOCK, os.O_RDWR | os.O_CREAT, 0o600)   # held while this run lives: sweep_old_runs skips it
+fcntl.flock(run_lock, fcntl.LOCK_EX)
+# A stop by SIGTERM (a job timeout, a cancel, `timeout`) exits through atexit, so the folder goes too.
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
 gitconfig = work / "gitconfig"
 gitconfig.write_text("[user]\n\tname = Test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n"
                      "[protocol \"file\"]\n\tallow = always\n")
@@ -449,11 +487,18 @@ if how in ('heavy', 'desk') and not missing:
         failed = m.self_test(m.copy_tool(os.path.realpath(source), '0' * 40))
     else:                       # install's stage step (its self-test), for the release config's first pool
         # The staged scripts run with os.getppid() == 1, so fork-fleet.py's gate (which refuses here) never finds the
-        # Runner.Worker of the CI job running this test, and never kills it.
-        shim = os.path.join(m.PREFIX, 'no-parent.py')
+        # Runner.Worker of the CI job running this test, and never kills it. Should the gate find its parent some
+        # other way, os.kill and os.killpg refuse every signal (logged, so the stage fails saying so, not exit 137);
+        # each start is logged too, so a gate that no longer starts through the stand-in fails as well.
+        shim, log = os.path.join(m.PREFIX, 'no-parent.py'), os.path.join(m.PREFIX, 'no-parent.log')
         with open(shim, 'w') as f:
-            f.write("import os, runpy, sys\nos.getppid = lambda: 1\nargs = sys.argv[1:]\n"
+            f.write("import os, runpy, sys\nos.getppid = lambda: 1\n"
+                    f"def note(line):\n    with open({log!r}, 'a') as f:\n        f.write(line + '\\n')\n"
+                    "def refuse(pid, sig):\n    if sig:\n        note(f'refused signal {int(sig)} to pid {pid}')\n"
+                    "        raise PermissionError('the no-parent stand-in refused the signal')\n"
+                    "os.kill = os.killpg = refuse\nargs = sys.argv[1:]\n"
                     "while args[0] in ('-I', '-B'):\n    args.pop(0)\nsys.argv = args\n"
+                    "note('started ' + os.path.basename(args[0]))\n"
                     "runpy.run_path(args[0], run_name='__main__')\n")
         m.CMD['python3'] = [sys.executable, '-I', '-B', shim]
         os.makedirs(m.p(m.OPT))
@@ -463,6 +508,15 @@ if how in ('heavy', 'desk') and not missing:
             m.stage(source, '0' * 40, None, pool)
         except m.Refused as e:
             failed = [str(e)]
+        try:
+            with open(log) as f:
+                notes = f.read().splitlines()
+        except OSError:
+            notes = []
+        failed += [f'a staged script tried to stop a process: the no-parent stand-in {n} (the gate finds its parent '
+                   f'another way now: update the stand-in in KIT_CHECK)' for n in notes if n.startswith('refused ')]
+        if 'started fork-fleet.py' not in notes:
+            failed.append(f'the staged gate did not start through the no-parent stand-in (its log: {notes})')
 print(json.dumps({'missing': missing, 'failed': failed}))
 """
 # kit -> (how its installer checks its files, the installer as the bootstrap runs it, the --source the bootstrap
@@ -637,12 +691,19 @@ if real_ok:
         agent = top / ".github/scripts/fork-fleet-desk-agent.py"
         agent.write_text(extra + agent.read_text())
         (top / "fork-kit/agent-guards/sbin/agent-guards-install").write_text("this is not python\n")
+        # a gate that finds its parent without os.getppid (here: the process that staged it, not a CI job's worker)
+        edit(top / ".github/scripts/fork-fleet.py", "    pid = os.getppid() if pid is None else pid\n",
+             "    if pid is None:\n        return int(open('/proc/self/stat').read().rsplit(')', 1)[1].split()[1])\n")
 
     caught = kit_release_problems(mutated_release("release-loads-more", loads_more))
     for kit, says in (("heavy", "bin/heavy --help failed"), ("desk", "fork-fleet-desk-agent.py --help fails")):
         check(f"release check: a copied {kit} script that loads a file the release lacks fails the {kit} self-test",
               any(c == "self-test" and says in t for c, t in caught.get(kit, []))
               and CAUSES["self-test"] in kit_failure_text(caught[kit]), str(caught.get(kit))[:1500])
+    check("release check: a staged gate that finds its parent another way fails desk's self-test with the "
+          "stand-in's message (the stand-in refused the kill: no exit 137)",
+          any(c == "self-test" and "no-parent stand-in refused signal 9" in t for c, t in caught.get("desk", [])),
+          str(caught.get("desk"))[:1500])
     check("release check: an installer that cannot run fails as 'did not run', not as a missing path",
           [c for c, _ in caught.get("agent-guards", [])] == ["ran"]
           and CAUSES["path"] not in kit_failure_text(caught["agent-guards"]), str(caught.get("agent-guards")))

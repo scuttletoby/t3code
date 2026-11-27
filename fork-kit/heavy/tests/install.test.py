@@ -424,6 +424,28 @@ class Install(unittest.TestCase):
         self.assertEqual(os.readlink(self.path('/usr/local/libexec/heavy/current')),
                          f'/usr/local/libexec/heavy/versions/{SHA1}')
 
+    def test_self_test_starts_each_installed_command(self):
+        self.assertEqual(self.install()[0], 0)
+        src = os.path.join(self.root, 'src')
+        shutil.copytree(KIT, src, ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(os.path.join(os.path.dirname(KIT), 'common'), os.path.join(self.root, 'common'),
+                        ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(CAPACITY, os.path.join(src, 'capacity'))
+        for tool, sha in (('t3-capacity', 'c' * 40), ('agent-slots', 'd' * 40)):   # a failed copy stays, per sha
+            with self.subTest(tool=tool):
+                path = os.path.join(src, 'bin', tool)
+                with open(path) as f:
+                    good = f.read()
+                with open(path, 'w') as f:
+                    f.write(good.replace('import ', 'import no_such_module, ', 1))
+                code, _, err = self.install(sha=sha, source=src)
+                with open(path, 'w') as f:
+                    f.write(good)
+                self.assertEqual(code, 1)
+                self.assertIn(f'bin/{tool} --help failed', err)
+                self.assertEqual(os.readlink(self.path('/usr/local/libexec/heavy/current')),
+                                 f'/usr/local/libexec/heavy/versions/{SHA1}')
+
     def test_upgrade_keeps_config_and_the_old_version(self):
         self.assertEqual(self.install('--slice', 'builds.slice', '--grace', '2.5')[0], 0)
         self.assertEqual(self.install(sha=SHA2)[0], 0)

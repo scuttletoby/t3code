@@ -105,6 +105,9 @@ def decide(data, c):
 
 
 def main():
+    if sys.argv[1:] in (['-h'], ['--help']):     # a hook gets no arguments; heavy-install's self-test starts this
+        print(__doc__.strip())
+        return 0
     try:
         out = decide(json.load(sys.stdin), config())
     except Exception:       # never break a call because of this hook

@@ -687,7 +687,8 @@ Two thin callers come with it:
   written) it does not hold, with a note, so no hold lasts past 20 s; no cache folder: no hold, with a note.
 - `bin/agent-slots` (not linked onto PATH: a host wires it in itself): a Claude Code hook (UserPromptSubmit, Stop)
   for orchestrator sessions: free agent slots are the smaller of the process limit and the machine's `fits` for
-  its kind.
+  its kind. `--help` prints its usage: heavy-install's self-test starts each of the three commands of a new copy
+  (`bin/heavy`, `bin/t3-capacity`, `bin/agent-slots`) with it before the copy is switched in.
 
 A `heavy facts` that does not answer within 5 s (it is killed), fails or prints something else is never free for
 either caller.

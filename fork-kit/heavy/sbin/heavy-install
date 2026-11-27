@@ -219,12 +219,13 @@ def copy_tool(source, sha):
 def self_test(dest):
     """The copied version folder DEST is whole and its commands start from it; [] when they do."""
     problems = tree_problems(dest)
-    for args in (['--help'], ['sweep', '--help'], ['queue', '--help'], ['capacity', '--help'],
-                 ['facts', '--help']):
-        r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, 'bin', 'heavy'), *args],
+    for tool, args in (('heavy', ['--help']), ('heavy', ['sweep', '--help']), ('heavy', ['queue', '--help']),
+                       ('heavy', ['capacity', '--help']), ('heavy', ['facts', '--help']),
+                       ('t3-capacity', ['--help']), ('agent-slots', ['--help'])):
+        r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, 'bin', tool), *args],
                            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
-        if r.returncode != 0 or 'heavy' not in r.stdout:
-            problems.append(f'bin/heavy {" ".join(args)} failed: {(r.stderr or r.stdout).strip()[:200]}')
+        if r.returncode != 0 or tool not in r.stdout:
+            problems.append(f'bin/{tool} {" ".join(args)} failed: {(r.stderr or r.stdout).strip()[:200]}')
     return problems
 
 
