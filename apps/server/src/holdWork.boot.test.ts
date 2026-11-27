@@ -174,7 +174,7 @@ const childEnv = (
   XDG_DATA_HOME: NodePath.join(root, "data"),
   XDG_STATE_HOME: NodePath.join(root, "state"),
   T3CODE_TELEMETRY_ENABLED: "true",
-  T3CODE_POSTHOG_HOST: remoteUrl,
+  T3CODE_TELEMETRY_HOST: remoteUrl,
   // A build with T3 Connect: startup then also reconciles the stored desired link. The build's
   // relay is the local fake server the stored link points at, so a held boot that reached it would
   // show there.
