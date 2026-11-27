@@ -7,6 +7,7 @@ set -u
 
 # ---- settings -------------------------------------------------------------------------------------
 # Programs that mean "in use, place no work here": exact process names, as `pgrep -x` matches them.
+# Linux keeps only the first 15 characters of a process name, so a longer name is matched by those.
 BUSY_PROCESSES=""
 # While this file exists the machine is not available; its first line is the reason.
 BUSY_FILE="${HOME:-/nonexistent}/.config/t3-placement/busy"
@@ -28,14 +29,22 @@ if [ -f "$BUSY_FILE" ]; then
   busy "busy: ${reason:-$BUSY_FILE is there}"
 fi
 
+# Without pgrep the busy list cannot be checked: not available rather than free.
+if [ -n "$BUSY_PROCESSES" ] && ! command -v pgrep >/dev/null 2>&1; then
+  busy "busy: pgrep is missing, so BUSY_PROCESSES cannot be checked"
+fi
 for name in $BUSY_PROCESSES; do
-  if pgrep -x "$name" >/dev/null 2>&1; then busy "busy: $name is running"; fi
+  # `pgrep -x` matches the kernel's 15-character process name.
+  short=$(printf '%.15s' "$name")
+  if pgrep -x "$short" >/dev/null 2>&1; then busy "busy: $name is running"; fi
 done
 
 if [ "$BUSY_ON_BATTERY" = 1 ]; then
   has_battery="" on_power=""
   for supply in "$POWER_SUPPLY_DIR"/*; do
     [ -r "$supply/type" ] || continue
+    # A wireless mouse's, keyboard's or controller's battery (scope Device) is not this machine's.
+    [ "$(cat "$supply/scope" 2>/dev/null)" = Device ] && continue
     case $(cat "$supply/type" 2>/dev/null) in
       Battery) has_battery=1 ;;
       Mains | USB*) [ "$(cat "$supply/online" 2>/dev/null)" = 1 ] && on_power=1 ;;

@@ -1514,8 +1514,11 @@ slow sampler leaves out `hostResources` without delaying `placement`. With them 
 count reads the same sample for its memory floor, so a hung sampler also gives `placement` "not
 available" (the gate could not count) after 6 seconds, the same answer the gate gives at launch. Facts are never stored: each read measures again, except a `factsCommand` answer, which is kept
 in memory for 15 seconds (a restart forgets it, and a run every reader stopped waiting for is
-stopped and kept by none). A slow `factsCommand` delays the read by up to its 5 seconds; it runs
-beside the slot and host reads.
+stopped and kept by none). `factsAt` is the time of the read, so a cached `factsCommand` answer
+in it can be up to about 15 seconds older. A slow `factsCommand` delays the read by up to its 5
+seconds, or about 6 for a program that ignores the stop (it is killed one second after it); it
+runs beside the slot and host reads. Its answer is read when its output closes, so a program that
+leaves a background child holding the output reads "did not answer within 5 seconds".
 The gate's status read does its own clean-up first (it drops used-up slot holds of waits, the same
 step `wait_list` runs); the facts read gives that status read at most 6 seconds (the gate's own
 count limit plus one), so a read can take that long on a busy machine, and it changes nothing but

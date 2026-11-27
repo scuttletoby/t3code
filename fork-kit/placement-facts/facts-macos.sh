@@ -27,6 +27,10 @@ if [ -f "$BUSY_FILE" ]; then
   busy "busy: ${reason:-$BUSY_FILE is there}"
 fi
 
+# Without pgrep the busy list cannot be checked: not available rather than free.
+if [ -n "$BUSY_PROCESSES" ] && ! command -v pgrep >/dev/null 2>&1; then
+  busy "busy: pgrep is missing, so BUSY_PROCESSES cannot be checked"
+fi
 for name in $BUSY_PROCESSES; do
   if pgrep -x "$name" >/dev/null 2>&1; then busy "busy: $name is running"; fi
 done

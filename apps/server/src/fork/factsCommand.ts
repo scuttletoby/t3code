@@ -152,6 +152,7 @@ export class FactsCommands extends Context.Service<
   { readonly run: (factsCommand: string) => Effect.Effect<FactsCommandResult> }
 >()("t3/fork/factsCommand/FactsCommands") {}
 
+/** Its span shows a boot built it (holdWork.boot.test.ts); without it every read says "no process runner". */
 export const make = Effect.gen(function* () {
   const runner = yield* ProcessRunner.ProcessRunner;
   const cache = yield* Cache.make({
@@ -165,7 +166,7 @@ export const make = Effect.gen(function* () {
   return FactsCommands.of({
     run: Effect.fn("FactsCommands.run")((factsCommand: string) => Cache.get(cache, factsCommand)),
   });
-});
+}).pipe(Effect.withSpan("FactsCommands.make"));
 
 /** Needs a process spawner; in `forkLayers.layerRuntimeServices`. */
 export const layer = Layer.effect(FactsCommands, make).pipe(Layer.provide(ProcessRunner.layer));

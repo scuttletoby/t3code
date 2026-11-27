@@ -57,11 +57,14 @@ class ScriptCase(unittest.TestCase):
         with open(os.path.join(self.dir, name), 'w') as f:
             f.write(text)
 
-    def supply(self, name, kind, online=None):
+    def supply(self, name, kind, online=None, scope=None):
         folder = os.path.join(self.power, name)
         os.makedirs(folder, exist_ok=True)
         with open(os.path.join(folder, 'type'), 'w') as f:
             f.write(kind + '\n')
+        if scope is not None:
+            with open(os.path.join(folder, 'scope'), 'w') as f:
+                f.write(scope + '\n')
         if online is not None:
             with open(os.path.join(folder, 'online'), 'w') as f:
                 f.write(f'{online}\n')
@@ -83,9 +86,17 @@ class ScriptCase(unittest.TestCase):
         os.chmod(path, 0o755)
         return path
 
+    def only_stand_ins_on_path(self):
+        """PATH holds the stand-ins and the few plain tools the scripts use, so a removed stand-in is missing."""
+        core = os.path.join(self.dir, 'core')
+        os.mkdir(core)
+        for name in ('cat', 'head', 'grep'):
+            os.symlink(shutil.which(name), os.path.join(core, name))
+        self.path = f'{self.bin}:{core}'
+
     def run_facts(self, **settings):
         path = self.configured(**settings)
-        env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'FAKE_DIR': self.dir, 'HOME': self.dir}
+        env = {'PATH': getattr(self, 'path', f'{self.bin}:/usr/bin:/bin'), 'FAKE_DIR': self.dir, 'HOME': self.dir}
         done = subprocess.run([path], env=env, capture_output=True, text=True, timeout=10)
         return done.returncode, done.stdout.splitlines(), done.stderr.strip().splitlines()[:1]
 
@@ -115,6 +126,14 @@ class CommonRules:
         self.assertEqual(self.run_facts(BUSY_PROCESSES='zoom steam'), (1, [], ['busy: steam is running']))
         # Not in the list: free.
         self.assertEqual(self.run_facts(BUSY_PROCESSES='zoom')[0], 0)
+
+    def test_missing_pgrep_with_a_busy_list_is_not_available(self):
+        self.only_stand_ins_on_path()
+        os.remove(os.path.join(self.bin, 'pgrep'))
+        self.assertEqual(self.run_facts(BUSY_PROCESSES='steam'),
+                         (1, [], ['busy: pgrep is missing, so BUSY_PROCESSES cannot be checked']))
+        # An empty busy list needs no pgrep: free, and no ci-runner label either.
+        self.assertEqual(self.run_facts()[:2], (0, []))
 
     def test_runner_is_a_label(self):
         self.write('running', 'Runner.Listener\n')
@@ -151,6 +170,20 @@ class Linux(CommonRules, ScriptCase):
         self.supply('AC', 'Mains', online=0)
         self.supply('ucsi', 'USB', online=1)
         self.assertEqual(self.run_facts()[0], 0)
+
+    def test_a_device_battery_is_not_the_machine_on_battery(self):
+        # A desktop with a wireless mouse: the mouse's battery (scope Device) and no Mains entry.
+        self.supply('hid-00:11:22:33:44:55-battery', 'Battery', scope='Device')
+        self.assertEqual(self.run_facts()[0], 0)
+        # A laptop's own battery (scope System, or no scope file) beside it still counts.
+        self.supply('BAT0', 'Battery', scope='System')
+        self.assertEqual(self.run_facts(), (1, [], ['busy: on battery']))
+
+    def test_busy_process_longer_than_15_characters_matches_its_kernel_name(self):
+        # Linux keeps 15 characters of a process name, and `pgrep -x` matches those.
+        self.write('running', 'gnome-character\n')
+        self.assertEqual(self.run_facts(BUSY_PROCESSES='gnome-characters'),
+                         (1, [], ['busy: gnome-characters is running']))
 
     def test_missing_power_folder_is_free(self):
         self.assertEqual(self.run_facts(POWER_SUPPLY_DIR=os.path.join(self.dir, 'nope'))[0], 0)

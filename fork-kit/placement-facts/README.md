@@ -29,9 +29,17 @@ The busy file is a switch a person (or their own scripts) can flip without openi
 - The setting is an absolute path to one program: no shell, no arguments. On Windows only an `.exe` runs, which is
   why the Windows example is C# source: build it with
   `& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /out:C:\t3-placement\facts.exe facts-windows.cs`.
-- No answer within 5 seconds is "not available". A machine that is asked by another one is asked with a short wait,
-  so keep the program fast (each example answers in well under a second, `nvidia-smi` included).
-- One answer serves every facts read for 15 seconds: a machine that turns busy says so on the read after that.
+- No answer within 5 seconds is "not available". T3 then stops the program and everything it started; one that
+  ignores the stop is killed a second later, so a read can wait about 6 seconds. A machine that is asked by another
+  one is asked with a short wait, so keep the program fast (each example answers in well under a second,
+  `nvidia-smi` included).
+- The answer is complete when the program's output closes, not when it exits: start no background program that
+  keeps the output open, or the read waits out the 5 seconds and says "did not answer".
+- One answer serves every facts read for 15 seconds: a machine that turns busy says so on the read after that. The
+  read's `factsAt` is the time of the read, so the program's answer in it can be up to about 15 seconds older.
+- Without `pgrep` the busy-program list cannot be checked, so the Linux and macOS examples say not available when
+  the list is not empty. A Linux process name is cut to 15 characters; the Linux example matches a longer name by
+  those. A desktop's wireless mouse or controller battery (scope `Device`) is not "on battery".
 - It runs with the T3 server's own rights. Keep it in a folder only you can write to.
 
 ## Tests
