@@ -36,6 +36,7 @@ const {
   writeRecords,
   command,
   NODE_COUNTS,
+  fileLimit,
 } = require("./fork-ci-tests.cjs");
 
 const never = () => false;
@@ -883,6 +884,177 @@ test("a process a test leaves behind holding its output does not hang the run", 
   }
 });
 
+test("a test file's time limit: FORK_CI_TEST_LIMIT, else 3 times its weight and at least 240 s (#1070)", () => {
+  assert.equal(fileLimit(null, {}), 240);
+  assert.equal(fileLimit(30, {}), 240);
+  assert.equal(fileLimit(120, {}), 360);
+  assert.equal(fileLimit(120, { FORK_CI_TEST_LIMIT: "" }), 360);
+  assert.equal(fileLimit(120, { FORK_CI_TEST_LIMIT: "2" }), 2);
+  assert.equal(fileLimit(null, { FORK_CI_TEST_LIMIT: "0.5" }), 0.5);
+  for (const bad of ["0", "-1", "x", "1e3", " 5", "Infinity"])
+    assert.throws(() => fileLimit(10, { FORK_CI_TEST_LIMIT: bad }), /FORK_CI_TEST_LIMIT/, bad);
+  // A longer setTimeout fires at once (every file would fail as timed out): refused, saying the maximum.
+  assert.equal(fileLimit(null, { FORK_CI_TEST_LIMIT: "2147483" }), 2147483);
+  assert.throws(() => fileLimit(10, { FORK_CI_TEST_LIMIT: "2147484" }), /at most 2147483 s/);
+  assert.throws(() => fileLimit(10, { FORK_CI_TEST_LIMIT: "3000000" }), /at most 2147483 s/);
+  assert.equal(fileLimit(99999, {}), 299997); // the largest weight the list takes fits
+});
+
+// A test that never ends fails at its time limit, quickly, with its file named and its last output lines shown
+// outside the group, and the run goes on to the next file. The 60 s limit of runScript() is the hang this replaces.
+test("a test file that never ends is stopped at its time limit and fails, naming the file (#1070)", () => {
+  const { root, run } = runScript(
+    {
+      // Ignores SIGTERM too: SIGKILL follows.
+      "fork-ci/hang.test.sh": "trap '' TERM; echo hang-started; sleep 30 & wait; sleep 30\n",
+      "fork-ci/after.test.sh": "echo after-ran\n",
+    },
+    1,
+    [],
+    "fork-ci/hang.test.sh\nfork-ci/after.test.sh",
+    { FORK_CI_TEST_LIMIT: "1" },
+  );
+  try {
+    assert.equal(run.error, undefined, String(run.error)); // not killed at the 60 s limit
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    assert.match(
+      run.stdout,
+      /::error file=fork-ci\/hang\.test\.sh::fork-ci\/hang\.test\.sh timed out after 1 s/,
+    );
+    assert.match(
+      run.stdout,
+      /Last \d+ line\(s\) of fork-ci\/hang\.test\.sh:\n::stop-commands::[\w-]+\nhang-started\n/,
+    );
+    assert.match(run.stdout, /did not end within 1 s: stopping it/);
+    assert.match(run.stdout, /::group::fork-ci\/after\.test\.sh[^\n]*\nafter-ran\n/);
+    assert.doesNotMatch(run.stdout, /::error file=fork-ci\/after\.test\.sh/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The case that hung the runner: a Python test file whose failing test leaves a thread that never ends (its cleanup never ran), so
+// the file does not end after unittest's summary. It fails at its limit with what it printed (not lost in a buffer)
+// and where each thread was (fork-ci-unittest.py's stack dump on SIGTERM).
+test("a failing Python test file that never ends shows its output and its threads' stacks (#1070)", () => {
+  const py = [
+    "import threading, unittest",
+    "stop = threading.Event()",
+    "def waits_for_ever():",
+    "    stop.wait()",
+    "class T(unittest.TestCase):",
+    "    def test_leaves_a_thread(self):",
+    "        threading.Thread(target=waits_for_ever).start()  # not a daemon: the file cannot end",
+    "        print('printed-before-the-hang')",
+    "        self.fail('this test fails before its cleanup would stop the thread')",
+    "unittest.main()",
+    "",
+  ].join("\n");
+  const { root, run } = runScript(
+    { "fork-ci/hang.test.py": py },
+    1,
+    [],
+    "fork-ci/hang.test.py unittest",
+    { FORK_CI_TEST_LIMIT: "2" },
+  );
+  try {
+    assert.equal(run.error, undefined, String(run.error));
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    assert.match(run.stdout, /fork-ci\/hang\.test\.py timed out after 2 s/);
+    assert.match(run.stdout, /printed-before-the-hang/);
+    assert.match(run.stdout, /FAILED \(failures=1\)/);
+    assert.match(run.stdout, /in waits_for_ever/); // the stack of the thread that kept it running
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The common hang: the test's main thread waits (a read, communicate()) after a print. The line is in the output
+// when the test is killed, not lost in stdout's buffer.
+test("a Python test hung in its main thread keeps the lines it printed (#1070)", () => {
+  const py = [
+    "import threading, unittest",
+    "class T(unittest.TestCase):",
+    "    def test_waits(self):",
+    "        print('printed-before-main-hang')",
+    "        threading.Event().wait()",
+    "unittest.main()",
+    "",
+  ].join("\n");
+  const { root, run } = runScript(
+    { "fork-ci/main-hang.test.py": py },
+    1,
+    [],
+    "fork-ci/main-hang.test.py unittest",
+    { FORK_CI_TEST_LIMIT: "2" },
+  );
+  try {
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    assert.match(run.stdout, /fork-ci\/main-hang\.test\.py timed out after 2 s/);
+    // In the file's group, before the stop (the stack dump after it fills the 20-line tail).
+    assert.match(
+      run.stdout,
+      /::group::fork-ci\/main-hang\.test\.py[^\n]*\nprinted-before-main-hang\n[\s\S]*did not end within 2 s/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A process the test started (a background job, a server) is in the test's process group and stops with it.
+test("a test stopped at its limit takes the processes it started with it (#1070)", () => {
+  const { root, run } = runScript(
+    {
+      "fork-ci/bg.test.sh": 'sleep 300 & echo $! > "$MARKS/bg.pid"; echo bg-started; wait\n',
+    },
+    1,
+    [],
+    "fork-ci/bg.test.sh",
+    { FORK_CI_TEST_LIMIT: "1" },
+  );
+  const pid = Number(fs.readFileSync(path.join(root, "bg.pid"), "utf8"));
+  const alive = () => {
+    try {
+      return !/^\d+ \(.*\) Z /.test(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
+    } catch {
+      return false;
+    }
+  };
+  try {
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    assert.match(run.stdout, /fork-ci\/bg\.test\.sh timed out after 1 s/);
+    assert.equal(alive(), false, "the background sleep outlived its test");
+  } finally {
+    try {
+      process.kill(pid);
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The failure tail repeats the test's last lines as text: a workflow command the test printed (an `::error` line)
+// is an annotation once, from the group, not again from the tail.
+test("a failed test's tail repeats its own ::error line as text, not as a second annotation (#1070)", () => {
+  const { root, run } = runScript(
+    {
+      "fork-ci/err.test.sh":
+        'echo "::error::own-error-line"; echo "$(printf "x%.0s" $(seq 600))"; exit 3\n',
+    },
+    1,
+  );
+  try {
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    assert.match(run.stdout, /fork-ci\/err\.test\.sh failed \(exit 3\)/);
+    const tail = run.stdout.slice(run.stdout.indexOf("Last "));
+    assert.match(
+      tail,
+      /^Last \d+ line\(s\) of fork-ci\/err\.test\.sh:\n::stop-commands::(fork-ci-tail-[\w-]+)\n::error::own-error-line\nx{500}\.\.\.\n::\1::\n/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // A pipe into a reader that stops early (`grep -q`, `grep -m`, `head`) kills the writer with SIGPIPE
 // whenever it has more to write; under `pipefail` that reads as a failed check, more often under load.
 const earlyExitPipe =
@@ -1275,6 +1447,10 @@ test("recordProblems: a failure, no count, nothing run, a skip not declared or d
     ...fields,
   });
   assert.deepEqual(recordProblems(row({})), []);
+  assert.deepEqual(recordProblems(row({ status: null, timed_out: 240 })), [
+    "k timed out after 240 s",
+  ]);
+  assert.deepEqual(recordProblems(row({ status: null })), ["k failed (exit null)"]);
   assert.deepEqual(
     recordProblems(row({ skipped: 1, skipped_tests: ["T.a"], allowed: ["T.a"] })),
     [],
@@ -1340,6 +1516,7 @@ test("record keeps what a run was, what its output counted and the skips its tes
       vars: ["A_TESTS=1"],
       only: "L",
       status: 0,
+      timed_out: null,
       seconds: 1.5,
       format: "unittest",
       tests: 3,
