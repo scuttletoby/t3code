@@ -408,7 +408,7 @@ const CurrentDirectDelivery = Context.Reference<DirectDelivery | undefined>(
  * Line places (`SlotGate.SlotPlace`): a waiting scheduled run's per task, at its due time; a webhook
  * delivery's per delivery, from its first ask. Each leaves as its run starts, given up or deleted
  * (`waitForWebhookSlot`, `leaveEndedPlaces` every 5 s), refused for its profile (`admitRun`), or as
- * its worker removes its stored row after its run returned (`keepStored`).
+ * its worker removes its stored row, after its run or before it (`keepStored`, `leaveStored`).
  */
 const SCHEDULED_PLACE = "scheduled-run:";
 const DELIVERY_PLACE = "webhook-delivery:";
@@ -964,17 +964,21 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   });
 
   /**
-   * The stored-delivery worker, after a delivery's run returned: `true` when its task was saved
+   * A stored delivery its worker removes: its own place in line goes now, not at the sweep. Named
+   * by its id, so it never frees another delivery's place (one stored for its task after a delete
+   * and a new task with the same id). A run that asked in its task's place (its row unreadable)
+   * left that place as its wait ended, or as the gate let it through.
+   */
+  const leaveStored = (deliveryId: string) => leaveLine(gate, [`${DELIVERY_PLACE}${deliveryId}`]);
+
+  /**
+   * The stored-delivery worker, after its delivery's run returned: `true` when its task was saved
    * while it waited (the worker keeps the row, runs it again on the task as saved; read once). Else
    * the worker removes the row: its place in line goes now, run, skipped or failed before it asked.
    */
-  const keepStored = (taskId: string) =>
+  const keepStored = (taskId: string, deliveryId: string) =>
     Effect.suspend(() =>
-      keep.delete(taskId)
-        ? Effect.succeed(true)
-        : Option.isNone(gate)
-          ? Effect.succeed(false)
-          : storedPlace(taskId).pipe(Effect.flatMap(leave), Effect.as(false)),
+      keep.delete(taskId) ? Effect.succeed(true) : leaveStored(deliveryId).pipe(Effect.as(false)),
     );
 
   /** The task's run ended, any way: a slot its dispatch never ended is free again. */
@@ -1019,6 +1023,8 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
     ended,
     directDelivery,
     keepStored,
+    /** The stored-delivery worker removes a delivery before its run (payload, prompt too long). */
+    leaveStored,
     /** `ScheduledTaskService.upsert`, last before it writes the row (`scheduledTaskMcpProfile.ts`). */
     saving: profiles.saving,
   };
