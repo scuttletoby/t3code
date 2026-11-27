@@ -68,6 +68,7 @@ TESTS = {'test', '[', '[['}
 FILE_TESTS = {'-e', '-f', '-s', '-d', '-p', '-r', '-w', '-x', '-L', '-h', '-S', '-b', '-c', '-N', '-O', '-G', '-nt',
               '-ot', '-ef'}
 NUMBER_TESTS = {'-lt', '-le', '-gt', '-ge', '-eq', '-ne'}
+COUNTER_TESTS = {'-lt', '-le', '-gt', '-ge'}     # a counter; -eq/-ne test a status, never a bound
 GH_CHECKS = {'run', 'pr', 'api', 'workflow', 'release'}
 WATCH_FLAGS_WITH_VALUE = {'-n', '--interval', '-q', '--equexit', '-s', '--shell'}
 HEREDOC = re.compile(r'<<(-?)\s*(["\']?)([A-Za-z_][A-Za-z0-9_]*)\2')
@@ -127,8 +128,24 @@ def strip_comments(text):
     return ''.join(out)
 
 
+def backticks(text):
+    """`cmd` as $(cmd), outside single quotes, so one reader handles both (an unquoted one splits into words)."""
+    out, quote, open_ = [], None, False
+    for k, c in enumerate(text):
+        if c == "'" and not open_ and quote != '"' and (k == 0 or text[k - 1] != '\\'):
+            quote = None if quote == "'" else "'"
+        elif c == '"' and quote != "'" and (k == 0 or text[k - 1] != '\\'):
+            quote = None if quote == '"' else '"'
+        elif c == '`' and quote != "'" and (k == 0 or text[k - 1] != '\\'):
+            out.append(')' if open_ else '$(')
+            open_ = not open_
+            continue
+        out.append(c)
+    return ''.join(out)
+
+
 def tokens(text):
-    lex = shlex.shlex(strip_comments(strip_heredocs(text)), posix=True, punctuation_chars='();<>|&\n')
+    lex = shlex.shlex(backticks(strip_comments(strip_heredocs(text))), posix=True, punctuation_chars='();<>|&\n')
     lex.whitespace, lex.commenters, lex.whitespace_split = ' \t\r', '', True
     out = []
     for t in lex:
@@ -170,7 +187,24 @@ def rounds(words):
 
 def frame(kind, n=1):
     """One loop being read (or the top): its rounds, the sleep of one round, and the checks made inside it."""
-    return {'kind': kind, 'n': n, 'sleep': 0.0, 'ci': [], 'local': [], 'bound': None}
+    return {'kind': kind, 'n': n, 'sleep': 0.0, 'ci': [], 'local': [], 'bound': None, 'cond': kind == 'while'}
+
+
+def substitutions(word):
+    """The command texts inside `$(...)` of one word (`"$(gh pr view 5 -q .state)"` is one word to the shell
+    reader, and its inside runs as commands; backticks are $(...) by then)."""
+    out, i = [], 0
+    while i < len(word):
+        if word.startswith('$(', i) and not word.startswith('$((', i):
+            depth, j = 1, i + 2
+            while j < len(word) and depth:
+                depth += {'(': 1, ')': -1}.get(word[j], 0)
+                j += 1
+            out.append(word[i + 2:j - 1] if not depth else word[i + 2:])
+            i = j
+        else:
+            i += 1
+    return out
 
 
 class Reading:
@@ -216,7 +250,11 @@ class Reading:
                 i += 1
                 continue
             word = os.path.basename(t) if '/' in t and not t.startswith('[') else t
+            if word == 'do' and self.stack[-1]['kind'] == 'while':
+                self.stack[-1]['cond'] = False         # the loop's own condition ends here
             if word in KEYWORDS or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', t, re.S):
+                for inner in substitutions(t):         # p="$(gh pr checks 5)"
+                    self.read(inner, depth + 1)
                 i += 1
                 continue
             if word == '$' and i + 1 < len(ts) and ts[i + 1] == '(':
@@ -270,14 +308,16 @@ class Reading:
                                      'checks', kind))
 
     def _bound(self, words):
-        """A counter test (`[ $n -lt 3 ]`, `(( n < 3 ))`) bounds the innermost while/until loop: its number is the
-        rounds, or one round when it is not a plain number."""
+        """A counter test (`[ $n -lt 3 ]`, `(( n < 3 ))`) in a while/until loop's own condition (not its body: a
+        `[ "$p" -eq 0 ] && break` there is a status test) bounds that loop: its number is the rounds, one round when
+        it is not a plain number; a 0 is no bound (`[ $pending -gt 0 ]` waits for a count to drop)."""
         f = self.stack[-1]
-        if f['kind'] != 'while':
+        if f['kind'] != 'while' or not f['cond']:
             return
-        nums = [int(w) for w in words if re.fullmatch(r'-?\d+', w)]
-        n = max([abs(x) for x in nums] or [1])
-        f['bound'] = max(f['bound'] or 0, n)
+        nums = [abs(int(w)) for w in words if re.fullmatch(r'-?\d+', w)]
+        n = max(nums) if nums else 1
+        if n:
+            f['bound'] = max(f['bound'] or 0, n)
 
     def _close(self):
         f = self.stack.pop()
@@ -314,6 +354,11 @@ class Reading:
             if not args:
                 return
             word, args = os.path.basename(args[0]), args[1:]
+        if word not in SHELLS and word not in ('eval', 'watch'):
+            for a in args:                         # [ "$(gh pr view 5 -q .state)" = OPEN ]: its inside runs too
+                if '$(' in a:
+                    for inner in substitutions(a):
+                        self.read(inner, depth + 1)
         if word == 'sleep':
             self._sleep(sum(seconds(a, self.s['loopSleepSeconds']) for a in args if not a.startswith('-')) or 0)
         elif word in SHELLS:
@@ -355,8 +400,8 @@ class Reading:
         elif word in TESTS:
             if any(a in FILE_TESTS for a in args):
                 self._check('local', word)
-            elif any(a in NUMBER_TESTS for a in args):
-                k = next(k for k, a in enumerate(args) if a in NUMBER_TESTS)
+            elif any(a in COUNTER_TESTS for a in args):
+                k = next(k for k, a in enumerate(args) if a in COUNTER_TESTS)
                 if k and k + 1 < len(args) and COUNTER.fullmatch(args[k - 1]) and COUNTER.fullmatch(args[k + 1]):
                     self._bound([args[k - 1], args[k + 1]])
         elif word in LOOKS or (word in READERS and not piped):

@@ -52,6 +52,15 @@ REFUSED = [
     'n=0; while ! gh pr checks 5 && [ $n -lt 100 ]; do n=$((n+1)); sleep 60; done',
     'while (( n < 50 )); do test -f /work/done && break; n=$((n+1)); sleep 10; done',
     'for i in 1 2 3; do gh pr checks 5 && break; sleep 60; done',
+    # fix round 2 (#1151 code lens): a status test in the body is no bound, and $(...) inside a word is read
+    'while true; do p=$(gh pr checks 5 | grep -c pending); [ "$p" -eq 0 ] && break; sleep 60; done',
+    'while [ "$(gh pr view 5 --json state -q .state)" = OPEN ]; do sleep 60; done',
+    'while true; do gh run view 9 --exit-status; rc=$?; [ $rc -eq 0 ] && break; sleep 60; done',
+    'until [ "$(gh run view 9 --json status -q .status)" = completed ]; do sleep 30; done',
+    'while [ `gh pr checks 5 | grep -c pending` -gt 0 ]; do sleep 60; done',
+    # a quoted # mid-word or after a space is no comment (removing the quote tracking turns these red)
+    'echo "a # b"; while ! gh pr checks 1; do sleep 60; done',
+    'gh pr comment 5 -b "done #1150"; while ! gh pr checks 5; do sleep 60; done',
 ]
 # fix round 1 (#1151 code lens): retry loops it refused before
 RETRIES = [

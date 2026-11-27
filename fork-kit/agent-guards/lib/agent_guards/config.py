@@ -351,7 +351,10 @@ def first_notice(text, event, home=None):
     folder = expand(NOTICE_DIR, home)
     name = hashlib.sha256(f'{sid}\0{text}'.encode()).hexdigest()[:32]
     try:
-        os.makedirs(folder, mode=0o700, exist_ok=True)
+        os.makedirs(folder, mode=0o700, exist_ok=True)   # a file there raises FileExistsError too: not "seen"
+    except OSError:
+        return True
+    try:
         fd = os.open(os.path.join(folder, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         return False
