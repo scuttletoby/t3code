@@ -254,13 +254,16 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
 };
 
 /**
- * The client settings' fork fields (stored on each device, not on the server). Their patch fields
- * (`ForkClientSettingsPatchFields`, spread into upstream's `ClientSettingsPatch`; the line is
- * announced in .github/fork-seams.json) come with the first change that saves one.
+ * The client settings' fork fields (stored on each device, not on the server), and their patch
+ * fields, spread into upstream's `ClientSettingsPatch`.
  */
 export const ForkClientSettingsFields = {
   /** Calm sidebar: role threads on top, every other thread folded into one group; off. */
   calmSidebarEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+};
+
+export const ForkClientSettingsPatchFields = {
+  calmSidebarEnabled: Schema.optionalKey(Schema.Boolean),
 };
 
 /** Fork settings a project may override; listed in `PROJECT_SCOPED_SERVER_SETTING_KEYS`. */

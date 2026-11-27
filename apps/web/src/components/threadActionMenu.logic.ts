@@ -3,6 +3,7 @@ import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled"
 import { msg } from "gt-react";
 
 import { m, type MessageResolver } from "../i18n/messages";
+import * as ForkRoleMenu from "./fork/calmSidebar/roleMenu.logic"; // Fork (calm sidebar)
 
 export type ThreadActionMenuId =
   | "find"
@@ -121,6 +122,7 @@ export interface ThreadActionMenuState {
   readonly snoozePresets: ReadonlyArray<SnoozePreset>;
   /** Guest links need their own grant, so the caller checks it instead of `canOperate`. */
   readonly canShareWithGuest?: boolean;
+  readonly forkThreadRole?: ForkRoleMenu.RoleMenuState | undefined; // Fork (calm sidebar)
   /** A No project thread with its own folder, on a server that can promote it. */
   readonly canTurnIntoProject?: boolean;
 }
@@ -200,6 +202,7 @@ export function buildThreadActionMenuItems(
               },
         ]
       : []),
+    ...ForkRoleMenu.roleMenuItems(state.forkThreadRole), // Fork (calm sidebar)
     {
       id: "rename",
       label: resolve(msg("Rename thread")),

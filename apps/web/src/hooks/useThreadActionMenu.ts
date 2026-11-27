@@ -25,6 +25,7 @@ import {
 } from "../components/threadActionMenu.logic";
 import { titleRegenerationToast } from "../components/threadTitleRegenerationToast";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
+import * as ForkRoleMenu from "../components/fork/calmSidebar/roleMenu"; // Fork (calm sidebar)
 import { copyThreadReference } from "../lib/copyThreadReference";
 import { m } from "../i18n/messages";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
@@ -153,6 +154,7 @@ export function useThreadActionMenu(input: {
         supports,
         snoozePresets,
         canShareWithGuest,
+        forkThreadRole: ForkRoleMenu.readRoleMenuState(threadRef), // Fork (calm sidebar)
         canTurnIntoProject: canTurnThreadIntoProject(threadRef),
       });
       const clicked = await settlePromise(() => api.contextMenu.show(items, position));
@@ -168,6 +170,7 @@ export function useThreadActionMenu(input: {
         );
         return;
       }
+      if (ForkRoleMenu.runIfRoleMenuAction(threadRef, action)) return; // Fork (calm sidebar)
       if (action.startsWith("snooze:")) {
         const preset =
           action === "snooze:custom"

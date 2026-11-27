@@ -180,6 +180,20 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     scope: "project-defaults",
   },
   {
+    id: "calm-sidebar",
+    title: "Calm sidebar",
+    to: FORK_PAGE,
+    searchTerms: ["calm sidebar roles assistant orchestrator other threads fold waiting"],
+    environmentOnly: true,
+  },
+  {
+    id: "thread-roles",
+    title: "Thread roles",
+    to: FORK_PAGE,
+    searchTerms: ["threadRoles role assistant orchestrator project calm sidebar missing"],
+    environmentOnly: true,
+  },
+  {
     id: "playtest",
     title: "Let agents run playtests",
     to: FORK_PAGE,

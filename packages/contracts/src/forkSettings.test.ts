@@ -11,6 +11,7 @@ import {
   FORK_PERSON_ONLY_KEYS,
   FORK_PROJECT_SCOPED_KEYS,
   ForkClientSettingsFields,
+  ForkClientSettingsPatchFields,
   ForkProjectOverrideFields,
   ForkServerSettingsFields,
   ForkServerSettingsPatchFields,
@@ -18,6 +19,7 @@ import {
 // The source texts, to pin the fork's lines in upstream's file and keep forkSettings.ts its own.
 import FORK_SOURCE from "./forkSettings.ts?raw";
 import {
+  ClientSettingsPatch,
   ClientSettingsSchema,
   PROJECT_SCOPED_SERVER_SETTING_KEYS,
   ProjectSettingsOverrides,
@@ -64,6 +66,8 @@ describe("fork settings seam", () => {
     sameFields(ServerSettingsPatch.fields, ForkServerSettingsPatchFields);
     sameFields(ProjectSettingsOverrides.fields, ForkProjectOverrideFields);
     sameFields(ClientSettingsSchema.fields, ForkClientSettingsFields);
+    // A device saves its fork settings with upstream's client patch (the calm sidebar's toggle).
+    sameFields(ClientSettingsPatch.fields, ForkClientSettingsPatchFields);
     for (const key of FORK_PROJECT_SCOPED_KEYS) {
       expect(PROJECT_SCOPED_SERVER_SETTING_KEYS).toContain(key);
     }
@@ -142,6 +146,9 @@ describe("fork settings seam", () => {
     const keys = Object.keys(ForkServerSettingsFields).toSorted();
     expect(Object.keys(ForkServerSettingsPatchFields).toSorted()).toEqual(keys);
     expect(Object.keys(FORK_PATCH_RULES).toSorted()).toEqual(keys);
+    expect(Object.keys(ForkClientSettingsPatchFields).toSorted()).toEqual(
+      Object.keys(ForkClientSettingsFields).toSorted(),
+    );
     expect(Object.keys(ForkProjectOverrideFields).toSorted()).toEqual(
       [...FORK_PROJECT_SCOPED_KEYS].toSorted(),
     );
@@ -164,8 +171,8 @@ describe("fork settings seam", () => {
 
   it("pins the fork's lines in settings.ts", () => {
     const lines = SETTINGS_SOURCE.split("\n");
-    // The import, `export *` and six spreads.
-    expect(lines.filter((line) => /forkSettings|ForkSettings/.test(line))).toHaveLength(8);
+    // The import, `export *` and seven spreads.
+    expect(lines.filter((line) => /forkSettings|ForkSettings/.test(line))).toHaveLength(9);
     // The inline `automaticUpdates`: its comment, its field and its patch field.
     expect(lines.filter((line) => line.includes("Fork:"))).toHaveLength(1);
     expect(lines.filter((line) => /^ {2}automaticUpdates:/.test(line))).toHaveLength(2);

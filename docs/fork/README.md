@@ -1332,6 +1332,14 @@ setting the person changes ([#138](https://github.com/scuttletoby/t3code/issues/
 no roles, changes nothing. This setting alone shows nothing: the calm sidebar
 (`client.calmSidebarEnabled`) reads it.
 
+In the app: a thread's menu (in the sidebar and the chat header) has **Thread role**: make the
+thread the assistant or its project's orchestrator (the menu says when that replaces the thread
+holding it), or remove its role. **Settings → Fork → Calm sidebar** lists each server's roles with
+their threads, marks a role whose thread cannot hold it now (missing, archived, not a top-level
+thread, in another project) and removes one. The marked pointer is kept until removed, so an
+archived thread holds its role again once unarchived. A server without the setting (an older
+build) offers no menu entry.
+
 Only the person can change it; agents cannot (the settings tool refuses it as person-only). A save
 that sets a pointer anew is refused unless the thread exists and is not deleted, is a top-level
 thread (not a sub-agent, a side chat or a task delegated from a linked machine) and, for an
@@ -1470,6 +1478,16 @@ other top-level threads fold into one closed group with a count of those waiting
 ([#139](https://github.com/scuttletoby/t3code/issues/139)). Off (the default): upstream's sidebar.
 It is a client setting, so each device chooses: calm on a phone, the full list on a desktop. A
 client settings file without it reads as off.
+
+On the web: the assistant, then each project's orchestrator, on top, each under its badge
+(Assistant, Orchestrator). Below them, **Other threads** with its count and, first, how many of
+those wait on you (an approval, a question, a sub-agent's request or a guest message; a usage-limit
+stop clears by itself and is not counted). Closed (the default, kept per device), upstream's list
+and its shelves are hidden, but the thread you have open stays in sight below the header. Open,
+upstream's list shows below, without the role rows. A role row keeps its own state (a settled
+orchestrator still shows un-settle). With calm on and no thread holding a role, the full list shows
+with a hint. Search, drafts and links work as before: calm only moves rows. In the app: **Settings
+→ Fork → Calm sidebar**.
 
 ### A setting the fork removed
 

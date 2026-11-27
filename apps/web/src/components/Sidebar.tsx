@@ -139,6 +139,7 @@ import { startNewThreadFromContext } from "../lib/chatThreadActions";
 import { useClientSettings } from "../hooks/useSettings";
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { useLocalStorage } from "../hooks/useLocalStorage";
+import * as ForkCalm from "./fork/calmSidebar/CalmSidebar"; // Fork (calm sidebar)
 import { useNowMinute } from "../hooks/useNowMinute";
 import {
   useEnvironmentIdentities,
@@ -1195,6 +1196,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
   const scopedProjectGroups = revealWidensScope ? [] : chosenProjectGroups;
   const scopedProjectRefs = scopedProjectGroups.flatMap((project) => project.memberProjectRefs);
   const scopedProjectKeys = revealWidensScope ? null : chosenScopeProjectKeys;
+  const forkCalmInput = { listedThreads, scopedProjectKeys, delegatedUnderParent }; // Fork (calm sidebar)
+  const forkCalm = ForkCalm.useCalmSidebar(forkCalmInput, routeRowThreadKey); // Fork (calm sidebar)
   const threadSearch = useThreadSearch(
     connectedEnvironmentIds,
     threadSearchQuery,
@@ -2696,6 +2699,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
               ),
               canTurnIntoProject: canTurnThreadIntoProject(threadRef),
               canRename: !fromSearch,
+              forkThreadRole: ForkCalm.readRoleMenuState(threadRef), // Fork (calm sidebar)
               supports: {
                 settlement: configLoaded,
                 autoSettleOptOut: supportsAutoSettleOptOut,
@@ -2711,6 +2715,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         );
         if (clicked._tag === "Failure" || clicked.value === null) return;
         if (threadActionRequiresOperate(clicked.value) && !checkThreadOperations([thread])) return;
+        if (ForkCalm.runIfRoleMenuAction(threadRef, clicked.value)) return; // Fork (calm sidebar)
         if (clicked.value?.startsWith("snooze:")) {
           const preset =
             clicked.value === "snooze:custom"
@@ -3579,7 +3584,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                           onDraftContextMenu={handleDraftContextMenu}
                         />,
                       ];
+                      items.push(...forkCalm.topItems(renderThreadRow, sectionByThreadKey)); // Fork (calm sidebar)
                       for (const item of sidebarListItems) {
+                        if (forkCalm.skipsListItem(item)) continue; // Fork (calm sidebar)
                         if (item.kind === "thread") {
                           // Folders draw active rows in their own place below.
                           if (projectFolders !== null && item.section === "active") continue;
@@ -3600,6 +3607,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               />,
                             );
                             for (const thread of folder.threads) {
+                              if (forkCalm.drawnOnTop(thread)) continue; // Fork (calm sidebar)
                               items.push(
                                 renderThreadRow(
                                   thread,
