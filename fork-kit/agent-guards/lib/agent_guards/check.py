@@ -16,6 +16,7 @@ from . import config, facts, wiring
 
 SESSION = 'agent-guards-check-'
 READ_ONLY = ('agent-slots', 'facts-hook')   # hooks that write nothing: run with the caller's HOME
+# (poll-loop-guard, read-size-guard and batch-nudge write nothing either; they run with HOME in the temporary folder)
 
 
 def _run(cmd, event, cwd, env=None, argv=None, timeout=30):
@@ -117,6 +118,7 @@ def cases(tmp, sid):
         ('agent-slots', 'Stop', 'a session it does not watch', {'hook_event_name': 'Stop', 'session_id': sid},
          'passed', None),
     ]
+    out += speed_cases(tmp, sid, bash)
     fc = config.load('facts')[0]       # read only: the machine's own tables and record repos, if any; the hook
     projects = facts.projects_for(fc, tmp)   # runs with this process's HOME (READ_ONLY), so "~/" means the same
     text = facts.session_text(facts.places(fc, tmp, projects=projects), projects, fc['indexLines'],
@@ -135,6 +137,42 @@ def cases(tmp, sid):
         out.append(('agent-slots', 'UserPromptSubmit', 'a prompt of a watched session',
                     {'hook_event_name': 'UserPromptSubmit', 'session_id': watched[0], 'prompt': 'check'}, 'context',
                     None))
+    return out
+
+
+def speed_cases(tmp, sid, bash):
+    """The cases of the three speed hooks. A hook turned off in the machine file ("enabled": false), or whose part
+    cannot be used (it then lets every call through), only gets its pass case."""
+    out = []
+    poll, problem = config.load('pollLoop')
+    loop = f'while ! gh pr checks 1; do sleep {poll["maxSleepSeconds"] + 1}; done'
+    if poll['enabled'] and not problem:
+        out.append(('poll-loop-guard', 'PreToolUse', 'a sleep loop on CI', bash(loop), 'refused', None))
+    out.append(('poll-loop-guard', 'PreToolUse', 'the same in the background',
+                dict(bash(loop), tool_input={'command': loop, 'run_in_background': True}), 'passed', None))
+    size, problem = config.load('readSize')
+    big = os.path.join(tmp, 'big.txt')
+    with open(big, 'w') as f:
+        f.write(('x' * 99 + '\n') * (size['maxChars'] // 100 + 2))
+    read = {'hook_event_name': 'PreToolUse', 'tool_name': 'Read', 'session_id': sid, 'cwd': tmp,
+            'tool_input': {'file_path': big}}
+    if size['enabled'] and not problem:
+        out.append(('read-size-guard', 'PreToolUse', 'a whole-file Read of a big file', read, 'refused', None))
+    out.append(('read-size-guard', 'PreToolUse', 'the same with a limit',
+                dict(read, tool_input={'file_path': big, 'limit': 50}), 'passed', None))
+    nudge, problem = config.load('batchNudge')
+    turns = max(1, nudge['afterTurns'])
+    transcript = os.path.join(tmp, 'batch.jsonl')
+    with open(transcript, 'w') as f:
+        for k in range(turns):
+            f.write(json.dumps({'type': 'assistant', 'message': {'id': f'm{k}', 'content': [
+                {'type': 'tool_use', 'id': f't{k}', 'name': 'Read', 'input': {'file_path': big, 'limit': 5}}]}}) + '\n')
+    post = {'hook_event_name': 'PostToolUse', 'tool_name': 'Read', 'session_id': sid, 'cwd': tmp,
+            'transcript_path': transcript, 'tool_input': {'file_path': big, 'limit': 5}}
+    if nudge['enabled'] and not problem and 'Read' in nudge['readOnlyTools']:
+        out.append(('batch-nudge', 'PostToolUse', f'{turns} one-read turns in a row', post, 'context', None))
+    out.append(('batch-nudge', 'PostToolUse', 'no transcript', dict(post, transcript_path=os.path.join(tmp, 'none')),
+                'passed', None))
     return out
 
 

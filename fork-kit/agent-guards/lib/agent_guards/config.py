@@ -20,8 +20,17 @@ problem in its answer (systemMessage, and additionalContext where the event take
                        "projects": [{"match": "github.com/owner/repo", "dirs": ["/srv/repo-facts"], "text": "",
                                      "name": "repo"}],
                        "records": [{"path": "/srv/records", "projectsDir": "projects",
-                                    "shared": ["machines", "orch", "shared"]}]}
+                                    "shared": ["machines", "orch", "shared"]}]},
+    "pollLoop":       {"enabled": true, "maxSleepSeconds": 120, "loopSleepSeconds": 5},
+    "readSize":       {"enabled": true, "maxChars": 20000},
+    "batchNudge":     {"enabled": true, "afterTurns": 3, "tailBytes": 1048576,
+                       "readOnlyTools": ["Read", "Grep", "Glob", "LS", "NotebookRead"],
+                       "readOnlyCommands": ["cat", "head", "tail", "sed", "grep", "ls", ...]}
   }
+
+The three speed hooks (pollLoop, readSize, batchNudge) differ in one way: a problem in their own part, or in the
+file, turns that hook off (it lets every call through and says so) instead of using the defaults, because they guard
+speed, not safety, and must never block work on a broken config. "enabled": false turns one off on purpose.
 
 Paths are absolute or start with "~/" (each user's own home). Plain Python 3 standard library.
 """
@@ -84,6 +93,27 @@ def _records(value):
     return None
 
 
+def _tools(value):
+    for v in value:
+        if not isinstance(v, str) or not re.match(r'^[A-Za-z][A-Za-z0-9_]{0,63}$', v):
+            return f'every entry must be a tool name (letters, digits, _), not {v!r}'
+    return None
+
+
+def _words(value):
+    for v in value:
+        if not isinstance(v, str) or not COMMAND_RE.match(v):
+            return f'every entry must be a command name (letters, digits, . _ + -), not {v!r}'
+    return None
+
+
+READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob', 'LS', 'NotebookRead']
+READ_ONLY_COMMANDS = ['cat', 'head', 'tail', 'sed', 'grep', 'egrep', 'fgrep', 'rg', 'ls', 'find', 'wc', 'stat', 'file',
+                      'tree', 'du', 'df', 'pwd', 'echo', 'printf', 'jq', 'awk', 'sort', 'uniq', 'cut', 'tr', 'nl',
+                      'diff', 'cmp', 'readlink', 'realpath', 'basename', 'dirname', 'which', 'type', 'column', 'less',
+                      'git', 'facts', 'true']
+
+
 def _scripts(value):
     for k, v in enumerate(value):
         p = _row_problem(k, v)
@@ -126,6 +156,22 @@ SPEC = {
         'indexChars': (int, 4000, _positive),
         'projects': (list, [], _projects),
         'records': (list, [], _records),
+    },
+    'pollLoop': {
+        'enabled': (bool, True, None),
+        'maxSleepSeconds': (int, 120, _positive),
+        'loopSleepSeconds': (int, 5, _positive),
+    },
+    'readSize': {
+        'enabled': (bool, True, None),
+        'maxChars': (int, 20000, _positive),
+    },
+    'batchNudge': {
+        'enabled': (bool, True, None),
+        'afterTurns': (int, 3, _positive),
+        'tailBytes': (int, 1048576, _positive),
+        'readOnlyTools': (list, READ_ONLY_TOOLS, _tools),
+        'readOnlyCommands': (list, READ_ONLY_COMMANDS, _words),
     },
 }
 HOOKS = tuple(SPEC)

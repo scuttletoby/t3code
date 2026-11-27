@@ -153,7 +153,7 @@ class Install(unittest.TestCase):
         r = subprocess.run([sys.executable, '-I', '-B', self.resolve('/usr/local/bin/t3-capacity'), '--help'],
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('t3-capacity [--kind KIND] [MB]', r.stdout)
+        self.assertIn('t3-capacity [--kind KIND] [--long] [MB]', r.stdout)
         with open(self.path('/etc/heavy/installed.tsv')) as f:
             self.assertIn(f'/usr/local/bin/t3-capacity\tlink\t{CAPACITY_LINK}\n', f.read())
         self.assertEqual(self.run_main('self-check')[0], 0)

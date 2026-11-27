@@ -1,0 +1,333 @@
+#!/usr/bin/python3 -IB
+"""Claude Code PreToolUse hook (Bash): refuse a command that waits on CI, a pull request or a background job by
+sleeping and checking again. Part of fork-kit/agent-guards (README.md there: install, settings entry, the machine
+file's "agent-guards" section).
+
+Why: agents spent about 39% of their tool time in wait loops they wrote themselves (`for i in $(seq 1 40); do grep
+-q DONE "$F" && break; sleep 30; done`, `while ! gh pr checks 12; do sleep 60; done`, `sleep 300; gh run view`).
+Each loop overshoots the end by up to one sleep, it ends at the Bash timeout and is written again, and each new poll
+is a model turn that sends the whole context again. The host has wait tools that wake the agent instead.
+
+Refuses (a Bash call in the foreground) when the command checks such a state AND it waits:
+  a check   `gh run|pr|api|workflow|release ...`, curl/wget (to any URL: a GitHub one counts as a CI check), or a
+            look at a file or a process: test, [, [[, ls, stat, grep, rg, tail, head, cat, wc, find, jq, pgrep,
+            pidof, ps, kill -0;
+  waits     its sleeps add up to more than maxSleepSeconds (default 120): `sleep N` counted once outside a loop,
+            N times the rounds of `for x in a b c`, `for i in $(seq 1 40)` or `{1..40}` (a list it cannot count:
+            one round); a while or until loop counts as endless when a round sleeps loopSleepSeconds (default 5)
+            or more, and for a CI check with any sleep at all;
+  or        `gh run watch`, `gh pr checks --watch` (CI waits that need no sleep).
+Lets through: short waits (a loop of 1 s sleeps for a local server, a few rounds that stay under the limit), a sleep
+with no check after it, any command run in the background (`run_in_background`: the host wakes the agent when it
+ends), the Monitor tool (an until-condition there is the right way to wait for a file), and text that only names
+these (echo, a commit message, a heredoc into a file). Shell text handed on (`bash -c '..'`, `sh -c`, `eval`) is
+read the same way.
+
+Settings (machine file, pollLoop): enabled (default true), maxSleepSeconds (120), loopSleepSeconds (5).
+Fail open: a broken settings part, a lib that cannot load, broken input or its own error lets the command run, with
+one line saying so. Exit 2 (refuse) only answers a wait it found. Tests: fork-kit/agent-guards/tests/poll-loop.test.py
+"""
+import json, math, os, re, shlex, sys
+
+NAME = 'poll-loop-guard'
+DEFAULTS = {'enabled': True, 'maxSleepSeconds': 120, 'loopSleepSeconds': 5}
+
+
+def _settings():
+    """(pollLoop settings, problem or None). A problem means the guard lets every call through (never blocks on a
+    broken config)."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        return config.load('pollLoop')
+    except BaseException as e:   # noqa: BLE001 - fail open
+        return dict(DEFAULTS), f'cannot load the kit\'s config code ({type(e).__name__}: {e})'
+
+
+OPS = ('&&', '||', ';;', '|&', '>>', '<<', ';', '&', '|', '(', ')', '<', '>', '\n')
+PUNCT = set('();<>|&\n')
+SEPARATORS = {'&&', '||', ';;', '|&', ';', '&', '|', '(', ')', '\n'}
+KEYWORDS = {'then', 'do', 'else', 'elif', 'if', '!', '{', '}', 'time'}
+WRAPPERS = {'sudo', 'env', 'nice', 'ionice', 'nohup', 'command', 'builtin', 'exec', 'stdbuf', 'setsid', 'heavy',
+            'chronic', 'unbuffer'}
+SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
+LOCAL_CHECKS = {'test', '[', '[[', 'ls', 'stat', 'grep', 'egrep', 'fgrep', 'rg', 'tail', 'head', 'cat', 'wc', 'find',
+                'jq', 'pgrep', 'pidof', 'ps'}
+GH_CHECKS = {'run', 'pr', 'api', 'workflow', 'release'}
+HEREDOC = re.compile(r'<<(-?)\s*(["\']?)([A-Za-z_][A-Za-z0-9_]*)\2')
+DEPTH = 8
+
+
+def strip_heredocs(text):
+    """The text without the bodies of heredocs that go to anything but a shell (a brief written to a file is text,
+    not commands); a heredoc into bash or sh keeps its body, which is then read as commands."""
+    out, lines, i = [], text.split('\n'), 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for m in HEREDOC.finditer(line):
+            before = line[:m.start()].split()
+            if before and os.path.basename(before[-1]) in SHELLS:
+                continue
+            tabs, delim = m.group(1), m.group(3)
+            while i < len(lines) and (lines[i].lstrip('\t') if tabs else lines[i]) != delim:
+                i += 1
+            i += 1
+    return '\n'.join(out)
+
+
+def tokens(text):
+    lex = shlex.shlex(strip_heredocs(text), posix=True, punctuation_chars='();<>|&\n')
+    lex.whitespace, lex.commenters, lex.whitespace_split = ' \t\r', '', True
+    out, comment = [], False          # a comment: from a word that starts with # to the end of its line
+    for t in lex:
+        if t and set(t) <= PUNCT:
+            while t:
+                op = next(o for o in OPS + (t[0],) if t.startswith(o))
+                t = t[len(op):]
+                if comment and op != '\n':
+                    continue
+                comment = False
+                out.append(op)
+        elif not comment:
+            if t.startswith('#'):
+                comment = True
+            else:
+                out.append(t)
+    return out
+
+
+def seconds(word, unknown):
+    if word == 'infinity':
+        return math.inf
+    m = re.fullmatch(r'(\d+(?:\.\d*)?|\.\d+)([smhd]?)', word)
+    if not m:
+        return unknown
+    return float(m.group(1)) * {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[m.group(2)]
+
+
+def rounds(words):
+    """The rounds of a for loop's list, or 1 when it cannot be counted."""
+    text = ' '.join(words)
+    m = re.fullmatch(r'\{(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?\}', text)
+    if m:
+        a, b, step = int(m.group(1)), int(m.group(2)), abs(int(m.group(3) or 1)) or 1
+        return abs(b - a) // step + 1
+    m = re.fullmatch(r'(?:\$ \( |`)seq (-?\d+)(?: (-?\d+))?(?: (-?\d+))?(?: \)|`)', text)
+    if m:
+        nums = [int(g) for g in m.groups() if g is not None]
+        a, step, b = (1, 1, nums[0]) if len(nums) == 1 else (nums[0], 1, nums[1]) if len(nums) == 2 else nums
+        return max(0, (b - a) // step + 1) if step else 1
+    if words and all(re.fullmatch(r'[A-Za-z0-9_.,:/+=@%-]+', w) for w in words):
+        return len(words)
+    return 1
+
+
+class Reading:
+    """What one command does: its sleeps (bounded total, and the longest round of an endless loop), its checks."""
+
+    def __init__(self, settings):
+        self.s = settings
+        self.ci, self.local, self.watch = [], [], []
+
+    def read(self, text, depth=0):
+        """(bounded sleep seconds, endless round sleep or 0, any endless loop with a sleep at all)."""
+        if depth > DEPTH:
+            return 0, 0, False
+        ts = tokens(text)
+        frames = [{'kind': 'top', 'n': 1, 'sleep': 0.0, 'endless': 0.0, 'any': False}]
+        i, at_cmd = 0, True
+        while i < len(ts):
+            t = ts[i]
+            if t in SEPARATORS:
+                at_cmd = True
+                i += 1
+                continue
+            if t in ('<', '>', '>>', '<<'):
+                i += 2
+                continue
+            if not at_cmd:
+                if t == '$' and i + 1 < len(ts) and ts[i + 1] == '(':
+                    at_cmd = True
+                    i += 2
+                    continue
+                i += 1
+                continue
+            word = os.path.basename(t) if '/' in t and not t.startswith('[') else t
+            if word in KEYWORDS or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', t, re.S):
+                i += 1
+                continue
+            if word == '$' and i + 1 < len(ts) and ts[i + 1] == '(':
+                i += 2
+                continue
+            if word in ('while', 'until'):
+                frames.append({'kind': 'while', 'n': math.inf, 'sleep': 0.0, 'endless': 0.0, 'any': False})
+                i += 1
+                continue
+            if word == 'for':
+                j = i + 1
+                while j < len(ts) and ts[j] not in ('in', 'do', ';', '\n'):
+                    j += 1
+                words = []
+                if j < len(ts) and ts[j] == 'in':
+                    j += 1
+                    while j < len(ts) and ts[j] not in (';', '\n', 'do'):
+                        words.append(ts[j])
+                        j += 1
+                frames.append({'kind': 'for', 'n': rounds(words) if words else 1, 'sleep': 0.0, 'endless': 0.0,
+                               'any': False})
+                i = j
+                continue
+            if word == 'done' and len(frames) > 1:
+                self._close(frames)
+                i += 1
+                at_cmd = False
+                continue
+            args, j = [], i + 1
+            while j < len(ts) and ts[j] not in SEPARATORS:
+                args.append(ts[j])
+                j += 1
+            frames[-1]['sleep'] += self._command(word, args, frames, depth)
+            i, at_cmd = j, False
+        while len(frames) > 1:
+            self._close(frames)
+        top = frames[0]
+        return top['sleep'], top['endless'], top['any']
+
+    def _close(self, frames):
+        f = frames.pop()
+        up = frames[-1]
+        if f['kind'] == 'while':
+            if f['sleep'] > 0:
+                up['endless'] = max(up['endless'], f['sleep'], f['endless'])
+                up['any'] = True
+            else:
+                up['endless'] = max(up['endless'], f['endless'])
+                up['any'] = up['any'] or f['any']
+        else:
+            up['sleep'] += f['sleep'] * f['n']
+            up['endless'] = max(up['endless'], f['endless'])
+            up['any'] = up['any'] or f['any']
+
+    def _command(self, word, args, frames, depth):
+        """The bounded sleep of one simple command (0 for any other); notes its checks; reads handed-on text."""
+        while word in WRAPPERS or word == 'timeout':
+            if word == 'timeout':
+                while args and args[0].startswith('-'):
+                    args = args[1:]
+                args = args[1:]
+            else:
+                while args and (args[0].startswith('-') or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', args[0], re.S)):
+                    args = args[1:]
+            if not args:
+                return 0
+            word, args = os.path.basename(args[0]), args[1:]
+        if word == 'sleep':
+            return sum(seconds(a, self.s['loopSleepSeconds']) for a in args if not a.startswith('-')) or 0
+        if word in SHELLS:
+            for k, a in enumerate(args):
+                if re.fullmatch(r'-[a-z]*c[a-z]*', a) and k + 1 < len(args):
+                    return self._handed(args[k + 1], frames, depth)
+            return 0
+        if word == 'eval':
+            return self._handed(' '.join(args), frames, depth)
+        if word == 'gh':
+            sub = [a for a in args if not a.startswith('-')]
+            rest = args
+            if sub and sub[0] in GH_CHECKS:
+                if (sub[:2] == ['run', 'watch']) or (sub[:2] == ['pr', 'checks'] and
+                                                     any(a == '--watch' or a.startswith('--watch=') for a in rest)):
+                    self.watch.append('gh ' + ' '.join(sub[:2]))
+                self.ci.append('gh ' + ' '.join(sub[:2]))
+        elif word in ('curl', 'wget'):
+            (self.ci if any('github.com' in a for a in args) else self.local).append(word)
+        elif word == 'kill':
+            if '-0' in args:
+                self.local.append('kill -0')
+        elif word in LOCAL_CHECKS:
+            self.local.append(word)
+        return 0
+
+    def _handed(self, text, frames, depth):
+        sleep, endless, anysleep = self.read(text, depth + 1)
+        frames[-1]['endless'] = max(frames[-1]['endless'], endless)
+        frames[-1]['any'] = frames[-1]['any'] or anysleep
+        return sleep
+
+
+def verdict(command, settings):
+    """None, or (what it checks, why it counts as a wait)."""
+    r = Reading(settings)
+    sleep, endless, anysleep = r.read(command)
+    checks = sorted(set(r.ci + r.local))
+    if r.watch:
+        return ', '.join(sorted(set(r.watch))), 'it waits for CI to finish'
+    if not checks:
+        return None
+    if endless >= settings['loopSleepSeconds'] or (r.ci and anysleep):
+        return ', '.join(checks), f'it loops with no end, sleeping {endless:g} s a round'
+    if sleep > settings['maxSleepSeconds']:
+        total = 'without end' if math.isinf(sleep) else f'{sleep:g} s'
+        return ', '.join(checks), f'its sleeps add up to {total} (more than {settings["maxSleepSeconds"]} s)'
+    return None
+
+
+def reason(what, why, settings):
+    return (f'Refused by {NAME}: this command waits by sleeping and checking again ({what}; {why}). Each new check '
+            'is a model turn that sends the whole context again, and the loop overshoots the end. To wait for a '
+            'background command: run it with run_in_background and wait with t3_background_wait (or Monitor with '
+            'an until-condition). To wait for CI or a pull request: push and stop (or watch_pull_request); you are '
+            f'told when it ends. Short waits (sleeps under {settings["maxSleepSeconds"]} s in all, or under '
+            f'{settings["loopSleepSeconds"]} s a round in a local loop) are not refused.')
+
+
+def _problem_out(problem, event):
+    text = (f'{NAME}: the machine file\'s "agent-guards" section cannot be used as written ({problem}); built-in '
+            f'defaults used for that part, and {NAME} lets every command through until it is fixed. Tell the owner; '
+            '`agent-guards self-check` names every problem.')
+    try:
+        sys.stderr.write(text + '\n')
+    except Exception:  # noqa: BLE001
+        pass
+    out = {'systemMessage': text}
+    if isinstance(event, dict) and event.get('hook_event_name') == 'PreToolUse':
+        out['hookSpecificOutput'] = {'hookEventName': 'PreToolUse', 'additionalContext': text}
+    print(json.dumps(out))
+
+
+def main(argv=None):
+    """Exit 2 with the reason on stderr refuses; 0 lets the command run; 1 (this guard failed) lets it run, loudly."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv:
+        sys.stderr.write(f'usage: {NAME} (hook: PreToolUse JSON on stdin; its settings entry: `agent-guards hooks`)\n')
+        return 1
+    event = None
+    try:
+        settings, problem = _settings()
+        event = json.loads(sys.stdin.read())
+        if problem:
+            _problem_out(problem, event)
+            return 0
+        if not settings['enabled'] or not isinstance(event, dict) or event.get('tool_name') != 'Bash':
+            return 0
+        ti = event.get('tool_input') or {}
+        command = ti.get('command')
+        if not isinstance(command, str) or ti.get('run_in_background') is True:
+            return 0
+        try:
+            found = verdict(command, settings)
+        except ValueError:   # text a shell reader cannot split (an open quote): not ours to judge
+            return 0
+    except BaseException as e:   # noqa: BLE001 - fail open: this guards a habit, not an attack
+        sys.stderr.write(f'{NAME}: failed ({type(e).__name__}: {e}); the command is NOT checked and runs. '
+                         'Tell the owner if this repeats.\n')
+        return 1
+    if not found:
+        return 0
+    sys.stderr.write(reason(*found, settings) + '\n')
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
