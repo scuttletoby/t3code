@@ -25,6 +25,7 @@ when it waited --wait-s without a start; 2 for a config it cannot use.
 """
 import argparse, json, os, re, resource, signal, subprocess, sys, time
 
+sys.dont_write_bytecode = True   # leave no __pycache__ beside the release's files
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import claims as claims_mod   # noqa: E402  (the same release)

@@ -17,6 +17,7 @@ reads the wall clock (the clock and who is alive are the test's).
 """
 import os, stat, tempfile, shutil, sys
 
+sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import claims as claims_mod   # noqa: E402
