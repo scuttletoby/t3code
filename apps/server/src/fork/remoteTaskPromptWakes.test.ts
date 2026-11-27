@@ -405,23 +405,34 @@ describe("a parent whose task on a linked machine waits there", () => {
     }),
   );
 
-  it.effect("a secret never goes to a blocking wait: one queued message at once, never again", () =>
+  it.effect("a secret ends a blocking wait as a question does; after its run, one message", () =>
     Effect.gen(function* () {
       const { world, start, of } = makeWorld({ blockingWait: true });
       world.there = { type: "known", prompts: secret() };
       const watcher = yield* start;
       yield* watcher.tick;
-      // A wait cannot end on a secret: its wake is left alone and the message is queued now.
-      assert.deepStrictEqual(of("delegated_task.wake-policy"), []);
-      assert.strictEqual(world.task.completionWake, "settled_only");
+      // The wait ends on it (the fork's seat in upstream's endsTaskWait): no message now.
+      const [ended, ...more] = of("delegated_task.wake-policy");
+      assert.deepStrictEqual(more, []);
+      assert.strictEqual(world.task.completionWake, "always");
+      assert.strictEqual(
+        ended?.commandId,
+        `server:remote-task-prompt-wait:${parentThreadId}:${box}:secret:item:prompt-wakes-secret`,
+      );
+      assert.deepStrictEqual(of("message.dispatch"), []);
+      // Read again and after a restart while the wait's run goes on: still the wait's.
+      yield* watcher.tick;
+      yield* (yield* start).tick;
+      assert.deepStrictEqual(of("message.dispatch"), []);
+      // The run ends with the secret still asked for there: one queued message, never again.
+      world.runs[0]!.status = "completed";
+      yield* (yield* start).tick;
       const [wake] = of("message.dispatch");
       assert.deepStrictEqual(wake?.dispatchMode, { type: "queue_after_active" });
       yield* watcher.tick;
-      // The wait runs to its timeout, the run ends, the server restarts: still the one message.
-      world.runs[0]!.status = "completed";
-      yield* watcher.tick;
       yield* (yield* start).tick;
       assert.strictEqual(of("message.dispatch").length, 1);
+      assert.strictEqual(of("delegated_task.wake-policy").length, 1);
     }),
   );
 

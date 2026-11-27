@@ -542,15 +542,10 @@
         "// Fork: the usage pacing gate held a delegated task; the message says until when.",
         "\"usage_pacing_hold\",",
         "// Fork: the agent slot gate refused a new delegated agent; the message names the rule.",
-        "\"slots_full\","
-      ],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import * as ForkOrchestratorMcp from \"./forkOrchestratorMcp.ts\"; // Fork: its result fields",
-          "...ForkOrchestratorMcp.ForkDelegateTaskResultFields,"
-        ]
-      }
+        "\"slots_full\",",
+        "import * as ForkOrchestratorMcp from \"./forkOrchestratorMcp.ts\"; // Fork: its result fields",
+        "...ForkOrchestratorMcp.ForkDelegateTaskResultFields,"
+      ]
     },
     "apps/server/src/mcp/OrchestratorMcpService.ts": {
       "why": "The fork's delegation checks (fork/delegateChecks.ts: usage pacing, agent slots, a child's own options, a linked child's prompts) at their seats in delegate_task, create_threads and a remote task's status, from before every upstream file was counted. A pending secret request of a linked child ends a blocking wait (#817): one call in upstream's endsTaskWait, on the module's existing DelegateChecks import.",
@@ -589,12 +584,9 @@
         "parent,",
         "requested: request.target,",
         "target: resolvedTarget,",
-        "});"
-      ],
-      "announced": {
-        "since": "2026-11-27",
-        "added": ["DelegateChecks.promptEndsWait(result) || // Fork: a secret request ends a wait"]
-      }
+        "});",
+        "DelegateChecks.promptEndsWait(result) || // Fork: a secret request ends a wait"
+      ]
     },
     "apps/server/src/peer/PeerLinks.ts": {
       "why": "#959: a link the peer turned away ends here as an expired one (fork/peerLinkRevoke.ts makeLinkRevokes). recordRevoked moves expires_at to now, only for the linked_at the refused call resolved, so a link made again since keeps its end. A renewal that answers a call made before the refusal (recordExpiry) skips the ended link's linked_at, so it cannot bring that link back; a link made again renews as before. Tested in apps/server/src/fork/peerLinkRevoke.test.ts.",

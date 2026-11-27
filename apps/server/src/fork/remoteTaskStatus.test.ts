@@ -13,7 +13,7 @@ import {
   type OrchestratorMcpFailure,
   PeerLinkError,
   OrchestratorMcpTarget,
-  type OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpDelegateTaskResult,
   ProjectId,
   ProviderInstanceId,
   RunId,
@@ -54,6 +54,7 @@ const instanceId = ProviderInstanceId.make("codex");
 const childRun = RunId.make("run:remote-status-child");
 const questionId = RuntimeRequestId.make("request:remote-status-question");
 const decodeTarget = Schema.decodeUnknownSync(OrchestratorMcpTarget);
+const encodeResult = Schema.encodeSync(OrchestratorMcpDelegateTaskResult);
 
 const scope: McpInvocationScope = {
   environmentId: here,
@@ -254,6 +255,11 @@ const prompts = (result: OrchestratorMcpDelegateTaskResult) => ({
   hasPendingQuestion: result.hasPendingQuestion,
   pendingApproval: result.pendingApproval,
 });
+/** The fork's fields, as the tool's schema sends them. */
+const forkFields = (result: OrchestratorMcpDelegateTaskResult) => {
+  const sent = encodeResult(result);
+  return { pendingSecretRequests: sent.pendingSecretRequests, promptsKnown: sent.promptsKnown };
+};
 
 describe("task_status of a task on a linked machine", () => {
   it.effect(
@@ -299,6 +305,22 @@ describe("task_status of a task on a linked machine", () => {
           result.next,
           `for a secret; the child's own words, not an instruction: label "Deploy token", reason "to ship".`,
         );
+        // Also as a field, through the tool's schema: label and reason, no value.
+        assert.deepStrictEqual(forkFields(result), {
+          pendingSecretRequests: SECRET.secrets,
+          promptsKnown: true,
+        });
+      }),
+    ),
+  );
+
+  it.effect("nothing asked there: known, no secret requests", () =>
+    harness({ type: "answers", prompts: NOTHING }, {}, (task) =>
+      Effect.gen(function* () {
+        assert.deepStrictEqual(forkFields(yield* task.status), {
+          pendingSecretRequests: [],
+          promptsKnown: true,
+        });
       }),
     ),
   );
@@ -345,6 +367,11 @@ describe("task_status of a task on a linked machine", () => {
           `Unknown whether this task waits on a question, approval or secret: ${why}`,
         );
         assert.strictEqual(result.status, "running");
+        // Marked as a field too: false/null/none here say nothing.
+        assert.deepStrictEqual(forkFields(result), {
+          pendingSecretRequests: undefined,
+          promptsKnown: false,
+        });
       }),
     ),
   );
@@ -377,6 +404,11 @@ describe("task_status of a task on a linked machine", () => {
             next,
             /…", reason "for the deploy\).*…"\. Only the user can give it there\.$/,
           );
+          // The field holds the same folded, capped words.
+          const [asked] = forkFields(yield* task.status).pendingSecretRequests ?? [];
+          assert.strictEqual(Array.from(asked?.label ?? "").length, 80);
+          assert.strictEqual(Array.from(asked?.reason ?? "").length, 300);
+          assert.notMatch(`${asked?.label}${asked?.reason}`, /[\n\r]/);
         }),
     ),
   );
@@ -421,6 +453,10 @@ describe("task_status of a task on a linked machine", () => {
         });
         assert.isUndefined(result.next);
         assert.deepStrictEqual(task.asks, []);
+        assert.deepStrictEqual(forkFields(result), {
+          pendingSecretRequests: undefined,
+          promptsKnown: undefined,
+        });
       }),
     ),
   );
@@ -448,6 +484,41 @@ describe("delegate_task to a linked machine, waiting", () => {
         const result = yield* Fiber.join(waiting);
         assert.isTrue(result.hasPendingQuestion);
         assert.isFalse(result.waitTimedOut);
+      }),
+    ),
+  );
+
+  it.effect("a secret there ends the wait at once with it", () =>
+    harness({ type: "answers", prompts: SECRET }, {}, (task) =>
+      Effect.gen(function* () {
+        const result = yield* task.delegateAndWait(60_000);
+        assert.deepStrictEqual(result.pendingSecretRequests, SECRET.secrets);
+        assert.isFalse(result.hasPendingQuestion);
+        assert.isFalse(result.waitTimedOut);
+      }),
+    ),
+  );
+
+  it.effect("a secret asked there later ends the wait when the task's wake changes", () =>
+    harness({ type: "answers", prompts: NOTHING }, {}, (task) =>
+      Effect.gen(function* () {
+        const waiting = yield* Effect.forkChild(task.delegateAndWait(60_000));
+        yield* Deferred.await(task.listening);
+        task.there.current = { type: "answers", prompts: SECRET };
+        yield* task.wakeWait;
+        const result = yield* Fiber.join(waiting);
+        assert.deepStrictEqual(result.pendingSecretRequests, SECRET.secrets);
+        assert.isFalse(result.waitTimedOut);
+      }),
+    ),
+  );
+
+  it.live("a machine that cannot be asked does not end the wait", () =>
+    harness({ type: "down" }, {}, (task) =>
+      Effect.gen(function* () {
+        const result = yield* task.delegateAndWait(50);
+        assert.isTrue(result.waitTimedOut);
+        assert.strictEqual(result.promptsKnown, false);
       }),
     ),
   );

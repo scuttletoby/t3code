@@ -292,7 +292,7 @@ export const makeReader = (
 
 export type StatusReport = Pick<
   OrchestratorMcpDelegateTaskResult,
-  "hasPendingQuestion" | "pendingApproval" | "next"
+  "hasPendingQuestion" | "pendingApproval" | "next" | "pendingSecretRequests" | "promptsKnown"
 >;
 
 /** A secret request's label and reason, quoted as the child's words (never its value: it has none). */
@@ -331,6 +331,7 @@ export const reportOf = (
     return {
       hasPendingQuestion: false,
       pendingApproval: null,
+      promptsKnown: false,
       next: `Unknown whether this task waits on a question, approval or secret: ${unknownWhy(remote.label, read.type === "unknown" ? read.reason : "gone")}. hasPendingQuestion false and pendingApproval null do not mean it is not waiting; read its status again later.`,
     };
   }
@@ -354,6 +355,9 @@ export const reportOf = (
   return {
     hasPendingQuestion: questions.length > 0,
     pendingApproval: task.completionDelivery?.state === "disposed" ? null : approval,
+    // Already folded and capped (`checkedPrompts`): label and reason only.
+    pendingSecretRequests: secrets,
+    promptsKnown: true,
     ...(notes.length === 0 ? {} : { next: notes.join(" ") }),
   };
 };

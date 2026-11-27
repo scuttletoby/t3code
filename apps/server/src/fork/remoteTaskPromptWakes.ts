@@ -1,8 +1,8 @@
 /**
  * Fork: wakes a parent here once per prompt its task's thread on a linked machine waits on, as
  * upstream's DelegatedTaskQuestionReactor does for a local question: a blocking wait is ended (its
- * wake set to `always`, for a question or approval only, and only while its run lasts), else one
- * queued message, cancelled while queued once answered there.
+ * wake set to `always`, only while its run lasts), else one queued message, cancelled while queued
+ * once answered there.
  */
 import {
   CommandId,
@@ -45,7 +45,6 @@ const WAIT_COMMAND = "server:remote-task-prompt-wait:";
 
 /** One prompt there: its kind and id, as the machine there names it. */
 interface Prompt {
-  /** A secret cannot end upstream's blocking wait (`endsTaskWait` sees questions and approvals). */
   readonly kind: "question" | "approval" | "secret";
   readonly key: string;
   readonly text: (task: OrchestrationV2Subagent) => string;
@@ -154,8 +153,7 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
     const id = idOf(task.threadId, remote.environmentId, prompt.key);
     const waitCommand = CommandId.make(`${WAIT_COMMAND}${id}`);
     const wakeCommand = CommandId.make(`${WAKE_COMMAND}${id}`);
-    // A secret always goes as a message: a wait cannot end on it and would hold it to its timeout.
-    if (prompt.kind !== "secret" && waitIsLive(task, runs)) {
+    if (waitIsLive(task, runs)) {
       // Fork note: the wait's own exit then sets the same policy again, which the engine refuses
       // as unchanged; upstream logs that as `wake-policy-failed`. Harmless noise.
       const ended = yield* threads
