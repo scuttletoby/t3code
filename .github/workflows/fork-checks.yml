@@ -22,12 +22,19 @@ permissions:
 # as passed, so a ruleset that requires "No database schema changes" must also require "Outside pull
 # request". A head repository GitHub no longer knows reads as "another fork". Test:
 # fork-contracts.test.py.
+#
+# `edited` (a title, body or base change) re-checks only when the base branch changed: no job reads
+# the title or the body, and the head is unchanged, so an edit of either would check the same thing
+# again. Such a run skips no_schema_changes and so starts no runner (the run ends "skipped").
+# fork-checks-ran.py, which fork-ci-result needs, passes over a run that skipped every job and
+# reads the newest one that checked. outside_pr still runs on every edit: a skipped one would count
+# as passed on top of the failure. Test: fork-contracts.test.py (checks-edited).
 jobs:
   # It also refuses changes to the upstream files listed in its last step. Keep the name: it is what
   # a ruleset would require.
   no_schema_changes:
     name: No database schema changes
-    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (github.event.action != 'edited' || github.event.changes.base) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

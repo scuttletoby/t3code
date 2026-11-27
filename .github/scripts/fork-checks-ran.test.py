@@ -40,10 +40,12 @@ def pr(number, ref='feature', repo_id=REPO_ID):
                                                          'url': 'https://api.github.invalid/repos/o/r'}}}
 
 
-def wr(rid, jobs, path=WF, event='pull_request_target', status='completed', prs=(7,), head_repo='o/r', branch='feature'):
+def wr(rid, jobs, path=WF, event='pull_request_target', status='completed', prs=(7,), head_repo='o/r', branch='feature',
+       conclusion=None):
     """A run of fork-checks.yml on SHA; by default one of pull request #7 (PR_ENV) from this repository's branch
-    `feature`. prs: numbers (entries from that branch) or whole entries."""
-    return {'id': rid, 'path': path, 'event': event, 'status': status, 'jobs': jobs, 'head_branch': branch,
+    `feature`. prs: numbers (entries from that branch) or whole entries. conclusion: the run's own."""
+    return {'id': rid, 'path': path, 'event': event, 'status': status, 'conclusion': conclusion, 'jobs': jobs,
+            'head_branch': branch,
             'pull_requests': [p if isinstance(p, dict) else pr(p, branch) for p in prs],
             'head_repository': {'full_name': head_repo, 'id': REPO_ID if head_repo == 'o/r' else OTHER_ID}}
 
@@ -212,6 +214,51 @@ class Check(unittest.TestCase):
                            ([wr(3, [job(CFG['check'])]), wr(9, [job(CFG['check'], 'completed', 'cancelled')])], 1)):
             code, out, _ = check(Fake([runs]))
             self.assertEqual(code, want, f'{[r["id"] for r in runs]}: {out}')
+
+    def test_a_newer_run_that_skipped_every_job_is_passed_over(self):
+        # A title or body edit (`edited`, base unchanged) skips the check, so that run ends "skipped" (#1090): the
+        # newest run that checked decides, red or green, and the skipped run's jobs are never asked for.
+        def edit(rid):
+            return wr(rid, [job(CFG['check'], 'completed', 'skipped'), job(CFG['outside_check'], 'completed', 'skipped')],
+                      conclusion='skipped')
+        for older, want in ((wr(3, [job(CFG['check'], 'completed', 'failure')], conclusion='failure'), 1),
+                            (wr(3, [job(CFG['check'])], conclusion='success'), 0),
+                            (wr(3, [job(CFG['check'], 'completed', 'cancelled')], conclusion='cancelled'), 1)):
+            fake = Fake([[edit(9), edit(8), older]])
+            code, out, _ = check(fake)
+            self.assertEqual(code, want, out)
+            self.assertNotIn('skipped (', out)
+            asked = ' '.join(fake.paths)
+            self.assertIn('actions/runs/3/jobs', asked)
+            self.assertNotIn('actions/runs/9/jobs', asked)
+            self.assertNotIn('actions/runs/8/jobs', asked)
+            self.assertLessEqual(len(fake.paths), fcr.API_CALLS_PER_POLL)
+
+    def test_a_newer_skipped_run_waits_for_an_older_run_still_going(self):
+        going = wr(3, [job(CFG['check'], 'in_progress', None)], status='in_progress')
+        code, out, clock = check(Fake([[wr(9, [job(CFG['check'], 'completed', 'skipped')], conclusion='skipped'), going],
+                                       [wr(9, [job(CFG['check'], 'completed', 'skipped')], conclusion='skipped'),
+                                        wr(3, [job(CFG['check'])], conclusion='success')]]))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(clock.slept), 1)
+
+    def test_when_every_run_skipped_every_job_the_newest_decides_and_fails(self):
+        skipped = [wr(rid, [job(CFG['check'], 'completed', 'skipped')], conclusion='skipped') for rid in (9, 3)]
+        fake = Fake([skipped])
+        code, out, clock = check(fake)
+        self.assertEqual(code, 1, out)
+        self.assertIn('was skipped', out)
+        self.assertIn('actions/runs/9/jobs', ' '.join(fake.paths))
+        self.assertEqual(clock.slept, [])
+
+    def test_a_run_that_is_still_going_or_ended_otherwise_is_not_passed_over(self):
+        # Only a finished run whose own conclusion is "skipped" is passed over; a newer run in any other state decides.
+        for newer in (wr(9, [job(CFG['check'], 'completed', 'failure')], conclusion='failure'),
+                      wr(9, [job(CFG['check'], 'completed', 'cancelled')], conclusion='cancelled'),
+                      wr(9, [], status='completed', conclusion='failure'),
+                      wr(9, [job(CFG['check'], 'completed', 'skipped')], status='in_progress', conclusion='skipped')):
+            code, out, _ = check(Fake([[newer, wr(3, [job(CFG['check'])], conclusion='success')]]))
+            self.assertEqual(code, 1, out)
 
     def test_reads_the_latest_attempt_only(self):
         fake = Fake([[wr(1, [job(CFG['check'])])]])

@@ -173,7 +173,11 @@ def look(api, sha, name, workflow, repo, number):
                    + urllib.parse.urlencode({'head_sha': sha, 'per_page': 100}))['workflow_runs']
     mine = [r for r in runs if r['path'].split('@')[0] == workflow and r.get('event') == 'pull_request_target'
             and of_this_pull_request(r, repo, number)]
-    for run in sorted(mine, key=lambda r: int(r['id']), reverse=True):
+    # A run that skipped every job checked nothing (fork-checks.yml skips its check on a title or body edit), so
+    # the newest run that did not end so decides. Only when every run ended so does the newest one decide (and its
+    # skipped check fails). The run list says it, so this costs no API call.
+    checked = [r for r in mine if not (r.get('status') == 'completed' and r.get('conclusion') == 'skipped')]
+    for run in sorted(checked or mine, key=lambda r: int(r['id']), reverse=True):
         jobs = api.get(f'actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')['jobs']
         named = [j for j in jobs if j['name'] == name]
         if not named:
