@@ -4,6 +4,7 @@
  */
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
+import type { ChildProcessHandle } from "effect/process/ChildProcessSpawner";
 import {
   decodeUtf8,
   type CollectedUint8StreamText,
@@ -66,3 +67,20 @@ export function isClosedStdin(error: unknown): boolean {
   }
   return false;
 }
+
+/**
+ * Lets a closed stdin pass when nothing went unread (an empty stdin, as the handoff command gives)
+ * or the child failed, its own non-zero exit code saying why. A child that exited 0 without reading
+ * a real stdin is still upstream's stdin error.
+ */
+export const closedStdinOf =
+  (child: Pick<ChildProcessHandle, "exitCode">, stdin: string) =>
+  <E>(cause: E): Effect.Effect<void, E> =>
+    stdin === ""
+      ? Effect.void
+      : child.exitCode.pipe(
+          Effect.matchEffect({
+            onFailure: () => Effect.fail(cause),
+            onSuccess: (code) => (code === 0 ? Effect.fail(cause) : Effect.void),
+          }),
+        );
