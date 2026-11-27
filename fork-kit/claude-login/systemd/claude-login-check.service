@@ -1,0 +1,12 @@
+# claude-login kit: written by claude-login-install. Do not edit: run the installer again.
+[Unit]
+Description=claude-login check: open an issue before a Claude Code login ends (fork-kit/claude-login)
+# runs the release in use; without one (an uninstall half-way) it does nothing
+ConditionPathExists=/usr/local/libexec/claude-login/current/bin/claude-login
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/claude-login/current/bin/claude-login check
+# each claude, gh and tmux call has its own time limit (the config's timeout); this bounds the whole run
+TimeoutStartSec=10min
+UMask=0077

@@ -1,0 +1,344 @@
+#!/usr/bin/python3 -IB
+"""claude-login: sign Claude Code accounts in on a machine with no browser, and warn before a login ends.
+
+  claude-login status                       every account: masked email, plan, login state, time left
+  claude-login start ACCOUNT [--again]      start the sign-in in a tmux session; prints the link for the owner
+  claude-login finish ACCOUNT FILE          type the code from FILE (a secret prompt's file), check the new login,
+                                            delete FILE
+  claude-login set-aside ACCOUNT            move a credentials file that cannot be read out of the way (kept, with
+                                            .unreadable-<time> at the end), so a new sign-in can replace it
+  claude-login check                        for a timer: opens one issue per account when its login is signed out,
+                                            unreadable, not refreshing, or ends within warnDays days
+
+The config is the user's own file, $XDG_CONFIG_HOME/claude-login/config.json (~/.config/...), or $CLAUDE_LOGIN_CONFIG:
+
+  {"version": 1, "claude": "~/.local/bin/claude",
+   "accounts": [{"name": "main", "configDir": ""}, {"name": "second", "configDir": "~/.claude-second"}],
+   "issueRepo": "OWNER/REPO", "labels": ["type:ops"], "machine": "the build box", "warnDays": 2}
+
+configDir "" is Claude Code's default folder (~/.claude). Other keys: timeout (s per claude, gh or tmux call, 60),
+wait (s finish waits for the new login, 30), readPause (s between reads of a credentials file, 1).
+
+Secrets: it reads only the expiry fields of a credentials file (and whether a refresh token is there), never prints
+or logs a token, the file's text or the code, and runs claude with CLAUDE_CODE_OAUTH_TOKEN unset (a normal login,
+never a setup token). Part of fork-kit/claude-login (README.md there). Tests: tests/claude-login.test.py
+"""
+import fcntl, json, os, re, shlex, subprocess, sys, time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from claudelogin.creds import read_login  # noqa: E402
+
+PROG = 'claude-login'
+NAME_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,31}$')
+REPO_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$')
+LINK_RE = re.compile(r'https://\S*oauth/authorize\S*')
+ERROR_WORDS = re.compile(r'error|invalid|failed|expired', re.I)
+NEW_LOGIN_MS = 3600000  # proof of a new login: its end moved on by more than this (a refresh never moves it that far)
+DAY_MS = 86400000
+DEFAULTS = {'claude': '~/.local/bin/claude', 'accounts': [{'name': 'main', 'configDir': ''}], 'issueRepo': '',
+            'labels': [], 'machine': 'this machine', 'warnDays': 2, 'timeout': 60, 'wait': 30, 'readPause': 1}
+
+
+class Fail(Exception):
+    def __init__(self, text, code=1):
+        super().__init__(text)
+        self.code = code
+
+
+def home():
+    return os.environ.get('HOME') or os.path.expanduser('~')
+
+
+def expand(path):
+    return os.path.join(home(), path[2:]) if path.startswith('~/') else path
+
+
+def config_path():
+    base = os.environ.get('XDG_CONFIG_HOME') or os.path.join(home(), '.config')
+    return os.environ.get('CLAUDE_LOGIN_CONFIG') or os.path.join(base, PROG, 'config.json')
+
+
+def load_config():
+    path = config_path()
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise Fail(f'no config at {path} (see `{PROG} --help`)', 2)
+    except (OSError, ValueError) as e:
+        raise Fail(f'{path} cannot be read ({type(e).__name__})', 2)
+    if not isinstance(data, dict) or data.get('version') != 1:
+        raise Fail(f'{path}: must be a JSON object with "version": 1', 2)
+    cfg = dict(DEFAULTS, **{k: v for k, v in data.items() if k != 'version'})
+    bad = [k for k in cfg if k not in DEFAULTS]
+    accounts = cfg['accounts'] if isinstance(cfg['accounts'], list) else []
+    names = [a.get('name') for a in accounts if isinstance(a, dict)]
+    problems = [f'unknown key {k!r}' for k in bad]
+    if not accounts or len(names) != len(accounts) or not all(isinstance(n, str) and NAME_RE.match(n) for n in names):
+        problems.append('accounts: a list of {"name": "a-z0-9-", "configDir": "" | path}')
+    if len(set(names)) != len(names):
+        problems.append('accounts: two accounts have the same name')
+    if any(not isinstance(a.get('configDir', ''), str) for a in accounts if isinstance(a, dict)):
+        problems.append('accounts: configDir must be a string')
+    if cfg['issueRepo'] and not (isinstance(cfg['issueRepo'], str) and REPO_RE.match(cfg['issueRepo'])):
+        problems.append('issueRepo: must be OWNER/REPO')
+    if not (isinstance(cfg['labels'], list) and all(isinstance(x, str) and x for x in cfg['labels'])):
+        problems.append('labels: a list of label names')
+    for k in ('warnDays', 'timeout', 'wait', 'readPause'):
+        if not isinstance(cfg[k], (int, float)) or isinstance(cfg[k], bool) or cfg[k] < 0:
+            problems.append(f'{k}: a number of 0 or more')
+    if not isinstance(cfg['claude'], str) or not isinstance(cfg['machine'], str):
+        problems.append('claude and machine: strings')
+    if problems:
+        raise Fail(f'{path}: ' + '; '.join(problems), 2)
+    return cfg
+
+
+class Account:
+    def __init__(self, row):
+        self.name, self.dir = row['name'], expand(row.get('configDir') or '')
+        self.cred = os.path.join(self.dir or os.path.join(home(), '.claude'), '.credentials.json')
+        self.session = f'{PROG}-{self.name}'
+
+    def env(self):
+        """A normal login of this account: never the setup token, and its own config folder."""
+        env = {k: v for k, v in os.environ.items() if k not in ('CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR')}
+        if self.dir:
+            env['CLAUDE_CONFIG_DIR'] = self.dir
+        return env
+
+    def login_cmd(self, claude):
+        """The shell text the tmux session runs (kept open after the sign-in, so its screen can be read)."""
+        pre = f'CLAUDE_CONFIG_DIR={shlex.quote(self.dir)}' if self.dir else '-u CLAUDE_CONFIG_DIR'
+        return f'env -u CLAUDE_CODE_OAUTH_TOKEN {pre} {shlex.quote(claude)} auth login; sleep 600'
+
+
+def account(cfg, name):
+    for row in cfg['accounts']:
+        if row['name'] == name:
+            return Account(row)
+    raise Fail(f'ACCOUNT must be one of: {", ".join(r["name"] for r in cfg["accounts"])}', 2)
+
+
+def run(cmd, cfg, env=None, check=False):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg['timeout'], env=env,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        if check:
+            raise Fail(f'`{os.path.basename(cmd[0])} {cmd[1]}` did not finish ({type(e).__name__})')
+        return None
+    if check and r.returncode:
+        raise Fail(f'`{os.path.basename(cmd[0])} {cmd[1]}` failed (exit {r.returncode})')
+    return r
+
+
+def info(acct, cfg):
+    """One status line; '?' for what is not known. The email is masked."""
+    state, facts = read_login(acct, cfg)
+    r = run([expand(cfg['claude']), 'auth', 'status'], cfg, acct.env())
+    try:
+        s = json.loads(r.stdout) if r and r.returncode == 0 else {}
+    except ValueError:
+        s = {}
+    s = s if isinstance(s, dict) else {}
+    e = s.get('email') if isinstance(s.get('email'), str) else ''
+    mail = (e[:3] + '…@' + e.split('@')[-1]) if '@' in e else '?'
+    now = time.time() * 1000
+    acc = round((facts['expiresAt'] - now) / 60000) if facts.get('expiresAt') else '?'
+    end = facts.get('end')
+    days = round((end - now) / DAY_MS, 1) if end else '?'
+    ends = time.strftime('%Y-%m-%d_%H:%MZ', time.gmtime(end / 1000)) if end else '?'
+    plan = s.get('subscriptionType') if isinstance(s.get('subscriptionType'), str) else '?'
+    return {'line': f'{acct.name} {mail} plan={plan} login={state} access_min_left={acc} login_days_left={days} '
+                    f'ends={ends}', 'login': state, 'access': acc, 'days': days, 'ends': ends.replace('_', ' ')}
+
+
+def tmux(cfg, *args):
+    # SHELL: the session's command is sh text, and a tmux started with no SHELL may find no shell to run it
+    return run(['tmux', *args], cfg, dict(os.environ, SHELL='/bin/sh'))
+
+
+def running(acct, cfg):
+    r = tmux(cfg, 'has-session', '-t', acct.session)
+    return bool(r) and r.returncode == 0
+
+
+def set_aside_hint(acct, again=''):
+    return f'run `{PROG} set-aside {acct.name}` first (it keeps the file), then `{PROG} start {acct.name}{again}`'
+
+
+def cmd_start(cfg, acct, again):
+    lock_dir = os.environ.get('XDG_RUNTIME_DIR') or '/tmp'
+    fd = os.open(os.path.join(lock_dir, f'{PROG}-{acct.name}.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+    try:   # one start at a time per account; the fd is not inherited (a tmux server started here never holds it)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise Fail(f'another start for {acct.name} is running')
+    if read_login(acct, cfg)[0] == 'unreadable':
+        raise Fail(f'the credentials file of {acct.name} cannot be read, and a new sign-in cannot replace it: '
+                   + set_aside_hint(acct))
+    if running(acct, cfg):
+        if not again:
+            raise Fail(f'a sign-in for {acct.name} is already running (finish it, or `{PROG} start {acct.name} '
+                       '--again` to replace it)')
+        tmux(cfg, 'kill-session', '-t', acct.session)
+    r = tmux(cfg, 'new-session', '-d', '-s', acct.session, '-x', '400', '-y', '50',
+             acct.login_cmd(expand(cfg['claude'])))
+    if not r or r.returncode:
+        raise Fail('tmux could not start the sign-in')
+    for _ in range(20):
+        r = tmux(cfg, 'capture-pane', '-p', '-J', '-t', acct.session)
+        m = LINK_RE.search(r.stdout if r else '')
+        if m:
+            print(m.group())
+            print(f'Open the link, sign in as {acct.name}, then give the code (a secret prompt, delivered as a file) '
+                  f'and run: {PROG} finish {acct.name} <file>')
+            return 0
+        time.sleep(1)
+    raise Fail('no sign-in link appeared; run start again with --again')
+
+
+def cmd_finish(cfg, acct, path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            code = f.read().replace('\r', '').replace('\n', '')
+    except OSError:
+        code = ''
+    if not code:
+        raise Fail('the code file is missing or empty', 2)
+    if not running(acct, cfg):
+        raise Fail(f'no sign-in for {acct.name} is running; run `{PROG} start {acct.name}` first ({path} is kept)')
+    state, facts = read_login(acct, cfg)
+    if state == 'unreadable':   # with "no login" as before, the next good read would look like a new login
+        raise Fail(f'the credentials file of {acct.name} cannot be read; nothing typed, {path} is kept. '
+                   + set_aside_hint(acct, ' --again'))
+    before = facts.get('end') or 0
+    for keys in (['-l', code], ['Enter']):
+        r = tmux(cfg, 'send-keys', '-t', acct.session, *keys)
+        if not r or r.returncode:
+            raise Fail(f'could not type the code into the sign-in; {path} is kept for a retry')
+    del code
+    os.unlink(path)
+    deadline = time.monotonic() + cfg['wait']
+    while True:
+        state, facts = read_login(acct, cfg)
+        if state == 'ok' and (facts.get('end') or 0) > before + NEW_LOGIN_MS:
+            tmux(cfg, 'kill-session', '-t', acct.session)
+            print(info(acct, cfg)['line'])
+            return 0
+        r = tmux(cfg, 'capture-pane', '-p', '-J', '-t', acct.session)
+        # only the matched words: the screen can still show the pasted code
+        words = sorted({w.lower() for w in ERROR_WORDS.findall('\n'.join((r.stdout if r else '').splitlines()[-6:]))})
+        if words:
+            tmux(cfg, 'kill-session', '-t', acct.session)
+            raise Fail(f'sign-in failed (the screen says: {" ".join(words)}); run `{PROG} start {acct.name} --again`')
+        if time.monotonic() >= deadline:
+            tmux(cfg, 'kill-session', '-t', acct.session)
+            raise Fail(f'no new login after {cfg["wait"]:g} s; run `{PROG} start {acct.name} --again`')
+        time.sleep(1)
+
+
+def cmd_set_aside(cfg, acct):
+    state, _ = read_login(acct, cfg)
+    if state != 'unreadable':
+        raise Fail(f'the credentials file of {acct.name} reads fine now (login={state}); nothing moved')
+    to = acct.cred + time.strftime('.unreadable-%Y%m%dT%H%M%SZ', time.gmtime())
+    os.rename(acct.cred, to)
+    print(f'moved the unreadable credentials file of {acct.name} to {to} (kept, not read); now run '
+          f'`{PROG} start {acct.name}` and `{PROG} finish {acct.name} <file>`')
+    return 0
+
+
+def open_once(cfg, prefix, title, body):
+    """Open the issue unless one whose title has that prefix is open. A failed lookup or create raises Fail, so a
+    timer turns red instead of looking green."""
+    repo = cfg['issueRepo']
+    if not repo:
+        raise Fail(f'would open "{title}", but the config names no issueRepo')
+    r = run(['gh', 'issue', 'list', '-R', repo, '--state', 'open', '--search', f'"{prefix}" in:title', '--json',
+             'number', '--jq', 'length'], cfg)
+    if not r or r.returncode or not r.stdout.strip().isdigit():
+        why = 'gh failed' if not r or r.returncode else 'gh printed no count'
+        raise Fail(f'cannot look up the open issues for "{prefix}" ({why}); nothing opened')
+    if r.stdout.strip() != '0':
+        return
+    labels = [x for label in cfg['labels'] for x in ('--label', label)]
+    r = run(['gh', 'issue', 'create', '-R', repo, '--title', title, *labels, '--body', body], cfg)
+    if not r or r.returncode:
+        raise Fail(f'could not open "{title}" (gh failed)')
+    print(f'opened: {title}')
+
+
+def renew_body(cfg, acct, why, steps):
+    return (f'The Claude Code login of the account `{acct.name}` on {cfg["machine"]} {why}.\n\n'
+            f'Agent: {steps} Run `{PROG} start {acct.name}` there, send the link to the owner, get the code with a '
+            f'secret prompt (delivered as a file), then `{PROG} finish {acct.name} <file>`. Check with '
+            f'`{PROG} status`; close this issue when it shows `login=ok` with more than {cfg["warnDays"]:g} days '
+            f'left.\n\nOpened by `{PROG} check` (its timer: claude-login-check.timer).')
+
+
+def cmd_check(cfg):
+    rc = 0
+    for row in cfg['accounts']:
+        acct = Account(row)
+        try:
+            i = info(acct, cfg)
+            prefix = f'Renew the Claude login of {acct.name}'
+            if i['login'] != 'ok' and running(acct, cfg):
+                print(f'{acct.name}: login={i["login"]}, but a sign-in for it is running; no issue opened')
+                continue
+            if i['login'] == 'unreadable':
+                open_once(cfg, prefix, f'{prefix} on {cfg["machine"]} (unreadable)', renew_body(
+                    cfg, acct, 'cannot be read (its credentials file is not valid, also after reading it again)',
+                    f'first run `{PROG} set-aside {acct.name}`: it moves the broken file aside (kept), since '
+                    f'`finish` refuses an unreadable file.'))
+                continue
+            if i['login'] != 'ok':
+                open_once(cfg, prefix, f'{prefix} on {cfg["machine"]} (signed out)',
+                          renew_body(cfg, acct, 'is signed out', ''))
+                continue
+            if i['access'] != '?' and i['access'] < -60:
+                t = f'Claude login of {acct.name} is not refreshing'
+                open_once(cfg, t, t, f'The access token of `{acct.name}` on {cfg["machine"]} ended {-i["access"]} '
+                          'minutes ago, so whatever refreshed it (a usage check, the account\'s agents) stopped. '
+                          f'See `{PROG} status`. Opened by `{PROG} check`.')
+            if i['days'] == '?':
+                raise Fail(f'the login of {acct.name} has no end date (an older Claude Code file?); not checked. '
+                           f'Sign in again (`{PROG} start {acct.name}`) to get one')
+            if i['days'] < cfg['warnDays']:
+                open_once(cfg, prefix, f'{prefix} on {cfg["machine"]} (ends {i["ends"]})', renew_body(
+                    cfg, acct, f'ends {i["ends"]} ({i["days"]} days left)', ''))
+        except Fail as e:
+            print(f'{PROG}: {acct.name}: {e}', file=sys.stderr)
+            rc = 1
+    return rc
+
+
+def main(argv):
+    if not argv or argv[0] in ('-h', '--help', 'help'):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    try:
+        cfg = load_config()
+        cmd, rest = argv[0], argv[1:]
+        if cmd == 'status' and not rest:
+            for row in cfg['accounts']:
+                print(info(Account(row), cfg)['line'])
+            return 0
+        if cmd == 'check' and not rest:
+            return cmd_check(cfg)
+        if cmd == 'start' and rest and rest[1:] in ([], ['--again']):
+            return cmd_start(cfg, account(cfg, rest[0]), rest[1:] == ['--again'])
+        if cmd == 'finish' and len(rest) == 2:
+            return cmd_finish(cfg, account(cfg, rest[0]), rest[1])
+        if cmd == 'set-aside' and len(rest) == 1:
+            return cmd_set_aside(cfg, account(cfg, rest[0]))
+        raise Fail(f'usage: see `{PROG} --help`', 2)
+    except Fail as e:
+        print(f'{PROG}: {e}', file=sys.stderr)
+        return e.code
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
