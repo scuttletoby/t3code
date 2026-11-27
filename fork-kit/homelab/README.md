@@ -52,15 +52,19 @@ the key named, never ignored.
 ## homelab check
 
 ```
-homelab check [--no-reach] [--timeout SECONDS]
+homelab check [--no-reach] [--timeout SECONDS] [--json]
 ```
 
-One line per finding, `ok` or `FAIL`; exit 1 when any line fails. It changes nothing.
+One line per finding, `ok` or `FAIL`; exit 1 when any line fails. It changes nothing. `--json` prints the same
+findings for scripts: `{"ok": true|false, "checks": [{"ok", "what", "machine", "text"}]}`, where `what` is
+`machineFile`, `leaseDir`, `lease` or `reach` and `machine` is the machine's name or `null`.
 
 - the machine file and its `homelab` section (a missing file says so, and where to read how to write it);
-- the lease folder: there, a folder and not a link, and writable by the user who runs the check;
+- the lease folder: there, a folder and not a link, not writable by everyone (o+w), and writable by the user who
+  runs the check;
 - each lease in it: free, or who holds it until when; a file the kit did not write fails;
-- each machine: a TCP connect to `host:port` within the timeout (3 s), nothing sent. `--no-reach` skips this.
+- each machine: a TCP connect to `host:port` within the timeout (`--timeout`, 1 to 60 s, default 3), nothing
+  sent. `--no-reach` skips this.
 
 ## Leases
 
@@ -73,7 +77,8 @@ homelab lease list [--json]
 - **take** gives the lease to `HOLDER` (for example `project/agent-name`) for `N` minutes (the machine's
   `defaultMinutes` when left out, at most `maxMinutes`). Taking a lease you hold renews it from now. A lease another
   holder holds is refused with exit code **3**, naming the holder and when it ends, so a script can wait and try
-  again.
+  again. `--note` says what it is for: one printable line of at most 200 characters (others see it in
+  `list`).
 - A lease **ends by itself** at its time: then anyone may take it, and `take` says whose lease ended.
 - **release** gives your lease back; another holder's live lease is refused (exit 3). Releasing a free or expired
   lease is fine (exit 0).
@@ -85,7 +90,10 @@ How: one file per machine, `<leaseDir>/<name>.json`, and one lock file, `<name>.
 lock (`flock`), so two takers at once never both win; the lease file is written beside it and renamed over it in
 one step, so a reader never sees half a lease, and a take stopped half-way leaves the old lease or the new one. A
 lease file the kit did not write (not JSON, another machine's, a link) is refused, never overwritten: look at it,
-then remove it.
+then remove it. A lock file that is not a plain file (a FIFO, a folder) is refused, not waited on. Every file is
+reached through one open handle on the folder, so a folder swapped for a link while a command runs is not followed.
+A temp file left by a take that stopped half-way is removed by the next take or release of that machine (under its
+lock, so no take is still writing it).
 
 The folder is shared by every agent user that may take leases. The owner makes it once, as root, with the agents'
 group (files are written group-writable, mode 664):
@@ -94,7 +102,8 @@ group (files are written group-writable, mode 664):
 install -d -m 2775 -g AGENTS_GROUP /var/lib/fork-homelab/leases
 ```
 
-Leases are an agreement between agents, not a wall: a user who can write the folder can remove a lease.
+Leases are an agreement between agents, not a wall: a user who can write the folder can remove a lease. A folder
+anyone can write (mode o+w, sticky or not) is refused by every command and fails `check`.
 
 ## Tests
 

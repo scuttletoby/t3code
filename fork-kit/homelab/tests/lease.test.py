@@ -4,6 +4,7 @@ No root, no network. RedCheck breaks each guard in a copy of the kit and shows i
   python3 -I -B fork-kit/homelab/tests/lease.test.py
 """
 import json, os, stat, subprocess, sys, textwrap, time, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import homelab_fixture as hf  # noqa: E402
@@ -17,6 +18,13 @@ class Take(hf.Temp):
     def setUp(self):
         super().setUp()
         self.write_machine()
+        self.child = textwrap.dedent(f'''
+            import sys
+            sys.path.insert(0, {hf.LIB!r})
+            from homelab import cli, config
+            config.MACHINE_PATH, config.OWNER_UID = {self.machine!r}, {os.getuid()}
+            sys.exit(cli.main(['lease', *sys.argv[1:]], now={NOW}))
+        ''')
 
     def test_a_free_machine_is_leased_for_its_default_time(self):
         code, out, err = self.run_cli('lease', 'take', 'test-box', '--holder', 'proj-a/agent-1', '--note', 'e2e')
@@ -75,8 +83,8 @@ class Take(hf.Temp):
             from homelab import cli, config, lease
             config.MACHINE_PATH, config.OWNER_UID = {self.machine!r}, {os.getuid()}
             read = lease._read
-            def slow(d, name):
-                got = read(d, name)
+            def slow(*a):
+                got = read(*a)
                 time.sleep(0.3)
                 return got
             lease._read = slow
@@ -141,6 +149,64 @@ class Take(hf.Temp):
         with open(target) as f:
             self.assertEqual(f.read(), '{}')
 
+
+    def test_a_lease_folder_anyone_can_write_is_refused(self):
+        for mode in (0o777, 0o1777):                  # sticky or not: anyone could still plant or forge a lease
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.leases, mode)
+                code, _, err = self.run_cli('lease', 'take', 'test-box', '--holder', 'a')
+                self.assertEqual(code, 1)
+                self.assertIn(f'lease folder {self.leases} is writable by everyone', err)
+                self.assertEqual(os.listdir(self.leases), [])
+        os.chmod(self.leases, 0o775)                  # group-writable, as the README asks: fine
+        self.assertEqual(self.run_cli('lease', 'take', 'test-box', '--holder', 'a')[0], 0)
+
+    def test_a_folder_swapped_for_a_link_mid_run_is_not_followed(self):
+        # After the take has opened the folder, it is moved away and a link to another folder is put in its place:
+        # the take must go on in the folder it opened, never write through the link.
+        elsewhere, moved = os.path.join(self.tmp, 'elsewhere'), os.path.join(self.tmp, 'moved')
+        os.makedirs(elsewhere)
+        read = hf.lease._read
+
+        def swap(*a):
+            got = read(*a)
+            os.rename(self.leases, moved)
+            os.symlink(elsewhere, self.leases)
+            return got
+        with mock.patch.object(hf.lease, '_read', swap):
+            code, _, err = self.run_cli('lease', 'take', 'test-box', '--holder', 'a')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(os.listdir(elsewhere), [])
+        self.assertEqual(sorted(os.listdir(moved)), ['test-box.json', 'test-box.lock'])
+
+    def test_a_lock_file_that_is_not_a_plain_file_is_refused_not_waited_on(self):
+        os.mkfifo(os.path.join(self.leases, 'test-box.lock'))      # opening a FIFO waits for a writer forever
+        for argv in (['take', 'test-box', '--holder', 'a'], ['release', 'test-box', '--holder', 'a']):
+            with self.subTest(argv=argv):
+                r = subprocess.run([sys.executable, '-I', '-B', '-c', self.child, *argv], capture_output=True,
+                                   text=True, timeout=20, stdin=subprocess.DEVNULL)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn('test-box.lock: is not a plain file', r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.leases, 'test-box.json')))
+
+    def test_a_note_that_is_not_one_short_printable_line_is_refused(self):
+        for note in ('two\nlines', 'tab\there', 'colour \x1b[31mred', 'x' * 201):
+            with self.subTest(note=note[:20]):
+                code, _, err = self.run_cli('lease', 'take', 'test-box', '--holder', 'a', '--note', note)
+                self.assertEqual(code, 1)
+                self.assertIn('--note: one printable line of at most 200 characters', err)
+                self.assertEqual(os.listdir(self.leases), [])
+        self.assertEqual(self.run_cli('lease', 'take', 'test-box', '--holder', 'a', '--note', 'x' * 200)[0], 0)
+
+    def test_temp_files_of_a_take_stopped_half_way_are_removed_by_the_next_take(self):
+        stale = ['.test-box.json.1.tmp', f'.test-box.json.{os.getpid() + 1}.tmp']   # takes of other process ids
+        kept = ['.test-box-2.json.1.tmp', 'notes.txt', '.test-box.json.x.tmp']      # not a take's temp file of this
+        for n in stale + kept:
+            with open(os.path.join(self.leases, n), 'w') as f:
+                f.write('{half')
+        code, _, err = self.run_cli('lease', 'take', 'test-box', '--holder', 'a')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(os.listdir(self.leases)), sorted(kept + ['test-box.json', 'test-box.lock']))
 
 class Release(hf.Temp):
 
@@ -229,6 +295,19 @@ MUTATIONS = {
     'release checks the holder': (
         'lease', "        if cur['until'] > now and cur['holder'] != holder:\n            raise Held(cur)\n", '',
         'Release.test_another_holder_cannot_release_a_live_lease'),
+    'a folder anyone can write is refused': (
+        'lease', '    if os.fstat(fd).st_mode & stat.S_IWOTH:', '    if False:',
+        'Take.test_a_lease_folder_anyone_can_write_is_refused'),
+    'the lock file must be a plain file': (
+        'lease', "            raise LeaseError(f'{path}: is not a plain file; look at it, then remove it')\n",
+        '            pass\n',
+        'Take.test_a_lock_file_that_is_not_a_plain_file_is_refused_not_waited_on'),
+    'a note is one short printable line': (
+        'lease', '    check_note(note)\n', '',
+        'Take.test_a_note_that_is_not_one_short_printable_line_is_refused'),
+    'stale temp files are swept': (
+        'lease', '    for n in os.listdir(dir_fd if os.listdir in os.supports_fd else d):', '    for n in []:',
+        'Take.test_temp_files_of_a_take_stopped_half_way_are_removed_by_the_next_take'),
     'a missing file says where to read how': (
         'config', "        if 'not there' in str(e):", '        if False:',
         'MissingMachineFile.test_every_lease_command_names_the_missing_file_and_where_to_read_how'),

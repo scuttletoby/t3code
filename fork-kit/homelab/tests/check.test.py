@@ -111,6 +111,41 @@ class Check(hf.Temp):
         self.assertIn('is writable by group or others', out)
 
 
+    def test_a_lease_folder_anyone_can_write_fails_the_check(self):
+        self.write_machine(self.up)
+        os.chmod(self.leases, 0o777)
+        code, out, _ = self.run_cli('check', '--no-reach')
+        self.assertEqual(code, 1)
+        self.assertIn(f'FAIL lease folder {self.leases} is writable by everyone', out)
+
+    def test_check_json_gives_each_finding_for_scripts(self):
+        self.write_machine(self.up, hf.BUILD_BOX)
+
+        def connect(where, timeout):
+            if where[0] != '127.0.0.1':
+                raise OSError(111, 'Connection refused')
+            return socket.socket()
+        code, out, _ = self.run_cli('check', '--json', '--timeout', '2', connect=connect)
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertIs(report['ok'], False)
+        rows = [(c['ok'], c['what'], c['machine']) for c in report['checks']]
+        self.assertEqual(rows, [(True, 'machineFile', None), (True, 'leaseDir', None), (True, 'lease', 'test-box'),
+                                (True, 'reach', 'test-box'), (False, 'reach', 'build-box')])
+        self.assertIn('does not answer', report['checks'][-1]['text'])
+        code, out, _ = self.run_cli('check', '--json', '--no-reach')
+        self.assertEqual((code, json.loads(out)['ok']), (0, True))
+
+    def test_a_timeout_out_of_range_is_a_usage_error(self):
+        self.write_machine(self.up)
+        for t in ('-1', '0', '0.5', '61', 'nan', 'inf', 'x'):
+            with self.subTest(timeout=t):
+                with self.assertRaises(SystemExit) as cm:
+                    self.run_cli('check', '--timeout', t)
+                self.assertEqual(cm.exception.code, 2)
+        for t in ('1', '60'):
+            self.assertEqual(self.run_cli('check', '--no-reach', '--timeout', t)[0], 0)
+
 class Section(hf.Temp):
 
     def refused(self, why, *machines, **section):
@@ -174,15 +209,20 @@ class Section(hf.Temp):
 
 MUTATIONS = {
     'a machine that does not answer fails': (
-        'check', "        return False, f'{m[\"name\"]}: {where} does not answer ({why})'",
-        "        return True, f'{m[\"name\"]}: {where} does not answer ({why})'",
+        'check', "        return _row(False, 'reach',", "        return _row(True, 'reach',",
         'Check.test_a_machine_that_does_not_answer_fails_the_check'),
     'a missing machine file fails': (
-        'check', "        return [(False, f'machine file: {e}')]", "        return [(True, f'machine file: {e}')]",
+        'check', "        return [_row(False, 'machineFile',", "        return [_row(True, 'machineFile',",
         'Check.test_a_missing_machine_file_fails_and_says_where_to_read_how'),
     'the lease folder must be writable': (
-        'check', 'if os.access(d, os.W_OK | os.X_OK):', 'if True:',
+        'check', 'if lease.writable(d, dir_fd):', 'if True:',
         'Check.test_a_lease_folder_this_user_cannot_write_fails_the_check'),
+    'check reports a folder anyone can write': (
+        'lease', '    if os.fstat(fd).st_mode & stat.S_IWOTH:', '    if False:',
+        'Check.test_a_lease_folder_anyone_can_write_fails_the_check'),
+    'the timeout is bounded': (
+        'cli', '    if not lo <= t <= hi:', '    if False:',
+        'Check.test_a_timeout_out_of_range_is_a_usage_error'),
     'names are unique': (
         'config', '    if twice:\n', '    if False:\n', 'Section.test_a_name_given_twice_is_refused'),
     'a leasable machine needs a folder': (

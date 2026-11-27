@@ -26,6 +26,7 @@ class Temp(unittest.TestCase):
     """A temporary folder with a lease folder in it, and the machine file path pointed there (not yet written)."""
 
     def setUp(self):
+        self.addCleanup(os.umask, os.umask(0o022))    # the tests' files get the modes they expect on any machine
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix='homelab-test-'))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.leases = os.path.join(self.tmp, 'leases')

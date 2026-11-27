@@ -1,6 +1,6 @@
 """homelab.cli: the `homelab` command (fork-kit/homelab/README.md).
 
-  homelab check [--no-reach] [--timeout SECONDS]
+  homelab check [--no-reach] [--timeout SECONDS] [--json]
   homelab lease take MACHINE --holder HOLDER [--minutes N] [--note TEXT]
   homelab lease release MACHINE --holder HOLDER
   homelab lease list [--json]
@@ -8,11 +8,24 @@
 Exit codes: 0 done; 1 a check failed, or the machine file or a lease cannot be used; 2 a usage error; 3 another
 holder holds the lease (take and release), so a script can wait and try again.
 """
-import argparse, json, socket, sys, time
+import argparse, json, math, socket, sys, time
 
 from homelab import check, config, lease
 
 HELD = 3
+TIMEOUT_RANGE = (1, 60)
+
+
+def _timeout(text):
+    """--timeout: seconds, 1 to 60 (a socket timeout of 0 or below, nan or inf is refused or waits forever)."""
+    lo, hi = TIMEOUT_RANGE
+    try:
+        t = float(text)
+    except ValueError:
+        t = math.nan
+    if not lo <= t <= hi:                     # also false for nan
+        raise argparse.ArgumentTypeError(f'{text!r}: seconds, {lo} to {hi}')
+    return t
 
 
 def _parser():
@@ -20,14 +33,16 @@ def _parser():
     sub = p.add_subparsers(dest='command', required=True)
     c = sub.add_parser('check', help='is the machine file usable here, and does every machine answer?')
     c.add_argument('--no-reach', action='store_true', help='do not try to reach the machines')
-    c.add_argument('--timeout', type=float, default=3.0, help='seconds to wait for each machine (default 3)')
+    c.add_argument('--timeout', type=_timeout, default=3.0,
+                   help='seconds to wait for each machine, 1 to 60 (default 3)')
+    c.add_argument('--json', action='store_true', help='{"ok", "checks": [{"ok", "what", "machine", "text"}]}')
     le = sub.add_parser('lease', help='who may use a shared test machine now')
     ls = le.add_subparsers(dest='action', required=True)
     t = ls.add_parser('take', help='take the lease, or renew yours')
     t.add_argument('machine')
     t.add_argument('--holder', required=True, help='who takes it, for example project/agent-name')
     t.add_argument('--minutes', type=int, help="how long (the machine's defaultMinutes when left out)")
-    t.add_argument('--note', default='', help='what it is for, shown to others')
+    t.add_argument('--note', default='', help='what it is for, shown to others: one printable line, at most 200')
     r = ls.add_parser('release', help='give your lease back')
     r.add_argument('machine')
     r.add_argument('--holder', required=True)
@@ -46,9 +61,12 @@ def main(argv, now=None, connect=socket.create_connection):
     now = time.time() if now is None else now
     if args.command == 'check':
         rows = check.run(now, reach=not args.no_reach, timeout=args.timeout, connect=connect)
-        for ok, text in rows:
-            print(f'{"ok  " if ok else "FAIL"} {text}')
-        return 0 if all(ok for ok, _ in rows) else 1
+        ok = all(r['ok'] for r in rows)
+        if args.json:
+            print(json.dumps({'ok': ok, 'checks': rows}, sort_keys=True))
+        for r in ([] if args.json else rows):
+            print(f'{"ok  " if r["ok"] else "FAIL"} {r["text"]}')
+        return 0 if ok else 1
     try:
         cfg = config.load()
         if args.action == 'take':
