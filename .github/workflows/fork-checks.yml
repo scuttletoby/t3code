@@ -37,7 +37,8 @@ jobs:
     name: No database schema changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    # Room for a copy's wait (COPY_WAIT_SECONDS in fork-checks-ran.py); the check itself takes about 4.
+    # Room for the copy step's wait (COPY_WAIT_SECONDS in fork-checks-ran.py). The real check's steps keep
+    # the old 5-minute bound each (it takes about 4 in all).
     timeout-minutes: 12
     # actions: read for the copy's run and job lists. Nothing from the pull request is run either way.
     permissions:
@@ -49,6 +50,7 @@ jobs:
       # Keep it the first step and keep its name (COPY_STEP): a copy tells a real check from another copy by it.
       - name: Copy the newest real check (a title or body edit)
         if: ${{ env.ONLY_COPY == 'true' }}
+        timeout-minutes: 10
         env:
           DEFAULT_SHA: ${{ github.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -69,6 +71,7 @@ jobs:
       # the check to fetch every blob it reads one at a time.
       - name: Check out the default branch and fetch the pull request's commits (not checked out)
         if: ${{ env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         env:
           DEFAULT_SHA: ${{ github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -83,11 +86,13 @@ jobs:
 
       - name: Test the check
         if: ${{ env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         run: node --test .github/scripts/fork-schema-check.test.cjs .github/scripts/fork-upstream-files-check.test.cjs .github/scripts/fork-seam-check.test.cjs
 
       # T3 has no down-migrations, so a fork migration strands installs that return to upstream.
       - name: Refuse schema and migration changes
         if: ${{ env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -98,6 +103,7 @@ jobs:
       # even when the schema step refused, so a PR sees both reasons.
       - name: Refuse changes to upstream files the fork leaves alone
         if: ${{ !cancelled() && env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -107,6 +113,7 @@ jobs:
 
       - name: Fork lines in upstream files
         if: ${{ !cancelled() && env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         env:
           DEFAULT_SHA: ${{ github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

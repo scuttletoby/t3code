@@ -5481,6 +5481,15 @@ def checks_edited_problems(wf):
     if not (type(job.get("timeout-minutes")) is int and job["timeout-minutes"] * 60 >= _fcr.COPY_WAIT_SECONDS + 180):
         problems.append(f"{CHECKS_FILE}/{check_job}: timeout-minutes does not hold COPY_WAIT_SECONDS "
                         f"({_fcr.COPY_WAIT_SECONDS} s) and 3 minutes more")
+    # The copy step may wait COPY_WAIT_SECONDS (plus its fetch); each real step keeps the old 5-minute job bound.
+    if not (type(first.get("timeout-minutes")) is int and _fcr.COPY_WAIT_SECONDS + 60 <= first["timeout-minutes"] * 60
+            and first["timeout-minutes"] < (job.get("timeout-minutes") or 0)):
+        problems.append(f"{CHECKS_FILE}/{check_job}: the copy step's timeout-minutes does not hold its wait, or not "
+                        "inside the job's")
+    unbound = [st.get("name", "") for st in (job.get("steps") or [])[1:]
+               if not (type(st.get("timeout-minutes")) is int and 0 < st["timeout-minutes"] <= 5)]
+    if unbound:
+        problems.append(f"{CHECKS_FILE}/{check_job}: real steps without a timeout of at most 5 minutes: {unbound}")
     for label, ctx, want_check, only_copy, want_outside in CHECKS_RUNS:
         for j, want in ((check_job, want_check), ("outside_pr", want_outside)):
             try:
@@ -5539,6 +5548,9 @@ for label, mutate in {
     "the check job without actions: read": lambda wf: wf["jobs"]["no_schema_changes"]["permissions"].pop("actions"),
     "the check job timing out before the copy's wait": lambda wf: wf["jobs"]["no_schema_changes"].__setitem__(
         "timeout-minutes", 5),
+    "the copy step timing out before its wait": lambda wf: check_steps(wf)[0].__setitem__("timeout-minutes", 5),
+    "a real step without its 5-minute bound": lambda wf: check_steps(wf)[3].pop("timeout-minutes"),
+    "a real step given the copy's wait": lambda wf: check_steps(wf)[4].__setitem__("timeout-minutes", 10),
     "outside_pr skipped on an edit": lambda wf: wf["jobs"]["outside_pr"].__setitem__(
         "if", "${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository "
               "&& github.event.action != 'edited' }}"),
