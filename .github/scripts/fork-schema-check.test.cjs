@@ -166,7 +166,7 @@ test("refuses changes to the check itself and to .gitattributes once the base ha
   assert.equal(findSchemaChanges(changes, { closure: new Set(), baseHasCheck: false }).length, 2);
 });
 
-test("the closure follows relative and package subpath imports, not root barrels or test-only files", () => {
+test("the closure follows relative and package subpath imports, not root barrels, type-only imports or test-only files", () => {
   const closure = schemaClosure(
     treeOf({
       [`${MIGRATIONS}/001_A.ts`]: `import { t } from "../../orchestration-v2/messageSearchIndex.ts";`,
@@ -197,7 +197,7 @@ test("the closure follows relative and package subpath imports, not root barrels
   );
   assert.deepEqual([...closure].sort(), [
     "apps/server/src/orchestration-v2/messageSearchIndex.ts",
-    "apps/server/src/orchestration-v2/types.ts",
+    // `import type` is erased at compile time, so types.ts stays free.
     "apps/server/src/persistence/Migrations.ts",
     `${MIGRATIONS}/001_A.ts`,
     "apps/server/src/persistence/testkit/seed.ts",
@@ -206,6 +206,119 @@ test("the closure follows relative and package subpath imports, not root barrels
     "packages/shared/src/assistantCitations.ts",
     "packages/shared/src/threadLinks.ts",
   ]);
+});
+
+test("type-only imports and exports are not followed; value names and side-effect imports are", () => {
+  const closure = schemaClosure(
+    treeOf({
+      "apps/server/src/persistence/Migrations.ts": [
+        'import type { T1 } from "./typeImport.ts";',
+        'import type * as T2 from "./typeNamespace.ts";',
+        'export type { T3 } from "./typeExport.ts";',
+        'export type * from "./typeExportAll.ts";',
+        // All names `type`, no `import type`: verbatimModuleSyntax keeps `import {} from "x"`,
+        // so these run their file and are followed like side-effect imports.
+        'import { type T4, type T5 as Five } from "./typeNames.ts";',
+        'export { type T6 } from "./typeNamesExport.ts";',
+        'import {} from "./emptyClause.ts";',
+        // Mixed: `B` is a value, so the file is followed.
+        'import { type A, B } from "./mixed.ts";',
+        'import Default, { type C } from "./defaultAndType.ts";',
+        // `type` as a name, not a modifier: the default export and the value `type`, renamed.
+        'import type from "./defaultNamedType.ts";',
+        'import { type as kind } from "./valueNamedType.ts";',
+        // Side-effect imports run the file, so they are followed.
+        'import "./sideEffect.ts";',
+        'import type { D } from "./typeThenSideEffect.ts";',
+        'import "./typeThenSideEffect.ts";',
+        // Package root: only the value name `S` is traced, not the type-only `Hidden`.
+        'import { type Hidden, S } from "@t3tools/c";',
+        'import type { Other } from "@t3tools/c";',
+        // All names `type` from a package root: it runs the root, so the barrel is followed whole.
+        'import { type Late } from "@t3tools/d";',
+      ].join("\n"),
+      ...Object.fromEntries(
+        [
+          "typeImport",
+          "typeNamespace",
+          "typeExport",
+          "typeExportAll",
+          "typeNames",
+          "typeNamesExport",
+          "emptyClause",
+          "mixed",
+          "defaultAndType",
+          "defaultNamedType",
+          "valueNamedType",
+          "sideEffect",
+          "typeThenSideEffect",
+        ].map((name) => [`apps/server/src/persistence/${name}.ts`, ""]),
+      ),
+      "packages/c/package.json": JSON.stringify({ name: "@t3tools/c", exports: "./src/index.ts" }),
+      "packages/c/src/index.ts": [
+        'export * from "./s.ts";',
+        'export * from "./hidden.ts";',
+        'export * from "./other.ts";',
+      ].join("\n"),
+      "packages/c/src/s.ts": "export const S = 1;",
+      "packages/c/src/hidden.ts": "export type Hidden = 1;",
+      "packages/c/src/other.ts": "export type Other = 1;",
+      "packages/d/package.json": JSON.stringify({ name: "@t3tools/d", exports: "./src/index.ts" }),
+      "packages/d/src/index.ts": 'export * from "./late.ts";',
+      "packages/d/src/late.ts": "export type Late = 1;",
+    }),
+  );
+  assert.deepEqual([...closure].sort(), [
+    "apps/server/src/persistence/Migrations.ts",
+    "apps/server/src/persistence/defaultAndType.ts",
+    "apps/server/src/persistence/defaultNamedType.ts",
+    "apps/server/src/persistence/emptyClause.ts",
+    "apps/server/src/persistence/mixed.ts",
+    "apps/server/src/persistence/sideEffect.ts",
+    "apps/server/src/persistence/typeNames.ts",
+    "apps/server/src/persistence/typeNamesExport.ts",
+    "apps/server/src/persistence/typeThenSideEffect.ts",
+    "apps/server/src/persistence/valueNamedType.ts",
+    "packages/c/src/index.ts",
+    "packages/c/src/s.ts",
+    "packages/d/src/index.ts",
+    "packages/d/src/late.ts",
+  ]);
+});
+
+test("a type-only statement without semicolons does not hide the next import", () => {
+  const targets = ["afterExportType", "afterComment", "reexportAll", "reexportNames", "typeComma"];
+  const closure = schemaClosure(
+    treeOf({
+      "apps/server/src/persistence/Migrations.ts": [
+        "export type { A }",
+        'import { B } from "./afterExportType.ts"',
+        "export type { C }",
+        "// a comment between",
+        'import { D } from "./afterComment.ts"',
+        "export type { E }",
+        'export * from "./reexportAll.ts"',
+        "export type { F }",
+        'export { G } from "./reexportNames.ts"',
+        // A default import named `type`, then `H`: a value import.
+        'import type , { H } from "./typeComma.ts"',
+        "type A = 1",
+        "type C = 1",
+        "type E = 1",
+        "type F = 1",
+      ].join("\n"),
+      ...Object.fromEntries(
+        targets.map((name) => [`apps/server/src/persistence/${name}.ts`, "export const x = 1"]),
+      ),
+    }),
+  );
+  assert.deepEqual(
+    [...closure].sort(),
+    [
+      "apps/server/src/persistence/Migrations.ts",
+      ...targets.map((name) => `apps/server/src/persistence/${name}.ts`),
+    ].sort(),
+  );
 });
 
 test("the closure follows a package root only to the files that declare the imported names", () => {
