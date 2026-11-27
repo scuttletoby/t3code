@@ -372,6 +372,93 @@ class InstallDrift(Check):
         found = self.run_check('install-drift', self.opts())
         self.assertEqual(self.ids(found), ['install-drift.unreadable'])
 
+
+class MachineTools(Check):
+    """A made-up machine under a prefix: a kit with its record, a git checkout, hand-made files and units."""
+
+    HOME = '/home/example'
+
+    def setUp(self):
+        super().setUp()
+        self.prefix = os.path.join(self.tmp, 'host')
+        self.env = {'GARDENER_TEST_PREFIX': self.prefix, 'HOME': self.HOME}
+        os.makedirs(self.prefix + '/etc/kit-a')
+        with open(self.prefix + '/etc/kit-a/installed.tsv', 'w') as f:
+            f.write('# path\tkind\twant\n'
+                    '/usr/local/libexec/kit-a/current\tlink\t/usr/local/libexec/kit-a/versions/' + 'a' * 40 + '\n'
+                    '/usr/local/bin/kit-a\tlink\t/usr/local/libexec/kit-a/current/bin/kit-a\n')
+        self.file('/usr/local/libexec/kit-a/versions/' + 'a' * 40 + '/bin/kit-a')
+        self.link('/usr/local/libexec/kit-a/current', '/usr/local/libexec/kit-a/versions/' + 'a' * 40)
+        self.link('/usr/local/bin/kit-a', '/usr/local/libexec/kit-a/current/bin/kit-a')
+        self.checkout = self.HOME + '/src/tools'
+        self.file(self.checkout + '/bin/committed')
+        self.file(self.checkout + '/bin/scratch')
+        self.git(self.prefix + self.checkout, 'init', '-q')
+        self.git(self.prefix + self.checkout, 'add', 'bin/committed')
+        self.git(self.prefix + self.checkout, 'commit', '-q', '-m', 'tools')
+        self.file('/lib/systemd/system/ssh.service')
+
+    def file(self, path):
+        os.makedirs(os.path.dirname(self.prefix + path), exist_ok=True)
+        with open(self.prefix + path, 'w') as f:
+            f.write('#!/bin/sh\n')
+
+    def link(self, path, target):
+        """A link as the machine would have it, its target inside the prefix."""
+        os.makedirs(os.path.dirname(self.prefix + path), exist_ok=True)
+        os.symlink(target if not target.startswith('/') else self.prefix + target, self.prefix + path)
+
+    def found(self, **opts):
+        return sorted((f['id'], f['where']) for f in self.run_check('machine-tools', opts))
+
+    def test_a_tool_the_machine_needs_that_is_missing_names_its_source(self):
+        tools = [{'path': '/usr/local/libexec/editor-build', 'source': 'example-owner/app: tools/editor-build'},
+                 {'path': '~/.local/bin/helper', 'source': 'the helper kit'}]
+        found = self.run_check('machine-tools', {'tools': tools, 'scan': []})
+        self.assertEqual(sorted((f['id'], f['severity'], f['where']) for f in found),
+                         [('machine-tools.missing', 'error', '/home/example/.local/bin/helper'),
+                          ('machine-tools.missing', 'error', '/usr/local/libexec/editor-build')])
+        self.assertIn('example-owner/app: tools/editor-build', ' '.join(f['text'] + f['fix'] for f in found))
+        self.file('/usr/local/libexec/editor-build')
+        self.file(self.HOME + '/.local/bin/helper')
+        self.assertEqual(self.run_check('machine-tools', {'tools': tools, 'scan': []}), [])
+
+    def test_every_entry_needs_a_source(self):
+        self.link(self.HOME + '/.local/bin/from-repo', self.checkout + '/bin/committed')
+        self.link(self.HOME + '/.local/bin/not-committed', self.checkout + '/bin/scratch')
+        self.link(self.HOME + '/.local/bin/gone', self.HOME + '/src/old/tool')
+        self.file(self.HOME + '/.local/bin/declared')
+        self.file(self.HOME + '/.local/bin/by-hand')
+        self.file('/usr/local/bin/by-hand-too')
+        self.link('/etc/systemd/system/sshd.service', '/lib/systemd/system/ssh.service')
+        self.link('/etc/systemd/system/multi-user.target.wants/hand.service', '/etc/systemd/system/hand.service')
+        os.makedirs(self.prefix + '/etc/systemd/system/hand.service.d')
+        self.file('/etc/systemd/system/hand.service')
+        self.file('/etc/systemd/system/snap-core-1.mount')
+        self.file(self.HOME + '/.config/systemd/user/watch.service')
+        self.link(self.HOME + '/.config/systemd/user/watch-alias.service', 'watch.service')
+        self.assertEqual(self.found(tools=[{'path': '~/.local/bin/declared', 'source': 'example-owner/app: bin'}]), [
+            ('machine-tools.broken-link', '/home/example/.local/bin/gone'),
+            ('machine-tools.no-source', '/etc/systemd/system/hand.service'),
+            ('machine-tools.no-source', '/home/example/.config/systemd/user/watch.service'),
+            ('machine-tools.no-source', '/home/example/.local/bin/by-hand'),
+            ('machine-tools.no-source', '/usr/local/bin/by-hand-too'),
+            ('machine-tools.untracked', '/home/example/.local/bin/not-committed')])
+
+    def test_scan_and_ignore_options(self):
+        self.file('/usr/local/bin/by-hand')
+        self.file('/usr/local/bin/vendor-tool')
+        self.assertEqual(self.found(scan=[]), [])
+        self.assertEqual(self.found(scan=['/usr/local/bin'], ignore=['vendor-*']),
+                         [('machine-tools.no-source', '/usr/local/bin/by-hand')])
+        self.assertEqual(self.found(scan=['/no/such/folder']), [])
+
+    def test_bad_options_fail_the_check(self):
+        for opts in ({'tools': [{'path': '/x'}]}, {'tools': [{'path': '/x', 'source': 's', 'extra': 1}]},
+                     {'tools': 'x'}, {'scan': '/usr/local/bin'}, {'ignore': [1]}):
+            with self.subTest(opts=opts):
+                self.run_check('machine-tools', opts, code=1)
+
 SHA = 'a' * 40
 QUEUE = {'required_checks': ['ci', 'head_check'], 'merge_method': 'squash', 'bot_logins': ['helper-bot'],
          'lens_author_associations': ['OWNER', 'MEMBER'],
@@ -951,6 +1038,20 @@ MUTATIONS = {
         'checks/context-budget', '        except OSError:                              # a broken link',
         '        except ValueError:                              # a broken link',
         'ContextBudget.test_a_skill_file_that_is_a_broken_link_is_missing'),
+    'machine-tools: a missing tool is an error': (
+        'checks/machine-tools', "    if not os.path.exists(prefix + path):\n        emit('machine-tools.missing'",
+        "    if False:\n        emit('machine-tools.missing'",
+        'MachineTools.test_a_tool_the_machine_needs_that_is_missing_names_its_source'),
+    'machine-tools: a kit record is a source': (
+        'checks/machine-tools', "        if from_a_kit(path, target):\n", "        if False:\n",
+        'MachineTools.test_every_entry_needs_a_source'),
+    'machine-tools: only a committed file is a source': (
+        'checks/machine-tools', "    return 'untracked' if r.returncode == 1 else 'tracked'", "    return 'tracked'",
+        'MachineTools.test_every_entry_needs_a_source'),
+    'machine-tools: a plain file is no source': (
+        'checks/machine-tools', "        emit('machine-tools.no-source', 'warn',",
+        "        continue\n        emit('machine-tools.no-source', 'warn',",
+        'MachineTools.test_every_entry_needs_a_source'),
     'install-drift: no prefix option': (
         'checks/install-drift', "prefix = os.environ.get('GARDENER_TEST_PREFIX', '')",
         "prefix = opt.get('prefix') or os.environ.get('GARDENER_TEST_PREFIX', '')",

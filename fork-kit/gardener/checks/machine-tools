@@ -1,0 +1,142 @@
+#!/usr/bin/python3 -IB
+"""machine-tools: the tools a machine needs, and the ones it runs that have no source. Report only.
+
+A tool listed in "tools" that is not there is an error naming where it comes from, so a machine set up again (or
+moved) is told what it still lacks. Every entry of the "scan" folders (programs, and systemd units) needs a source:
+a fork kit's install record (/etc/<kit>/installed.tsv, as install-drift reads them), a link to a file committed in
+a git checkout, a link into the system's own folders (/usr, /lib, but not /usr/local), or a "tools" entry. Anything
+else was put there by hand and has no review, tests or history: one warning per entry, so it can be moved into a
+kit or a project's repository, declared, or removed.
+
+Options:
+  tools    [{"path": "/usr/local/bin/x" or "~/...", "source": "where it comes from (a kit, OWNER/REPO: path, ...)"}]
+  scan     folders to look through (default below; [] looks at none); "~/" is the home folder of the gardener's user
+  ignore   [glob] entry names that need no source (default: snapd's generated units and __pycache__)
+  etc      "/etc": the folder of the kits' etc folders
+"""
+import fnmatch, glob, os, subprocess, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from gardener.contract import emit, read_context  # noqa: E402
+
+SCAN = ['~/.local/bin', '~/.config/systemd/user', '/usr/local/bin', '/usr/local/sbin', '/usr/local/libexec',
+        '/etc/systemd/system']
+IGNORE = ['snap-*', 'snap.*', '__pycache__']
+UNIT_DIRS = ('.wants', '.requires', '.upholds', '.d')     # a unit folder's links and drop-ins, not units
+SYSTEM = ('/usr/', '/lib/', '/lib64/', '/bin/', '/sbin/')     # the distribution's own (packages)
+
+ctx = read_context()
+opt = ctx['options']
+prefix = os.environ.get('GARDENER_TEST_PREFIX', '')   # tests only: every path is read under this folder
+etc = opt.get('etc') or '/etc'
+tools = opt.get('tools') or []
+scan = SCAN if opt.get('scan') is None else opt['scan']
+ignore = IGNORE if opt.get('ignore') is None else opt['ignore']
+if not isinstance(tools, list) or not all(isinstance(t, dict) and isinstance(t.get('path'), str) and t['path']
+                                          and isinstance(t.get('source'), str) and t['source'].strip()
+                                          and set(t) <= {'path', 'source'} for t in tools):
+    raise SystemExit('machine-tools: "tools" must be a list of {"path": ..., "source": ...}')
+for key, value in (('scan', scan), ('ignore', ignore)):
+    if not isinstance(value, list) or not all(isinstance(x, str) and x for x in value):
+        raise SystemExit(f'machine-tools: "{key}" must be a list of strings')
+
+
+def logical(path):
+    """An option's path as the machine names it: ~/ expanded, absolute, normalised."""
+    return os.path.normpath(os.path.expanduser(path))
+
+
+def real(path):
+    """The machine path `path` (logical) resolves to, links followed, still without the test prefix."""
+    r = os.path.realpath(prefix + path)
+    return r[len(prefix):] if prefix and (r == prefix or r.startswith(prefix + '/')) else r
+
+
+def inside(path, folder):
+    return path == folder or path.startswith(folder.rstrip('/') + '/')
+
+
+# what the kits installed: each recorded path, and the folder a recorded link points to (a kit's versions/<sha>)
+recorded = set()
+for record in glob.glob(os.path.join(prefix + etc, '*', 'installed.tsv')):
+    try:
+        with open(record, encoding='utf-8') as f:
+            for row in (ln.rstrip('\n').split('\t') for ln in f if ln.strip() and not ln.startswith('#')):
+                if len(row) >= 3 and row[0].startswith('/'):
+                    recorded.add(os.path.normpath(row[0]))
+                    if row[1] == 'link' and row[2].startswith('/'):
+                        recorded.add(os.path.normpath(row[2]))
+    except OSError:
+        pass        # install-drift reports a record it cannot read
+declared = {logical(t['path']) for t in tools}
+
+for t in tools:
+    path = logical(t['path'])
+    if not os.path.exists(prefix + path):
+        emit('machine-tools.missing', 'error', f'{path} is missing (it comes from: {t["source"].strip()})', path,
+             f'install it from {t["source"].strip()}, or drop it from this check\'s "tools" if the machine no longer '
+             'needs it')
+
+
+def from_a_kit(path, target):
+    return any(inside(r, path) or inside(path, r) or inside(target, r) for r in recorded)
+
+
+def in_git(target):
+    """'tracked', 'untracked' or None (not in a git checkout). A checkout git will not read (another user's) counts
+    as tracked: this check cannot tell, and says nothing rather than guess."""
+    folder = os.path.dirname(target)
+    while True:
+        if os.path.exists(os.path.join(prefix + folder, '.git')):
+            break
+        if folder in ('/', ''):
+            return None
+        folder = os.path.dirname(folder)
+    try:
+        r = subprocess.run(['git', '-C', prefix + folder, 'ls-files', '--error-unmatch', '--',
+                            os.path.relpath(target, folder)], capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL, env=dict(os.environ, GIT_CONFIG_NOSYSTEM='1'))
+    except (OSError, subprocess.SubprocessError):
+        return 'tracked'
+    return 'untracked' if r.returncode == 1 else 'tracked'
+
+
+for folder in dict.fromkeys(logical(x) for x in scan):
+    try:
+        names = sorted(os.listdir(prefix + folder))
+    except FileNotFoundError:
+        continue
+    except OSError as e:
+        emit('machine-tools.unreadable', 'info', f'{folder} cannot be read as this user ({e.strerror}): not checked',
+             folder)
+        continue
+    units = '/systemd/' in folder + '/'
+    for name in names:
+        path = os.path.join(folder, name)
+        if any(fnmatch.fnmatchcase(name, g) for g in ignore) or path in declared:
+            continue
+        is_link = os.path.islink(prefix + path)
+        if units and os.path.isdir(prefix + path) and (name.endswith(UNIT_DIRS) or not is_link):
+            continue                # a unit folder's .wants/.d folders
+        target = real(path) if is_link else path
+        if from_a_kit(path, target):
+            continue
+        if is_link and target.startswith(SYSTEM) and not target.startswith('/usr/local/'):
+            continue                # the distribution's own unit or program, linked
+        if is_link and inside(os.path.dirname(target), folder) and units:
+            continue                # an alias of another unit in the same folder: that one is checked
+        if not os.path.exists(prefix + target):
+            emit('machine-tools.broken-link', 'warn', f'{path} is a link to {target}, which is not there', path,
+                 'remove the link, or install what it points to')
+            continue
+        git = in_git(target)
+        if git == 'tracked':
+            continue
+        if git == 'untracked':
+            emit('machine-tools.untracked', 'warn', (f'{path} links to {target}, which' if is_link else path) +
+                 ' is in a git checkout but not committed: it has no history or review', path,
+                 'commit it in its repository, or move it into a kit')
+            continue
+        kind = 'folder' if os.path.isdir(prefix + path) else 'link' if is_link else 'file'
+        emit('machine-tools.no-source', 'warn', f'{path} ({kind}) has no source: no kit installed it and it is not '
+             'from a git checkout', path, 'move it into a fork kit (general) or the project\'s repository '
+             '(project-only) and install it from there; or list it in "tools" with its source; or remove it')
