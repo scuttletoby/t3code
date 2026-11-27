@@ -756,6 +756,8 @@ describe("a child's own options, remote delegate_task", () => {
                 Layer.mock(PeerLinks.PeerLinks)({ get: () => Effect.succeedNone }),
                 Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
                 Layer.mock(ProjectService.ProjectService)({}),
+                // Upstream's launch reads the providers to check an agent's mode pick.
+                Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
                 Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({}),
                 Layer.mock(ServerEnvironment.ServerEnvironment)({
                   getEnvironmentId: Effect.succeed(here),

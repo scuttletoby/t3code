@@ -139,6 +139,7 @@ import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegi
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderUsageLimitsIngestion from "./provider/ProviderUsageLimitsIngestion.ts";
 import * as ForkLayers from "./fork/forkLayers.ts";
+import { flow } from "effect/Function"; // Fork: see the runtime layer chain
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
@@ -790,12 +791,18 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ReplayMarkers.layer,
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
 ).pipe(
-  Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction), // Fork: one owner (fork/handoff)
-  Layer.provideMerge(layerOrchestrationApplication),
+  // Fork: one owner (fork/handoff). Effect's pipe takes at most 20 steps, upstream's 20 here.
+  flow(
+    Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction),
+    Layer.provideMerge(layerOrchestrationApplication),
+  ),
   // One hub, which the feeders above and the workflow store inside the runtime publish to.
   Layer.provideMerge(MilestoneHub.layer),
-  Layer.provideMerge(ForkLayers.mcpProfileTurnCheck), // Fork: MCP profiles (needs the task folders below)
-  Layer.provideMerge(Layer.merge(layerTaskFolders, LayoutCommandApprovalWrites.layer)),
+  Layer.provideMerge(
+    ForkLayers.mcpProfileTurnCheck.pipe(
+      Layer.provideMerge(Layer.merge(layerTaskFolders, LayoutCommandApprovalWrites.layer)),
+    ),
+  ), // Fork: MCP profiles
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
   // Settlement registers queued settle scripts in PendingSettleScripts; storage cleanup reads them.
   Layer.provideMerge(

@@ -1,7 +1,6 @@
 // Fork: what a chat file link does beyond upstream's (#17): a long press opens its menu on touch
 // devices, a file on another machine opens in the viewing device's editor over SSH, and a link
 // naming an environment downloads from it.
-/* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own messages are English only; upstream's translation catalogs hold no fork keys. */
 import { useAtomValue } from "@effect/atom-react";
 import {
   AuthFilesystemReadScope,

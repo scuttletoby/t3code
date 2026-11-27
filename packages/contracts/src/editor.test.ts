@@ -52,16 +52,17 @@ describe("buildRemoteOpenUrl keeps the host when the path climbs", () => {
     ).toBe(expected);
   });
 
+  // No isFile: a folder link, which upstream opens in a new window (?windowId=_blank).
   it("keeps a climb that stays below the root on the same host", () => {
     expect(
       buildRemoteOpenUrl({ editor: "vscode", host: "sol", absolutePath: "/home/u/../v/a.ts" }),
-    ).toBe("vscode://vscode-remote/ssh-remote+sol/home/v/a.ts");
+    ).toBe("vscode://vscode-remote/ssh-remote+sol/home/v/a.ts?windowId=_blank");
   });
 
   it("keeps a Windows drive as the root a climb cannot leave", () => {
     expect(
       buildRemoteOpenUrl({ editor: "vscode", host: "sol", absolutePath: String.raw`C:\..\x.ts` }),
-    ).toBe("vscode://vscode-remote/ssh-remote+sol/C%3A/x.ts");
+    ).toBe("vscode://vscode-remote/ssh-remote+sol/C%3A/x.ts?windowId=_blank");
     expect(
       buildRemoteOpenUrl({ editor: "zed", host: "sol", absolutePath: String.raw`C:\a\..\..\x.ts` }),
     ).toBe("zed://ssh/sol/x.ts");

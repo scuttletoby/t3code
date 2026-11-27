@@ -49,6 +49,7 @@ import * as PeerLinks from "../peer/PeerLinks.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -289,6 +290,8 @@ const makeParentServer = (database: Context.Context<SqlClient.SqlClient>, there:
         Layer.mergeAll(
           there.forwarding,
           Layer.mock(PeerLinks.PeerLinks)({ get: () => Effect.succeedNone }),
+          // Upstream's launch reads the providers to check an agent's mode pick.
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
           Layer.mock(ProjectService.ProjectService)({
             getById: () => Effect.succeedSome({ workspaceRoot: "/srv/app" } as never),
           }),

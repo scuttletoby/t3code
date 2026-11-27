@@ -1398,7 +1398,16 @@ it.effect("keeps a preparation held when the server stops, and the next server p
   // One thread-launch service per server process, both on the same database.
   const launchLayer = Layer.fresh(
     ThreadLaunch.layer.pipe(
-      Layer.provide(Layer.mergeAll(CommandReceiptStore.layer, IdAllocator.layer)),
+      // As upstream's own launch layer above: the projection store (on the harness's database)
+      // and the platform's file system.
+      Layer.provide(
+        Layer.mergeAll(
+          CommandReceiptStore.layer,
+          IdAllocator.layer,
+          ProjectionStore.layer,
+          NodeServices.layer,
+        ),
+      ),
     ),
   );
   return Effect.gen(function* () {

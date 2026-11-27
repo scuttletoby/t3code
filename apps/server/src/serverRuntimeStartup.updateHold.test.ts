@@ -12,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 
+import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as ServerConfig from "./config.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -63,6 +64,7 @@ it.effect.each([
       const dependencies = Layer.mergeAll(
         NodeCrypto.layer,
         Path.layer,
+        Layer.mock(BackgroundPolicy.BackgroundPolicy)({}), // upstream's startup reads it since v0.1.14
         Layer.mock(ServerConfig.ServerConfig)({
           ...(yield* ServerConfig.deriveServerPaths("/update-hold-project", undefined).pipe(
             Effect.provide(Path.layer),

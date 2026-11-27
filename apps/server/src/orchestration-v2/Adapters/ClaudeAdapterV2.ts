@@ -14329,7 +14329,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ? openQueryRuntime
               : adapterOptions.installationGate.execute(adapterOptions.instanceId, openQueryRuntime)
           ).pipe(
-            Effect.tap(checkMcpProfile),
+            Effect.tap(({ querySession }) => checkMcpProfile(querySession)),
             Effect.onError(() =>
               closedExistingNativeThreadId === nativeThreadId
                 ? Effect.gen(function* () {
