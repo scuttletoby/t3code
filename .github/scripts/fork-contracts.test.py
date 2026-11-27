@@ -21,9 +21,10 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                Environment, the App key is named only by the guard's presence test and the one token
                step, and that token reaches only the start step right after it and the finish step
                (the last). No other fork workflow names the key.
-  secret-scan  fork-secret-scan.yml runs on every pull request and every push (no branch, tag or
-               path filter) on its own, with no concurrency group (workflow or job), so a newer push
-               never cancels the scan of an older head; fork-tests.yml's `secrets` job calls it (the
+  secret-scan  fork-secret-scan.yml runs on every push (no branch, tag or path filter) on its own,
+               with no concurrency group (workflow or job), so a newer push never cancels the scan of
+               an older head (a pull request's head is a pushed branch: its push run stands in for a
+               pull_request run of its own, #1090); fork-tests.yml's `secrets` job calls it (the
                check a ruleset requires), and no other fork workflow runs the scan script. Its scan
                step runs the script read from the default branch's tip (CONFIG_BRANCH), never the
                checkout's copy. In the job that scans, no step runs the checkout's code (only the
@@ -79,6 +80,13 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                continue-on-error, a checkout with its own timeout, and a job timeout that holds the worst
                case: the checkout's timeout, the wait cap (or the script's git calls, if longer) and one
                last poll, from the script's own limits, with a minute to spare for the job's set-up.
+  tests-concurrency  fork-tests.yml: a newer run of a pull request cancels the older one; a push to
+               main, a dispatch (merge train, release mode) and a call each have a group of their own (the
+               run id), so they never cancel, wait for or are cancelled by another run (#1090).
+  checks-edited  fork-checks.yml checks in full on opened, synchronize, reopened and a base change; on a
+               title or body edit its check job runs only its first step, which copies the newest real
+               check of the head (fork-checks-ran.py --copy), so a red check from a base change stays red
+               (a skipped job would read as passed, #1134); outside_pr runs on every event (#1090).
   windows      fork-windows-tests.yml (a nightly report, never in the merge path) runs on schedule and by
                hand only, reads only, cancels an older run, hides no red result, keeps the recorded steps of
                upstream's windows-tests.yml and its 45-minute limit on hosted Windows, and runs the Windows
@@ -1776,8 +1784,6 @@ def secret_scan_problems(wfs):
     scan = wfs.get(SCAN_FILE)
     if scan is None:
         return [f"{SCAN_FILE} is missing"]
-    if "pull_request" not in triggers(scan):
-        problems.append(f"{SCAN_FILE}: no pull_request trigger (a run of its own that nothing cancels)")
     on = scan.get(True, scan.get("on"))
     if "push" not in triggers(scan):
         problems.append(f"{SCAN_FILE}: no push trigger (a branch is public from its first push)")
@@ -1814,7 +1820,7 @@ def secret_scan_problems(wfs):
     return problems
 
 
-check("secret-scan: fork-secret-scan.yml runs on pull requests and pushes, uncancelled, with the default "
+check("secret-scan: fork-secret-scan.yml runs on every push, uncancelled, with the default "
       "branch's script in a job that runs no checkout code; fork-tests.yml calls it with its tests, which "
       "cannot fail quietly; fork-secret-sweep.yml calls it daily and alerts by issue",
       not secret_scan_problems(real), "; ".join(secret_scan_problems(real)))
@@ -1878,7 +1884,6 @@ for label, mutate in {
     "a job concurrency group": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__("concurrency", GROUP),
     "a concurrency group that does not cancel": lambda w: w[SCAN_FILE].__setitem__(
         "concurrency", {"group": "scan", "cancel-in-progress": False}),
-    "no pull_request trigger": lambda w: w[SCAN_FILE][True].pop("pull_request"),
     "no push trigger": lambda w: w[SCAN_FILE][True].pop("push"),
     "a push trigger for main only": lambda w: w[SCAN_FILE][True].__setitem__("push", {"branches": ["main"]}),
     "a push trigger without tags": lambda w: w[SCAN_FILE][True].__setitem__("push", {"branches": ["**"]}),
@@ -3447,7 +3452,9 @@ check("secret-scan e2e: run again over an earlier or stopped run's files: only t
 check("secret-scan: the expression evaluator reads GitHub's rules (&& and || give an operand, == ignores case)",
       gh_eval("'a' && 'B' == 'b'", {}) and not gh_eval("'' || null", {}) and gh_eval("!x.y", {})
       and gh_eval("format('refs/heads/{0}', a.b) == 'REFS/heads/main'", {"a": {"b": "main"}})
-      and not gh_eval("(true || false) && !true", {}))
+      and not gh_eval("(true || false) && !true", {})
+      and gh_eval("a && format('pr-{0}', b) || 'c'", {"a": True, "b": 7}, raw=True) == "pr-7"
+      and gh_eval("x.y || 'c'", {}, raw=True) == "c")
 
 # The scan job's token drop (#317 item 4): actions/checkout keeps the job's token in the repository's
 # git config (persist-credentials stays on: the checkout rule above), and every origin fetch of the
@@ -5297,6 +5304,271 @@ for label, mutate in {
     check(f"windows: {label} fails", caught)
 caught = bool(windows_problems(*windows_inputs[:3], windows_inputs[3] + "\n# windows-tests.yml\n", windows_inputs[4]))
 check("windows: fork-tests.yml naming windows-tests.yml fails", caught)
+
+# --- tests-concurrency (#1090) -----------------------------------------------------------------
+# fork-tests.yml: a newer run of a pull request cancels its older one; every other run has a group of its own.
+
+
+def rendered(text, ctx):
+    """A workflow string with ${{ }} parts, as GitHub renders it (null as '')."""
+    def part(m):
+        v = gh_eval(m.group(1), ctx, raw=True)
+        return "" if v is None else str(v).lower() if isinstance(v, bool) else str(v)
+    return re.sub(r"\$\{\{(.*?)\}\}", part, str(text), flags=re.S)
+
+
+def tests_run(event, run_id, pr=None, ref=None):
+    payload = {"pull_request": {"number": pr}} if pr else {}
+    return {"github": {"event_name": event, "run_id": run_id, "sha": "a" * 40, "ref": "refs/heads/main",
+                       "event": payload}, "inputs": {"ref": ref} if ref is not None else {}}
+
+
+# (label, context, cancels an older run of its group). Two runs of each kind, the same commit or ref, so a
+# group by commit, ref or event name shows.
+TESTS_RUNS = [
+    ("pull request #7, first push", tests_run("pull_request", 100, pr=7), True),
+    ("pull request #7, next push", tests_run("pull_request", 101, pr=7), True),
+    ("pull request #8", tests_run("pull_request", 102, pr=8), True),
+    ("a push to main", tests_run("push", 200), False),
+    ("a second push run of that commit", tests_run("push", 201), False),
+    ("a dispatch with ref=main (merge train, release mode)", tests_run("workflow_dispatch", 300, ref="main"), False),
+    ("a second dispatch with ref=main", tests_run("workflow_dispatch", 301, ref="main"), False),
+    ("a release's call (caller on workflow_dispatch)", tests_run("workflow_dispatch", 400, ref="b" * 40), False),
+    ("a call from a caller on pull request #7", tests_run("pull_request", 500, pr=7, ref="b" * 40), False),
+]
+
+
+def tests_concurrency_problems(wf):
+    conc = wf.get("concurrency")
+    if not isinstance(conc, dict) or "group" not in conc:
+        return ["fork-tests.yml: no concurrency group (a superseded pull request run keeps all its jobs)"]
+    problems, groups = [], {}
+    for label, ctx, cancels in TESTS_RUNS:
+        try:
+            groups[label] = rendered(conc["group"], ctx)
+            c = conc.get("cancel-in-progress", False)
+            got = c if isinstance(c, bool) else gh_eval(expression(c), ctx)
+        except ValueError as e:
+            return [f"fork-tests.yml: concurrency cannot be evaluated ({e})"]
+        if got != cancels:
+            problems.append(f"fork-tests.yml: {label} {'cancels' if got else 'does not cancel'} an older run of its group")
+    pr = [label for label, _, cancels in TESTS_RUNS if cancels]
+    if groups[pr[0]] != groups[pr[1]]:
+        problems.append("fork-tests.yml: two pushes of one pull request are in different groups (nothing cancels)")
+    if groups[pr[0]] == groups[pr[2]]:
+        problems.append("fork-tests.yml: two pull requests share a group (one cancels the other)")
+    for label, _, cancels in TESTS_RUNS:
+        if not cancels and any(groups[label] == g for other, g in groups.items() if other != label):
+            problems.append(f"fork-tests.yml: {label} shares a group with another run (it would wait, or a newer run "
+                            "would cancel it while it waits)")
+    return problems
+
+
+problems = tests_concurrency_problems(real.get("fork-tests.yml", {}))
+check("tests-concurrency: fork-tests.yml cancels a pull request's older run; push, dispatch and call runs each have "
+      "a group of their own and never cancel", not problems, "; ".join(problems))
+for label, conc in {
+    "no concurrency": None,
+    "main's group before #1090 (by event name and commit or ref)": {
+        "group": "fork-tests-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.ref || github.sha }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"},
+    "a group by pull request or run id that ignores inputs.ref": {
+        "group": "fork-tests-${{ github.event.pull_request.number || github.run_id }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"},
+    "one group for every run": {"group": "fork-tests", "cancel-in-progress": False},
+    "cancel-in-progress always": {
+        "group": "fork-tests-${{ github.event_name == 'pull_request' && !inputs.ref && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}",
+        "cancel-in-progress": True},
+    "cancel-in-progress never": {
+        "group": "fork-tests-${{ github.event_name == 'pull_request' && !inputs.ref && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}",
+        "cancel-in-progress": False},
+}.items():
+    wf = copy.deepcopy(real.get("fork-tests.yml", {}))
+    if conc is None:
+        wf.pop("concurrency", None)
+    else:
+        wf["concurrency"] = conc
+    check(f"tests-concurrency: {label} fails", bool(tests_concurrency_problems(wf)))
+
+# --- checks-edited (#1090, #1134) ----------------------------------------------------------------
+# fork-checks.yml: on a title or body edit (base unchanged) the check job still runs, but only its first step, which
+# copies the newest real check of the head (fork-checks-ran.py --copy): a skipped job would count as passed next to a
+# red check from a base change (#1134). A base change, and every other event, checks in full. An outside pull
+# request's failing job runs on every event, edits too.
+CHECKS_FILE = "fork-checks.yml"
+CHECK_NAME = "No database schema changes"
+COPY_RUN = "python3 -I .github/scripts/fork-checks-ran.py --copy"
+COPY_ENV = {"DEFAULT_SHA": "${{ github.sha }}", "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+            "PR_NUMBER": "${{ github.event.pull_request.number }}", "GITHUB_TOKEN": "${{ github.token }}"}
+
+
+def checks_run(action, outside=False, changes=None):
+    pr = {"head": {"repo": {"full_name": "other/repo" if outside else "owner/repo"}}}
+    event = {"action": action, "pull_request": pr, **({"changes": changes} if changes is not None else {})}
+    return {"github": {"event_name": "pull_request_target", "repository": "owner/repo", "event": event}}
+
+
+BASE_CHANGE = {"base": {"ref": {"from": "side"}, "sha": {"from": "c" * 40}}}
+# (label, context, runs the check job, only its copy step, runs outside_pr)
+CHECKS_RUNS = [(f"{a}", checks_run(a), True, False, False) for a in ("opened", "synchronize", "reopened")] + [
+    ("a base change (edited)", checks_run("edited", changes=BASE_CHANGE), True, False, False),
+    ("a base and title change (edited)", checks_run("edited", changes={**BASE_CHANGE, "title": {"from": "x"}}), True,
+     False, False),
+    ("a title edit", checks_run("edited", changes={"title": {"from": "x"}}), True, True, False),
+    ("a body edit", checks_run("edited", changes={"body": {"from": "x"}}), True, True, False),
+    ("an edit with no changes listed", checks_run("edited"), True, True, False),
+] + [(f"an outside pull request, {a}", checks_run(a, outside=True), False, False, True)
+     for a in ("opened", "synchronize", "reopened", "edited")]
+
+
+def check_job_of(wf):
+    jobs = wf.get("jobs") or {}
+    return next((j for j, job in jobs.items() if job.get("name") == CHECK_NAME), None)
+
+
+def steps_that_run(job, ctx):
+    """The names of the job's steps that run on ctx (job env rendered as GitHub does, every step before passed)."""
+    env = {k: rendered(v, ctx) for k, v in (job.get("env") or {}).items()}
+    sctx = {**ctx, "env": env, "status": "success"}
+    return [st.get("name", "") for st in job.get("steps") or [] if gh_eval(expression(st.get("if", "success()")), sctx)]
+
+
+def required_check_after(wf, events):
+    """What GitHub's required check CHECK_NAME reads on the head after these runs, in order: [(ctx, what a real check
+    would end)]. A skipped job counts as passed; a copy ends as the newest earlier real check (none: failure)."""
+    job_id = check_job_of(wf)
+    job = (wf.get("jobs") or {}).get(job_id) or {}
+    ended = []   # (real?, conclusion), oldest first
+    for ctx, real in events:
+        if not gh_eval(expression(job.get("if", "true")), ctx):
+            ended.append((False, "skipped"))
+            continue
+        ran = steps_that_run(job, ctx)
+        if ran and ran[0] == _fcr.COPY_STEP:
+            earlier = [c for r, c in ended if r]
+            ended.append((False, earlier[-1] if earlier else "failure"))
+        else:
+            ended.append((True, real))
+    return ended[-1][1] if ended else None
+
+
+# A stacked pull request moved onto main: its check passed against the side branch, fails against main, then a fix
+# round edits the body. The required check must stay red (#1134: a skipped edit run read as passed).
+RETARGET_THEN_EDIT = [(checks_run("synchronize"), "success"), (checks_run("edited", changes=BASE_CHANGE), "failure"),
+                      (checks_run("edited", changes={"body": {"from": "x"}}), None)]
+
+
+def checks_edited_problems(wf):
+    problems = []
+    on = wf.get(True, wf.get("on")) or {}
+    types = set(((on.get("pull_request_target") or {}) if isinstance(on, dict) else {}).get("types") or [])
+    if not {"opened", "synchronize", "reopened", "edited"} <= types:
+        problems.append(f"{CHECKS_FILE}: pull_request_target types {sorted(types)} lack one of opened, synchronize, "
+                        "reopened, edited (a base change fires only edited)")
+    jobs = wf.get("jobs") or {}
+    check_job = check_job_of(wf)
+    if check_job is None or "outside_pr" not in jobs:
+        return problems + [f"{CHECKS_FILE}: no job named {CHECK_NAME}, or no outside_pr"]
+    job = jobs[check_job]
+    first = (job.get("steps") or [{}])[0]
+    if first.get("name") != _fcr.COPY_STEP or first.get("run", "").strip().splitlines()[-1:] != [COPY_RUN] \
+            or first.get("env") != COPY_ENV or "continue-on-error" in first or "continue-on-error" in job:
+        problems.append(f"{CHECKS_FILE}/{check_job}: the first step is not the copy ({_fcr.COPY_STEP!r}, ending in "
+                        f"{COPY_RUN}, env {sorted(COPY_ENV)}, never continue-on-error)")
+    if (job.get("permissions") or {}) != {"actions": "read", "contents": "read"}:
+        problems.append(f"{CHECKS_FILE}/{check_job}: permissions are not actions: read, contents: read")
+    # The copy's worst case: its wait, one last poll (a minute), the fetch and the job's set-up (a minute each).
+    if not (type(job.get("timeout-minutes")) is int and job["timeout-minutes"] * 60 >= _fcr.COPY_WAIT_SECONDS + 180):
+        problems.append(f"{CHECKS_FILE}/{check_job}: timeout-minutes does not hold COPY_WAIT_SECONDS "
+                        f"({_fcr.COPY_WAIT_SECONDS} s) and 3 minutes more")
+    # The copy step may wait COPY_WAIT_SECONDS (plus its fetch); each real step keeps the old 5-minute job bound.
+    if not (type(first.get("timeout-minutes")) is int and _fcr.COPY_WAIT_SECONDS + 60 <= first["timeout-minutes"] * 60
+            and first["timeout-minutes"] < (job.get("timeout-minutes") or 0)):
+        problems.append(f"{CHECKS_FILE}/{check_job}: the copy step's timeout-minutes does not hold its wait, or not "
+                        "inside the job's")
+    unbound = [st.get("name", "") for st in (job.get("steps") or [])[1:]
+               if not (type(st.get("timeout-minutes")) is int and 0 < st["timeout-minutes"] <= 5)]
+    if unbound:
+        problems.append(f"{CHECKS_FILE}/{check_job}: real steps without a timeout of at most 5 minutes: {unbound}")
+    for label, ctx, want_check, only_copy, want_outside in CHECKS_RUNS:
+        for j, want in ((check_job, want_check), ("outside_pr", want_outside)):
+            try:
+                got = gh_eval(expression(jobs[j].get("if", "true")), ctx)
+            except ValueError as e:
+                problems.append(f"{CHECKS_FILE}/{j}: if: cannot be evaluated ({e})")
+                continue
+            if got != want:
+                problems.append(f"{CHECKS_FILE}/{j}: {'runs' if got else 'does not run'} on {label}")
+        if not want_check:
+            continue
+        try:
+            ran = steps_that_run(job, ctx)
+        except ValueError as e:
+            problems.append(f"{CHECKS_FILE}/{check_job}: a step's if: cannot be evaluated ({e})")
+            continue
+        others = [st.get("name", "") for st in job.get("steps") or [] if st.get("name") != _fcr.COPY_STEP]
+        if only_copy and ran != [_fcr.COPY_STEP]:
+            problems.append(f"{CHECKS_FILE}/{check_job}: on {label} runs {ran}, not only the copy")
+        if not only_copy and ran != others:
+            problems.append(f"{CHECKS_FILE}/{check_job}: on {label} runs {ran}, not the whole check")
+    try:
+        after = required_check_after(wf, RETARGET_THEN_EDIT)
+    except ValueError as e:
+        after = f"cannot be evaluated ({e})"
+    if after != "failure":
+        problems.append(f"{CHECKS_FILE}: a base change goes red, then a body edit leaves {CHECK_NAME} {after} "
+                        "(#1134)")
+    return problems
+
+
+problems = checks_edited_problems(real.get(CHECKS_FILE, {}))
+check("checks-edited: fork-checks.yml checks in full on opened, synchronize, reopened and a base change, only copies "
+      "the newest real check on a title or body edit (so a red check from a base change stays red), and fails an "
+      "outside pull request on every event", not problems, "; ".join(problems))
+GUARD_IF = "${{ " + PR_GUARD + " }}"
+
+
+def check_steps(wf):
+    return wf["jobs"]["no_schema_changes"]["steps"]
+
+
+for label, mutate in {
+    "the check skipped on a title or body edit (#1134's first version)": lambda wf: wf["jobs"]["no_schema_changes"]
+        .__setitem__("if", "${{ " + PR_GUARD + " && (github.event.action != 'edited' || github.event.changes.base) }}"),
+    "the full check on every edit": lambda wf: wf["jobs"]["no_schema_changes"]["env"].__setitem__("ONLY_COPY", "false"),
+    "only the copy on a base change too": lambda wf: wf["jobs"]["no_schema_changes"]["env"].__setitem__(
+        "ONLY_COPY", "${{ github.event.action == 'edited' }}"),
+    "a real step not left out of a copy": lambda wf: check_steps(wf)[2].pop("if"),
+    "the copy step after another": lambda wf: check_steps(wf).insert(0, check_steps(wf).pop(1)),
+    "the copy step renamed": lambda wf: check_steps(wf)[0].__setitem__("name", "Copy"),
+    "the copy step not copying": lambda wf: check_steps(wf)[0].__setitem__("run", "true"),
+    "the copy step may fail quietly": lambda wf: check_steps(wf)[0].__setitem__("continue-on-error", True),
+    "the copy step with the head as the default branch": lambda wf: check_steps(wf)[0]["env"].__setitem__(
+        "DEFAULT_SHA", "${{ github.event.pull_request.head.sha }}"),
+    "the check job without actions: read": lambda wf: wf["jobs"]["no_schema_changes"]["permissions"].pop("actions"),
+    "the check job timing out before the copy's wait": lambda wf: wf["jobs"]["no_schema_changes"].__setitem__(
+        "timeout-minutes", 5),
+    "the copy step timing out before its wait": lambda wf: check_steps(wf)[0].__setitem__("timeout-minutes", 5),
+    "a real step without its 5-minute bound": lambda wf: check_steps(wf)[3].pop("timeout-minutes"),
+    "a real step given the copy's wait": lambda wf: check_steps(wf)[4].__setitem__("timeout-minutes", 10),
+    "outside_pr skipped on an edit": lambda wf: wf["jobs"]["outside_pr"].__setitem__(
+        "if", "${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository "
+              "&& github.event.action != 'edited' }}"),
+    "no edited type (a base change goes unchecked)": lambda wf: wf[True]["pull_request_target"].__setitem__(
+        "types", ["opened", "synchronize", "reopened"]),
+}.items():
+    wf = copy.deepcopy(real.get(CHECKS_FILE, {}))
+    try:
+        mutate(wf)
+        caught = bool(checks_edited_problems(wf))
+    except Exception as e:
+        caught, label = False, label + f" (crashed: {e!r})"
+    check(f"checks-edited: {label} fails", caught)
+wf = copy.deepcopy(real.get(CHECKS_FILE, {}))
+wf["jobs"]["no_schema_changes"]["if"] = ("${{ " + PR_GUARD + " && (github.event.action != 'edited' || "
+                                         "github.event.changes.base) }}")
+check("checks-edited: with #1134's first version a base change goes red and a body edit then reads as passed",
+      required_check_after(wf, RETARGET_THEN_EDIT) == "skipped")
 
 # --- review-kit (#957) ---------------------------------------------------------------------------
 # The fork keeps its kit settings under its own name, so the general kit's tests do not name them (#957 item 5).

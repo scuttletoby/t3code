@@ -586,11 +586,40 @@ function runScripts(workflow) {
   return scripts;
 }
 
+// The check job's first step on a title or body edit: it checks out only the default branch
+// (sparse) and runs the default branch's fork-checks-ran.py --copy, which needs a token with
+// actions: read for the run and job lists. It is the one place the token may appear, so it is
+// pinned whole: any change to it leaves it in the text below, where its token and checkout fail.
+const COPY_STEP = [
+  "      - name: Copy the newest real check (a title or body edit)",
+  "        if: ${{ env.ONLY_COPY == 'true' }}",
+  "        timeout-minutes: 10",
+  "        env:",
+  "          DEFAULT_SHA: ${{ github.sha }}",
+  "          HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+  "          PR_NUMBER: ${{ github.event.pull_request.number }}",
+  "          GITHUB_TOKEN: ${{ github.token }}",
+  "        run: |",
+  "          set -euo pipefail",
+  "          git init -q",
+  '          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"',
+  '          git fetch -q --no-tags --no-recurse-submodules --depth=1 --filter=blob:none origin "$DEFAULT_SHA"',
+  "          git sparse-checkout set --no-cone /.github/scripts/ /.github/fork-actions-policies.json",
+  '          git checkout -q --detach "$DEFAULT_SHA"',
+  "          python3 -I .github/scripts/fork-checks-ran.py --copy",
+].join("\n");
 // Why a workflow may run pull request code or hand it a token; empty when it cannot.
 function prCodeProblems(workflow) {
-  const code = workflow.replace(/^\s*#.*$/gm, "");
   const problems = [];
   const expect = (ok, why) => ok || problems.push(why);
+  const stripped = workflow.replace(/^\s*#.*$/gm, "");
+  expect(stripped.split(COPY_STEP).length <= 2, "the copy step is there more than once");
+  // Only the whole step: the next line that is not blank must start a new step or job (indent 6 or
+  // less), or a line added to its run block would be stripped with it.
+  const at = stripped.indexOf(COPY_STEP);
+  const after = at < 0 ? "" : stripped.slice(at + COPY_STEP.length);
+  const whole = at >= 0 && /^\n(?:[ \t]*\n)*(?: {0,6}\S|$)/.test(after);
+  const code = whole ? stripped.slice(0, at) + after : stripped;
   expect(/^on:\n {2}pull_request_target:/m.test(code), "not triggered by pull_request_target");
   expect(!/^\s+pull_request:/m.test(code), "triggered by pull_request");
   // The only checkout is of the default branch (`github.sha` under pull_request_target).
@@ -655,6 +684,7 @@ test("runScripts reads one-line runs and whole run blocks", () => {
 
 test("a workflow that pastes PR values into a script or reaches a token fails the check", () => {
   const workflow = fs.readFileSync(WORKFLOW, "utf8");
+  assert.ok(workflow.includes(COPY_STEP), "the copy step is pinned as it is in the workflow");
   // The checkout step's `run: |` block: a line after its first, where a one-line check misses it.
   const block = /^ +run: \|\n( +)(\S.*)\n/m;
   assert.match(workflow, block);
@@ -676,6 +706,15 @@ test("a workflow that pastes PR values into a script or reaches a token fails th
       (line, indent) => `${line}${indent}  T: \${{ secrets.GITHUB_TOKEN }}\n`,
     ),
     "a pull_request trigger": workflow.replace(/^on:\n/m, "on:\n  pull_request:\n"),
+    "the copy step checking out the head": workflow.replace(
+      /^( {10}git checkout -q --detach )"\$DEFAULT_SHA"\n( {10}python3 -I .*--copy)$/m,
+      '$1"$HEAD_SHA"\n$2',
+    ),
+    "the copy step running something else too": workflow.replace(
+      /^( {10}python3 -I .*--copy)$/m,
+      "$1\n          node .github/scripts/fork-schema-check.cjs x y",
+    ),
+    "a second copy of the copy step": workflow.replace(COPY_STEP, `${COPY_STEP}\n\n${COPY_STEP}`),
     // `run:` alone, the script on the next line.
     "an expression in a run value that starts on the next line": workflow.replace(
       /^( +)run: (node --test .*)$/m,
@@ -740,8 +779,10 @@ function scratchRepo() {
 // The workflow's checkout step, run as CI runs it, against `origin` (a local repository).
 function runCheckoutStep(origin, shas) {
   const workflow = fs.readFileSync(WORKFLOW, "utf8");
-  const block = workflow.match(/^ {8}run: \|\n((?: {10}.*\n)+)/m);
-  assert.ok(block && /git init/.test(block[1]), "the first run block is the checkout step");
+  const block = workflow.match(
+    /^ {6}- name: Check out the default branch and fetch[^\n]*\n(?: {8}(?!run:).*\n)*? {8}run: \|\n((?: {10}.*\n)+)/m,
+  );
+  assert.ok(block && /git init/.test(block[1]), "the checkout step's run block is found");
   const script = block[1].replace(/^ {10}/gm, "");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fork-checks-runner-"));
   const result = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], {

@@ -4,11 +4,12 @@
 import re
 
 
-def gh_eval(text, ctx):
+def gh_eval(text, ctx, raw=False):
     """A GitHub Actions expression, as GitHub evaluates it, for the few forms fork workflows use:
     literals, contexts (a missing property is null), !, ==, != (strings ignore case), &&, || (each
     gives one of its operands), parentheses, format(), startsWith() and the status functions success(),
-    failure(), cancelled() and always() (ctx["status"]). Anything else raises ValueError."""
+    failure(), cancelled() and always() (ctx["status"]). Anything else raises ValueError. True or false, or with
+    raw the value itself (what a ${{ }} inside a string puts there)."""
     tokens = re.findall(r"'(?:[^']|'')*'|[A-Za-z_][\w.-]*|\d+|==|!=|&&|\|\||[!(),]|\S", text)
     pos = 0
 
@@ -91,4 +92,4 @@ def gh_eval(text, ctx):
     value = disjunction()
     if pos != len(tokens):
         raise ValueError(f"cannot read the end of {text!r}")
-    return truthy(value)
+    return value if raw else truthy(value)
