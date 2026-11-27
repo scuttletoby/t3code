@@ -83,9 +83,10 @@ copies that must fail (so a check that stops seeing its problem goes red too):
   tests-concurrency  fork-tests.yml: a newer run of a pull request cancels the older one; a push to
                main, a dispatch (merge train, release mode) and a call each have a group of their own (the
                run id), so they never cancel, wait for or are cancelled by another run (#1090).
-  checks-edited  fork-checks.yml checks on opened, synchronize, reopened and a base change; on a title
-               or body edit every job but an outside pull request's failing one is skipped, so the run
-               starts no runner and ends "skipped" (fork-checks-ran.py passes over such a run, #1090).
+  checks-edited  fork-checks.yml checks in full on opened, synchronize, reopened and a base change; on a
+               title or body edit its check job runs only its first step, which copies the newest real
+               check of the head (fork-checks-ran.py --copy), so a red check from a base change stays red
+               (a skipped job would read as passed, #1134); outside_pr runs on every event (#1090).
   windows      fork-windows-tests.yml (a nightly report, never in the merge path) runs on schedule and by
                hand only, reads only, cancels an older run, hides no red result, keeps the recorded steps of
                upstream's windows-tests.yml and its 45-minute limit on hosted Windows, and runs the Windows
@@ -5389,11 +5390,16 @@ for label, conc in {
         wf["concurrency"] = conc
     check(f"tests-concurrency: {label} fails", bool(tests_concurrency_problems(wf)))
 
-# --- checks-edited (#1090) -----------------------------------------------------------------------
-# fork-checks.yml: a title or body edit starts no runner (every job skipped, so the run ends "skipped", which
-# fork-checks-ran.py passes over); a base change, and every other event, checks as before; an outside pull request's
-# failing job runs on every event, edits too.
+# --- checks-edited (#1090, #1134) ----------------------------------------------------------------
+# fork-checks.yml: on a title or body edit (base unchanged) the check job still runs, but only its first step, which
+# copies the newest real check of the head (fork-checks-ran.py --copy): a skipped job would count as passed next to a
+# red check from a base change (#1134). A base change, and every other event, checks in full. An outside pull
+# request's failing job runs on every event, edits too.
 CHECKS_FILE = "fork-checks.yml"
+CHECK_NAME = "No database schema changes"
+COPY_RUN = "python3 -I .github/scripts/fork-checks-ran.py --copy"
+COPY_ENV = {"DEFAULT_SHA": "${{ github.sha }}", "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+            "PR_NUMBER": "${{ github.event.pull_request.number }}", "GITHUB_TOKEN": "${{ github.token }}"}
 
 
 def checks_run(action, outside=False, changes=None):
@@ -5403,16 +5409,53 @@ def checks_run(action, outside=False, changes=None):
 
 
 BASE_CHANGE = {"base": {"ref": {"from": "side"}, "sha": {"from": "c" * 40}}}
-# (label, context, runs the check, runs outside_pr)
-CHECKS_RUNS = [(f"{a}", checks_run(a), True, False) for a in ("opened", "synchronize", "reopened")] + [
-    ("a base change (edited)", checks_run("edited", changes=BASE_CHANGE), True, False),
+# (label, context, runs the check job, only its copy step, runs outside_pr)
+CHECKS_RUNS = [(f"{a}", checks_run(a), True, False, False) for a in ("opened", "synchronize", "reopened")] + [
+    ("a base change (edited)", checks_run("edited", changes=BASE_CHANGE), True, False, False),
     ("a base and title change (edited)", checks_run("edited", changes={**BASE_CHANGE, "title": {"from": "x"}}), True,
-     False),
-    ("a title edit", checks_run("edited", changes={"title": {"from": "x"}}), False, False),
-    ("a body edit", checks_run("edited", changes={"body": {"from": "x"}}), False, False),
-    ("an edit with no changes listed", checks_run("edited"), False, False),
-] + [(f"an outside pull request, {a}", checks_run(a, outside=True), False, True)
+     False, False),
+    ("a title edit", checks_run("edited", changes={"title": {"from": "x"}}), True, True, False),
+    ("a body edit", checks_run("edited", changes={"body": {"from": "x"}}), True, True, False),
+    ("an edit with no changes listed", checks_run("edited"), True, True, False),
+] + [(f"an outside pull request, {a}", checks_run(a, outside=True), False, False, True)
      for a in ("opened", "synchronize", "reopened", "edited")]
+
+
+def check_job_of(wf):
+    jobs = wf.get("jobs") or {}
+    return next((j for j, job in jobs.items() if job.get("name") == CHECK_NAME), None)
+
+
+def steps_that_run(job, ctx):
+    """The names of the job's steps that run on ctx (job env rendered as GitHub does, every step before passed)."""
+    env = {k: rendered(v, ctx) for k, v in (job.get("env") or {}).items()}
+    sctx = {**ctx, "env": env, "status": "success"}
+    return [st.get("name", "") for st in job.get("steps") or [] if gh_eval(expression(st.get("if", "success()")), sctx)]
+
+
+def required_check_after(wf, events):
+    """What GitHub's required check CHECK_NAME reads on the head after these runs, in order: [(ctx, what a real check
+    would end)]. A skipped job counts as passed; a copy ends as the newest earlier real check (none: failure)."""
+    job_id = check_job_of(wf)
+    job = (wf.get("jobs") or {}).get(job_id) or {}
+    ended = []   # (real?, conclusion), oldest first
+    for ctx, real in events:
+        if not gh_eval(expression(job.get("if", "true")), ctx):
+            ended.append((False, "skipped"))
+            continue
+        ran = steps_that_run(job, ctx)
+        if ran and ran[0] == _fcr.COPY_STEP:
+            earlier = [c for r, c in ended if r]
+            ended.append((False, earlier[-1] if earlier else "failure"))
+        else:
+            ended.append((True, real))
+    return ended[-1][1] if ended else None
+
+
+# A stacked pull request moved onto main: its check passed against the side branch, fails against main, then a fix
+# round edits the body. The required check must stay red (#1134: a skipped edit run read as passed).
+RETARGET_THEN_EDIT = [(checks_run("synchronize"), "success"), (checks_run("edited", changes=BASE_CHANGE), "failure"),
+                      (checks_run("edited", changes={"body": {"from": "x"}}), None)]
 
 
 def checks_edited_problems(wf):
@@ -5423,41 +5466,84 @@ def checks_edited_problems(wf):
         problems.append(f"{CHECKS_FILE}: pull_request_target types {sorted(types)} lack one of opened, synchronize, "
                         "reopened, edited (a base change fires only edited)")
     jobs = wf.get("jobs") or {}
-    check_job = next((j for j, job in jobs.items() if job.get("name") == "No database schema changes"), None)
+    check_job = check_job_of(wf)
     if check_job is None or "outside_pr" not in jobs:
-        return problems + [f"{CHECKS_FILE}: no job named No database schema changes, or no outside_pr"]
-    for label, ctx, want_check, want_outside in CHECKS_RUNS:
-        for j in jobs:
-            want = want_outside if j == "outside_pr" else want_check if j == check_job else None
+        return problems + [f"{CHECKS_FILE}: no job named {CHECK_NAME}, or no outside_pr"]
+    job = jobs[check_job]
+    first = (job.get("steps") or [{}])[0]
+    if first.get("name") != _fcr.COPY_STEP or first.get("run", "").strip().splitlines()[-1:] != [COPY_RUN] \
+            or first.get("env") != COPY_ENV or "continue-on-error" in first or "continue-on-error" in job:
+        problems.append(f"{CHECKS_FILE}/{check_job}: the first step is not the copy ({_fcr.COPY_STEP!r}, ending in "
+                        f"{COPY_RUN}, env {sorted(COPY_ENV)}, never continue-on-error)")
+    if (job.get("permissions") or {}) != {"actions": "read", "contents": "read"}:
+        problems.append(f"{CHECKS_FILE}/{check_job}: permissions are not actions: read, contents: read")
+    # The copy's worst case: its wait, one last poll (a minute), the fetch and the job's set-up (a minute each).
+    if not (type(job.get("timeout-minutes")) is int and job["timeout-minutes"] * 60 >= _fcr.COPY_WAIT_SECONDS + 180):
+        problems.append(f"{CHECKS_FILE}/{check_job}: timeout-minutes does not hold COPY_WAIT_SECONDS "
+                        f"({_fcr.COPY_WAIT_SECONDS} s) and 3 minutes more")
+    for label, ctx, want_check, only_copy, want_outside in CHECKS_RUNS:
+        for j, want in ((check_job, want_check), ("outside_pr", want_outside)):
             try:
                 got = gh_eval(expression(jobs[j].get("if", "true")), ctx)
             except ValueError as e:
                 problems.append(f"{CHECKS_FILE}/{j}: if: cannot be evaluated ({e})")
                 continue
-            if want is None:
-                # Any other job: never on an edit that changes no base (the run must end skipped).
-                if got and ctx["github"]["event"]["action"] == "edited" and not want_check and not want_outside:
-                    problems.append(f"{CHECKS_FILE}/{j}: runs on {label} (the run would not end skipped)")
-            elif got != want:
+            if got != want:
                 problems.append(f"{CHECKS_FILE}/{j}: {'runs' if got else 'does not run'} on {label}")
+        if not want_check:
+            continue
+        try:
+            ran = steps_that_run(job, ctx)
+        except ValueError as e:
+            problems.append(f"{CHECKS_FILE}/{check_job}: a step's if: cannot be evaluated ({e})")
+            continue
+        others = [st.get("name", "") for st in job.get("steps") or [] if st.get("name") != _fcr.COPY_STEP]
+        if only_copy and ran != [_fcr.COPY_STEP]:
+            problems.append(f"{CHECKS_FILE}/{check_job}: on {label} runs {ran}, not only the copy")
+        if not only_copy and ran != others:
+            problems.append(f"{CHECKS_FILE}/{check_job}: on {label} runs {ran}, not the whole check")
+    try:
+        after = required_check_after(wf, RETARGET_THEN_EDIT)
+    except ValueError as e:
+        after = f"cannot be evaluated ({e})"
+    if after != "failure":
+        problems.append(f"{CHECKS_FILE}: a base change goes red, then a body edit leaves {CHECK_NAME} {after} "
+                        "(#1134)")
     return problems
 
 
 problems = checks_edited_problems(real.get(CHECKS_FILE, {}))
-check("checks-edited: fork-checks.yml checks on opened, synchronize, reopened and a base change, starts no job on a "
-      "title or body edit, and fails an outside pull request on every event", not problems, "; ".join(problems))
+check("checks-edited: fork-checks.yml checks in full on opened, synchronize, reopened and a base change, only copies "
+      "the newest real check on a title or body edit (so a red check from a base change stays red), and fails an "
+      "outside pull request on every event", not problems, "; ".join(problems))
 GUARD_IF = "${{ " + PR_GUARD + " }}"
+
+
+def check_steps(wf):
+    return wf["jobs"]["no_schema_changes"]["steps"]
+
+
 for label, mutate in {
-    "the check on every edit": lambda wf: wf["jobs"]["no_schema_changes"].__setitem__("if", GUARD_IF),
-    "the check skipped on a base change too": lambda wf: wf["jobs"]["no_schema_changes"].__setitem__(
-        "if", "${{ " + PR_GUARD + " && (github.event.action != 'edited') }}"),
+    "the check skipped on a title or body edit (#1134's first version)": lambda wf: wf["jobs"]["no_schema_changes"]
+        .__setitem__("if", "${{ " + PR_GUARD + " && (github.event.action != 'edited' || github.event.changes.base) }}"),
+    "the full check on every edit": lambda wf: wf["jobs"]["no_schema_changes"]["env"].__setitem__("ONLY_COPY", "false"),
+    "only the copy on a base change too": lambda wf: wf["jobs"]["no_schema_changes"]["env"].__setitem__(
+        "ONLY_COPY", "${{ github.event.action == 'edited' }}"),
+    "a real step not left out of a copy": lambda wf: check_steps(wf)[2].pop("if"),
+    "the copy step after another": lambda wf: check_steps(wf).insert(0, check_steps(wf).pop(1)),
+    "the copy step renamed": lambda wf: check_steps(wf)[0].__setitem__("name", "Copy"),
+    "the copy step not copying": lambda wf: check_steps(wf)[0].__setitem__("run", "true"),
+    "the copy step may fail quietly": lambda wf: check_steps(wf)[0].__setitem__("continue-on-error", True),
+    "the copy step with the head as the default branch": lambda wf: check_steps(wf)[0]["env"].__setitem__(
+        "DEFAULT_SHA", "${{ github.event.pull_request.head.sha }}"),
+    "the check job without actions: read": lambda wf: wf["jobs"]["no_schema_changes"]["permissions"].pop("actions"),
+    "the check job timing out before the copy's wait": lambda wf: wf["jobs"]["no_schema_changes"].__setitem__(
+        "timeout-minutes", 5),
     "outside_pr skipped on an edit": lambda wf: wf["jobs"]["outside_pr"].__setitem__(
         "if", "${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository "
               "&& github.event.action != 'edited' }}"),
     "no edited type (a base change goes unchecked)": lambda wf: wf[True]["pull_request_target"].__setitem__(
         "types", ["opened", "synchronize", "reopened"]),
-    "a new job that runs on every edit": lambda wf: wf["jobs"].__setitem__(
-        "extra", {"if": GUARD_IF, "runs-on": "ubuntu-latest", "steps": [{"run": "true"}]}),
 }.items():
     wf = copy.deepcopy(real.get(CHECKS_FILE, {}))
     try:
@@ -5466,6 +5552,11 @@ for label, mutate in {
     except Exception as e:
         caught, label = False, label + f" (crashed: {e!r})"
     check(f"checks-edited: {label} fails", caught)
+wf = copy.deepcopy(real.get(CHECKS_FILE, {}))
+wf["jobs"]["no_schema_changes"]["if"] = ("${{ " + PR_GUARD + " && (github.event.action != 'edited' || "
+                                         "github.event.changes.base) }}")
+check("checks-edited: with #1134's first version a base change goes red and a body edit then reads as passed",
+      required_check_after(wf, RETARGET_THEN_EDIT) == "skipped")
 
 # --- review-kit (#957) ---------------------------------------------------------------------------
 # The fork keeps its kit settings under its own name, so the general kit's tests do not name them (#957 item 5).
