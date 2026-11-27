@@ -16,9 +16,9 @@ counted. GitHub leaves pull_requests empty on runs of a pull request from anothe
 counted (fail closed). Two pull requests from the same head branch may both be listed on each other's runs, and so
 may a pull request closed and a new one opened from the same branch at the same commit (the old pull request's runs
 list the new one, and decide until its own run exists); either needs someone who can push to this repository. It
-waits while that job is queued or running; failed, cancelled or skipped fails at once, and so does a finished run
-without the job (a blocked event leaves one). The Actions API needs only actions: read, which every caller of
-fork-tests.yml grants.
+waits while that job is queued or running (or skipped in a run not yet finished); failed, cancelled or skipped
+fails at once, and so does a finished run without the job (a blocked event leaves one). The Actions API needs only
+actions: read, which every caller of fork-tests.yml grants.
 
 The config is read from the pull request's base commit (BASE_SHA, fetched when the checkout lacks it), not from the
 checkout: pull_request_target runs the base branch's copy of fork-checks.yml, so a pull request that renames its job
@@ -37,6 +37,9 @@ check, since its check runs are named "<caller job> / ... / fork-ci-result", nev
 direct run (push, workflow_dispatch) passes only on the default branch: on any other branch its passing fork-ci-result
 would land on that branch's tip, which may be an open pull request's head that fork-checks never passed (#430).
 
+--copy is fork-checks.yml's own check job on a title or body edit: it ends as the newest real check of the head ended
+(see copy()), so a skipped job never stands as "passed" next to a red check from a base change (#1134).
+
 Environment: EVENT_NAME, HEAD_SHA, BASE_SHA, PR_NUMBER, OUTSIDE_PR (true/false), DEFAULT_BRANCH, GITHUB_REF,
 GITHUB_WORKFLOW_REF, GITHUB_TOKEN (actions: read), GITHUB_REPOSITORY, GITHUB_API_URL. Test: fork-checks-ran.test.py.
 """
@@ -48,6 +51,9 @@ SHA = re.compile(r'[0-9a-f]{40}')
 NUMBER = re.compile(r'[1-9][0-9]*')
 GIT_TIMEOUT, GIT_CALLS = 60, 3            # seconds per git call; at most cat-file, fetch, show
 API_TIMEOUT, API_CALLS_PER_POLL = 30, 2   # seconds per API call; one poll: the run list, then one run's jobs
+# --copy (fork-checks.yml on a title or body edit): its first step's name, and how long it waits for the real check.
+COPY_STEP = 'Copy the newest real check (a title or body edit)'
+COPY_WAIT_SECONDS = 480
 NOT_RAN = 'fork-checks did not run: check the Actions policy (#401)'
 WAY_OUT = ('Once that is fixed, push again or close and reopen the pull request (a blocked run cannot be re-run), '
            'then this job runs again.')
@@ -165,22 +171,54 @@ def of_this_pull_request(run, repo, number):
     return any(isinstance(p, dict) and p.get('number') == number and from_this_run(p) for p in prs)
 
 
-def look(api, sha, name, workflow, repo, number):
+def copy_kind(job):
+    """Is this job of fork-checks.yml a copy (its first step, COPY_STEP, ran: a title or body edit) or a real check
+    (that step skipped, or a job with steps but none of that name: a run of an older fork-checks.yml)? None while
+    that cannot be told yet: no steps listed, or the step still queued (a real job lists it queued too)."""
+    steps = job.get('steps')
+    if not isinstance(steps, list) or not steps:
+        return None
+    named = [s for s in steps if isinstance(s, dict) and s.get('name') == COPY_STEP]
+    if not named:
+        return 'real'
+    s = named[0]
+    if s.get('status') == 'completed':
+        return 'real' if s.get('conclusion') == 'skipped' else 'copy'
+    return 'copy' if s.get('status') == 'in_progress' else None
+
+
+def look(api, sha, name, workflow, repo, number, before=None, real_only=False):
     """What the newest pull_request_target run of the workflow on sha for pull request `number` from `repo` says
     about its job `name`, latest attempt: None (no such run yet), ('going', url), ('blocked', run url: finished
-    without the job) or (conclusion, url). At most API_CALLS_PER_POLL calls."""
+    without the job) or (conclusion, url). before: only runs with a smaller id (made earlier). real_only: pass over
+    runs whose job is a copy (copy_kind), so a copy copies a real check, never another copy; one API call per run
+    read. Without it, at most API_CALLS_PER_POLL calls."""
     runs = api.get(f'actions/workflows/{urllib.parse.quote(os.path.basename(workflow))}/runs?'
                    + urllib.parse.urlencode({'head_sha': sha, 'per_page': 100}))['workflow_runs']
     mine = [r for r in runs if r['path'].split('@')[0] == workflow and r.get('event') == 'pull_request_target'
-            and of_this_pull_request(r, repo, number)]
-    for run in sorted(mine, key=lambda r: int(r['id']), reverse=True):
+            and of_this_pull_request(r, repo, number) and (before is None or int(r['id']) < before)]
+    # A run that skipped every job checked nothing (an older fork-checks.yml of this PR's skipped its check on a title
+    # or body edit), so the newest run that did not end so decides. Only when every run ended so does the newest one
+    # decide (and its skipped check fails). The run list says it, so this costs no API call.
+    checked = [r for r in mine if not (r.get('status') == 'completed' and r.get('conclusion') == 'skipped')]
+    for run in sorted(checked or mine, key=lambda r: int(r['id']), reverse=True):
         jobs = api.get(f'actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')['jobs']
         named = [j for j in jobs if j['name'] == name]
         if not named:
             return ('blocked', run.get('html_url', f'run {run["id"]}')) if run['status'] == 'completed' \
                 else ('going', run.get('html_url', ''))
         j = named[0]
-        if j['status'] != 'completed':
+        if real_only:
+            kind = copy_kind(j)
+            if kind == 'copy':
+                continue
+            if kind is None:   # unknown: wait while it runs, fail once it has ended (fail closed)
+                if j['status'] != 'completed':
+                    return 'going', j.get('html_url', '')
+                return f'{j["conclusion"] or "without a conclusion"}, and not clearly a real check', \
+                    j.get('html_url', '')
+        # A skipped check in a run not yet finished: the run may still end "skipped" and be passed over, so wait.
+        if j['status'] != 'completed' or (j['conclusion'] == 'skipped' and run.get('status') != 'completed'):
             return 'going', j.get('html_url', '')
         return j['conclusion'] or 'without a conclusion', j.get('html_url', '')
     return None
@@ -292,11 +330,89 @@ def check(env, api, config, now=time.time, sleep=time.sleep, say=print):
         sleep(wait)
 
 
+def copy(env, api, config, now=time.time, sleep=time.sleep, say=print):
+    """--copy: fork-checks.yml's check job on a title or body edit (base unchanged). The head is unchanged, so instead
+    of checking the same thing again this job ends as the newest earlier run of this pull request on the head that
+    really checked (not a copy, look's real_only) ended: success passes, anything else fails, and so does no such
+    run (missing) or a job that cannot be told apart (unknown). It waits while that check runs, at most
+    COPY_WAIT_SECONDS. A skipped check job would count as passed next to a red one from a base change (#1134), so the
+    job always runs. config(sha) reads fork_checks from the default branch's commit (DEFAULT_SHA), whose
+    fork-checks.yml runs this.
+    Environment: HEAD_SHA, DEFAULT_SHA, PR_NUMBER, GITHUB_RUN_ID, GITHUB_REPOSITORY, GITHUB_TOKEN, GITHUB_API_URL."""
+    sha, default, number = env.get('HEAD_SHA', ''), env.get('DEFAULT_SHA', ''), env.get('PR_NUMBER', '')
+    run_id, repo = env.get('GITHUB_RUN_ID', ''), env.get('GITHUB_REPOSITORY', '')
+    problems = [f'{k} {v!r} is not a commit id' for k, v in (('HEAD_SHA', sha), ('DEFAULT_SHA', default))
+                if not SHA.fullmatch(v)]
+    problems += [f'{k} {v!r} is not a number' for k, v in (('PR_NUMBER', number), ('GITHUB_RUN_ID', run_id))
+                 if not NUMBER.fullmatch(v)]
+    if not repo:
+        problems.append('GITHUB_REPOSITORY is empty')
+    if problems:
+        say('::error::' + '; '.join(problems))
+        return 1
+    start = now()
+    try:
+        cfg = config(default)
+    except ConfigError as e:
+        say(f'::error::nothing to copy (failing closed): {e}')
+        return 1
+    problems = config_problems(cfg)
+    if problems:
+        say(f'::error::{CONFIG_PATH} on {default}: ' + '; '.join(problems))
+        return 1
+    name, workflow, poll = cfg['check'], cfg['workflow'], cfg['poll_seconds']
+    deadline = start + COPY_WAIT_SECONDS
+    way_out = ('Push again or close and reopen the pull request (that checks it again), or re-run the real check '
+               'and then this job.')
+    say(f'A title or body edit: the head {sha} is unchanged, so this copies the result of the newest earlier run of '
+        f'{workflow} for pull request #{number} that checked it (at most {COPY_WAIT_SECONDS} s).')
+    last_error = None
+    while True:
+        wait = poll
+        try:
+            found = look(api, sha, name, workflow, repo, int(number), before=int(run_id), real_only=True)
+            last_error = None
+        except Fatal as e:
+            say(f'::error::nothing to copy (failing closed): GitHub API error: {e}')
+            return 1
+        except Transient as e:
+            found, last_error = ('going', ''), str(e)
+            say(f'::warning::{e}; retrying')
+            if isinstance(e, RateLimited):
+                wait = max(poll, e.reset - now())
+        except (KeyError, TypeError, IndexError, AttributeError, ValueError) as e:
+            say(f'::error::nothing to copy (failing closed): unexpected GitHub reply ({e!r})')
+            return 1
+        if found is None:
+            say(f'::error::no earlier run of {workflow} for pull request #{number} checked {sha}: nothing to copy, '
+                f'so this fails. {way_out}')
+            return 1
+        state, url = found
+        if state == 'success':
+            say(f'ok: copied: the real check of {sha} passed ({url})')
+            return 0
+        if state != 'going':
+            say(f'::error::copied: the real check of {sha} ended {state} ({url}). {way_out}')
+            return 1
+        if wait > deadline - now():
+            what = f'the last GitHub API call failed: {last_error}' if last_error else f'it is still running ({url})'
+            say(f'::error::the real check of {sha} did not finish within {COPY_WAIT_SECONDS} s ({what}). '
+                'Once it has ended, re-run this job.')
+            return 1
+        sleep(wait)
+
+
 def main():
     env = os.environ
     api = GitHub(env.get('GITHUB_TOKEN', ''), env.get('GITHUB_REPOSITORY', ''),
                  env.get('GITHUB_API_URL') or 'https://api.github.com')
-    return check(env, api, base_config, say=lambda m: print(m, flush=True))
+    say = lambda m: print(m, flush=True)
+    if sys.argv[1:] == ['--copy']:
+        return copy(env, api, base_config, say=say)
+    if sys.argv[1:]:
+        say(f'::error::unknown arguments {sys.argv[1:]!r} (only --copy)')
+        return 1
+    return check(env, api, base_config, say=say)
 
 
 if __name__ == '__main__':

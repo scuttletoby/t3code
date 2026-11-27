@@ -22,6 +22,14 @@ permissions:
 # as passed, so a ruleset that requires "No database schema changes" must also require "Outside pull
 # request". A head repository GitHub no longer knows reads as "another fork". Test:
 # fork-contracts.test.py.
+#
+# `edited` (a title, body or base change): a base change checks again. A title or body edit leaves the
+# head unchanged and no job reads the title or the body, so the check job runs only its first step: it
+# waits for and copies the result of the newest earlier run of this pull request on the head that
+# really checked (fork-checks-ran.py --copy, about 15 s; no such run, or one it cannot read, fails).
+# The job must not be skipped: a skipped check counts as passed, and would stand next to a red check
+# from a base change (#1134). outside_pr runs on every edit too. Test: fork-contracts.test.py
+# (checks-edited).
 jobs:
   # It also refuses changes to the upstream files listed in its last step. Keep the name: it is what
   # a ruleset would require.
@@ -29,13 +37,41 @@ jobs:
     name: No database schema changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Room for the copy step's wait (COPY_WAIT_SECONDS in fork-checks-ran.py). The real check's steps keep
+    # the old 5-minute bound each (it takes about 4 in all).
+    timeout-minutes: 12
+    # actions: read for the copy's run and job lists. Nothing from the pull request is run either way.
+    permissions:
+      actions: read
+      contents: read
+    env:
+      ONLY_COPY: ${{ github.event.action == 'edited' && !github.event.changes.base }}
     steps:
+      # Keep it the first step and keep its name (COPY_STEP): a copy tells a real check from another copy by it.
+      - name: Copy the newest real check (a title or body edit)
+        if: ${{ env.ONLY_COPY == 'true' }}
+        timeout-minutes: 10
+        env:
+          DEFAULT_SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          git fetch -q --no-tags --no-recurse-submodules --depth=1 --filter=blob:none origin "$DEFAULT_SHA"
+          git sparse-checkout set --no-cone /.github/scripts/ /.github/fork-actions-policies.json
+          git checkout -q --detach "$DEFAULT_SHA"
+          python3 -I .github/scripts/fork-checks-ran.py --copy
+
       # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ but no
       # .gitmodules, and checkout's credential cleanup runs `git submodule foreach`, which fails on
       # them. The full checkout fetches the default branch's blobs in one batch; a sparse one leaves
       # the check to fetch every blob it reads one at a time.
       - name: Check out the default branch and fetch the pull request's commits (not checked out)
+        if: ${{ env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         env:
           DEFAULT_SHA: ${{ github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -49,10 +85,14 @@ jobs:
           git checkout -q --detach "$DEFAULT_SHA"
 
       - name: Test the check
+        if: ${{ env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         run: node --test .github/scripts/fork-schema-check.test.cjs .github/scripts/fork-upstream-files-check.test.cjs .github/scripts/fork-seam-check.test.cjs
 
       # T3 has no down-migrations, so a fork migration strands installs that return to upstream.
       - name: Refuse schema and migration changes
+        if: ${{ env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -62,7 +102,8 @@ jobs:
       # upstream's (upstream's own changes reach main through fork-follow's rebase, not a PR). Runs
       # even when the schema step refused, so a PR sees both reasons.
       - name: Refuse changes to upstream files the fork leaves alone
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -71,7 +112,8 @@ jobs:
         run: node .github/scripts/fork-upstream-files-check.cjs "$BASE_SHA" "$HEAD_SHA" "$UPSTREAM_FILES"
 
       - name: Fork lines in upstream files
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.ONLY_COPY != 'true' }}
+        timeout-minutes: 5
         env:
           DEFAULT_SHA: ${{ github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
