@@ -67,6 +67,15 @@
 # URL), RUNNER_DOWNLOAD (the https base of its tarballs) and RUNNER_MIN (the oldest runner version refresh may install,
 # empty for none), FREE_COMMAND (a free/v1 script's absolute path, empty for none) and FREE_CHECK (its reader,
 # free_contract.py beside this launcher) have defaults below.
+# Each job unit's own limits (job_limits), so a job that runs away is held or killed, never the host's own work:
+# JOB_MEMORY_MAX_MB (MemoryMax: the job is killed above it; empty, the default: MemTotal minus RESERVE_MB, shared by
+# the RUNNER_USERS, so all slots together never take the reserve; at least JOB_MEMORY_MIN), JOB_MEMORY_HIGH_MB
+# (MemoryHigh: the kernel slows the job and takes its memory back above it; empty: 90% of MemoryMax), JOB_SWAP_MAX_MB
+# (MemorySwapMax, 0 by default: a job never fills the host's swap), JOB_CPU_WEIGHT (CPUWeight, 1 to 10000, 50 by
+# default: half a normal unit's share when the host is busy), JOB_CPU_QUOTA (CPUQuota in percent, 100 = one CPU;
+# empty, the default: no cap) and JOB_OOM_SCORE_ADJUST (OOMScoreAdjust, 1 to 1000, 500 by default: when the host
+# itself runs out of memory, the kernel kills a job before any of the host's own processes). OOMPolicy=kill: the
+# kernel killing one process of a job stops all of the job's unit.
 # HOOK (and the two files beside it), WORK_ROOT and RESOLV_CONF are bound into every job too: never under a folder that
 # holds data (/home, /root, /mnt, /media, /srv), also through a symlink (no_data). A bind mount of a data folder at
 # one of them is not seen (it has no link to resolve): that is the operator's to avoid (.github/fork-fleet.md, step 4).
@@ -125,7 +134,8 @@ SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazo
 ALLOW_PATHS='' CANARY_DIR=/etc
 JOB_PATHS='' RUNNER_RELEASE=https://api.github.com/repos/actions/runner/releases/latest
 RUNNER_DOWNLOAD=https://github.com/actions/runner/releases/download RUNNER_MIN='' FREE_COMMAND='' FREE_CHECK=''
-setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|OWN_ADDRESS_SECONDS|JOB_PATHS|ALLOW_PATHS|CANARY_DIR|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK)=([^[:space:]]*)$'
+JOB_MEMORY_MAX_MB='' JOB_MEMORY_HIGH_MB='' JOB_SWAP_MAX_MB=0 JOB_CPU_WEIGHT=50 JOB_CPU_QUOTA='' JOB_OOM_SCORE_ADJUST=500
+setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|OWN_ADDRESS_SECONDS|JOB_PATHS|ALLOW_PATHS|CANARY_DIR|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK|JOB_MEMORY_MAX_MB|JOB_MEMORY_HIGH_MB|JOB_SWAP_MAX_MB|JOB_CPU_WEIGHT|JOB_CPU_QUOTA|JOB_OOM_SCORE_ADJUST)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
@@ -150,6 +160,13 @@ fi
 [[ $FREE_COMMAND =~ ^($PLAIN_PATH)?$ && $FREE_CHECK =~ ^($PLAIN_PATH)?$ ]] ||
   die "$conf: FREE_COMMAND and FREE_CHECK are plain absolute paths"
 [[ -n $FREE_CHECK ]] || FREE_CHECK=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/free_contract.py
+MB_SETTING='(0|[1-9][0-9]{0,6})'
+[[ $JOB_MEMORY_MAX_MB =~ ^$MB_SETTING?$ && $JOB_MEMORY_HIGH_MB =~ ^$MB_SETTING?$ && $JOB_SWAP_MAX_MB =~ ^$MB_SETTING$ ]] ||
+  die "$conf: JOB_MEMORY_MAX_MB, JOB_MEMORY_HIGH_MB and JOB_SWAP_MAX_MB are numbers of megabytes"
+{ [[ $JOB_CPU_WEIGHT =~ ^[1-9][0-9]{0,4}$ ]] && ((JOB_CPU_WEIGHT <= 10000)); } || die "$conf: JOB_CPU_WEIGHT is 1 to 10000"
+[[ $JOB_CPU_QUOTA =~ ^([1-9][0-9]{0,4})?$ ]] || die "$conf: JOB_CPU_QUOTA is a percent (100: one CPU), or empty for none"
+{ [[ $JOB_OOM_SCORE_ADJUST =~ ^[1-9][0-9]{0,3}$ ]] && ((JOB_OOM_SCORE_ADJUST <= 1000)); } ||
+  die "$conf: JOB_OOM_SCORE_ADJUST is 1 to 1000 (a job is killed before the host's own processes, never after)"
 
 NAME='^[a-z0-9][a-z0-9-]{0,62}-[0-9]{1,20}$'
 name_ok() { [[ $1 =~ $NAME ]] || die "not a runner name: $1"; }
@@ -1266,8 +1283,27 @@ sandbox() {
   )
 }
 
+# The least MemoryMax a job gets (megabytes): less, and no start (a smaller host sets fewer RUNNER_USERS).
+JOB_MEMORY_MIN=1024
+# Sets mem_max and mem_high (megabytes) for a job unit (the settings above): JOB_MEMORY_MAX_MB, or MemTotal minus
+# RESERVE_MB shared by the RUNNER_USERS (each slot's share, so the jobs together never reach the reserve).
+job_limits() {
+  local kb users=${RUNNER_USERS//[^,]/}
+  mem_max=$JOB_MEMORY_MAX_MB
+  if [[ -z $mem_max ]]; then
+    kb=$(awk '$1 == "MemTotal:" { print $2 }' "$MEMINFO")
+    [[ $kb =~ ^[0-9]+$ ]] || die "no MemTotal in $MEMINFO"
+    mem_max=$(((kb / 1024 - RESERVE_MB) / (${#users} + 1)))
+  fi
+  ((mem_max >= JOB_MEMORY_MIN)) || die "start: a job would get ${mem_max} MB (MemoryMax), under $JOB_MEMORY_MIN MB:" \
+    "refused (set JOB_MEMORY_MAX_MB, a smaller RESERVE_MB or fewer RUNNER_USERS in $conf)"
+  mem_high=${JOB_MEMORY_HIGH_MB:-$((mem_max * 9 / 10))}
+  ((mem_high <= mem_max)) || die "$conf: JOB_MEMORY_HIGH_MB ($mem_high) is over the job's MemoryMax ($mem_max MB)"
+}
+
 start() {
   local name=$1 dir env_file line key value user resolv bad left own blocked seen from linked f real wait code
+  local mem_max mem_high
   local -a props
   local -A got=()
   name_ok "$name"
@@ -1283,6 +1319,8 @@ start() {
     got[$key]=$value
   done
   ((${#got[@]} == 3)) || die "start: needs ACTIONS_RUNNER_INPUT_JITCONFIG, FORK_FLEET_RUN and FORK_FLEET_ATTEMPT"
+  # The unit's own limits (memory, CPU, OOM), before anything is made: a setting that cannot be used makes nothing.
+  job_limits
 
   # The template: an unconfigured runner nobody but this user can change (each copy hard-links its files).
   owned_safe "$TEMPLATE"
@@ -1357,6 +1395,9 @@ start() {
   timeout -k 2 "$wait" "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" \
     --working-directory "$dir" -p Type=exec -p KillMode=control-group -p "EnvironmentFile=$env_file" \
     "${props[@]}" -p "ReadWritePaths=$dir" \
+    -p "MemoryMax=${mem_max}M" -p "MemoryHigh=${mem_high}M" -p "MemorySwapMax=${JOB_SWAP_MAX_MB}M" \
+    -p "CPUWeight=$JOB_CPU_WEIGHT" -p "CPUQuota=${JOB_CPU_QUOTA:+$JOB_CPU_QUOTA%}" \
+    -p "OOMScoreAdjust=$JOB_OOM_SCORE_ADJUST" -p OOMPolicy=kill \
     -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "$dir/run.sh" || code=$?
   # What systemd really applies (issues #365 item 1, #636), drop-ins and defaults included, not what was asked for: a
   # unit that could run on past its limit (a stop timeout over STOP_MAX, a RuntimeMaxSec over MAX_SECONDS, a kill that
