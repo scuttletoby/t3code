@@ -1603,13 +1603,16 @@ read -r -d '' OWN_PROBE <<'EOF' || true
 bad=0
 [[ $1 =~ [^[:space:]] ]] || { echo "FAIL  no own public address to try"; bad=1; }
 for own in $1; do
-  if err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1); then
+  ec=0
+  err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1) || ec=$?
+  if [[ -n $err ]]; then why=$err; elif ((ec == 124)); then why='no answer in 5 s'; else why="exit $ec, nothing said"; fi
+  if ((ec == 0)); then
     echo "FAIL  this host's own public address $own is reachable from inside with the table alone"
     bad=1
   elif [[ $err =~ (No\ route\ to\ host) ]]; then
     echo "ok    this host's own public address $own is refused by the table alone (${BASH_REMATCH[1]})"
   else
-    echo "FAIL  this host's own public address $own is not refused by the table alone (${err:-no answer in 5 s})"
+    echo "FAIL  this host's own public address $own is not refused by the table alone ($why)"
     bad=1
   fi
 done
@@ -1622,33 +1625,44 @@ EOF
 # (the unit's IPAddressDeny drops it before the table: the one difference between the two units); an answer, any
 # other error (a reset: the packet got through) or no answer without that proof fails. No answer is timeout's own
 # exit (124) with nothing said: a connect that ended silently any other way (killed: SIGKILL, the OOM killer) fails.
+# A HOST PORT pair is closed on a refusal (a reset too: nothing listens there) or that same no answer, else it fails.
 read -r -d '' PROBE <<'EOF' || true
 url=$1 table=$3 bad=0
+[[ $2 =~ [^[:space:]] ]] || { echo "FAIL  no own public address to try"; bad=1; }
 for own in $2; do
   ec=0
   err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1) || ec=$?
+  if [[ -n $err ]]; then why=$err; elif ((ec == 124)); then why='no answer in 5 s'; else why="exit $ec, nothing said"; fi
   if ((ec == 0)); then
     echo "FAIL  this host's own public address $own is reachable from inside"
     bad=1
   elif [[ $table != refused ]]; then
-    echo "FAIL  this host's own public address $own: the table alone did not refuse it (above), so this proves nothing (${err:-no answer in 5 s})"
+    echo "FAIL  this host's own public address $own: the table alone did not refuse it (above), so this proves nothing ($why)"
     bad=1
   elif [[ $err =~ (Operation\ not\ permitted|No\ route\ to\ host|Permission\ denied|Network\ is\ unreachable) ]]; then
     echo "ok    this host's own public address $own is refused (${BASH_REMATCH[1]})"
   elif ((ec == 124)) && [[ -z $err ]]; then
     echo "ok    this host's own public address $own gets no answer (the unit's IPAddressDeny drops it; the table alone refuses it, above)"
   else
-    echo "FAIL  this host's own public address $own is not refused by the walls (${err:-exit $ec, nothing said})"
+    echo "FAIL  this host's own public address $own is not refused by the walls ($why)"
     bad=1
   fi
 done
 shift 3
 while (($# >= 2)); do
-  if timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null; then
+  ec=0
+  err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>&1) || ec=$?
+  if [[ -n $err ]]; then why=$err; elif ((ec == 124)); then why='no answer in 5 s'; else why="exit $ec, nothing said"; fi
+  if ((ec == 0)); then
     echo "FAIL  $1:$2 is reachable from inside"
     bad=1
+  elif [[ $err =~ (Connection\ refused|Operation\ not\ permitted|No\ route\ to\ host|Permission\ denied|Network\ is\ unreachable) ]]; then
+    echo "ok    $1:$2 is closed (${BASH_REMATCH[1]})"
+  elif ((ec == 124)) && [[ -z $err ]]; then
+    echo "ok    $1:$2 is closed ($why)"
   else
-    echo "ok    $1:$2 is closed"
+    echo "FAIL  $1:$2 is not shown closed ($why)"
+    bad=1
   fi
   shift 2
 done
