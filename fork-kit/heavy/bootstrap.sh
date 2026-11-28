@@ -5,7 +5,9 @@
 #
 # Installer options (fork-kit/heavy/sbin/heavy-install): --slice NAME, --grace SECONDS, and, to have the kit write
 # the slice unit, --memory-high SIZE, --memory-max SIZE, --swap-max SIZE, --cpu-weight N; --sweep-timer to write
-# the leftover sweep's user units (each user enables the timer), --no-sweep-timer to remove them.
+# the leftover sweep's user units (each user enables the timer), --no-sweep-timer to remove them;
+# --replace-t3-capacity to link /usr/local/bin/t3-capacity over a host's own plain copy (kept in heavy-kept/).
+# The installer options come after --repo, --sha and --release-branch; a second --sha or --source is refused.
 # It refuses a sha that is not a commit on the fork's protected release branch (ci-release), downloads exactly
 # that commit, prints the sha and the hash of what it downloaded, and runs its installer (safe to run again).
 # Needs: curl, tar, python3. Linux with systemd only.
@@ -23,8 +25,14 @@ while [ $# -gt 0 ]; do
     --repo) repo="${2-}"; shift 2 ;;
     --sha) sha="${2-}"; shift 2 ;;
     --release-branch) branch="${2-}"; shift 2 ;;
-    --slice|--grace|--memory-high|--memory-max|--swap-max|--cpu-weight|--sweep-timer|--no-sweep-timer) break ;;
+    --slice|--grace|--memory-high|--memory-max|--swap-max|--cpu-weight|--sweep-timer|--no-sweep-timer|\
+    --replace-t3-capacity) break ;;
     *) die "unknown option $1 (see the top of this file)" ;;
+  esac
+done
+for a in "$@"; do
+  case "$a" in
+    --sha|--sha=*|--source|--source=*) die "$a after the installer options: the installer gets the sha checked here" ;;
   esac
 done
 printf '%s\n' "$repo" | grep -Eqx '[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}' || die "--repo must be OWNER/NAME"

@@ -32,6 +32,7 @@ import * as RunRecorder from "./runRecords/RunRecorder.ts";
 import * as StopFinishedChildren from "./stopFinishedChildren.ts";
 import * as ThreadRoleTargets from "./threadRoleTargetsLayer.ts";
 import * as WorkerWakeSlots from "./workerWakeSlots.ts";
+import * as WorkPanel from "./workPanel/workPanel.ts";
 
 /**
  * Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. A
@@ -52,13 +53,15 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
 
 /**
  * In server.ts's `layerRuntimeCoreDependenciesBase`: usage pacer and history, slot gate, usage
- * refresher, handoff service (built beside upstream's idle compaction worker), run records, result
- * reminder, the stop of finished children's sessions, the `threadRoles` save check's thread
- * lookup, which every settings write reaches, and the facts read's `factsCommand` runs.
+ * refresher, handoff service (beside upstream's idle compaction worker), run records, result
+ * reminder, finished children's session stop, the `threadRoles` save check's thread lookup, the
+ * facts read's `factsCommand` runs, and the work panel's shared runs read.
  */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
-  SlotGate.layer,
+  // fork.workPanel: the thread side panel's shared GitHub runs read and this machine's capacity,
+  // which reads this one slot gate (fork issue 1136).
+  WorkPanel.layer.pipe(Layer.provideMerge(SlotGate.layer)),
   HeadlessUsageRefresher.layer,
   HandoffService.layer,
   RunRecorder.layer,

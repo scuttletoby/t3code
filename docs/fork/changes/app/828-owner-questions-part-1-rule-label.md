@@ -1,0 +1,5 @@
+- Change: Owner questions, part 1: the rule (label `status:needs-owner-decision`, titles starting "Owner question" or "<Topic> Q<n>:", answered by a comment starting "Owner decision:" or "Owner decision (") is one fork file, `packages/contracts/src/forkOwnerQuestions.ts`. A fork page, **Waiting on you** (`/owner-questions`), lists the open owner questions of every project on every connected server, read-only, through upstream's issue listing, plus a listing by the label so a labelled question is never cut; it names any repository read only in part and says nothing is waiting only when every server answered in full. Part 2: the Issues entry opens it while the client setting `ownerQuestionsPage` is on (default on, owner decision; Settings > Fork > Issues page), at one seam in `_chat.issues.tsx`; off, upstream's Issues page.
+- Why: Owner questions spread over several repositories, in one place inside T3.
+- Setting: `client.ownerQuestionsPage`
+- Default: on (owner decision)
+- PR: [#828](https://github.com/scuttletoby/t3code/issues/828), [#976](https://github.com/scuttletoby/t3code/pull/976)

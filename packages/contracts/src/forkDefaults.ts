@@ -311,6 +311,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
       "On by default (the owner's decision): Issues opens Waiting on you, the open owner questions of every project, instead of upstream's Issues page. It changes which page the Issues entry opens, nothing else; turn it off in Settings > Fork for upstream's page.",
     decidedIn: "#828",
   },
+  {
+    scope: "client",
+    key: "workPanelEnabled",
+    default: false,
+    off: true,
+    reason: "Each device shows upstream's side panel until its owner turns the work panel on.",
+    decidedIn: "#1136",
+  },
 ];
 
 const FIELDS: Readonly<Record<ForkSettingScope, Readonly<Record<string, Schema.Top>>>> = {

@@ -237,6 +237,7 @@ class Caps(Base):
                                        'north has no writer slot (1/1 writers))') for l in self.log_lines()))
 
     def test_the_start_asks_for_the_model_effort_parent_and_machine(self):
+        self.cfg['machines']['north']['worktreeIsolation'] = True     # opted in: its project is a git checkout
         self.item('w1', machines=['north'], role='worker', isolation='worktree')
         self.run_filler()
         b = self.w.api.starts[0]
@@ -292,7 +293,7 @@ class Caps(Base):
 
     def test_refusals_back_off_doubling_under_one_request_id(self):
         self.cfg['machines']['local']['maxAgents'] = 0
-        self.w.api.refuse['env-north'] = ('usage_pacing_hold', 'the account is paced')
+        self.w.api.refuse['env-north'] = ('provider_unavailable', 'north is offline')
         self.item('w1')
         at = lambda s: (lambda: NOW + datetime.timedelta(seconds=s))
         for t in (0, 30, 61, 120, 181):
@@ -302,8 +303,8 @@ class Caps(Base):
         self.assertEqual(len(self.w.api.starts), 3)
         self.assertEqual(len({b['requestId'] for b in self.w.api.starts}), 1)   # so the wake goes once
         req = json.load(open(os.path.join(self.state, 'requests', 'w1.json')))['machines']['north']
-        self.assertEqual((req['refusals'], req['lastCode']), (3, 'usage_pacing_hold'))
-        self.assertTrue(any('north backing off after 1 refusal(s) (last: usage_pacing_hold) until '
+        self.assertEqual((req['refusals'], req['lastCode']), (3, 'provider_unavailable'))
+        self.assertTrue(any('north backing off after 1 refusal(s) (last: provider_unavailable) until '
                             '2026-11-21T12:01:00Z' in l for l in self.log_lines()))
         self.w.api.refuse.clear()
         self.w.now = at(181 + 240)
@@ -362,7 +363,7 @@ class Caps(Base):
 
     def test_a_request_id_refused_for_good_keeps_its_backoff(self):
         self.cfg['machines']['north']['maxAgents'] = 0
-        self.w.api.refuse_next = [('usage_pacing_hold', 'paced'), ('usage_pacing_hold', 'paced'),
+        self.w.api.refuse_next = [('provider_unavailable', 'offline'), ('provider_unavailable', 'offline'),
                                   ('request_rejected', 'refused at its dispatch')]
         self.item('w1')
         for s in (0, 60, 180):
@@ -438,6 +439,247 @@ class Usage(Base):
         self.meter('claude-north', 10)
         self.run_filler()
         self.assertEqual(self.started_ids(), ['w1'])
+
+
+class AccountFallback(Base):
+    """An item (or the defaults) may name an ordered list of accounts: the first with usage left on that machine is
+    used, by the same rules as the usage guard."""
+    ACCTS = ['claude-anne', 'claudeAgent']
+
+    def setUp(self):
+        super().setUp()
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.meter('claude-anne', 40)
+
+    def account_started(self, iid='w1'):
+        with open(os.path.join(self.q, 'started', iid + '.json')) as f:
+            return json.load(f)['account']
+
+    def test_a_full_first_account_falls_back_to_the_second(self):
+        self.meter('claude-anne', 95)
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts], ['claudeAgent'])
+        self.assertEqual(self.account_started(), 'claudeAgent')
+        line = [l for l in self.log_lines() if 'started w1' in l][0]
+        self.assertIn('on local as claudeAgent', line)
+        self.assertIn('claude-anne is full (5h 95%)', line)
+
+    def test_the_first_account_with_room_is_used_first(self):
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        self.assertEqual(self.w.api.starts[0]['task']['target']['providerInstanceId'], 'claude-anne')
+        self.assertEqual(self.account_started(), 'claude-anne')
+
+    def test_both_full_waits_and_says_why_once(self):
+        self.meter('claude-anne', 99)
+        self.meter('claudeAgent', 95)
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        line = [l for l in self.log_lines() if 'waiting w1' in l][0]
+        self.assertIn('claude-anne is full (5h 99%)', line)
+        self.assertIn('claudeAgent is full (5h 95%)', line)
+        lines = self.log_lines()
+        self.run_filler()                                   # runs again: nothing new, nothing written
+        self.assertEqual(self.log_lines(), lines)
+        self.meter('claudeAgent', 10)                       # the second frees up
+        self.run_filler()
+        self.assertEqual(self.account_started(), 'claudeAgent')
+
+    def test_stale_or_missing_data_on_the_first_uses_the_second(self):
+        self.meter('claude-anne', 10, age_min=91)
+        self.item('w1', account=self.ACCTS)
+        os.remove(os.path.join(self.caches, 'claude-anne.json'))
+        self.item('w2', account=['claude-gone', 'claude-anne', 'claudeAgent'])
+        self.meter('claude-anne', 10, age_min=91)
+        self.run_filler()
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts],
+                         ['claudeAgent', 'claudeAgent'])
+
+    def test_windows_of_another_family_or_past_resets_do_not_block_the_first(self):
+        self.meter('claude-anne', 0, windows=[
+            {'id': 'seven_day_fable', 'usedPercent': 100, 'resetsAt': '2026-11-25T00:00:00Z'},
+            {'id': 'five_hour', 'usedPercent': 99, 'resetsAt': '2026-11-21T11:00:00Z'}])
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        self.assertEqual(self.account_started(), 'claude-anne')
+
+    def test_a_single_string_and_a_default_list_keep_working(self):
+        self.item('w1', account='claudeAgent')
+        self.run_filler()
+        self.assertEqual(self.account_started(), 'claudeAgent')
+        self.meter('claude-anne', 96)
+        self.cfg['defaults']['account'] = self.ACCTS        # a machine default list; the item names none
+        self.item('w2')
+        self.run_filler()
+        self.assertEqual(self.account_started('w2'), 'claudeAgent')
+        self.meter('claude-anne', 10)
+        self.item('w3', kind='other')                       # two writers already hold the writer slots
+        self.run_filler()
+        self.assertEqual(self.account_started('w3'), 'claude-anne')
+
+    def test_a_remote_machine_skips_accounts_without_a_meter_there(self):
+        self.cfg['machines']['local']['maxAgents'] = 0
+        self.cfg['machines']['north']['maxAgents'] = 2
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        b = self.w.api.starts[0]['task']['target']
+        self.assertEqual((b['providerInstanceId'], b['environmentId']), ('claudeAgent', 'env-north'))
+
+    def test_bad_account_fields_are_refused(self):
+        for iid, acct in (('a1', []), ('a2', 5), ('a3', ['claudeAgent', '']), ('a4', [None])):
+            self.item(iid, account=acct)
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        for iid in ('a1', 'a2', 'a3', 'a4'):
+            self.assertTrue(any(f'refused {iid}.json: "account" must be' in l for l in self.log_lines()), iid)
+        cfg = dict(self.cfg, defaults={'account': []})
+        path = self.write('cfg.json', json.dumps(cfg))
+        with self.assertRaises(sf.ConfigError):
+            sf.load_config(path)
+
+    def test_a_start_cut_off_mid_way_asks_again_on_the_same_account(self):
+        self.item('w1', account=self.ACCTS)
+        self.w.api.crash_after_start = True
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.meter('claude-anne', 99)                       # the first fills while the answer was lost
+        self.w.now = lambda: NOW + datetime.timedelta(minutes=1)
+        self.run_filler()
+        self.assertEqual(len(self.w.api.by_request), 1)     # never a second task on the other account
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts],
+                         ['claude-anne', 'claude-anne'])
+        self.assertEqual(self.account_started(), 'claude-anne')
+
+    def test_a_first_account_refused_by_the_server_moves_to_the_second_after_its_wait(self):
+        self.item('w1', account=self.ACCTS)
+        self.w.api.refuse_next = [('usage_pacing_hold', 'claude-anne filled since the last reading')]
+        self.run_filler()
+        self.assertEqual(self.started_ids(), [])
+        self.meter('claude-anne', 99)
+        self.w.now = lambda: NOW + datetime.timedelta(seconds=61)
+        self.run_filler()
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts],
+                         ['claude-anne', 'claudeAgent'])
+        self.assertEqual(self.account_started(), 'claudeAgent')
+
+    def test_a_pacing_hold_on_the_first_moves_to_the_second_while_its_meter_is_low(self):
+        # the server's pacing gate holds an account ahead of pace well under 95%: the meter here still reads 40%
+        self.item('w1', account=self.ACCTS)
+        self.w.api.refuse_next = [('usage_pacing_hold', 'claude-anne is ahead of pace; claudeAgent has room')]
+        self.run_filler()
+        self.assertEqual(self.started_ids(), [])
+        self.w.now = lambda: NOW + datetime.timedelta(seconds=30)      # the next run, inside the first's wait
+        self.run_filler()
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts],
+                         ['claude-anne', 'claudeAgent'])
+        self.assertEqual(self.account_started(), 'claudeAgent')
+        self.assertEqual(len({b['requestId'] for b in self.w.api.starts}), 1)   # one request id: no double start
+
+    def test_a_held_account_is_tried_again_after_its_wait_and_doubles(self):
+        self.item('w1', account=self.ACCTS)
+        self.meter('claudeAgent', 99)
+        self.w.api.refuse[None] = ('usage_pacing_hold', 'paced')
+        at = lambda s: (lambda: NOW + datetime.timedelta(seconds=s))
+        for t in (0, 30, 61, 120, 181):
+            self.w.now = at(t)
+            self.run_filler()
+        self.assertEqual(len(self.w.api.starts), 3)                    # 0 s, 61 s, 181 s
+        with open(os.path.join(self.state, 'requests', 'w1.json')) as f:
+            req = json.load(f)
+        self.assertEqual(req['accounts']['local']['claude-anne']['refusals'], 3)
+        self.assertNotIn('local', req.get('machines') or {})           # the machine itself does not wait
+        self.w.now = at(200)
+        self.run_filler()
+        line = [l for l in self.log_lines() if 'waiting w1' in l][-1]
+        self.assertIn('claude-anne on local backing off after', line)
+        self.assertIn('claudeAgent is full', line)
+
+    def test_an_account_null_uses_the_default_as_on_main(self):
+        self.item('w1', account=None)
+        self.run_filler()
+        self.assertEqual(self.account_started(), 'claudeAgent')
+
+    def test_a_lens_watch_with_a_bad_account_is_refused_and_a_list_is_kept(self):
+        self.w.prs[7] = green()
+        self.write('queue/lens-watch/bad.json', json.dumps({'pr': 7, 'lenses': [{'lens': 'code'}], 'account': []}))
+        self.write('queue/lens-watch/good.json', json.dumps({'pr': 7, 'lenses': [{'lens': 'tests'}],
+                                                             'account': self.ACCTS}))
+        self.run_filler()
+        self.assertTrue(any('refused lens-watch/bad.json: "account" must be' in l for l in self.log_lines()))
+        self.assertFalse(any(n.startswith('lens-7-code-') for n in os.listdir(self.q)))
+        self.assertEqual(self.account_started('lens-7-tests-' + HEAD[:7]), 'claude-anne')
+
+    def test_a_stale_reading_is_logged_once_while_only_its_age_grows(self):
+        self.meter('claude-anne', 10, age_min=91)
+        self.meter('claudeAgent', 10, age_min=95)
+        self.item('w1', account=self.ACCTS)
+        for m in (0, 1, 2):
+            self.w.now = lambda m=m: NOW + datetime.timedelta(minutes=m)
+            self.run_filler()
+        self.assertEqual(len([l for l in self.log_lines() if 'waiting w1' in l]), 1)
+        self.meter('claudeAgent', 96)                                   # a real change is logged again
+        self.run_filler()
+        self.assertEqual(len([l for l in self.log_lines() if 'waiting w1' in l]), 2)
+
+    def test_an_old_marker_without_a_chosen_account_still_recovers(self):
+        self.item('w1')
+        os.makedirs(os.path.join(self.state, 'inflight'))
+        with open(os.path.join(self.q, 'w1.json')) as f:
+            it = json.load(f)
+        sf.write_json(os.path.join(self.state, 'inflight', 'w1.json'),
+                      {'requestId': 'w1:1', 'parentThreadId': 'thread-orch', 'machine': 'local',
+                       'at': '2026-11-21T11:59:00Z', 'item': it})
+        self.run_filler()
+        self.assertEqual([b['requestId'] for b in self.w.api.starts], ['w1:1'])
+        self.assertEqual(self.w.api.starts[0]['task']['target']['providerInstanceId'], 'claudeAgent')
+        self.assertEqual(self.started_ids(), ['w1'])
+
+
+class LinkedMachines(Base):
+    def test_a_machine_with_a_project_id_sends_it_and_one_without_does_not(self):
+        self.cfg['machines']['north']['projectId'] = 'project-north'
+        self.item('w1', machines=['north'])
+        self.item('w2', machines=['local'])
+        self.run_filler()
+        targets = {b['task']['title']: b['task']['target'] for b in self.w.api.starts}
+        self.assertEqual((targets['Task w1']['environmentId'], targets['Task w1']['projectId']),
+                         ('env-north', 'project-north'))
+        self.assertNotIn('projectId', targets['Task w2'])
+
+    def test_worktree_isolation_on_a_machine_without_it_is_refused_when_read(self):
+        self.item('wt1', machines=['north'], isolation='worktree')            # linked: off by default
+        self.cfg['machines']['local']['worktreeIsolation'] = False            # not a git checkout
+        self.item('wt2', machines=['local'], isolation='worktree')
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        lines = self.log_lines()
+        for iid, name in (('wt1', 'north'), ('wt2', 'local')):
+            self.assertEqual(len([l for l in lines if f'refused {iid}.json: "isolation": "worktree" cannot run on '
+                                  f'{name}' in l]), 1, iid)
+        self.run_filler()
+        self.assertEqual(self.log_lines(), lines)                              # once, not every run
+        self.assertTrue(os.path.exists(os.path.join(self.q, 'wt1.json')))     # kept
+
+    def test_a_worktree_item_without_machines_runs_only_where_it_can(self):
+        self.cfg['machines']['local']['maxAgents'] = 0
+        self.item('wt1', isolation='worktree')
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        line = [l for l in self.log_lines() if 'waiting wt1' in l][0]
+        self.assertIn('north has no worktree isolation', line)
+        self.cfg['machines']['local']['maxAgents'] = 3
+        self.run_filler()
+        self.assertEqual([b['task']['target'].get('environmentId') for b in self.w.api.starts], [None])
+        self.cfg['machines']['local']['worktreeIsolation'] = False             # no machine can: refused
+        self.item('wt2', isolation='worktree')
+        self.run_filler()
+        self.assertTrue(any('refused wt2.json: "isolation": "worktree" cannot run on local, north' in l
+                            for l in self.log_lines()))
+        self.item('w3', machines=['north'])                                    # no isolation: fine there
+        self.run_filler()
+        self.assertIn('w3', self.started_ids())
 
 
 class ReadyWhen(Base):
@@ -874,11 +1116,22 @@ MUTATIONS = {
         "        if answer.get('parentSettled') is True:\n", "        if False:\n",
         'Caps.test_a_parent_settled_by_hand_stops_the_run'),
     'notes stay quiet': (
-        "        if self.notes.get(key) != line:\n", "        if True:\n",
+        "        if AGE_RE.sub('is old', self.notes.get(key) or '') != AGE_RE.sub('is old', line):\n", "        if True:\n",
         'Quiet.test_a_second_run_with_nothing_new_writes_nothing'),
     'broken files are refused': (
         "        if not text.strip():\n            return None, 'empty file'\n", "",
         'BrokenQueueFiles.test_empty_broken_and_incomplete_files_are_refused_and_kept'),
+    'account fallback': (
+        "            if r is None:\n                return account, '; '.join(skipped) or None\n",
+        "            if True:\n                return account, None\n",
+        'AccountFallback.test_a_full_first_account_falls_back_to_the_second'),
+    'worktree isolation is checked': (
+        "        return bool(m.get('worktreeIsolation', not m.get('environmentId')))\n",
+        "        return True\n",
+        'LinkedMachines.test_worktree_isolation_on_a_machine_without_it_is_refused_when_read'),
+    'a usage refusal holds only that account': (
+        "        usage = bool(account) and code.startswith('usage_')\n", "        usage = False\n",
+        'AccountFallback.test_a_pacing_hold_on_the_first_moves_to_the_second_while_its_meter_is_low'),
     'lens rounds': (
         "if len(rounds) >= int(lw.get('maxRounds', 2)):", "if False:",
         'Lenses.test_a_new_head_is_a_new_round_and_rounds_stop_at_the_limit'),

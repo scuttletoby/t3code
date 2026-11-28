@@ -1,0 +1,5 @@
+- Change: Agent slots: `delegate_task` is refused above a number of running agents per machine or account, or below a memory floor.
+- Why: Too many agents at once can overload a small machine.
+- Setting: `server.agentSlots`
+- Default: on: capacity rule decides
+- PR: [#84](https://github.com/scuttletoby/t3code/pull/84), [#89](https://github.com/scuttletoby/t3code/pull/89)

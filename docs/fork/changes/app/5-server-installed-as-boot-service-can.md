@@ -1,0 +1,5 @@
+- Change: A server installed as a boot service can update itself once no thread is working, after an optional "is it quiet?" command agrees.
+- Why: Updates without someone watching, and without cutting off running work.
+- Setting: `server.automaticUpdates`, `server.automaticUpdatesQuietCommand`
+- Default: off
+- PR: [#5](https://github.com/scuttletoby/t3code/pull/5)

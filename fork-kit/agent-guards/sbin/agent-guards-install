@@ -5,12 +5,13 @@
   agent-guards-install uninstall
   agent-guards-install self-check
 
-install copies bin/ (the six hooks, agent-guards-fast, agent-guards and facts), sbin/agent-guards-install, lib/agent_guards/, README.md, FACTS.md and
+install copies bin/ (the six hooks, agent-guards-fast, agent-guards, facts and fork-lens-packet), sbin/agent-guards-install, lib/agent_guards/, README.md, FACTS.md and
 fork-kit/common/{machine_file,kit_install}.py of one release into /usr/local/libexec/agent-guards/versions/<sha>/
 (with MANIFEST.sha256 and the bytecode of BYTECODE, see kit_install.bytecode_files), checks the copy, switches the link `current` to it and links /usr/local/bin/<hook> and
-/usr/local/bin/{agent-guards,facts} to it. With --settings it also writes the hooks' Claude Code managed settings drop-in
+/usr/local/bin/{agent-guards,facts,fork-lens-packet} to it. With --settings it also writes the hooks' Claude Code managed settings drop-in
 (/etc/claude-code/managed-settings.d/agent-guards.json), which every session of every user on the machine reads
-and only root can change; --no-settings removes it. The choice is kept in /etc/agent-guards/config.json, so a run
+and only root can change, with the speed variables of the machine file's "agent-guards"."harnessEnv" as its "env"
+(defaults in agent_guards.config.HARNESS_ENV; a variable another managed settings file sets is left to it); --no-settings removes it. The choice is kept in /etc/agent-guards/config.json, so a run
 without either option keeps it (the first install: no drop-in). The drop-in is written only after the links, so a
 hook it names is always there. Safe to run again, and to stop at any step; one installer at a time. The steps every
 kit shares are in fork-kit/common/kit_install.py. A run killed while writing a file leaves its temporary copy
@@ -34,13 +35,14 @@ sys.path[:0] = [_common if os.path.isdir(_common) else os.path.join(os.path.dirn
                 os.path.join(_kit, 'lib')]
 try:
     import kit_install  # noqa: E402
-    from agent_guards import wiring  # noqa: E402
+    import machine_file  # noqa: E402
+    from agent_guards import config as guard_config, wiring  # noqa: E402
 except ImportError as e:     # a copy with a part missing: the bootstrap makes it whole again
     sys.exit(f'agent-guards-install: cannot load its installer code ({e}): install again with the bootstrap, as root '
              '(fork-kit/agent-guards/README.md, Install)')
 
 HOOKS = wiring.HOOKS
-COMMANDS = ('agent-guards', 'facts')   # commands people and agents run, linked beside the hooks
+COMMANDS = ('agent-guards', 'facts', 'fork-lens-packet')   # commands people and agents run, linked beside the hooks
 HELPERS = (wiring.FAST,)               # run by the hooks' settings entries, linked beside the hooks
 
 
@@ -57,7 +59,7 @@ class AgentGuardsInstaller(kit_install.Installer):
         'sbin/agent-guards-install', 'README.md', 'FACTS.md', 'common/machine_file.py', 'common/kit_install.py')
     EXECUTABLE = frozenset([f'bin/{h}' for h in HOOKS + COMMANDS + HELPERS] + ['sbin/agent-guards-install'])
     PACKAGE = 'agent_guards'
-    MODULES = ('__init__', 'approval', 'check', 'config', 'facts', 'fast', 'quick', 'wiring')
+    MODULES = ('__init__', 'approval', 'check', 'config', 'facts', 'fast', 'lenspacket', 'quick', 'wiring')
     # the hooks the fast path runs from bytecode (agent_guards.fast), and the lib they import
     BYTECODE = tuple(f'bin/{h}' for h in wiring.FAST_HOOKS) + tuple(f'lib/agent_guards/{m}.py' for m in MODULES)
     HELP = ('bin/agent-guards', 'agent-guards check')
@@ -101,7 +103,29 @@ class AgentGuardsInstaller(kit_install.Installer):
         off = self.read_config().get('settingsOff')
         if not settings and self.drop_in_ours():
             off = 'pending'          # written before the drop-in goes; the time once it is gone (kit_step)
-        return {'settings': settings, 'settingsOff': None if settings else off}
+        out = {'settings': settings, 'settingsOff': None if settings else off}
+        if settings:
+            out['env'] = self.harness_env()
+        return out
+
+    def harness_env(self):
+        """The drop-in's "env": the machine file's harnessEnv over the kit's defaults (config.harness_env), less
+        every variable managed-settings.json or another managed-settings.d file already sets: those files merge with
+        the drop-in key by key and the later file wins, so the kit never replaces a value the machine sets there. A
+        broken machine file keeps the defaults; each problem is said, the install goes on (speed, not safety)."""
+        try:
+            section = machine_file.read_section(guard_config.KIT, self.p(machine_file.default_path()), self.ROOT_UID,
+                                                optional=True) or {}
+        except machine_file.MachineFileError as e:
+            section = {}
+            self.say(f'warning: harnessEnv: the machine file cannot be used ({e}): the kit\'s defaults used')
+        env, problems = guard_config.harness_env(section)
+        for p in problems:
+            self.say(f'warning: harnessEnv: {p}')
+        env, left = wiring.env_for(env, self.p(wiring.DROP_IN))
+        for f, taken in left:
+            self.say(f'managed settings env left to {self.show(f)}: {", ".join(taken)}')
+        return env
 
     def config(self, a, plan):
         out = {'version': 1, 'settings': plan['settings']}
@@ -116,9 +140,11 @@ class AgentGuardsInstaller(kit_install.Installer):
             for path in (wiring.MANAGED_DIR, os.path.dirname(wiring.DROP_IN)):
                 if not os.path.lexists(self.p(path)):   # Claude Code's folders: made when missing, else left as
                     self.ensure_dir(path)               # they are (check_managed: root-owned folders)
-            if self.write_file(wiring.DROP_IN, wiring.drop_in_text()):
+            env = plan.get('env') or {}
+            if self.write_file(wiring.DROP_IN, wiring.drop_in_text(env=env)):
                 self.say(f'wrote {wiring.DROP_IN}: every new Claude Code session runs the hooks '
                          '(sessions already running keep the hooks they started with)')
+            self.say('managed settings env: ' + (' '.join(f'{k}={v}' for k, v in env.items()) or 'none'))
         else:
             self.settings_off(plan)
 

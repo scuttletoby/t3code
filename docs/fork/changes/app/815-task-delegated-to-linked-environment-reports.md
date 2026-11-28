@@ -1,0 +1,5 @@
+- Change: A task delegated to a linked environment reports what its thread there waits on (a question, an approval, a secret by label and reason only) in `task_status` and `delegate_task` (secrets also as `pendingSecretRequests`; `promptsKnown: false` when unknown), and wakes its parent once per prompt; a question, approval or secret ends a blocking wait; a machine that cannot be asked reads as unknown.
+- Why: Upstream always reported it as not waiting, so its parent never learned it was blocked.
+- Setting: none
+- Default: always
+- PR: [#815](https://github.com/scuttletoby/t3code/pull/815), [#817](https://github.com/scuttletoby/t3code/issues/817)

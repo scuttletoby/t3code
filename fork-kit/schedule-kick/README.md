@@ -48,9 +48,14 @@ with placeholder names:
       "ref": "main",
       "inputs": { "mode": "quick" }
     }
-  ]
+  ],
+  "heads": [{ "repo": "OWNER/REPO", "workflow": "tests.yml", "graceMinutes": 10, "maxPerPass": 3 }],
+  "keepOn": [{ "repo": "OWNER/REPO", "workflows": ["tests.yml", "follow.yml"] }]
 }
 ```
+
+`entries`, `heads` and `keepOn` are each optional, but a config needs at least one entry in one of them. `heads`
+and `keepOn` are described in [Heads](#heads-every-trusted-head-gets-a-run) and [Keep-on](#keep-on-turn-named-workflows-back-on).
 
 - `cron` is a copy of the workflow's own `schedule` line. Each field takes a number, `*`, `A-B`, `*/N`, `A-B/N`
   or a comma list of those. Anything else (names such as `MON`, `@daily`, `?`, `L`, six fields, `5/15`) is
@@ -114,6 +119,65 @@ tick also logs one line per entry to the journal (`journalctl --user -u schedule
 - **Many other runs:** one runs-list call reads up to 100 runs of the ref since the slot. If more than 100 push runs
   come first, the slot's run is not seen and one dispatch is sent: the tool errs towards running, never towards
   being held off.
+
+## Heads: every trusted head gets a run
+
+GitHub drops the events of a workflow while it is switched off, so a pull request head or a push to the default
+branch can end up with no run at all. Each tick, for each `heads` entry, makes **one** GraphQL call: the default
+branch's tip and the 100 most recently updated open pull requests, each head commit with its GitHub Actions check
+suites. Only trusted heads count: the default branch's tip and heads of pull requests from a branch of the same
+repository; a pull request from another fork is never dispatched. A head with any run of the entry's workflow
+(any event, any state) needs nothing. A head without one is recorded the first time it is seen, and once it has been
+seen for `graceMinutes` (0 to 60, default 10) it gets **one** `workflow_dispatch` on its branch with the inputs
+`ref` (the head's commit) and `head` (`true`); at most `maxPerPass` (1 to 20, default 3) attempts a tick (refused
+ones count too), the default branch first, then the pull requests updated last.
+
+Every head gets a **run**, not a **result**: a head with a run in any state counts as done, so a run cancelled by
+hand, lost with its runner or stuck queued is never dispatched again here (the fleet's watch and sweep and
+`fork-ci-rerun` deal with those), and a head run whose pull request also has no fork-checks run (both events dropped
+in one switch-off) fails in `fork_checks_ran` and is not dispatched again either.
+
+The workflow needs a `workflow_dispatch` with a `ref` input and a boolean `head` input that makes the run test its
+own commit (`github.sha`, where its checks land), not the commit `ref` names: if the branch moved between the
+GraphQL call and the dispatch, the new head is the one that is tested and gets the result. Its result stands in for
+the pull request's own run, so it must never be weaker: fork-tests.yml's head run tests the pull request's merge
+commit, scans for secrets as that pull request's run and runs every job. A branch whose workflow file is older than
+the `head` input (HTTP 422 "Unexpected inputs") or has no `workflow_dispatch` refuses the dispatch for good: that
+commit is recorded as refused, alerted once and not sent again (its next push brings the new file). Any other 422
+is about that one commit: that head alone waits (5 minutes, then 10) and after 3 refusals is recorded as refused and
+alerted once, while the heads after it go on in the same tick. "Cannot trigger a 'workflow_dispatch' on a disabled
+workflow" (switched off at that moment, #517), and every error that is not a 422, are about the whole entry: it
+waits (5 minutes, doubling, at most an hour) and tries again. That wait goes on counting across ticks whose GraphQL
+call works and ends only after a tick with no such error. Fewer than 100 REST calls left stops the dispatches of
+the tick. With `ghAs` the App needs Actions write and read access to pull requests and contents.
+
+| Case                                                     | What happens                                                                                                                        |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Runs again                                               | a head is recorded as sent before the call and never sent twice, also when its run is slow to show                                  |
+| Stops half-way                                           | sent, state not written: the run's check suite shows next tick, nothing is sent again                                               |
+| Sent, but no run shows within 30 minutes                 | one ALERT line, an error exit and one alert-channel message (`lost`), not sent again                                                |
+| No runs at all, empty or broken state                    | first tick records the heads; the check suites are what stop a second dispatch, not the state file                                  |
+| A head force-pushed mid-pass                             | a pull request whose head moved while GitHub answered waits a tick; marks of heads gone stay 7 days                                 |
+| More check suites on a commit than read (50), none a run | not sent (cannot tell), with a note                                                                                                 |
+| API error                                                | that entry waits (5 minutes, doubling, at most an hour); a rate limit, or a low REST or GraphQL budget (each counted apart), pauses |
+| A 422 about one commit                                   | that head waits on its own (5, then 10 minutes), refused after 3; the heads after it go on                                          |
+
+Budget: one GraphQL call a tick per entry (a few points of the 5,000 an hour) plus at most `maxPerPass` dispatches.
+
+## Keep-on: turn named workflows back on
+
+`schedule-kick keep-on` (its own timer, every 15 seconds) makes one workflow-list call per `keepOn` entry and turns
+back on (`PUT .../enable`) each workflow the entry names that is `disabled_manually` or `disabled_inactivity`. Each
+re-enable is one `ALERT` line in the journal (`journalctl --user -u schedule-kick-keep-on`) and counts in
+`keep-on.json`. A named workflow that is missing, in another state (`disabled_fork`), or that cannot be turned on
+(an API refusal) is an error line, exit 1, and a message through the machine's [alert
+channel](../common/README.md#the-alert-channel) (event `workflow-off`), at most once an hour for each workflow. It
+never switches a workflow off (the GitHub client has no call that could), and it never touches a workflow the entry
+does not name. The token needs Actions write. Budget: one call per entry every 15 seconds (240 an hour) plus one
+per re-enable. `schedule-kick status --keep-on` prints the last pass. Runs again: an `active` workflow needs no call;
+two passes at once: the second does nothing (its own lock). Stopped after a re-enable, before the state is written:
+the next pass finds it on. A broken state file reads as empty. A rate limit pauses keep-on until GitHub's reset
+(or `retry-after`); a low budget seen later in the same pass never shortens that pause.
 
 ## Late schedule runs
 
@@ -205,9 +269,10 @@ loginctl enable-linger "$USER"     # as root, if the user is not always logged i
 
 Files: `/usr/local/libexec/schedule-kick/versions/<sha>/` (code, with `MANIFEST.sha256`), the link `current`,
 `/usr/local/bin/schedule-kick`, `/usr/local/sbin/schedule-kick-install`, `/etc/schedule-kick/config.json` (only
-whether the timer is on) and `installed.tsv`, and with `--timer` the user units `schedule-kick.service` and
-`schedule-kick.timer` in `/etc/systemd/user/`. `schedule-kick-install self-check` reports drift. Upgrade: the
-bootstrap with the new sha. Remove: each user runs `systemctl --user disable --now schedule-kick.timer`, then
+whether the timer is on) and `installed.tsv`, and with `--timer` the user units `schedule-kick.service`,
+`schedule-kick.timer`, `schedule-kick-keep-on.service` and `schedule-kick-keep-on.timer` in `/etc/systemd/user/`
+(a user with `keepOn` also runs `systemctl --user enable --now schedule-kick-keep-on.timer`). `schedule-kick-install self-check` reports drift. Upgrade: the
+bootstrap with the new sha. Remove: each user runs `systemctl --user disable --now schedule-kick.timer schedule-kick-keep-on.timer`, then
 `schedule-kick-install uninstall` as root. Users' own config and state folders stay (delete them by hand).
 
 The service runs with `UMask=0077` and no other sandboxing: `gh-as` gets the App token through `sudo`, which
@@ -220,7 +285,7 @@ which some distributions restrict: check `systemctl --user status schedule-kick.
 
 ## Tests
 
-`tests/*.test.py` (`late.test.py` for the late check), run with
+`tests/*.test.py` (`late.test.py` for the late check, `heads.test.py` and `keepon.test.py` for those parts), run with
 `python3 -I -B fork-kit/schedule-kick/tests/NAME.test.py` from the repository root: a fake GitHub (in the process,
 a local HTTP server and a fake `gh-as`), a fixed clock and a temporary folder. No root, no systemd, no network. `RedCheck` in each file breaks every rule in a copy of the code and shows its test
 then fails.

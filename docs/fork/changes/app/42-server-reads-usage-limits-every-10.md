@@ -1,0 +1,5 @@
+- Change: The server reads usage limits every 10 minutes while no app is open.
+- Why: Pacing has current numbers on a machine nobody is looking at.
+- Setting: `server.headlessUsageRefreshInterval`
+- Default: on (10 minutes); read only
+- PR: [#42](https://github.com/scuttletoby/t3code/pull/42)

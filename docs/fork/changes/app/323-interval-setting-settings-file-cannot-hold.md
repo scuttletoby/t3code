@@ -1,0 +1,5 @@
+- Change: An interval setting the settings file cannot hold (negative, not finite, too large) is refused when saved; one already in the file reads as its default instead of resetting every setting. A test finds every interval setting from the schema.
+- Why: A `1e400` saved as `null` made the next start reject the whole settings file.
+- Setting: none
+- Default: always
+- PR: [#323](https://github.com/scuttletoby/t3code/pull/323)

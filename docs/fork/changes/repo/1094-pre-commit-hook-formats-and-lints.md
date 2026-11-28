@@ -1,0 +1,5 @@
+- Change: The pre-commit hook formats and lints only the staged files and runs no knip (CI runs knip on every pull request).
+- Why: A whole-repo knip on each commit took ~4 GB and, under load, over 30 minutes.
+- Setting: none
+- Default: always
+- PR: [#1094](https://github.com/scuttletoby/t3code/issues/1094)

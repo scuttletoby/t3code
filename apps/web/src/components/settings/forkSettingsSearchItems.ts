@@ -268,6 +268,13 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     scope: "environment-defaults",
   },
   {
+    id: "work-panel",
+    title: "Work panel",
+    to: FORK_PAGE,
+    searchTerms: ["work panel workPanelEnabled ci checks queue runs side panel capacity"],
+    environmentOnly: true,
+  },
+  {
     id: "assistant",
     title: "Offer an assistant thread",
     to: FORK_PAGE,

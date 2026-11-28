@@ -1,0 +1,5 @@
+- Change: Handoff instead of compaction, part 2: the handoff service hands a big or idle thread to a fresh session in the same thread, with T3's state and the recent conversation, only while the thread is quiet and still at the run that triggered it.
+- Why: Long threads keep their children, PRs and waits instead of compacting.
+- Setting: `server.handoff`, `projectOverride.handoff`
+- Default: off
+- PR: [#320](https://github.com/scuttletoby/t3code/pull/320)

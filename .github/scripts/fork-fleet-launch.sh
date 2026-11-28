@@ -30,13 +30,15 @@
 #                and adds the new addresses to each running unit's IPAddressDeny. No lookup answers: it fails and
 #                changes nothing (the last block stays), and the dispatcher starts no runner on the pool this pass.
 #   check-net URL HOST:PORT...
-#                the proof of the network and the walls (.github/fork-fleet.md, host step 6): runs two probes in a
-#                runner's real sandbox, as a free runner user. Exit 0 only when URL (public) answers, every HOST:PORT
-#                (services this host reaches: its loopback, its LAN address, Tailscale) is closed from inside, this
-#                host's own public address is refused, no AF_VSOCK socket, io_uring ring or 32-bit system call
-#                works inside, only the pseudo devices and no socket are there, the unit sees no mount but the ones
-#                job_fs allows, each of them comes from the host path job_fs resolved (no link swapped in between),
-#                and none of them receives a mount the host makes later.
+#                the proof of the network and the walls (.github/fork-fleet.md, host step 6): runs three probes in a
+#                runner's real sandbox, as a free runner user (one with this host's own public addresses left out of
+#                its IPAddressDeny, so the nft table alone must refuse them). Exit 0 only when URL (public) answers,
+#                every HOST:PORT (services this host reaches: its loopback, its LAN address, Tailscale) is closed from
+#                inside, this host's own public address is refused by the table alone and closed in the job's own
+#                sandbox, no AF_VSOCK socket, io_uring ring or 32-bit system call works inside, only the pseudo
+#                devices and no socket are there, the unit sees no mount but the ones job_fs allows, each of them
+#                comes from the host path job_fs resolved (no link swapped in between), and none of them receives a
+#                mount the host makes later.
 #   paths        reads only, for the per-OS walls (fork-fleet-walls/<os>, `mounts`): a line `DEST SOURCE` for every
 #                file or folder of this host a job's unit gets (DEST where the unit has it, SOURCE the real path bound
 #                there: job_view, the same rule as start's), WORK_ROOT standing for each job's copy in it.
@@ -1592,29 +1594,75 @@ kill_unit() {
   return 1
 }
 
-# Runs in the sandbox as the runner user: $1 the URL that must answer, $2 this host's own public addresses, which the
-# walls must refuse (a refusal, not a timeout: a router that drops the packet would prove nothing), then HOST PORT
-# pairs that must be closed.
-read -r -d '' PROBE <<'EOF' || true
-url=$1 bad=0
-for own in $2; do
-  if err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1); then
-    echo "FAIL  this host's own public address $own is reachable from inside"
+# This host's own public addresses ($1, as the units block them) from inside, with the nft table alone: run in the
+# sandbox, as the runner user, with these addresses left out of the unit's IPAddressDeny. Each must get the table's
+# refusal (its reject: No route to host), not a timeout: a router that drops the packet would prove nothing. A job's
+# unit has them in IPAddressDeny too, which drops the packet in the kernel before it reaches the table (no answer,
+# no refusal): PROBE takes that silence as closed only once this probe saw the table refuse each of them.
+read -r -d '' OWN_PROBE <<'EOF' || true
+bad=0
+[[ $1 =~ [^[:space:]] ]] || { echo "FAIL  no own public address to try"; bad=1; }
+for own in $1; do
+  ec=0
+  err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1) || ec=$?
+  if [[ -n $err ]]; then why=$err; elif ((ec == 124)); then why='no answer in 5 s'; else why="exit $ec, nothing said"; fi
+  if ((ec == 0)); then
+    echo "FAIL  this host's own public address $own is reachable from inside with the table alone"
     bad=1
-  elif [[ $err =~ (Operation\ not\ permitted|No\ route\ to\ host|Permission\ denied|Network\ is\ unreachable) ]]; then
-    echo "ok    this host's own public address $own is refused (${BASH_REMATCH[1]})"
+  elif [[ $err =~ (No\ route\ to\ host) ]]; then
+    echo "ok    this host's own public address $own is refused by the table alone (${BASH_REMATCH[1]})"
   else
-    echo "FAIL  this host's own public address $own is not refused by the walls (${err:-no answer in 5 s})"
+    echo "FAIL  this host's own public address $own is not refused by the table alone ($why)"
     bad=1
   fi
 done
-shift 2
+exit "$bad"
+EOF
+
+# Runs in the sandbox as the runner user: $1 the URL that must answer, $2 this host's own public addresses, which the
+# walls must refuse, $3 `refused` when OWN_PROBE saw the table alone refuse each of them (else `unproven`), then HOST
+# PORT pairs that must be closed. An own address must get a refusal, or no answer at all only after OWN_PROBE passed
+# (the unit's IPAddressDeny drops it before the table: the one difference between the two units); an answer, any
+# other error (a reset: the packet got through) or no answer without that proof fails. No answer is timeout's own
+# exit (124) with nothing said: a connect that ended silently any other way (killed: SIGKILL, the OOM killer) fails.
+# A HOST PORT pair is closed on a refusal (a reset too: nothing listens there) or that same no answer, else it fails.
+read -r -d '' PROBE <<'EOF' || true
+url=$1 table=$3 bad=0
+[[ $2 =~ [^[:space:]] ]] || { echo "FAIL  no own public address to try"; bad=1; }
+for own in $2; do
+  ec=0
+  err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1) || ec=$?
+  if [[ -n $err ]]; then why=$err; elif ((ec == 124)); then why='no answer in 5 s'; else why="exit $ec, nothing said"; fi
+  if ((ec == 0)); then
+    echo "FAIL  this host's own public address $own is reachable from inside"
+    bad=1
+  elif [[ $table != refused ]]; then
+    echo "FAIL  this host's own public address $own: the table alone did not refuse it (above), so this proves nothing ($why)"
+    bad=1
+  elif [[ $err =~ (Operation\ not\ permitted|No\ route\ to\ host|Permission\ denied|Network\ is\ unreachable) ]]; then
+    echo "ok    this host's own public address $own is refused (${BASH_REMATCH[1]})"
+  elif ((ec == 124)) && [[ -z $err ]]; then
+    echo "ok    this host's own public address $own gets no answer (the unit's IPAddressDeny drops it; the table alone refuses it, above)"
+  else
+    echo "FAIL  this host's own public address $own is not refused by the walls ($why)"
+    bad=1
+  fi
+done
+shift 3
 while (($# >= 2)); do
-  if timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null; then
+  ec=0
+  err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>&1) || ec=$?
+  if [[ -n $err ]]; then why=$err; elif ((ec == 124)); then why='no answer in 5 s'; else why="exit $ec, nothing said"; fi
+  if ((ec == 0)); then
     echo "FAIL  $1:$2 is reachable from inside"
     bad=1
+  elif [[ $err =~ (Connection\ refused|Operation\ not\ permitted|No\ route\ to\ host|Permission\ denied|Network\ is\ unreachable) ]]; then
+    echo "ok    $1:$2 is closed (${BASH_REMATCH[1]})"
+  elif ((ec == 124)) && [[ -z $err ]]; then
+    echo "ok    $1:$2 is closed ($why)"
   else
-    echo "ok    $1:$2 is closed"
+    echo "FAIL  $1:$2 is not shown closed ($why)"
+    bad=1
   fi
   shift 2
 done
@@ -1882,8 +1930,8 @@ make_canaries() {
 }
 
 check_net() {
-  local url=$1 target host port user resolv own blocked seen from linked canaries rc=0
-  local -a pairs=() props
+  local url=$1 target host port user resolv own blocked seen from linked canaries rc=0 prop n=0 table=refused
+  local -a pairs=() props table_props=()
   shift
   [[ $url =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] || die "check-net: not a plain http(s) URL: $url"
   (($# > 0)) || die "check-net: name at least one HOST:PORT that must be closed"
@@ -1906,6 +1954,16 @@ check_net() {
   merge_own "$own"
   net_up "$user"
   sandbox "$user" "$resolv" "$blocked" "$RUN_DIR/check-net.root" ''
+  # The same sandbox with this host's own addresses left out of IPAddressDeny: the nft table alone stands between
+  # the job and them (OWN_PROBE).
+  for prop in "${props[@]}"; do
+    if [[ $prop == IPAddressDeny=* ]]; then
+      prop="IPAddressDeny=${PRIVATE4[*]} ::/0"
+      n=$((n + 1))
+    fi
+    table_props+=("$prop")
+  done
+  ((n == 1)) || die "check-net: the sandbox has $n IPAddressDeny settings, not one"
   canaries="$CANARY_DIR/fork-fleet-canary $CANARY_DIR/fork-fleet-canary-group"
   # Expanded now, as start's env file: removed however check-net ends (one a kill left is replaced next time).
   # shellcheck disable=SC2064
@@ -1914,9 +1972,13 @@ check_net() {
   # Every probe's words (the names of files any local user may make among them) reach the terminal through shown().
   /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from" "$linked" "$canaries" 2>&1 | shown_lines
   echo "check-net: as $user, in its namespace fork-fleet-$user"
+  "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-own --uid "$user" "${table_props[@]}" \
+    -p RuntimeMaxSec=60 -- /bin/bash --norc --noprofile -c "$OWN_PROBE" check-own "$blocked" </dev/null 2>&1 |
+    shown_lines || { rc=4 && table=unproven; }
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-net --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "${pairs[@]}" </dev/null 2>&1 |
-    shown_lines || rc=$?
+    -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "$table" \
+    "${pairs[@]}" </dev/null 2>&1 |
+    shown_lines || rc=$((rc | 1))
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-walls --uid "$user" "${props[@]}" \
     -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" "$linked" "$canaries" </dev/null 2>&1 |
     shown_lines || rc=$((rc | 2))

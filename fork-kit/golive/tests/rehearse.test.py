@@ -87,7 +87,19 @@ elif a[0] == '__fork-report':
         r.update(M.get('report', {{}}))
         if M.get('dieInReport'):
             with open(rt) as f:
-                os.kill(json.load(f)['pid'], signal.SIGKILL)
+                pid = json.load(f)['pid']
+            os.kill(pid, signal.SIGKILL)
+            # A kill is only queued: on a busy machine the server can still be exiting when rehearse looks at it
+            # right after this report. Return once it is dead (a zombie, or gone), as a server that died is.
+            end = time.monotonic() + 30
+            while time.monotonic() < end:
+                try:
+                    with open('/proc/%d/stat' % pid) as f:
+                        if f.read().rsplit(')', 1)[1].split()[0] in 'ZX':
+                            break
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                time.sleep(0.01)
     print(json.dumps(r))
 elif a[0] == 'serve' and '--help' in a:
     print('USAGE t3 serve [--host] [--port] [--no-browser] [--base-dir]'
