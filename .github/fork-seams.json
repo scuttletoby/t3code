@@ -452,13 +452,17 @@
       }
     },
     "apps/web/src/hooks/useThreadActionMenu.ts": {
-      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" before it builds the menu and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The thread menu's hook fills the MCP profile entry's state as it builds the menu and hands the entry's clicks to the fork, which saves that one thread's pick (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The state is read synchronously, so the menu still opens at once. The thread menu's hook fills the Role entry's state (read synchronously) and hands its picks to the fork, which saves one threadRoles pointer (calm sidebar, #878 CAL4; fork/calmSidebar/threadRoleMenu.ts).",
+      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" when the menu opens (openMenu, before it builds the menu, and only for a thread on the app's own server, so a menu for any other thread still opens at once; the command palette's synchronous readMenu has no handoff entry) and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The thread menu's hook fills the MCP profile entry's state as it builds the menu and hands the entry's clicks to the fork, which saves that one thread's pick (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The state is read synchronously, so the menu still opens at once. The thread menu's hook fills the Role entry's state (read synchronously) and hands its picks to the fork, which saves one threadRoles pointer (calm sidebar, #878 CAL4; fork/calmSidebar/threadRoleMenu.ts).",
       "added": [],
       "announced": {
-        "since": "2026-11-27",
+        "since": "2026-11-28",
         "added": [
           "import * as ForkHandoffMenu from \"../components/fork/handoff/handoffMenu\"; // Fork (HO5)",
-          "forkHandoff: await ForkHandoffMenu.readHandoffMenuState(threadRef), // Fork (HO5)",
+          "const forkHandoff: { state: ForkHandoffMenu.HandoffMenuState } = { state: null }; // Fork (HO5): openMenu fills it",
+          "forkHandoff: forkHandoff.state, // Fork (HO5)",
+          "if (threadRef.environmentId === primaryEnvironmentId)",
+          "// Fork (HO5): only the app's own server hands off",
+          "forkHandoff.state = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
           "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
           "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
           "import * as ForkMcp from \"../components/fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
