@@ -381,7 +381,9 @@ export function useThreadActionMenu(input: {
     void (async () => {
       const api = readLocalApi();
       if (!api || threadRef === null) return;
-      forkHandoff.state = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)
+      if (threadRef.environmentId === primaryEnvironmentId)
+        // Fork (HO5): only the app's own server hands off
+        forkHandoff.state = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)
       const menu = readMenu();
       if (!menu) {
         failureToast(

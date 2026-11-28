@@ -460,7 +460,9 @@
         "forkHandoff: forkHandoff.state, // Fork (HO5)",
         "forkHandoff.state = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
         "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
-        "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)"
+        "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
+        "if (threadRef.environmentId === primaryEnvironmentId)",
+        "// Fork (HO5): only the app's own server hands off"
       ],
       "announced": {
         "since": "2026-11-28",
@@ -470,9 +472,7 @@
           "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, action)) return; // Fork (MCP profile)",
           "import * as ForkRoles from \"../components/fork/calmSidebar/threadRoleMenu\"; // Fork (calm sidebar)",
           "forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)",
-          "if (ForkRoles.runIfThreadRoleMenuAction(threadRef, action)) return; // Fork (calm sidebar)",
-          "if (threadRef.environmentId === primaryEnvironmentId)",
-          "// Fork (HO5): only the app's own server hands off"
+          "if (ForkRoles.runIfThreadRoleMenuAction(threadRef, action)) return; // Fork (calm sidebar)"
         ]
       }
     },
