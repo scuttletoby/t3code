@@ -1,0 +1,5 @@
+- Change: The pacing gate on `delegate_task`: advise only, or move, lower the effort of, or hold a task on an account that is ahead of pace. A child a linked machine sends is paced by the machine that runs it.
+- Why: Delegated work follows the pace without the agent having to check.
+- Setting: `server.usagePacingGate`, `server.usagePacingLowerEffort`
+- Default: off
+- PR: [#73](https://github.com/scuttletoby/t3code/pull/73), [#1081](https://github.com/scuttletoby/t3code/pull/1081)

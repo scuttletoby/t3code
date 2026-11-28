@@ -35,8 +35,10 @@ fork-kit/
 !.github/fork-fleet.json
 !.github/fork-upstream-mobile-eas-preview-fork.yml
 
-# The fork's changes list; fork-changes-list.test.cjs (the `workflows` job) checks it against forkDefaults.ts.
+# The fork's changes list (the entry page and one file per change); fork-changes-list.test.cjs (the `workflows`
+# job) checks it against forkDefaults.ts.
 FORK_CHANGES.md
+docs/fork/changes/
 
 # The secret scan's settings; the `secrets` job runs on every pull request.
 .gitleaks.toml

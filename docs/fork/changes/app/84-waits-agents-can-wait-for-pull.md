@@ -1,0 +1,5 @@
+- Change: Waits: agents can wait for a pull request, a file, a system unit, a named check command or a free agent slot (`wait_for`, `wait_list`, `wait_cancel`), and are woken when it happens.
+- Why: An agent no longer polls or sleeps while it waits.
+- Setting: `server.waitFor`, `server.waitChecks`, `projectOverride.waitChecks`
+- Default: off
+- PR: [#84](https://github.com/scuttletoby/t3code/pull/84), [#90](https://github.com/scuttletoby/t3code/pull/90), [#91](https://github.com/scuttletoby/t3code/pull/91), [#103](https://github.com/scuttletoby/t3code/pull/103), [#106](https://github.com/scuttletoby/t3code/pull/106), [#109](https://github.com/scuttletoby/t3code/pull/109), [#110](https://github.com/scuttletoby/t3code/pull/110), [#116](https://github.com/scuttletoby/t3code/pull/116), [#119](https://github.com/scuttletoby/t3code/pull/119)

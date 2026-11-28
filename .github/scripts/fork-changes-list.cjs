@@ -1,13 +1,19 @@
-// Fork only: FORK_CHANGES.md names every fork setting of the pin table (packages/contracts/src/forkDefaults.ts,
-// read as text) and no setting that does not exist. Run by fork-changes-list.test.cjs in Fork tests' `workflows`
-// job, which runs on every pull request, so FORK_CHANGES.md can be fork-owned (.github/fork-owned-paths.txt) and a
-// fork feature pull request that only adds its line there still skips the app jobs.
+// Fork only: the changes list (one file per change in docs/fork/changes/, so pull requests that add or edit different
+// changes merge cleanly; FORK_CHANGES.md is its entry page) names every fork setting of forkDefaults.ts and no other.
+// Run by fork-changes-list.test.cjs in Fork tests' `workflows` job. CLI: `print` (the list as one table) and
+// `adopt [<base>]` (an open pull request's rows of the old FORK_CHANGES.md table, written as change files).
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "../..");
 const CHANGES = "FORK_CHANGES.md";
+const CHANGES_DIR = "docs/fork/changes";
+/** Each folder of docs/fork/changes/ and the heading its changes print under (the old table's sections). */
+const SECTIONS = { app: "In T3 Code itself", repo: "Repository, CI and releases" };
+/** The lines of a change file, in this order, each `- <field>: <text>`. */
+const FIELDS = ["Change", "Why", "Setting", "Default", "PR"];
+const FILE_NAME = /^[a-z0-9][a-z0-9-]*\.md$/u;
 const DEFAULTS = "packages/contracts/src/forkDefaults.ts";
 const SCOPES = ["server", "projectOverride", "client"];
 
@@ -165,14 +171,367 @@ function git(args, root) {
 function readRepoFile(file, root = ROOT) {
   const full = path.join(root, file);
   if (fs.existsSync(full)) return fs.readFileSync(full, "utf8");
-  let sparse = "";
-  try {
-    sparse = git(["config", "--bool", "core.sparseCheckout"], root).trim();
-  } catch {
-    // not set: a full checkout
-  }
-  if (sparse !== "true") throw new Error(`${file} is missing from the checkout`);
+  if (!isSparse(root)) throw new Error(`${file} is missing from the checkout`);
   return git(["show", `HEAD:${file}`], root);
 }
 
-module.exports = { CHANGES, DEFAULTS, SETTING_ID, pinnedIds, namedIds, compare, readRepoFile };
+function isSparse(root) {
+  try {
+    return git(["config", "--bool", "core.sparseCheckout"], root).trim() === "true";
+  } catch {
+    return false; // not set: a full checkout
+  }
+}
+
+/**
+ * Every file under docs/fork/changes/, as { rel: its path in that folder, read() }. Read like readRepoFile: a sparse
+ * checkout that left the folder out reads it from the checked-out commit; a full checkout without it is an error.
+ */
+function changeFiles(root) {
+  const dir = path.join(root, CHANGES_DIR);
+  if (fs.existsSync(dir)) {
+    const rels = [];
+    const walk = (rel) => {
+      for (const item of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
+        const child = rel === "" ? item.name : `${rel}/${item.name}`;
+        if (item.isDirectory()) walk(child);
+        else rels.push(child);
+      }
+    };
+    walk("");
+    return rels.sort().map((rel) => ({
+      rel,
+      read: () => fs.readFileSync(path.join(dir, rel), "utf8"),
+    }));
+  }
+  if (!isSparse(root)) throw new Error(`${CHANGES_DIR}/ is missing from the checkout`);
+  return git(["ls-tree", "-r", "--name-only", "HEAD", "--", CHANGES_DIR], root)
+    .split("\n")
+    .filter(Boolean)
+    .map((file) => ({
+      rel: file.slice(CHANGES_DIR.length + 1),
+      read: () => git(["show", `HEAD:${file}`], root),
+    }));
+}
+
+/** A change file's text as { Change, Why, Setting, Default, PR }. Throws on any other shape, so no line goes unread. */
+function parseChange(text, where) {
+  const fail = (why) => {
+    throw new Error(
+      `${where}: ${why} (a change file is exactly ${FIELDS.length} lines: ` +
+        `${FIELDS.map((field) => `"- ${field}: ..."`).join(", ")}, in that order)`,
+    );
+  };
+  const lines = text.replace(/\n$/u, "").split("\n");
+  if (lines.length !== FIELDS.length) fail(`${lines.length} lines, not ${FIELDS.length}`);
+  const entry = {};
+  FIELDS.forEach((field, index) => {
+    const prefix = `- ${field}: `;
+    if (!lines[index].startsWith(prefix)) fail(`line ${index + 1} does not start with "${prefix}"`);
+    const value = lines[index].slice(prefix.length).trim();
+    if (value === "") fail(`line ${index + 1}: an empty ${field}`);
+    entry[field] = value;
+  });
+  return entry;
+}
+
+/** A change file's text: one `- <field>: <text>` line per field. */
+function formatChange(entry) {
+  return `${FIELDS.map((field) => `- ${field}: ${entry[field]}`).join("\n")}\n`;
+}
+
+const LINK = /\]\(([^)\s]+)\)/gu;
+
+/** Relative Markdown links of a text written in folder `from` (repository-relative), rewritten for folder `to`. */
+function relink(text, from, to) {
+  return text.replace(LINK, (all, target) => {
+    if (/^(?:[a-z][a-z0-9+.-]*:|#|\/)/iu.test(target)) return all;
+    const hash = target.indexOf("#");
+    const file = hash === -1 ? target : target.slice(0, hash);
+    const anchor = hash === -1 ? "" : target.slice(hash);
+    return `](${path.posix.relative(to || ".", path.posix.join(from || ".", file))}${anchor})`;
+  });
+}
+
+const relinkEntry = (entry, from, to) =>
+  Object.fromEntries(FIELDS.map((field) => [field, relink(entry[field], from, to)]));
+
+/**
+ * The changes list: { section, name, path, text, entry } per file of docs/fork/changes/<section>/, its entry's links
+ * repository-relative. Fails closed: no change file, a file outside a section folder (README.md at the top is the
+ * folder's own page), a name that is not lowercase-and-dashes .md, or a file that is not exactly the five lines.
+ */
+function readChanges(root = ROOT) {
+  const changes = [];
+  for (const { rel, read } of changeFiles(root)) {
+    if (rel === "README.md") continue;
+    const where = `${CHANGES_DIR}/${rel}`;
+    const [section, name, ...deeper] = rel.split("/");
+    if (name === undefined || deeper.length > 0 || !Object.hasOwn(SECTIONS, section)) {
+      throw new Error(
+        `${where}: not a change file (a change is ${CHANGES_DIR}/<${Object.keys(SECTIONS).join("|")}>/<name>.md)`,
+      );
+    }
+    if (!FILE_NAME.test(name)) {
+      throw new Error(
+        `${where}: a change file's name is lowercase letters, digits and "-", ending in .md`,
+      );
+    }
+    const text = read();
+    const entry = relinkEntry(parseChange(text, where), path.posix.dirname(where), "");
+    changes.push({ section, name, path: where, text, entry });
+  }
+  if (changes.length === 0) throw new Error(`${CHANGES_DIR}/: no change file`);
+  return changes;
+}
+
+/** The settings the changes list names (namedIds over every change file). */
+const changesNamedIds = (changes) => namedIds(changes.map((change) => change.text).join("\n"));
+
+/**
+ * FORK_CHANGES.md is the entry page. A table row there is the old list (an open pull request that kept its own copy
+ * in a merge), which this check no longer reads: refused, with the command that moves the rows to files.
+ */
+function checkEntryPage(text) {
+  const row = text.split("\n").findIndex((line) => line.trimStart().startsWith("|"));
+  if (row !== -1) {
+    throw new Error(
+      `${CHANGES} line ${row + 1}: a table row, but the list is one file per change in ${CHANGES_DIR}/ now. ` +
+        "Move an open pull request's rows there with: node .github/scripts/fork-changes-list.cjs adopt",
+    );
+  }
+}
+
+function splitRow(line) {
+  return line
+    .trim()
+    .replace(/^\|/u, "")
+    .replace(/(?<!\\)\|$/u, "")
+    .split(/(?<!\\)\|/u)
+    .map((cell) => cell.trim().replace(/\\\|/gu, "|"));
+}
+
+/** The rows of the old FORK_CHANGES.md table, as { section, entry }: none in the new entry page. */
+function tableRows(text) {
+  const rows = [];
+  let section = null;
+  for (const line of text.split("\n")) {
+    const heading = /^## (.+)$/u.exec(line);
+    if (heading !== null) {
+      section = Object.keys(SECTIONS).find((key) => SECTIONS[key] === heading[1].trim()) ?? null;
+      continue;
+    }
+    if (!line.startsWith("|")) continue;
+    const cells = splitRow(line);
+    if (cells.every((cell) => /^:?-+:?$/u.test(cell))) continue;
+    if (cells[0] === FIELDS[0] && cells[1] === FIELDS[1]) continue;
+    const where = `${CHANGES}: the row "${line.slice(0, 60).trim()}..."`;
+    if (section === null) throw new Error(`${where} is under no known "## " section`);
+    if (cells.length !== FIELDS.length || cells.some((cell) => cell === "")) {
+      throw new Error(`${where} has ${cells.length} cells or an empty one, not ${FIELDS.length}`);
+    }
+    rows.push({ section, entry: Object.fromEntries(FIELDS.map((field, i) => [field, cells[i]])) });
+  }
+  return rows;
+}
+
+/** The first `#<number>` a change's PR field links, or null. */
+function firstRef(entry) {
+  const match = /#(\d+)/u.exec(entry.PR);
+  return match === null ? null : Number(match[1]);
+}
+
+/** A new change file's name: its first pull request or issue number and the change's first words. */
+function fileName(entry) {
+  const stop = new Set(["a", "an", "the"]);
+  const words = entry.Change.toLowerCase()
+    .replace(/\]\([^)]*\)/gu, "]")
+    .replace(/['’]/gu, "")
+    .replace(/[^a-z0-9]+/gu, " ")
+    .trim()
+    .split(" ")
+    .filter((word) => word !== "" && !stop.has(word))
+    .slice(0, 6);
+  const ref = firstRef(entry);
+  return `${[ref ?? "change", ...words].join("-").slice(0, 60).replace(/-+$/u, "")}.md`;
+}
+
+const sameEntry = (a, b) => FIELDS.every((field) => a[field] === b[field]);
+const sameChange = (a, b) =>
+  a.Change === b.Change || (firstRef(a) !== null && firstRef(a) === firstRef(b));
+
+/**
+ * An open pull request's edits of the old table (rows of `headText` not in its merge base's `baseText`) as change
+ * files: { write, remove, conflicts }. An edit writes its row's file only while that file still holds the base row.
+ * Idempotent: a row a file already holds is skipped, so a rerun writes only what is missing.
+ */
+function adopt(baseText, headText, changes) {
+  const base = tableRows(baseText);
+  const head = tableRows(headText);
+  const key = (row) => [row.section, ...FIELDS.map((field) => row.entry[field])].join("\0");
+  const baseKeys = new Set(base.map(key));
+  const headKeys = new Set(head.map(key));
+  const added = head.filter((row) => !baseKeys.has(key(row)));
+  const removed = base.filter((row) => !headKeys.has(key(row)));
+  const files = changes.map((change) => ({
+    section: change.section,
+    path: change.path,
+    entry: change.entry,
+  }));
+  const holding = (row) =>
+    files.find((file) => file.section === row.section && sameEntry(file.entry, row.entry));
+  const taken = new Set(files.map((file) => file.path));
+  const result = { write: [], remove: [], conflicts: [] };
+  const paired = new Set();
+  const label = (row) => `${row.section}: "${row.entry.Change.slice(0, 60)}..."`;
+  for (const row of added) {
+    const open = removed.filter((was) => !paired.has(was) && was.section === row.section);
+    const was =
+      open.find((candidate) => candidate.entry.Change === row.entry.Change) ??
+      open.find((candidate) => sameChange(candidate.entry, row.entry));
+    if (was !== undefined) paired.add(was);
+    if (holding(row) !== undefined) continue;
+    let file = was === undefined ? undefined : holding(was);
+    if (was !== undefined && file === undefined) {
+      const now = files.find(
+        (other) => other.section === row.section && sameChange(other.entry, was.entry),
+      );
+      result.conflicts.push(
+        `${label(row)}: the row this pull request edits changed on the base since ` +
+          `(${now === undefined ? "it is gone there" : `now ${now.path}`}); make the edit there by hand`,
+      );
+      continue;
+    }
+    if (file === undefined) {
+      const dir = `${CHANGES_DIR}/${row.section}`;
+      const name = fileName(row.entry).replace(/\.md$/u, "");
+      let candidate = `${dir}/${name}.md`;
+      for (let n = 2; taken.has(candidate); n++) candidate = `${dir}/${name}-${n}.md`;
+      taken.add(candidate);
+      file = { section: row.section, path: candidate };
+      files.push(file);
+    }
+    file.entry = row.entry;
+    result.write.push({
+      path: file.path,
+      text: formatChange(relinkEntry(row.entry, "", path.posix.dirname(file.path))),
+    });
+  }
+  for (const was of removed) {
+    if (paired.has(was)) continue;
+    const file = holding(was);
+    if (file !== undefined) result.remove.push(file.path);
+    else if (
+      files.some(
+        (other) => other.section === was.section && other.entry.Change === was.entry.Change,
+      )
+    ) {
+      result.conflicts.push(
+        `${label(was)}: this pull request removes the row, but it changed on the base since; remove it by hand`,
+      );
+    }
+  }
+  return result;
+}
+
+/** The whole list as Markdown tables, one per section, each ordered by first pull request (none last). */
+function printList(changes) {
+  const order = (change) => firstRef(change.entry) ?? Number.MAX_SAFE_INTEGER;
+  const out = [];
+  for (const [section, title] of Object.entries(SECTIONS)) {
+    const rows = changes
+      .filter((change) => change.section === section)
+      .sort((a, b) => order(a) - order(b) || a.name.localeCompare(b.name));
+    if (rows.length === 0) continue;
+    out.push(
+      `## ${title}`,
+      "",
+      `| ${FIELDS.join(" | ")} |`,
+      `|${FIELDS.map(() => " --- |").join("")}`,
+    );
+    for (const change of rows) {
+      out.push(
+        `| ${FIELDS.map((field) => change.entry[field].replace(/\|/gu, "\\|")).join(" | ")} |`,
+      );
+    }
+    out.push("");
+  }
+  return out.join("\n");
+}
+
+/** `adopt [<base>]` in the checkout of the current folder: writes and removes files, says what is left to do. */
+function adoptCommand(baseRef = "origin/main") {
+  const root = git(["rev-parse", "--show-toplevel"], process.cwd()).trim();
+  if (!fs.existsSync(path.join(root, CHANGES_DIR))) {
+    throw new Error(
+      `${CHANGES_DIR}/ is not in this checkout: merge ${baseRef} first, then run this again`,
+    );
+  }
+  const show = (rev) => {
+    try {
+      return git(["show", `${rev}:${CHANGES}`], root);
+    } catch {
+      return "";
+    }
+  };
+  const mergeBase = git(["merge-base", "HEAD", baseRef], root).trim();
+  const result = adopt(show(mergeBase), show("HEAD"), readChanges(root));
+  for (const file of result.write) {
+    const full = path.join(root, file.path);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(`${full}.tmp`, file.text);
+    fs.renameSync(`${full}.tmp`, full);
+    console.log(`wrote   ${file.path}`);
+  }
+  for (const file of result.remove) {
+    fs.rmSync(path.join(root, file), { force: true });
+    console.log(`removed ${file}`);
+  }
+  for (const conflict of result.conflicts) console.error(`by hand: ${conflict}`);
+  if (result.write.length + result.remove.length + result.conflicts.length === 0) {
+    console.log(
+      `nothing to adopt: HEAD's ${CHANGES} edits no table row, or every row is a file already`,
+    );
+  }
+  console.log(
+    `next: git checkout ${baseRef} -- ${CHANGES} && git add ${CHANGES} ${CHANGES_DIR} (then commit or finish the merge)`,
+  );
+  return result.conflicts.length === 0 ? 0 : 1;
+}
+
+module.exports = {
+  CHANGES,
+  CHANGES_DIR,
+  DEFAULTS,
+  SECTIONS,
+  SETTING_ID,
+  pinnedIds,
+  namedIds,
+  compare,
+  readRepoFile,
+  readChanges,
+  changesNamedIds,
+  checkEntryPage,
+  parseChange,
+  formatChange,
+  relink,
+  tableRows,
+  fileName,
+  adopt,
+  printList,
+};
+
+if (require.main === module) {
+  const [command, ...rest] = process.argv.slice(2);
+  try {
+    if (command === "print") process.stdout.write(printList(readChanges()));
+    else if (command === "adopt") process.exitCode = adoptCommand(...rest);
+    else {
+      console.error("usage: fork-changes-list.cjs print | adopt [<base>]");
+      process.exitCode = 2;
+    }
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+}

@@ -1,0 +1,5 @@
+- Change: Stop finished children: once a delegated child's task is over and its thread has been idle for the grace time (60 s by default), its own provider process is stopped through upstream's idle release; the next message resumes the thread in a new process. Never a thread that works, waits or asks, and never a shared process. Settings → Fork, section Finished children.
+- Why: A finished child's process held 150-300 MB and an agent slot for 30 minutes.
+- Setting: `server.stopFinishedChildren`
+- Default: off
+- PR: [#925](https://github.com/scuttletoby/t3code/issues/925)

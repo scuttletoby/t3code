@@ -1,0 +1,5 @@
+- Change: Host kits (`fork-kit/`): `gh-apps` (GitHub App tokens for agents), `heavy` (run builds in a capped slice), `golive` (move a boot service to a new build; core and `check` so far), `desk` (a desktop's side of a fleet desk pool).
+- Why: Things the fork installs on a machine, each with an installer, a self-check and tests.
+- Setting: none
+- Default: only when installed
+- PR: [#86](https://github.com/scuttletoby/t3code/pull/86), [#173](https://github.com/scuttletoby/t3code/pull/173), [#182](https://github.com/scuttletoby/t3code/pull/182), [#183](https://github.com/scuttletoby/t3code/pull/183)

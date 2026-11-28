@@ -1,0 +1,5 @@
+- Change: Every fork setting has a pinned default, and lives in the fork's own file (`forkSettings.ts`).
+- Why: An upstream sync can never switch a fork feature on, and a new setting touches no upstream file.
+- Setting: none
+- Default: always
+- PR: [#171](https://github.com/scuttletoby/t3code/pull/171), [#185](https://github.com/scuttletoby/t3code/pull/185)

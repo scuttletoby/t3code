@@ -1,0 +1,5 @@
+- Change: fork-follow: once a day, rebase the fork onto upstream's newest tag, test, and release only when green; on trouble, open one issue.
+- Why: Stay close to upstream without manual work.
+- Setting: repository variable `FORK_FOLLOW_CHANNEL`
+- Default: `nightly`
+- PR: [#4](https://github.com/scuttletoby/t3code/pull/4), [#22](https://github.com/scuttletoby/t3code/pull/22), [#66](https://github.com/scuttletoby/t3code/pull/66)

@@ -229,7 +229,7 @@ with tempfile.TemporaryDirectory(prefix="fork-owned-paths-") as tmp:
 REAL = owned([
     "fork-ci/actions/pr-queue/pr_queue.py", "fork-kit/heavy/heavy", ".github/scripts/fork-fleet-walls.py",
     ".github/scripts/fork-fleet-walls/linux", ".github/scripts/fork_workflow_expr.py", ".github/fork-ci-tests.txt",
-    ".gitleaks.toml", "FORK_CHANGES.md",
+    ".gitleaks.toml", "FORK_CHANGES.md", "docs/fork/changes/app/1-a-change.md",
     # never
     ".github/fork-owned-paths.txt", ".github/scripts/fork-owned-paths.cjs", ".github/workflows/fork-tests.yml",
     ".github/workflows/fork-checks.yml", ".github/actions/ci-changes/action.yml", ".github/scripts/ci-changes.cjs",
@@ -241,7 +241,7 @@ REAL = owned([
 want_owned = {p for p in REAL if p.startswith(("fork-ci/actions", "fork-kit/heavy")) and "/review.vectors" not in p
               and "/testdata/lens-corpus" not in p or p in {
     ".github/scripts/fork-fleet-walls.py", ".github/scripts/fork-fleet-walls/linux", ".github/scripts/fork_workflow_expr.py",
-    ".github/fork-ci-tests.txt", ".gitleaks.toml", "FORK_CHANGES.md"}}
+    ".github/fork-ci-tests.txt", ".gitleaks.toml", "FORK_CHANGES.md", "docs/fork/changes/app/1-a-change.md"}}
 check("list: the fork's own folders and scripts are fork-owned; the rest, and every NEVER path, are not",
       {p for p, v in REAL.items() if v} == want_owned, json.dumps({p: v for p, v in REAL.items() if v != (p in want_owned)}))
 check("list: NEVER wins over a line that owns everything under .github/",

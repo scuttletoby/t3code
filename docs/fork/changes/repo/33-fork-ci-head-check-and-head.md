@@ -1,0 +1,5 @@
+- Change: fork-ci head check and head gate: the queue's required check, posted by a GitHub App and judged by the default branch's code.
+- Why: A pull request cannot fake its own required check. See [gate trust](../../gate-trust.md).
+- Setting: none
+- Default: only where used
+- PR: [#33](https://github.com/scuttletoby/t3code/pull/33), [#85](https://github.com/scuttletoby/t3code/pull/85), [#87](https://github.com/scuttletoby/t3code/pull/87)

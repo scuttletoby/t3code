@@ -1,0 +1,5 @@
+- Change: Usage pacing: a reserve of each limit window kept free for the person, and an even pace for agents.
+- Why: Agents should not use up a subscription before its owner needs it.
+- Setting: `server.usagePacing`
+- Default: off
+- PR: [#52](https://github.com/scuttletoby/t3code/pull/52)
