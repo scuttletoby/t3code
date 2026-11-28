@@ -1,0 +1,5 @@
+- Change: A project's `.t3code/issues.json` (`repositories`: `owner/repo` names) replaces the repositories T3 guesses from git remotes for its issues: only the named ones are listed and writable; an issue link elsewhere on the host still opens read-only. A file that cannot be read lists no git-host repository. A standalone tracker bound in Settings is kept. `apps/server/src/fork/issueRepos.ts`, one seam in `IssueService.ts`.
+- Why: A fork's Issues page would list its upstream's issues, and tools could write there.
+- Setting: none (the project's own file)
+- Default: T3's guess without a file
+- PR: [#887](https://github.com/scuttletoby/t3code/issues/887), [#830](https://github.com/scuttletoby/t3code/issues/830)

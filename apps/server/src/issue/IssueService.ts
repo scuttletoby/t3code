@@ -59,6 +59,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import * as IssueTrackerRegistry from "./IssueTrackerRegistry.ts";
+import * as ForkIssueRepos from "../fork/issueRepos.ts"; // Fork (.t3code/issues.json)
 
 const DEFAULT_LIST_LIMIT = 50;
 const SCOPE_CONCURRENCY = 4;
@@ -280,6 +281,7 @@ const make = Effect.gen(function* () {
         const gitHost = resolveGitHostBindings({ ...project, repositoryIdentity });
         return [...resolveStandaloneBindings(binding), ...gitHost];
       }),
+      Effect.flatMap(ForkIssueRepos.namedRepositories(project, registry)), // Fork (issues.json)
     );
 
   const listProjects = (filter: {

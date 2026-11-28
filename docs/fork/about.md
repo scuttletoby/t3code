@@ -80,6 +80,11 @@ has no row yet (usage history, busy check, placement, thread roles): set it in `
 
 - Assistant: Settings offers **Make assistant**, one thread that can reach every project.
   Settings → Fork → Assistant ([assistant.md](assistant.md)).
+- A project's repositories for issues: a committed `.t3code/issues.json` with
+  `{ "repositories": ["owner/repo"] }` names the repositories its Issues page lists and its issue
+  tools may write to, instead of the ones T3 guesses from git remotes (which, in a fork checkout,
+  include its upstream). Without the file, T3 guesses as upstream does. A file that cannot be read
+  lists no git-host repository (the server log says why), never the guess.
 - Thread roles: which thread is the assistant and which is each project's orchestrator. Only you
   set them (**Make assistant** sets the assistant); the app does not show them yet. Settings file
   only (`threadRoles`).
