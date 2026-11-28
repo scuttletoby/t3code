@@ -705,9 +705,17 @@ it.layer(NodeServices.layer)("wait tools", (it) => {
           }));
           assert.deepStrictEqual(
             all.map((tool) => tool.name),
-            ["wait_for", "wait_list", "wait_cancel", "task_list", "playtest", "lens_start"],
+            [
+              "wait_for",
+              "wait_list",
+              "wait_cancel",
+              "task_list",
+              "playtest",
+              "lens_start",
+              "lens_report",
+            ],
           );
-          // task_list, playtest and lens_start share the toolkit; their budget is ForkAgentContextBudget's.
+          // task_list, playtest, lens_start and lens_report share the toolkit; their budget is ForkAgentContextBudget's.
           const listed = all.filter((tool) => tool.name.startsWith("wait_"));
           const total = listed.reduce((sum, tool) => sum + tool.description.length, 0);
           assert.isAtMost(total, 900);
