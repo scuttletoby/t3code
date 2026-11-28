@@ -4,11 +4,13 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  DEFAULT_LANE_DEFINITIONS,
+  BUILT_IN_LANE_DEFINITIONS,
   findLaneDefinition,
   formatLaneItemRef,
   LaneClaim,
+  laneDefinitions,
   LaneEscalation,
+  LaneItemRef,
   LaneNote,
   parseLaneItemRef,
 } from "./forkLanes.ts";
@@ -18,36 +20,53 @@ import { ServerSettings, ServerSettingsPatch } from "./settings.ts";
 const decodeServer = Schema.decodeUnknownSync(ServerSettings);
 const encodeServer = Schema.encodeSync(ServerSettings);
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+const decodeItemRef = Schema.decodeUnknownExit(LaneItemRef);
 
-const PR_QUEUE = DEFAULT_LANE_DEFINITIONS["pr-queue"]!;
+const PR_QUEUE = BUILT_IN_LANE_DEFINITIONS["pr-queue"]!;
+const ISSUES = BUILT_IN_LANE_DEFINITIONS["issues"]!;
+const lanesOf = (lanes: unknown) => laneDefinitions(decodeServer({ lanes }).lanes);
 
 describe("lanes settings", () => {
-  it("reads an old file, or anything but an object, as off with the built-in lanes", () => {
+  it("reads an old file, or anything but an object, as off with only the built-in lanes", () => {
     for (const lanes of [undefined, null, true, "on", [], [{ enabled: true }]]) {
       const settings = decodeServer({ lanes, enableAgentBrowserAccess: false });
-      expect(settings.lanes).toEqual({ enabled: false, definitions: DEFAULT_LANE_DEFINITIONS });
+      expect(settings.lanes).toEqual({ enabled: false, definitions: {} });
+      expect(laneDefinitions(settings.lanes)).toEqual(BUILT_IN_LANE_DEFINITIONS);
       expect(settings.enableAgentBrowserAccess).toBe(false);
     }
-    expect(Object.keys(DEFAULT_LANE_DEFINITIONS)).toEqual(["pr-queue", "issues"]);
+    expect(Object.keys(BUILT_IN_LANE_DEFINITIONS)).toEqual(["pr-queue", "issues"]);
   });
 
-  it("is on only for enabled: true, and keeps the built-in lanes when definitions is left out", () => {
+  it("is on only for enabled: true", () => {
     expect(decodeServer({ lanes: { enabled: true } }).lanes).toEqual({
       enabled: true,
-      definitions: DEFAULT_LANE_DEFINITIONS,
+      definitions: {},
     });
     for (const enabled of ["yes", 1, null]) {
       expect(decodeServer({ lanes: { enabled } }).lanes.enabled).toBe(false);
     }
   });
 
-  it("defines no lane for definitions that is not an object, and an empty one as none", () => {
+  it("stores nothing for definitions that is not an object, so only the built-in lanes exist", () => {
     for (const definitions of [{}, null, [], "pr-queue"]) {
-      expect(decodeServer({ lanes: { enabled: true, definitions } }).lanes).toEqual({
-        enabled: true,
-        definitions: {},
-      });
+      expect(lanesOf({ enabled: true, definitions })).toEqual(BUILT_IN_LANE_DEFINITIONS);
     }
+  });
+
+  it("adds, changes and removes lanes over the built-in ones", () => {
+    const mine = { description: "Mine.", owns: ["pr", "issue"], driver: "agent" };
+    const lanes = lanesOf({
+      definitions: {
+        ops: { description: "Ops.", owns: ["issue"] },
+        "pr-queue": mine,
+        issues: false,
+      },
+    });
+    expect(lanes).toEqual({
+      "pr-queue": mine,
+      ops: { description: "Ops.", owns: ["issue"], driver: "agent" },
+    });
+    expect(Object.keys(lanes)).toEqual(["pr-queue", "ops"]);
   });
 
   it("drops a bad lane name or definition alone and keeps the others", () => {
@@ -55,35 +74,39 @@ describe("lanes settings", () => {
       lanes: {
         enabled: true,
         definitions: {
-          "pr-queue": { description: "Pull requests.", owns: ["pr"] },
-          ops: { description: "Machines and CI.", owns: [], driver: "agent", later: 1 },
+          ops: { description: "Machines and CI.", owns: ["issue"], driver: "agent", later: 1 },
           "PR Queue": { description: "Not a lane name.", owns: ["pr"] },
           "-lead": { description: "Not a lane name.", owns: ["pr"] },
           ["x".repeat(41)]: { description: "Too long a name.", owns: ["pr"] },
           program: { description: "A driver not built yet.", owns: ["pr"], driver: "program" },
           kinds: { description: "An unknown item kind.", owns: ["commit"] },
+          none: { description: "Owns nothing.", owns: [] },
+          twice: { description: "Owns pr twice.", owns: ["pr", "pr"] },
           blank: { description: "  ", owns: ["issue"] },
           bare: "a lane",
+          custom: false,
+          issues: false,
         },
       },
     });
     expect(settings.lanes.definitions).toEqual({
-      "pr-queue": { description: "Pull requests.", owns: ["pr"], driver: "agent" },
-      ops: { description: "Machines and CI.", owns: [], driver: "agent" },
+      ops: { description: "Machines and CI.", owns: ["issue"], driver: "agent" },
+      issues: false,
     });
   });
 
   it("writes the value it read back to the file", () => {
     const settings = decodeServer({
-      lanes: { enabled: true, definitions: { "pr-queue": PR_QUEUE } },
+      lanes: { enabled: true, definitions: { "pr-queue": PR_QUEUE, issues: false } },
     });
     expect(decodeServer(encodeServer(settings)).lanes).toEqual(settings.lanes);
   });
 
   it("finds a defined lane and refuses a name the settings do not define", () => {
-    const { lanes } = decodeServer({});
+    const { lanes } = decodeServer({ lanes: { definitions: { issues: false } } });
     expect(findLaneDefinition(lanes, "pr-queue")).toEqual(PR_QUEUE);
-    for (const name of ["ops", "toString", "constructor", "PR-QUEUE", ""]) {
+    expect(findLaneDefinition(decodeServer({}).lanes, "issues")).toEqual(ISSUES);
+    for (const name of ["issues", "ops", "toString", "constructor", "__proto__", "PR-QUEUE", ""]) {
       expect(findLaneDefinition(lanes, name)).toBeUndefined();
     }
   });
@@ -92,18 +115,32 @@ describe("lanes settings", () => {
     expect(decodePatch({ lanes: { enabled: true } }).lanes).toEqual({ enabled: true });
     expect(
       decodePatch({
-        lanes: { definitions: { ops: { description: "Machines.", owns: [] }, issues: null } },
+        lanes: {
+          definitions: {
+            ops: { description: "Machines.", owns: ["issue"] },
+            issues: false,
+            x: null,
+          },
+        },
       }).lanes,
     ).toEqual({
-      definitions: { ops: { description: "Machines.", owns: [], driver: "agent" }, issues: null },
+      definitions: {
+        ops: { description: "Machines.", owns: ["issue"], driver: "agent" },
+        issues: false,
+        x: null,
+      },
     });
     for (const lanes of [
       { enabled: "yes" },
       { definitions: { "PR Queue": PR_QUEUE } },
-      { definitions: { ops: { description: "", owns: [] } } },
+      { definitions: { ops: { description: "", owns: ["pr"] } } },
       { definitions: { ops: { description: "Machines.", owns: ["commit"] } } },
-      { definitions: { ops: { description: "Machines.", owns: [], driver: "program" } } },
-      { definitions: { ops: { owns: [] } } },
+      { definitions: { ops: { description: "Machines.", owns: [] } } },
+      { definitions: { ops: { description: "Machines.", owns: ["pr", "pr"] } } },
+      { definitions: { ops: { description: "Machines.", owns: ["pr"], driver: "program" } } },
+      { definitions: { ops: { owns: ["pr"] } } },
+      { definitions: { ops: false } },
+      { definitions: { issues: true } },
     ]) {
       expect(() => decodePatch({ lanes })).toThrow();
     }
@@ -112,33 +149,52 @@ describe("lanes settings", () => {
 });
 
 describe("lane items", () => {
-  it("reads and writes a pull request or issue reference", () => {
+  it("reads a pull request or issue reference, owner and repository in lower case", () => {
     expect(parseLaneItemRef("pr:owner/repo#12")).toEqual({
       kind: "pr",
       repo: "owner/repo",
       number: 12,
     });
-    expect(parseLaneItemRef("issue:some-org/a.repo_x#1")).toEqual({
-      kind: "issue",
+    expect(parseLaneItemRef("PR:Some-Org/A.Repo_x#1")).toEqual({
+      kind: "pr",
       repo: "some-org/a.repo_x",
       number: 1,
     });
-    expect(formatLaneItemRef({ kind: "issue", repo: "owner/repo", number: 7 })).toBe(
+  });
+
+  it("gives one reference per item, whatever the case it was written in", () => {
+    const refs = ["pr:Owner/Repo#1", "pr:owner/repo#1", "PR:OWNER/REPO#1"].map((text) =>
+      formatLaneItemRef(parseLaneItemRef(text)!),
+    );
+    expect(new Set(refs)).toEqual(new Set(["pr:owner/repo#1"]));
+    expect(formatLaneItemRef({ kind: "issue", repo: "Owner/Repo", number: 7 })).toBe(
       "issue:owner/repo#7",
     );
+    expect(decodeItemRef("pr:Owner/repo#1")._tag).toBe("Failure");
+  });
+
+  it("refuses text that is not a reference, and . or .. as owner or repository", () => {
     for (const text of [
       "pr:repo#1",
       "pr:owner/repo#0",
       "pr:owner/repo#01",
       "pr:owner/repo",
       "commit:owner/repo#1",
-      "PR:owner/repo#1",
       " pr:owner/repo#1",
       "pr:owner/repo/x#1",
       "pr:owner/repo#12345678901",
+      "pr:../..#1",
+      "pr:./repo#1",
+      "pr:owner/..#1",
+      "pr:owner/.#1",
     ]) {
       expect(parseLaneItemRef(text)).toBeNull();
     }
+    // A dot inside a name is fine.
+    expect(parseLaneItemRef("pr:owner/.github#3")?.repo).toBe("owner/.github");
+    expect(parseLaneItemRef("pr:owner/...#3")?.repo).toBe("owner/...");
+    expect(formatLaneItemRef({ kind: "pr", repo: "../..", number: 1 })).toBeNull();
+    expect(formatLaneItemRef({ kind: "pr", repo: "owner/repo", number: 0 })).toBeNull();
   });
 });
 

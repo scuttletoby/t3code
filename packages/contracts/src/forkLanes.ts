@@ -44,17 +44,26 @@ export type LaneDriver = typeof LaneDriver.Type;
 
 const LANE_DESCRIPTION_MAX_CHARS = 2_000;
 
+const hasNoRepeat = Schema.makeFilter(
+  (kinds: ReadonlyArray<string>) => new Set(kinds).size === kinds.length,
+  { expected: "each item kind once" },
+);
+
 /** One lane: what it does (its thread's brief starts from this), what it owns, who runs it. */
 export const LaneDefinition = Schema.Struct({
   description: TrimmedNonEmptyString.check(Schema.isMaxLength(LANE_DESCRIPTION_MAX_CHARS)),
-  /** The kinds of item this lane may claim. */
-  owns: Schema.Array(LaneItemKind),
+  /** The kinds of item this lane may claim: at least one, each once. */
+  owns: Schema.Array(LaneItemKind).check(Schema.isMinLength(1), hasNoRepeat),
   driver: LaneDriver.pipe(Schema.withDecodingDefault(Effect.succeed("agent" as const))),
 });
 export type LaneDefinition = typeof LaneDefinition.Type;
 
-/** The built-in lanes, defined but not running until the orchestrator switches one on. */
-export const DEFAULT_LANE_DEFINITIONS: { readonly [name: string]: LaneDefinition } = {
+/**
+ * The built-in lanes, defined without a word in the settings. They live here, not in the settings'
+ * default: the settings writer leaves out what equals the default, so a default holding them would
+ * lose them, or a change to one, on the next restart.
+ */
+export const BUILT_IN_LANE_DEFINITIONS: { readonly [name: string]: LaneDefinition } = {
   "pr-queue": {
     description:
       "Moves the project's open pull requests to a decision: reviews, fix rounds, checks and merges.",
@@ -69,23 +78,26 @@ export const DEFAULT_LANE_DEFINITIONS: { readonly [name: string]: LaneDefinition
   },
 };
 
+const isBuiltInLane = (name: string): boolean => Object.hasOwn(BUILT_IN_LANE_DEFINITIONS, name);
+
+/** A stored lane: its definition, or `false` for a built-in lane the person removed. */
+const LaneEntry = Schema.Union([LaneDefinition, Schema.Literal(false)]);
+
 /**
- * The `lanes` settings block. `enabled` off: no lane can be switched on, whatever is defined. Each
- * field has its default, since the settings writer saves the value sparse.
+ * The `lanes` settings block as stored. `enabled` off: no lane can be switched on, whatever is
+ * defined. `definitions` holds only what differs from the built-in lanes (empty by default); read
+ * the lanes with {@link laneDefinitions}.
  */
 export const LanesSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
-  definitions: Schema.Record(LaneName, LaneDefinition).pipe(
-    Schema.withDecodingDefault(Effect.succeed(DEFAULT_LANE_DEFINITIONS)),
+  definitions: Schema.Record(LaneName, LaneEntry).pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
   ),
 });
 export type LanesSettings = typeof LanesSettings.Type;
 
-/** Off, with the built-in lanes defined: what a settings file without `lanes` reads as. */
-const DEFAULT_LANES_SETTINGS: LanesSettings = {
-  enabled: false,
-  definitions: DEFAULT_LANE_DEFINITIONS as LanesSettings["definitions"],
-};
+/** Off, nothing stored: what a settings file without `lanes` reads as. */
+const DEFAULT_LANES_SETTINGS: LanesSettings = { enabled: false, definitions: {} };
 
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -93,23 +105,25 @@ const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
 const decodeDefinition = Schema.decodeUnknownOption(LaneDefinition);
 
 /**
- * The settings file's `lanes`, read leniently: not an object (or missing) reads as the default.
- * Anything but `enabled: true` is off. `definitions` left out keeps the built-in lanes; a value that
- * is not an object defines no lane. An entry whose name is not a lane name, or whose definition does
- * not decode (an unknown driver or item kind included), drops alone.
+ * The settings file's `lanes`, read leniently: not an object (or missing) reads as off with nothing
+ * stored. Anything but `enabled: true` is off. A `definitions` that is not an object stores nothing.
+ * An entry whose name is not a lane name, whose definition does not decode (another driver or item
+ * kind, no item kind, a kind twice), or a `false` for a lane that is not built in, drops alone.
  */
 function readLanes(raw: unknown): typeof LanesSettings.Encoded {
   if (!isRecord(raw)) return DEFAULT_LANES_SETTINGS;
-  const enabled = raw.enabled === true;
-  if (!("definitions" in raw)) return { enabled, definitions: DEFAULT_LANE_DEFINITIONS };
   const definitions = isRecord(raw.definitions) ? raw.definitions : {};
-  const kept: Record<string, LaneDefinition> = {};
+  const kept: Record<string, LaneDefinition | false> = {};
   for (const [name, value] of Object.entries(definitions)) {
     if (!isLaneName(name)) continue;
+    if (value === false) {
+      if (isBuiltInLane(name)) kept[name] = false;
+      continue;
+    }
     const definition = decodeDefinition(value);
     if (definition._tag === "Some") kept[name] = definition.value;
   }
-  return { enabled, definitions: kept };
+  return { enabled: raw.enabled === true, definitions: kept };
 }
 
 /** {@link LanesSettings} as the settings file holds it: read by {@link readLanes}. */
@@ -125,36 +139,68 @@ export const LanesSettingsFromSettingsFile = Schema.Unknown.pipe(
 );
 
 /**
- * A save's change to `lanes`. A field left out keeps its value; each definition is set whole or
- * (`null`) removed on its own. Strict: a bad name or a bad definition is refused (a record keyed by
- * {@link LaneName} would drop a bad name and save nothing, so the names are checked here).
+ * A save's change to `lanes`. A field left out keeps its value. Each lane on its own: a definition
+ * sets it whole, `false` removes a built-in lane, `null` drops what is stored (a built-in lane is
+ * back as built). Strict: a bad name or definition, or `false` for a lane that is not built in, is
+ * refused (a record keyed by {@link LaneName} would drop a bad name and save nothing).
  */
 export const LanesSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   definitions: Schema.optionalKey(
-    Schema.Record(Schema.String, Schema.NullOr(LaneDefinition)).check(
+    Schema.Record(Schema.String, Schema.NullOr(LaneEntry)).check(
       Schema.makeFilter((definitions) => Object.keys(definitions).every(isLaneName), {
         expected: "lane names: lower-case words joined by '-', at most 40 characters",
       }),
+      Schema.makeFilter(
+        (definitions) =>
+          Object.entries(definitions).every(
+            ([name, value]) => value !== false || isBuiltInLane(name),
+          ),
+        { expected: "false only for a built-in lane (pr-queue, issues)" },
+      ),
     ),
   ),
 });
 export type LanesSettingsPatch = typeof LanesSettingsPatch.Type;
+
+/** The lanes that exist: the built-in ones, changed or removed by the stored ones, then the rest. */
+export function laneDefinitions(settings: LanesSettings): {
+  readonly [name: string]: LaneDefinition;
+} {
+  const merged: Record<string, LaneDefinition | false> = {
+    ...BUILT_IN_LANE_DEFINITIONS,
+    ...settings.definitions,
+  };
+  const lanes: Record<string, LaneDefinition> = {};
+  for (const [name, entry] of Object.entries(merged)) {
+    if (entry !== false) lanes[name] = entry;
+  }
+  return lanes;
+}
 
 /** A defined lane by name, or undefined for a name the settings do not define (refuse it). */
 export function findLaneDefinition(
   settings: LanesSettings,
   name: string,
 ): LaneDefinition | undefined {
-  return isLaneName(name) && Object.hasOwn(settings.definitions, name)
-    ? settings.definitions[name]
-    : undefined;
+  const lanes = laneDefinitions(settings);
+  return isLaneName(name) && Object.hasOwn(lanes, name) ? lanes[name] : undefined;
 }
 
-/** `pr:<owner>/<repo>#<n>` or `issue:<owner>/<repo>#<n>`. */
-const LANE_ITEM_PATTERN = /^(pr|issue):([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#([1-9][0-9]{0,9})$/u;
+/** An owner or repository name, never `.` or `..`. */
+const REPO_PART = String.raw`(?!\.\.?[/#])[a-z0-9_.-]+`;
+/** `pr:<owner>/<repo>#<n>` or `issue:<owner>/<repo>#<n>`, owner and repository in lower case. */
+const LANE_ITEM_PATTERN = new RegExp(
+  String.raw`^(pr|issue):(${REPO_PART}/${REPO_PART})#([1-9][0-9]{0,9})$`,
+  "u",
+);
+/** As written by hand or a tool: any case, which GitHub ignores. */
+const LANE_ITEM_INPUT_PATTERN = new RegExp(LANE_ITEM_PATTERN.source, "iu");
 
-/** One item a lane can own, as text: `pr:owner/repo#12`. */
+/**
+ * One item a lane can own, as text: `pr:owner/repo#12`. Owner and repository are lower case, so
+ * one pull request or issue has one reference (and one claim); {@link parseLaneItemRef} makes one.
+ */
 export const LaneItemRef = Schema.String.check(Schema.isPattern(LANE_ITEM_PATTERN)).pipe(
   Schema.brand("LaneItemRef"),
 );
@@ -162,22 +208,28 @@ export type LaneItemRef = typeof LaneItemRef.Type;
 
 export interface LaneItem {
   readonly kind: LaneItemKind;
-  /** `owner/repo`. */
+  /** `owner/repo`, lower case. */
   readonly repo: string;
   readonly number: number;
 }
 
-/** The parts of an item reference, or null for text that is not one. */
+/**
+ * The parts of an item reference in any case (the kind too), owner and repository lower-cased; null
+ * for text that is not one.
+ */
 export function parseLaneItemRef(text: string): LaneItem | null {
-  const match = LANE_ITEM_PATTERN.exec(text);
+  const match = LANE_ITEM_INPUT_PATTERN.exec(text);
   if (match === null) return null;
   const number = Number(match[3]);
   if (!Number.isSafeInteger(number)) return null;
-  return { kind: match[1] as LaneItemKind, repo: match[2]!, number };
+  return { kind: match[1]!.toLowerCase() as LaneItemKind, repo: match[2]!.toLowerCase(), number };
 }
 
-export const formatLaneItemRef = (item: LaneItem): LaneItemRef =>
-  `${item.kind}:${item.repo}#${item.number}` as LaneItemRef;
+/** The one reference of an item (owner and repository lower-cased), or null for a bad item. */
+export function formatLaneItemRef(item: LaneItem): LaneItemRef | null {
+  const text = `${item.kind}:${item.repo.toLowerCase()}#${item.number}`;
+  return LANE_ITEM_PATTERN.test(text) ? (text as LaneItemRef) : null;
+}
 
 /**
  * Which lane thread acts for a lane: bumped each time the lane gets a new thread, so a replaced

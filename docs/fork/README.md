@@ -1453,25 +1453,33 @@ pull request queue, with its own workers. Settings only so far: nothing reads th
 runs.
 
 - `enabled` (off): no lane can be switched on, whatever is defined.
-- `definitions`: the lanes that exist, by name. The orchestrator only switches a defined lane on and
-  off; it cannot make one. A name is lower-case words joined by `-` (`pr-queue`), at most 40
+- `definitions`: changes to the lanes that exist. The built-in lanes `pr-queue` (owns `pr`) and
+  `issues` (owns `issue`) exist without a word here. An entry by name adds a lane or replaces a
+  built-in one whole; `false` removes a built-in lane. The orchestrator only switches a defined lane
+  on and off; it cannot make one. A name is lower-case words joined by `-` (`pr-queue`), at most 40
   characters. Each lane has a `description` (what it does, the start of its thread's brief), `owns`
-  (the kinds of item it may claim: `pr`, `issue`) and `driver` (`agent`, the default and for now the
-  only one). Left out, the built-in lanes `pr-queue` and `issues` are defined.
+  (the kinds of item it may claim, `pr` and/or `issue`: at least one, each once) and `driver`
+  (`agent`, the default and for now the only one).
 
-Only the person can change it. A save changes `enabled` and each definition on its own (`null`
-removes a lane), so two saves for different lanes keep both; a save with a bad name or definition is
-refused. The file is read leniently: a value that is not an object reads as off with the built-in
-lanes, anything but `"enabled": true` as off, a `definitions` that is not an object as no lanes, and
-a bad name or definition (another driver included) drops alone. A record that names a lane no
-longer defined keeps the name; whatever acts on it treats the lane as unknown.
+Only the person can change it. A save changes `enabled` and each lane on its own: a definition sets
+it, `false` removes a built-in lane, and `null` drops the entry (a built-in lane is back as built),
+so two saves for different lanes keep both. A save with a bad name or definition, or `false` for a
+lane that is not built in, is refused. The file is read leniently: a value that is not an object, or
+a `definitions` that is not an object, reads as the built-in lanes; anything but `"enabled": true`
+as off; and a bad name or definition (another driver included) drops alone. A record that names a
+lane no longer defined keeps the name; whatever acts on it treats the lane as unknown.
+
+An item a lane claims is written `pr:<owner>/<repo>#<n>` or `issue:<owner>/<repo>#<n>`, owner and
+repository in lower case (GitHub ignores case, so one item has one reference); `.` and `..` are
+never an owner or repository.
 
 ```json
 {
   "lanes": {
     "enabled": true,
     "definitions": {
-      "pr-queue": { "description": "Moves open pull requests to a decision.", "owns": ["pr"] }
+      "issues": false,
+      "ops": { "description": "Keeps the machines and CI healthy.", "owns": ["issue"] }
     }
   }
 }
