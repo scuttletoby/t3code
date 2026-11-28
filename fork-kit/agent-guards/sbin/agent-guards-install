@@ -42,7 +42,7 @@ except ImportError as e:     # a copy with a part missing: the bootstrap makes i
              '(fork-kit/agent-guards/README.md, Install)')
 
 HOOKS = wiring.HOOKS
-COMMANDS = ('agent-guards', 'facts', 'fork-lens-packet')   # commands people and agents run, linked beside the hooks
+COMMANDS = ('agent-guards', 'facts', 'fork-lens-packet', 'leak-scan')   # commands people and agents run, linked beside the hooks
 HELPERS = (wiring.FAST,)               # run by the hooks' settings entries, linked beside the hooks
 
 
@@ -56,10 +56,11 @@ class AgentGuardsInstaller(kit_install.Installer):
                  **{'/usr/local/sbin/agent-guards-install': 'sbin/agent-guards-install'})
     OPTIONAL_LINKS = (f'{wiring.BIN}/facts',)   # a common name: another program called facts is left alone
     SOURCE_FILES = tuple(f'bin/{h}' for h in HOOKS + COMMANDS + HELPERS) + (
-        'sbin/agent-guards-install', 'README.md', 'FACTS.md', 'common/machine_file.py', 'common/kit_install.py')
+        'sbin/agent-guards-install', 'README.md', 'FACTS.md', 'LEAK.md', 'common/machine_file.py',
+        'common/kit_install.py')
     EXECUTABLE = frozenset([f'bin/{h}' for h in HOOKS + COMMANDS + HELPERS] + ['sbin/agent-guards-install'])
     PACKAGE = 'agent_guards'
-    MODULES = ('__init__', 'approval', 'check', 'config', 'facts', 'fast', 'lenspacket', 'quick', 'wiring')
+    MODULES = ('__init__', 'approval', 'check', 'config', 'facts', 'fast', 'leak', 'lenspacket', 'quick', 'wiring')
     # the hooks the fast path runs from bytecode (agent_guards.fast), and the lib they import
     BYTECODE = tuple(f'bin/{h}' for h in wiring.FAST_HOOKS) + tuple(f'lib/agent_guards/{m}.py' for m in MODULES)
     HELP = ('bin/agent-guards', 'agent-guards check')

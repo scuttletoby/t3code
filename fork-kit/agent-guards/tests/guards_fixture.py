@@ -80,6 +80,15 @@ def machine_file(folder, section=None, text=None, mode=0o644):
     return path
 
 
+def own_machine(folder, section=None):
+    """<folder>/machine.json with that section and leakGuard.patternsFile at a missing file in `folder` (unless the
+    section names one): NO_MACHINE's defaults would read the machine's own pattern file (/etc/fork-kit/leak-patterns),
+    so a test's answer would depend on the machine it runs on."""
+    section = dict(section or {})
+    section.setdefault('leakGuard', {'patternsFile': os.path.join(folder, 'no-leak-patterns')})
+    return machine_file(folder, section)
+
+
 def use_machine(path):
     """This process's hooks (loaded as modules) read `path`, owned by the user who runs the test."""
     config.MACHINE_PATH, config.OWNER_UID = path, os.geteuid()

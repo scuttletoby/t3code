@@ -1,8 +1,8 @@
-"""agent_guards.fast: the fast path of the three hooks that run on every Bash call (bin/agent-guards-fast).
+"""agent_guards.fast: the fast path of the hooks that run on every Bash call (bin/agent-guards-fast).
 
-Each Bash call runs actions-disable-guard, capacity-pipe-guard and memory-index-guard. Started as a script, Python
-compiles a hook's whole file on every call (a script's bytecode is never cached), and actions-disable-guard is
-5,000 lines: ~30 ms of compiling and ~10 ms of regular expressions before it reads the command, on an idle machine,
+Each Bash call runs actions-disable-guard, capacity-pipe-guard, leak-guard and memory-index-guard. Started as a
+script, Python compiles a hook's whole file on every call (a script's bytecode is never cached), and
+actions-disable-guard is 5,000 lines: ~30 ms of compiling and ~10 ms of regular expressions before it reads the command, on an idle machine,
 and many times that under memory pressure, up to the hook's timeout, which refuses the call.
 
 The settings entry of these hooks runs `python3 -IBS agent-guards-fast <the hook file>` (agent_guards.wiring). This
@@ -19,7 +19,7 @@ The hook decides everything the fast check does not; its answer is the answer. A
 check (a broken event, a machine file problem to report, a missing lib part) goes to the hook, never to a pass.
 tests/fast.test.py runs every case of the hooks' tests both ways and expects the same answer.
 """
-import io, json, os, signal, sys
+import io, json, os, re, signal, sys
 
 TEXT_TOOLS = ('Bash', 'Monitor')   # the tools whose tool_input.command is shell text
 # Seconds for reading stdin and the fast check (ms when all is well). Past it the hook decides on its own clock: the
@@ -98,8 +98,31 @@ def memory_index(data, env):
     return last == f'{st.st_mtime_ns} {st.st_size}'
 
 
+# the programs leak-guard reads as a post or a push: a command without one of these names anywhere in its text (quotes
+# and backslashes taken out first, so that g''h and g\\h count) holds no post
+LEAK_NAMES = re.compile(r'(?<![A-Za-z0-9_])(gh|git|curl|wget|https?|xhs?)(?![A-Za-z0-9_])')
+
+
+def leak(data, env):
+    """leak-guard's own first step: a Bash or Monitor command that names no posting program, or another tool."""
+    from agent_guards import config
+    settings, problem = config.load('leakGuard')
+    if problem:   # the guard says so in its answer
+        return False
+    ev = json.loads(_text(data))
+    if not isinstance(ev, dict):
+        return False
+    if ev.get('tool_name') not in {'Bash', 'Monitor'}:
+        return True
+    cmd = (ev.get('tool_input') or {}).get('command')
+    if not isinstance(cmd, str):
+        return True
+    plain = cmd.replace('\\\n', '').replace('\\', '').replace("'", '').replace('"', '')
+    return not LEAK_NAMES.search(plain)
+
+
 FAST = {'actions-disable-guard': actions_disable, 'capacity-pipe-guard': capacity_pipe,
-        'memory-index-guard': memory_index}
+        'memory-index-guard': memory_index, 'leak-guard': leak}
 
 
 class Late(BaseException):

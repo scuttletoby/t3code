@@ -15,7 +15,7 @@ import json, os, shutil, signal, subprocess, tempfile
 from . import config, facts, wiring
 
 SESSION = 'agent-guards-check-'
-READ_ONLY = ('agent-slots', 'facts-hook')   # hooks that write nothing: run with the caller's HOME
+READ_ONLY = ('agent-slots', 'facts-hook', 'leak-guard')   # hooks that write nothing: run with the caller's HOME
 # (poll-loop-guard, read-size-guard and batch-nudge write nothing either; they run with HOME in the temporary folder)
 
 
@@ -119,6 +119,7 @@ def cases(tmp, sid):
          'passed', None),
     ]
     out += speed_cases(tmp, sid, bash)
+    out += leak_cases(bash)
     fc = config.load('facts')[0]       # read only: the machine's own tables and record repos, if any; the hook
     projects = facts.projects_for(fc, tmp)   # runs with this process's HOME (READ_ONLY), so "~/" means the same
     text = facts.session_text(facts.places(fc, tmp, projects=projects), projects, fc['indexLines'],
@@ -193,6 +194,28 @@ def _fake_claude(tmp):
     busy = ("sh -c 'sleep 30; true' shell-snapshots/snapshot-agent-guards-check >/dev/null 2>&1 & B=$!; "
             + hook + 'kill $B 2>/dev/null; exit $r')
     return fake, {'claude': busy, 'idle': hook + 'exit $r'}
+
+
+def leak_cases(bash):
+    """leak-guard: a post that holds nothing passes; one that holds the first plain pattern of the machine's own
+    pattern file is refused. The label names its line number only, never the pattern."""
+    from agent_guards import leak
+    pats = leak.load(config.load('leakGuard')[0]['patternsFile'])
+    out = [('leak-guard', 'PreToolUse', 'a comment with nothing personal',
+            bash("gh issue comment 1 -R example/example --body 'agent-guards check'"),
+            'refused' if pats.problem else 'passed', None)]
+    text = None
+    try:
+        with open(pats.path, encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        n = next((n for n, _ in pats.rows if not lines[n - 1].strip().startswith('re:')), None)
+        text = n and lines[n - 1].strip()
+    except (OSError, ValueError):
+        n = None
+    if text and "'" not in text:
+        out.append(('leak-guard', 'PreToolUse', f'a comment that holds pattern line {n}',
+                    bash(f"gh issue comment 1 -R example/example --body 'x {text} x'"), 'refused', None))
+    return out
 
 
 def run(settings, source, say=print):

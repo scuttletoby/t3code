@@ -114,6 +114,11 @@
       "processName": "claude",
       "note": "at most 4 build agents"
     },
+    "leakGuard": {
+      "patternsFile": "/etc/fork-kit/leak-patterns",
+      "maxPushBytes": 20000000,
+      "repos": ["example/public-repo"]
+    },
     "facts": {
       "dirs": ["/etc/fork-kit/facts"],
       "staleDays": 30,

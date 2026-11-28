@@ -29,6 +29,7 @@ class Entries(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.bin = os.path.join(self.tmp, 'bin')
         os.makedirs(self.bin)
+        self.machine = fx.own_machine(self.tmp)   # the built-in defaults, without the machine's own pattern file
         for hook in wiring.HOOKS:      # each one: the kit's hook with the built-in defaults
             self.stand_in(hook)
         self.home = os.path.join(self.tmp, 'home')
@@ -39,7 +40,7 @@ class Entries(unittest.TestCase):
     def stand_in(self, hook, text=None):
         with open(os.path.join(self.bin, hook), 'w') as f:
             f.write(text if text is not None else STAND_IN.format(
-                lib=fx.LIB, machine=fx.NO_MACHINE, uid=os.geteuid(), hook=os.path.join(fx.BIN, hook)))
+                lib=fx.LIB, machine=self.machine, uid=os.geteuid(), hook=os.path.join(fx.BIN, hook)))
 
     def sh(self, hook, event, command=None, timeout=60):
         cmd = command or wiring.command(hook, self.bin, sys.executable)
@@ -50,7 +51,7 @@ class Entries(unittest.TestCase):
         self.assertEqual(sorted((e, x.get('matcher'), [h['timeout'] for h in x['hooks']])
                                 for e, xs in wiring.hooks().items() for x in xs),
                          sorted([('PreToolUse', 'Write|Edit|MultiEdit', [5]), ('PreToolUse', 'Bash|Monitor', [10]),
-                                 ('PreToolUse', 'Bash|Monitor', [10]),
+                                 ('PreToolUse', 'Bash|Monitor', [10]), ('PreToolUse', 'Bash|Monitor', [10]),
                                  ('PreToolUse', 'Bash', [5]), ('PreToolUse', 'Read', [5]),
                                  ('PostToolUse', 'Write|Edit|MultiEdit|Bash|Monitor', [5]),
                                  ('PostToolUse', 'Read|Grep|Glob|LS|NotebookRead|Bash', [5]),
@@ -101,7 +102,7 @@ class Entries(unittest.TestCase):
         for _event, entries in wiring.hooks().items():
             for e in entries:
                 for h in e['hooks']:
-                    closed = 'actions-disable-guard' in h['command']
+                    closed = any(f'/{c};' in h['command'] for c in wiring.CLOSED)
                     self.assertEqual(h.get('onFailure'), 'block' if closed else None, h['command'])
 
     def test_find_matches_whole_names_only(self):
@@ -136,7 +137,7 @@ class Entries(unittest.TestCase):
         path = os.path.join(self.bin, wiring.FAST)
         with open(path, 'w') as f:
             f.write(text if text is not None else
-                    f'import sys\nsys.argv[1:1] = [{fx.LIB!r}, {fx.NO_MACHINE!r}, "{os.geteuid()}"]\n' + fx.FAST_RUNNER)
+                    f'import sys\nsys.argv[1:1] = [{fx.LIB!r}, {self.machine!r}, "{os.geteuid()}"]\n' + fx.FAST_RUNNER)
         self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
 
     def test_the_fast_path_answers_as_the_hook_and_is_left_out_when_it_is_not_there(self):
@@ -176,7 +177,7 @@ class Entries(unittest.TestCase):
                     if hook in wiring.CLOSED:
                         self.assertEqual(r.returncode, 2, r.stderr)   # lens A nit: empty refuses too
                         self.assertIn('is missing or empty' if name == 'empty'
-                                      else 'actions-disable-guard: the guard failed (exit', r.stderr)
+                                      else f'{hook}: the guard failed (exit', r.stderr)
                         if name != 'empty':
                             self.assertIn('the command is refused', r.stderr)
                     else:
@@ -202,7 +203,7 @@ class Check(unittest.TestCase):
         self.old_home = os.environ.get('HOME')
         os.environ['HOME'] = self.home     # check.run's clean-up of its made-up session, in this process
         self.addCleanup(self.restore_home)
-        fx.use_machine(fx.NO_MACHINE)
+        fx.use_machine(self.machine)
 
     def restore_home(self):
         if self.old_home is None:
@@ -220,18 +221,33 @@ class Check(unittest.TestCase):
     def test_the_kit_entries_pass(self):
         code, lines = self.run_check(self.settings)
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 22, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 23, '\n'.join(lines))
         self.assertEqual(lines[-1], 'check: test settings: OK')
         # lens A nit: the hooks ran with HOME in check's own temporary folder; nothing (log, cache, state) is
         # written in the caller's HOME
         self.assertEqual(os.listdir(self.home), [])
+
+    def test_the_leak_cases_follow_the_pattern_file_not_the_machines(self):
+        """Fix round 1 of #1118: the count above holds on a machine with a pattern file too (the test's machine file
+        points at a missing one); with a pattern file of its own, check adds the refused case and it passes."""
+        patterns = os.path.join(self.tmp, 'leak-patterns')
+        with open(patterns, 'w') as f:
+            f.write('# made up\nExample Person\n')
+        machine = fx.own_machine(self.tmp, {'leakGuard': {'patternsFile': patterns}})
+        fx.use_machine(machine)
+        self.stand_in('leak-guard', STAND_IN.format(lib=fx.LIB, machine=machine, uid=os.geteuid(),
+                                                    hook=os.path.join(fx.BIN, 'leak-guard')))
+        code, lines = self.run_check(self.settings)
+        self.assertEqual(code, 0, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 24, '\n'.join(lines))
+        self.assertIn('PASS leak-guard (PreToolUse) a comment that holds pattern line 2', '\n'.join(lines))
 
     def test_facts_hook_with_a_home_folder_table_wants_and_gets_context(self):
         # review round 1: the wanted answer and the hook read "~/" under the same HOME (a false FAIL before)
         os.makedirs(os.path.join(self.home, 'facts'))
         with open(os.path.join(self.home, 'facts', 'STATE.md'), 'w') as f:
             f.write('| Thing | State now | Updated |\n|---|---|---|\n| Example thing | on | 11-23 |\n')
-        machine = fx.machine_file(self.tmp, {'facts': {'dirs': ['~/facts']}})
+        machine = fx.own_machine(self.tmp, {'facts': {'dirs': ['~/facts']}})
         fx.use_machine(machine)
         with open(os.path.join(self.bin, 'facts-hook'), 'w') as f:
             f.write(STAND_IN.format(lib=fx.LIB, machine=machine, uid=os.geteuid(),
@@ -320,7 +336,8 @@ class Command(unittest.TestCase):
         for name, value in (('PATH', os.path.join(self.tmp, 'etc', 'approval.json')), ('OWNER_UID', os.geteuid())):
             self.addCleanup(setattr, approval, name, getattr(approval, name))
             setattr(approval, name, value)
-        fx.use_machine(fx.NO_MACHINE)
+        self.machine = fx.own_machine(self.tmp)   # not the machine's own pattern file
+        fx.use_machine(self.machine)
 
     def main(self, *argv):
         import contextlib
@@ -440,7 +457,7 @@ class Command(unittest.TestCase):
                 ('a variable another managed file sets', dict(defaults, BASH_MAX_OUTPUT_LENGTH=None), None,
                  {'env': {'BASH_MAX_OUTPUT_LENGTH': '1'}}, 0)):
             with self.subTest(name):
-                fx.use_machine(fx.machine_file(self.tmp, {'harnessEnv': rows}) if rows else fx.NO_MACHINE)
+                fx.use_machine(fx.own_machine(self.tmp, {'harnessEnv': rows} if rows else None))
                 if other:
                     with open(sibling, 'w') as f:
                         json.dump(other, f)
@@ -461,7 +478,7 @@ class Command(unittest.TestCase):
                     self.assertIn('managed settings env: ', out.getvalue())
 
     def test_self_check_names_an_unknown_key(self):
-        machine = fx.machine_file(self.tmp, {'gardener': {}})
+        machine = fx.own_machine(self.tmp, {'gardener': {}})
         fx.use_machine(machine)
         import contextlib
         out = io.StringIO()

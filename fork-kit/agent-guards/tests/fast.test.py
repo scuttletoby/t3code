@@ -34,6 +34,7 @@ def suite(name):
 AD = suite('actions-disable.test.py')
 CAP = suite('capacity-pipe.test.py')
 MEM = suite('memory-index.test.py')
+LEAK = suite('leak-guard.test.py')
 
 
 def quick_for(machine):
@@ -79,7 +80,7 @@ def slow_event(hook):
     if hook == 'memory-index-guard':
         return json.dumps({'hook_event_name': 'PreToolUse', 'tool_name': 'Write',
                            'tool_input': {'file_path': '/x/MEMORY.md'}}).encode()
-    return event('t3-capacity 1 && x' if hook == 'capacity-pipe-guard' else 'pnpm test')
+    return event({'capacity-pipe-guard': 't3-capacity 1 && x', 'leak-guard': 'gh pr view 1'}.get(hook, 'pnpm test'))
 
 
 class QuickCopyTest(unittest.TestCase):
@@ -202,6 +203,32 @@ class CapacityContractTest(unittest.TestCase):
         self.assertFalse(fast.passes('/x/capacity-pipe-guard', b'{"tool_name": ["Bash"]}', {}))
 
 
+class LeakContractTest(LEAK.Case):
+    """Is every command the fast path passes one leak-guard passes, over its own cases and the others' hooks'?"""
+
+    def test_what_the_fast_path_passes_the_guard_passes(self):
+        cases = [f"gh pr comment 1 --body '{LEAK.FAKE_NAME}'", f'g""h pr comment 1 --body "{LEAK.FAKE_NAME}"',
+                 f"g\\\nh pr comment 1 --body '{LEAK.FAKE_NAME}'", f"/usr/bin/gh pr comment 1 -b '{LEAK.FAKE_NAME}'",
+                 f"env -u GH_TOKEN gh pr comment 1 -b '{LEAK.FAKE_NAME}'", f"bash -c 'git commit -m {LEAK.FAKE_HOST}'",
+                 f"curl -d '{LEAK.FAKE_NAME}' https://api.github.com/x", f'echo {LEAK.FAKE_NAME}', 'ls -la',
+                 'pnpm test']
+        cases += [c if isinstance(c, str) else c[0] for c in AD.QUICK_PASS + AD.TRICKY + CAP.ALLOWED]
+        fx.use_machine(self.machine)
+        n = 0
+        for cmd in cases:
+            with self.subTest(cmd=cmd):
+                if fast.leak(event(cmd), {}):
+                    n += 1
+                    self.assertIsNone(self.decide(cmd), cmd)
+        self.assertGreater(n, 20)
+        for cmd in cases[:7]:
+            self.assertFalse(fast.leak(event(cmd), {}), cmd)
+        self.assertTrue(fast.leak(event('gh pr comment 1', 'Read'), {}))
+        self.assertFalse(fast.passes('/x/leak-guard', b'{"tool_name": ["Bash"]}', {}))
+        fx.use_machine(fx.machine_file(self.dir, text='{'))
+        self.assertFalse(fast.leak(event('ls'), {}))   # a machine file problem: the hook says so
+
+
 class ViaFast:
     """Mixed into a hook's own test class: every hook run of it goes through the fast path."""
 
@@ -221,6 +248,10 @@ class MemoryPostViaFast(ViaFast, MEM.Post):
 
 class MemoryRobustViaFast(ViaFast, MEM.Robust):
     """Odd input never breaks a call, through the fast path too."""
+
+
+class LeakHookViaFast(ViaFast, LEAK.HookTest):
+    """leak-guard as Claude Code runs it, through the fast path: the same answers?"""
 
 
 class CapacityConfiguredViaFast(ViaFast, CAP.Configured):
@@ -326,7 +357,7 @@ class LauncherTest(unittest.TestCase):
 
     def test_a_machine_file_problem_an_unknown_hook_or_arguments_go_to_the_hook(self):
         broken = fx.machine_file(self.tmp, text='{')
-        for name in ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard'):
+        for name in ('actions-disable-guard', 'capacity-pipe-guard', 'leak-guard', 'memory-index-guard'):
             with self.subTest(name):
                 r = self.via(self.stand_in(name), event('ls'), machine=broken)
                 self.assertIn(b'"command": "ls"', r.stdout)
@@ -398,7 +429,7 @@ class LauncherTest(unittest.TestCase):
         """Fix round 1 of #1119: the settings entry gives the link /usr/local/bin/<hook>. The bytecode used is the
         installer's, beside the file the link points to; a .pyc planted beside the link (outside the manifest and the
         self-check) never runs, whatever kind it is; an unchecked or writable one in the copy is not used either."""
-        for name in ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard'):
+        for name in ('actions-disable-guard', 'capacity-pipe-guard', 'leak-guard', 'memory-index-guard'):
             with self.subTest(name):
                 hook, link, source = self.installed(name)
                 for flags in (1, 3):   # Python takes an unchecked one as it is, a checked one if the source matches
