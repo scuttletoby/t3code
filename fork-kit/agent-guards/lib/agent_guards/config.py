@@ -21,7 +21,7 @@ problem in its answer (systemMessage, and additionalContext where the event take
                                      "name": "repo"}],
                        "records": [{"path": "/srv/records", "projectsDir": "projects",
                                     "shared": ["machines", "orch", "shared"]}]},
-    "harnessEnv":     [{"name": "API_TIMEOUT_MS", "value": "240000"}, {"name": "DISABLE_AUTOUPDATER", "value": null}],
+    "harnessEnv":     [{"name": "API_TIMEOUT_MS", "value": "400000"}, {"name": "DISABLE_AUTOUPDATER", "value": "1"}],
     "pollLoop":       {"enabled": true, "maxSleepSeconds": 120, "loopSleepSeconds": 5},
     "readSize":       {"enabled": true, "maxChars": 20000},
     "batchNudge":     {"enabled": true, "afterTurns": 3, "tailBytes": 1048576,
@@ -180,18 +180,26 @@ SPEC = {
 HOOKS = tuple(SPEC)
 
 # "harnessEnv": the Claude Code environment variables `agent-guards-install --settings` writes in the "env" of the
-# managed settings drop-in, for every session on the machine (speed: smaller tool outputs, fewer compactions, no
-# 10-minute wait on a stuck request, no update in the middle of a run). Each is in the Claude Code docs
-# (code.claude.com/docs/en/env-vars). None: off (not written) unless the machine file gives a value.
+# managed settings drop-in, for every session on the machine (speed: smaller tool outputs, fewer compactions, a
+# shorter wait on a stuck request). Each is in the Claude Code docs (code.claude.com/docs/en/env-vars). None: off
+# (not written) unless the machine file gives a value.
 HARNESS_ENV = {
     'BASH_MAX_OUTPUT_LENGTH': '12000',     # Claude Code's default 30000 characters
-    'MAX_MCP_OUTPUT_TOKENS': '8000',       # default 25000
-    'API_TIMEOUT_MS': '180000',            # time to the response headers, not the stream; default 600000
-    'DISABLE_AUTOUPDATER': '1',            # updates come with the kit, not in the middle of a run
-    'CLAUDE_CODE_AUTO_COMPACT_WINDOW': None,          # orchestrator only, and managed env is for every session
-    'CLAUDE_CODE_PROMPT_CACHE_TTL': None,             # "5m" or "1h": on after measuring cache reads vs writes
-    'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL': None,
+    # default 25000; a t3_thread_read page (at most 30000 bytes, about 7500 tokens) fits twice
+    'MAX_MCP_OUTPUT_TOKENS': '15000',
+    # default 600000. Not only the wait for the response headers: it also caps the first-byte watchdog of a large
+    # request and bounds a whole non-streaming fallback answer, so not below 5 minutes
+    'API_TIMEOUT_MS': '300000',
+    # off: no kit, timer or CI step updates Claude Code, so turning the background updater off would keep a machine
+    # on its version (security fixes too) until someone updates it by hand. A machine with its own update path
+    # sets it to "1"
+    'DISABLE_AUTOUPDATER': None,
 }
+# Variables T3 sets for each session it starts (the prompt-cache TTLs, the auto-compact window). Managed env wins
+# over T3's per-launch env and T3 does not read managed settings, so one here would silently override T3's value
+# (and T3 would show the wrong one): refused. FORCE_PROMPT_CACHING_5M overrides both TTLs.
+T3_SETS = ('CLAUDE_CODE_PROMPT_CACHE_TTL', 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+           'FORCE_PROMPT_CACHING_5M')
 ENV_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$')
 
 
@@ -200,7 +208,8 @@ def harness_env(section):
     {"name": "<VARIABLE>", "value": "<text>" | <whole number> | null}. A row's value replaces the default; null takes
     the variable out. Rows, not an object keyed by the name: the machine file refuses keys that look like a secret,
     and MAX_MCP_OUTPUT_TOKENS is one. A name that looks like a secret is still refused here (the drop-in is world
-    readable), unless it is one of HARNESS_ENV. A bad row, or a name given again, is left out and named; a
+    readable), unless it is one of HARNESS_ENV, and so is one T3 sets per session (T3_SETS). A bad row, or a name
+    given again, is left out and named; a
     "harnessEnv" that is not a list keeps the defaults. Never raises."""
     env = {k: v for k, v in HARNESS_ENV.items()}
     where, problems = f'{KIT}.harnessEnv', []
@@ -222,6 +231,9 @@ def harness_env(section):
                             '(that entry is left out)')
         elif name in seen:
             problems.append(f'{where}: entry {k}: {name!r} is given twice (that entry is left out)')
+        elif name in T3_SETS:
+            problems.append(f'{where}: entry {k}: {name!r} is not set here: T3 sets it per session, and managed env '
+                            'would override T3\'s value without T3 knowing (that entry is left out)')
         elif machine_file.SECRET_KEY.search(name) and name not in HARNESS_ENV:
             problems.append(f'{where}: entry {k}: {name!r} looks like a secret, and the managed settings are readable '
                             'by every user (that entry is left out)')

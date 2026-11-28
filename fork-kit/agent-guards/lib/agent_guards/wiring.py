@@ -95,6 +95,39 @@ def drop_in_text(bin_dir=BIN, env=None):
     return json.dumps(dict({'hooks': hooks(bin_dir)}, **({'env': dict(env)} if env else {})), indent=2) + '\n'
 
 
+def other_env(drop_in):
+    """[(path, [names])]: the env variables managed-settings.json and the other managed-settings.d/*.json files set
+    (the folders of `drop_in`, a real path). Claude Code merges those with the drop-in key by key, the later file
+    winning, so the kit leaves such a variable to them. A file that cannot be read or parsed is skipped."""
+    import glob, os
+    folder = os.path.dirname(drop_in)
+    out = []
+    for f in [os.path.join(os.path.dirname(folder), 'managed-settings.json')] + \
+            sorted(glob.glob(os.path.join(folder, '*.json'))):
+        if os.path.abspath(f) == os.path.abspath(drop_in):
+            continue
+        try:
+            with open(f, encoding='utf-8') as fh:
+                env = json.load(fh).get('env')
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(env, dict) and env:
+            out.append((f, sorted(env)))
+    return out
+
+
+def env_for(env, drop_in):
+    """(the drop-in's env: `env` less what other managed files set, [(path, [names left to it])])."""
+    env, left = dict(env), []
+    for f, names in other_env(drop_in):
+        taken = [n for n in names if n in env]
+        if taken:
+            left.append((f, taken))
+            for n in taken:
+                del env[n]
+    return env, left
+
+
 def env_ok(env):
     """An "env" this kit may write: an object of variable names to text."""
     import re

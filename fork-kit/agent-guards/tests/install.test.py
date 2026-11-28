@@ -22,8 +22,7 @@ CONFIG = '/etc/agent-guards/config.json'
 FOREIGN = {'permissions': {'deny': ['Bash(rm -rf /)']}}
 MACHINE = '/etc/fork-kit/machine.json'
 MANAGED = f'{wiring.MANAGED_DIR}/managed-settings.json'
-DEFAULT_ENV = {'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '8000', 'API_TIMEOUT_MS': '180000',
-               'DISABLE_AUTOUPDATER': '1'}
+DEFAULT_ENV = {'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '15000', 'API_TIMEOUT_MS': '300000'}
 
 
 class Install(fx.FakeHost):
@@ -201,18 +200,18 @@ class Install(fx.FakeHost):
                 self.assertEqual(self.drop_in()['env'], DEFAULT_ENV)
                 self.assertTrue(wiring.ours(self.drop_in()))
                 self.assertIn('managed settings env: BASH_MAX_OUTPUT_LENGTH=12000', out)
-                self.assertNotIn('CLAUDE_CODE_PROMPT_CACHE_TTL', self.drop_in()['env'])   # off until measured
+                self.assertNotIn('DISABLE_AUTOUPDATER', self.drop_in()['env'])   # the kit ships no update path
                 self.assertEqual(self.run_main('self-check')[0], 0)
 
     def test_harness_env_a_machine_value_wins_and_off_removes_the_key(self):
-        self.machine([{'name': 'API_TIMEOUT_MS', 'value': '300000'}, {'name': 'MAX_MCP_OUTPUT_TOKENS', 'value': 6000},
-                      {'name': 'DISABLE_AUTOUPDATER', 'value': None},
+        self.machine([{'name': 'API_TIMEOUT_MS', 'value': '400000'}, {'name': 'MAX_MCP_OUTPUT_TOKENS', 'value': 20000},
+                      {'name': 'BASH_MAX_OUTPUT_LENGTH', 'value': None}, {'name': 'DISABLE_AUTOUPDATER', 'value': '1'},
                       {'name': 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL', 'value': '1h'}])
-        code, _, err = self.install('--settings')
+        code, out, err = self.install('--settings')
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.drop_in()['env'], {'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '6000',
-                                                 'API_TIMEOUT_MS': '300000',
-                                                 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL': '1h'})
+        self.assertEqual(self.drop_in()['env'], {'MAX_MCP_OUTPUT_TOKENS': '20000', 'API_TIMEOUT_MS': '400000',
+                                                 'DISABLE_AUTOUPDATER': '1'})
+        self.assertIn('T3 sets it per session', out)      # managed env would override T3's own value
         self.machine([{'name': n, 'value': None} for n in DEFAULT_ENV])          # every key off: no "env" at all
         code, _, err = self.install()
         self.assertEqual(code, 0, err)
@@ -221,13 +220,13 @@ class Install(fx.FakeHost):
 
     def test_harness_env_never_clobbers_env_other_managed_files_set(self):
         self.put_json(MANAGED, {'env': {'API_TIMEOUT_MS': '900000'}, 'model': 'x'})
-        self.put_json(f'{os.path.dirname(DROP_IN)}/zz-site.json', {'env': {'DISABLE_AUTOUPDATER': '0'}})
+        self.put_json(f'{os.path.dirname(DROP_IN)}/zz-site.json', {'env': {'BASH_MAX_OUTPUT_LENGTH': '30000'}})
         self.put_json(f'{os.path.dirname(DROP_IN)}/broken.json', '{"env": ')
         code, out, err = self.install('--settings')
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.drop_in()['env'], {'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '8000'})
+        self.assertEqual(self.drop_in()['env'], {'MAX_MCP_OUTPUT_TOKENS': '15000'})
         self.assertIn(f'left to {MANAGED}: API_TIMEOUT_MS', out)
-        self.assertIn('zz-site.json: DISABLE_AUTOUPDATER', out)
+        self.assertIn('zz-site.json: BASH_MAX_OUTPUT_LENGTH', out)
         with open(self.path(MANAGED)) as f:
             self.assertEqual(json.load(f), {'env': {'API_TIMEOUT_MS': '900000'}, 'model': 'x'})   # not touched
 

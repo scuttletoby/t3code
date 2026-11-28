@@ -68,8 +68,15 @@ def self_check(bin_dir, drop_in, links_dir=None):
         else:
             wired = True
             notes.append(f'{drop_in}: every hook is wired in managed settings')
-            notes.append('managed settings env: ' + (' '.join(f'{k}={v}' for k, v in data.get('env', {}).items())
-                                                     or 'none'))
+            have = data.get('env', {})
+            notes.append('managed settings env: ' + (' '.join(f'{k}={v}' for k, v in have.items()) or 'none'))
+            section, _ = config._section()          # a broken file: the defaults, as the installer writes them
+            want = wiring.env_for(config.harness_env(section or {})[0], drop_in)[0]
+            for k in sorted(set(have) | set(want)):
+                if have.get(k) != want.get(k):
+                    problems.append(f'{drop_in}: {k} is {have.get(k, "not set")} in the drop-in, the machine file '
+                                    f'gives {want.get(k, "not set")}: run the installer again (the drop-in\'s env is '
+                                    'written at install)')
     except FileNotFoundError:
         notes.append(f'{drop_in} is not there: the hooks are not in managed settings (installer --settings, or '
                      'by hand from `agent-guards hooks`)')

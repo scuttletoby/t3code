@@ -122,21 +122,9 @@ class AgentGuardsInstaller(kit_install.Installer):
         env, problems = guard_config.harness_env(section)
         for p in problems:
             self.say(f'warning: harnessEnv: {p}')
-        files = [f'{wiring.MANAGED_DIR}/managed-settings.json'] + sorted(
-            f[len(self.PREFIX):] for f in glob.glob(self.p(f'{os.path.dirname(wiring.DROP_IN)}/*.json')))
-        for f in files:
-            if f == wiring.DROP_IN:
-                continue
-            try:
-                with open(self.p(f), encoding='utf-8') as fh:
-                    other = json.load(fh).get('env')
-            except (OSError, ValueError, AttributeError):
-                continue
-            taken = sorted(k for k in (other if isinstance(other, dict) else {}) if k in env)
-            if taken:
-                self.say(f'managed settings env left to {f}: {", ".join(taken)}')
-                for k in taken:
-                    del env[k]
+        env, left = wiring.env_for(env, self.p(wiring.DROP_IN))
+        for f, taken in left:
+            self.say(f'managed settings env left to {self.show(f)}: {", ".join(taken)}')
         return env
 
     def config(self, a, plan):
