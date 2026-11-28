@@ -76,6 +76,15 @@ class Install(fx.FakeHost):
         with open(self.path(UNITS[1])) as f:
             self.assertEqual(f.read(), '[Timer]\nOnCalendar=daily\n')
 
+    def test_a_unit_someone_else_wrote_that_is_not_utf8_is_refused_not_a_traceback(self):
+        os.makedirs(self.path('/etc/systemd/user'))
+        with open(self.path(UNITS[0]), 'wb') as f:
+            f.write(b'# \xff\xfe not text\n[Service]\n')
+        code, _, err = self.install('--timer')
+        self.assertEqual(code, 1)
+        self.assertIn('was not written by this kit', err)
+        self.assertNotIn('Traceback', err)
+
 
 if __name__ == '__main__':
     unittest.main()

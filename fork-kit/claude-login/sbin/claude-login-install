@@ -64,7 +64,7 @@ class ClaudeLoginInstaller(kit_install.Installer):
         try:
             with open(real, encoding='utf-8') as f:
                 return f.readline().startswith(UNIT_HEADER)
-        except OSError:
+        except (OSError, UnicodeDecodeError):   # a file someone else wrote, in any encoding: not ours
             return False
 
     def foreign_refusal(self, path):

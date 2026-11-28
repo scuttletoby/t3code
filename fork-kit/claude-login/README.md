@@ -10,7 +10,7 @@ from the user's own config: nothing in the kit names a project, a person or a ma
 ## Use
 
 ```sh
-claude-login status                    # every account: masked email, plan, login=ok|signed_out|unreadable, time left
+claude-login status                    # every account: masked email, plan, login=ok|ended|signed_out|unreadable, …
 claude-login start main                # prints the sign-in link for the owner (a tmux session waits for the code)
 claude-login finish main /path/code    # types the code from the file, checks the new login, deletes the file
 claude-login set-aside main            # a credentials file that cannot be read: moved aside (kept), see below
@@ -18,9 +18,10 @@ claude-login check                     # the timer's job: one issue per account 
 ```
 
 The agent gets the code with a secret prompt delivered as a file (never in chat or on a command line), and
-`finish` reads it from that file. The proof of a new login is that its end (`refreshTokenExpiresAt`) moved on by
-more than an hour: a refresh of the access token rewrites the file every few minutes, so "the file changed" proves
-nothing.
+`finish` reads it from that file and hands it to tmux on stdin (`tmux load-buffer -`, then `paste-buffer`), never as
+an argument. The proof of a new login is the sign-in's own `claude auth login` ending with exit 0 and a login in the
+file, or the login's end (`refreshTokenExpiresAt`) moving on by more than an hour. A refresh of the access token
+rewrites the file every few minutes, so "the file changed" proves nothing.
 
 ## Config
 
@@ -42,45 +43,75 @@ nothing.
 ```
 
 `configDir` `""` is Claude Code's default folder (`~/.claude`); another folder is used as `CLAUDE_CONFIG_DIR`.
-Optional: `timeout` (seconds per claude, gh or tmux call, 60), `wait` (seconds `finish` waits for the new login,
-30), `readPause` (seconds between reads of a credentials file, 1). Without `issueRepo`, `check` says what it would
-open and fails (exit 1).
+Optional: `timeout` (seconds per claude, gh or tmux call, above 0, 60), `wait` (seconds `start` waits for the link
+and `finish` for the new login, 30), `readPause` (seconds between reads of a credentials file, 1). Numbers must be
+finite (no `NaN`, `Infinity` or `1e400`). Without `issueRepo`, `check` says what it would open and fails (exit 1).
 
 ## What check opens
 
-One issue per account and kind (it looks up open issues by title first; a failed lookup or create fails the run,
-so the timer turns red instead of looking green):
+One issue per account, machine and kind. Each title names all three (`Renew the Claude login of main on the build
+box (signed out)`), and check compares the titles of the open issues itself: GitHub's title search matches words,
+so `main` also finds `main-2`. Machines that share one `issueRepo` and use the same account names never hide each
+other's issues. A failed lookup or create fails the run, so the timer turns red instead of looking green.
 
 - **signed out** (no credentials file, or no login in it): start, then finish.
-- **unreadable** (a file that is not valid JSON, also when read again): set-aside first, then start and finish.
+- **ended** (its `refreshTokenExpiresAt` has passed): start, then finish.
+- **unreadable** (not valid JSON, also when read again; or no regular file: a link, also a dangling one, a FIFO or a
+  file over 64 KiB): set-aside first, then start and finish.
   `finish` refuses an unreadable file every time, since "no login" as the value before would make the next good
   read look like a new login. `set-aside` renames the file to `.credentials.json.unreadable-<UTC time>` (kept, never
-  read or printed) only when it is still unreadable after three reads.
+  read or printed; `-1`, `-2` … at the end when that name is taken) only when it is still unreadable after three
+  reads.
 - **ends within `warnDays`**, and **not refreshing** (the access token ended over an hour ago: whatever refreshed it
   stopped).
 - A file with no end date (an older Claude Code wrote no `refreshTokenExpiresAt`) opens nothing; check fails with
   that reason.
 
-Not opened: an account whose sign-in is running right now (`claude-login-<account>` tmux session): an agent is on
-it.
+Not opened: any issue of an account whose sign-in is running right now (`claude-login-<account>` tmux session, under
+30 minutes old): an agent is on it.
 
 ## State
 
 - **A file half-written for a moment.** A refresh rewrites the credentials file; every read of it (status, check,
   start, finish) reads again, up to three times, while it is not valid.
 - **`start` twice.** The second is refused while the first sign-in runs (another agent may be about to finish it);
-  `start ACCOUNT --again` replaces it. One start at a time per account (a lock in `$XDG_RUNTIME_DIR`, which a tmux
-  server started by it never holds).
+  `start ACCOUNT --again` replaces it. One start, finish or set-aside at a time per account: a lock in
+  `$XDG_RUNTIME_DIR/claude-login/` when that folder is the user's and nobody else can write to it, else in
+  `~/.local/state/claude-login/` (`$XDG_STATE_HOME`), never in a shared `/tmp`. The lock folder must be the user's
+  own with mode 0700, and the lock is opened without following a link; a tmux server started under it never holds
+  it.
 - **A stale code.** `finish` prints only the error word the sign-in shows (the screen may still hold the code) and
-  says to `start --again`. The code file is deleted once typed, kept when typing fails or no sign-in runs.
-- **A login stopped half-way.** The tmux session stays until `start --again`, `finish`, or its 10 minutes end.
+  says to `start --again`. The code file is kept when nothing was typed (no sign-in runs, or tmux would not take the
+  code). Once the code may be in the sign-in, the session is ended on every way out (no screen keeps the code) and
+  the code file deleted; a failed paste or Enter says to `start --again`, so a retry never types the code twice.
+- **A login stopped half-way.** A sign-in session older than 30 minutes is stale: the next `start`, `finish` or
+  `check` ends it, so an unfinished start never keeps check quiet for longer than that. (The shell's `sleep` after
+  `claude auth login` only starts once claude exits, and claude waits for a code for as long as it is left.)
 
 ## Secrets
 
 It reads only the expiry fields of a credentials file and whether a refresh token is there. It never prints or
-logs a token, the file's text or the code; a broken file is named by its state, not its content. Claude runs with
-`CLAUDE_CODE_OAUTH_TOKEN` unset, so a normal login is used and made, never a setup token. The tests use made-up
-files and codes only, and check that none of them shows in any output.
+logs a token, the file's text or the code, and never puts the code on a command line (where `ps` shows it to every
+local user); a broken file is named by its state, not its content. Claude runs with `CLAUDE_CODE_OAUTH_TOKEN`
+unset, so a normal login is used and made, never a setup token. The tests use made-up files and codes only, and
+check that none of them shows in any output or in the command lines given to tmux and gh.
+
+## Moving from a copy kept in a project
+
+A `claude-login` helper copied into a project before this kit keeps running after the kit is installed: a user
+unit `~/.config/systemd/user/claude-login-check.timer` (or `.service`) overrides the kit's units in
+`/etc/systemd/user/`, and `~/.local/bin/claude-login` usually comes before `/usr/local/bin` on PATH. Its issue
+titles (`Renew the <account>'s Claude login`) are not the kit's, so check does not see them as open. For each user:
+
+```sh
+systemctl --user disable --now claude-login-check.timer   # the old helper's timer, if it ran
+rm -f ~/.config/systemd/user/claude-login-check.timer ~/.config/systemd/user/claude-login-check.service
+rm -f ~/.local/bin/claude-login                           # only the old helper's copy
+systemctl --user daemon-reload && systemctl --user enable --now claude-login-check.timer
+command -v claude-login                                   # /usr/local/bin/claude-login
+```
+
+Then close the old helper's open issues; check opens its own where one is still needed.
 
 ## Install
 
