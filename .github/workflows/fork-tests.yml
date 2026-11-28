@@ -5,6 +5,9 @@ name: Fork tests
 # Commands follow ci.yml step for step. Only the runners, time limits, apt
 # setup and the task cache differ (kept with actions/cache instead of upstream's
 # private remote cache), Test splits over two runners and Test Web over three.
+# Test and Test Web also keep Vitest's module cache as upstream's Test Server does,
+# and Rust keeps cargo's build output; .github/scripts/fork-ci-cache-keys.cjs
+# checks every cache key here (lockfile hashes, push-only saves).
 # Upstream's composite actions and change detector (.github/actions,
 # .github/scripts/ci-changes.cjs) are used as they are, so a rebase brings their
 # changes. The `workflows` job lints the fork workflows (actionlint) and the
@@ -1161,6 +1164,17 @@ jobs:
           cat "$RUNNER_TEMP/apt.log"
           exit "$(cat "$RUNNER_TEMP/apt-status")"
 
+      # Fork only, as upstream's Test Server: Vitest's module cache (transformed files, keyed
+      # inside by each file's content, the config and Vitest's version), saved only by pushes
+      # to main so pull requests never evict each other's entries. Tests always run.
+      - name: Restore Vitest module cache
+        if: steps.shard.outputs.any == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: node_modules/.vitest-cache
+          key: vitest-modules-test-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
+          restore-keys: vitest-modules-test-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+
       # Whole packages as upstream runs them; a large package's slice runs its
       # own test script in its directory with vitest's --shard (`vp run` does
       # not pass arguments through to vitest).
@@ -1193,6 +1207,13 @@ jobs:
             echo "::endgroup::"
           done
           exit "$status"
+
+      - name: Save Vitest module cache
+        if: steps.shard.outputs.any == 'true' && github.event_name == 'push'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: node_modules/.vitest-cache
+          key: vitest-modules-test-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end
@@ -1272,6 +1293,14 @@ jobs:
         working-directory: apps/web
         run: node ../../.github/scripts/fork-vitest-gc-check.cjs
 
+      # Fork only: Vitest's module cache, as on the Test shards.
+      - name: Restore Vitest module cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: node_modules/.vitest-cache
+          key: vitest-modules-web-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
+          restore-keys: vitest-modules-web-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+
       # Upstream: `vp run --filter @t3tools/web test --shard N/total`. The same
       # script, run in its directory with the slice, as on the Test shards.
       # Upstream's release test_web also boots the built client on shard 1;
@@ -1286,6 +1315,13 @@ jobs:
           VITEST_CHROMIUM_GC_DISK_THRESHOLD_GB: "1000000"
         working-directory: apps/web
         run: eval "$(jq -r .scripts.test package.json) --shard=$SHARD"
+
+      - name: Save Vitest module cache
+        if: github.event_name == 'push'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: node_modules/.vitest-cache
+          key: vitest-modules-web-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end
@@ -1472,6 +1508,27 @@ jobs:
           toolchain: stable
           components: rustfmt
 
+      # Fork only: cargo's downloaded crates and the crates' build output, read only for the same
+      # rustc and lockfiles and saved once for them, by a push to main. Cargo still rebuilds the
+      # crates themselves (the fresh checkout's sources are newer than every cached build) and
+      # runs every test.
+      - name: Resolve rustc version
+        id: rustc
+        run: echo "version=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo cache
+        id: cargo
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            native/resource-monitor/target
+            native/kde-snap-shot/target
+            native/hyprland-snap-shot/target
+          key: cargo-v1-${{ runner.os }}-${{ runner.arch }}-rustc${{ steps.rustc.outputs.version }}-${{ hashFiles('native/*/Cargo.lock') }}
+
       - name: Check Rust formatting
         run: |
           for crate in resource-monitor kde-snap-shot hyprland-snap-shot; do
@@ -1483,6 +1540,19 @@ jobs:
           for crate in resource-monitor kde-snap-shot hyprland-snap-shot; do
             cargo test --locked --manifest-path "native/$crate/Cargo.toml"
           done
+
+      - name: Save Cargo cache
+        if: github.event_name == 'push' && steps.cargo.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            native/resource-monitor/target
+            native/kde-snap-shot/target
+            native/hyprland-snap-shot/target
+          key: ${{ steps.cargo.outputs.cache-primary-key }}
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end

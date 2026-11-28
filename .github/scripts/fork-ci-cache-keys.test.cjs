@@ -307,3 +307,33 @@ test("main prints one ::error:: line per problem and returns 1", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("Test, Test Web, Test Server and Rust restore their build output caches and save them only on a push", () => {
+  const steps = cacheSteps(
+    fs.readFileSync(path.join(__dirname, "../workflows/fork-tests.yml"), "utf8"),
+  );
+  const want = {
+    test: { prefix: "vitest-modules-test-", path: "node_modules/.vitest-cache" },
+    test_web: { prefix: "vitest-modules-web-", path: "node_modules/.vitest-cache" },
+    test_server: { prefix: "vitest-modules-server-", path: "node_modules/.vitest-cache" },
+    rust: { prefix: "cargo-", path: "native/resource-monitor/target" },
+  };
+  for (const [job, { prefix, path: cachePath }] of Object.entries(want)) {
+    const restore = steps.find(
+      (step) => step.job === job && step.kind === "restore" && step.key.startsWith(prefix),
+    );
+    const save = steps.find(
+      (step) =>
+        step.job === job &&
+        step.kind === "save" &&
+        (step.key.startsWith(prefix) ||
+          step.key.includes(`steps.${restore?.id}.outputs.cache-primary-key`)),
+    );
+    assert.ok(
+      restore && save && restore.index < save.index,
+      `${job}: a restore of ${prefix} and a later save`,
+    );
+    assert.ok(restore.path.split("\n").includes(cachePath), `${job}: restores ${cachePath}`);
+    assert.match(save.if, /github\.event_name == 'push'/, `${job}: saves only on a push`);
+  }
+});
