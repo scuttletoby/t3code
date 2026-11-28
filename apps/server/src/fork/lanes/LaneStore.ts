@@ -3,7 +3,14 @@
  * reads, changes and atomically rewrites it under one lock. Off: every step refused, no file read or
  * written. An unreadable file is unknown, not empty: every step refused, the file kept.
  */
-import type { LaneClaim, LaneEscalation, LaneNote, ProjectId, ThreadId } from "@t3tools/contracts";
+import {
+  type LaneClaim,
+  laneDefinitions,
+  type LaneEscalation,
+  type LaneNote,
+  type ProjectId,
+  type ThreadId,
+} from "@t3tools/contracts";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -121,14 +128,14 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
   const fileOf = (projectId: ProjectId) =>
     path.join(options.directory, `${encodeURIComponent(projectId)}.json`);
 
-  /** The definitions while lanes are on; refused while off or when settings cannot be read. */
+  /** The lanes that exist (built-in, then the stored ones over them) while lanes are on; else refused. */
   const definitionsNow = settings.getSettings.pipe(
     Effect.mapError(() =>
       refused(LaneState.refuse("lanes-off", "The server settings cannot be read now.")),
     ),
     Effect.flatMap((current) =>
       current.lanes.enabled
-        ? Effect.succeed(current.lanes.definitions as LaneState.LaneDefinitions)
+        ? Effect.succeed(laneDefinitions(current.lanes))
         : Effect.fail(
             refused(LaneState.refuse("lanes-off", "Lanes are off (server.lanes.enabled).")),
           ),

@@ -1,12 +1,7 @@
 /** Fork (issue 1156, phase 2): the lane store over a real folder, one store per server start. */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import {
-  DEFAULT_LANE_DEFINITIONS,
-  type LaneDefinition,
-  ProjectId,
-  ThreadId,
-} from "@t3tools/contracts";
+import { type LaneDefinition, ProjectId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -29,16 +24,17 @@ const PR = "pr:owner/repo#12";
 /** A second lane that also owns pull requests, so two lanes can want one. */
 const CI: LaneDefinition = { description: "Keeps CI green.", owns: ["pr"], driver: "agent" };
 
+/** The `lanes` setting as stored: only what differs from the built-in lanes. */
 interface Lanes {
   enabled: boolean;
-  definitions: { [name: string]: LaneDefinition };
+  definitions: { [name: string]: LaneDefinition | false };
 }
 
 const harness = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const directory = path.join(yield* fs.makeTempDirectoryScoped({ prefix: "lanes-" }), "lanes");
-  const lanes: Lanes = { enabled: true, definitions: { ...DEFAULT_LANE_DEFINITIONS, ci: CI } };
+  const lanes: Lanes = { enabled: true, definitions: { ci: CI } };
   const settings = Layer.mock(ServerSettingsService)({
     getSettings: Effect.sync(() => ({ lanes: { ...lanes } }) as unknown as ServerSettings),
   });
@@ -168,8 +164,8 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
         reasonOf(yield* Effect.exit(store.replaceLaneThread(PROJECT, "pr-queue", 1, C))),
         "stale-owner",
       );
-      // A lane removed from the settings leaves a stale claim: the next claim takes it.
-      delete lanes.definitions["pr-queue"];
+      // A built-in lane removed in the settings (`false`) leaves a stale claim: the next claim takes it.
+      lanes.definitions["pr-queue"] = false;
       assert.isNull(yield* store.ownerOf(PROJECT, PR));
       const board = yield* store.board(PROJECT);
       assert.deepStrictEqual(
