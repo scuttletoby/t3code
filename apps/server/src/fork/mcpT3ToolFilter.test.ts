@@ -176,7 +176,8 @@ const serverLayer = <S>(shared: Layer.Layer<S>) => {
         }),
         Layer.mock(Playtest)({ filePath: "unused" }),
         Layer.mock(LaneStore)({
-          board: () => Effect.succeed({ lanes: {}, claims: [], outbox: [], notes: [] }),
+          board: () =>
+            Effect.succeed({ definitions: {}, lanes: {}, claims: [], outbox: [], notes: [] }),
         }),
         Layer.mock(RemoteDelegation.RemoteDelegation)({}),
         Layer.mock(PeerForwarding.PeerForwarding)({}),
@@ -581,6 +582,22 @@ describe("the lane tools: off means off (lanes, fork issue #1156)", () => {
           const board = yield* call("all", "lane_board", {});
           expect(board.result?.isError).not.toBe(true);
           expect(board.result?.structuredContent).toMatchObject({ claims: [], notes: [] });
+        }),
+      { ...SETTINGS, lanes: { enabled: true } },
+    ),
+  );
+  it.effect("lanes turned off after a list: tool_search no longer finds them", () =>
+    withServer(
+      ({ list, call }) =>
+        Effect.gen(function* () {
+          LaneToolsVisibility.__testing.clear();
+          expect(yield* list("all")).toContain("lane_board");
+          const settings = yield* ServerSettingsService.ServerSettingsService;
+          yield* settings.updateSettings({ lanes: { enabled: false } } as never);
+          // No list in between: the search itself sees the setting as it is now.
+          expect(
+            found(yield* call("all", "tool_search", { query: "lane_board lanes" })),
+          ).not.toContain("lane_board");
         }),
       { ...SETTINGS, lanes: { enabled: true } },
     ),

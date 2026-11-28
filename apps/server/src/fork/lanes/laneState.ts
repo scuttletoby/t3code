@@ -40,6 +40,11 @@ const LaneEntry = Schema.Struct({
   generation: Schema.Number,
   threadId: ThreadId,
   startedAt: Schema.String,
+  /**
+   * The thread that started it (an orchestrator), the one thread that may stop it. Absent: the
+   * owner started it, and only the owner stops it.
+   */
+  startedBy: Schema.optionalKey(ThreadId),
   stoppedAt: Schema.NullOr(Schema.String),
   /** Every thread that acted as this lane, oldest first, at most {@link THREADS_PER_LANE}. */
   threads: Schema.Array(LaneThread),
@@ -124,6 +129,10 @@ export type LaneRefusalReason =
   | "already-running"
   /** The caller is not the lane's current thread and generation (a replaced or old thread). */
   | "stale-owner"
+  /** A thread named as the lane's thread is the thread that starts the lane. */
+  | "self-lane"
+  /** Only the thread that started a lane, or the owner, stops it. */
+  | "not-starter"
   /** The lane's definition does not own this kind of item. */
   | "kind-not-owned"
   | "bad-item"
@@ -172,6 +181,11 @@ const ok = <A>(state: LaneProjectState, value: A, changed = true): LaneStep<A> =
 
 /** The lanes the settings define, by name. */
 export type LaneDefinitions = { readonly [name: string]: LaneDefinition };
+
+/** Who starts or stops a lane: a thread (an orchestrator, through the lane tools), or the owner. */
+export type LaneOperator =
+  | { readonly _tag: "thread"; readonly threadId: ThreadId }
+  | { readonly _tag: "owner" };
 
 const definitionOf = (definitions: LaneDefinitions, lane: string): LaneDefinition | undefined =>
   own(definitions, lane);
@@ -273,10 +287,22 @@ const rememberThread = (
 export function startLane(
   state: LaneProjectState,
   definitions: LaneDefinitions,
-  input: { readonly lane: string; readonly threadId: ThreadId; readonly now: string },
+  input: {
+    readonly lane: string;
+    readonly threadId: ThreadId;
+    readonly by: LaneOperator;
+    readonly now: string;
+  },
 ): LaneStepResult<LaneEntry> {
   if (definitionOf(definitions, input.lane) === undefined) {
     return refuse("unknown-lane", `The settings do not define the lane '${input.lane}'.`);
+  }
+  // The starter stops the lane; as the lane's thread too, it could stop and claim at once.
+  if (input.by._tag === "thread" && input.by.threadId === input.threadId) {
+    return refuse(
+      "self-lane",
+      `Thread ${input.threadId} starts the lane '${input.lane}', so it cannot be the lane's thread: name another thread of the project.`,
+    );
   }
   const current = own(state.lanes, input.lane);
   if (current?.status === "running") {
@@ -304,6 +330,7 @@ export function startLane(
     generation,
     threadId: input.threadId,
     startedAt: input.now,
+    ...(input.by._tag === "thread" ? { startedBy: input.by.threadId } : {}),
     stoppedAt: null,
     threads: rememberThread(current?.threads ?? [], generation, input.threadId, input.now),
   };
@@ -342,6 +369,12 @@ export function replaceLaneThread(
       `The lane '${input.lane}' is at generation ${current.generation}, not ${input.fromGeneration}.`,
     );
   }
+  if (current.startedBy === input.threadId) {
+    return refuse(
+      "self-lane",
+      `Thread ${input.threadId} started the lane '${input.lane}', so it cannot be the lane's thread.`,
+    );
+  }
   const generation = current.generation + 1;
   const entry: LaneEntry = {
     ...current,
@@ -362,13 +395,26 @@ export function replaceLaneThread(
 
 /**
  * Switches a lane off and releases its claims (returned). A lane not running, or no longer
- * defined, stops too: stopping is how its claims go. Repeating it changes nothing.
+ * defined, stops too: stopping is how its claims go. Repeating it changes nothing. Only the
+ * thread that started the lane, or the owner, stops it.
  */
 export function stopLane(
   state: LaneProjectState,
-  input: { readonly lane: string; readonly now: string },
+  input: { readonly lane: string; readonly by: LaneOperator; readonly now: string },
 ): LaneStepResult<ReadonlyArray<LaneClaim>> {
   const current = own(state.lanes, input.lane);
+  if (
+    current !== undefined &&
+    input.by._tag === "thread" &&
+    current.startedBy !== input.by.threadId
+  ) {
+    return refuse(
+      "not-starter",
+      current.startedBy === undefined
+        ? `The owner started the lane '${input.lane}'; only the owner stops it.`
+        : `Thread ${current.startedBy} started the lane '${input.lane}'; only it (or the owner) stops it.`,
+    );
+  }
   const released = Object.values(state.claims).filter((claim) => claim.lane === input.lane);
   if ((current === undefined || current.status === "stopped") && released.length === 0) {
     return ok(state, [], false);

@@ -6,12 +6,10 @@
  */
 import {
   LaneClaim,
-  type LaneDefinition,
   LaneEscalation,
   LaneGeneration,
   LaneItemKind,
   LaneNote,
-  laneDefinitions,
   OrchestratorMcpFailure,
   ThreadId,
 } from "@t3tools/contracts";
@@ -20,27 +18,36 @@ import * as Schema from "effect/Schema";
 
 import { callingThread as threadOfCaller } from "../../mcp/toolkits/waits/callingThread.ts";
 import { unavailable } from "../../mcp/threadAccess.ts";
-import { ServerSettingsService } from "../../serverSettings.ts";
 import { LaneStore, type LaneStoreRefused } from "./LaneStore.ts";
-import { type LaneRefusalReason, normalizeItem, own } from "./laneState.ts";
+import { type LaneOperator, type LaneRefusalReason, normalizeItem, own } from "./laneState.ts";
 
 /** Notes per lane the board shows, newest last; the store keeps more. */
 export const BOARD_NOTES_PER_LANE = 3;
 
-const LANE_REFUSAL_REASONS = [
-  "lanes-off",
-  "store-unreadable",
-  "unknown-lane",
-  "not-running",
-  "already-running",
-  "stale-owner",
-  "kind-not-owned",
-  "bad-item",
-  "bad-input",
-  "claimed",
-  "not-holder",
-  "outbox-full",
-] as const satisfies ReadonlyArray<LaneRefusalReason>;
+/**
+ * Every reason the store refuses with, once: a reason added to {@link LaneRefusalReason} and not
+ * here is a type error, so no refusal is ever a code the failure's schema rejects.
+ */
+const LANE_REFUSAL_REASON_KEYS: { readonly [Reason in LaneRefusalReason]: true } = {
+  "lanes-off": true,
+  "store-unreadable": true,
+  "store-unwritable": true,
+  "unknown-lane": true,
+  "not-running": true,
+  "already-running": true,
+  "stale-owner": true,
+  "self-lane": true,
+  "not-starter": true,
+  "kind-not-owned": true,
+  "bad-item": true,
+  "bad-input": true,
+  claimed: true,
+  "not-holder": true,
+  "outbox-full": true,
+};
+const LANE_REFUSAL_REASONS = Object.keys(
+  LANE_REFUSAL_REASON_KEYS,
+) as ReadonlyArray<LaneRefusalReason>;
 
 /** A step the lane store refused: its reason, and for `claimed` and `not-holder` the claim that stands. */
 export class LaneToolFailure extends Schema.TaggedError<LaneToolFailure>()("LaneToolFailure", {
@@ -114,6 +121,9 @@ export const LaneReleaseResult = Schema.Struct({
 const callingThread = () =>
   threadOfCaller("Lanes belong to a project. This MCP client is not running inside a T3 thread.");
 
+/** A lane tool always acts as the calling thread, never as the owner. */
+const asThread = (threadId: ThreadId): LaneOperator => ({ _tag: "thread", threadId });
+
 const failure = (refusal: LaneStoreRefused) =>
   new LaneToolFailure({
     code: refusal.reason as LaneToolFailure["code"],
@@ -124,7 +134,7 @@ const failure = (refusal: LaneStoreRefused) =>
 const refusedAs = <A, R>(step: Effect.Effect<A, LaneStoreRefused, R>) =>
   step.pipe(Effect.mapError(failure));
 
-/** `lane_start`: the thread must be a live thread of the caller's project. */
+/** `lane_start`: the thread must be a live thread of the caller's project, and not the caller. */
 export const laneStartCall = Effect.fn("laneTools.start")(function* (
   input: typeof LaneStartInput.Type,
 ) {
@@ -146,7 +156,9 @@ export const laneStartCall = Effect.fn("laneTools.start")(function* (
     });
   }
   const store = yield* LaneStore;
-  const entry = yield* refusedAs(store.startLane(projectId, input.lane, input.threadId));
+  const entry = yield* refusedAs(
+    store.startLane(projectId, input.lane, input.threadId, asThread(calling.caller.id)),
+  );
   return {
     lane: input.lane,
     generation: entry.generation,
@@ -156,25 +168,24 @@ export const laneStartCall = Effect.fn("laneTools.start")(function* (
   };
 });
 
+/** `lane_stop`: only from the thread that started the lane. */
 export const laneStopCall = Effect.fn("laneTools.stop")(function* (
   input: typeof LaneStopInput.Type,
 ) {
   const calling = yield* callingThread();
   const store = yield* LaneStore;
-  const released = yield* refusedAs(store.stopLane(calling.caller.projectId, input.lane));
+  const released = yield* refusedAs(
+    store.stopLane(calling.caller.projectId, input.lane, asThread(calling.caller.id)),
+  );
   return { lane: input.lane, released: released.map((claim) => claim.item) };
 });
 
 export const laneBoardCall = Effect.fn("laneTools.board")(function* () {
   const calling = yield* callingThread();
   const store = yield* LaneStore;
+  // One read: the definitions come with the store's view (settings that cannot be read: refused).
   const board = yield* refusedAs(store.board(calling.caller.projectId));
-  // The store read the settings an instant ago; a read error now only drops the defined-but-off rows.
-  const definitions: Readonly<Record<string, LaneDefinition>> = yield* ServerSettingsService.pipe(
-    Effect.flatMap((service) => service.getSettings),
-    Effect.map((settings) => laneDefinitions(settings.lanes)),
-    Effect.orElseSucceed(() => ({})),
-  );
+  const definitions = board.definitions;
   const names = [...new Set([...Object.keys(definitions), ...Object.keys(board.lanes)])].toSorted();
   const lanes = names.map((lane) => {
     const entry = own(board.lanes, lane);

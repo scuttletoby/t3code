@@ -45,6 +45,8 @@ export interface BoardClaim {
 }
 
 export interface LaneBoard {
+  /** The lanes the settings define, from the same read as the rest of the board. */
+  readonly definitions: LaneState.LaneDefinitions;
   readonly lanes: { readonly [lane: string]: LaneState.LaneEntry };
   readonly claims: ReadonlyArray<BoardClaim>;
   readonly outbox: ReadonlyArray<LaneEscalation>;
@@ -60,6 +62,7 @@ export class LaneStore extends Context.Service<
       projectId: ProjectId,
       lane: string,
       threadId: ThreadId,
+      by: LaneState.LaneOperator,
     ) => Step<LaneState.LaneEntry>;
     readonly replaceLaneThread: (
       projectId: ProjectId,
@@ -68,7 +71,11 @@ export class LaneStore extends Context.Service<
       threadId: ThreadId,
     ) => Step<LaneState.LaneEntry>;
     /** The claims it released. */
-    readonly stopLane: (projectId: ProjectId, lane: string) => Step<ReadonlyArray<LaneClaim>>;
+    readonly stopLane: (
+      projectId: ProjectId,
+      lane: string,
+      by: LaneState.LaneOperator,
+    ) => Step<ReadonlyArray<LaneClaim>>;
     readonly claim: (
       projectId: ProjectId,
       actor: LaneState.LaneActor,
@@ -236,9 +243,9 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
     );
 
   return LaneStore.of({
-    startLane: Effect.fn("LaneStore.startLane")(function* (projectId, lane, threadId) {
+    startLane: Effect.fn("LaneStore.startLane")(function* (projectId, lane, threadId, by) {
       return yield* run(projectId, (state, definitions, now) =>
-        LaneState.startLane(state, definitions, { lane, threadId, now }),
+        LaneState.startLane(state, definitions, { lane, threadId, by, now }),
       );
     }),
     replaceLaneThread: Effect.fn("LaneStore.replaceLaneThread")(
@@ -248,9 +255,9 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
         );
       },
     ),
-    stopLane: Effect.fn("LaneStore.stopLane")(function* (projectId, lane) {
+    stopLane: Effect.fn("LaneStore.stopLane")(function* (projectId, lane, by) {
       return yield* run(projectId, (state, _definitions, now) =>
-        LaneState.stopLane(state, { lane, now }),
+        LaneState.stopLane(state, { lane, by, now }),
       );
     }),
     claim: Effect.fn("LaneStore.claim")(function* (projectId, actor, item) {
@@ -287,6 +294,7 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
     }),
     board: Effect.fn("LaneStore.board")(function* (projectId) {
       return yield* view(projectId, (state, definitions) => ({
+        definitions,
         lanes: state.lanes,
         claims: Object.values(state.claims).map((claim) => ({
           claim,

@@ -6,6 +6,7 @@ import {
   type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderInstanceId,
+  ServerSettingsError,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -69,10 +70,35 @@ const client = McpSchema.McpServerClient.of({
   getClient: Effect.die("unused"),
 });
 
-/** The fork's tools over a lane store in `directory` (one server start). */
-const toolsLayer = (directory: string, settings: object) => {
+/**
+ * Settings that read once more after `allow(n)`, then fail: a read the store did not make sees the
+ * failure.
+ */
+const flakySettings = (settings: object) => {
+  let left = Number.POSITIVE_INFINITY;
+  const layer = Layer.effect(
+    ServerSettingsService,
+    Effect.gen(function* () {
+      const real = yield* ServerSettingsService;
+      return ServerSettingsService.of({
+        ...real,
+        getSettings: Effect.suspend(() =>
+          left-- > 0
+            ? real.getSettings
+            : Effect.fail(
+                new ServerSettingsError({ settingsPath: "test", operation: "read-file" }),
+              ),
+        ),
+      });
+    }),
+  ).pipe(Layer.provide(ServerSettingsService.layerTest(settings as never)));
+  return { layer, allow: (reads: number) => (left = reads) };
+};
+
+/** The fork's tools over a lane store in `directory` (one server start), with these settings. */
+const toolsLayerWith = <E>(directory: string, settings: Layer.Layer<ServerSettingsService, E>) => {
   const base = Layer.mergeAll(
-    ServerSettingsService.layerTest(settings as never),
+    settings,
     Layer.mock(ThreadManagement.ThreadManagementService)({
       getThreadShell: (threadId) =>
         Effect.succeed(shells.get(threadId) ?? McpToolAccessTestkit.liveThreadShell(threadId)),
@@ -90,6 +116,9 @@ const toolsLayer = (directory: string, settings: object) => {
     Layer.provideMerge(base),
   );
 };
+
+const toolsLayer = (directory: string, settings: object) =>
+  toolsLayerWith(directory, ServerSettingsService.layerTest(settings as never));
 
 const call = (caller: ThreadId, name: string, args: Record<string, unknown>) =>
   Effect.gen(function* () {
@@ -393,6 +422,94 @@ it.layer(NodeServices.layer)("lane tools", (it) => {
           }),
         ),
       );
+    }),
+  );
+
+  it.effect("lane_start refuses the calling thread as the lane's own thread", () =>
+    Effect.gen(function* () {
+      const { fs, directory, file } = yield* workspace;
+      yield* Effect.gen(function* () {
+        // The caller (an orchestrator) cannot make itself the lane and then claim as it.
+        expect(
+          failed(yield* call(MAIN, "lane_start", { lane: "pr-queue", threadId: MAIN })),
+        ).toMatchObject({ code: "self-lane" });
+        expect(
+          failed(yield* call(MAIN, "lane_claim", { lane: "pr-queue", generation: 1, item: PR })),
+        ).toMatchObject({ code: "not-running" });
+      }).pipe(Effect.provide(toolsLayer(directory, ON)));
+      assert.isFalse(yield* fs.exists(file));
+    }),
+  );
+
+  it.effect("lane_stop: only the thread that started the lane stops it", () =>
+    Effect.gen(function* () {
+      const { directory } = yield* workspace;
+      yield* Effect.gen(function* () {
+        succeeded(yield* call(MAIN, "lane_start", { lane: "pr-queue", threadId: PR_LANE }));
+        succeeded(
+          yield* call(PR_LANE, "lane_claim", { lane: "pr-queue", generation: 1, item: PR }),
+        );
+        // Not the lane's own thread, nor another thread of the project (another lane's).
+        for (const thread of [PR_LANE, CI_LANE, ISSUES_THREAD]) {
+          expect(
+            failed(yield* call(thread, "lane_stop", { lane: "pr-queue" })),
+            thread,
+          ).toMatchObject({ code: "not-starter", message: expect.stringContaining(MAIN) });
+        }
+        expect(succeeded(yield* call(MAIN, "lane_board", {})).claims).toEqual([
+          expect.objectContaining({ item: PR, live: true }),
+        ]);
+        expect(succeeded(yield* call(MAIN, "lane_stop", { lane: "pr-queue" }))).toEqual({
+          lane: "pr-queue",
+          released: [PR],
+        });
+        // Started again by another thread: that one stops it now, the first no longer.
+        succeeded(yield* call(CI_LANE, "lane_start", { lane: "pr-queue", threadId: PR_LANE }));
+        expect(failed(yield* call(MAIN, "lane_stop", { lane: "pr-queue" }))).toMatchObject({
+          code: "not-starter",
+        });
+        succeeded(yield* call(CI_LANE, "lane_stop", { lane: "pr-queue" }));
+      }).pipe(Effect.provide(toolsLayer(directory, ON)));
+    }),
+  );
+
+  it.effect("a lane file that cannot be written: the store's refusal, not a crash", () =>
+    Effect.gen(function* () {
+      const { fs, directory, file } = yield* workspace;
+      yield* fs.makeDirectory(directory, { recursive: true });
+      yield* fs.chmod(directory, 0o555);
+      yield* Effect.gen(function* () {
+        expect(
+          failed(yield* call(MAIN, "lane_start", { lane: "pr-queue", threadId: PR_LANE })),
+        ).toMatchObject({ code: "store-unwritable" });
+      }).pipe(Effect.provide(toolsLayer(directory, ON)));
+      yield* fs.chmod(directory, 0o755);
+      assert.isFalse(yield* fs.exists(file));
+    }),
+  );
+
+  it.effect("lane_board reads the settings once: no window where lanes show as undefined", () =>
+    Effect.gen(function* () {
+      const { directory } = yield* workspace;
+      const settings = flakySettings(ON);
+      yield* Effect.gen(function* () {
+        succeeded(yield* call(MAIN, "lane_start", { lane: "pr-queue", threadId: PR_LANE }));
+        // One read for the board; any second read fails.
+        settings.allow(1);
+        const board = succeeded(yield* call(MAIN, "lane_board", {}));
+        expect(
+          board.lanes.find((lane: { lane: string }) => lane.lane === "pr-queue"),
+        ).toMatchObject({ status: "running", owns: ["pr"] });
+        expect(
+          board.lanes.filter((lane: { status: string }) => lane.status === "undefined"),
+        ).toEqual([]);
+        // Settings that cannot be read at all: a plain refusal, not a board of undefined lanes.
+        settings.allow(0);
+        expect(failed(yield* call(MAIN, "lane_board", {}))).toMatchObject({
+          code: "lanes-off",
+          message: expect.stringContaining("cannot be read"),
+        });
+      }).pipe(Effect.provide(toolsLayerWith(directory, settings.layer)));
     }),
   );
 

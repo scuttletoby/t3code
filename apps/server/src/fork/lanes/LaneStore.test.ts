@@ -23,6 +23,8 @@ const ISSUES = ThreadId.make("issues-thread");
 const PR = "pr:owner/repo#12";
 /** A run's end time far after every step of a test. */
 const NOW = "2999-01-01T00:00:00.000Z";
+/** The owner starts and stops these lanes; the lane tools' tests cover a thread doing it. */
+const OWNER = { _tag: "owner" } as const;
 
 /** A second lane that also owns pull requests, so two lanes can want one. */
 const CI: LaneDefinition = { description: "Keeps CI green.", owns: ["pr"], driver: "agent" };
@@ -66,7 +68,7 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start, readFile } = yield* harness;
       const first = yield* start;
-      const entry = yield* first.startLane(PROJECT, "pr-queue", A);
+      const entry = yield* first.startLane(PROJECT, "pr-queue", A, OWNER);
       assert.strictEqual(entry.generation, 1);
       const { claim } = yield* first.claim(PROJECT, actor("pr-queue", 1, A), PR);
       yield* first.note(PROJECT, actor("pr-queue", 1, A), "Reviewing #12.", [PR]);
@@ -85,15 +87,15 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
         ["Reviewing #12."],
       );
       // The lane's thread still acts for it after the restart; another lane is still refused.
-      yield* again.startLane(PROJECT, "ci", C);
+      yield* again.startLane(PROJECT, "ci", C, OWNER);
       const exit = yield* Effect.exit(again.claim(PROJECT, actor("ci", 1, C), PR));
       assert.strictEqual(reasonOf(exit), "claimed");
       // A repeated start of the same thread changes nothing; another thread is refused.
       const before = yield* readFile;
-      yield* again.startLane(PROJECT, "pr-queue", A);
+      yield* again.startLane(PROJECT, "pr-queue", A, OWNER);
       assert.strictEqual(yield* readFile, before);
       assert.strictEqual(
-        reasonOf(yield* Effect.exit(again.startLane(PROJECT, "pr-queue", B))),
+        reasonOf(yield* Effect.exit(again.startLane(PROJECT, "pr-queue", B, OWNER))),
         "already-running",
       );
       // Other projects keep their own file.
@@ -105,8 +107,8 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
-      yield* store.startLane(PROJECT, "ci", C);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
+      yield* store.startLane(PROJECT, "ci", C, OWNER);
       const exits = yield* Effect.all(
         [
           Effect.exit(store.claim(PROJECT, actor("pr-queue", 1, A), PR)),
@@ -140,10 +142,10 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start, lanes } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
       yield* store.claim(PROJECT, actor("pr-queue", 1, A), PR);
       // Thread A dies; the lane stays running and its claim still refuses other lanes.
-      yield* store.startLane(PROJECT, "ci", C);
+      yield* store.startLane(PROJECT, "ci", C, OWNER);
       assert.strictEqual(
         reasonOf(yield* Effect.exit(store.claim(PROJECT, actor("ci", 1, C), PR))),
         "claimed",
@@ -179,12 +181,12 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
       assert.strictEqual(taken.takenFrom?.lane, "pr-queue");
       assert.strictEqual(taken.claim.lane, "ci");
       // Stopping a lane releases its claims, and a new start is a new generation.
-      const released = yield* store.stopLane(PROJECT, "ci");
+      const released = yield* store.stopLane(PROJECT, "ci", OWNER);
       assert.deepStrictEqual(
         released.map((claim) => claim.item),
         [PR],
       );
-      assert.strictEqual((yield* store.startLane(PROJECT, "ci", ISSUES)).generation, 2);
+      assert.strictEqual((yield* store.startLane(PROJECT, "ci", ISSUES, OWNER)).generation, 2);
       assert.strictEqual(
         reasonOf(yield* Effect.exit(store.claim(PROJECT, actor("ci", 1, C), PR))),
         "stale-owner",
@@ -196,7 +198,7 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start, lanes, readFile } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
       const { claim } = yield* store.claim(PROJECT, actor("pr-queue", 1, A), PR);
       const before = yield* readFile;
       lanes.enabled = false;
@@ -204,8 +206,8 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
       for (const step of [
         off.claim(PROJECT, actor("pr-queue", 1, A), "pr:owner/repo#13"),
         off.release(PROJECT, actor("pr-queue", 1, A), PR),
-        off.stopLane(PROJECT, "pr-queue"),
-        off.startLane(PROJECT, "issues", ISSUES),
+        off.stopLane(PROJECT, "pr-queue", OWNER),
+        off.startLane(PROJECT, "issues", ISSUES, OWNER),
         off.ownerOf(PROJECT, PR),
         off.board(PROJECT),
         off.ackEscalations(PROJECT, [{ lane: "pr-queue", id: "x" }]),
@@ -243,7 +245,10 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
         }),
       ]) {
         yield* fs.writeFileString(file, text);
-        for (const step of [store.startLane(PROJECT, "pr-queue", A), store.ownerOf(PROJECT, PR)]) {
+        for (const step of [
+          store.startLane(PROJECT, "pr-queue", A, OWNER),
+          store.ownerOf(PROJECT, PR),
+        ]) {
           assert.strictEqual(
             reasonOf(
               yield* Effect.exit(step as Effect.Effect<unknown, LaneStore.LaneStoreRefused>),
@@ -256,7 +261,7 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
       }
       // Readable again: steps work.
       yield* fs.remove(file);
-      assert.strictEqual((yield* store.startLane(PROJECT, "pr-queue", A)).generation, 1);
+      assert.strictEqual((yield* store.startLane(PROJECT, "pr-queue", A, OWNER)).generation, 1);
     }),
   );
 
@@ -264,7 +269,7 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start, readFile } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
       const me = actor("pr-queue", 1, A);
       yield* store.escalate(PROJECT, me, "esc-1", "Merge #12?", [PR]);
       yield* store.escalate(PROJECT, me, "esc-1", "Merge #12? (again)", [PR]);
@@ -315,13 +320,13 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start, readFile } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
       const { claim } = yield* store.claim(PROJECT, actor("pr-queue", 1, A), PR);
       const before = yield* readFile;
       for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
-        assert.deepStrictEqual(yield* store.stopLane(PROJECT, name), []);
+        assert.deepStrictEqual(yield* store.stopLane(PROJECT, name, OWNER), []);
         assert.strictEqual(
-          reasonOf(yield* Effect.exit(store.startLane(PROJECT, name, B))),
+          reasonOf(yield* Effect.exit(store.startLane(PROJECT, name, B, OWNER))),
           "unknown-lane",
         );
         assert.strictEqual(
@@ -340,8 +345,8 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
-      yield* store.startLane(PROJECT, "ci", C);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
+      yield* store.startLane(PROJECT, "ci", C, OWNER);
       const { claim } = yield* store.claim(PROJECT, actor("pr-queue", 1, A), "pr:Owner/Repo#12");
       assert.strictEqual(claim.item, PR);
       assert.strictEqual(
@@ -365,8 +370,8 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
-      yield* store.startLane(PROJECT, "ci", C);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
+      yield* store.startLane(PROJECT, "ci", C, OWNER);
       yield* store.escalate(PROJECT, actor("pr-queue", 1, A), "esc-1 ", "Merge #12?", []);
       yield* store.escalate(PROJECT, actor("pr-queue", 1, A), " esc-1", "Merge #12?", []);
       const other = yield* store.escalate(PROJECT, actor("ci", 1, C), "esc-1", "Rerun CI?", []);
@@ -393,7 +398,7 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start, fs, directory, readFile } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
       const before = yield* readFile;
       yield* fs.chmod(directory, 0o500);
       const exit = yield* Effect.exit(store.claim(PROJECT, actor("pr-queue", 1, A), PR));
@@ -404,13 +409,54 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     }),
   );
 
+  it.effect("lets only the thread that started a lane, or the owner, stop it", () =>
+    Effect.gen(function* () {
+      const { start, fs, file, readFile } = yield* harness;
+      const store = yield* start;
+      const by = (threadId: ThreadId) => ({ _tag: "thread", threadId }) as const;
+      // A thread cannot start a lane as its own thread.
+      assert.strictEqual(
+        reasonOf(yield* Effect.exit(store.startLane(PROJECT, "pr-queue", A, by(A)))),
+        "self-lane",
+      );
+      yield* store.startLane(PROJECT, "pr-queue", A, by(B));
+      for (const thread of [A, C]) {
+        assert.strictEqual(
+          reasonOf(yield* Effect.exit(store.stopLane(PROJECT, "pr-queue", by(thread)))),
+          "not-starter",
+        );
+      }
+      // Nor be given it as a replacement thread.
+      assert.strictEqual(
+        reasonOf(yield* Effect.exit(store.replaceLaneThread(PROJECT, "pr-queue", 1, B))),
+        "self-lane",
+      );
+      yield* store.stopLane(PROJECT, "pr-queue", by(B));
+      // Repeats by the starter change nothing; the owner may stop any lane.
+      yield* store.stopLane(PROJECT, "pr-queue", by(B));
+      yield* store.startLane(PROJECT, "ci", C, by(B));
+      yield* store.stopLane(PROJECT, "ci", OWNER);
+      // A lane the owner started (or an older file without a starter): only the owner stops it.
+      yield* store.startLane(PROJECT, "issues", ISSUES, OWNER);
+      assert.strictEqual(
+        reasonOf(yield* Effect.exit(store.stopLane(PROJECT, "issues", by(B)))),
+        "not-starter",
+      );
+      const raw = JSON.parse(yield* readFile);
+      assert.isFalse("startedBy" in raw.lanes.issues);
+      assert.strictEqual(raw.lanes.ci.startedBy, B);
+      yield* fs.writeFileString(file, JSON.stringify(raw));
+      yield* store.stopLane(PROJECT, "issues", OWNER);
+    }),
+  );
+
   it.effect("records a stopped lane's thread as a lane run only up to the stop", () =>
     Effect.gen(function* () {
       const { start } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
       const early = DateTime.formatIso(yield* DateTime.now);
-      yield* store.stopLane(PROJECT, "pr-queue");
+      yield* store.stopLane(PROJECT, "pr-queue", OWNER);
       assert.strictEqual(yield* store.laneOfRun(PROJECT, A, null, early), "pr-queue");
       assert.strictEqual(
         yield* store.laneOfRun(PROJECT, ThreadId.make("worker"), A, early),
@@ -425,8 +471,8 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start, lanes } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "ci", C);
-      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "ci", C, OWNER);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
       yield* store.claim(PROJECT, actor("ci", 1, C), PR);
       lanes.definitions["ci"] = { ...CI, owns: ["issue"] };
       assert.isNull(yield* store.ownerOf(PROJECT, PR));
@@ -439,7 +485,7 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
     Effect.gen(function* () {
       const { start, fs, file, readFile } = yield* harness;
       const store = yield* start;
-      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "pr-queue", A, OWNER);
       yield* store.claim(PROJECT, actor("pr-queue", 1, A), PR);
       yield* store.note(PROJECT, actor("pr-queue", 1, A), "Seen.", []);
       const good = JSON.parse(yield* readFile);

@@ -244,6 +244,9 @@ const makeVisible = Effect.gen(function* () {
       if (method === "tools/list") return false;
       return yield* new T3ToolOutsideProfile({ message: t3ToolRefusal(set, target) });
     }
+    // Fork (lanes): a search reads the setting as it is now, so lanes turned off since the last
+    // list are not found.
+    if (method === "tools/call" && target === TOOL_SEARCH) yield* laneToolsOn;
     // Fork (lanes): the lane tools only while lanes are on.
     if (LANE_TOOLS.has(target) && !(yield* laneToolsOn)) {
       if (method === "tools/list") return false;

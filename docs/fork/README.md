@@ -1508,13 +1508,16 @@ stopped lane, only runs that ended by its stop.
 the calling thread's project, and each repeats safely:
 
 - `lane_start`: switches a defined lane on with a thread of the project acting for it (usually a
-  child the orchestrator started with `delegate_task`; a thread acts for at most one running lane),
-  and returns its generation. That thread passes the lane and generation to `lane_claim` and
-  `lane_release`; a thread that is not the lane's current one is refused.
-- `lane_stop`: switches a lane off and releases its claims.
+  child the orchestrator started with `delegate_task`; a thread acts for at most one running lane,
+  and never for a lane it starts itself), and returns its generation. That thread passes the lane
+  and generation to `lane_claim` and `lane_release`; a thread that is not the lane's current one
+  is refused.
+- `lane_stop`: switches a lane off and releases its claims. Only the thread that started the lane
+  stops it (another lane's thread or worker is refused with `not-starter`).
 - `lane_board`: every defined lane (`off` when it never ran, `undefined` when settings no longer
   define it) with its thread and generation, the claims (stale ones marked), the escalations
-  waiting and each lane's last 3 notes.
+  waiting and each lane's last 3 notes. Settings that cannot be read: refused, not a board of
+  `undefined` lanes.
 - `lane_claim`, `lane_release`: from the lane's thread, one owner per item, as the store above.
 
 ```json

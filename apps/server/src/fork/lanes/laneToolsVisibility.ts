@@ -1,7 +1,8 @@
 /**
  * Fork (issue 1156): off means off. The lane tools are listed and callable only while
  * `server.lanes.enabled` is on; the T3 tool rule (fork/mcpT3ToolRule.ts) asks this on every
- * `tools/list` and `tools/call`, and `tool_search` keeps them out unless the last check found lanes on.
+ * `tools/list` and `tools/call` (a `tool_search` call too, so a search sees the setting as it is
+ * then), and `tool_search` keeps them out unless that check found lanes on.
  */
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
