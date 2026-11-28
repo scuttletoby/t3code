@@ -24,6 +24,10 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"
 # The channel, the fork's release names and version_gt.
 . "$(dirname "${BASH_SOURCE[0]}")/fork-channel.sh"
+# git_retry (fork-git-retry.sh): upstream's fetch is tried again after a connection error, never after another error.
+# Its tags come with their files (that remote is no promisor), so a try may take minutes.
+. "$(dirname "${BASH_SOURCE[0]}")/fork-git-retry.sh"
+GIT_RETRY_TRY=300 GIT_RETRY_TOTAL=360
 
 REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:?REPOSITORY or GITHUB_REPOSITORY}}"
 ORIGIN="${ORIGIN:-origin}"
@@ -138,7 +142,7 @@ cmd_resolve() {
   head="$(git rev-parse HEAD)"
 
   # Read-only fetch of upstream's tags and default branch into refs this run alone uses.
-  git fetch --quiet --prune --no-tags "$url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head"
+  git_retry fetch --quiet --prune --no-tags "$url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head"
 
   # Lists are read into variables first: a failure inside <(...) would go unnoticed.
   local refs tag
