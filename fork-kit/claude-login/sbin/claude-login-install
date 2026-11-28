@@ -1,0 +1,121 @@
+#!/usr/bin/python3 -IB
+"""claude-login-install: install, uninstall or check the claude-login kit, as root (fork-kit/claude-login/README.md).
+
+  claude-login-install install --source KIT_FOLDER --sha RELEASE_SHA [--timer | --no-timer]
+  claude-login-install uninstall
+  claude-login-install self-check
+
+install copies bin/claude-login, sbin/claude-login-install, lib/claudelogin/, systemd/, README.md and
+fork-kit/common/kit_install.py of one release into /usr/local/libexec/claude-login/versions/<sha>/ (with
+MANIFEST.sha256), checks the copy, switches the link `current` to it and links /usr/local/bin/claude-login and
+/usr/local/sbin/claude-login-install to it. With --timer it also writes the user units claude-login-check.service and
+claude-login-check.timer in /etc/systemd/user/, which run `claude-login check` every hour for each user who enables
+the timer (that user's own config file names the accounts and the issue repo); --no-timer removes them. The choice
+is kept in /etc/claude-login/config.json, so a run without either option keeps it. Safe to run again, and to stop at
+any step; one installer at a time. The steps every kit shares are in fork-kit/common/kit_install.py.
+"""
+import os, sys
+
+_kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_common = os.path.join(_kit, 'common')
+sys.path[:0] = [_common if os.path.isdir(_common) else os.path.join(os.path.dirname(_kit), 'common')]
+try:
+    import kit_install  # noqa: E402
+except ImportError as e:     # a copy without common/kit_install.py (changed or partly removed by hand)
+    sys.exit(f'claude-login-install: cannot load its installer code ({e}): install again with the bootstrap, as '
+             'root (fork-kit/claude-login/README.md, Install)')
+
+UNIT_DIR = '/etc/systemd/user'
+TIMER_UNITS = ('claude-login-check.service', 'claude-login-check.timer')
+UNIT_HEADER = '# claude-login kit: written by claude-login-install.'
+ENABLE = 'systemctl --user daemon-reload && systemctl --user enable --now claude-login-check.timer'
+DISABLE = 'systemctl --user disable --now claude-login-check.timer'
+
+
+class ClaudeLoginInstaller(kit_install.Installer):
+    PROG = 'claude-login-install'
+    PROGRAM = __file__
+    KIT = 'claude-login'
+    ETC = '/etc/claude-login'
+    LIBEXEC = '/usr/local/libexec/claude-login'
+    LINKS = {'/usr/local/bin/claude-login': 'bin/claude-login',
+             '/usr/local/sbin/claude-login-install': 'sbin/claude-login-install'}
+    SOURCE_FILES = ('bin/claude-login', 'sbin/claude-login-install', 'README.md', 'common/kit_install.py',
+                    'systemd/claude-login-check.service', 'systemd/claude-login-check.timer')
+    EXECUTABLE = frozenset({'bin/claude-login', 'sbin/claude-login-install'})
+    PACKAGE = 'claudelogin'
+    MODULES = ('__init__', 'creds')
+    HELP = ('bin/claude-login', 'claude-login check')
+    HAS_CONFIG = True
+    KIT_STEPS = ('timer-units',)
+
+    def add_install_options(self, parser):
+        parser.add_argument('--timer', dest='timer', action='store_true', default=None)
+        parser.add_argument('--no-timer', dest='timer', action='store_false')
+
+    def unit_paths(self):
+        return [f'{UNIT_DIR}/{name}' for name in TIMER_UNITS]
+
+    def ours_unit(self, path):
+        """A unit file this kit wrote (its first line says so), and no link."""
+        real = self.p(path)
+        if os.path.islink(real):
+            return False
+        try:
+            with open(real, encoding='utf-8') as f:
+                return f.readline().startswith(UNIT_HEADER)
+        except (OSError, UnicodeDecodeError):   # a file someone else wrote, in any encoding: not ours
+            return False
+
+    def foreign_refusal(self, path):
+        return self.Refused(f'{path} exists and was not written by this kit: remove it and run again, or run with '
+                            '--no-timer to leave it alone')
+
+    def plan(self, a):
+        timer = a.timer if a.timer is not None else bool(self.read_config().get('timer'))
+        foreign = [u for u in self.unit_paths() if os.path.lexists(self.p(u)) and not self.ours_unit(u)]
+        if timer and foreign:
+            raise self.foreign_refusal(foreign[0])
+        return {'timer': timer}
+
+    def config(self, a, plan):
+        return {'version': 1, 'timer': plan['timer']}
+
+    def kit_step(self, step, a, plan, dest):
+        # after the links: the timer is only written once the release it runs is the one in use
+        for name, path in zip(TIMER_UNITS, self.unit_paths()):
+            if plan['timer']:
+                if os.path.lexists(self.p(path)) and not self.ours_unit(path):
+                    raise self.foreign_refusal(path)
+                self.ensure_dir(UNIT_DIR)
+                with open(os.path.join(dest, 'systemd', name), encoding='utf-8') as f:
+                    if self.write_file(path, f.read()):
+                        self.say(f'wrote {path}: each user with a config runs `{ENABLE}`')
+            elif self.ours_unit(path):
+                os.unlink(self.p(path))
+                self.say(f'removed {path} (users run `{DISABLE}`)')
+
+    def kit_rows(self, plan):
+        if not plan['timer']:
+            return []
+        return [(path, 'file', kit_install.sha256_file(self.p(path))) for path in self.unit_paths()]
+
+    def kit_uninstall(self):
+        for path in self.unit_paths():
+            if self.ours_unit(path):
+                os.unlink(self.p(path))
+                self.say(f'removed {path} (users run `{DISABLE}`)')
+
+    def installed_summary(self, plan):
+        return ', timer units written (hourly)' if plan['timer'] else ', no timer'
+
+
+INSTALLER = ClaudeLoginInstaller()
+
+
+def main(argv, stop_after=None):
+    return INSTALLER.main(argv, stop_after, doc=__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

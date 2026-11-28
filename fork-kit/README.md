@@ -16,6 +16,7 @@ Every kit follows the same pattern:
 | Kit                                          | What                                                                                                                                                                                                                       |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [agent-guards](agent-guards/README.md)       | Claude Code hooks that guard every agent on a machine: no disabling Actions, no piped capacity check, a memory index in budget, no stop with a background command, agent slots (Linux)                                     |
+| [claude-login](claude-login/README.md)       | `claude-login`: sign Claude Code accounts in on a machine with no browser (the owner opens a link, an agent types the code), and an hourly check that opens an issue before a login ends (Linux, tmux, gh)                 |
 | [cleaner](cleaner/README.md)                 | `fork-cleaner`: free disk space by rules (`worktrees` with merged branches, `tmp`, `agent-scratch`, `docker`; `compress-cold` and `dedupe` delete no content) and never what could be needed; daily timer (Linux, systemd) |
 | [desk](desk/README.md)                       | A desktop's side of a fork fleet desk pool: runner users, walls, desk agent; one folder (Linux, WSL2)                                                                                                                      |
 | [gardener](gardener/README.md)               | `gardener`: each project's checks once a day (small scripts, JSON-line findings; general ones shipped, project ones by path), one report issue per project updated in place; report only (Linux, systemd)                  |
@@ -33,7 +34,7 @@ Every kit follows the same pattern:
 
 [common](common/README.md) is code the kits share, copied into each kit's version folder: the loader of the one
 private machine file (`/etc/fork-kit/machine.json`) where the facts of one machine live, and the installer and
-bootstrap of the agent-guards, cleaner, gardener, golive, schedule-kick and update-policy kits.
+bootstrap of the agent-guards, claude-login, cleaner, gardener, golive, schedule-kick and update-policy kits.
 
 [review](review/README.md) and [placement-facts](placement-facts/README.md) have no installer: review is a skill,
 docs and tools an agent uses from a checkout of the fork, beside the merge gate whose parser it imports;

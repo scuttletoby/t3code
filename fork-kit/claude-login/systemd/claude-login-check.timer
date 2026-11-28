@@ -1,0 +1,11 @@
+# claude-login kit: written by claude-login-install. Do not edit: run the installer again.
+[Unit]
+Description=claude-login check every hour (fork-kit/claude-login)
+
+[Timer]
+OnStartupSec=5min
+OnCalendar=hourly
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

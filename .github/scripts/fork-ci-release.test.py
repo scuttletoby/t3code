@@ -522,6 +522,7 @@ print(json.dumps({'missing': missing, 'failed': failed}))
 # kit -> (how its installer checks its files, the installer as the bootstrap runs it, the --source the bootstrap
 # passes: the kit's folder or the release's top folder)
 KITS = {"agent-guards": ("kit_install", "sbin/agent-guards-install", "kit"),
+        "claude-login": ("kit_install", "sbin/claude-login-install", "kit"),
         "cleaner": ("kit_install", "sbin/fork-cleaner-install", "kit"),
         "gardener": ("kit_install", "sbin/gardener-install", "kit"),
         "golive": ("kit_install", "sbin/t3-golive-install", "kit"),
