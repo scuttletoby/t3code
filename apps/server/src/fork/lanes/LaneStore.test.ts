@@ -2,6 +2,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { type LaneDefinition, ProjectId, ThreadId } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -20,6 +21,8 @@ const B = ThreadId.make("lane-thread-b");
 const C = ThreadId.make("lane-thread-c");
 const ISSUES = ThreadId.make("issues-thread");
 const PR = "pr:owner/repo#12";
+/** A run's end time far after every step of a test. */
+const NOW = "2999-01-01T00:00:00.000Z";
 
 /** A second lane that also owns pull requests, so two lanes can want one. */
 const CI: LaneDefinition = { description: "Keeps CI green.", owns: ["pr"], driver: "agent" };
@@ -205,20 +208,20 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
         off.startLane(PROJECT, "issues", ISSUES),
         off.ownerOf(PROJECT, PR),
         off.board(PROJECT),
-        off.ackEscalations(PROJECT, ["x"]),
+        off.ackEscalations(PROJECT, [{ lane: "pr-queue", id: "x" }]),
       ]) {
         assert.strictEqual(
           reasonOf(yield* Effect.exit(step as Effect.Effect<unknown, LaneStore.LaneStoreRefused>)),
           "lanes-off",
         );
       }
-      assert.isNull(yield* off.laneOfRun(PROJECT, A, null));
+      assert.isNull(yield* off.laneOfRun(PROJECT, A, null, NOW));
       assert.strictEqual(yield* readFile, before);
       // On again: the claim and its lane are as they were.
       lanes.enabled = true;
       const on = yield* start;
       assert.deepStrictEqual(yield* on.ownerOf(PROJECT, PR), claim);
-      assert.strictEqual(yield* on.laneOfRun(PROJECT, ThreadId.make("worker"), A), "pr-queue");
+      assert.strictEqual(yield* on.laneOfRun(PROJECT, ThreadId.make("worker"), A, NOW), "pr-queue");
     }),
   );
 
@@ -249,7 +252,7 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
           );
         }
         assert.strictEqual(yield* readFile, text);
-        assert.isNull(yield* store.laneOfRun(PROJECT, A, null));
+        assert.isNull(yield* store.laneOfRun(PROJECT, A, null, NOW));
       }
       // Readable again: steps work.
       yield* fs.remove(file);
@@ -273,8 +276,17 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
           ["esc-2", "Close #9?"],
         ],
       );
-      assert.strictEqual(yield* store.ackEscalations(PROJECT, ["esc-1", "gone"]), 1);
-      assert.strictEqual(yield* store.ackEscalations(PROJECT, ["esc-1"]), 0);
+      assert.strictEqual(
+        yield* store.ackEscalations(PROJECT, [
+          { lane: "pr-queue", id: "esc-1" },
+          { lane: "pr-queue", id: "gone" },
+        ]),
+        1,
+      );
+      assert.strictEqual(
+        yield* store.ackEscalations(PROJECT, [{ lane: "pr-queue", id: "esc-1" }]),
+        0,
+      );
       for (let index = 0; index <= NOTES_PER_LANE; index += 1) {
         yield* store.note(PROJECT, me, `note ${index}`, []);
       }
@@ -295,8 +307,156 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
         );
       }
       assert.strictEqual(yield* readFile, before);
-      assert.strictEqual(yield* store.laneOfRun(PROJECT, A, null), "pr-queue");
-      assert.isNull(yield* store.laneOfRun(PROJECT, ThreadId.make("main"), null));
+      assert.strictEqual(yield* store.laneOfRun(PROJECT, A, null, NOW), "pr-queue");
+      assert.isNull(yield* store.laneOfRun(PROJECT, ThreadId.make("main"), null, NOW));
+    }),
+  );
+  it.effect("keeps a project's file readable whatever lane or item name a step gets", () =>
+    Effect.gen(function* () {
+      const { start, readFile } = yield* harness;
+      const store = yield* start;
+      yield* store.startLane(PROJECT, "pr-queue", A);
+      const { claim } = yield* store.claim(PROJECT, actor("pr-queue", 1, A), PR);
+      const before = yield* readFile;
+      for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
+        assert.deepStrictEqual(yield* store.stopLane(PROJECT, name), []);
+        assert.strictEqual(
+          reasonOf(yield* Effect.exit(store.startLane(PROJECT, name, B))),
+          "unknown-lane",
+        );
+        assert.strictEqual(
+          reasonOf(yield* Effect.exit(store.release(PROJECT, actor("pr-queue", 1, A), name))),
+          "bad-item",
+        );
+        assert.isNull(yield* store.ownerOf(PROJECT, name));
+      }
+      assert.strictEqual(yield* readFile, before);
+      assert.deepStrictEqual(yield* store.ownerOf(PROJECT, PR), claim);
+      assert.strictEqual((yield* store.board(PROJECT)).claims.length, 1);
+    }),
+  );
+
+  it.effect("treats an item's owner and repository in any case as one item", () =>
+    Effect.gen(function* () {
+      const { start } = yield* harness;
+      const store = yield* start;
+      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "ci", C);
+      const { claim } = yield* store.claim(PROJECT, actor("pr-queue", 1, A), "pr:Owner/Repo#12");
+      assert.strictEqual(claim.item, PR);
+      assert.strictEqual(
+        reasonOf(yield* Effect.exit(store.claim(PROJECT, actor("ci", 1, C), PR))),
+        "claimed",
+      );
+      assert.deepStrictEqual(yield* store.ownerOf(PROJECT, "pr:OWNER/repo#12"), claim);
+      assert.deepStrictEqual(
+        yield* store.release(PROJECT, actor("pr-queue", 1, A), "pr:owner/REPO#12"),
+        claim,
+      );
+      assert.isNull(yield* store.ownerOf(PROJECT, PR));
+      const note = yield* store.note(PROJECT, actor("pr-queue", 1, A), "Seen.", [
+        "pr:Owner/Repo#12",
+      ]);
+      assert.deepStrictEqual(note.items as ReadonlyArray<string>, [PR]);
+    }),
+  );
+
+  it.effect("keys escalations by lane and trimmed id, and acks them the same way", () =>
+    Effect.gen(function* () {
+      const { start } = yield* harness;
+      const store = yield* start;
+      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.startLane(PROJECT, "ci", C);
+      yield* store.escalate(PROJECT, actor("pr-queue", 1, A), "esc-1 ", "Merge #12?", []);
+      yield* store.escalate(PROJECT, actor("pr-queue", 1, A), " esc-1", "Merge #12?", []);
+      const other = yield* store.escalate(PROJECT, actor("ci", 1, C), "esc-1", "Rerun CI?", []);
+      assert.strictEqual(other.text, "Rerun CI?");
+      assert.deepStrictEqual(
+        (yield* store.board(PROJECT)).outbox.map((entry) => [entry.lane, entry.id]),
+        [
+          ["pr-queue", "esc-1"],
+          ["ci", "esc-1"],
+        ],
+      );
+      assert.strictEqual(
+        yield* store.ackEscalations(PROJECT, [{ lane: "pr-queue", id: "esc-1 " }]),
+        1,
+      );
+      assert.deepStrictEqual(
+        (yield* store.board(PROJECT)).outbox.map((entry) => entry.lane),
+        ["ci"],
+      );
+    }),
+  );
+
+  it.effect("says a failed write is a write failure, and changes nothing", () =>
+    Effect.gen(function* () {
+      const { start, fs, directory, readFile } = yield* harness;
+      const store = yield* start;
+      yield* store.startLane(PROJECT, "pr-queue", A);
+      const before = yield* readFile;
+      yield* fs.chmod(directory, 0o500);
+      const exit = yield* Effect.exit(store.claim(PROJECT, actor("pr-queue", 1, A), PR));
+      yield* fs.chmod(directory, 0o700);
+      assert.strictEqual(reasonOf(exit), "store-unwritable");
+      assert.strictEqual(yield* readFile, before);
+      assert.isNull(yield* store.ownerOf(PROJECT, PR));
+    }),
+  );
+
+  it.effect("records a stopped lane's thread as a lane run only up to the stop", () =>
+    Effect.gen(function* () {
+      const { start } = yield* harness;
+      const store = yield* start;
+      yield* store.startLane(PROJECT, "pr-queue", A);
+      const early = DateTime.formatIso(yield* DateTime.now);
+      yield* store.stopLane(PROJECT, "pr-queue");
+      assert.strictEqual(yield* store.laneOfRun(PROJECT, A, null, early), "pr-queue");
+      assert.strictEqual(
+        yield* store.laneOfRun(PROJECT, ThreadId.make("worker"), A, early),
+        "pr-queue",
+      );
+      assert.isNull(yield* store.laneOfRun(PROJECT, A, null, NOW));
+      assert.isNull(yield* store.laneOfRun(PROJECT, ThreadId.make("worker"), A, NOW));
+    }),
+  );
+
+  it.effect("makes a claim stale when its lane no longer owns that kind of item", () =>
+    Effect.gen(function* () {
+      const { start, lanes } = yield* harness;
+      const store = yield* start;
+      yield* store.startLane(PROJECT, "ci", C);
+      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.claim(PROJECT, actor("ci", 1, C), PR);
+      lanes.definitions["ci"] = { ...CI, owns: ["issue"] };
+      assert.isNull(yield* store.ownerOf(PROJECT, PR));
+      const taken = yield* store.claim(PROJECT, actor("pr-queue", 1, A), PR);
+      assert.strictEqual(taken.takenFrom?.lane, "ci");
+    }),
+  );
+
+  it.effect("refuses a lane file whose claim key or record project does not match", () =>
+    Effect.gen(function* () {
+      const { start, fs, file, readFile } = yield* harness;
+      const store = yield* start;
+      yield* store.startLane(PROJECT, "pr-queue", A);
+      yield* store.claim(PROJECT, actor("pr-queue", 1, A), PR);
+      yield* store.note(PROJECT, actor("pr-queue", 1, A), "Seen.", []);
+      const good = JSON.parse(yield* readFile);
+      const wrongKey = { ...good, claims: { "pr:owner/repo#99": good.claims[PR] } };
+      const wrongProject = {
+        ...good,
+        notes: [{ ...good.notes[0], projectId: OTHER_PROJECT }],
+      };
+      for (const bad of [wrongKey, wrongProject]) {
+        const text = JSON.stringify(bad);
+        yield* fs.writeFileString(file, text);
+        assert.strictEqual(
+          reasonOf(yield* Effect.exit(store.ownerOf(PROJECT, PR))),
+          "store-unreadable",
+        );
+        assert.strictEqual(yield* readFile, text);
+      }
     }),
   );
 });

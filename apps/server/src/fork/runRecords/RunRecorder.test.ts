@@ -692,7 +692,7 @@ it.layer(NodeServices.layer)("RunRecorder", (it) => {
       yield* start;
       // The orchestrator thread now runs the pr-queue lane; its child is one of its workers.
       const lanes = Layer.mock(LaneStore)({
-        laneOfRun: (_projectId, threadId, parentThreadId) =>
+        laneOfRun: (_projectId, threadId, parentThreadId, _endedAt) =>
           Effect.succeed(threadId === "parent" || parentThreadId === "parent" ? "pr-queue" : null),
       });
       const withLanes = RunRecorder.make({ directory: path.dirname(runsFile) }).pipe(

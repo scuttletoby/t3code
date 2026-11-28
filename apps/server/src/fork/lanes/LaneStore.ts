@@ -92,19 +92,24 @@ export class LaneStore extends Context.Service<
       text: string,
       items: ReadonlyArray<string>,
     ) => Step<LaneEscalation>;
-    /** Removes delivered escalations; the number removed. */
-    readonly ackEscalations: (projectId: ProjectId, ids: ReadonlyArray<string>) => Step<number>;
-    /** The live claim on an item, or null: none, or only a stale one. */
+    /** Removes delivered escalations, by lane and id; the number removed. */
+    readonly ackEscalations: (
+      projectId: ProjectId,
+      keys: ReadonlyArray<LaneState.EscalationKey>,
+    ) => Step<number>;
+    /** The live claim on an item (any case of owner/repo), or null: none, stale, or not an item. */
     readonly ownerOf: (projectId: ProjectId, item: string) => Step<LaneClaim | null>;
     readonly board: (projectId: ProjectId) => Step<LaneBoard>;
     /**
-     * The lane a run belongs to: its thread's, or (a lane's worker) its parent's. Null while lanes
-     * are off, for a thread of no lane, and when the file cannot be read (logged): never fails.
+     * The lane a run that ended at `endedAt` (ISO) belongs to: its thread's, or (a lane's worker)
+     * its parent's; a stopped lane only for runs that ended by its stop. Null while lanes are off,
+     * for a thread of no lane, and when the file cannot be read (logged): never fails.
      */
     readonly laneOfRun: (
       projectId: ProjectId,
       threadId: ThreadId,
       parentThreadId: ThreadId | null,
+      endedAt: string,
     ) => Effect.Effect<string | null>;
   }
 >()("t3/fork/lanes/LaneStore") {}
@@ -177,7 +182,10 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
       Effect.provideService(Path.Path, path),
       Effect.mapError(() =>
         refused(
-          LaneState.refuse("store-unreadable", "The project's lane file cannot be written now."),
+          LaneState.refuse(
+            "store-unwritable",
+            "The project's lane file cannot be written now (disk or permissions); nothing changed.",
+          ),
         ),
       ),
     );
@@ -198,7 +206,20 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
         const now = DateTime.formatIso(yield* DateTime.now);
         const result = step(state, definitions, now);
         if (result._tag === "refused") return yield* refused(result);
-        if (result.changed) yield* write(projectId, result.state);
+        if (result.changed) {
+          // Never write a file the next read would refuse (that would lock the project's lanes).
+          if (
+            LaneState.decodeLaneState(LaneState.encodeLaneState(result.state), projectId) === null
+          ) {
+            return yield* refused(
+              LaneState.refuse(
+                "bad-input",
+                "This step would leave a lane file that cannot be read back; nothing was written.",
+              ),
+            );
+          }
+          yield* write(projectId, result.state);
+        }
         return result.value;
       }),
     );
@@ -252,12 +273,13 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
         LaneState.addEscalation(state, definitions, { actor, id, text, items, now }),
       );
     }),
-    ackEscalations: Effect.fn("LaneStore.ackEscalations")(function* (projectId, ids) {
-      return yield* run(projectId, (state) => LaneState.ackEscalations(state, ids));
+    ackEscalations: Effect.fn("LaneStore.ackEscalations")(function* (projectId, keys) {
+      return yield* run(projectId, (state) => LaneState.ackEscalations(state, keys));
     }),
     ownerOf: Effect.fn("LaneStore.ownerOf")(function* (projectId, item) {
       return yield* view(projectId, (state, definitions) => {
-        const claim = state.claims[item];
+        const key = LaneState.normalizeItem(item);
+        const claim = key === null ? undefined : LaneState.own(state.claims, key);
         return claim !== undefined && LaneState.claimIsLive(state, definitions, claim)
           ? claim
           : null;
@@ -275,12 +297,14 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
       }));
     }),
     laneOfRun: Effect.fn("LaneStore.laneOfRun")(
-      function* (projectId, threadId, parentThreadId) {
+      function* (projectId, threadId, parentThreadId, endedAt) {
         return yield* view(
           projectId,
           (state) =>
-            LaneState.laneOfThread(state, threadId) ??
-            (parentThreadId === null ? null : LaneState.laneOfThread(state, parentThreadId)),
+            LaneState.laneOfThread(state, threadId, endedAt) ??
+            (parentThreadId === null
+              ? null
+              : LaneState.laneOfThread(state, parentThreadId, endedAt)),
         );
       },
       Effect.orElseSucceed(() => null),
@@ -288,7 +312,10 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
   });
 });
 
-/** Over `<stateDir>/lanes`. */
+/**
+ * Over `<stateDir>/lanes`. Build it once per server (provide this same layer value everywhere it
+ * is needed, so Layer memoization shares it): two stores over one folder would mean two locks.
+ */
 export const layer = Layer.effect(
   LaneStore,
   Effect.gen(function* () {

@@ -1481,21 +1481,27 @@ written whole and atomically after each change, one change at a time, so it surv
   was switched out) takes the next generation; a number is never used twice, so a replaced thread
   can no longer act for the lane: its steps are refused. Repeating a start or a replacement that
   already happened changes nothing, so a step half-done can be run again.
-- **Claims:** one owner per item (`pr:owner/repo#12`, `issue:owner/repo#3`), and only an item of a
-  kind the lane `owns`. A second lane's claim is refused while the first lane runs. The claims of a
-  lane whose thread died stay its own and move to its next thread. A claim of a lane stopped or no
-  longer defined is stale: the next claim on the item takes it. Stopping a lane releases its
-  claims.
-- **Outbox:** escalations for the main orchestrator, kept until delivered; the same id twice is
-  kept once, and at 200 waiting a new one is refused (never dropped).
+- **Claims:** one owner per item (`pr:owner/repo#12`, `issue:owner/repo#3`; owner and repository
+  in any case are one item, kept lower-case), and only an item of a kind the lane `owns`. A second
+  lane's claim is refused while the first lane runs. The claims of a lane whose thread died stay
+  its own and move to its next thread. A claim of a lane stopped, no longer defined, or no longer
+  owning that kind of item is stale: the next claim on the item takes it. Stopping a lane releases
+  its claims.
+- **Outbox:** escalations for the main orchestrator, kept until delivered and keyed by lane and
+  trimmed id: the same lane's id twice is kept once while it waits (once delivered, the id is free
+  again), and at 200 waiting a new one is refused (never dropped).
 - **Notes:** short reports for the board; each lane keeps its last 50.
 
 While `enabled` is off every step is refused and no lane file is read or written: claims on disk
 wait unchanged until lanes are on again. A lane file that exists but cannot be read (not JSON,
 another version, a broken entry) counts as unknown, not empty: every step for that project is
-refused and the file is kept until it reads again. Text a later read could not take back (empty,
-over 2000 characters, an item that is not one) is refused before it is written. Run records name
-the lane a run worked for (a lane's thread, or one of its workers) in `lane`.
+refused and the file is kept until it reads again. A file that cannot be written (disk,
+permissions) refuses the step as `store-unwritable` and changes nothing. No step writes a file a
+later read would refuse: text that could not be read back (empty, over 2000 characters, an item
+that is not one) is refused, and every new state is checked before it is written. Lane and item
+names are looked up as the file's own keys only, so a name like `constructor` finds nothing. Run
+records name the lane a run worked for (a lane's thread, or one of its workers) in `lane`; for a
+stopped lane, only runs that ended by its stop.
 
 ```json
 {

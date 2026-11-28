@@ -12,6 +12,7 @@ import {
   type LaneItemKind,
   type LaneNote,
   LaneNote as LaneNoteSchema,
+  formatLaneItemRef,
   parseLaneItemRef,
   ProjectId,
   ThreadId,
@@ -82,9 +83,29 @@ export function decodeLaneState(text: string, projectId: ProjectId): LaneProject
     return null;
   }
   const decoded = decodeState(raw);
-  if (decoded._tag === "None" || decoded.value.projectId !== projectId) return null;
-  return decoded.value;
+  if (decoded._tag === "None") return null;
+  const state = decoded.value;
+  // Every record names this project, and each claim sits under its own item's key.
+  const records = [...Object.values(state.claims), ...state.outbox, ...state.notes];
+  if (state.projectId !== projectId || records.some((record) => record.projectId !== projectId)) {
+    return null;
+  }
+  if (Object.entries(state.claims).some(([key, claim]) => key !== claim.item)) return null;
+  return state;
 }
+
+/** `record[key]` only for the record's own key, never an inherited one (`constructor`). */
+export const own = <V>(record: { readonly [key: string]: V }, key: string): V | undefined =>
+  Object.hasOwn(record, key) ? record[key] : undefined;
+
+/** An item reference in one spelling (owner and repository lower-case), or null for no item. */
+export function normalizeItem(text: string): string | null {
+  const parsed = parseLaneItemRef(text.trim());
+  return parsed === null ? null : formatLaneItemRef(parsed);
+}
+
+/** Escalation ids are stored trimmed; compare them the same way. */
+const normalizeEscalationId = (id: string): string => id.trim();
 
 export const encodeLaneState = (state: LaneProjectState): string =>
   `${JSON.stringify(state, null, 2)}\n`;
@@ -95,6 +116,8 @@ export type LaneRefusalReason =
   | "lanes-off"
   /** The project's lane file exists but cannot be read or decoded. */
   | "store-unreadable"
+  /** The project's lane file cannot be written now (a full disk, no permission). */
+  | "store-unwritable"
   /** The settings do not define the lane. */
   | "unknown-lane"
   | "not-running"
@@ -151,7 +174,7 @@ const ok = <A>(state: LaneProjectState, value: A, changed = true): LaneStep<A> =
 export type LaneDefinitions = { readonly [name: string]: LaneDefinition };
 
 const definitionOf = (definitions: LaneDefinitions, lane: string): LaneDefinition | undefined =>
-  Object.hasOwn(definitions, lane) ? definitions[lane] : undefined;
+  own(definitions, lane);
 
 /** Who asks to act as a lane: the lane, the generation it was told, and its own thread. */
 export interface LaneActor {
@@ -170,7 +193,7 @@ function checkActor(
   if (definition === undefined) {
     return refuse("unknown-lane", `The settings do not define the lane '${actor.lane}'.`);
   }
-  const entry = state.lanes[actor.lane];
+  const entry = own(state.lanes, actor.lane);
   if (entry === undefined || entry.status !== "running") {
     return refuse("not-running", `The lane '${actor.lane}' is not running.`);
   }
@@ -207,24 +230,32 @@ const decodeClaim = Schema.decodeUnknownOption(LaneClaimSchema);
 const decodeNote = Schema.decodeUnknownOption(LaneNoteSchema);
 const decodeEscalation = Schema.decodeUnknownOption(LaneEscalationSchema);
 
+/** Each item in one spelling; text that is no item is kept as it is, so the record check refuses it. */
+const normalizeItems = (items: ReadonlyArray<string>): ReadonlyArray<string> =>
+  items.map((item) => normalizeItem(item) ?? item);
+
 const isRefusal = (value: unknown): value is LaneRefusal =>
   typeof value === "object" && value !== null && (value as LaneRefusal)._tag === "refused";
 
 /**
- * A claim counts while its lane is defined and running: it then belongs to the lane's current
- * thread, whatever thread made it. A claim of a stopped, removed or unknown lane is stale and the
- * next claim on the item takes it.
+ * A claim counts while its lane is defined, running and still owns the item's kind: it then belongs
+ * to the lane's current thread, whatever thread made it. Any other claim is stale and the next
+ * claim on the item takes it.
  */
 export function claimIsLive(
   state: LaneProjectState,
   definitions: LaneDefinitions,
   claim: LaneClaim,
 ): boolean {
-  const entry = state.lanes[claim.lane];
+  const entry = own(state.lanes, claim.lane);
+  const definition = definitionOf(definitions, claim.lane);
+  const kind = parseLaneItemRef(claim.item)?.kind;
   return (
     entry !== undefined &&
     entry.status === "running" &&
-    definitionOf(definitions, claim.lane) !== undefined
+    definition !== undefined &&
+    kind !== undefined &&
+    definition.owns.includes(kind)
   );
 }
 
@@ -247,7 +278,7 @@ export function startLane(
   if (definitionOf(definitions, input.lane) === undefined) {
     return refuse("unknown-lane", `The settings do not define the lane '${input.lane}'.`);
   }
-  const current = state.lanes[input.lane];
+  const current = own(state.lanes, input.lane);
   if (current?.status === "running") {
     return current.threadId === input.threadId
       ? ok(state, current, false)
@@ -287,7 +318,7 @@ export function replaceLaneThread(
   if (definitionOf(definitions, input.lane) === undefined) {
     return refuse("unknown-lane", `The settings do not define the lane '${input.lane}'.`);
   }
-  const current = state.lanes[input.lane];
+  const current = own(state.lanes, input.lane);
   if (current === undefined || current.status !== "running") {
     return refuse("not-running", `The lane '${input.lane}' is not running.`);
   }
@@ -326,7 +357,7 @@ export function stopLane(
   state: LaneProjectState,
   input: { readonly lane: string; readonly now: string },
 ): LaneStepResult<ReadonlyArray<LaneClaim>> {
-  const current = state.lanes[input.lane];
+  const current = own(state.lanes, input.lane);
   const released = Object.values(state.claims).filter((claim) => claim.lane === input.lane);
   if ((current === undefined || current.status === "stopped") && released.length === 0) {
     return ok(state, [], false);
@@ -365,8 +396,9 @@ export function claimItem(
 ): LaneStepResult<ClaimOutcome> {
   const actor = checkActor(state, definitions, input.actor);
   if (isRefusal(actor)) return actor;
-  const parsed = parseLaneItemRef(input.item);
-  if (parsed === null) {
+  const parsed = parseLaneItemRef(input.item.trim());
+  const item = parsed === null ? null : formatLaneItemRef(parsed);
+  if (parsed === null || item === null) {
     return refuse(
       "bad-item",
       `'${input.item}' is not an item: pr:owner/repo#12 or issue:owner/repo#12.`,
@@ -378,21 +410,21 @@ export function claimItem(
       `The lane '${input.actor.lane}' does not own items of kind '${parsed.kind}'.`,
     );
   }
-  const existing = state.claims[input.item];
+  const existing = own(state.claims, item);
   if (existing !== undefined && existing.lane === input.actor.lane) {
     return ok(state, { claim: existing, takenFrom: null }, false);
   }
   if (existing !== undefined && claimIsLive(state, definitions, existing)) {
     return refuse(
       "claimed",
-      `${input.item} is claimed by the lane '${existing.lane}' (thread ${existing.threadId}).`,
+      `${item} is claimed by the lane '${existing.lane}' (thread ${existing.threadId}).`,
       existing,
     );
   }
   const claim = checked(
     decodeClaim,
     {
-      item: input.item,
+      item,
       projectId: state.projectId,
       lane: input.actor.lane,
       generation: input.actor.generation,
@@ -403,7 +435,7 @@ export function claimItem(
   );
   if (isRefusal(claim)) return claim;
   return ok(
-    { ...state, claims: { ...state.claims, [input.item]: claim } },
+    { ...state, claims: { ...state.claims, [item]: claim } },
     { claim, takenFrom: existing ?? null },
   );
 }
@@ -416,16 +448,19 @@ export function releaseItem(
 ): LaneStepResult<LaneClaim | null> {
   const actor = checkActor(state, definitions, input.actor);
   if (isRefusal(actor)) return actor;
-  const existing = state.claims[input.item];
-  if (existing === undefined) return ok(state, null, false);
-  if (existing.lane !== input.actor.lane) {
+  const item = normalizeItem(input.item);
+  if (item === null) {
     return refuse(
-      "not-holder",
-      `${input.item} is claimed by the lane '${existing.lane}'.`,
-      existing,
+      "bad-item",
+      `'${input.item}' is not an item: pr:owner/repo#12 or issue:owner/repo#12.`,
     );
   }
-  const { [input.item]: _released, ...claims } = state.claims;
+  const existing = own(state.claims, item);
+  if (existing === undefined) return ok(state, null, false);
+  if (existing.lane !== input.actor.lane) {
+    return refuse("not-holder", `${item} is claimed by the lane '${existing.lane}'.`, existing);
+  }
+  const claims = Object.fromEntries(Object.entries(state.claims).filter(([key]) => key !== item));
   return ok({ ...state, claims }, existing);
 }
 
@@ -451,7 +486,7 @@ export function addNote(
       threadId: input.actor.threadId,
       at: input.now,
       text: input.text,
-      items: input.items,
+      items: normalizeItems(input.items),
     },
     "note",
   );
@@ -463,8 +498,9 @@ export function addNote(
 }
 
 /**
- * Puts an escalation in the outbox for the main orchestrator. The same `id` again (a repeat)
- * changes nothing; a full outbox refuses it rather than drop one.
+ * Puts an escalation in the outbox for the main orchestrator. The same lane and trimmed `id` again
+ * while it waits (a repeat) changes nothing; once acked, the id is free again. A full outbox
+ * refuses a new one rather than drop one.
  */
 export function addEscalation(
   state: LaneProjectState,
@@ -479,7 +515,9 @@ export function addEscalation(
 ): LaneStepResult<LaneEscalation> {
   const actor = checkActor(state, definitions, input.actor);
   if (isRefusal(actor)) return actor;
-  const repeat = state.outbox.find((entry) => entry.id === input.id);
+  const id = normalizeEscalationId(input.id);
+  // One escalation per lane and id: a repeat changes nothing; another lane's same id is its own.
+  const repeat = state.outbox.find((entry) => entry.lane === input.actor.lane && entry.id === id);
   if (repeat !== undefined) return ok(state, repeat, false);
   if (state.outbox.length >= OUTBOX_LIMIT) {
     return refuse(
@@ -490,14 +528,14 @@ export function addEscalation(
   const escalation = checked(
     decodeEscalation,
     {
-      id: input.id,
+      id,
       projectId: state.projectId,
       lane: input.actor.lane,
       generation: input.actor.generation,
       threadId: input.actor.threadId,
       at: input.now,
       text: input.text,
-      items: input.items,
+      items: normalizeItems(input.items),
     },
     "escalation",
   );
@@ -505,23 +543,40 @@ export function addEscalation(
   return ok({ ...state, outbox: [...state.outbox, escalation] }, escalation);
 }
 
-/** Removes delivered escalations from the outbox; an id not there (a repeat) is ignored. */
+/** An escalation's key in the outbox: its lane and its trimmed id. */
+export interface EscalationKey {
+  readonly lane: string;
+  readonly id: string;
+}
+
+const escalationKey = (key: EscalationKey) =>
+  JSON.stringify([key.lane, normalizeEscalationId(key.id)]);
+
+/** Removes delivered escalations from the outbox; a key not there (a repeat) is ignored. */
 export function ackEscalations(
   state: LaneProjectState,
-  ids: ReadonlyArray<string>,
+  keys: ReadonlyArray<EscalationKey>,
 ): LaneStepResult<number> {
-  const done = new Set(ids);
-  const outbox = state.outbox.filter((entry) => !done.has(entry.id));
+  const done = new Set(keys.map(escalationKey));
+  const outbox = state.outbox.filter((entry) => !done.has(escalationKey(entry)));
   const removed = state.outbox.length - outbox.length;
   return removed === 0 ? ok(state, 0, false) : ok({ ...state, outbox }, removed);
 }
 
-/** The lane a thread acted for, by any generation, or null. */
-export function laneOfThread(state: LaneProjectState, threadId: string): string | null {
+/**
+ * The lane a thread acted for (by any generation) when a run of it ended at `endedAt`, or null.
+ * A stopped lane counts only for runs that ended by its stop.
+ */
+export function laneOfThread(
+  state: LaneProjectState,
+  threadId: string,
+  endedAt: string,
+): string | null {
   for (const [lane, entry] of Object.entries(state.lanes)) {
-    if (entry.threadId === threadId || entry.threads.some((t) => t.threadId === threadId)) {
-      return lane;
-    }
+    const acted = entry.threadId === threadId || entry.threads.some((t) => t.threadId === threadId);
+    const inTime =
+      entry.status === "running" || (entry.stoppedAt !== null && endedAt <= entry.stoppedAt);
+    if (acted && inTime) return lane;
   }
   return null;
 }

@@ -156,13 +156,18 @@ export const make = Effect.fn("RunRecorder.make")(function* (options: {
     const project = yield* projects
       .getShell(thread.projectId)
       .pipe(Effect.orElseSucceed(() => Option.none()));
-    const lane =
-      lanes === null
-        ? null
-        : yield* lanes.laneOfRun(thread.projectId, run.threadId, parentThreadId);
     const ms = (value: DateTime.Utc) => DateTime.toEpochMillis(value);
     const endedMs =
       run.completedAt === null ? DateTime.toEpochMillis(yield* DateTime.now) : ms(run.completedAt);
+    const lane =
+      lanes === null
+        ? null
+        : yield* lanes.laneOfRun(
+            thread.projectId,
+            run.threadId,
+            parentThreadId,
+            DateTime.formatIso(DateTime.makeUnsafe(endedMs)),
+          );
     return buildRunRecord({
       run,
       thread: {
