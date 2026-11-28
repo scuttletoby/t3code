@@ -392,7 +392,8 @@ jobs:
       # cache, builtInDrivers.ts, the drivers' kind files and the files where each reads its effort
       # (claudeModelOptions.ts, the adapters) and Kiro's agent id (acpSupport.ts): the effort id of each
       # built-in driver, in fork-kit/model-guard/tests/guard.test.py; modelPolicy.ts: the server's model
-      # policy reads the same effort ids, same test); packages/shared/src/capacity/: the capacity rule's one
+      # policy reads the same effort ids, same test; modelPolicyRoutesMarker.ts: the routes marker's name and
+      # routes, same test); packages/shared/src/capacity/: the capacity rule's one
       # source, which the heavy kit's evaluator and its tests read and heavy-install copies
       # (fork-kit/heavy/tests/capacity_rule.test.py, facts.test.py, install.test.py); keep the lists in step.
       # The workspace files (pnpm-workspace.yaml, the package.json files) are what fork-owned-paths.cjs narrows a
@@ -424,6 +425,7 @@ jobs:
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
+            /apps/server/src/fork/modelPolicyRoutesMarker.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
             /apps/server/src/persistence/Sqlite.ts
@@ -598,6 +600,7 @@ jobs:
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
+            /apps/server/src/fork/modelPolicyRoutesMarker.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
             /apps/server/src/persistence/Sqlite.ts
@@ -702,6 +705,7 @@ jobs:
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
+            /apps/server/src/fork/modelPolicyRoutesMarker.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
             /apps/server/src/persistence/Sqlite.ts

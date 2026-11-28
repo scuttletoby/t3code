@@ -19,7 +19,7 @@ export const MODEL_POLICY_ROUTES_MARKER = "fork-capabilities.json";
  * The routes this server checks against its model policy for an agent's call, whatever the
  * calling client: model-guard leaves exactly these to T3 (its SERVER_CHECKED_TOOLS).
  */
-export const MODEL_POLICY_CHECKED_ROUTES = [
+const MODEL_POLICY_CHECKED_ROUTES = [
   "delegate_task",
   "create_threads",
 ] as const satisfies ReadonlyArray<PolicyRoute>;
@@ -39,7 +39,7 @@ export const markerContents = (pid: number): typeof MarkerContents.Type => ({
 });
 
 /** The marker beside `serverRuntimeStatePath`. */
-export const markerPath = (path: Path.Path, serverRuntimeStatePath: string) =>
+const markerPath = (path: Path.Path, serverRuntimeStatePath: string) =>
   path.join(path.dirname(serverRuntimeStatePath), MODEL_POLICY_ROUTES_MARKER);
 
 /** In server.ts's runtime services (fork/forkLayers.ts). A failed write only logs: the guard then keeps checking. */

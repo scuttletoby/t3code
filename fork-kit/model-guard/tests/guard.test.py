@@ -16,6 +16,17 @@ LIB = os.path.join(KIT, 'lib', 'model_guard.py')
 sys.path.insert(0, os.path.join(KIT, 'lib'))
 import model_guard  # noqa: E402
 
+
+def in_kit_checkout(path):
+    """Whether the Fork kit job's sparse checkout (.github/workflows/fork-tests.yml) has `path`."""
+    with open(os.path.join(REPO, '.github', 'workflows', 'fork-tests.yml'), encoding='utf-8') as f:
+        workflow = f.read()
+    job = workflow[:workflow.index('- name: Fork kit tests')]
+    listed = job[job.rindex('sparse-checkout: |'):].splitlines()[1:]
+    entries = [line.strip() for line in listed if line.strip().startswith('/')]
+    return any(e == f'/{path}' or (e.endswith('/') and f'/{path}'.startswith(e)) for e in entries)
+
+
 LARGE = {'driver': 'claudeAgent', 'model': 'example-large-1', 'efforts': ['medium', 'high'], 'defaultEffort': 'high',
          'aliases': ['large'], 'useFor': 'most work'}
 DEEP = {'driver': 'claudeAgent', 'model': 'example-deep-2', 'efforts': ['high'], 'aliases': ['deep']}
@@ -2355,6 +2366,8 @@ class Contract(unittest.TestCase):
     }
 
     def read_repo(self, path):
+        # CI's Fork kit job checks out only the files its sparse list names: a file read here must be in it.
+        self.assertTrue(in_kit_checkout(path), f"{path}: add it to the Fork kit job's checkout in fork-tests.yml")
         with open(os.path.join(REPO, *path.split('/')), encoding='utf-8') as f:
             return f.read()
 
