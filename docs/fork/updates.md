@@ -187,9 +187,11 @@ watches; it changes nothing on the machine, and `0` turns it off.
   only one the branch's merge-base has: two branches from one main that each add the one listed
   copy are each green, and once one merges the other is refused ("update the branch from its
   base"). Neither seam check runs on `merge_group`. Two changes that are fine apart but not together
-  (a seam line in both, or a pending file each shrinks) are judged together because main's ruleset
-  requires a branch to be up to date with main before it merges (#444): the later one is updated
-  from main, and that update runs both checks again. A branch made before fork-follow last
+  (a seam line in both, or a pending file each shrinks) are judged together because a pull request
+  that is behind main is updated from main once, right before it merges, and merges only after
+  that update's CI ([agent rules](agent-rules.md), #444): the later one's update runs both checks
+  again. Main's ruleset leaves "require up to date" (strict) off on purpose: the single update
+  before the merge gives the same check without an update on every move of main. A branch made before fork-follow last
   rebased main is refused with one "update the branch" error. Only `--from-upstream` (which fork-follow passes)
   runs it from an upstream commit and reads the head's list; without it a base with no list is
   refused, and an upstream that is itself a fork with a list is still judged by this fork's list.
