@@ -1396,7 +1396,8 @@ Which threads hold a role, for the calm sidebar: the `assistant` thread (or `nul
 settings, not a tag on the thread, so a project has at most one orchestrator and the roles are a
 setting the person changes ([#138](https://github.com/scuttletoby/t3code/issues/138)). The default,
 no roles, changes nothing. This setting alone shows nothing: the calm sidebar
-(`client.calmSidebarEnabled`) reads it.
+(`client.calmSidebarEnabled`) reads it, and the MCP profile check reads `assistant` (that thread
+never gets more than the profile `assistant`, [assistant.md](assistant.md)).
 
 Only the person can change it; agents cannot (the settings tool refuses it as person-only). A save
 that sets a pointer anew is refused unless the thread exists and is not deleted, is a top-level

@@ -11,6 +11,7 @@ import * as NodePath from "node:path";
 import {
   FORK_AGENT_WRITABLE_KEYS,
   FORK_PERSON_ONLY_KEYS,
+  MCP_T3_NARROW_GROUPS,
   MCP_T3_TOOL_GROUPS,
   MCP_T3_UNGROUPED_TOOLS,
 } from "@t3tools/contracts";
@@ -19,13 +20,15 @@ import * as Schema from "effect/Schema";
 import { beforeAll, describe, expect, it } from "vite-plus/test";
 
 import { withoutMachineOnlyFields } from "./advertisedMachineFields.ts";
-import { T3_TOOL_GROUPS } from "./mcpT3ToolRule.ts";
+import { T3_TOOL_GROUPS, T3_TOOL_NARROW_GROUPS } from "./mcpT3ToolRule.ts";
 import {
+  MCP_T3_NARROW_GROUP_TOOLS,
   MCP_T3_TOOLKIT_GROUPS,
   MCP_T3_TOOL_NOT_ALLOWED,
   MCP_T3_TOOL_OWN_GROUPS,
   MCP_T3_UNGROUPED_TOOL_KITS,
   mcpT3ToolGroup,
+  mcpT3ToolNarrowGroups,
 } from "./mcpProfile.ts";
 
 const TOOLKITS_DIR = NodePath.resolve(import.meta.dirname, "../mcp/toolkits");
@@ -475,7 +478,10 @@ describe("MCP profile T3 tool groups", () => {
     expect(Object.keys(MCP_T3_TOOLKIT_GROUPS).toSorted()).toEqual(toolkitFolders().toSorted());
     const used = new Set(
       [...toolsByFolder].flatMap(([folder, names]) =>
-        [...names].map((name) => mcpT3ToolGroup(folder, name)),
+        [...names].flatMap((name) => [
+          mcpT3ToolGroup(folder, name),
+          ...mcpT3ToolNarrowGroups(folder, name),
+        ]),
       ),
     );
     expect(MCP_T3_TOOL_GROUPS.filter((group) => !used.has(group))).toEqual([]);
@@ -546,8 +552,36 @@ describe("MCP profile T3 tool groups", () => {
   it("gives every group of MCP_T3_TOOL_GROUPS a tool in the T3 tool filter's table", () => {
     // A group added to the contracts (a new toolkit, or tools moved) with no toolkit behind it in the
     // filter would be offered in Settings and keep nothing.
-    const used = new Set(T3_TOOL_GROUPS.values());
+    const used = new Set<string>([
+      ...T3_TOOL_GROUPS.values(),
+      ...[...T3_TOOL_NARROW_GROUPS.values()].flat(),
+    ]);
     expect(MCP_T3_TOOL_GROUPS.filter((group) => !used.has(group))).toEqual([]);
+  });
+
+  it("names each narrow group's tools in their toolkits, within its whole groups (#980)", () => {
+    for (const [narrow, kits] of Object.entries(MCP_T3_NARROW_GROUP_TOOLS)) {
+      const wholes = MCP_T3_NARROW_GROUPS[narrow as keyof typeof MCP_T3_NARROW_GROUPS] ?? [];
+      expect(wholes, narrow).not.toEqual([]);
+      const homes = new Set<string>();
+      for (const [toolkit, names] of Object.entries(kits)) {
+        for (const name of names) {
+          expect(toolsByFolder.get(toolkit)?.has(name), `${toolkit} has ${name}`).toBe(true);
+          const home = mcpT3ToolGroup(toolkit, name);
+          // Within its whole groups, so a profile with all of them keeps the narrow group's tools.
+          expect(wholes, `${toolkit}/${name} -> ${home}`).toContain(home);
+          homes.add(home);
+        }
+      }
+      // Each whole group listed has one of its tools, so the containment is not wider than real.
+      expect([...wholes].toSorted(), narrow).toEqual([...homes].toSorted());
+    }
+    // No other group is narrow, and no tool is in a narrow group of a toolkit that lacks it.
+    expect(Object.keys(MCP_T3_NARROW_GROUPS).toSorted()).toEqual(
+      Object.keys(MCP_T3_NARROW_GROUP_TOOLS).toSorted(),
+    );
+    expect(mcpT3ToolNarrowGroups("project", "t3_thread_send")).toEqual([]);
+    expect(mcpT3ToolNarrowGroups("orchestrator", "t3_thread_send")).toEqual(["message"]);
   });
 
   it("does not allow a tool this build does not know", () => {

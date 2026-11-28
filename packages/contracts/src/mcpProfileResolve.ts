@@ -11,6 +11,7 @@ import {
   MCP_PROFILE_ASSISTANT,
   MCP_PROFILE_T3_ONLY,
   MCP_SUBAGENT_INHERIT,
+  MCP_T3_NARROW_GROUPS,
   MCP_T3_TOOL_GROUPS,
   type McpT3ToolGroup,
   isBuiltInMcpProfileName,
@@ -129,7 +130,8 @@ export const MCP_BUILT_IN_PROFILES: Readonly<Record<string, McpProfileSet>> = {
   [MCP_PROFILE_T3_ONLY]: { servers: [], t3Tools: "all" },
   [MCP_PROFILE_ASSISTANT]: {
     servers: [],
-    t3Tools: ["orchestration", "threads", "projects"],
+    // Only these: never `orchestration`, `threads` or `projects` whole (the owner's decision).
+    t3Tools: ["read", "start", "message"],
     builtinTools: MCP_BUILTIN_TOOLS_NONE,
   },
 };
@@ -303,14 +305,21 @@ export function readCarried(value: unknown): CarriedLookup {
   if (!t3Tools.ok) return { ok: false, name, issue: t3Tools.issue };
   const builtinTools = parseBuiltinTools(value.builtinTools);
   if (!builtinTools.ok) return { ok: false, name, issue: builtinTools.issue };
-  return {
-    ok: true,
-    name,
-    profile: withBuiltinTools(
-      { servers: servers.value, t3Tools: t3Tools.value.groups },
-      builtinTools.value,
-    ),
-  };
+  const profile = withBuiltinTools(
+    { servers: servers.value, t3Tools: t3Tools.value.groups },
+    builtinTools.value,
+  );
+  // A carried `assistant` is re-narrowed as it is read: one recorded before the split names
+  // the whole groups `orchestration`, `threads` and `projects`, and keeps only what the built-in
+  // `assistant` keeps now. An older build's own profile of that name is cut the same way.
+  if (name === MCP_PROFILE_ASSISTANT) {
+    return {
+      ok: true,
+      name,
+      profile: cutTo(profile, MCP_BUILT_IN_PROFILES[MCP_PROFILE_ASSISTANT]!),
+    };
+  }
+  return { ok: true, name, profile };
 }
 
 /** A set value; empty or absent means "not set". */
@@ -342,6 +351,30 @@ function ownChoice(
   return { name: nonEmpty(settings.mcpProfile) ?? MCP_PROFILE_ALL, source: "environment" };
 }
 
+/**
+ * True when the keep-list has the group, or (for a narrow group) every whole group its tools are
+ * in (`MCP_T3_NARROW_GROUPS`), which then keeps all of its tools too.
+ */
+const keepsGroup = (groups: ReadonlyArray<McpT3ToolGroup>, group: McpT3ToolGroup): boolean => {
+  if (groups.includes(group)) return true;
+  const wholes = MCP_T3_NARROW_GROUPS[group];
+  return wholes !== undefined && wholes.every((whole) => groups.includes(whole));
+};
+
+/**
+ * The T3 groups two keep-lists both keep: each group one list keeps that the other also keeps
+ * (a narrow group counts as kept by a list with all of its whole groups). A whole group cut to a
+ * list of narrow groups keeps those narrow groups, never the whole group.
+ */
+const bothKeep = (
+  child: ReadonlyArray<McpT3ToolGroup>,
+  parent: ReadonlyArray<McpT3ToolGroup>,
+): ReadonlyArray<McpT3ToolGroup> =>
+  unique([
+    ...child.filter((group) => keepsGroup(parent, group)),
+    ...parent.filter((group) => !child.includes(group) && keepsGroup(child, group)),
+  ]);
+
 /** `child` cut down to `parent`: a keep-list keeps only what both keep. */
 function cutTo(child: McpProfileSet, parent: McpProfileSet): McpProfileSet {
   const servers =
@@ -355,7 +388,7 @@ function cutTo(child: McpProfileSet, parent: McpProfileSet): McpProfileSet {
       ? child.t3Tools
       : child.t3Tools === "all"
         ? parent.t3Tools
-        : child.t3Tools.filter((group) => parent.t3Tools.includes(group));
+        : bothKeep(child.t3Tools, parent.t3Tools);
   // Either one without built-in tools leaves the thread without them.
   return withBuiltinTools({ servers, t3Tools }, child.builtinTools ?? parent.builtinTools);
 }

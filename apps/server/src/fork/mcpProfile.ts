@@ -85,6 +85,50 @@ export const MCP_T3_TOOL_OWN_GROUPS: Readonly<
   lens_report: { toolkit: "waits", group: "orchestration" },
 };
 
+/**
+ * Each narrow group's tools (`MCP_T3_NARROW_GROUPS`), by toolkit; each also stays in its own group.
+ * A tool not named here (a new one too) is in no narrow group. Nothing that deletes, stops, moves,
+ * configures, schedules or links is named. personOnlySettings.test.ts checks every row.
+ */
+export const MCP_T3_NARROW_GROUP_TOOLS: Readonly<
+  Record<"read" | "start" | "message", Readonly<Record<string, ReadonlyArray<string>>>>
+> = {
+  read: {
+    orchestrator: [
+      "orchestrator_capabilities",
+      "task_status",
+      "t3_background_wait",
+      "list_scheduled_tasks",
+      "t3_thread_list",
+      "t3_thread_read",
+      "t3_thread_wait",
+      "t3_environment_links",
+    ],
+    thread: ["t3_thread_search", "t3_submit_output"],
+    project: ["t3_project_list", "t3_project_read"],
+  },
+  start: {
+    orchestrator: ["delegate_task", "create_threads"],
+    project: ["t3_thread_launch"],
+  },
+  message: {
+    orchestrator: ["t3_thread_send"],
+  },
+};
+
+/** The narrow groups a T3 tool is in, besides its own group; none for most tools. */
+export function mcpT3ToolNarrowGroups(
+  toolkit: string,
+  tool: string,
+): ReadonlyArray<McpT3ToolGroup> {
+  return (
+    Object.keys(MCP_T3_NARROW_GROUP_TOOLS) as Array<keyof typeof MCP_T3_NARROW_GROUP_TOOLS>
+  ).filter((group) => {
+    const kits = MCP_T3_NARROW_GROUP_TOOLS[group];
+    return Object.hasOwn(kits, toolkit) && kits[toolkit]!.includes(tool);
+  });
+}
+
 /** {@link mcpT3ToolGroup}'s answer for a tool no profile may keep. */
 export const MCP_T3_TOOL_NOT_ALLOWED = "not-allowed";
 

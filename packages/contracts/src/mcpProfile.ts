@@ -14,8 +14,8 @@ export const MCP_PROFILE_ALL = "all";
 /** No outside servers, every T3 tool. */
 export const MCP_PROFILE_T3_ONLY = "t3-only";
 /**
- * The assistant's: no outside servers, no built-in tools, and the T3 groups `orchestration`,
- * `threads` and `projects` (docs/fork/assistant.md lists what they can do).
+ * The assistant's: no outside servers, no built-in tools, and only the T3 groups `read`, `start`
+ * and `message` (docs/fork/assistant.md lists their tools).
  */
 export const MCP_PROFILE_ASSISTANT = "assistant";
 /** The profiles every build knows; `mcpProfiles` cannot redefine them. */
@@ -58,9 +58,9 @@ const McpProfileChoice = McpProfileName.check(
 );
 
 /**
- * Groups of T3's own tools: one per toolkit (`preview` has two), and `playtest`, a waits tool that
- * runs build and deploy steps, so keeping `waits` does not give it. {@link MCP_T3_UNGROUPED_TOOLS}
- * are in no group; apps/server/src/fork/mcpProfile.ts maps each tool, and a test checks them all.
+ * Groups of T3's own tools: one per toolkit (`preview` has two); `playtest`, a waits tool that runs
+ * build and deploy steps; and the narrow groups ({@link MCP_T3_NARROW_GROUPS}). {@link
+ * MCP_T3_UNGROUPED_TOOLS} are in no group; apps/server/src/fork/mcpProfile.ts maps each tool.
  */
 export const MCP_T3_TOOL_GROUPS = [
   "orchestration",
@@ -79,8 +79,24 @@ export const MCP_T3_TOOL_GROUPS = [
   "playtest",
   "workflows",
   "feedback",
+  "read",
+  "start",
+  "message",
 ] as const;
 export type McpT3ToolGroup = (typeof MCP_T3_TOOL_GROUPS)[number];
+
+/**
+ * Narrow groups, each with the whole groups its tools are in: `read` (changes nothing), `start`
+ * (delegate, make or launch a thread) and `message` (write to a thread). One is within a profile
+ * that keeps all of its whole groups; apps/server/src/fork/mcpProfile.ts names each tool.
+ */
+export const MCP_T3_NARROW_GROUPS: Readonly<
+  Partial<Record<McpT3ToolGroup, ReadonlyArray<McpT3ToolGroup>>>
+> = {
+  read: ["orchestration", "threads", "projects"],
+  start: ["orchestration", "projects"],
+  message: ["orchestration"],
+};
 
 /**
  * T3 tools every profile keeps, in no group: the two message tools, and `tool_search`, which only
