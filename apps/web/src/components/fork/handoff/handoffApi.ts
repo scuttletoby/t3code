@@ -17,7 +17,7 @@ import { resolvePrimaryEnvironmentHttpUrl } from "../../../environments/primary/
 import { readPrimaryEnvironmentId } from "../../../state/environments";
 
 /** The thread lives on the server this app talks to over HTTP. */
-export function onPrimaryEnvironment(threadRef: ScopedThreadRef): boolean {
+function onPrimaryEnvironment(threadRef: ScopedThreadRef): boolean {
   return readPrimaryEnvironmentId() === threadRef.environmentId;
 }
 

@@ -20,6 +20,7 @@ const menuState: ThreadActionMenuState = {
   canSnoozeNow: true,
   isRegeneratingTitle: false,
   isRunning: false,
+  hasCompletedRun: false,
   supports: {
     settlement: true,
     autoSettleOptOut: true,

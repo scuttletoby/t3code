@@ -27,9 +27,9 @@ export const HAND_OFF_NOW = "fork:hand-off-now" as unknown as ThreadActionMenuId
 export type HandoffMenuState = HandoffRouteState | null;
 
 /** How long the menu waits for the state before it opens without the item. */
-export const HANDOFF_MENU_READ_TIMEOUT_MS = 300;
+const HANDOFF_MENU_READ_TIMEOUT_MS = 300;
 
-export function blockerText(blocker: HandoffRouteBlocker): string {
+function blockerText(blocker: HandoffRouteBlocker): string {
   switch (blocker.kind) {
     case "run-active":
       return "a turn still running";

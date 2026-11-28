@@ -14,7 +14,10 @@ import type { ComposerBannerStackItem } from "../../chat/ComposerBannerStack";
 import { waitingOnText } from "./handoffMenu";
 
 /** While the chip shows: its blockers may end without a change the thread shell carries. */
-export const HANDOFF_CHIP_POLL_MS = 10_000;
+const HANDOFF_CHIP_POLL_MS = 10_000;
+
+/** The handoff calls load on the first read, not with the composer (outside the hook: the React Compiler cannot compile `import()`). */
+const loadHandoffApi = () => import("./handoffApi");
 
 export function handoffWaitingItem(
   blockers: ReadonlyArray<HandoffRouteBlocker>,
@@ -52,7 +55,7 @@ export function useForkHandoffWaitingItems(
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const readOnce = async () => {
-      const { readHandoffState } = await import("./handoffApi");
+      const { readHandoffState } = await loadHandoffApi();
       const state = await readHandoffState(
         { environmentId, threadId },
         { signal: controller.signal },
