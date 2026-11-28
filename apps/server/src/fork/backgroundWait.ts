@@ -64,7 +64,7 @@ export const remember = (
  * order; each is handed back once.
  */
 export const read = (
-  providerThread: { readonly nativeThreadRef: { readonly nativeId: string } | null },
+  providerThread: { readonly nativeThreadRef: { readonly nativeId: string | null } | null },
   taskIds: ReadonlyArray<string>,
   matched: ReadonlyArray<string>,
 ): Effect.Effect<ReadonlyArray<EndedTask>> =>
