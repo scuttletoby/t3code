@@ -26,7 +26,8 @@ The same entries go in the managed settings drop-in the installer writes (--sett
 "harnessEnv" as its "env": config.harness_env) or, by hand, in any settings
 file (`agent-guards hooks`). Monitor runs shell text like Bash, so every hook that reads a command reads it for
 Monitor too, except poll-loop-guard: an until-condition in a Monitor is the right way to wait for a file, so it
-is wired for Bash only.
+is wired for Bash only. Claude Code still runs the Bash entries for a Monitor call, with tool_name "Bash", so
+poll-loop-guard tells a Monitor apart by its tool_use_id in the transcript and lets its local waits through.
 """
 import json
 

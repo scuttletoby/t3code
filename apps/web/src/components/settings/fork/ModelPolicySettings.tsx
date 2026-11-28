@@ -35,12 +35,17 @@ import {
   aliasModelPolicyRows,
   MODEL_POLICY_MODE_OPTIONS,
   modelPolicyEditorText,
+  modelPolicyListedRows,
+  type ModelPolicyListProvider,
   modelPolicyRowLine,
   modelPolicyStartsFromStartRows,
+  modelPolicyTextRows,
   personModelPickMarks,
+  staleModelPolicyRows,
   unknownModelPolicyDrivers,
   unreadableModelPolicyMode,
   unreadableModelPolicyText,
+  withAddedModelPolicyRow,
   withModelPolicyAllow,
 } from "./modelPolicySettings.logic";
 import { defaultIs } from "./forkDefaultText.logic";
@@ -67,10 +72,13 @@ function UnreadableWarning({
 
 function AllowDialog({
   value,
+  providers,
   onOpenChange,
   onSave,
 }: {
   readonly value: ModelPolicy;
+  /** The selected machines' providers, whose model lists the person adds rows from. */
+  readonly providers: ReadonlyArray<ModelPolicyListProvider>;
   readonly onOpenChange: (open: boolean) => void;
   readonly onSave: (next: ModelPolicyPatch, onSaved: () => void, onFailed: () => void) => void;
 }) {
@@ -84,6 +92,18 @@ function AllowDialog({
   const fileMode = unreadableModelPolicyMode(value);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const listed = modelPolicyListedRows(modelPolicyTextRows(text), providers);
+  const addListed = (key: string | null) => {
+    const entry = listed.find((candidate) => candidate.key === key);
+    if (entry === undefined) return;
+    const result = withAddedModelPolicyRow(text, entry.row);
+    if ("error" in result) {
+      setError(result.error);
+      return;
+    }
+    setError(null);
+    setText(result.text);
+  };
   const save = () => {
     if (saving) return;
     if (mode === null) {
@@ -114,7 +134,8 @@ function AllowDialog({
           <DialogDescription>
             A JSON list, as in the settings file. Each row names a driver (such as claudeAgent or
             codex) and a model; efforts limits its efforts (a row without it checks only the model),
-            defaultEffort is one of them, and useFor is a note shown to agents.
+            defaultEffort is one of them, and useFor is a note shown to agents. Add a model appends
+            a row for a model the selected machines list, with the efforts its own control offers.
           </DialogDescription>
         </DialogHeader>
         <DialogPanel>
@@ -157,6 +178,23 @@ function AllowDialog({
                   </SelectPopup>
                 </Select>
               </>
+            ) : null}
+            {listed.length > 0 ? (
+              <Select value={null} onValueChange={addListed}>
+                <SelectTrigger size="sm" className="w-full sm:w-96" aria-label="Add a listed model">
+                  <SelectValue>Add a model from the selected machines&apos; lists</SelectValue>
+                </SelectTrigger>
+                <SelectPopup alignItemWithTrigger={false}>
+                  {listed.map((entry) => (
+                    <SelectItem hideIndicator key={entry.key} value={entry.key}>
+                      {entry.label}
+                      {entry.row.efforts === undefined
+                        ? " (no effort control)"
+                        : ` (efforts ${entry.row.efforts.join(", ")})`}
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
             ) : null}
             <Textarea
               aria-label="Allowed models"
@@ -245,6 +283,7 @@ export function ModelPolicySettings() {
   const aliasRows = new Map(
     aliasModelPolicyRows(shown.allow, providers).map(({ row, aliasOf }) => [row, aliasOf]),
   );
+  const staleRows = new Set(staleModelPolicyRows(shown.allow, providers));
   const marks = personModelPickMarks(shown, picks, providers, target?.environmentId);
   const byDriver = new Map<string, Array<ModelPolicy["allow"][number]>>();
   for (const row of shown.allow)
@@ -345,6 +384,12 @@ export function ModelPolicySettings() {
                             moves it to a new model, and does not allow a pick of the full id.
                           </span>
                         )}
+                        {staleRows.has(row) ? (
+                          <span role="note" className="text-destructive-foreground">
+                            No {row.driver} model list on a selected machine holds {row.model}; it
+                            may be retired or misspelled, so this row may allow nothing there.
+                          </span>
+                        ) : null}
                       </span>
                     );
                   })}
@@ -381,6 +426,7 @@ export function ModelPolicySettings() {
       {editing ? (
         <AllowDialog
           value={shown}
+          providers={providers}
           onOpenChange={setEditing}
           onSave={(next, onSaved, onFailed) => save(next, { onSaved, onFailed })}
         />
