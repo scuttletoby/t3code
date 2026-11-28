@@ -168,6 +168,21 @@ const MODEL_POLICY_DRIVER_EFFORT_IDS: Readonly<Record<string, string>> = {
  * no effort, exactly as if the option were left out.
  */
 const MODEL_POLICY_OPENCODE_NO_VARIANT = "t3:default";
+/**
+ * Per driver, the effort choice that sends no effort (the driver picks): OpenCode's no-variant and
+ * Claude's `default` for a model outside its catalog (`ClaudeModelCatalog.ts` `claudeReportedModels`;
+ * a server test keeps them in step). A pick reads it as no effort; a new row never offers it.
+ */
+const MODEL_POLICY_NO_EFFORT_CHOICES: Readonly<Record<string, string>> = {
+  claudeAgent: "default",
+  opencode: MODEL_POLICY_OPENCODE_NO_VARIANT,
+};
+/** Whether a driver's effort option holding this value sends no effort ({@link MODEL_POLICY_NO_EFFORT_CHOICES}). */
+const sendsNoEffort = (driver: string | undefined, optionId: string, value: unknown): boolean =>
+  driver !== undefined &&
+  Object.hasOwn(MODEL_POLICY_NO_EFFORT_CHOICES, driver) &&
+  optionId === MODEL_POLICY_DRIVER_EFFORT_IDS[driver] &&
+  value === MODEL_POLICY_NO_EFFORT_CHOICES[driver];
 /** The ultracode option, and the effort name the policy gives it: it runs at xhigh in ultracode. */
 const MODEL_POLICY_ULTRACODE = "ultracode";
 /** The only driver with the ultracode option (the Claude driver reads the catalog's default for it). */
@@ -238,7 +253,7 @@ export function modelPolicyPickEfforts(pick: ModelPolicyPick): ReadonlyArray<str
       options.flatMap((option) =>
         effortIds.has(option.id) &&
         typeof option.value === "string" &&
-        !sendsNoVariant(pick, option)
+        !sendsNoEffort(pick.driver, option.id, option.value)
           ? [option.value]
           : [],
       ),
@@ -257,15 +272,6 @@ export function modelPolicyPickEfforts(pick: ModelPolicyPick): ReadonlyArray<str
   if (!ultracode) return efforts;
   return [MODEL_POLICY_ULTRACODE, ...efforts.filter((effort) => effort !== "xhigh")];
 }
-
-/** OpenCode's "Default" variant: the driver sends no variant, so it names no effort. */
-const sendsNoVariant = (
-  pick: ModelPolicyPick,
-  option: { readonly id: string; readonly value: unknown },
-) =>
-  pick.driver === "opencode" &&
-  option.id === MODEL_POLICY_DRIVER_EFFORT_IDS.opencode &&
-  option.value === MODEL_POLICY_OPENCODE_NO_VARIANT;
 
 /**
  * The option ids read as a pick's effort. `guess`: without a known driver, every driver's own id
@@ -316,6 +322,12 @@ export interface ModelPolicyListedModel {
               readonly id: string;
               readonly type: string;
               readonly role?: string | undefined;
+              /** A toggle's value when the pick leaves it out (the ultracode default). */
+              readonly currentValue?: unknown;
+              /** A select's choices, as Settings offers them for a new row. */
+              readonly options?:
+                | ReadonlyArray<{ readonly id: string; readonly isDefault?: boolean | undefined }>
+                | undefined;
             }>
           | undefined;
       }
@@ -346,6 +358,40 @@ export function modelPolicyCatalogEffortIds(
         .map((descriptor) => descriptor.id),
     ),
   ];
+}
+
+/**
+ * The efforts a new row for a listed model names: the choices of the select its driver reads (else
+ * the marked control) and its default, never a no-effort or old `ultracode` choice. With ultracode
+ * on by default, a pick leaving it out runs ultracode, so the row allows it as its default.
+ */
+export function modelPolicyListedEfforts(
+  driver: string,
+  model: ModelPolicyListedModel,
+): { readonly efforts: ReadonlyArray<string>; readonly defaultEffort: string | undefined } {
+  const ids = Object.hasOwn(MODEL_POLICY_DRIVER_EFFORT_IDS, driver)
+    ? [MODEL_POLICY_DRIVER_EFFORT_IDS[driver]!]
+    : modelPolicyCatalogEffortIds([[model]], model.slug);
+  const descriptors = model.capabilities?.optionDescriptors ?? [];
+  const choices = descriptors
+    .filter((descriptor) => descriptor.type === "select" && ids.includes(descriptor.id))
+    .flatMap((descriptor) =>
+      (descriptor.options ?? []).filter(
+        (choice) =>
+          choice.id !== MODEL_POLICY_OPENCODE_NO_VARIANT &&
+          choice.id !== MODEL_POLICY_ULTRACODE &&
+          !sendsNoEffort(driver, descriptor.id, choice.id),
+      ),
+    );
+  const efforts = [...new Set(choices.map((choice) => choice.id))];
+  const ultracodeByDefault = descriptors.some(
+    (descriptor) => descriptor.id === MODEL_POLICY_ULTRACODE && descriptor.currentValue === true,
+  );
+  if (ultracodeByDefault && efforts.length > 0) {
+    return { efforts: [...efforts, MODEL_POLICY_ULTRACODE], defaultEffort: MODEL_POLICY_ULTRACODE };
+  }
+  const defaultEffort = choices.find((choice) => choice.isDefault === true)?.id;
+  return { efforts, defaultEffort };
 }
 
 /**
@@ -561,15 +607,28 @@ export function checkModelPolicyPick(
   };
 }
 
-/** One row as the refusal lists it. */
+/**
+ * One row as the refusal lists it. A hand-written effort that is the row's driver's no-effort
+ * choice ({@link MODEL_POLICY_NO_EFFORT_CHOICES}, such as Claude's `default`) is left out of the
+ * list and named apart: a pick naming it names no effort, which the row refuses, so the list must
+ * not tell an agent to use it.
+ */
 function modelPolicyRowText(row: ModelPolicyRow): string {
-  const efforts =
-    row.efforts === undefined
-      ? "no effort"
-      : `efforts ${row.efforts.join(", ")}${
-          row.defaultEffort === undefined ? "" : `; default ${row.defaultEffort}`
-        }`;
-  return `${row.driver} ${row.model} (${efforts})`;
+  if (row.efforts === undefined) return `${row.driver} ${row.model} (no effort)`;
+  const effortId = MODEL_POLICY_DRIVER_EFFORT_IDS[row.driver] ?? "";
+  const noEffort = (effort: string) => sendsNoEffort(row.driver, effortId, effort);
+  const usable = row.efforts.filter((effort) => !noEffort(effort));
+  const dropped = row.efforts.filter(noEffort);
+  const list = usable.length === 0 ? "efforts none usable" : `efforts ${usable.join(", ")}`;
+  const defaultText =
+    row.defaultEffort === undefined || noEffort(row.defaultEffort)
+      ? ""
+      : `; default ${row.defaultEffort}`;
+  const droppedText =
+    dropped.length === 0
+      ? ""
+      : `; ${dropped.join(", ")} left out: on ${row.driver} it sends no effort, so a pick naming it is refused`;
+  return `${row.driver} ${row.model} (${list}${defaultText}${droppedText})`;
 }
 
 /** The allowed rows as one line, for a refusal or a note. */

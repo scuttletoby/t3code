@@ -140,6 +140,8 @@ import { resolveThreadActionProjectRef, startNewThreadFromContext } from "../lib
 import { useClientSettings } from "../hooks/useSettings";
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { useLocalStorage } from "../hooks/useLocalStorage";
+import * as ForkRoles from "./fork/calmSidebar/threadRoleMenu"; // Fork (calm sidebar)
+import { useForkCalmSidebar } from "./fork/calmSidebar/useForkCalmSidebar"; // Fork (calm sidebar)
 import { useNowMinute } from "../hooks/useNowMinute";
 import {
   useEnvironmentIdentities,
@@ -1336,6 +1338,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     },
   );
 
+  // Fork (calm sidebar): role rows on top, other threads folded (fork/calmSidebar).
+  const forkCalm = useForkCalmSidebar({ listedThreads, scopedProjectKeys, isSearchingThreads });
   const {
     workingShelfEnabled,
     pinnedThreads,
@@ -1379,6 +1383,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     connectedEnvironmentIds,
     optimisticDrop,
     threads: listedThreads,
+    ...forkCalm.sidebarInput(routeRowThreadKey), // Fork (calm sidebar)
     delegatedUnderParent,
     routeRowThreadKey,
     departingThreadKey,
@@ -2706,6 +2711,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         // Search results also reach threads in collapsed shelves, which are not rendered rows.
         const thread =
           threadByKeyRef.current.get(threadKey) ??
+          forkCalm.roleThread(threadKey) ?? // Fork (calm sidebar): role rows are not in the list
           searchableThreads.find((candidate) => threadShellKey(candidate) === threadKey);
         if (!thread) return;
         const threadWorkspacePath =
@@ -2763,6 +2769,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
               ),
               canTurnIntoProject: canTurnThreadIntoProject(threadRef),
               canRename: !fromSearch,
+              forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)
               supports: {
                 settlement: configLoaded,
                 autoSettleOptOut: supportsAutoSettleOptOut,
@@ -2782,6 +2789,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           !checkThreadOperations([thread], isThreadTriageAction(clicked.value))
         )
           return;
+        if (ForkRoles.runIfThreadRoleMenuAction(threadRef, clicked.value)) return; // Fork (calm sidebar)
         if (clicked.value?.startsWith("snooze:")) {
           const preset =
             clicked.value === "snooze:custom"
@@ -3626,6 +3634,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                     };
                     const from = isContextDrag ? null : (dragState?.activeSection ?? null);
                     const items: ReactNode[] = [
+                      ...forkCalm.topRows(renderThreadRow), // Fork (calm sidebar)
                       <SidebarDraftBlock
                         key="draft-sessions"
                         draftIds={draftIds}

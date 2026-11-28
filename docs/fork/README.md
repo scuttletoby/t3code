@@ -1418,8 +1418,18 @@ Which threads hold a role, for the calm sidebar: the `assistant` thread (or `nul
 `orchestrators` one thread per project (project id to thread id). A role is a pointer in the
 settings, not a tag on the thread, so a project has at most one orchestrator and the roles are a
 setting the person changes ([#138](https://github.com/scuttletoby/t3code/issues/138)). The default,
-no roles, changes nothing. This setting alone shows nothing: the calm sidebar
-(`client.calmSidebarEnabled`) reads it.
+no roles, changes nothing. The thread header shows a badge, Assistant or Orchestrator, on a thread
+that holds a role now; the calm sidebar (`client.calmSidebarEnabled`) puts those threads on top.
+
+**Setting a role.** A thread's menu (the sidebar's and the thread title's) has **Role**: Make
+project orchestrator or Make assistant, Replace (naming the thread that holds it now) when another
+thread does, and Remove role, which clears every pointer to that thread. A pick saves one pointer;
+the menu has no Role for a sub-agent, side chat, delegated task or deleted thread, nor on a
+connection without the right to change settings. A role the thread holds shows checked (and cannot
+be picked again). An archived thread can be given a role from its menu, but the role is paused (no
+role row, no badge) until the thread is unarchived. **Settings → Fork → Calm sidebar** lists the roles
+of the selected environment, each marked when it gives no role now (missing, deleted, archived, a
+sub-agent, or in another project), with Remove for each.
 
 Only the person can change it; agents cannot (the settings tool refuses it as person-only). A save
 that sets a pointer anew is refused unless the thread exists and is not deleted, is a top-level
@@ -1558,7 +1568,22 @@ Turns on the calm sidebar on this device: the threads in `server.threadRoles` go
 other top-level threads fold into one closed group with a count of those waiting for you
 ([#139](https://github.com/scuttletoby/t3code/issues/139)). Off (the default): upstream's sidebar.
 It is a client setting, so each device chooses: calm on a phone, the full list on a desktop. A
-client settings file without it reads as off.
+client settings file without it reads as off. Switch it in **Settings → Fork → Calm sidebar**.
+
+On the web, with it on:
+
+- The role threads come first, under the heading Assistant, then Orchestrator(s), drawn as ordinary
+  rows (their menu, settle and pin work as anywhere). A settled or snoozed role thread stays on top.
+  An archived or deleted one, a sub-agent or a thread moved to another project holds no role.
+- **Other threads (N)** folds every other thread the list would show open (pinned, active,
+  working). Its heading counts them and, when any waits for you (an approval, a question, a
+  sub-agent's request or a guest message), shows "W waiting". A usage-limit stop is not counted: it
+  clears without you. Whether the group is open is kept per device; it starts closed. The open
+  thread is never folded away. Snoozed and settled threads stay in their own sections, which are
+  already folded.
+- No thread holds a role: the list stays as it is, with a hint at the top on how to make one.
+- While a search runs, the calm view steps aside, so the search finds every thread.
+- The project filter applies first: role rows outside it are not shown.
 
 ### `client.ownerQuestionsPage`
 
