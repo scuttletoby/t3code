@@ -14,7 +14,9 @@ import {
   handoffSourceProblem,
   handoffThreadRows,
   parseArgvLines,
+  handoffRolesLabel,
   threadModeProblem,
+  withRolesMode,
   withThreadMode,
 } from "./handoffSettings.logic";
 
@@ -97,5 +99,26 @@ describe("boundHandoffTokens", () => {
   it("matches the server's limit: one token more is refused", () => {
     const empty = fromFile({}).handoff;
     expect(isSavable({ ...empty, sizeTokens: HANDOFF_MAX_TOKENS + 1 })).toBe(false);
+  });
+});
+
+const decodeHandoff = Schema.decodeSync(HandoffSettings);
+const isHandoffSettings = Schema.is(HandoffSettings);
+
+describe("the role threads' mode (HO6)", () => {
+  const base = decodeHandoff({ mode: "off" });
+
+  it("sets the roles mode, and removes it for the mode above, as a save the server takes", () => {
+    const set = withRolesMode(base, "handoff");
+    expect(set.roles).toBe("handoff");
+    expect(isHandoffSettings(set)).toBe(true);
+    const back = withRolesMode(set, "inherit");
+    expect(Object.hasOwn(back, "roles")).toBe(false);
+    expect(back).toEqual(base);
+  });
+
+  it("labels the choice", () => {
+    expect(handoffRolesLabel("inherit")).toBe("Same as above");
+    expect(handoffRolesLabel("handoff")).toBe("Handoff");
   });
 });

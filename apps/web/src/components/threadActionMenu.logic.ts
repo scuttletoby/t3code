@@ -4,6 +4,7 @@ import { msg } from "gt-react";
 
 import { m, type MessageResolver } from "../i18n/messages";
 import * as ForkRoleMenu from "./fork/calmSidebar/threadRoleMenu.logic"; // Fork (calm sidebar)
+import * as ForkHandoffMenu from "./fork/handoff/handoffMenu"; // Fork (HO5)
 
 export type ThreadActionMenuId =
   | ForkRoleMenu.ThreadRoleMenuId // Fork (calm sidebar)
@@ -130,6 +131,7 @@ export interface ThreadActionMenuState {
   /** A No project thread with its own folder, on a server that can promote it. */
   readonly canTurnIntoProject?: boolean;
   readonly forkThreadRole?: ForkRoleMenu.ThreadRoleMenuState | undefined; // Fork (calm sidebar)
+  readonly forkHandoff?: ForkHandoffMenu.HandoffMenuState; // Fork (HO5)
 }
 
 /** Local navigation, read markers, and copying remain available to read-only clients. */
@@ -295,6 +297,7 @@ export function buildThreadActionMenuItems(
         ]
       : []),
     ...ForkRoleMenu.threadRoleMenuItems(state.forkThreadRole), // Fork (calm sidebar)
+    ...ForkHandoffMenu.handOffNowItems(state.forkHandoff, resolve), // Fork (HO5)
     {
       id: "copy",
       label: resolve(msg("Copy", { $context: "submenu of things to copy" })),

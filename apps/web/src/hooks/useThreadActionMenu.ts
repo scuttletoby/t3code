@@ -1,6 +1,7 @@
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { requestCustomSnooze } from "../components/CustomSnoozeDialog";
+import * as ForkHandoffMenu from "../components/fork/handoff/handoffMenu"; // Fork (HO5)
 import { openGuestShareDialog } from "../components/chat/guestShareDialogState";
 import {
   type AtomCommandResult,
@@ -119,6 +120,7 @@ export function useThreadActionMenu(input: {
     onError: (error) => failureToast(m(msg("Failed to copy thread ID")), error),
   });
 
+  const forkHandoff: { state: ForkHandoffMenu.HandoffMenuState } = { state: null }; // Fork (HO5): openMenu fills it
   /** The thread's menu as of now, and a runner for its actions. Null until the thread loads. */
   const readMenu = () => {
     if (threadRef === null) return null;
@@ -155,6 +157,7 @@ export function useThreadActionMenu(input: {
       canShareWithGuest,
       canTurnIntoProject: canTurnThreadIntoProject(threadRef),
       forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)
+      forkHandoff: forkHandoff.state, // Fork (HO5)
     });
     const run = async (action: ThreadActionMenuId) => {
       const api = readLocalApi();
@@ -199,6 +202,8 @@ export function useThreadActionMenu(input: {
         }
       };
       switch (action) {
+        case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)
+          return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)
         case "find":
           onFind?.(threadRef);
           return;
@@ -379,6 +384,9 @@ export function useThreadActionMenu(input: {
     void (async () => {
       const api = readLocalApi();
       if (!api || threadRef === null) return;
+      if (threadRef.environmentId === primaryEnvironmentId)
+        // Fork (HO5): only the app's own server hands off
+        forkHandoff.state = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)
       const menu = readMenu();
       if (!menu) {
         failureToast(

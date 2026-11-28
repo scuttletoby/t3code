@@ -5,6 +5,7 @@ import {
   DEFAULT_HANDOFF_SETTINGS,
   HANDOFF_THREADS_MAX,
   HandoffSettings,
+  holdsThreadRole,
   resolveHandoffSettings,
 } from "./handoff.ts";
 import { FORK_AGENT_WRITABLE_KEYS, FORK_PERSON_ONLY_KEYS } from "./forkSettings.ts";
@@ -14,6 +15,7 @@ import { T3ProjectFile } from "./t3ProjectFile.ts";
 const decodeServer = Schema.decodeUnknownSync(ServerSettings);
 const decodeProject = Schema.decodeUnknownSync(ProjectSettingsOverrides);
 const decodeHandoff = Schema.decodeSync(HandoffSettings);
+const decodeUnknownHandoff = Schema.decodeUnknownSync(HandoffSettings);
 const readFile = (handoff: unknown) =>
   decodeServer(handoff === undefined ? {} : { handoff }).handoff;
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
@@ -111,6 +113,32 @@ describe("handoff settings", () => {
     expect(resolveHandoffSettings(server, project, "t3").mode).toBe("off");
     // A thread id that no longer exists is never read; an inherited key name is no thread.
     expect(resolveHandoffSettings(server, null, "toString").mode).toBe("handoff");
+  });
+
+  it("gives a thread holding a role the roles mode, below its own mode (HO6)", () => {
+    const server = decodeHandoff({ mode: "off", roles: "handoff", threads: { t1: "compact" } });
+    expect(resolveHandoffSettings(server, undefined, "t2", true).mode).toBe("handoff");
+    expect(resolveHandoffSettings(server, undefined, "t2", false).mode).toBe("off");
+    // A thread's own mode still wins.
+    expect(resolveHandoffSettings(server, undefined, "t1", true).mode).toBe("compact");
+    // A project's value replaces the server's whole, `roles` too: not set there, its `mode`.
+    const project = decodeHandoff({ mode: "compact" });
+    expect(resolveHandoffSettings(server, project, "t2", true).mode).toBe("compact");
+    // Old settings without `roles` read as before.
+    expect(DEFAULT_HANDOFF_SETTINGS.roles).toBeUndefined();
+    expect(() => decodeUnknownHandoff({ roles: "sometimes" })).toThrow();
+  });
+
+  it("knows the assistant and a project's own orchestrator as holding a role (HO6)", () => {
+    const roles = { assistant: "t-assistant", orchestrators: { "p-1": "t-orch" } };
+    expect(holdsThreadRole(roles, { id: "t-assistant", projectId: "p-9" })).toBe(true);
+    expect(holdsThreadRole(roles, { id: "t-orch", projectId: "p-1" })).toBe(true);
+    // Another project's orchestrator pointer is no role here; nor an inherited key name.
+    expect(holdsThreadRole(roles, { id: "t-orch", projectId: "p-2" })).toBe(false);
+    expect(holdsThreadRole(roles, { id: "t-other", projectId: "toString" })).toBe(false);
+    expect(
+      holdsThreadRole({ assistant: null, orchestrators: {} }, { id: "t", projectId: "p" }),
+    ).toBe(false);
   });
 
   it("takes the command from the person's settings only, never an agent or a repository file", () => {

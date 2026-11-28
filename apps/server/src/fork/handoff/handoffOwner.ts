@@ -7,6 +7,7 @@ import {
   type ModelSelection,
   type OrchestrationV2ServerCommand,
   type ProjectId,
+  holdsThreadRole,
   type ProviderInstanceId,
   resolveHandoffSettings,
   resolveProjectProviderInstanceEnabled,
@@ -21,9 +22,12 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 
-/** A thread's handoff settings and mode: its project's override, else the server's. */
+/**
+ * A thread's handoff settings and mode: its project's override, else the server's; a thread that
+ * holds a role (HO6) takes the settings' `roles` mode unless it has its own.
+ */
 const threadHandoffSettings = (
-  current: Pick<ServerSettingsValue, "handoff" | "projectSettingsOverrides">,
+  current: Pick<ServerSettingsValue, "handoff" | "projectSettingsOverrides" | "threadRoles">,
   projectId: ProjectId,
   threadId: ThreadId,
 ): ReturnType<typeof resolveHandoffSettings> =>
@@ -33,6 +37,7 @@ const threadHandoffSettings = (
       ? current.projectSettingsOverrides[projectId]?.handoff
       : undefined,
     threadId,
+    holdsThreadRole(current.threadRoles, { id: threadId, projectId }),
   );
 
 /** Why a handoff cannot run: its provider instance is turned off for the project, or not there. */
@@ -47,7 +52,10 @@ export type HandoffBlocked = {
  * the project (upstream's rule) and registered (upstream's lookup, where a send to it fails).
  */
 export const threadHandoff = Effect.fn("HandoffOwner.threadHandoff")(function* (
-  current: Pick<ServerSettingsValue, "handoff" | "projectSettingsOverrides" | "providerInstances">,
+  current: Pick<
+    ServerSettingsValue,
+    "handoff" | "projectSettingsOverrides" | "providerInstances" | "threadRoles"
+  >,
   thread: {
     readonly id: ThreadId;
     readonly projectId: ProjectId;

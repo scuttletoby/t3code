@@ -35,6 +35,23 @@ export const HANDOFF_MODE_OPTIONS: ReadonlyArray<{
 export const handoffModeLabel = (mode: HandoffMode) =>
   HANDOFF_MODE_OPTIONS.find((option) => option.value === mode)?.label ?? mode;
 
+/** The roles row's choice: a mode, or `inherit` (no `roles`: the mode above decides). */
+export type HandoffRolesChoice = HandoffMode | "inherit";
+
+export const HANDOFF_ROLES_INHERIT_LABEL = "Same as above";
+
+export const handoffRolesLabel = (choice: HandoffRolesChoice) =>
+  choice === "inherit" ? HANDOFF_ROLES_INHERIT_LABEL : handoffModeLabel(choice);
+
+/** The whole new value with the roles mode set, or removed with `inherit`. */
+export function withRolesMode(
+  settings: HandoffSettings,
+  choice: HandoffRolesChoice,
+): HandoffSettings {
+  const { roles: _old, ...rest } = settings;
+  return choice === "inherit" ? rest : { ...rest, roles: choice };
+}
+
 /**
  * A typed handoff size as the server's save takes it: between the minimum and the server's limit,
  * so the field never offers a value the save refuses. `allowZero` keeps the idle size's 0 (never).

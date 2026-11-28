@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FiberMap from "effect/FiberMap";
 import * as FiberSet from "effect/FiberSet";
+import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
@@ -42,7 +43,13 @@ import {
   handoffWriteTimedOut,
 } from "./handoffAgent.ts";
 import * as HandoffCommand from "./handoffCommand.ts";
-import { HANDOFF_IDLE_LEAD_MS, type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
+import {
+  HANDOFF_IDLE_LEAD_MS,
+  type HandoffBlocker,
+  type HandoffSkipReason,
+  type HandoffTrigger,
+  handoffDecision,
+} from "./handoffDecision.ts";
 import { leaveLine } from "../agentSlotRoutes.ts";
 import {
   dispatchHandoff,
@@ -144,6 +151,28 @@ function withoutWriteTurns(
 const waitsForSlot = (outcome: unknown): outcome is HandoffWaitsForSlot =>
   typeof outcome === "object" && outcome !== null && "type" in outcome;
 
+/**
+ * The answer to a person's "Hand off now" (design 4.5): `started`, or why not now. `wait` names
+ * what the thread waits on; nothing is queued, so a busy thread is asked again once it is quiet.
+ */
+export type HandoffAskAnswer =
+  | { readonly kind: "off" }
+  | { readonly kind: "started" }
+  | { readonly kind: "skip"; readonly reason: HandoffSkipReason }
+  | { readonly kind: "wait"; readonly blockers: ReadonlyArray<HandoffBlocker> };
+
+/** A thread's handoff for the thread menu and the "handoff waiting on" chip. */
+export interface HandoffThreadState {
+  /** The thread's resolved mode is `handoff` and it can run. */
+  readonly on: boolean;
+  /** The last provider turn's size; null when unknown. */
+  readonly usedTokens: number | null;
+  /** What "Hand off now" would answer now, without starting anything. */
+  readonly ask: HandoffAskAnswer;
+  /** What a due handoff waits on now; empty when none waits. In memory: a restart clears it. */
+  readonly waitingOn: ReadonlyArray<HandoffBlocker>;
+}
+
 export const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -166,9 +195,29 @@ export const make = Effect.gen(function* () {
           ? Effect.provideService(provided, SlotGate.SlotGate, gate.value)
           : provided,
     );
+  // Keyed by thread: a newer finished run (or a person's "Hand off now") replaces the waiting one.
+  // In memory: a restart drops it.
+  const timers = yield* FiberMap.make<ThreadId>();
+  // Per thread, the loop that owns the entry (a replaced loop's late clean-up leaves a newer one):
+  // what a due handoff waits on (the chip), and the run a loop is handing off now (settle onward).
+  const waitingOn = new Map<
+    ThreadId,
+    { readonly loop: object; readonly blockers: ReadonlyArray<HandoffBlocker> }
+  >();
+  const handingOff = new Map<ThreadId, { readonly loop: object; readonly runId: string }>();
+  // The run a person's press is handing off, from the press until its loop ends.
+  const pressed = new Map<ThreadId, { readonly loop: object; readonly runId: string }>();
+  const clearMarks = (threadId: ThreadId, loop: object) => {
+    if (waitingOn.get(threadId)?.loop === loop) waitingOn.delete(threadId);
+    if (handingOff.get(threadId)?.loop === loop) handingOff.delete(threadId);
+  };
+  const ownsRun = (threadId: ThreadId, runId: string) =>
+    handingOff.get(threadId)?.runId === runId || pressed.get(threadId)?.runId === runId;
   const logSlotWait = (threadId: ThreadId, outcome: HandoffWaitsForSlot) =>
     Effect.logInfo("handoff waits for an agent slot", { threadId, detail: outcome.detail });
 
+  // The cause last logged for a thread whose handoff cannot run; cleared when it can again.
+  const blockedLogged = new Map<ThreadId, string>();
   const readThread = Effect.fn("HandoffService.readThread")(function* (threadId: ThreadId) {
     const current = yield* serverSettings.getSettings;
     const thread = yield* projections.getThread(threadId);
@@ -179,11 +228,17 @@ export const make = Effect.gen(function* () {
     if (resolved.mode !== "handoff") return null;
     // Same rule as the compaction wrapper (handoffOwner.ts): a handoff that cannot run sends
     // nothing, and idle compaction covers the thread instead. Read again at every step.
+    if (blocked === null) blockedLogged.delete(threadId);
     if (blocked !== null) {
-      yield* Effect.logWarning("handoff cannot run; idle compaction covers this thread", {
-        threadId,
-        ...blocked,
-      });
+      // Once per thread and cause: the menu and the chip read it too, at each open and change.
+      const key = `${blocked.instanceId}\n${blocked.reason}`;
+      if (blockedLogged.get(threadId) !== key) {
+        blockedLogged.set(threadId, key);
+        yield* Effect.logWarning("handoff cannot run; idle compaction covers this thread", {
+          threadId,
+          ...blocked,
+        });
+      }
       return null;
     }
     return { ...resolved, records: yield* withStores(readHandoffRecords(threadId)) };
@@ -622,9 +677,14 @@ export const make = Effect.gen(function* () {
   });
 
   const handOffLoop = Effect.fn("HandoffService.handOffWhenDue")(
-    function* (threadId: ThreadId, sourceRunId: RunId, waiting: Waiting) {
+    function* (
+      threadId: ThreadId,
+      sourceRunId: RunId,
+      waiting: Waiting,
+      firstTrigger: "turn-end" | "asked",
+    ) {
       let runId = sourceRunId;
-      let trigger: HandoffTrigger = "turn-end";
+      let trigger: HandoffTrigger = firstTrigger;
       let slotWaitLogged = false;
       // The `command` source's result for one handoff (its ids and command): a slot wait reuses it.
       let commandRun:
@@ -697,6 +757,8 @@ export const make = Effect.gen(function* () {
         if (decision.kind !== "handoff") yield* endSettle;
         // Not due now: it needs no slot, so it holds no place from the waiters behind it.
         if (decision.kind !== "handoff") yield* leavePlace(waiting);
+        clearMarks(threadId, waiting);
+        if (decision.kind === "handoff") handingOff.set(threadId, { loop: waiting, runId });
         if (decision.kind === "skip") return;
         if (decision.kind === "sleep") {
           yield* Effect.sleep(Duration.millis(decision.untilMs - nowMs));
@@ -704,6 +766,15 @@ export const make = Effect.gen(function* () {
           continue;
         }
         if (decision.kind === "wait") {
+          // A person's press is not queued: busy again before it sent, the press ends and the
+          // loop goes on as the turn end's it replaced (its wait, then its idle handoff). The
+          // person may ask again.
+          if (trigger === "asked") {
+            trigger = "turn-end";
+            if (pressed.get(threadId)?.loop === waiting) pressed.delete(threadId);
+            continue;
+          }
+          waitingOn.set(threadId, { loop: waiting, blockers: decision.blockers });
           yield* Effect.logInfo("handoff waiting", { threadId, blockers: decision.blockers });
           // Read again when the thread changes: the work ending decides, not only the next turn.
           yield* Deferred.await(wake);
@@ -848,11 +919,110 @@ export const make = Effect.gen(function* () {
       ),
   );
 
-  /** Replaced by a newer run's timer, or stopped: its place in the line goes with it. */
-  const handOffWhenDue = (threadId: ThreadId, sourceRunId: RunId) => {
+  /** Replaced by a newer run's timer, or stopped: its place in the line and its marks go with it. */
+  const handOffWhenDue = (
+    threadId: ThreadId,
+    sourceRunId: RunId,
+    trigger: "turn-end" | "asked" = "turn-end",
+  ) => {
     const waiting: Waiting = { key: undefined };
-    return handOffLoop(threadId, sourceRunId, waiting).pipe(Effect.ensuring(leavePlace(waiting)));
+    const marked = Effect.sync(() => {
+      if (trigger === "asked") pressed.set(threadId, { loop: waiting, runId: sourceRunId });
+    });
+    // `FiberMap.run` puts a fiber in the map only at its first pause. Pause before the first read
+    // (which can resume a press's fiber): else that press finds no timer, and this late install
+    // interrupts it. The press's mark comes first: a late update of the pressed run must find it.
+    return Effect.andThen(
+      Effect.andThen(marked, Effect.yieldNow),
+      handOffLoop(threadId, sourceRunId, waiting, trigger),
+    ).pipe(
+      Effect.ensuring(
+        Effect.andThen(
+          leavePlace(waiting),
+          Effect.sync(() => {
+            clearMarks(threadId, waiting);
+            // Only here: the loop clears its other marks at each decision, and a late update
+            // between two decisions must still find the press.
+            if (pressed.get(threadId)?.loop === waiting) pressed.delete(threadId);
+          }),
+        ),
+      ),
+      // The whole timer, its clean-up too (the loop's own span ends before it).
+      Effect.withSpan("HandoffService.handOffTimer"),
+    );
   };
+
+  /** The decision for the thread's latest run, as a person's press would ask it; null when off. */
+  const askDecision = Effect.fn("HandoffService.askDecision")(function* (threadId: ThreadId) {
+    const read = yield* readThread(threadId);
+    if (read === null) return null;
+    const facts = handoffThreadFacts(read.records);
+    const runId = facts.lastRun?.id;
+    const decision =
+      runId === undefined
+        ? ({ kind: "skip", reason: "no-runs" } as const)
+        : handoffDecision({
+            ...facts,
+            trigger: "asked",
+            runId,
+            threadId,
+            mode: read.mode,
+            source: read.settings.source,
+            sizeTokens: read.settings.sizeTokens,
+            idleTokens: read.settings.idleTokens,
+            nowMs: DateTime.toEpochMillis(yield* DateTime.now),
+          });
+    return { runId, decision, usedTokens: facts.usedTokens };
+  });
+
+  const toAnswer = (
+    decision: NonNullable<Effect.Success<ReturnType<typeof askDecision>>>["decision"],
+  ): HandoffAskAnswer =>
+    decision.kind === "skip"
+      ? { kind: "skip", reason: decision.reason }
+      : decision.kind === "wait"
+        ? { kind: "wait", blockers: decision.blockers }
+        : { kind: "started" };
+
+  /**
+   * A person's "Hand off now": the same decision, check, settle and ids as a turn end's, so a
+   * second press or a turn end at the same time sends one handoff. Not quiet now: answers what it
+   * waits on, and starts nothing.
+   */
+  const ask = Effect.fn("HandoffService.ask")(function* (threadId: ThreadId) {
+    const asked = yield* askDecision(threadId);
+    if (asked === null) return { kind: "off" } as const satisfies HandoffAskAnswer;
+    const answer = toAnswer(asked.decision);
+    if (answer.kind !== "started" || asked.runId === undefined) return answer;
+    // A loop already handing this run off (settling or sending), or an earlier press, is left to finish.
+    if (!ownsRun(threadId, asked.runId)) {
+      yield* FiberMap.run(
+        timers,
+        threadId,
+        handOffWhenDue(threadId, asked.runId as RunId, "asked"),
+      );
+    }
+    return answer;
+  });
+
+  /** The thread's handoff for the thread menu and the chip; off for a thread it cannot read. */
+  const threadState = Effect.fn("HandoffService.threadState")(function* (threadId: ThreadId) {
+    const asked = yield* askDecision(threadId);
+    if (asked === null) {
+      return { on: false, usedTokens: null, ask: { kind: "off" }, waitingOn: [] } as const;
+    }
+    const size = asked.usedTokens;
+    return {
+      on: true,
+      usedTokens: size !== undefined && Number.isFinite(size) ? size : null,
+      // A thread handing off now answers `started`: a press leaves it to finish.
+      ask:
+        asked.runId !== undefined && ownsRun(threadId, asked.runId)
+          ? { kind: "started" }
+          : toAnswer(asked.decision),
+      waitingOn: waitingOn.get(threadId)?.blockers ?? [],
+    } satisfies HandoffThreadState;
+  });
 
   /** A handoff run that ended: keep the thread read, or send the same text once more if it failed. */
   const handoffRunEnded = Effect.fn("HandoffService.handoffRunEnded")(
@@ -951,8 +1121,6 @@ export const make = Effect.gen(function* () {
   );
 
   const start = Effect.fn("HandoffService.start")(function* () {
-    // Keyed by thread: a newer finished run replaces the waiting one. In memory: a restart drops it.
-    const timers = yield* FiberMap.make<ThreadId>();
     // Off the event stream: a dispatch from inside its handler would wait on the stream itself.
     const followUps = yield* FiberSet.make();
     yield* forkParked(
@@ -1003,19 +1171,35 @@ export const make = Effect.gen(function* () {
             );
             return;
           }
-          if (run.status === "completed") {
+          // A late update of a run a person pressed for would replace the press's loop with a
+          // turn end's, which skips a thread under the size backstop; a newer run still replaces
+          // it. A turn end's own loop is replaced as before: the new one carries its handoff on.
+          if (run.status === "completed" && pressed.get(event.threadId)?.runId !== run.id) {
             yield* FiberMap.run(timers, event.threadId, handOffWhenDue(event.threadId, run.id));
           }
         }),
       ),
     );
   });
-  return { start };
+  return { start, ask, threadState };
 });
 
+/** The running handoff service: a person's "Hand off now" and a thread's state (fork/handoff/handoffRoutes.ts). */
+export class HandoffService extends Context.Service<
+  HandoffService,
+  {
+    readonly ask: Effect.Success<typeof make>["ask"];
+    readonly threadState: Effect.Success<typeof make>["threadState"];
+  }
+>()("t3/fork/handoff/HandoffService") {}
+
 /** Started with the server's other workers, from `ForkLayers.layerRuntimeServices` (fork/forkLayers.ts). */
-export const layer = Layer.effectDiscard(
-  make.pipe(Effect.flatMap((service) => service.start())),
+export const layer = Layer.effect(
+  HandoffService,
+  make.pipe(
+    Effect.tap((service) => service.start()),
+    Effect.map(({ ask, threadState }) => HandoffService.of({ ask, threadState })),
+  ),
 ).pipe(
   Layer.provide(HandoffCommand.layer),
   Layer.provide(ProjectionStore.layer),

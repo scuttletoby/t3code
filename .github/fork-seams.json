@@ -427,15 +427,15 @@
         "import * as ForkRoleMenu from \"./fork/calmSidebar/threadRoleMenu.logic\"; // Fork (calm sidebar)",
         "| ForkRoleMenu.ThreadRoleMenuId // Fork (calm sidebar)",
         "readonly forkThreadRole?: ForkRoleMenu.ThreadRoleMenuState | undefined; // Fork (calm sidebar)",
-        "...ForkRoleMenu.threadRoleMenuItems(state.forkThreadRole), // Fork (calm sidebar)"
+        "...ForkRoleMenu.threadRoleMenuItems(state.forkThreadRole), // Fork (calm sidebar)",
+        "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
+        "readonly forkHandoff?: ForkHandoffMenu.HandoffMenuState; // Fork (HO5)",
+        "...ForkHandoffMenu.handOffNowItems(state.forkHandoff, resolve), // Fork (HO5)"
       ],
       "announced": {
         "since": "2026-11-27",
         "added": [
-          "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
           "| typeof ForkHandoffMenu.HAND_OFF_NOW; // Fork (HO5)",
-          "readonly forkHandoff?: ForkHandoffMenu.HandoffMenuState; // Fork (HO5)",
-          "...ForkHandoffMenu.handOffNowItems(state.forkHandoff, resolve), // Fork (HO5)",
           "import * as ForkMcpMenu from \"./fork/mcpProfile/threadMcpProfile.logic\"; // Fork (MCP profile)",
           "| ForkMcpMenu.McpProfileMenuId // Fork (MCP profile)",
           "readonly forkMcpProfile?: ForkMcpMenu.McpProfileMenuState | undefined; // Fork (MCP profile)",
@@ -448,19 +448,19 @@
       "added": [
         "import * as ForkRoles from \"../components/fork/calmSidebar/threadRoleMenu\"; // Fork (calm sidebar)",
         "forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)",
-        "if (ForkRoles.runIfThreadRoleMenuAction(threadRef, action)) return; // Fork (calm sidebar)"
+        "if (ForkRoles.runIfThreadRoleMenuAction(threadRef, action)) return; // Fork (calm sidebar)",
+        "import * as ForkHandoffMenu from \"../components/fork/handoff/handoffMenu\"; // Fork (HO5)",
+        "const forkHandoff: { state: ForkHandoffMenu.HandoffMenuState } = { state: null }; // Fork (HO5): openMenu fills it",
+        "forkHandoff: forkHandoff.state, // Fork (HO5)",
+        "forkHandoff.state = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
+        "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
+        "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
+        "if (threadRef.environmentId === primaryEnvironmentId)",
+        "// Fork (HO5): only the app's own server hands off"
       ],
       "announced": {
         "since": "2026-11-28",
         "added": [
-          "import * as ForkHandoffMenu from \"../components/fork/handoff/handoffMenu\"; // Fork (HO5)",
-          "const forkHandoff: { state: ForkHandoffMenu.HandoffMenuState } = { state: null }; // Fork (HO5): openMenu fills it",
-          "forkHandoff: forkHandoff.state, // Fork (HO5)",
-          "if (threadRef.environmentId === primaryEnvironmentId)",
-          "// Fork (HO5): only the app's own server hands off",
-          "forkHandoff.state = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
-          "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
-          "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
           "import * as ForkMcp from \"../components/fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
           "forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)",
           "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, action)) return; // Fork (MCP profile)"
@@ -478,16 +478,16 @@
         "forkCalm.roleThread(threadKey) ?? // Fork (calm sidebar): role rows are not in the list",
         "forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)",
         "if (ForkRoles.runIfThreadRoleMenuAction(threadRef, clicked.value)) return; // Fork (calm sidebar)",
-        "...forkCalm.topRows(renderThreadRow), // Fork (calm sidebar)"
+        "...forkCalm.topRows(renderThreadRow), // Fork (calm sidebar)",
+        "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
+        "const forkHandoff = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
+        "forkHandoff, // Fork (HO5)",
+        "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
+        "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)"
       ],
       "announced": {
         "since": "2026-11-27",
         "added": [
-          "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
-          "const forkHandoff = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
-          "forkHandoff, // Fork (HO5)",
-          "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
-          "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
           "import * as ForkMcp from \"./fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
           "forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)",
           "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, clicked.value)) return; // Fork (MCP profile)"
@@ -511,17 +511,12 @@
         "import { useForkNoEffortItems } from \"./fork/modelPolicy/useForkNoEffortItems\"; // Fork (model policy)",
         "const forkNoEffortItems = useForkNoEffortItems(routeThreadRef); // Fork (model policy)",
         "...forkNoEffortItems, // Fork (model policy)",
-        "...forkNoEffortItems, // Fork (model policy)"
-      ],
-      "announced": {
-        "since": "2026-11-28",
-        "added": [
-          "import { useForkHandoffWaitingItems } from \"./fork/handoff/useForkHandoffWaitingItems\"; // Fork (HO5)",
-          "const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)",
-          "...forkHandoffWaitingItems, // Fork (HO5)",
-          "...forkHandoffWaitingItems, // Fork (HO5)"
-        ]
-      }
+        "...forkNoEffortItems, // Fork (model policy)",
+        "import { useForkHandoffWaitingItems } from \"./fork/handoff/useForkHandoffWaitingItems\"; // Fork (HO5)",
+        "const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)",
+        "...forkHandoffWaitingItems, // Fork (HO5)",
+        "...forkHandoffWaitingItems, // Fork (HO5)"
+      ]
     },
     "apps/web/src/components/chat/TimelineUserMessageRow.tsx": {
       "why": "A handoff's first message shows the handoff divider in place of \"New session\" (handoff, HO5): a scope around upstream's fresh-session row tells that row which message it is (fork/handoff/handoffDivider.tsx). JSX children cannot end in a // comment, so a JSX comment line marks the two tags.",
