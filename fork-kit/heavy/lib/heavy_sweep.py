@@ -32,7 +32,7 @@ section, an unknown key or a newer version: nothing is checked or stopped, the r
 `heavy leftovers` uses the defaults when the file or the section is not there (it only looks), and refuses a
 broken one like the sweep.
 """
-import contextlib, datetime, fcntl, fnmatch, importlib.machinery, importlib.util, json, os, re, shlex, signal, stat
+import contextlib, datetime, fcntl, fnmatch, json, os, re, shlex, signal, stat
 import pwd, subprocess, sys, tempfile, time
 
 KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -95,20 +95,12 @@ TOKEN_SHAPE = re.compile(r'(gh[pousr]_|github_pat_|glpat-|xox[abposr]-|sk-|AKIA|
                          r'[A-Za-z0-9+/_=.-]{32,}')
 
 
-def _load_machine_file():
-    """fork-kit/common/machine_file.py: in the version folder once installed, next to the kit in the repository."""
-    for folder in (os.path.join(KIT, 'common'), os.path.join(os.path.dirname(KIT), 'common')):
-        path = os.path.join(folder, 'machine_file.py')
-        if os.path.isfile(path):
-            loader = importlib.machinery.SourceFileLoader('fork_kit_machine_file', path)
-            spec = importlib.util.spec_from_loader('fork_kit_machine_file', loader)
-            mod = importlib.util.module_from_spec(spec)
-            loader.exec_module(mod)
-            return mod
-    raise ImportError('fork-kit/common/machine_file.py not found next to the heavy kit')
+_LIB = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [] if _LIB in sys.path else [_LIB]
+import kit_load  # noqa: E402  (the kit's one loader, #800 item 5)
 
-
-machine_file = _load_machine_file()
+# fork-kit/common/machine_file.py: in the version folder once installed, next to the kit in the repository
+machine_file = kit_load.load('fork_kit_machine_file', 'common/machine_file.py', __file__)
 MachineFileError = machine_file.MachineFileError
 
 

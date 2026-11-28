@@ -50,7 +50,7 @@ interval, so a kind with short spikes should get a start value above its spikes.
 Settings: the optional "queue" object in the machine file's "heavy" section (fork-kit/common/README.md); without
 the file or the key, the defaults below hold. Standard library only.
 """
-import datetime, errno, fcntl, importlib.machinery, importlib.util, json, math, os, re, signal, stat, sys, time
+import datetime, errno, fcntl, json, math, os, re, signal, stat, sys, time
 
 KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 VERSION = 1
@@ -76,20 +76,12 @@ CAPACITY_SECONDS = 7        # one `heavy facts` answer (heavy_facts.ANSWER_SECON
                             # 2) under the queue lock
 
 
-def _load_machine_file():
-    """fork-kit/common/machine_file.py: in the version folder once installed, next to the kit in the repository."""
-    for folder in (os.path.join(KIT, 'common'), os.path.join(os.path.dirname(KIT), 'common')):
-        path = os.path.join(folder, 'machine_file.py')
-        if os.path.isfile(path):
-            loader = importlib.machinery.SourceFileLoader('fork_kit_machine_file', path)
-            spec = importlib.util.spec_from_loader('fork_kit_machine_file', loader)
-            mod = importlib.util.module_from_spec(spec)
-            loader.exec_module(mod)
-            return mod
-    raise ImportError('fork-kit/common/machine_file.py not found next to the heavy kit')
+_LIB = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [] if _LIB in sys.path else [_LIB]
+import kit_load  # noqa: E402  (the kit's one loader, #800 item 5)
 
-
-machine_file = _load_machine_file()
+# fork-kit/common/machine_file.py: in the version folder once installed, next to the kit in the repository
+machine_file = kit_load.load('fork_kit_machine_file', 'common/machine_file.py', __file__)
 
 
 def _at_least(low, high=None):

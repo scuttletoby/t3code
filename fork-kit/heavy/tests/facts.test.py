@@ -478,6 +478,88 @@ class Ledger(Case):
         self.assertEqual((code, d['tier']), (75, 'basic'))
         self.assertTrue(any('user 4000000002 has a session' in n for n in d['notes']), d['notes'])
 
+    def test_a_folder_the_machine_file_names_holds_a_person_s_reservations_when_their_home_is_closed(self):
+        # #844, #800 item 2: a CI runner's user cannot read the owner's home (750 is a common default), so the
+        # machine tier was "never free" there. The owner names an open folder in heavy.capacity.reserveDirs; it is
+        # read for that person in place of their home's, by every caller.
+        uid = 4000000001
+        self.m.write('/etc/login.defs', 'UID_MIN 1000\nUID_MAX 4294967294\n')
+        self.m.write('/etc/passwd', f'owner:x:{uid}:{uid}::/home/owner:/bin/sh\nme:x:{UID}:{UID}::/home/me:/bin/sh\n')
+        os.chmod(self.m.root + '/etc', 0o755)
+        game = os.path.join(self.tmp, 'game')
+        closed = self.m.root + '/home/owner/.config/t3-capacity/reserve.d'
+        self.m.write('/home/owner/.config/t3-capacity/reserve.d/game.conf', f'1536 {game}/\n')
+        listed = '/var/lib/t3-capacity/owner/reserve.d'
+        self.m.write(listed + '/game.conf', f'1536 {game}/\n')
+        os.makedirs(self.m.root + OTHER)
+        shutil.rmtree(self.m.root + MANAGER)        # the machine tier: a caller with no user manager
+        if os.geteuid() != 0:                       # root reads every folder: no closed home to show
+            os.chmod(closed, 0)
+            self.addCleanup(os.chmod, closed, 0o755)
+            code, d = self.facts('--mb', '64', '--fresh')
+            self.assertEqual((code, d['tier']), (75, 'basic'), 'before: a closed home is never free')
+        dirs = [{'user': 'owner', 'dir': listed}]
+        self.machine_file({'version': 1, 'heavy': {'capacity': {'reserveDirs': dirs}}})
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.m.cache)                 # other settings start "elevated" (#945): a first call here
+        os.makedirs(game)
+        code, d = self.facts('--mb', '64', '--fresh')
+        self.assertEqual((code, d['tier']), (0, 'machine'), (d.get('reason'), d['notes']))
+        self.assertEqual([(r['name'], r['mb']) for r in d['reservations']], [('owner:game', 1536)])
+        self.assertEqual(d['memory']['holdMb'], 1536)
+        self.assertFalse([n for n in d['notes'] if 'cannot be read' in n], d['notes'])
+        code, d = self.facts('--mb', str(d['memory']['freeMb'] + 1), '--fresh', cwd=game)
+        self.assertEqual(code, 0, 'a caller working in the reserved folder is the work it is kept for')
+        os.unlink(self.m.root + listed + '/game.conf')   # the folder is the person's: their home's is not read
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['holdMb'], 0)
+        shutil.rmtree(self.m.root + '/var/lib/t3-capacity/owner')   # not there (yet): nothing held, still machine
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[:1], (0,))
+        self.m.write(listed + '/game.conf', f'1536 {game}/\n')
+        if os.geteuid() != 0:                       # a named folder others cannot read: never free, as a home
+            os.chmod(self.m.root + listed, 0)
+            code, d = self.facts('--mb', '64', '--fresh')
+            os.chmod(self.m.root + listed, 0o755)
+            self.assertEqual((code, d['tier']), (75, 'basic'))
+            self.assertTrue(any('reservations of user owner cannot be read' in n for n in d['notes']), d['notes'])
+        # a name not in the password database: its folder still holds, with a note
+        self.machine_file({'version': 1, 'heavy': {'capacity': {'reserveDirs': [{'user': 'ghost', 'dir': listed}]}}})
+        os.chmod(closed, 0o755)
+        code, d = self.facts('--mb', '64', '--fresh')
+        self.assertEqual(sorted(r['name'] for r in d['reservations']), ['ghost:game', 'owner:game'], d['notes'])
+        self.assertIn('reserveDirs: user ghost is not known here: its reservations hold for everyone', d['notes'])
+
+    def test_the_caller_s_own_folder_in_the_machine_file_is_its_own_and_read_once(self):
+        # #844: the owner's own calls see their named folder as their own (a caller inside it is not held back), and
+        # a folder that is also their T3_CAPACITY_RESERVE_DIR is read once
+        game = os.path.join(self.tmp, 'game')
+        listed = '/srv/t3-capacity/me/reserve.d'      # in the fake machine
+        self.m.write(listed + '/game.conf', f'1536 {game}/\n')
+        os.makedirs(game)
+        self.machine_file({'version': 1, 'heavy': {'capacity': {
+            'reserveDirs': [{'user': hf.user_name(), 'dir': listed}]}}})
+        code, d = self.facts('--mb', '64', '--fresh')
+        self.assertEqual([(r['name'], r['mb'], r['own']) for r in d['reservations']], [('game', 1536, False)])
+        self.assertEqual(d['memory']['holdMb'], 1536)
+        code, d = self.facts('--mb', '64', '--fresh', cwd=game)
+        self.assertEqual([r['own'] for r in d['reservations']], [True])
+        code, d = self.facts('--mb', '64', '--fresh', env={'T3_CAPACITY_RESERVE_DIR': self.m.root + listed})
+        self.assertEqual([r['name'] for r in d['reservations']], ['game'], 'read once, not twice')
+
+    def test_reserve_dirs_that_are_broken_are_refused(self):
+        good = {'user': 'owner', 'dir': '/var/lib/t3-capacity/owner/reserve.d'}
+        self.machine_file({'version': 1, 'heavy': {'capacity': {'reserveDirs': [good]}}})
+        self.assertEqual(self.facts('--fresh')[0], 0)
+        for bad in ([dict(good, dir='relative/reserve.d')], [dict(good, dir='/a/../b')], [dict(good, dir='/')],
+                    [dict(good, dir='/a/')], [dict(good, dir='/a//b')], [dict(good, user='bad name')],
+                    [dict(good, user='')], [{'user': 'owner'}], [dict(good, more=1)], [good, good],
+                    [dict(good, user=f'u{i}') for i in range(9)], 'not a list'):
+            with self.subTest(bad=bad):
+                self.machine_file({'version': 1, 'heavy': {'capacity': {'reserveDirs': bad}}})
+                self.assertEqual(self.facts('--fresh'), (1, None))
+        self.machine_file({'version': 1, 'heavy': {'capacity': {
+            'reserveDirs': [dict(good, user=f'u{i}') for i in range(8)]}}})
+        self.assertEqual(self.facts('--fresh')[0], 0, 'at most 8')
+
     def test_a_home_behind_an_automount_is_read_only_for_a_person_with_a_session(self):
         # #951: the machine tier read every passwd home on every call, so an autofs /home mounted them all; a home
         # behind a trigger that is not mounted is read only while its person has a session (then it is mounted)
@@ -1059,6 +1141,61 @@ class Holds(Case):
         self.assertEqual(code, 0, out)
         self.assertIn('available=10192MB', out.splitlines()[0])
         self.assertEqual(out.splitlines()[1], 'reservations: ci-slice:4096MB(using 2000,holding 2096)')
+
+    def light(self, uid, anon_mb, limit=str(2048 * MB)):
+        """A "CI light" slice in user uid's own manager, using anon_mb (#949)."""
+        folder = f'/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/ci-light.slice'
+        self.m.write(folder + '/memory.stat', f'anon {anon_mb * MB}\nshmem 0\n')
+        self.m.write(folder + '/memory.max', f'{limit}\n')
+        self.m.write(folder + '/run-light.scope/memory.stat', f'anon {anon_mb * MB}\nshmem 0\n')   # the step
+        return folder[len('/sys/fs/cgroup/'):]
+
+    def test_a_slice_in_a_user_manager_holds_its_room_while_it_is_busy(self):
+        # #949: while a light step runs, every caller (its own user's builds too) keeps what the slice can still grow
+        # to, not just what it uses now
+        other = int(OTHER.split('user@')[1].split('.')[0])
+        for uid in (other, UID):
+            with self.subTest(uid=uid):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self.m.cache)         # other settings start "elevated" (#945): a first call here
+                cgroup = self.light(uid, 1500)
+                self.holds({'label': 'ci-light', 'cgroup': cgroup})
+                code, d, held = self.held()
+                self.assertEqual((code, held), (0, {'ci-light': (2048, 1500)}), d and d['notes'])
+                self.assertEqual(d['memory']['holdMb'], 2048 - 1500)
+                self.assertEqual(d['memory']['owedMb'], 0, 'its step is not a heavy job: counted once, as the hold')
+                self.light(uid, 500)                # idle (at most inUseFromMb, 1024): holds nothing
+                self.assertEqual(self.held()[2], {})
+                self.light(uid, 1500)
+                code, out, _ = self.cli([T3CAP, '64'])   # t3-capacity, the callers' command, names it
+                self.assertEqual(code, 0, out)
+                self.assertEqual(out.splitlines()[1], 'reservations: ci-light:2048MB(using 1500,holding 548)')
+                self.holds({'label': 'ci-light', 'cgroup': cgroup, 'users': [hf.user_name()]})
+                self.assertEqual(self.held()[2], {}, 'users still leaves a hold\'s own users out')
+                shutil.rmtree(self.m.root + '/sys/fs/cgroup/' + cgroup)
+        shutil.rmtree(self.m.root + MANAGER)        # the machine tier (a CI runner's user) holds it too
+        os.unlink(self.m.cache)
+        cgroup = self.light(other, 1500)
+        self.holds({'label': 'ci-light', 'cgroup': cgroup})
+        code, d, held = self.held()
+        self.assertEqual((d['tier'], held), ('machine', {'ci-light': (2048, 1500)}), d['notes'])
+
+    def test_a_user_manager_hold_that_would_count_jobs_or_agents_twice_is_refused(self):
+        # #949: only a slice in a user's own manager, and never heavy's slice or app.slice (agents), around or in them
+        m = f'user.slice/user-{UID}.slice/user@{UID}.service'
+        for cgroup in (f'{m}/heavy.slice', f'{m}/heavy.slice/x.slice', f'{m}/app.slice',
+                       f'{m}/app-t3code.slice', f'user.slice/user-{UID}.slice/user@1.service/x.slice',
+                       f'{m}/x.scope', f'{m}/x.slice/y.scope', f'user.slice/user-{UID}.slice', m, 'user.slice'):
+            with self.subTest(cgroup=cgroup):
+                self.holds({'label': 'light', 'cgroup': cgroup})
+                self.assertEqual(self.facts('--fresh'), (1, None))
+        self.holds({'label': 'light', 'cgroup': f'{m}/heavy-light.slice'})   # shares heavy's first letters only
+        self.assertEqual(self.facts('--fresh')[0], 0)
+        self.holds({'label': 'light', 'cgroup': f'{m}/ci.slice/ci-light.slice'})
+        self.assertEqual(self.facts('--fresh')[0], 0)
+        with mock.patch.object(hf, 'ROOT', self.m.root):   # heavy's own check before a job refuses it the same way
+            self.holds({'label': 'light', 'cgroup': f'{m}/heavy.slice'})
+            self.assertIn('heavy\'s slice heavy.slice', hf.ready(hq, 'heavy.slice') or '')
 
     def test_the_example_machine_file_is_accepted(self):
         with open(os.path.join(os.path.dirname(KIT), 'common', 'machine.example.json')) as f:
@@ -2301,6 +2438,45 @@ class OneRule(unittest.TestCase):
         with mock.patch.object(os, 'lstat', side_effect=PermissionError(13, 'denied')):
             self.assertEqual((heavy.others_can_swap('/parent/home'), sweep.others_can_swap('/parent/home')),
                              (True, True))
+
+
+class OneLoader(unittest.TestCase):
+    """#800 item 5: the kit's files load each other through one loader, lib/kit_load.py."""
+
+    def test_no_kit_file_has_a_loader_of_its_own(self):
+        own = []
+        for folder in ('bin', 'lib', 'sbin'):
+            for name in sorted(os.listdir(os.path.join(KIT, folder))):
+                path = os.path.join(KIT, folder, name)
+                if not os.path.isfile(path) or (folder, name) == ('lib', 'kit_load.py'):
+                    continue
+                with open(path, encoding='utf-8') as f:
+                    text = f.read()
+                own += [f'{folder}/{name}: {w}' for w in ('SourceFileLoader', 'spec_from_file_location',
+                                                          'exec_module') if w in text]
+        self.assertEqual(own, [])
+
+    def test_the_installer_ships_the_loader(self):
+        loader = importlib.machinery.SourceFileLoader('heavy_install', os.path.join(KIT, 'sbin', 'heavy-install'))
+        m = importlib.util.module_from_spec(importlib.util.spec_from_loader('heavy_install', loader))
+        loader.exec_module(m)
+        self.assertIn('lib/kit_load.py', m.SOURCE_FILES)
+
+    def test_a_copy_of_the_kit_loads_its_own_files(self):
+        # the loader is shared through sys.modules (the first kit's), so it must load beside the asking file
+        tmp = tempfile.mkdtemp(prefix='kit-copy-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        for part in ('heavy', 'common'):
+            shutil.copytree(os.path.join(os.path.dirname(KIT), part), os.path.join(tmp, part),
+                            ignore=shutil.ignore_patterns('tests', '__pycache__'))
+        copy = load_module('heavy_queue_copy', os.path.join(tmp, 'heavy', 'lib', 'heavy_queue.py'))
+        self.assertEqual(os.path.realpath(copy.machine_file.__file__),
+                         os.path.realpath(os.path.join(tmp, 'common', 'machine_file.py')))
+        self.assertEqual(os.path.realpath(hq.machine_file.__file__),
+                         os.path.realpath(os.path.join(os.path.dirname(KIT), 'common', 'machine_file.py')))
+        os.unlink(os.path.join(tmp, 'common', 'machine_file.py'))    # gone from the copy: never the other kit's
+        with self.assertRaises(ImportError):
+            load_module('heavy_queue_copy2', os.path.join(tmp, 'heavy', 'lib', 'heavy_queue.py'))
 
 
 class RedCheck(Case):

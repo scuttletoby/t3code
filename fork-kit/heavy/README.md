@@ -591,7 +591,8 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   jobs of its own, every user's are counted as usual, and so are other people's reservations (`tier: "machine"`, a
   note, and the reason says "machine-wide numbers"). Its limits:
   - It reads only each person's default `~/.config/t3-capacity/reserve.d`, not a `T3_CAPACITY_RESERVE_DIR` they
-    set for themselves.
+    set for themselves, unless the machine file names their folder (`heavy.capacity.reserveDirs`, #844: then that
+    folder in place of the home's, which is how a home closed to others is read).
   - It reads the people of `/etc/passwd` with a UID from `UID_MIN` to `UID_MAX`, and anyone with a `user.slice`
     session. Not read: root and system users (below `UID_MIN`), people known only through NSS (LDAP, sssd) who have
     no session now, homes that are `/` or not absolute, and, for a person with no session now, a home behind an
@@ -635,7 +636,8 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   lines hold nothing and give a note. Every person's reservations count in the full tier too (as in the machine
   tier, above), so one person's reservation holds against another person's work; in the full tier one that cannot
   be read (a home closed to others, as most are by default) is a note, not "never free": make
-  `~/.config/t3-capacity/reserve.d` and the folders above it readable to others for it to be seen.
+  `~/.config/t3-capacity/reserve.d` and the folders above it readable to others for it to be seen, or the owner
+  names an open folder for them in `heavy.capacity.reserveDirs` (below).
 - **Holds (machine file):** a cgroup outside the user managers, such as a CI runners' slice, is not in the ledger.
   `heavy.capacity.holds` names such cgroups; one that uses more than `inUseFromMb` (anon + shmem + swap) keeps its
   budget (its `memory.max`, or `budgetMb` when it has none) less the RAM it uses (anon + shmem: `memory.max` limits
@@ -738,8 +740,9 @@ for one and not for the other. A machine with the kit from before the swap trend
   `until=` date, its `ttl=` or `idle=` time, or until the line is removed. A writer that stopped renewing its file
   (killed, crashed) leaves a line with `ttl=` that ends by itself; one without it holds until it is removed.
 - **Machine file** missing, or without `heavy` or `capacity`: no holds. Broken (not JSON, an unknown key, a wrong
-  value, a `user.slice` cgroup, a label twice, a cgroup in or the same as another hold's, more than 8 holds,
-  writable by others): `heavy facts` gives no answer, so
+  value, a `user.slice` cgroup that is not a slice in a user manager or that is heavy's slice or `app.slice`, a
+  label twice, a cgroup in or the same as another hold's, more than 8 holds, a `reserveDirs` folder that is not
+  absolute, a user there twice, more than 8 of them, writable by others): `heavy facts` gives no answer, so
   `t3-capacity` says `NOT OK` naming the key. A changed file is read again at once (the cache key holds it).
 
 ### Settings: the machine file's `heavy.disk`
@@ -764,21 +767,47 @@ Optional, in `/etc/fork-kit/machine.json` (`fork-kit/common/README.md`):
 ```json
 "heavy": {
   "capacity": {
-    "holds": [{ "label": "ci-slice", "cgroup": "ci.slice/ci-runners.slice", "users": ["ci-*"] }]
+    "holds": [
+      { "label": "ci-slice", "cgroup": "ci.slice/ci-runners.slice", "users": ["ci-*"] },
+      { "label": "ci-light", "cgroup": "user.slice/user-1000.slice/user@1000.service/ci-light.slice" }
+    ],
+    "reserveDirs": [{ "user": "owner", "dir": "/var/lib/t3-capacity/owner/reserve.d" }]
   }
 }
 ```
 
-| Key in a hold | Default  | What                                                                             |
-| ------------- | -------- | -------------------------------------------------------------------------------- |
-| `label`       | required | the name in `reservations:` (lower-case letters, digits, `_ . -`; at most 40)    |
-| `cgroup`      | required | its folder below the cgroup root; never below `user.slice` (counted already)     |
-| `inUseFromMb` | 1024     | held only while it uses more than this                                           |
-| `budgetMb`    | 6144     | its budget when its `memory.max` is `max`, cannot be read or is not there        |
-| `users`       | `[]`     | user name patterns (`fnmatch`) whose own budget it is: never held back from them |
+| Key in a hold | Default  | What                                                                                |
+| ------------- | -------- | ----------------------------------------------------------------------------------- |
+| `label`       | required | the name in `reservations:` (lower-case letters, digits, `_ . -`; at most 40)       |
+| `cgroup`      | required | its folder below the cgroup root; below `user.slice` only a slice in a user manager |
+| `inUseFromMb` | 1024     | held only while it uses more than this                                              |
+| `budgetMb`    | 6144     | its budget when its `memory.max` is `max`, cannot be read or is not there           |
+| `users`       | `[]`     | user name patterns (`fnmatch`) whose own budget it is: never held back from them    |
 
 At most 8 holds, none in another's cgroup (it would hold the same room twice). The sweep and the queue accept the
 `capacity` key and leave it to `heavy facts`.
+
+**A slice in a user's own manager (#949)**, such as a "CI light" slice for small tooling steps
+(`user.slice/user-<uid>.slice/user@<uid>.service/<name>.slice`, the same uid twice, slices only below the manager):
+while it uses more than `inUseFromMb` it holds what it can still grow to (its `MemoryMax` less the RAM it uses) for
+every caller, its own user's builds too, so a build cannot start while a light step is small and then grow with it.
+Leave its own user out with `users` if their callers are the light steps themselves. The rest of `user.slice` is
+the ledger's: heavy's slice, a slice in, on or around it, and `app.slice` / `app-*.slice` (where T3's agents run)
+are refused, since their jobs and agents are counted already. A `t3code-*.scope` run inside the held slice would be
+counted twice (as an agent and in the hold): the strict side. Set its size with the slice's own `MemoryMax=` (a unit
+in the user's `~/.config/systemd/user/`); without one, `budgetMb`.
+
+**`reserveDirs` (#844, #800 item 2):** a person's reservations in a folder others can read, for hosts whose homes
+are closed to others (mode 750 or 700, Ubuntu's default). For that person (`user`, a name) the folder `dir`
+(absolute) is read in place of their home's `~/.config/t3-capacity/reserve.d`, by every caller and in every tier but
+basic: a CI runner's user without a user manager then keeps the room the owner reserved and stays in the machine
+tier instead of "never free". The owner's tools write their reservation files there (`T3_CAPACITY_RESERVE_DIR` set
+to it, or both); the owner's own calls read it as their own (a caller working inside a reserved folder is not held
+back), once when it is also their `T3_CAPACITY_RESERVE_DIR`. Make the folder and the ones above it readable to
+others, and writable only by the owner: a file in it holds as that person's, whoever wrote it (only ever more
+room held). Not there: nothing held. There but not readable: never free in the machine tier, as a closed home was.
+A user name not in the password database: its folder holds for every caller, with a note. At most 8, one per
+user.
 
 ## Settings
 
@@ -872,6 +901,10 @@ a plain copy back (`heavy --self-check` says the link differs and warns about th
   refuses and names the file; remove it, or run with `--no-sweep-timer`.
 - **Rollback past `heavy.capacity`:** remove the `capacity` key from the machine file's `heavy` section first; a
   release from before it refuses the whole section (as below).
+- **Rollback past user-manager holds and `reserveDirs` (#949, #844):** remove those holds and the `reserveDirs`
+  key first: an older `heavy facts` refuses a `user.slice` hold and an unknown key, and then gives no answer
+  (`t3-capacity` NOT OK naming the key). The reservation files in a `reserveDirs` folder are then not read by
+  older releases.
 - **Rollback past the memory queue:** remove the `queue` key from the machine file's `heavy` section first. A
   release from before the queue does not know it: its sweep refuses the whole machine file and says which key. That
   release cannot be changed from here, so the order is the guard: key out, then the older release.

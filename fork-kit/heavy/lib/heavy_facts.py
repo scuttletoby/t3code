@@ -36,6 +36,9 @@ already, so it is counted once, #923). A process counts toward one reservation o
 then the first by name), and a piece's debt is split over its processes by their use, so no debt is taken off two
 reservations (#945). It does not hold back a caller whose working folder is in it; past its until date or ttl, or
 broken, it holds nothing (a note says so). Every person's readable reservations count in the full tier too (#800).
+The machine file's heavy.capacity.reserveDirs (#844) names a folder others can read for a person whose home they
+cannot: it is read for that person in place of their home's, and by that person as their own. Its holds
+(held_cgroups) are cgroups outside the user managers, or a slice in a user's own manager (#949).
 
 Readings are kept 5 seconds in /run/user/<uid>/heavy-facts-v<version>-<hash of the settings>.json, one file per
 version and settings, so callers of one user with other settings (slice, queue, reservations folder) or another
@@ -70,6 +73,7 @@ KIND_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,59}\Z')
 USER_RE = re.compile(r'^user-([0-9]{1,10})\.slice\Z')
 HOLD_LABEL_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,39}\Z')
 CG_PART_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\Z')
+MANAGER_HOLD_RE = re.compile(r'^user\.slice/user-([0-9]{1,10})\.slice/user@([0-9]{1,10})\.service/[^/]')
 CACHE_FILE_RE = re.compile(r'^heavy-facts(-v[0-9]{1,4}-[0-9a-f]{16})?\.json\Z')   # an older kit's: heavy-facts.json
 CACHE_KEYS = {'v', 'key', 'atMs', 'tier', 'facts', 'boxPsi', 'reservations', 'learned', 'carry', 'notes', 'load1',
               'cpu', 'queue', 'pressure'}
@@ -392,8 +396,11 @@ def on_autofs(home, mounts):
     return deepest is not None and deepest[1] == 'autofs'
 
 
-def other_reserve_dirs(uid):
-    """For the machine tier (#844): every other person's reserve.d, ([(user name, uid, folder)], blind, notes). The
+def other_reserve_dirs(uid, listed=None):
+    """For the machine tier (#844): every other person's reserve.d, ([(user name, uid, folder)], blind, notes).
+    listed: {user name: folder} of the machine file's heavy.capacity.reserveDirs (#844): that folder is read for that
+    person in place of their home's (a home closed to others then needs no opening), also for a person without a
+    home or session here (uid -1 when the name is not known). The
     people are the /etc/passwd entries in login_range() and every user.slice user in it; a user with a session but no
     home that can be found is 'blind'. Root and system users are not read (their homes are closed to others). A
     person without a session whose home is behind an automount trigger is not read (#951: each read would mount
@@ -427,10 +434,14 @@ def other_reserve_dirs(uid):
             homes[u] = (pw.pw_name, pw.pw_dir)
         except KeyError:
             blind.append(f'user {u} has a session but no home that can be found: its reservations cannot be read')
+    listed = dict(listed or {})
     mounts, note = autofs_points() if sessions is not None else ([], None)
     notes += [note] if note else []
     out, skipped = [], []
     for u, (n, h) in sorted(homes.items()):
+        if n in listed:
+            out.append((n, u, ROOT + listed.pop(n)))
+            continue
         if not os.path.isabs(h) or h == '/':
             continue
         if mounts and u not in sessions and on_autofs(os.path.normpath(h), mounts):
@@ -440,6 +451,14 @@ def other_reserve_dirs(uid):
     if skipped:
         notes.append(f'reservations not read for {len(skipped)} people without a session whose home is not mounted '
                      f'(autofs): {", ".join(skipped[:5])}{" ..." if len(skipped) > 5 else ""}')
+    for n, folder in sorted(listed.items()):        # named in the machine file, not a person read above
+        try:
+            u = pwd.getpwnam(n).pw_uid
+        except KeyError:
+            u = -1
+            notes.append(f'reserveDirs: user {n} is not known here: its reservations hold for everyone')
+        if u != uid:
+            out.append((n, u, ROOT + folder))
     return out, blind, notes
 
 
@@ -608,8 +627,21 @@ def _hold_cgroup(value):
     if len(parts) > 16 or any(p in ('.', '..') or not CG_PART_RE.match(p) for p in parts):
         return 'must be a folder below the cgroup root, like "ci.slice/ci-runners.slice"'
     if parts[0] == 'user.slice':
-        return 'is below user.slice, whose heavy jobs and agents are counted already (it would count them twice)'
+        # #949: a slice in a user's own systemd manager (a "CI light" slice for small tooling steps) may be held; the
+        # rest of user.slice is the ledger's (heavy jobs and agents), which would be counted twice
+        m = MANAGER_HOLD_RE.match(value)
+        if not m or m.group(1) != m.group(2) or not all(p.endswith('.slice') for p in parts[3:]):
+            return ('below user.slice only a slice in a user manager, like '
+                    '"user.slice/user-1000.slice/user@1000.service/ci-light.slice": the rest of user.slice is '
+                    'counted already (heavy jobs and agents: it would count them twice)')
+        if parts[3] == 'app.slice' or parts[3].startswith('app-'):
+            return 'is in app.slice, where T3\'s agents run and are counted already (it would count them twice)'
     return None
+
+
+def _manager_slice(cgroup):
+    """The slice path inside its user manager of a user-manager hold (#949), or None for another hold."""
+    return '/'.join(cgroup.split('/')[3:]) if MANAGER_HOLD_RE.match(cgroup) else None
 
 
 def _users(value):
@@ -630,17 +662,34 @@ def hold_spec(required):
 
 
 MAX_HOLDS = 8
+MAX_RESERVE_DIRS = 8
+USER_NAME_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}\Z')
 
 
-def capacity_settings(mf, section_spec, path=None, owner_uid=0):
+def _reserve_dir(value):
+    parts = value.split('/')
+    ok = (value.startswith('/') and value != '/' and len(value) <= 512 and not value.endswith('/')
+          and all(p not in ('.', '..') for p in parts[1:]) and '' not in parts[1:])
+    return None if ok else 'must be an absolute folder, like "/var/lib/t3-capacity/owner/reserve.d"'
+
+
+def reserve_dir_spec(required):
+    """One entry of heavy.capacity.reserveDirs (#844): the folder that holds one person's reservations."""
+    return {'user': (str, required, lambda v: None if USER_NAME_RE.match(v) else 'must be a user name'),
+            'dir': (str, required, _reserve_dir)}
+
+
+def capacity_settings(mf, section_spec, path=None, owner_uid=0, heavy_slice=None):
     """heavy.capacity of the machine file (mf: fork-kit/common/machine_file.py): {'holds': [...]}. A missing file,
-    section or key is no holds; anything broken raises mf.MachineFileError naming the key."""
+    section or key is no holds; anything broken raises mf.MachineFileError naming the key. heavy_slice: heavy's
+    slice, whose jobs are counted already, so a user-manager hold (#949) in, on or around it is refused."""
     where = path or mf.default_path()
     section = mf.read_section('heavy', path, owner_uid, optional=True)
     if section is None:
-        return {'holds': []}
+        return {'holds': [], 'reserveDirs': []}
     section = mf.fields(section, section_spec, f'{where}: heavy')
-    cap = mf.fields(section.get('capacity') or {}, {'holds': (list, [], None)}, f'{where}: heavy.capacity')
+    cap = mf.fields(section.get('capacity') or {}, {'holds': (list, [], None), 'reserveDirs': (list, [], None)},
+                    f'{where}: heavy.capacity')
     if len(cap['holds']) > MAX_HOLDS:
         raise mf.MachineFileError(f'{where}: heavy.capacity.holds: at most {MAX_HOLDS}')
     spec = hold_spec(mf.REQUIRED)
@@ -654,8 +703,23 @@ def capacity_settings(mf, section_spec, path=None, owner_uid=0):
             if (b + '/').startswith(a + '/'):
                 raise mf.MachineFileError(f'{where}: heavy.capacity.holds[{i}]: cgroup {h["cgroup"]!r} is in or the '
                                           f'same as {o["cgroup"]!r} of hold {o["label"]!r} (held twice)')
+        inner = _manager_slice(h['cgroup'])
+        if inner and heavy_slice:
+            short, long = sorted((inner, slice_path(heavy_slice)), key=len)
+            if (long + '/').startswith(short + '/'):
+                raise mf.MachineFileError(f'{where}: heavy.capacity.holds[{i}]: cgroup {h["cgroup"]!r} is in, on or '
+                                          f'around heavy\'s slice {heavy_slice}, whose jobs are counted already '
+                                          f'(held twice)')
         holds.append(h)
-    return {'holds': holds}
+    if len(cap['reserveDirs']) > MAX_RESERVE_DIRS:
+        raise mf.MachineFileError(f'{where}: heavy.capacity.reserveDirs: at most {MAX_RESERVE_DIRS}')
+    dirs, spec = [], reserve_dir_spec(mf.REQUIRED)
+    for i, d in enumerate(cap['reserveDirs']):
+        d = mf.fields(d, spec, f'{where}: heavy.capacity.reserveDirs[{i}]')
+        if any(d['user'] == o['user'] for o in dirs):
+            raise mf.MachineFileError(f'{where}: heavy.capacity.reserveDirs[{i}]: user {d["user"]!r} is there twice')
+        dirs.append(d)
+    return {'holds': holds, 'reserveDirs': dirs}
 
 
 DISK_FLOOR_GB = 25     # #982: below this much free disk on the work filesystem t3-capacity says NOT OK
@@ -718,8 +782,10 @@ def user_name():
 
 
 def held_cgroups(host, holds, user):
-    """The machine file's holds: a cgroup outside the user managers (a CI runners' slice, say) that is in use keeps
-    its budget less what it uses, as a reservation, for every user but its own (`users`). ([reservation], notes)"""
+    """The machine file's holds: a cgroup outside the user managers (a CI runners' slice, say), or a slice in a user's
+    own manager (#949: a "CI light" slice), that is in use keeps its budget less what it uses, as a reservation, for
+    every user but its own (`users`; a user-manager slice holds for its own user too unless `users` names them, so
+    that user's builds keep its room). ([reservation], notes)"""
     out, notes = [], []
     for h in holds:
         if any(fnmatch.fnmatchcase(user, g) for g in h['users']):
@@ -1004,13 +1070,24 @@ def read_machine(rule, where, carry, now):
         return cr.cost_of(rule, ask_kind(rule, kind), learned, None)['mb']
     res, more, _ = reservation_files(where['reserveDir'], now, size=size)
     notes += more
+    listed = {d['user']: d['dir'] for d in where.get('reserveDirs', ())}
+    if where['user'] in listed:
+        # #844: the caller's own folder in the machine file is its too (unless it is the one just read)
+        try:
+            again = os.path.samefile(ROOT + listed[where['user']], where['reserveDir'])
+        except OSError:
+            again = False
+        if not again:
+            more_res, more, _ = reservation_files(ROOT + listed[where['user']], now, size=size)
+            res += more_res
+            notes += more
     if tier != 'basic':
         # #945: a caller with no user manager is often another user (a CI runner, root), whose own reserve.d is not
         # the owner's: read every person's, so it never takes the room they keep. One it cannot read: never free.
         # #800: the full tier reads them too, so one person's reservation holds against every other person's work;
         # there one it cannot read (a home closed to others, as most are by default) is a note, as before #800 it
         # was not read at all: a person who wants it seen makes ~/.config/t3-capacity/reserve.d readable to others.
-        dirs, blind, more = other_reserve_dirs(uid)
+        dirs, blind, more = other_reserve_dirs(uid, listed)
         notes += more
         for more_res, more, cannot in read_homes(dirs, now, size):
             res += more_res
@@ -1597,11 +1674,13 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
                      os.path.expanduser('~'), '.config', 't3-capacity', 'reserve.d')}
         # the machine file: under HEAVY_FACTS_ROOT too (tests: a fake machine, which also fakes all of /proc and /sys)
         mf = hq.machine_file
-        where['holds'] = capacity_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None,
-                                           os.getuid() if ROOT else 0)['holds']
+        settings = capacity_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None,
+                                     os.getuid() if ROOT else 0, slice_name)
+        where['holds'], where['reserveDirs'] = settings['holds'], settings['reserveDirs']
         where['user'] = user_name()
         where['key'] = '\n'.join((slice_name, where['queueDir'], where['reserveDir'], where['user'],
-                                  json.dumps(where['holds'], sort_keys=True)))
+                                  json.dumps(where['holds'], sort_keys=True),
+                                  json.dumps(where['reserveDirs'], sort_keys=True)))
         given = os.environ.get('HEAVY_FACTS_CACHE')
         if given:
             name = os.path.basename(given)
@@ -1704,7 +1783,8 @@ def ready(hq, slice_name=None):
     try:
         cr.shipped_rule()
         mf = hq.machine_file
-        capacity_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None, os.getuid() if ROOT else 0)
+        capacity_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None, os.getuid() if ROOT else 0,
+                          slice_name)
     except Exception as e:
         return f'{e.__class__.__name__}: {e}'
     uid = os.getuid()
@@ -1729,17 +1809,14 @@ def ready(hq, slice_name=None):
     return None
 
 
+_LIB = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [] if _LIB in sys.path else [_LIB]
+import kit_load  # noqa: E402  (the kit's one loader, #800 item 5)
+
+
 def load(name, rel):
-    """A kit file: in the installed version folder, or next to the kit in the repository (fork-kit/<rel>)."""
-    import importlib.machinery, importlib.util
-    kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    for path in (os.path.join(kit, rel), os.path.join(os.path.dirname(kit), rel)):
-        if os.path.isfile(path):
-            loader = importlib.machinery.SourceFileLoader(name, path)
-            mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
-            loader.exec_module(mod)
-            return mod
-    raise ImportError(f'{rel} not found in {kit} or next to it')
+    """A kit file of this kit (kit_load.load: the installed version folder, or next to the kit in the repository)."""
+    return kit_load.load(name, rel, __file__)
 
 
 cr = load('capacity_rule', 'lib/capacity_rule.py')
