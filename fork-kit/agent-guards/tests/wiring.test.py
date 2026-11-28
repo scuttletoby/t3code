@@ -213,7 +213,7 @@ class Check(unittest.TestCase):
     def test_the_kit_entries_pass(self):
         code, lines = self.run_check(self.settings)
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 20, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 21, '\n'.join(lines))
         self.assertEqual(lines[-1], 'check: test settings: OK')
         # lens A nit: the hooks ran with HOME in check's own temporary folder; nothing (log, cache, state) is
         # written in the caller's HOME

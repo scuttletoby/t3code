@@ -673,10 +673,11 @@ journalctl -u t3code-fleet-dispatcher -n 20      # each runner it starts or skip
 #    its Tailscale (100.64.0.0/10) address, its Docker bridges. check-net refuses a target the host itself does not
 #    reach (its refusal inside would prove nothing): if a listener just closed, run it again. Expect "ok" on every
 #    line and exit 0. Run it again after any network change on the host, and whenever a new service listens.
-#    It also proves, inside, that this host's own public address is refused, that AF_VSOCK, io_uring and 32-bit
-#    system calls are closed, that only the pseudo devices are there, only the allowed mounts, none that receives
-#    the host's later mounts, nothing in /mnt and /media, and no socket of the host's ("host:" lines first say which
-#    of these this host has outside: where it has none, the refusal inside shows nothing there).
+#    It also proves, inside, that this host's own public address is refused (by the nft table alone, in a probe
+#    without it in IPAddressDeny; a job's own unit drops it unanswered before the table), that AF_VSOCK, io_uring
+#    and 32-bit system calls are closed, that only the pseudo devices are there, only the allowed mounts, none that
+#    receives the host's later mounts, nothing in /mnt and /media, and no socket of the host's ("host:" lines first
+#    say which of these this host has outside: where it has none, the refusal inside shows nothing there).
 mapfile -t addrs < <(ip -4 -o addr show | awk '{ sub("/.*", "", $4); print $4 }')
 mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
     n = split($4, hp, ":"); h = hp[1]; p = hp[n]; sub(/%.*/, "", h)

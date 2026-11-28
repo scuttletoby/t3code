@@ -1,0 +1,5 @@
+- Change: A weekly check that the repository's interaction limit never lapses.
+- Why: Outsiders cannot post while the limit holds.
+- Setting: none
+- Default: always
+- PR: [#30](https://github.com/scuttletoby/t3code/pull/30)

@@ -3,7 +3,7 @@
  * and caches of link_pull_request and watch_pull_request) and judges with `judgePrChecks`. The
  * settle rule's "seen" head is kept in memory only: after a restart it takes two fresh reads.
  */
-import type { PullRequestRef } from "@t3tools/contracts";
+import type { OrchestrationProjectShell, PullRequestRef } from "@t3tools/contracts";
 import { WaitPrSpec } from "@t3tools/contracts/waitFor";
 import { type Judgement, judgePrChecks, type PrSeen } from "@t3tools/shared/waitFor";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
@@ -32,13 +32,14 @@ const clip = (text: string) =>
   text.length > MESSAGE_MAX ? `${text.slice(0, MESSAGE_MAX - 1)}…` : text;
 
 /**
- * wait_for's own words for a target it cannot build (link_pull_request's say "pass url", a field
- * wait_for does not have). Each comes from the project's remote: it refuses a new wait, but for a
- * stored one it is a failed read, retried and reported after the error grace, since a remote can
- * be changed back and a remote lookup that timed out reads as none.
+ * wait_for's own words for a target it cannot build (never "pass url": wait_for has no such
+ * field). A new wait is refused; a stored one is a failed read, retried until the error grace.
+ * Without a remote, only when no pin and no project of T3 with that repository gives the host.
  */
-const NO_REMOTE =
-  "This thread's project has no remote on a pull request host T3 knows, so the host to read is unknown. Wait from a thread whose project's remote is on the pull request's host.";
+const NO_REMOTE_PREFIX = "This thread's project has no remote on a pull request host T3 knows";
+const NO_REMOTE = `${NO_REMOTE_PREFIX}, so the pull request's host is unknown. Name its repository (owner/repo) if a project in T3 has it as its remote, or wait from a thread whose project's remote is on the pull request's host.`;
+const noProjectWith = (repository: string) =>
+  `${NO_REMOTE_PREFIX}, and no project in T3 has ${repository} as its remote, so the host to read is unknown. Wait from a thread whose project's remote is on the pull request's host, or add a project with that remote to T3.`;
 const NO_REPOSITORY =
   "T3 cannot tell this project's repository from its remote. Name the pull request's repository.";
 const NO_URL_SHAPE =
@@ -103,6 +104,28 @@ export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
   const projects = yield* ProjectService.ProjectService;
   const enrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
   const pullRequests = yield* PullRequestService.PullRequestService;
+  /**
+   * A project of T3 whose remote is `repository` (on `host` when given), with its remote looked up
+   * (cached); null when none is. Read only for a wait whose own project has no remote.
+   */
+  const projectWithRemote = Effect.fn("WaitPrJudge.projectWithRemote")(function* (
+    repository: string,
+    host: string | undefined,
+  ) {
+    const shells = yield* projects.listShells().pipe(Effect.orElseSucceed(() => []));
+    const wanted = repository.toLowerCase();
+    for (const candidate of shells) {
+      const identity =
+        candidate.repositoryIdentity ??
+        (yield* enrichment.readRepositoryIdentity(candidate.workspaceRoot));
+      if (identity == null) continue;
+      if (sourceControlDefinitions.repositorySelector(identity)?.toLowerCase() !== wanted) continue;
+      const projectHost = sourceControlDefinitions.changeRequestHost(identity, identity.provider);
+      if (host !== undefined && projectHost?.toLowerCase() !== host.toLowerCase()) continue;
+      return { ...candidate, repositoryIdentity: identity };
+    }
+    return null;
+  });
   /** The settle rule's memory, by pull request: it is about the head, not about one wait. */
   const seenByPr = new Map<string, { readonly seen: PrSeen; readonly at: number }>();
 
@@ -133,9 +156,27 @@ export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
       yield* enrichment.refreshRepositoryIdentity(shell.workspaceRoot);
       identity = yield* enrichment.readRepositoryIdentity(shell.workspaceRoot);
     }
-    if (identity === null) return remoteProblem(NO_REMOTE, registering);
-    const withRemote = { ...shell, repositoryIdentity: identity };
-    const repository = spec.repository ?? sourceControlDefinitions.repositorySelector(identity);
+    // Without a remote here, the host comes from what T3 holds: another project whose remote is
+    // the named repository, else the host the wait pinned at its first read. Only reading local
+    // state: the pull request is read through any project on its host (PullRequestService).
+    let withRemote: OrchestrationProjectShell;
+    if (identity !== null) {
+      withRemote = { ...shell, repositoryIdentity: identity };
+    } else {
+      const elsewhere =
+        spec.repository === undefined ? null : yield* projectWithRemote(spec.repository, spec.host);
+      if (elsewhere !== null) withRemote = elsewhere;
+      else if (spec.repository !== undefined && spec.host !== undefined) withRemote = shell;
+      else {
+        return remoteProblem(
+          spec.repository === undefined ? NO_REMOTE : noProjectWith(spec.repository),
+          registering,
+        );
+      }
+    }
+    const repository =
+      spec.repository ??
+      (identity === null ? null : sourceControlDefinitions.repositorySelector(identity));
     if (repository === null) return remoteProblem(NO_REPOSITORY, registering);
     // A wait keeps the host and repository of its first read: a later remote change (a
     // fork's remote flipped to upstream) must not end it from another pull request's number.
