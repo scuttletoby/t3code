@@ -48,7 +48,11 @@ How it reads a command (by parsing, not by pattern):
      command that also runs a word the guard cannot read is refused: `echo '<the command>' | at now`,
      `cp x.txt run.sh && bash run.sh`, `curl -q -X PUT "$(cat url.txt)"`.
   6. It answers in time: the hook has a 10 s limit and a hook that is not done by then does not stop the
-     command, so 5 s after the hook process started the guard refuses the command itself. Before that:
+     command, so 5 s after the hook process started the guard stops reading. It then skims the command (the skim,
+     below decide_text): refused when the command or a file it names holds a guard word (a guarded token, gh, an
+     HTTP client, `workflow`, `disable`, claude/codex, a refuseScripts line) or the skim runs out of its 2 s too,
+     passed otherwise, answered by 8 s at the latest. Shell text past MAX_COMMANDS (10,000) commands in one call
+     is skimmed the same way instead of parsed (a 2 MB script took 4 s on an idle machine). Before that:
        - fast exit: a command of plain words that cannot name or run anything guarded (ls, git status, cat a > b,
          grep ..: quick_pass() below) passes before any file is read and whatever the clock says;
        - cache: what it learns from files (a code file names a token or not, a `#!` line, the gh aliases) is kept
@@ -96,7 +100,7 @@ Refused:
     filters (`sort f | bash`, `nl f | cut -f2 | bash`), or a program that runs the lines it reads (awk system() or
     a pipe to a command, perl/ruby system/qx); writes by sed -f / awk -f scripts and rsync count as copies
   - a GraphQL call whose query (or a field name that can be `query`) the guard cannot read
-  - a command the guard cannot finish reading in time
+  - a command the guard cannot finish reading in time, when the skim finds a guard word in it or a file it names
 Passes: reads (GET), gh workflow enable/list/view/run, PUT .../enable, searching and writing text about all this
 (rg/grep, notes, commit messages, issue and PR bodies through gh), and every command that names no guarded token.
 A file that is byte for byte this guard is not read as a script (running or testing the guard is no attack).
@@ -303,7 +307,8 @@ PREFIX = 'Refused by actions-disable-guard: '
 
 
 def reason(what, hint=''):
-    return f'{PREFIX}{what}. {hint + " " if hint else ""}{RULE}'
+    """The refusal: what was refused and why, what to do instead, then the owner rule."""
+    return f'{PREFIX}{what}. {"What to do instead: " + hint + " " if hint else ""}{RULE}'
 
 
 class Slow(BaseException):
@@ -314,9 +319,10 @@ def out_of_time(*_):
     raise Slow()
 
 
+SLOW_HINT = ('If it does not switch anything off, run it as smaller Bash calls (the part that calls gh or an HTTP '
+             'client on its own); tell the owner if this repeats.')
 SLOW = reason(f'the guard could not finish reading this command and the scripts it runs within {BUDGET:g} s of '
-              'its start, so it refuses (a hook that runs out of time would let the command through unread)',
-              'Run it as smaller commands; tell the owner if this repeats.')
+              'its start, so it refuses (a hook that runs out of time would let the command through unread)', SLOW_HINT)
 
 
 def process_age():
@@ -922,16 +928,35 @@ def quote(tok):
     return "'" + tok.replace("'", "'\\''") + "'"
 
 
+ASSIGN_RE = re.compile(r'^[A-Za-z_]\w*(\[[^\]]*\])?=')
+DUR_RE = re.compile(r'^\d+(\.\d+)?[smhd]?$')
+
+
 def is_assign(tok):
-    return re.match(r'^[A-Za-z_]\w*(\[[^\]]*\])?=', tok) is not None
+    return ASSIGN_RE.match(tok) is not None
 
 
 def is_dur(tok):
-    return re.match(r'^\d+(\.\d+)?[smhd]?$', tok) is not None or tok == '{}'
+    return DUR_RE.match(tok) is not None or tok == '{}'
+
+
+_HEADS = {}   # head() of a word list: one shell text asks it of each command ~20 times (a 400 KB script: 1 M calls)
 
 
 def head(toks):
-    """(index of the command word after assignments and wrappers, which of shell/eval/xargs wrapped it)."""
+    """(index of the command word after assignments and wrappers, which of shell/eval/xargs wrapped it). The words
+    alone decide it, so the answer is kept (a frozenset, so no caller changes a kept answer)."""
+    key = tuple(toks)
+    got = _HEADS.get(key)
+    if got is None:
+        if len(_HEADS) > 20_000:
+            _HEADS.clear()
+        h, via = head_of(key)
+        got = _HEADS[key] = (h, frozenset(via))
+    return got
+
+
+def head_of(toks):
     i, via, prev_flag, script_next = 0, set(), False, False
     while i < len(toks):
         t = toks[i]
@@ -3215,7 +3240,7 @@ def sed_reason(args, ctx, own, fed):
             return unproven(tok, 'where `sed` runs its text as shell commands (the `e` command or the s///e flag)')
         flow['unknown'] = 'sed e'   # its input may come from anywhere
     if writes and tok:   # sed -n 'w run.sh' p.txt: the text gets a name a later word may run
-        flow['free'] = tok
+        flow['free'], flow['free_to'] = tok, 'writes to a file with `sed w`'
     return None
 
 
@@ -3380,8 +3405,32 @@ def data_gate(word, args, ctx, own, fed, loose):
     if tok and ctx.get('proven'):   # the text is a script the same command runs: it was read as shell text
         return None
     if tok and (ctx.get('leak') or moved or (own and word in WRITERS)):
-        flow['free'] = tok
+        flow['free'], flow['free_to'] = tok, flow_to(word, ctx, moved)
     return None
+
+
+def file_hint(word):
+    """What to do instead when text that names a token goes into the words or input of a word the guard does not
+    know: a file argument is data to the guard."""
+    return (f'If `{word}` only handles the text, write the text to a file first (an edit tool, or a Bash call of its '
+            f'own) and give `{word}` that file as an argument, not through a pipe, $(..), its input or its words.')
+
+
+def flow_to(word, ctx, moved):
+    """Where a data word sends text that names a guarded token, for the refusal: `writes it to the file x.md`."""
+    files = [f'`{redact(t)}`' for t in ctx.get('targets', ()) if not hidden(t)][:3]
+    if files:
+        return f'writes to the file{"s" if len(files) > 1 else ""} {", ".join(files)}'
+    if moved:
+        return f'gives a file that holds it another name with `{word}`'
+    if word in WRITERS:
+        return f'writes to a file with `{word}`'
+    cmd = ctx.get('cmd') or {}
+    if cmd.get('sub'):
+        return f'hands on from `{word}` into the words of another command ($(..))'
+    if cmd.get('pipe'):
+        return f'pipes on from `{word}`'
+    return f'passes on from `{word}`'
 
 
 SHELL_EXT = ('.sh', '.bash', '.zsh')
@@ -3547,7 +3596,7 @@ def launcher_gate(toks, h, ctx, own, fed, loose):
     name = redact(os.path.basename(word)) if not hidden(word) else 'a command word from a variable'
     if (own or fed) and not ctx.get('nogate'):
         return unproven(own or fed, f'and runs `{name}`, a command word the guard does not know (a launcher, a '
-                                    'project tool, a renamed program ..)')
+                                    'project tool, a renamed program ..)', file_hint(name))
     i = runner_at(toks, h + 1)
     r = (i is not None and segment_reason(toks[i:], ctx, loose)) or arg_scripts_reason(name, toks[h + 1:], ctx)
     if r:
@@ -3559,8 +3608,12 @@ def launcher_gate(toks, h, ctx, own, fed, loose):
 def flow_reason(flow):
     """The whole command read: token text that went somewhere, next to a word the guard could not read."""
     if flow.get('free') and flow.get('unknown'):
-        return unproven(flow['free'], f'in text that goes on (a pipe, a file, a variable), and that also runs '
-                                      f'`{flow["unknown"]}`, which the guard cannot read')
+        to = flow.get('free_to') or 'passes on (a pipe, a file, a variable)'
+        return unproven(flow['free'], f'in text it {to}, and it also runs `{flow["unknown"]}`, which the guard '
+                                      'cannot read and which could run that text',
+                        file_hint(flow['unknown']) if to.startswith(('pipes', 'hands on')) else
+                        f'If nothing here switches anything off, run them as separate Bash calls: the part that {to} '
+                        f'in one, the part with `{flow["unknown"]}` in another. Each passes on its own.')
     if flow.get('env') and (flow.get('unknown') or flow.get('ran')):
         return unproven(flow['env'], 'in an exported variable, which the programs run after it may take as a '
                                      'command (PAGER, GIT_SSH_COMMAND ..)')
@@ -4047,6 +4100,7 @@ def segment_reason(toks, ctx, loose):
     if toks[h] in ctx.get('funcs', ()) or expansions:
         if own or fed:   # its body is in the text and was read; the words it gets may go anywhere
             flow['free'] = own or fed
+            flow['free_to'] = f'hands to the shell function `{redact(toks[h])}`'
         return None
     files = cmd_files(toks[h], ctx, False)
     if any(is_self(p, ctx) for p, _ in files):
@@ -4704,6 +4758,171 @@ def stopped(text, what, flow, hint=''):
     return None
 
 
+# ---------- the skim: what the guard reads where it does not parse
+# Two cases do not get the full reading: shell text past MAX_COMMANDS commands in one call (a 2 MB script took 4 s
+# of the 5 s budget on an idle machine, and far more on a loaded one), and a command the guard ran out of time on.
+# Neither may let a switch-off through, and neither may refuse a call that has nothing to do with one. So the guard
+# reads what it needs for that: the text and every file it names (also behind NAME=value, in a folder the text names,
+# a script on a PATH folder under $HOME, two files deep), for a guard word: a guarded token, gh, an HTTP client, the
+# word workflow or disable, an agent session (claude, codex) or a refuseScripts line, quotes and backslashes removed
+# too. A compiled program counts only as gh under another name. One guard word, a file it cannot read whole or open
+# where something may run it, more than MAX_READINGS files or no time left: refused. A text without any: passes;
+# what it does with its own words cannot switch anything off without one of them (a word built at run time is not
+# covered by the full reading either).
+MAX_COMMANDS = 10_000   # commands of shell text parsed in full per call (~25 us each on an idle machine)
+SKIM_TIME = 2.0         # seconds for the skim after the guard ran out of time (it then still answers by ~7 s of 10)
+SKIM_END = 8.0          # ... and never past this many seconds from the hook's start (its limit is 10 s)
+SKIM_RE = re.compile(r'\bgh\b|curl|wget|httpie|\bxh\b|aria2c|api\.github|workflow|disable|\bclaude\b|\bcodex\b'
+                     r'|CLAUDE_CODE_SIMPLE|graphql', re.I)
+SKIM_PART = re.compile(r'[^\s;&|()<>`=:,]+')   # a word, or the part of one after `=` (NAME=f, --input=f) or `:`
+SKIM_VAR = re.compile(r'\$\{?([A-Za-z_]\w*)\}?')
+SKIM_SET = re.compile(r'(?:^|[\s;&|(`])(?:export\s+|local\s+|declare\s+)?([A-Za-z_]\w*)=([^\s;&|()<>`]*)')
+
+
+class SkimRefused(Exception):
+    """The skim's answer: a refusal, with the guard word and where it is."""
+
+
+def skim_word(text):
+    """The guard word a text holds, as a label, or None."""
+    for t in (text, re.sub(r'[\'"\\]', '', text)):
+        tok = named(t) or (REFUSE_SCRIPTS and refuse_script_named(t))
+        if tok:
+            return tok
+        m = LOOSE_RE.search(t) or SKIM_RE.search(t)
+        if m:
+            return f'`{m.group(0)}`'
+    return None
+
+
+def skim_parts(text, env):
+    """The words of a text that may name a file or a folder: quotes and backslashes removed, split at `=` and `:`,
+    with each $NAME the text gives a plain value (NAME=value) put in, and $HOME. A part with another variable is left
+    out: the full reading does not know such a file either (a hidden command word is one the guard cannot read)."""
+    text = re.sub(r'[\'"\\]', '', text)
+    values = {'HOME': [env.get('HOME') or os.path.expanduser('~')]}
+    for m in SKIM_SET.finditer(text):
+        if '$' not in m.group(2) and len(values.setdefault(m.group(1), [])) < 4:
+            values[m.group(1)].append(m.group(2))
+    out = {}
+    for m in SKIM_PART.finditer(text):
+        part = m.group(0).lstrip('@')   # gh -F x=@file, curl -d @file
+        names = SKIM_VAR.findall(part)
+        if not names:
+            out[part] = None
+        elif all(n in values for n in names) and SKIM_VAR.sub('', part).strip('/'):
+            for v in values[names[0]]:   # $D/off.sh with D=. and D=sub: both
+                out[SKIM_VAR.sub(lambda x: v if x.group(1) == names[0] else values[x.group(1)][0], part)] = None
+    return [p for p in out if p and not p.startswith('-')]
+
+
+def skim_files(text, dirs, ctx):
+    """The regular files the parts of a text name, looked for in the folders and in every folder the text names
+    (`cd sub && bash x.sh`, in the order it names them), and a bare word as a script in a PATH folder under $HOME
+    (an earlier call may have left one there)."""
+    parts, home = skim_parts(text, ctx['env']), os.path.realpath(ctx['env'].get('HOME') or os.path.expanduser('~'))
+    dirs, listing = list(dict.fromkeys(dirs)), {}
+
+    def names_in(d):
+        if d not in listing:
+            try:
+                listing[d] = set(os.listdir(d)) if os.path.isdir(d) else set()
+            except OSError:
+                listing[d] = set()
+        return listing[d]
+
+    path_dirs = [d for d in (ctx['env'].get('PATH') or '').split(':')
+                 if d and os.path.isabs(d) and d not in STD_BINS and os.path.realpath(d).startswith(home + os.sep)]
+    found = {}
+    for i, part in enumerate(parts):
+        if i % 512 == 511 and ctx.get('stop_at') is not None and time.monotonic() > ctx['stop_at']:
+            raise Slow()
+        if '/' in part or part.startswith(('~', '.')):
+            places = [resolve_path(part, d) for d in dirs]
+        else:
+            places = [os.path.join(d, part) for d in dirs + path_dirs if part in names_in(d)]
+        for q in places:
+            if os.path.isfile(q):
+                found.setdefault(os.path.realpath(q), q)
+            elif len(dirs) < 16 and q not in dirs and os.path.isdir(q):
+                dirs.append(q)
+    return list(found.values())
+
+
+def skim_reason(text, ctx, what, hint):
+    """None when the skim finds no guard word in the text or the files it names, else the refusal."""
+    try:
+        skim(text, list(folders(ctx)), ctx, 0, {}, 'the command')
+    except SkimRefused as e:
+        return reason(f'{what}. The guard skimmed it instead, for gh, HTTP clients, disabling words and agent sessions, '
+                      f'in the text and in the files it names, and found {e}', hint)
+    return None
+
+
+def skim(text, dirs, ctx, depth, seen, where):
+    if ctx.get('stop_at') is not None and time.monotonic() > ctx['stop_at']:
+        raise Slow()
+    tok = skim_word(text)
+    if tok:
+        raise SkimRefused(f'{tok} in {where}')
+    runs = []   # whether a word of the text is a shell, interpreter or runner: worked out once, when needed
+    for path in skim_files(text, dirs, ctx):
+        if path in seen or is_self(path, ctx):
+            continue
+        seen[path] = True
+        name = redact(os.path.basename(path))
+        if len(seen) > MAX_READINGS:
+            raise SkimRefused(f'more than {MAX_READINGS} files named (it reads no more)')
+        if ctx.get('stop_at') is not None and time.monotonic() > ctx['stop_at']:
+            raise Slow()
+        body = read_text(path)
+        if body is None:
+            try:
+                with open(path, 'rb') as f:
+                    binary = b'\0' in f.read(8192)
+            except OSError:
+                binary = False
+            if binary:
+                if gh_file(path, ctx):
+                    raise SkimRefused(f'gh under another name ({name})')
+                continue
+            if not runs:
+                runs.append(any(crash_runner(w) for w in set(re.findall(r'[\w.+-]+', re.sub(r'[\'"\\]', '', text)))))
+            if runs[0] or script_like(path):   # a big script, or one a shell or interpreter may run
+                tok = file_token(path)
+                if tok:
+                    raise SkimRefused(f'{tok} in the file {name}' if tok not in (TOO_BIG, NO_OPEN)
+                                      else f'the file {name}, which may run and is {tok}')
+            continue
+        if depth < MAX_DEPTH:
+            skim(body, [os.path.dirname(path)] + dirs, ctx, depth + 1, seen, f'the file {name}')
+        else:
+            tok = skim_word(body)
+            if tok:
+                raise SkimRefused(f'{tok} in the file {name}')
+
+
+def slow_reason(cmd, ctx):
+    """The guard ran out of time on this command: the refusal, or None when the skim of it finds no guard word.
+    The skim gets SKIM_TIME of its own (in the hook an alarm too); out of time again, it refuses."""
+    took = min(SKIM_TIME, SKIM_END - process_age())   # a hook that is late already (a slow start) has less
+    if took < 0.2:
+        return SLOW
+    ctx['stop_at'] = time.monotonic() + took
+    hook = __name__ == '__main__' and hasattr(signal, 'SIGALRM')
+    try:
+        if hook:
+            signal.signal(signal.SIGALRM, out_of_time)
+            signal.setitimer(signal.ITIMER_REAL, took + 0.3)
+        return skim_reason(cmd, ctx, f'the guard could not finish reading this command and the scripts it runs '
+                                     f'within {BUDGET:g} s', SLOW_HINT)
+    except BaseException:   # noqa: BLE001 - out of time again, or a failure: refused, as before the skim
+        return SLOW
+    finally:
+        if hook:
+            alarm_off()
+
+
 def pipe_span(runs, k):
     """The commands a pipe out of command k feeds: the next one, or every command of the group it starts
     (`cat f | (cd x && bash)`, `cat f | { true; bash; }`: the group's stdin is the pipe)."""
@@ -4725,6 +4944,17 @@ def decide_text(text, ctx, scan_raw=True):
     if nest > MAX_NEST:
         return stopped(text, 'shell text nested too deep to read', flow)
     cmds, plain, taint, rest = parse(text)
+    tally = ctx.get('tally')
+    if tally is not None:
+        tally[0] += len(cmds)
+        if tally[0] > MAX_COMMANDS:   # read only what it needs: the guard words, here and in the files named
+            r = skim_reason(text, ctx, f'more than {MAX_COMMANDS:,} commands of shell text in this call (the '
+                                       'command and the scripts it runs), more than the guard parses in time',
+                            'Run the part that calls gh or an HTTP client as a Bash call of its own.')
+            if r:
+                return r
+            flow['unknown'] = f'shell text past the guard\'s {MAX_COMMANDS:,} commands'
+            return None
     if rest:   # more than 400 $(..) `..` <(..): what was not read is no harmless text
         r = stopped('\n'.join(rest) + '\n' + text, 'more than 400 $(..), `..` or <(..) in one text, more than the '
                     'guard reads', flow, 'Run it as smaller commands.')
@@ -4907,12 +5137,12 @@ def decide(cmd, cwd, env, budget=None, use_id=None, saves=None):
     if not cmd or (QUICK and quick_pass(cmd) and not quick_shadowed(cmd, cwd, env)):
         return None
     ctx = {'cwd': cwd or os.getcwd(), 'env': env, 'depth': 0, 'raw': cmd, 'all': cmd, 'memo': {}, 'flow': {},
-           'stop_at': None if budget is None else time.monotonic() + budget, 'cache': {}}
+           'stop_at': None if budget is None else time.monotonic() + budget, 'cache': {}, 'tally': [0]}
     try:
         why = decide_text(cmd, ctx) or flow_reason(ctx['flow'])
     except Slow:
-        why = SLOW
-        ctx['cache'] = {}   # a reading cut off half-way keeps nothing
+        why = slow_reason(cmd, ctx)
+        ctx['cache'] = {}   # a reading cut off half-way keeps nothing (nor what the skim after it looked up)
     if why:
         why = owner_marker(why, cmd, ctx['cwd'], env, use_id)
     if saves is not None:
@@ -5136,11 +5366,9 @@ def answer():
         if QUICK and quick_pass(cmd) and not quick_shadowed(cmd, cwd, env):
             alarm_off()
             return passed()
-        left = BUDGET - process_age()
-        if left <= 0:
-            raise Slow()
+        left = BUDGET - process_age()   # none left (a slow start): decide() goes straight to the skim
         saves = []
-        why = decide(cmd, cwd, env, max(left - 1.0, 0.0), ev.get('tool_use_id'), saves)
+        why = decide(cmd, cwd, env, left - 1.0, ev.get('tool_use_id'), saves)
         if why:
             deny(why)   # the answer first: a slow or hung file system then holds up only the save, cut by the alarm
         save_quietly(saves)
