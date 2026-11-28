@@ -79,11 +79,7 @@ export function isOwnerDecision(body: string, rule: OwnerQuestionRule): boolean 
  * members and its collaborators. Anyone can comment on a public repository; their "Owner decision:"
  * answers nothing.
  */
-export const OWNER_DECISION_ASSOCIATIONS: ReadonlyArray<string> = [
-  "OWNER",
-  "MEMBER",
-  "COLLABORATOR",
-];
+const OWNER_DECISION_ASSOCIATIONS: ReadonlyArray<string> = ["OWNER", "MEMBER", "COLLABORATOR"];
 
 /** What the rule reads of a comment. */
 export interface OwnerDecisionComment {
