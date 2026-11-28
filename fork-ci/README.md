@@ -75,6 +75,7 @@ Each action's README has a full example, every input and output, and what happen
 | [pr-queue](actions/pr-queue/README.md)             | a merge queue for an up-to-date-required repository (also a reusable workflow)            | `config`, `state-file`, `cache`, `token` | none                                              | the pr-queue config                                      |
 | [doc-check](actions/doc-check/README.md)           | fails instruction files over budget, history in them, broken links, added dated reports   | `config`, `base`, `mode`                 | none                                              | `.github/doc-check.json` (optional: budgets, rules)      |
 | [weakened-tests](actions/weakened-tests/README.md) | reports (never fails) the existing tests a pull request deletes, skips or weakens         | `config`, `token`                        | `status`, `count`, `missing_why`                  | `.github/weakened-tests.json` (optional: added patterns) |
+| [owner-questions](actions/owner-questions/)        | lists the open owner questions; `label` mode keeps the label on just the waiting ones     | `config`, `mode`, `token`                | `count`, `changed`, `questions`                   | `.t3code/issues.json` (optional)                         |
 
 Two habits every action expects:
 

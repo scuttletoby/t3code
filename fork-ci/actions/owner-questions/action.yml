@@ -1,0 +1,46 @@
+name: owner-questions
+description: >-
+  Lists a repository's open owner questions (an issue with the rule's label, or a title starting "Owner question" or
+  "<Topic> Q<n>:", that no "Owner decision:" comment answers), as the job summary and outputs. In label mode it also
+  puts the rule's label on each waiting question and takes it off each answered one. The project's config file
+  (optional) names the repositories and may rename the rule. GitHub only; needs gh and python3. Usage: README.md next
+  to this file.
+inputs:
+  config:
+    description: The project's JSON config (optional file; README "Config"), a path in the checkout.
+    required: false
+    default: .t3code/issues.json
+  mode:
+    description: list (reads only) or label (also changes labels; the token needs issues write).
+    required: false
+    default: list
+  repo:
+    description: The repository read when the config names none, owner/name.
+    required: false
+    default: ${{ github.repository }}
+  token:
+    description: A token that can read the repositories' issues (and write their labels in label mode).
+    required: false
+    default: ${{ github.token }}
+outputs:
+  count:
+    description: How many owner questions wait (empty when the step failed).
+    value: ${{ steps.scan.outputs.count }}
+  changed:
+    description: How many labels label mode put on or took off (0 in list mode; empty when the step failed).
+    value: ${{ steps.scan.outputs.changed }}
+  questions:
+    description: The waiting questions as a JSON array of {repo, number, title, url, labelled} (empty when it failed).
+    value: ${{ steps.scan.outputs.questions }}
+runs:
+  using: composite
+  steps:
+    # Only code from this action's folder (the caller's pinned SHA) runs; the checkout gives only the config's data.
+    - id: scan
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        CONFIG: ${{ inputs.config }}
+        MODE: ${{ inputs.mode }}
+        REPO: ${{ inputs.repo }}
+      run: exec python3 -I "$GITHUB_ACTION_PATH/owner_questions.py" --config "$CONFIG" --repo "$REPO" --mode "$MODE"
