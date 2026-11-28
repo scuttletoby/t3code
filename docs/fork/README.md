@@ -1571,8 +1571,23 @@ and then 15 minutes when GitHub does not answer. Counts older than 10 minutes ar
 request the read has no runs for falls back to what the pull request watch saw (failed and passed
 checks, and whether checks are pending), then to its last sync. A part with no answer says unknown
 and why, never 0: also a machine that answered before and then fails, or whose last answer arrived
-more than three minutes ago; the ages count on from when the answer arrived. Only github.com repositories are read. Off (the
-default): upstream's side panel. A client settings file without it reads as off.
+more than three minutes ago; the ages count on from when the answer arrived. Only github.com
+repositories are read.
+
+Above the CI part, the capacity bar: one bar for the fleet's agent sessions in use of those allowed
+(each machine's slot gate, as placement reads it on `t3_environment_read`), split per machine on
+hover or under **Per machine**, and the memory free of the total (the host sampler). Every machine
+the device knows is asked with the same `fork.workPanel` read, without a thread (the thread's CI is
+a separate read, so neither waits on the other). A machine that is not connected, does not answer
+(also after an earlier answer), answers more than three minutes late, or runs a version without the
+capacity read is grey and unknown, with why. Agents above a lowered limit read against the gate's
+own limit. CI runners: busy is the running runs of this thread's repositories (the queue lines),
+and free is always unknown, since GitHub does not report the hosted runners' cap and the fleet
+starts a runner per job (#13). Under it, each provider account (by its label, no e-mail): session
+and weekly room left (the tightest window of each), from the provider status T3 already reads. A
+window it does not report, a window whose reset has passed since it was read, and limits read more
+than 30 minutes ago are unknown. Off (the default): upstream's side panel. A client settings
+file without it reads as off.
 
 ### A setting the fork removed
 
