@@ -1,6 +1,6 @@
 // Fork only: fails when an upstream composite action the fork copies changed and its copy's
 // `# upstream-blob: <id>` line (git blob id of the upstream file it follows) was not updated, or a
-// fork workflow uses the upstream action. Port the change into the copy first, then `--record`.
+// fork workflow uses the upstream action, or a signing workflow uses the copy's node_modules cache. Port the change into the copy first, then `--record`.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -28,6 +28,31 @@ const usesPattern = (dir) =>
     `^\\s*(?:-\\s+)?uses:\\s*["']?\\./${dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/?["']?\\s*(?:#.*)?$`,
     "m",
   );
+
+const SIGNS = /^\s*(?:id-token|attestations):\s*write\b/m;
+const CACHE_OFF = /^\s*cache-node-modules:\s*(["']?)false\1\s*(?:#.*)?$/;
+
+// Each use of the copy in a workflow whose output is signed or attested (it can write an id-token or
+// attestations) that does not turn the node_modules cache off: such output never comes from a cache.
+function cachedSignedUses(text, copyDir) {
+  if (!SIGNS.test(text)) return [];
+  const lines = text.split("\n");
+  const uses = usesPattern(copyDir);
+  const found = [];
+  lines.forEach((line, i) => {
+    if (!uses.test(line)) return;
+    const column = line.indexOf("uses:");
+    let off = false;
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = lines[j];
+      if (/^\s*(#.*)?$/.test(next)) continue;
+      if (next.match(/^ */)[0].length < column) break;
+      if (CACHE_OFF.test(next)) off = true;
+    }
+    if (!off) found.push(i + 1);
+  });
+  return found;
+}
 
 /**
  * Problems for `root` (one line each, empty when all is well). `read(file)` gives a file's bytes or
@@ -68,6 +93,11 @@ function check({ read, workflows, copies = COPIES }) {
       if (usesPattern(upstreamDir).test(text)) {
         problems.push(
           `${workflow} uses ./${upstreamDir}: fork workflows use the fork's copy, ./${path.posix.dirname(copy)}.`,
+        );
+      }
+      for (const line of cachedSignedUses(text, path.posix.dirname(copy))) {
+        problems.push(
+          `${workflow}:${line} uses ./${path.posix.dirname(copy)} with its node_modules cache in a workflow that signs or attests its output: pass \`cache-node-modules: "false"\` (signed output never comes from a cache).`,
         );
       }
     }

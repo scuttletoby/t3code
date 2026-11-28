@@ -117,9 +117,12 @@ runs:
         fi
 
     # Fork: node_modules is cached on an exact key only (no restore keys): the lockfile, the
-    # workspace's package.json files, pnpm-workspace.yaml, .npmrc, .pnpmfile, the patch files, the
-    # Vite+, Node.js and pnpm versions, the install args, the OS release and the workspace and store
-    # paths (node-modules-key.sh). So an entry from another lockfile or toolchain is never restored.
+    # workspace's package.json files, pnpm-workspace.yaml, .npmrc, .pnpmfile, the patch files, pnpm's
+    # settings from the environment, this action and its key script, the Vite+, Node.js and pnpm
+    # versions, the install args, the OS release and the workspace and store paths
+    # (node-modules-key.cjs). So an entry from another lockfile, toolchain or copy of this action is
+    # never restored. A lockfile line the script cannot read for sure, or a runner that is not
+    # GitHub-hosted (fleet jobs each have their own paths), turns the cache off.
     - name: Resolve node_modules cache
       id: node_modules
       if: inputs.install == 'true' && inputs.cache-node-modules == 'true'
@@ -130,7 +133,8 @@ runs:
         NODE_VERSION: ${{ steps.vp.outputs.node }}
         PNPM: ${{ steps.vp.outputs.pnpm }}
         STORE_PATH: ${{ steps.pnpm_store.outputs.path }}
-      run: bash "$GITHUB_ACTION_PATH/node-modules-key.sh"
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: node "$GITHUB_ACTION_PATH/node-modules-key.cjs"
 
     - name: Restore node_modules
       id: node_modules_cache
@@ -218,13 +222,16 @@ runs:
         key: ${{ steps.pnpm_cache.outputs.cache-primary-key }}
 
     # Fork: saved right after the install, before the job runs anything that writes into
-    # node_modules (test caches, the Electron download). The same jobs and events save it as save the
-    # store (one job per set of install args; not a stacked pull request). An entry is only ever
-    # written whole: actions/cache commits it after the upload finishes.
+    # node_modules (test caches, the Electron download), by the store's saver only (one job per set
+    # of install args). Only a push to the default branch that tests the pushed commit saves (the key
+    # script's `save`, checked again here): a pull request, a dispatch or call that tests another
+    # ref, and a schedule only restore. An entry is only ever written whole: actions/cache commits it
+    # after the upload finishes.
     - name: Save node_modules
       if: >-
-        steps.node_modules.outputs.key != '' && inputs.save-pnpm-store == 'true' &&
-        (github.event_name != 'pull_request' || github.base_ref == github.event.repository.default_branch) &&
+        steps.node_modules.outputs.key != '' && steps.node_modules.outputs.save == 'true' &&
+        inputs.save-pnpm-store == 'true' &&
+        github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
         steps.node_modules_cache.outputs.cache-hit != 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:

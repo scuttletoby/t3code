@@ -367,15 +367,15 @@ fork-follow (`.github/workflows/fork-follow.yml`) rebases the fork onto upstream
 once a day, tests, and publishes only when the tests are green. On a conflict, a red test or a schema
 change, or a fork line beyond the seams, it stops and opens one issue. Then:
 
-1. First, before the rest of the sync: if upstream changed a composite action the fork keeps its
-   own copy of (today `.github/actions/setup-ci-deps`, copied as
+1. Rebase by hand as the workflow's report says. Never take upstream's side of a fork setting's
+   default: keep the fork's value (and the `Fork:` comment of the inline `automaticUpdates`).
+2. First, right after the rebase and before the rest of the sync: if upstream changed a composite
+   action the fork keeps its own copy of (today `.github/actions/setup-ci-deps`, copied as
    `.github/actions/fork-setup-ci-deps`), port that change into the copy and record it:
    `node .github/scripts/fork-setup-copy-check.cjs` names the change and the `git diff` to read;
    after porting, `node .github/scripts/fork-setup-copy-check.cjs --record`. Fork tests fail
    ("Compare upstream's setup-ci-deps with the fork's copy") until the copy's recorded blob id
    matches upstream's file, so a sync cannot land with the copy behind it.
-2. Rebase by hand as the workflow's report says. Never take upstream's side of a fork setting's
-   default: keep the fork's value (and the `Fork:` comment of the inline `automaticUpdates`).
 3. Check that the fork's lines in upstream files are only the seams:
    `node .github/scripts/fork-seam-check.cjs --from-upstream <upstream tag> HEAD`. A refused line moves into the
    fork's own file (a setting into `forkSettings.ts`, a server layer into

@@ -10,7 +10,9 @@ const { COPIES, blobId, check, record, fromTree } = require("./fork-setup-copy-c
 const root = path.resolve(__dirname, "../..");
 const UPSTREAM = ".github/actions/setup-ci-deps/action.yml";
 const COPY = ".github/actions/fork-setup-ci-deps/action.yml";
-const KEY_SCRIPT = path.join(root, ".github/actions/fork-setup-ci-deps/node-modules-key.sh");
+const ACTION_DIR = path.join(root, ".github/actions/fork-setup-ci-deps");
+const KEY_SCRIPT = path.join(ACTION_DIR, "node-modules-key.cjs");
+const keys = require(KEY_SCRIPT);
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "fork-setup-copy-"));
 
@@ -153,15 +155,51 @@ const byName = (name) => {
 const index = (name) => copySteps.findIndex((s) => s.name === name);
 const HIT = "steps.node_modules_cache.outputs.cache-hit != 'true'";
 
-test("the copy keeps every upstream step, in order, with the same action and run", () => {
+// A step's text without comments and blank lines; the store steps' one fork clause (skip after a
+// node_modules hit) taken out, so everything else must be upstream's text.
+const FORK_CLAUSE = {
+  "Restore pnpm store": [" && steps.node_modules_cache.outputs.cache-hit != 'true'", ""],
+  "Save pnpm store": ["\n        steps.node_modules_cache.outputs.cache-hit != 'true' &&", ""],
+};
+const body = (step, fork = false) => {
+  let text = step.text
+    .split("\n")
+    .filter((line) => !/^\s*(#.*)?$/.test(line))
+    .join("\n");
+  if (fork && FORK_CLAUSE[step.name]) {
+    const [clause, none] = FORK_CLAUSE[step.name];
+    assert.ok(text.includes(clause), `${step.name} lost its fork clause`);
+    text = text.replace(clause, none);
+  }
+  return text;
+};
+
+test("the copy keeps every upstream step, in order, word for word (inputs, id, if, env, with, uses, run)", () => {
   let at = -1;
   for (const up of upstreamSteps) {
     const i = copySteps.findIndex((s, j) => j > at && s.name === up.name);
     assert.ok(i > at, `upstream step "${up.name}" is missing or out of order in the copy`);
-    assert.equal(copySteps[i].uses, up.uses, up.name);
-    assert.equal(copySteps[i].run, up.run, up.name);
+    assert.equal(body(copySteps[i], true), body(up), up.name);
     at = i;
   }
+  // Upstream's inputs, name and description are the copy's too.
+  const upstream = fs.readFileSync(path.join(root, UPSTREAM), "utf8");
+  const copy = fs.readFileSync(path.join(root, COPY), "utf8");
+  const head = (text) => text.split(/^runs:\n/m)[0].split(/^name: /m)[1];
+  for (const block of `name: ${head(upstream)}`.split(/^(?=  [a-z-]+:$)/m)) {
+    assert.ok(copy.includes(block), `upstream's header or input is not in the copy:\n${block}`);
+  }
+});
+
+test("the step-text check catches a changed env or with value", () => {
+  const setup = copySteps.find((s) => s.name === "Setup Vite+");
+  const changed = {
+    ...setup,
+    text: setup.text.replace('VP_DOWNLOAD_TIMEOUT: "120"', 'VP_DOWNLOAD_TIMEOUT: "600"'),
+  };
+  const up = upstreamSteps.find((s) => s.name === "Setup Vite+");
+  assert.equal(body(setup, true), body(up));
+  assert.notEqual(body(changed, true), body(up));
 });
 
 test("the copy, like upstream's, caches Vite+ before it installs or runs project code", () => {
@@ -222,7 +260,7 @@ test("after a node_modules hit the store is neither restored nor saved (no near-
   assert.equal(byName("Restore lockfile verification").if, "inputs.install == 'true'");
 });
 
-test("node_modules is saved right after the install, by the store's saver only, never over a hit", () => {
+test("node_modules is saved right after the install, by the store's saver only, only on a push to main, never over a hit", () => {
   const save = byName("Save node_modules");
   assert.match(save.uses, /^actions\/cache\/save@[0-9a-f]{40} /);
   assert.ok(index("Install dependencies") < index("Save node_modules"));
@@ -233,10 +271,16 @@ test("node_modules is saved right after the install, by the store's saver only, 
   );
   assert.ok(save.if.includes(HIT));
   assert.ok(save.if.includes("inputs.save-pnpm-store == 'true'"));
+  // Only a push to the default branch that tests the pushed commit: the key script's decision and
+  // the event and ref again here. No pull request, dispatch, call or schedule saves.
+  assert.ok(save.if.includes("steps.node_modules.outputs.save == 'true'"));
+  assert.ok(save.if.includes("github.event_name == 'push'"));
   assert.ok(
-    save.if.includes("github.base_ref == github.event.repository.default_branch"),
-    "a stacked PR does not save",
+    save.if.includes(
+      "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+    ),
   );
+  assert.doesNotMatch(save.if, /\|\|/, "no other way in");
   assert.doesNotMatch(
     save.if,
     /always\(\)|failure\(\)|cancelled\(\)/,
@@ -245,6 +289,44 @@ test("node_modules is saved right after the install, by the store's saver only, 
   const restore = byName("Restore node_modules");
   assert.equal(save.text.match(/path: (.*)/)[1], restore.text.match(/path: (.*)/)[1]);
   assert.equal(save.text.match(/key: (.*)/)[1], restore.text.match(/key: (.*)/)[1]);
+  const resolve = byName("Resolve node_modules cache");
+  assert.match(
+    resolve.text,
+    /DEFAULT_BRANCH: \$\{\{ github\.event\.repository\.default_branch \}\}/,
+  );
+  assert.match(resolve.run, /node "\$GITHUB_ACTION_PATH\/node-modules-key\.cjs"/);
+});
+
+test("the key script saves only for a push to the default branch that tests the pushed commit", () => {
+  const sha = "a".repeat(40);
+  const push = {
+    GITHUB_EVENT_NAME: "push",
+    GITHUB_REF: "refs/heads/main",
+    DEFAULT_BRANCH: "main",
+    GITHUB_SHA: sha,
+  };
+  assert.equal(keys.saveDecision(push, sha)[0], true);
+  for (const [label, env, head] of [
+    [
+      "a pull request",
+      { ...push, GITHUB_EVENT_NAME: "pull_request", GITHUB_REF: "refs/pull/1/merge" },
+      sha,
+    ],
+    [
+      "a dispatch on main testing another ref",
+      { ...push, GITHUB_EVENT_NAME: "workflow_dispatch" },
+      "b".repeat(40),
+    ],
+    ["a dispatch on main testing main", { ...push, GITHUB_EVENT_NAME: "workflow_dispatch" }, sha],
+    ["a schedule (fork-follow's candidate)", { ...push, GITHUB_EVENT_NAME: "schedule" }, sha],
+    ["a workflow_call from a release", { ...push, GITHUB_EVENT_NAME: "workflow_call" }, sha],
+    ["a push to another branch", { ...push, GITHUB_REF: "refs/heads/feature" }, sha],
+    ["a push testing another commit", push, "b".repeat(40)],
+    ["a push with no checkout", push, ""],
+    ["no default branch known", { ...push, DEFAULT_BRANCH: "" }, sha],
+  ]) {
+    assert.equal(keys.saveDecision(env, head)[0], false, label);
+  }
 });
 
 test("cache-node-modules: false is upstream's action (nothing restored or saved)", () => {
@@ -279,28 +361,35 @@ importers:
   'packages/odd name':
     dependencies: {}
 
+  packages/empty: {}
+
 packages: {}
 `;
 
-function workspace(files = {}) {
-  const dir = tmp();
-  const all = {
-    "pnpm-lock.yaml": LOCK,
-    "pnpm-workspace.yaml":
-      'packages:\n  - apps/*\n  - packages/*\npatchedDependencies:\n  # why\n  "a@1.0.0": patches/a@1.0.0.patch\n',
-    "package.json": "{}\n",
-    "apps/web/package.json": '{"name":"web"}\n',
-    "packages/odd name/package.json": '{"name":"odd"}\n',
-    "patches/a@1.0.0.patch": "--- a\n",
-    ...files,
-  };
-  for (const [file, text] of Object.entries(all)) {
-    if (text === null) continue;
-    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
-    fs.writeFileSync(path.join(dir, file), text);
-  }
-  return dir;
-}
+const WORKSPACE = [
+  "packages:",
+  "  - apps/*",
+  "  - packages/*",
+  "patchedDependencies:",
+  "  # why",
+  '  "a@1.0.0": patches/a@1.0.0.patch',
+  "  b@2.0.0: patches/b.patch # a note",
+  "  'c@3.0.0': 'patches/c with space.patch'",
+  "",
+].join("\n");
+
+const FILES = {
+  "pnpm-lock.yaml": LOCK,
+  "pnpm-workspace.yaml": WORKSPACE,
+  "package.json": '{"pnpm":{"patchedDependencies":{"d@4.0.0":"patches/d.patch"}}}\n',
+  "apps/web/package.json": '{"name":"web"}\n',
+  "packages/odd name/package.json": '{"name":"odd"}\n',
+  "packages/empty/package.json": '{"name":"empty"}\n',
+  "patches/a@1.0.0.patch": "--- a\n",
+  "patches/b.patch": "--- b\n",
+  "patches/c with space.patch": "--- c\n",
+  "patches/d.patch": "--- d\n",
+};
 
 const ENV = {
   NAMESPACE: "full",
@@ -310,65 +399,70 @@ const ENV = {
   STORE_PATH: "/home/runner/.local/share/pnpm/store/v11",
   RUNNER_OS: "Linux",
   RUNNER_ARCH: "X64",
+  RUNNER_ENVIRONMENT: "github-hosted",
 };
 
-function keyOf(dir, env = {}) {
-  const out = path.join(tmp(), "output");
-  fs.writeFileSync(out, "");
-  const result = spawnSync("bash", [KEY_SCRIPT], {
-    cwd: dir,
-    env: { PATH: process.env.PATH, ...ENV, ...env, GITHUB_OUTPUT: out },
-    encoding: "utf8",
+// compute() on an in-memory workspace: files maps a path to its text (null: absent).
+function keyOf(
+  files = {},
+  { env = {}, cwd = "/home/runner/work/t3code/t3code", ownDir = ACTION_DIR } = {},
+) {
+  const all = { ...FILES, ...files };
+  return keys.compute({
+    env: { ...ENV, ...env },
+    read: (file) => (all[file] == null ? undefined : Buffer.from(all[file])),
+    cwd,
+    ownDir,
+    head: "",
+    osRelease: "ubuntu-24.04",
   });
-  assert.equal(result.status, 0, result.stderr);
-  const text = fs.readFileSync(out, "utf8");
-  const key = text.match(/^key=(.*)$/m)?.[1];
-  const paths = text
-    .match(/^paths<<FORK_NODE_MODULES_PATHS\n([\s\S]*?)\nFORK_NODE_MODULES_PATHS$/m)?.[1]
-    .split("\n");
-  return { key, paths, stdout: result.stdout };
 }
 
-test("the key script lists every importer's node_modules once, across lockfile documents", () => {
-  const { key, paths } = keyOf(workspace());
+test("the key script lists every importer's node_modules once (empty and quoted importers too)", () => {
+  const { key, paths, skip } = keyOf();
+  assert.equal(skip, undefined);
   assert.match(
     key,
-    /^fork-node-modules-v1-full-Linux-X64-node26\.13\.1-pnpm@12\.14\.0-[0-9a-f]{64}$/,
+    new RegExp(
+      `^fork-node-modules-${keys.VERSION}-full-Linux-X64-node26\\.13\\.1-pnpm@12\\.14\\.0-[0-9a-f]{64}$`,
+    ),
   );
   assert.deepEqual(paths, [
     "node_modules",
     "apps/web/node_modules",
+    "packages/empty/node_modules",
     "packages/odd name/node_modules",
+  ]);
+  assert.deepEqual(keys.patches(WORKSPACE, FILES["package.json"]), [
+    "patches/a@1.0.0.patch",
+    "patches/b.patch",
+    "patches/c with space.patch",
+    "patches/d.patch",
   ]);
 });
 
 test("the key is the same for the same inputs (a re-run, another job)", () => {
-  const dir = workspace();
-  assert.equal(keyOf(dir).key, keyOf(dir).key);
+  assert.equal(keyOf().key, keyOf().key);
 });
 
 test("the key changes with every input of the install (an old or other install is never restored)", () => {
-  const dir = workspace();
-  const base = keyOf(dir).key;
+  const base = keyOf().key;
   const edits = {
     "pnpm-lock.yaml": `${LOCK}\n`,
-    "pnpm-workspace.yaml": "packages:\n  - apps/*\n",
-    "package.json": '{"x":1}\n',
+    "pnpm-workspace.yaml": `${WORKSPACE}catalog: {}\n`,
+    "package.json": '{"pnpm":{"patchedDependencies":{"d@4.0.0":"patches/d.patch"}},"x":1}\n',
     "apps/web/package.json": '{"name":"web","bin":"x"}\n',
     "packages/odd name/package.json": "{}\n",
-    "patches/a@1.0.0.patch": "--- b\n",
+    "packages/empty/package.json": "{}\n",
+    "patches/a@1.0.0.patch": "--- a2\n",
+    "patches/b.patch": "--- b2\n",
+    "patches/c with space.patch": "--- c2\n",
+    "patches/d.patch": "--- d2\n",
     ".npmrc": "x=1\n",
     ".pnpmfile.cjs": "module.exports = {}\n",
   };
   for (const [file, text] of Object.entries(edits)) {
-    const other = workspace({ [file]: text });
-    // Same workspace path, so only the file differs.
-    fs.rmSync(dir, { recursive: true });
-    fs.renameSync(other, dir);
-    assert.notEqual(keyOf(dir).key, base, file);
-    fs.rmSync(dir, { recursive: true });
-    fs.renameSync(workspace(), dir);
-    assert.equal(keyOf(dir).key, base, `restored ${file}`);
+    assert.notEqual(keyOf({ [file]: text }).key, base, file);
   }
   for (const [name, value] of Object.entries({
     NAMESPACE: "filtered-123",
@@ -378,27 +472,137 @@ test("the key changes with every input of the install (an old or other install i
     STORE_PATH: "/elsewhere",
     RUNNER_OS: "macOS",
     RUNNER_ARCH: "ARM64",
+    NODE_ENV: "production",
+    pnpm_config_node_linker: "hoisted",
+    npm_config_registry: "https://example.invalid/",
   })) {
-    assert.notEqual(keyOf(dir, { [name]: value }).key, base, name);
+    assert.notEqual(keyOf({}, { env: { [name]: value } }).key, base, name);
   }
-  // The workspace path is in .bin shims: another checkout path is another key.
-  const elsewhere = workspace();
-  assert.notEqual(keyOf(elsewhere).key, base);
+  assert.notEqual(keyOf({}, { cwd: "/elsewhere" }).key, base, "the workspace path");
+  // The action and the key script are in the key: a change to how the tree is built is a new key.
+  for (const file of ["action.yml", "node-modules-key.cjs"]) {
+    const dir = tmp();
+    for (const own of ["action.yml", "node-modules-key.cjs"]) {
+      fs.copyFileSync(path.join(ACTION_DIR, own), path.join(dir, own));
+    }
+    assert.equal(keyOf({}, { ownDir: dir }).key, base, "a same copy");
+    fs.appendFileSync(path.join(dir, file), "\n# changed\n");
+    assert.notEqual(keyOf({}, { ownDir: dir }).key, base, file);
+  }
 });
 
-test("without a usable lockfile nothing is cached (the action installs from the store)", () => {
-  for (const [label, files] of [
+test("anything the key script cannot read for sure, or a runner that is not GitHub-hosted, turns the cache off", () => {
+  for (const [label, files, env = {}] of [
     ["no lockfile", { "pnpm-lock.yaml": null }],
     ["no importers", { "pnpm-lock.yaml": "lockfileVersion: '9.0'\npackages: {}\n" }],
     [
       "an importer outside the workspace",
       { "pnpm-lock.yaml": "importers:\n\n  ../outside:\n    dependencies: {}\n" },
     ],
+    [
+      "an importer with a .. segment",
+      { "pnpm-lock.yaml": "importers:\n\n  a/../../b:\n    dependencies: {}\n" },
+    ],
     ["an absolute importer", { "pnpm-lock.yaml": "importers:\n\n  /abs:\n    dependencies: {}\n" }],
+    ["flow-style importers", { "pnpm-lock.yaml": "importers: {a: {}}\n" }],
+    [
+      "an importer line it cannot read",
+      { "pnpm-lock.yaml": "importers:\n\n  a: {dependencies: {}}\n" },
+    ],
+    ["an odd indent", { "pnpm-lock.yaml": "importers:\n   a:\n" }],
+    ["a tab indent", { "pnpm-lock.yaml": "importers:\n\t.:\n" }],
+    ["flow-style patches", { "pnpm-workspace.yaml": "patchedDependencies: {a@1: p.patch}\n" }],
+    [
+      "a patch line it cannot read",
+      { "pnpm-workspace.yaml": "patchedDependencies:\n  a@1: [p.patch]\n" },
+    ],
+    [
+      "a nested patch entry",
+      { "pnpm-workspace.yaml": "patchedDependencies:\n  a@1:\n    path: p.patch\n" },
+    ],
+    ["package.json that is not JSON", { "package.json": "{" }],
+    ["a pnpmfile set by path", { "pnpm-workspace.yaml": "pnpmfile: tools/pnpmfile.cjs\n" }],
+    ["a fleet runner", {}, { RUNNER_ENVIRONMENT: "self-hosted" }],
+    ["an unknown runner", {}, { RUNNER_ENVIRONMENT: "" }],
   ]) {
-    const { key, paths, stdout } = keyOf(workspace(files));
-    assert.equal(key, undefined, label);
-    assert.equal(paths, undefined, label);
-    assert.match(stdout, /node_modules is not cached/, label);
+    const result = keyOf(files, { env });
+    assert.equal(result.key, undefined, label);
+    assert.equal(typeof result.skip, "string", label);
   }
+  assert.equal(
+    keyOf({ "pnpm-workspace.yaml": "patchedDependencies: {}\n" }).skip,
+    undefined,
+    "an empty map",
+  );
+});
+
+test("the key script's command writes key, paths and save, or only save=false", () => {
+  const dir = tmp();
+  for (const [file, text] of Object.entries(FILES)) {
+    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+    fs.writeFileSync(path.join(dir, file), text);
+  }
+  execFileSync("git", ["init", "-q"], { cwd: dir });
+  execFileSync(
+    "git",
+    ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
+    { cwd: dir },
+  );
+  const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+  const run = (env) => {
+    const out = path.join(tmp(), "output");
+    fs.writeFileSync(out, "");
+    const result = spawnSync(process.execPath, [KEY_SCRIPT], {
+      cwd: dir,
+      env: { PATH: process.env.PATH, ...ENV, GITHUB_OUTPUT: out, ...env },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return fs.readFileSync(out, "utf8");
+  };
+  const push = {
+    GITHUB_EVENT_NAME: "push",
+    GITHUB_REF: "refs/heads/main",
+    DEFAULT_BRANCH: "main",
+    GITHUB_SHA: sha,
+  };
+  const saved = run(push);
+  assert.match(saved, /^key=fork-node-modules-/m);
+  assert.match(saved, /^save=true$/m);
+  assert.match(saved, /^paths<<FORK_NODE_MODULES_PATHS\nnode_modules\napps\/web\/node_modules\n/m);
+  assert.match(run({ ...push, GITHUB_SHA: "b".repeat(40) }), /^save=false$/m);
+  assert.match(run({ ...push, GITHUB_EVENT_NAME: "workflow_dispatch" }), /^save=false$/m);
+  assert.equal(run({ ...push, RUNNER_ENVIRONMENT: "self-hosted" }), "save=false\n");
+});
+
+test("a signing or attesting workflow must turn the copy's node_modules cache off", () => {
+  const ok = { [UPSTREAM]: UP, [COPY]: copyOf(blobId(Buffer.from(UP))) };
+  const step = (extra) =>
+    `permissions:\n  id-token: write\njobs:\n  a:\n    steps:\n      - name: Setup\n        uses: ./.github/actions/fork-setup-ci-deps\n        with:\n          install-args: --filter=x\n${extra}      - name: Next\n        run: echo\n`;
+  const cached = check(tree({ ...ok, ".github/workflows/fork-x.yml": step("") }));
+  assert.equal(cached.length, 1);
+  assert.match(cached[0], /fork-x\.yml:7 .*signs or attests.*cache-node-modules: "false"/);
+  for (const off of [
+    '          cache-node-modules: "false"\n',
+    "          cache-node-modules: false\n",
+  ]) {
+    assert.deepEqual(check(tree({ ...ok, ".github/workflows/fork-x.yml": step(off) })), [], off);
+  }
+  // A cache-off in the next step does not count for this one.
+  const next = step("").replace(
+    "        run: echo\n",
+    '        with:\n          cache-node-modules: "false"\n',
+  );
+  assert.equal(check(tree({ ...ok, ".github/workflows/fork-x.yml": next })).length, 1);
+  // A workflow that signs nothing may cache.
+  const plain = step("").replace("permissions:\n  id-token: write\n", "");
+  assert.deepEqual(check(tree({ ...ok, ".github/workflows/fork-x.yml": plain })), []);
+  // The release workflow turns it off in every job that uses the copy.
+  const release = fs.readFileSync(path.join(root, ".github/workflows/fork-release.yml"), "utf8");
+  assert.match(release, /id-token: write/);
+  assert.equal(
+    (release.match(/uses: \.\/\.github\/actions\/fork-setup-ci-deps$/gm) ?? []).length,
+    2,
+  );
+  assert.equal((release.match(/^ +cache-node-modules: "false"$/gm) ?? []).length, 2);
 });
