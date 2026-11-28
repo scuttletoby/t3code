@@ -22,7 +22,7 @@ import { callingThread as threadOfCaller } from "../../mcp/toolkits/waits/callin
 import { unavailable } from "../../mcp/threadAccess.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { LaneStore, type LaneStoreRefused } from "./LaneStore.ts";
-import type { LaneRefusalReason } from "./laneState.ts";
+import { type LaneRefusalReason, normalizeItem, own } from "./laneState.ts";
 
 /** Notes per lane the board shows, newest last; the store keeps more. */
 export const BOARD_NOTES_PER_LANE = 3;
@@ -177,8 +177,8 @@ export const laneBoardCall = Effect.fn("laneTools.board")(function* () {
   );
   const names = [...new Set([...Object.keys(definitions), ...Object.keys(board.lanes)])].toSorted();
   const lanes = names.map((lane) => {
-    const entry = Object.hasOwn(board.lanes, lane) ? board.lanes[lane] : undefined;
-    const definition = Object.hasOwn(definitions, lane) ? definitions[lane] : undefined;
+    const entry = own(board.lanes, lane);
+    const definition = own(definitions, lane);
     return {
       lane,
       owns: definition?.owns ?? [],
@@ -214,14 +214,28 @@ const actorOf = (
   threadId,
 });
 
+/** The item in the store's one spelling (owner/repo lower-case), or the refusal for text that is none. */
+const itemOf = (text: string) => {
+  const item = normalizeItem(text);
+  return item === null
+    ? Effect.fail(
+        new LaneToolFailure({
+          code: "bad-item",
+          message: `'${text}' is not an item: pr:owner/repo#12 or issue:owner/repo#12.`,
+        }),
+      )
+    : Effect.succeed(item);
+};
+
 /** `lane_claim`: the calling thread claims for its lane; a replaced thread is refused. */
 export const laneClaimCall = Effect.fn("laneTools.claim")(function* (
   input: typeof LaneClaimInput.Type,
 ) {
   const calling = yield* callingThread();
+  const item = yield* itemOf(input.item);
   const store = yield* LaneStore;
   return yield* refusedAs(
-    store.claim(calling.caller.projectId, actorOf(input, calling.caller.id), input.item),
+    store.claim(calling.caller.projectId, actorOf(input, calling.caller.id), item),
   );
 });
 
@@ -229,9 +243,10 @@ export const laneReleaseCall = Effect.fn("laneTools.release")(function* (
   input: typeof LaneReleaseInput.Type,
 ) {
   const calling = yield* callingThread();
+  const item = yield* itemOf(input.item);
   const store = yield* LaneStore;
   const released = yield* refusedAs(
-    store.release(calling.caller.projectId, actorOf(input, calling.caller.id), input.item),
+    store.release(calling.caller.projectId, actorOf(input, calling.caller.id), item),
   );
   return { released };
 });

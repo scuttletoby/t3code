@@ -32,6 +32,7 @@ const MAIN = ThreadId.make("thread-main");
 const PR_LANE = ThreadId.make("thread-pr-lane");
 const CI_LANE = ThreadId.make("thread-ci-lane");
 const ELSEWHERE = ThreadId.make("thread-elsewhere");
+const ISSUES_THREAD = ThreadId.make("thread-issues");
 const PR = "pr:owner/repo#12";
 const ISSUE = "issue:owner/repo#3";
 
@@ -221,6 +222,67 @@ it.layer(NodeServices.layer)("lane tools", (it) => {
         ).toMatchObject({ lane: "ci" });
       }).pipe(Effect.provide(toolsLayer(directory, ON)));
     }),
+  );
+
+  it.effect(
+    "an item is one item whatever its owner/repo case; a lane named like a built-in key is unknown",
+    () =>
+      Effect.gen(function* () {
+        const { directory } = yield* workspace;
+        yield* Effect.gen(function* () {
+          succeeded(yield* call(MAIN, "lane_start", { lane: "pr-queue", threadId: PR_LANE }));
+          succeeded(yield* call(MAIN, "lane_start", { lane: "ci", threadId: CI_LANE }));
+          const claimed = succeeded(
+            yield* call(PR_LANE, "lane_claim", {
+              lane: "pr-queue",
+              generation: 1,
+              item: " pr:Owner/Repo#12 ",
+            }),
+          );
+          expect(claimed.claim).toMatchObject({ item: PR });
+          // Another spelling of the same item is the same item.
+          expect(
+            failed(
+              yield* call(CI_LANE, "lane_claim", {
+                lane: "ci",
+                generation: 1,
+                item: "pr:OWNER/repo#12",
+              }),
+            ),
+          ).toMatchObject({ code: "claimed", holder: { item: PR } });
+          expect(
+            succeeded(
+              yield* call(PR_LANE, "lane_release", {
+                lane: "pr-queue",
+                generation: 1,
+                item: "pr:owner/REPO#12",
+              }),
+            ).released,
+          ).toMatchObject({ item: PR });
+          expect(
+            failed(
+              yield* call(PR_LANE, "lane_release", {
+                lane: "pr-queue",
+                generation: 1,
+                item: "#12",
+              }),
+            ),
+          ).toMatchObject({ code: "bad-item" });
+          // Inherited keys of a plain object are not lanes.
+          for (const lane of ["constructor", "toString", "__proto__"]) {
+            expect(
+              failed(yield* call(MAIN, "lane_start", { lane, threadId: ISSUES_THREAD })),
+              lane,
+            ).toMatchObject({ code: "unknown-lane" });
+          }
+          const board = succeeded(yield* call(MAIN, "lane_board", {}));
+          expect(board.lanes.map((lane: { lane: string }) => lane.lane)).toEqual([
+            "ci",
+            "issues",
+            "pr-queue",
+          ]);
+        }).pipe(Effect.provide(toolsLayer(directory, ON)));
+      }),
   );
 
   it.effect("lane_stop releases the lane's claims; the old thread can no longer claim", () =>
