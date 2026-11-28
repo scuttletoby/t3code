@@ -465,7 +465,8 @@ jobs:
             !/.repos/
           sparse-checkout-cone-mode: false
 
-      # Pinned release, verified by checksum. Upstream's own workflows use runner
+      # Pinned release, verified by checksum, downloaded with retries (as fork-secret-scan.yml's gitleaks,
+      # fork-release-downloads.test.py). Upstream's own workflows use runner
       # labels this fork does not have, so only the fork's workflows are linted.
       - name: Lint fork workflows (actionlint)
         env:
@@ -473,14 +474,15 @@ jobs:
           SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
           archive="actionlint_${VERSION}_linux_amd64.tar.gz"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-max-time 120 --connect-timeout 20 --max-time 120 \
+            -o "$RUNNER_TEMP/$archive" \
             "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/${archive}"
           echo "$SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color .github/workflows/fork-*.yml
 
       # The fleet launcher runs as root on each fleet host: every shellcheck finding is fixed or
-      # disabled with its reason there (#667). Pinned release, verified by checksum, as a fleet
+      # disabled with its reason there (#667). Pinned release, verified by checksum (retries as above), as a fleet
       # runner need not have it; a few seconds.
       - name: Lint the fleet launcher (shellcheck)
         env:
@@ -488,7 +490,8 @@ jobs:
           SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
         run: |
           archive="shellcheck-v${VERSION}.linux.x86_64.tar.xz"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-max-time 120 --connect-timeout 20 --max-time 120 \
+            -o "$RUNNER_TEMP/$archive" \
             "https://github.com/koalaman/shellcheck/releases/download/v${VERSION}/${archive}"
           echo "$SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
           tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" "shellcheck-v${VERSION}/shellcheck"

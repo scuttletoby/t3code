@@ -68,6 +68,7 @@
 .github/scripts/fork-changes-list.test.cjs
 .github/scripts/fork-release-workflow.test.py ok lines
 .github/scripts/fork-release.test.sh ~5s
+.github/scripts/fork-release-downloads.test.py ~8s unittest
 .github/scripts/fork-run-alert.test.sh
 .github/scripts/fork-reusable-permissions.test.py ok lines
 .github/scripts/fork-schema-check.test.cjs ~6s
