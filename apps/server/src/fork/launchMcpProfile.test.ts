@@ -8,6 +8,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
   OrchestratorMcpFailure,
+  ProviderDriverKind,
   type OrchestrationV2ThreadShell,
   type Project as ProjectRecord,
   ProjectId,
@@ -15,10 +16,12 @@ import {
   type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
+import { TestClock } from "effect/testing";
 
 import * as ServerConfig from "../config.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
@@ -40,6 +43,7 @@ import * as Project from "../project/ProjectService.ts";
 import * as DocumentText from "../provider/DocumentText.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import {
@@ -91,6 +95,8 @@ const harness = (
     readonly slots?: SlotWorld;
     /** This machine's providers (none unless named). */
     readonly providers?: ReadonlyArray<ServerProvider>;
+    /** This machine's usage pace (none unless named). */
+    readonly pacer?: Layer.Layer<UsagePacer.UsagePacer>;
   } = {},
 ) => {
   const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
@@ -187,6 +193,7 @@ const harness = (
       namedProjectsRoot: "/projects",
       isScratchProject: () => Effect.succeed(false),
     }),
+    options.pacer ?? Layer.empty,
     DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer)),
   ).pipe(
     Layer.provideMerge(GitVcsDriver.layer),
@@ -210,6 +217,8 @@ const harness = (
     readonly message?: string | null;
     /** The launch's model; `null` names none (it inherits the caller's). */
     readonly modelSelection?: Record<string, unknown> | null;
+    /** The parent there, as a linked machine's `delegate_task` child names it. */
+    readonly delegatedFrom?: Record<string, unknown>;
   }) =>
     Effect.gen(function* () {
       const toolkit = yield* ProjectToolkit.pipe(
@@ -233,6 +242,7 @@ const harness = (
                 },
               }),
           ...(input.environmentId === undefined ? {} : { environmentId: input.environmentId }),
+          ...(input.delegatedFrom === undefined ? {} : { delegatedFrom: input.delegatedFrom }),
           ...(input.clientRequestId === undefined
             ? {}
             : { clientRequestId: input.clientRequestId }),
@@ -870,3 +880,97 @@ describe("the model policy on t3_thread_launch: an option the policy cannot read
     }),
   );
 });
+
+// Placement P1: the effort the owner's setting lowers for a linked machine's delegated task is the
+// one the started thread runs at (the gate's result spreads over the launch, after its model).
+it.effect(
+  "a linked machine's delegated task on an ahead account starts at the lowered effort",
+  () =>
+    Effect.gen(function* () {
+      const nowMs = Date.parse("2026-11-13T12:00:00.000Z");
+      yield* TestClock.setTime(nowMs);
+      const iso = (offsetMs: number) => DateTime.formatIso(DateTime.makeUnsafe(nowMs + offsetMs));
+      const instanceId = ProviderInstanceId.make("codex");
+      const codex: ServerProvider = {
+        instanceId,
+        driver: ProviderDriverKind.make("codex"),
+        enabled: true,
+        installed: true,
+        status: "ready",
+        version: null,
+        auth: { status: "authenticated" },
+        checkedAt: iso(-60_000),
+        models: [
+          {
+            slug: "gpt-5.4",
+            name: "gpt-5.4",
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: [
+                {
+                  id: "reasoningEffort",
+                  label: "Reasoning",
+                  type: "select",
+                  options: [
+                    { id: "medium", label: "Medium" },
+                    { id: "high", label: "High", isDefault: true },
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+        slashCommands: [],
+        skills: [],
+        // Half way through the week at 60% used: ahead of the even pace.
+        usageLimits: {
+          checkedAt: iso(-60_000),
+          windows: [
+            {
+              id: "seven_day",
+              kind: "weekly",
+              label: "Weekly",
+              usedPercent: 60,
+              resetsAt: iso(3.5 * 24 * 3_600_000),
+              windowDurationMins: 7 * 24 * 60,
+            },
+          ],
+        },
+      };
+      const { launched, launch } = harness(
+        { usagePacingGate: "enforce", usagePacingLowerEffort: { high: "medium" } },
+        {
+          caller: "linked agent",
+          providers: [codex],
+          pacer: Layer.mock(UsagePacer.UsagePacer)({
+            paceOf: (id) =>
+              Effect.succeed(
+                UsagePacer.paceInstance({
+                  instanceId: id,
+                  provider: id === instanceId ? codex : undefined,
+                  history: [],
+                  pacing: UsagePacer.DEFAULT_PACING,
+                  nowMs,
+                  staleAfterMs: 30 * 60_000,
+                }),
+              ),
+          }),
+        },
+      );
+      const chunks = yield* launch({
+        modelSelection: {
+          instanceId,
+          model: "gpt-5.4",
+          options: [{ id: "reasoningEffort", value: "high" }],
+        },
+        delegatedFrom: { environmentId: THERE, threadId: "thread:parent-there", title: "Parent" },
+      });
+      expect(refusal(chunks)).toBeUndefined();
+      expect(launched).toHaveLength(1);
+      expect(launched[0]?.modelSelection).toEqual({
+        instanceId,
+        model: "gpt-5.4",
+        options: [{ id: "reasoningEffort", value: "medium" }],
+      });
+    }),
+);

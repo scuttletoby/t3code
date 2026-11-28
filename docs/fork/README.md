@@ -188,6 +188,13 @@ What happens when an agent starts a task with `delegate_task`. `"off"`: nothing,
 on an account that is ahead of its pace moves to another account of the same provider, runs at a
 lower effort (`usagePacingLowerEffort`), or is refused for now and the agent asks again later.
 
+A `delegate_task` child that a linked machine sends here runs on this machine's accounts, so this
+machine's own setting decides it, before its agent slot, as for a task started here: the
+`usagePacingLowerEffort` step applies here, once, and the child starts at the lowered effort (an
+effort this machine's `modelPolicy` does not allow keeps the checked one). It never moves to another account: the reply does not offer one, as this machine cannot tell whether
+the project there allows it. A refusal has the code `usage_pacing_hold`, which the sending machine
+gets back as it is; the owner's own launches from a linked machine are not paced.
+
 Switch on: **Settings → Fork**, section Plan usage pacing, "Pace agents by plan usage", or in `settings.json`:
 `"usagePacingGate": "advise"` (try `advise` before `enforce`).
 
@@ -796,7 +803,8 @@ These routes start a new agent run and go through the same gate, with the same c
 - A call that asks another machine to start an agent (`delegate_task`, `t3_thread_launch` or
   `t3_thread_send` with an `environmentId`) is decided by that machine's gate, the one that would
   run the agent; this machine's gate is not asked. A machine on a build without this gate starts
-  it as before.
+  it as before. A `delegate_task` child is first paced there by that machine's
+  `usagePacingGate`, so a held task takes no slot.
 
 Only an agent caller is told it can wait for a slot (`wait_for`) and end its turn. A start with no
 caller here (another machine's call, a scheduled run) is told plainly what happened: the machine
