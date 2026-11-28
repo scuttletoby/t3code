@@ -509,7 +509,12 @@
     },
     "apps/web/src/components/ChatView.tsx": {
       "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts). A thread whose playtest session is on shows the Playtest chip with its End button in the composer's banners (playtest F5, #889): one hook call and its items spread into both banner lists (fork/playtest/usePlaytestChipItems.tsx). A thread whose next turn names no effort while the model policy is on shows a warning in the composer's banners (model policy, #876): one hook call and its items spread into both banner lists (fork/modelPolicy/useForkNoEffortItems.ts).",
-      "added": [],
+      "added": [
+        "import { useForkPlaytestItems } from \"./fork/playtest/usePlaytestChipItems\"; // Fork (playtest)",
+        "const forkPlaytestItems = useForkPlaytestItems(routeThreadRef); // Fork (playtest)",
+        "...forkPlaytestItems, // Fork (playtest)",
+        "...forkPlaytestItems, // Fork (playtest)"
+      ],
       "announced": {
         "since": "2026-11-28",
         "added": [
@@ -517,10 +522,6 @@
           "const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)",
           "...forkHandoffWaitingItems, // Fork (HO5)",
           "...forkHandoffWaitingItems, // Fork (HO5)",
-          "import { useForkPlaytestItems } from \"./fork/playtest/usePlaytestChipItems\"; // Fork (playtest)",
-          "const forkPlaytestItems = useForkPlaytestItems(routeThreadRef); // Fork (playtest)",
-          "...forkPlaytestItems, // Fork (playtest)",
-          "...forkPlaytestItems, // Fork (playtest)",
           "import { useForkNoEffortItems } from \"./fork/modelPolicy/useForkNoEffortItems\"; // Fork (model policy)",
           "const forkNoEffortItems = useForkNoEffortItems(routeThreadRef); // Fork (model policy)",
           "...forkNoEffortItems, // Fork (model policy)",
