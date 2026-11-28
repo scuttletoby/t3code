@@ -607,15 +607,28 @@ export function checkModelPolicyPick(
   };
 }
 
-/** One row as the refusal lists it. */
+/**
+ * One row as the refusal lists it. A hand-written effort that is the row's driver's no-effort
+ * choice ({@link MODEL_POLICY_NO_EFFORT_CHOICES}, such as Claude's `default`) is left out of the
+ * list and named apart: a pick naming it names no effort, which the row refuses, so the list must
+ * not tell an agent to use it.
+ */
 function modelPolicyRowText(row: ModelPolicyRow): string {
-  const efforts =
-    row.efforts === undefined
-      ? "no effort"
-      : `efforts ${row.efforts.join(", ")}${
-          row.defaultEffort === undefined ? "" : `; default ${row.defaultEffort}`
-        }`;
-  return `${row.driver} ${row.model} (${efforts})`;
+  if (row.efforts === undefined) return `${row.driver} ${row.model} (no effort)`;
+  const effortId = MODEL_POLICY_DRIVER_EFFORT_IDS[row.driver] ?? "";
+  const noEffort = (effort: string) => sendsNoEffort(row.driver, effortId, effort);
+  const usable = row.efforts.filter((effort) => !noEffort(effort));
+  const dropped = row.efforts.filter(noEffort);
+  const list = usable.length === 0 ? "efforts none usable" : `efforts ${usable.join(", ")}`;
+  const defaultText =
+    row.defaultEffort === undefined || noEffort(row.defaultEffort)
+      ? ""
+      : `; default ${row.defaultEffort}`;
+  const droppedText =
+    dropped.length === 0
+      ? ""
+      : `; ${dropped.join(", ")} left out: on ${row.driver} it sends no effort, so a pick naming it is refused`;
+  return `${row.driver} ${row.model} (${list}${defaultText}${droppedText})`;
 }
 
 /** The allowed rows as one line, for a refusal or a note. */
