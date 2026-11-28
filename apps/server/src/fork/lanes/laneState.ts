@@ -40,6 +40,12 @@ const LaneEntry = Schema.Struct({
   generation: Schema.Number,
   threadId: ThreadId,
   startedAt: Schema.String,
+  /**
+   * The thread that started it (an orchestrator): while it is a live thread of the project, it
+   * alone (or the owner) stops the lane. Absent (the owner started it, or an older server rewrote
+   * the file and dropped the key): no starter to wait for, so any thread of the project stops it.
+   */
+  startedBy: Schema.optionalKey(ThreadId),
   stoppedAt: Schema.NullOr(Schema.String),
   /** Every thread that acted as this lane, oldest first, at most {@link THREADS_PER_LANE}. */
   threads: Schema.Array(LaneThread),
@@ -114,6 +120,8 @@ export const encodeLaneState = (state: LaneProjectState): string =>
 export type LaneRefusalReason =
   /** `server.lanes.enabled` is off. */
   | "lanes-off"
+  /** The server settings cannot be read now, so whether lanes are on is unknown. */
+  | "settings-unreadable"
   /** The project's lane file exists but cannot be read or decoded. */
   | "store-unreadable"
   /** The project's lane file cannot be written now (a full disk, no permission). */
@@ -124,6 +132,10 @@ export type LaneRefusalReason =
   | "already-running"
   /** The caller is not the lane's current thread and generation (a replaced or old thread). */
   | "stale-owner"
+  /** A thread named as the lane's thread is the thread that starts the lane. */
+  | "self-lane"
+  /** Only the thread that started a lane (while it is a live thread of the project), or the owner, stops it. */
+  | "not-starter"
   /** The lane's definition does not own this kind of item. */
   | "kind-not-owned"
   | "bad-item"
@@ -172,6 +184,15 @@ const ok = <A>(state: LaneProjectState, value: A, changed = true): LaneStep<A> =
 
 /** The lanes the settings define, by name. */
 export type LaneDefinitions = { readonly [name: string]: LaneDefinition };
+
+/**
+ * Who starts or stops a lane: a thread (an orchestrator, through the lane tools), or the owner.
+ * `goneStarter`: a starter the caller found is no longer a live thread of the project; a stop
+ * passes the starter check only while the lane still names that same starter.
+ */
+export type LaneOperator =
+  | { readonly _tag: "thread"; readonly threadId: ThreadId; readonly goneStarter?: ThreadId }
+  | { readonly _tag: "owner" };
 
 const definitionOf = (definitions: LaneDefinitions, lane: string): LaneDefinition | undefined =>
   own(definitions, lane);
@@ -273,10 +294,22 @@ const rememberThread = (
 export function startLane(
   state: LaneProjectState,
   definitions: LaneDefinitions,
-  input: { readonly lane: string; readonly threadId: ThreadId; readonly now: string },
+  input: {
+    readonly lane: string;
+    readonly threadId: ThreadId;
+    readonly by: LaneOperator;
+    readonly now: string;
+  },
 ): LaneStepResult<LaneEntry> {
   if (definitionOf(definitions, input.lane) === undefined) {
     return refuse("unknown-lane", `The settings do not define the lane '${input.lane}'.`);
+  }
+  // The starter stops the lane; as the lane's thread too, it could stop and claim at once.
+  if (input.by._tag === "thread" && input.by.threadId === input.threadId) {
+    return refuse(
+      "self-lane",
+      `Thread ${input.threadId} starts the lane '${input.lane}', so it cannot be the lane's thread: name another thread of the project.`,
+    );
   }
   const current = own(state.lanes, input.lane);
   if (current?.status === "running") {
@@ -287,12 +320,24 @@ export function startLane(
           `The lane '${input.lane}' already runs in thread ${current.threadId} (generation ${current.generation}).`,
         );
   }
+  // One lane per thread: run records and claims name a thread's lane by its thread.
+  const busy = Object.entries(state.lanes).find(
+    ([lane, entry]) =>
+      lane !== input.lane && entry.status === "running" && entry.threadId === input.threadId,
+  );
+  if (busy !== undefined) {
+    return refuse(
+      "already-running",
+      `Thread ${input.threadId} already acts for the lane '${busy[0]}'; a lane needs its own thread.`,
+    );
+  }
   const generation = (current?.generation ?? 0) + 1;
   const entry: LaneEntry = {
     status: "running",
     generation,
     threadId: input.threadId,
     startedAt: input.now,
+    ...(input.by._tag === "thread" ? { startedBy: input.by.threadId } : {}),
     stoppedAt: null,
     threads: rememberThread(current?.threads ?? [], generation, input.threadId, input.now),
   };
@@ -331,6 +376,12 @@ export function replaceLaneThread(
       `The lane '${input.lane}' is at generation ${current.generation}, not ${input.fromGeneration}.`,
     );
   }
+  if (current.startedBy === input.threadId) {
+    return refuse(
+      "self-lane",
+      `Thread ${input.threadId} started the lane '${input.lane}', so it cannot be the lane's thread.`,
+    );
+  }
   const generation = current.generation + 1;
   const entry: LaneEntry = {
     ...current,
@@ -351,13 +402,26 @@ export function replaceLaneThread(
 
 /**
  * Switches a lane off and releases its claims (returned). A lane not running, or no longer
- * defined, stops too: stopping is how its claims go. Repeating it changes nothing.
+ * defined, stops too: stopping is how its claims go. Repeating it changes nothing. Only the
+ * thread that started the lane, or the owner, stops it.
  */
 export function stopLane(
   state: LaneProjectState,
-  input: { readonly lane: string; readonly now: string },
+  input: { readonly lane: string; readonly by: LaneOperator; readonly now: string },
 ): LaneStepResult<ReadonlyArray<LaneClaim>> {
   const current = own(state.lanes, input.lane);
+  const starter = current?.startedBy;
+  if (
+    starter !== undefined &&
+    input.by._tag === "thread" &&
+    starter !== input.by.threadId &&
+    starter !== input.by.goneStarter
+  ) {
+    return refuse(
+      "not-starter",
+      `Thread ${starter} started the lane '${input.lane}'; while it is a live thread of the project, only it (or the owner) stops it.`,
+    );
+  }
   const released = Object.values(state.claims).filter((claim) => claim.lane === input.lane);
   if ((current === undefined || current.status === "stopped") && released.length === 0) {
     return ok(state, [], false);

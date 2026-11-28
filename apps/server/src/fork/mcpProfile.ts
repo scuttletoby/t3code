@@ -83,6 +83,12 @@ export const MCP_T3_TOOL_OWN_GROUPS: Readonly<
   lens_start: { toolkit: "waits", group: "orchestration" },
   // Fork (review rules): lens_start's children call it; they carry the profile of the thread that had lens_start.
   lens_report: { toolkit: "waits", group: "orchestration" },
+  // Fork (lanes, issue 1156): switching lanes and claiming items is its own grant, not waiting.
+  lane_start: { toolkit: "waits", group: "lanes" },
+  lane_stop: { toolkit: "waits", group: "lanes" },
+  lane_board: { toolkit: "waits", group: "lanes" },
+  lane_claim: { toolkit: "waits", group: "lanes" },
+  lane_release: { toolkit: "waits", group: "lanes" },
 };
 
 /** {@link mcpT3ToolGroup}'s answer for a tool no profile may keep. */

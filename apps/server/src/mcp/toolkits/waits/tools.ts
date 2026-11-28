@@ -31,6 +31,20 @@ import {
   LensReportToolInput,
   LensReportToolResult,
 } from "../../../fork/reviewRules/lensReportTool.ts";
+import {
+  LaneBoardResult,
+  LaneClaimInput,
+  LaneClaimResult,
+  LaneReleaseInput,
+  LaneReleaseResult,
+  LaneStartInput,
+  LaneStartResult,
+  LaneStopInput,
+  LaneStopResult,
+  LaneToolsFailure,
+} from "../../../fork/lanes/laneTools.ts";
+import { LaneStore } from "../../../fork/lanes/LaneStore.ts";
+import { ServerSettingsService } from "../../../serverSettings.ts";
 import { TaskListInput, TaskListResult } from "./taskList.ts";
 
 const dependencies = [
@@ -172,6 +186,91 @@ const LensReportTool = Tool.make("lens_report", {
   .annotate(Tool.OpenWorld, true)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
+// Fork (lanes, issue 1156): the lane tools, in their own group `lanes`; hidden while lanes are off.
+const laneDependencies = [
+  McpInvocationContext.McpInvocationContext,
+  ThreadManagementService.ThreadManagementService,
+  LaneStore,
+  ServerSettingsService,
+];
+
+// Each lane tool repeats safely: the same start, stop, claim or release twice changes nothing.
+const LaneStartTool = Tool.make("lane_start", {
+  description:
+    "Start a settings-defined lane with a thread of this project acting for it. Returns the generation that thread passes to lane_claim and lane_release.",
+  parameters: LaneStartInput,
+  success: LaneStartResult,
+  failure: LaneToolsFailure,
+  failureMode: "return",
+  dependencies: laneDependencies,
+})
+  .annotate(Tool.Title, "Start a lane")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
+const LaneStopTool = Tool.make("lane_stop", {
+  description: "Stop a lane and release its claims.",
+  parameters: LaneStopInput,
+  success: LaneStopResult,
+  failure: LaneToolsFailure,
+  failureMode: "return",
+  dependencies: laneDependencies,
+})
+  .annotate(Tool.Title, "Stop a lane")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
+const LaneBoardTool = Tool.make("lane_board", {
+  description: "This project's lanes, their threads, claims, escalations and recent notes.",
+  // No `parameters`: an empty Schema.Struct serializes to a schema MCP clients reject (worktree/tools.ts).
+  success: LaneBoardResult,
+  failure: LaneToolsFailure,
+  failureMode: "return",
+  dependencies: laneDependencies,
+})
+  .annotate(Tool.Title, "Lane board")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
+const LaneClaimTool = Tool.make("lane_claim", {
+  description: "From a lane's thread: claim an item. One lane per item.",
+  parameters: LaneClaimInput,
+  success: LaneClaimResult,
+  failure: LaneToolsFailure,
+  failureMode: "return",
+  dependencies: laneDependencies,
+})
+  .annotate(Tool.Title, "Claim an item")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
+const LaneReleaseTool = Tool.make("lane_release", {
+  description: "From a lane's thread: release its claim on an item.",
+  parameters: LaneReleaseInput,
+  success: LaneReleaseResult,
+  failure: LaneToolsFailure,
+  failureMode: "return",
+  dependencies: laneDependencies,
+})
+  .annotate(Tool.Title, "Release an item")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
 export const WaitsToolkit = Toolkit.make(
   WaitForTool,
   WaitListTool,
@@ -180,4 +279,9 @@ export const WaitsToolkit = Toolkit.make(
   PlaytestTool,
   LensStartTool,
   LensReportTool,
+  LaneStartTool,
+  LaneStopTool,
+  LaneBoardTool,
+  LaneClaimTool,
+  LaneReleaseTool,
 );

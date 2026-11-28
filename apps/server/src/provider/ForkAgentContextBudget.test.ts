@@ -14,6 +14,9 @@ import { ThreadManagementService } from "../orchestration-v2/ThreadManagementSer
 import { PeerForwarding } from "../peer/PeerForwarding.ts";
 import { RemoteDelegation } from "../peer/RemoteDelegation.ts";
 import { Playtest } from "../playtest/PlaytestLayer.ts";
+import { LaneStore } from "../fork/lanes/LaneStore.ts";
+import { LANE_TOOLS } from "../fork/lanes/laneToolsVisibility.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 import { Waits } from "../waits/WaitWorker.ts";
 import budget from "./forkAgentContextBudget.json" with { type: "json" };
 
@@ -21,6 +24,8 @@ import budget from "./forkAgentContextBudget.json" with { type: "json" };
 const toolHandlerServices = Layer.mergeAll(
   Layer.mock(ThreadManagementService)({}),
   Layer.mock(Waits)({}),
+  Layer.mock(LaneStore)({}),
+  Layer.mock(ServerSettingsService)({}),
   Layer.mock(RemoteDelegation)({}),
   Layer.mock(PeerForwarding)({}),
   Layer.mock(Playtest)({ filePath: "unused" }),
@@ -36,17 +41,24 @@ const layerForkTools = McpHttpServer.layerForkTools.pipe(
 it.effect("fork tool context matches the fork's committed budget", () =>
   Effect.gen(function* () {
     const mcp = yield* McpServer.McpServer;
-    const measured = {
-      // The model sees these fields. outputSchema and annotations are protocol metadata.
-      mcpToolListJsonBytes: utf8Bytes(
+    // The model sees these fields. outputSchema and annotations are protocol metadata.
+    const bytesOf = (tools: typeof mcp.tools) =>
+      utf8Bytes(
         JSON.stringify(
-          mcp.tools.map(({ tool }) => ({
+          tools.map(({ tool }) => ({
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema,
           })),
         ),
-      ),
+      );
+    // The lane tools are sent only while server.lanes.enabled is on (off by default): the T3 tool
+    // rule leaves them out of tools/list (mcpT3ToolFilter.test.ts), so they are counted apart.
+    const lanes = mcp.tools.filter(({ tool }) => LANE_TOOLS.has(tool.name));
+    expect(lanes.map(({ tool }) => tool.name).toSorted()).toEqual([...LANE_TOOLS].toSorted());
+    const measured = {
+      mcpToolListJsonBytes: bytesOf(mcp.tools.filter(({ tool }) => !LANE_TOOLS.has(tool.name))),
+      laneToolsJsonBytesWhenLanesOn: bytesOf(lanes),
     };
 
     expect(

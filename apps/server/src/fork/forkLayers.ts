@@ -63,8 +63,9 @@ export const layerRuntimeServices = Layer.mergeAll(
   SlotGate.layer,
   HeadlessUsageRefresher.layer,
   HandoffService.layer,
-  // The lane store tells run records which lane a run worked for (issue 1156; off by default).
-  RunRecorder.layer.pipe(Layer.provide(LaneStore.layer)),
+  // The lane store tells run records which lane a run worked for, and serves the lane tools
+  // (issue 1156; off by default). One store, so one lock, for both.
+  RunRecorder.layer.pipe(Layer.provideMerge(LaneStore.layer)),
   DelegatedResultReminder.layer,
   StopFinishedChildren.layer,
   ThreadRoleTargets.layer,
