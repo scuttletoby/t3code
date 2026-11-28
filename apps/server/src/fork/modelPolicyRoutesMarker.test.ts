@@ -11,13 +11,17 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import type * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import type * as Path from "effect/Path";
 
 import * as ServerConfig from "../config.ts";
 import * as ForkLayers from "./forkLayers.ts";
 import * as ModelPolicyRoutesMarker from "./modelPolicyRoutesMarker.ts";
 
-const withConfig = <A, E>(effect: Effect.Effect<A, E, ServerConfig.ServerConfig>) =>
+const withConfig = <A, E>(
+  effect: Effect.Effect<A, E, ServerConfig.ServerConfig | FileSystem.FileSystem | Path.Path>,
+) =>
   effect.pipe(
     Effect.provide(
       ServerConfig.layerTest(process.cwd(), { prefix: "t3-model-policy-marker-" }).pipe(

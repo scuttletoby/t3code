@@ -7,6 +7,7 @@ import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../config.ts";
 import type { PolicyRoute } from "./modelPolicyCheck.ts";
@@ -23,8 +24,15 @@ export const MODEL_POLICY_CHECKED_ROUTES = [
   "create_threads",
 ] as const satisfies ReadonlyArray<PolicyRoute>;
 
+const MarkerContents = Schema.Struct({
+  version: Schema.Literal(1),
+  pid: Schema.Number,
+  modelPolicyRoutes: Schema.Array(Schema.String),
+});
+const encodeMarker = Schema.encodeEffect(Schema.fromJsonString(MarkerContents));
+
 /** What the marker holds for the process `pid`. */
-export const markerContents = (pid: number) => ({
+export const markerContents = (pid: number): typeof MarkerContents.Type => ({
   version: 1,
   pid,
   modelPolicyRoutes: [...MODEL_POLICY_CHECKED_ROUTES],
@@ -40,10 +48,8 @@ export const layer = Layer.effectDiscard(
     const config = yield* ServerConfig.ServerConfig;
     const path = yield* Path.Path;
     const filePath = markerPath(path, config.serverRuntimeStatePath);
-    yield* writeFileStringAtomically({
-      filePath,
-      contents: `${JSON.stringify(markerContents(process.pid))}\n`,
-    }).pipe(
+    yield* encodeMarker(markerContents(process.pid)).pipe(
+      Effect.flatMap((json) => writeFileStringAtomically({ filePath, contents: `${json}\n` })),
       Effect.catchCause((cause) =>
         Effect.logWarning("model policy routes marker: write failed", { filePath, cause }),
       ),
