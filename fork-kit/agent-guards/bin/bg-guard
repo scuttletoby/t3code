@@ -5,8 +5,9 @@ Part of fork-kit/agent-guards (README.md there: install, settings entry, the mac
 Why: in some hosts (child threads, headless runs) the end of a background command never wakes the agent, so it
 stalls for hours (several agents did). This hook blocks such a stop once per try and tells the agent to wait in the
 foreground: t3_background_wait, or a loop on that command's PID (it names each PID), which poll-loop-guard lets
-through because the PID is in the agent's own process tree (tests/poll-loop.test.py, BgGuardAgrees, holds the two
-to that). At most maxBlocks blocks per session, so a deliberate leftover (a test server) never loops.
+through because the PID is in the agent's own process tree, and still when one of the PIDs it named has ended
+before that loop starts (it then names no process: `while kill -0 A || kill -0 B` ends at once on it; tests/
+poll-loop.test.py, BgGuardAgrees and OwnJob, hold the two to that). At most maxBlocks blocks per session, so a deliberate leftover (a test server) never loops.
 
 General (any project, any Claude config dir). Settings, all optional (machine file, bgGuard):
   skipSessionsFiles  files with one session id per line (# comments): sessions never blocked (e.g. orchestrators

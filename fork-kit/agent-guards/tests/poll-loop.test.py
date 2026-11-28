@@ -335,9 +335,10 @@ class Hook(unittest.TestCase):
 
 SID = 'aaaaaaaa-1111-2222-3333-444444444444'      # this session
 OTHER = 'bbbbbbbb-1111-2222-3333-444444444444'    # another one
-TASKS = f'/tmp/claude-1000/-work-p/{SID}/tasks'
+TASKS = f'/tmp/claude-{os.getuid()}/-work-p/{SID}/tasks'
 MINE = 4242                                       # a PID in the agent's own process tree (a stand-in test)
-OWN = G.Own(SID, pid=lambda n: n == MINE)
+ENDED = 4343                                      # a PID that names no process now (a stand-in test)
+OWN = G.Own(SID, pid=lambda n: n == MINE, gone=lambda n: n == ENDED)
 # the clash: bg-guard refuses to end the turn while these jobs run, so a wait on them must pass (the first two are
 # the shapes agents were refused on, 11-28)
 OWN_WAITS = [
@@ -346,7 +347,6 @@ OWN_WAITS = [
     f'until [ -s {TASKS}/x.output ]; do sleep 20; done',
     f'export F={TASKS}/x.output; until grep -q DONE "$F"; do sleep 20; done',
     f'until tail -1 {TASKS}/x.output | grep -q ok; do sleep 20; done',
-    f'while ! jq -e .done {TASKS}/x.output >/dev/null; do sleep 30; done',
     f'until test -s ${{T}}/x.output; do sleep 30; done'.replace('${T}', TASKS),
     f'sleep 300; tail -5 {TASKS}/x.output',
     f'while kill -0 {MINE} 2>/dev/null; do sleep 30; done',
@@ -356,6 +356,13 @@ OWN_WAITS = [
     f'while [ -d /proc/{MINE} ]; do sleep 30; done',
     'make & p=$!; while kill -0 $p; do sleep 10; done',
     f'while kill -0 {MINE} 2>/dev/null || [ ! -s {TASKS}/x.output ]; do sleep 30; done',
+    f'until [[ -s {TASKS}/x.output ]]; do sleep 30; done',
+    f'while ps -p {MINE} -o comm= >/dev/null; do sleep 30; done',
+    f'until grep -qF "all done" {TASKS}/x.output; do sleep 30; done',
+    f'until tail -n 5 {TASKS}/x.output | grep -q x; do sleep 30; done',
+    # bg-guard's wait after one of the jobs it named has ended (it then names no process at all)
+    f'while kill -0 {ENDED} 2>/dev/null || kill -0 {MINE} 2>/dev/null; do sleep 30; done',
+    f'while kill -0 {ENDED} 2>/dev/null; do sleep 30; done',
 ]
 # still refused with the agent's own jobs known: not its own, or CI beside its own
 NOT_OWN = [
@@ -374,6 +381,40 @@ NOT_OWN = [
     f'f=$(ls {TASKS}/*.output); until [ -s "$f" ]; do sleep 20; done',                    # a value not known
     f'until [ -s "{TASKS}/$ID.output" ]; do sleep 20; done',
     f'while kill -0 $(cat {TASKS}/x.pid); do sleep 30; done',
+    f'while ! jq -e .done {TASKS}/x.output >/dev/null; do sleep 30; done',                # jq: not on the list
+    # round 1 of the review (PR #1196): each passed on 2b73dd51
+    f'OUT={TASKS}/x.output; until [[ -s $OUT || -f /tmp/ci-done ]]; do sleep 60; done',   # [[ ]] split at ||
+    f'until [[ -s {TASKS}/x.output && ! -e /tmp/lock ]]; do sleep 60; done',
+    f'until [ -s /proc/{MINE}/cwd/ci-status.txt ]; do sleep 60; done',                    # /proc/<pid>/ reaches
+    f'until grep -q success /proc/{MINE}/root/home/u/ci.json; do sleep 60; done',         # every file
+    f'until find {TASKS} -name b1.output -exec gh pr checks 5 \\; ; do sleep 60; done',     # find runs anything
+    f'until find {TASKS} -newer x -exec gh run view 1 \\; | grep -q completed; do sleep 60; done',
+    f'while ps -e -p {MINE} -o comm | grep -q gh; do sleep 60; done',                     # ps: other selectors
+    f'while ps -p {MINE} -u root >/dev/null; do sleep 60; done',
+    f'while ps -p {MINE} -C gh >/dev/null; do sleep 30; done',
+    f'while ps -p {MINE} --ppid 1 >/dev/null; do sleep 30; done',
+    f'while ! kill -0 {MINE} -5555; do sleep 30; done',                                   # a process group
+    f'until grep -q pass {TASKS}/x.output - < /tmp/ci-status; do sleep 60; done',         # another input
+    f'until grep -q pass {TASKS}/x.output /dev/stdin < /tmp/ci-status; do sleep 60; done',
+    f'until rg --pre=ghcheck -q pass {TASKS}/x.output; do sleep 60; done',                # rg runs a command
+    f'f={TASKS}/x.output; read -r f < /tmp/ptr; until [ -s "$f" ]; do sleep 60; done',    # set again
+    f'f={TASKS}/x.output; for f in /tmp/x; do until [ -s "$f" ]; do sleep 60; done; done',
+    f'f={TASKS}/x; f+=.output; until [ -s "$f" ]; do sleep 60; done',
+    f'P={MINE}; while kill -0 $P; do sleep 30; read P < /run/other.pid; done',
+    f'x && f={TASKS}/x.output; until [ -s "$f" ]; do sleep 60; done',                     # set or not
+    f'f={TASKS}/x.output true; until [ -s "$f" ]; do sleep 60; done',                     # for `true` only
+    f'(f={TASKS}/x.output); until [ -s "$f" ]; do sleep 60; done',                        # in a subshell
+    f'bash -c "f={TASKS}/x.output"; until [ -s "$f" ]; do sleep 60; done',
+    f'declare -n f={TASKS}/x.output; until [ -s "$f" ]; do sleep 60; done',
+    f'until grep -f /tmp/patterns {TASKS}/x.output; do sleep 60; done',                   # an option off the list
+    f'until [ -s /work/{SID}/tasks/x.output ]; do sleep 60; done',                        # not Claude's folder
+    f'until [ -s /tmp/claude-{os.getuid() + 1}/p/{SID}/tasks/x.output ]; do sleep 60; done',   # another user's
+    f'until [ -s {TASKS}/x.log ]; do sleep 60; done',                                     # not a .output
+    # a PID that names no process, anywhere but a `while` loop's own condition: it waits for one to take it
+    f'until kill -0 {ENDED}; do sleep 30; done',
+    f'while ! kill -0 {ENDED}; do sleep 30; done',
+    f'while true; do kill -0 {ENDED} || break; sleep 30; done',
+    f'while bash -c "kill -0 {ENDED}"; do sleep 30; done',
 ]
 
 
@@ -404,8 +445,9 @@ class OwnJob(unittest.TestCase):
     def test_a_pid_test_that_fails_is_not_its_own(self):
         def boom(n):
             raise OSError('gone')
-        self.assertIsNotNone(G.verdict(f'while kill -0 {MINE}; do sleep 30; done', DEFAULTS,
-                                       own=G.Own(SID, pid=boom)))
+        for gone in (lambda n: False, boom):    # a gone test that fails: not gone either
+            self.assertIsNotNone(G.verdict(f'while kill -0 {MINE}; do sleep 30; done', DEFAULTS,
+                                           own=G.Own(SID, pid=boom, gone=gone)))
 
     def test_the_refusal_names_the_own_job_way(self):
         text = G.reason(*G.verdict('until test -f x; do sleep 10; done', DEFAULTS), DEFAULTS)
@@ -425,6 +467,57 @@ class OwnJob(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout), [False, False, True])
 
+
+    def test_a_symlink_on_the_way_makes_no_file_its_own(self):
+        """The path as written must be the real one: a symlink placed as a task file, or as its tasks folder,
+        would make any file its own."""
+        root = tempfile.mkdtemp(prefix='poll-loop-own-')
+        self.addCleanup(shutil.rmtree, root, True)
+        own = G.Own(SID, pid=lambda n: False, roots=[root])
+        tasks = os.path.join(root, f'claude-{os.getuid()}', 'p', SID, 'tasks')
+        os.makedirs(tasks)
+        real = os.path.join(tasks, 'real.output')
+        open(real, 'w').close()
+        os.symlink('/etc/hostname', os.path.join(tasks, 'link.output'))
+        self.assertTrue(own.path(real))
+        self.assertTrue(own.path(os.path.join(tasks, 'not-yet.output')))      # written when the job prints
+        self.assertFalse(own.path(os.path.join(tasks, 'link.output')))
+        other = os.path.join(root, f'claude-{os.getuid()}', 'q', SID)
+        os.makedirs(os.path.join(root, 'elsewhere'))
+        os.makedirs(other)
+        os.symlink(os.path.join(root, 'elsewhere'), os.path.join(other, 'tasks'))
+        self.assertFalse(own.path(os.path.join(other, 'tasks', 'x.output')))
+        for cmd in (f'until [ -s {tasks}/link.output ]; do sleep 60; done',
+                    f'until [ -s {other}/tasks/x.output ]; do sleep 60; done'):
+            self.assertIsNotNone(G.verdict(cmd, DEFAULTS, own=own), cmd)
+        self.assertIsNone(G.verdict(f'until [ -s {real} ]; do sleep 60; done', DEFAULTS, own=own))
+
+    def test_a_pid_that_names_no_process_is_gone_for_real(self):
+        """The hook's own test: a PID above the kernel's highest (2^22) never names a process."""
+        free = 2 ** 22 + 1
+        own = G.Own(SID, pid=lambda n: n == MINE)
+        self.assertTrue(own.gone(free))
+        self.assertFalse(own.gone(os.getpid()))
+        self.assertFalse(own.gone(1))
+        self.assertIsNone(G.verdict(f'while kill -0 {free} 2>/dev/null || kill -0 {MINE} 2>/dev/null; do sleep 30; '
+                                    'done', DEFAULTS, own=own))
+        self.assertIsNotNone(G.verdict(f'until kill -0 {free}; do sleep 30; done', DEFAULTS, own=own))
+        self.assertIsNotNone(G.verdict(f'while kill -0 {os.getpid()}; do sleep 30; done', DEFAULTS, own=own))
+
+    def test_a_monitor_curl_to_anything_but_this_machine_counts_as_ci(self):
+        for cmd in ('until curl -sf localhost:8080/health; do sleep 5; done',
+                    'until curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/ | grep -q 200; do sleep 5; done'):
+            with self.subTest(cmd):
+                self.assertIsNone(G.verdict(cmd, DEFAULTS, own=OWN, monitor=True))
+        for cmd in ('until curl -s https://status.example.com/api | grep -q ok; do sleep 60; done',
+                    'until curl -s example.com/status; do sleep 60; done',
+                    'until curl -s localhost example.com; do sleep 5; done',
+                    'until curl --connect-to localhost:80:example.com:80 localhost; do sleep 5; done',
+                    'until curl -x http://proxy:3128 localhost; do sleep 5; done',
+                    'until curl -s "$URL"; do sleep 5; done',
+                    'until wget -q -O- https://api.github.com/repos/o/r/actions/runs/1; do sleep 60; done'):
+            with self.subTest(cmd):
+                self.assertEqual(G.verdict(cmd, DEFAULTS, own=OWN, monitor=True)[2], 'ci')
 
 def transcript(folder, tool_use_id, name, compact=True, junk=0):
     """A transcript file whose last line is the assistant's tool_use of `name` with that id (after `junk` bytes)."""

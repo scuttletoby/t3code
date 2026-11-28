@@ -25,21 +25,32 @@ under the limit), a sleep with no check after it, a counter test (`[ $n -lt 3 ]`
 command run in the background (`run_in_background`: the host wakes the agent when it ends), and text that only names
 these (echo, a commit message, a heredoc into a file, a comment; a quoted "#1150" is no comment).
 Also lets through a wait on the agent's OWN background job, in the foreground too (bg-guard refuses to let the turn
-end while that job runs, and tells the agent to wait for it: the two must agree): a loop whose every check reads only
-that job, i.e. its output file (`<...>/<session id>/tasks/<task>.output`, Claude Code's file of a run_in_background
-command, found also through a variable: `f=<that file>; until [ -s "$f" ]; do sleep 20; done`) or a process in the
-agent's own process tree (`while kill -0 <pid>; do sleep 30; done`, `ps -p <pid>`, `[ -d /proc/<pid> ]`, or `$!` of
-a job the same command started). A wait on a process outside that tree, another session's file or anything else
-stays refused. And a Monitor: Claude Code runs a Monitor call's command through the Bash hooks with tool_name "Bash",
-so the guard looks the call's tool_use_id up in the transcript (its tail, for up to MONITOR_LOOK seconds, only when it
-found a wait: the line may be written just after the hook starts). A Monitor with an until-condition on a file or a
-process is the right way to wait (it streams, it is no model turn per check), so it passes; a Monitor that polls CI
-or a pull request is refused like a Bash loop. A call it cannot find there counts as Bash (refused as before). Shell text handed on (`bash -c '..'`, `sh -c`,
-`sudo -u x bash -c`, `eval`, `bash <<EOF`, `cat <<EOF | bash`) is read the same way.
+end while that job runs, and tells the agent to wait for it: the two must agree): a loop whose every check is one of a
+few exact forms that read only that job, and nothing else beside it (Own, Reading._own_call):
+  its output file  `[ -s|-f|-e|-r F ]` (test, [, [[, `!` allowed, one test each), or grep/tail/head/cat/wc/ls/stat
+            with options from a short list (OWN_READ) on F and /dev/null; F is Claude Code's file of a
+            run_in_background command, `<tmp>/claude-<uid>/<project>/<session id>/tasks/<task>.output` with no
+            symlink on the way, written out or through a variable set once (`f=F; until [ -s "$f" ]; ...`);
+  its process      `kill -0 <pid>..`, `ps -p <pid>` (with -o/-h only), `[ -d /proc/<pid> ]` (that folder itself),
+            `tail --pid=<pid>`, for a process in the agent's own Claude Code process tree or `$!` of a job the same
+            command started; in a `while` loop's own condition also a PID that names no process now (the job
+            bg-guard named has ended: `while kill -0 A || kill -0 B` then ends at once, not refused).
+Anything else stays refused: another session's or user's file, a process outside that tree, another selector or
+input (`ps -e`, `grep x - < f`, `[[ own || other ]]`), find (-exec), rg (--pre), jq, a value set twice, in a branch,
+a subshell or for one command only. And a Monitor: Claude Code runs a Monitor call's command through the Bash hooks
+with tool_name "Bash", so the guard looks the call's tool_use_id up in the transcript (its tail, for up to
+MONITOR_LOOK seconds, only when it found a wait: the line may be written just after the hook starts). A Monitor with
+an until-condition on a file or a process is the right way to wait (it streams, it is no model turn per check), so
+it passes; a Monitor that polls CI, a pull request or anything else outside this machine (gh, a curl/wget to any URL
+but localhost/127.x/[::1]) is refused like a Bash loop. A call it cannot find there counts as Bash (refused as
+before). Shell text handed on (`bash -c '..'`, `sh -c`, `sudo -u x bash -c`, `eval`, `bash <<EOF`, `cat <<EOF | bash`)
+is read the same way (a value set inside it is not kept).
 Known gaps (misses, on purpose: a false refusal costs more): a count it cannot read (`$(seq 1 $N)`, `[ $n -lt $MAX
 ]`, C-style `for ((..))`) is one round; a script file it does not open; a loop built with a function. Its own-job
-test is narrow the other way (it refuses what it cannot tell is the agent's own): a PID from `$(cat x.pid)` or
-pgrep, a relative path, an option value it does not know (`stat -c %s`), a PID whose process already ended.
+test is narrow the other way (it refuses what it cannot prove is the agent's own): a PID from `$(cat x.pid)` or
+pgrep, a relative path, an option off its list, a PID of an ended job outside `while <cond>` or one that another
+process took again. One the other way: a value set outside `bash -c '...'` counts inside it, although single-quoted
+text there sees it only when it is exported (the guard reads no quotes; at worst it waits on a file of nobody).
 Also refuses (foreground or background: F7, 107 calls in two weeks) a `pkill -f P`, `kill $(pgrep -f P)` or `pgrep -f
 P | xargs kill` whose pattern also matches this command's text: the host runs the command as `bash -c '<text>'`, so
 that shell's command line matches too, pkill spares only itself, and the shell dies (exit 143/144, nothing after it
@@ -92,7 +103,6 @@ INTO_SHELL = re.compile(r'\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:bash|sh|zsh|d
 COUNTER = re.compile(r'\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|[A-Za-z_][A-Za-z0-9_]*|-?\d+')
 DEPTH = 8
 OWN_BG = '\x00bg'            # `$!` after a `&` in the same command: a job this command starts itself
-NEUTRAL = {'/dev/null', '/dev/stdin', '-'}
 OWN_LIST = {'export', 'local', 'declare', 'readonly', 'typeset'}   # assignments as arguments
 VAR = re.compile(r'\$\{(!|[A-Za-z_][A-Za-z0-9_]*)\}|\$(!|[A-Za-z_][A-Za-z0-9_]*)')
 SESSION = re.compile(r'[A-Za-z0-9-]{8,128}')
@@ -100,6 +110,25 @@ TOOL_USE_ID = re.compile(r'[A-Za-z0-9_-]{1,128}')
 MONITOR_LOOK = 1.5           # seconds to look for the tool_use line in the transcript (only when a wait was found)
 TRANSCRIPT_TAIL = 1 << 20    # bytes of the transcript's end that are read
 CLAUDE = 'claude'            # Claude Code's process name (as bg-guard)
+LOCAL_URL = re.compile(r'(?:[a-z][a-z0-9+.-]*://)?(?:[^/@\s]*@)?(?:localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)'
+                       r'(?::\d+)?(?:[/?#].*)?', re.I)
+HOST = re.compile(r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:/.*)?')
+CURL_ELSEWHERE = {'-x', '--proxy', '--preproxy', '--resolve', '--connect-to', '-K', '--config', '--socks5',
+                  '--socks5-hostname', '--socks4', '--socks4a'}
+# the exact forms a check of the agent's own job may take (anything else in such a call: not its own)
+OWN_TEST_FILE = {'-e', '-f', '-s', '-r'}
+OWN_TEST_PROC = {'-d', '-e'}
+OWN_READ = {   # command: (short option letters, options with a value, long options)
+    'grep': (set('qsFEGixwlcvaHhn'), {'-e', '-m'}, {'--quiet', '--silent', '--count', '--fixed-strings',
+                                                    '--extended-regexp', '--ignore-case', '--no-filename'}),
+    'tail': (set('fFqv'), {'-n', '-c'}, {'--follow', '--quiet', '--silent'}),
+    'head': (set('qv'), {'-n', '-c'}, {'--quiet', '--silent'}),
+    'cat': (set('AbeEnstTuv'), set(), set()),
+    'wc': (set('lcwmL'), set(), {'--lines', '--bytes', '--words', '--chars'}),
+    'ls': (set('laAhs1dtrSi'), set(), set()),
+    'stat': (set('Lt'), {'-c'}, set()),
+}
+OWN_READ['egrep'] = OWN_READ['fgrep'] = OWN_READ['grep']
 # pkill/pgrep (procps): the options that take a value (short, then long without "=")
 KILL_SHORT_VALUE = set('gGPstuUFrqOd')
 KILL_LONG_VALUE = {'--signal', '--group', '--parent', '--pgroup', '--session', '--terminal', '--euid', '--uid',
@@ -289,6 +318,29 @@ def substitutions(word):
     return out
 
 
+def pinned(text):
+    """The names this command sets exactly once, by a plain `NAME=value` (or `export NAME=value`), and names nowhere
+    else bare: no `for NAME`, `read NAME`, `NAME+=`, `NAME[..]`, `printf -v NAME`, `unset NAME`, `(( NAME++ ))`. Only
+    these keep a value the guard can know (the text order is then the run order); any other name is not known."""
+    seen, once = {}, set()
+    for m in re.finditer(r'(?<![\w$-])(?<!\$\{)([A-Za-z_][A-Za-z0-9_]*)(=)?', text):
+        name = m.group(1)
+        seen[name] = seen.get(name, 0) + 1
+        if m.group(2) and not text.startswith('==', m.start(2)):
+            once.add(name)
+    return {n for n in once if seen[n] == 1 and not re.search(r'-v\s*' + n + r'\b', text)}
+
+
+def local_url(args):
+    """A curl/wget that asks only this machine: a localhost/127.x/[::1] URL, no other URL or host name, and no
+    option that sends it elsewhere (a proxy, --resolve, --connect-to, a config file)."""
+    if any(a.split('=', 1)[0] in CURL_ELSEWHERE for a in args):
+        return False
+    words = [a for a in args if not a.startswith('-')]
+    return any(LOCAL_URL.fullmatch(a) for a in words) and not any(
+        ('://' in a or HOST.fullmatch(a)) and not LOCAL_URL.fullmatch(a) for a in words)
+
+
 def _ppid(pid):
     try:
         with open(f'/proc/{pid}/stat') as f:
@@ -316,14 +368,20 @@ def claude_pid(start):
 
 
 class Own:
-    """What is the agent's own background job: a file in its session's tasks folder (Claude Code writes a
-    run_in_background command's output there), or a running process under its Claude Code process (not that process
-    itself). `pid` is a test of a PID (the hook's: the process tree in /proc); a session id that is empty or odd
-    makes no file its own."""
+    """What is the agent's own background job: the output file Claude Code writes for its run_in_background command
+    (`<tmp>/claude-<uid>/<project>/<session id>/tasks/<task>.output`, `<tmp>` being /tmp, $TMPDIR or
+    $CLAUDE_CODE_TMPDIR; the path as written must be the real one: no symlink in it), or a running process under its
+    Claude Code process (not that process itself). `pid` is a test of a PID (the hook's: the process tree in /proc),
+    `gone` one that the PID names no process at all; a session id that is empty or odd makes no file its own."""
 
-    def __init__(self, session, pid=None):
+    def __init__(self, session, pid=None, gone=None, roots=None, uid=None):
         self.session = session if isinstance(session, str) and SESSION.fullmatch(session) else ''
         self._pid = pid if pid is not None else self._tree
+        self._gone = gone if gone is not None else (lambda n: not os.path.exists(f'/proc/{n}'))
+        if roots is None:
+            roots = ['/tmp'] + [os.environ.get(k, '') for k in ('TMPDIR', 'CLAUDE_CODE_TMPDIR')]
+        self.roots = sorted({os.path.normpath(r) for r in roots if r and r.startswith('/')})
+        self.uid = os.getuid() if uid is None else uid
         self._root = None
 
     def _tree(self, pid):
@@ -344,19 +402,28 @@ class Own:
         except Exception:   # noqa: BLE001 - cannot tell: not its own
             return False
 
+    def gone(self, n):
+        try:
+            return n > 1 and bool(self._gone(n))
+        except Exception:   # noqa: BLE001 - cannot tell: not gone
+            return False
+
+    def proc(self, p):
+        """`/proc/<pid>` itself (nothing under it: /proc/<pid>/root and cwd reach every file) of its own tree."""
+        m = re.fullmatch(r'/proc/(\d+)/?', p)
+        return bool(m) and self.pid(int(m.group(1)))
+
     def path(self, p):
-        if not p.startswith('/') or '$' in p or '`' in p:
+        if not self.session or not p.startswith('/') or '$' in p or '`' in p or '\x00' in p:
             return False
         p = os.path.normpath(p)
-        m = re.fullmatch(r'/proc/(\d+)(?:/.*)?', p)
-        if m:
-            return self.pid(int(m.group(1)))
-        parts = p.split('/')
-        if not self.session:
-            return False
-        for i in range(len(parts) - 1):
-            if parts[i] == self.session and parts[i + 1] == 'tasks' and len(parts) <= i + 3:
-                return True
+        for root in self.roots:
+            m = re.fullmatch(re.escape(root) + r'/claude-(\d+)/[^/]+/([^/]+)/tasks/[A-Za-z0-9_-]{1,64}\.output', p)
+            if m and int(m.group(1)) == self.uid and m.group(2) == self.session:
+                try:     # no symlink on the way: the file (when it is there) and its folders are where they say
+                    return os.path.realpath(p) == os.path.join(os.path.realpath(root), os.path.relpath(p, root))
+                except (OSError, ValueError):
+                    return False
         return False
 
 
@@ -365,12 +432,18 @@ class Reading:
     counts), or a check after top-level sleeps. A check elsewhere in the command (an `ls` before a retry loop, a
     `cat` of its log after it) does not make a retry loop a wait."""
 
-    def __init__(self, settings, text='', own=None):
+    def __init__(self, settings, text='', own=None, monitor=False):
         self.s = settings
         self.text = text       # the whole command: the shell that runs it has this on its command line
         self.own = own         # an Own, or None: nothing is the agent's own job
+        self.monitor = monitor  # a Monitor's command: a curl to anything but this machine counts as CI
+        self.pinned = pinned(text)   # the names whose value it may know
         self.vars = {}         # NAME -> its value as far as it is known (None: not known)
         self.bg = False        # a `&` was seen: `$!` is a job of this command
+        self.plain = True      # the command being read runs for sure, in this shell (top level, after ; or &)
+        self.negated = False   # the command being read has a `!` before it
+        self.depth = 0         # ... and is in shell text handed on (bash -c, eval, $(..)) when > 0
+        self._bang = False
         self.found = []        # (what it checks, why it is a wait, 'ci' or 'local')
         self.watch = []
         self.kills = []        # the pkill/pgrep calls that also kill the shell running them
@@ -379,11 +452,18 @@ class Reading:
         self.top_slept = 0.0   # the plain sleeps at the top so far (not inside a loop)
         self.stack = [frame('top')]
 
+    def _nested(self, text, depth):
+        """Shell text handed on (bash -c, eval, $(..), watch): a value it sets is not kept (a child shell)."""
+        saved = dict(self.vars)
+        self.read(text, depth)
+        self.vars = saved
+
     def read(self, text, depth=0):
         if depth > DEPTH:
             return
         ts, base = tokens(text), len(self.stack)
         i, at_cmd, piped = 0, True, False
+        last, ifs, paren, dollar = None, 0, 0, 0    # the last separator; if/case, (..) and $(..) it is inside
         while i < len(ts):
             t = ts[i]
             if t == '(' and i + 1 < len(ts) and ts[i + 1] == '(' and not (i and ts[i - 1].endswith('$')):
@@ -397,7 +477,11 @@ class Reading:
                 continue
             if t in SEPARATORS:
                 self.bg = self.bg or (t == '&' and not (i and ts[i - 1] in ('>', '<')))   # not 2>&1
-                at_cmd, piped = True, t in ('|', '|&')
+                if t == '(':
+                    paren += 1
+                elif t == ')':
+                    dollar, paren = (dollar - 1, paren) if dollar else (0, max(0, paren - 1))
+                at_cmd, piped, last = True, t in ('|', '|&'), t
                 i += 1
                 continue
             if t in ('<', '>', '>>', '<<'):
@@ -405,7 +489,7 @@ class Reading:
                 continue
             if not at_cmd:
                 if t == '$' and i + 1 < len(ts) and ts[i + 1] == '(':
-                    at_cmd, piped = True, False
+                    at_cmd, piped, dollar = True, False, dollar + 1
                     i += 2
                     continue
                 i += 1
@@ -413,18 +497,30 @@ class Reading:
             word = os.path.basename(t) if '/' in t and not t.startswith('[') else t
             if word == 'do' and self.stack[-1]['kind'] == 'while':
                 self.stack[-1]['cond'] = False         # the loop's own condition ends here
+            plain = len(self.stack) == max(base, 1) and not ifs and not paren and last in (None, ';', '\n', '&')
+            if word in ('if', 'case'):
+                ifs += 1
+            elif word in ('fi', 'esac'):
+                ifs = max(0, ifs - 1)
             if word in KEYWORDS or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', t, re.S):
                 for inner in substitutions(t):         # p="$(gh pr checks 5)"
-                    self.read(inner, depth + 1)
-                if word not in KEYWORDS:
-                    self._assign(t)
+                    self._nested(inner, depth + 1)
+                if word == '!':
+                    self._bang = True
+                elif word not in KEYWORDS:
+                    j = i + 1                          # `f=x cmd`: a value for that command only
+                    while j < len(ts) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', ts[j], re.S):
+                        j += 1
+                    prefix = j < len(ts) and ts[j] not in SEPARATORS and ts[j] not in ('<', '>', '>>', '<<')
+                    self._assign(t, plain and not prefix)
                 i += 1
                 continue
             if word == '$' and i + 1 < len(ts) and ts[i + 1] == '(':
+                dollar += 1
                 i += 2
                 continue
             if word in ('while', 'until'):
-                self.stack.append(frame('while', math.inf))
+                self.stack.append(dict(frame('while', math.inf), word=word))
                 i += 1
                 continue
             if word == 'for':
@@ -448,6 +544,7 @@ class Reading:
             while j < len(ts) and ts[j] not in SEPARATORS:
                 args.append(ts[j])
                 j += 1
+            self.plain, self.negated, self.depth, self._bang = plain, self._bang, depth, False
             self._command(word, args, piped, depth)
             i, at_cmd = j, False
         while len(self.stack) > max(base, 1):
@@ -463,23 +560,41 @@ class Reading:
             return m.group(0) if value is None else value
         return VAR.sub(put, word)
 
-    def _assign(self, word):
+    def _assign(self, word, known=True):
+        """A value it can know: set once in the whole command (pinned), where it runs for sure, not from $(..)."""
         name, _, value = word.partition('=')
-        self.vars[name] = None if '$(' in value or '`' in value else self._expand(value)
+        known = known and name in self.pinned and '$(' not in value and '`' not in value
+        self.vars[name] = self._expand(value) if known else None
 
     def _own_pid(self, word):
         return word == OWN_BG or (word.isdigit() and self.own.pid(int(word)))
 
+    def _ended(self, word):
+        """A PID that names no process now, tested in a `while` loop's own condition (`while kill -0 A || kill -0 B`,
+        the wait bg-guard names): that job has ended, so the test is false at once and ends the loop. In an `until`,
+        after a `!`, in the body or in text handed on it would wait for some other process to take that PID."""
+        f = self.stack[-1]
+        return word.isdigit() and f.get('word') == 'while' and f['cond'] and not self.negated and \
+            not self.depth and self.own.gone(int(word))
+
     def _own_call(self, word, args):
-        """True when this check reads only the agent's own background job (Own): its output file, or a process
-        in its own tree. Anything it cannot tell (a PID from pgrep, a relative path, an option value it does not
-        know) is not its own, so the wait is judged as before."""
+        """True when this check reads only the agent's own background job (Own), in one of a few exact forms:
+        `kill -0 <pid>..`, `ps -p <pid>` (with -o/-h only), `[ -s|-f|-e|-r <own file> ]` or `[ -d|-e /proc/<pid> ]`
+        (test, [ and [[ alike, one test each, `!` allowed), and grep/tail/head/cat/wc/ls/stat with options from a
+        short list, its own files and /dev/null (`tail --pid=<pid>` too). Anything else (another selector, a file
+        or input beside its own, an option it does not list, a value it does not know) is not its own, so the wait
+        is judged as before."""
         if self.own is None:
             return False
         ex, k = [], 0
         while k < len(args):                     # without its redirections (`2>/dev/null`, `>out`)
             a = args[k]
-            if a in ('<', '>', '>>', '<<'):
+            if a in ('<', '<<'):                 # it reads another input (`grep x - < /tmp/ci`): only /dev/null
+                if a == '<<' or k + 1 >= len(args) or args[k + 1] != '/dev/null':
+                    return False
+                k += 2
+                continue
+            if a in ('>', '>>'):
                 k += 2
                 continue
             if len(a) == 1 and a.isdigit() and k + 1 < len(args) and args[k + 1] in ('<', '>', '>>'):   # 2>x
@@ -488,53 +603,74 @@ class Reading:
             ex.append(self._expand(a))
             k += 1
         if word == 'kill':
-            pids = [a for a in ex if not a.startswith('-') and a != '0']
-            return bool(pids) and all(self._own_pid(a) for a in pids)
+            pids = ex[1:] if ex[:1] == ['-0'] else []
+            pids = pids[1:] if pids[:1] == ['--'] else pids
+            return bool(pids) and all(self._own_pid(p) or self._ended(p) for p in pids)
         if word == 'ps':
             pids, k = [], 0
             while k < len(ex):
                 a = ex[k]
-                if a in ('-p', '--pid', '-q', '--quick-pid') and k + 1 < len(ex):
-                    pids += ex[k + 1].split(',')
-                    k += 1
-                elif re.fullmatch(r'--(?:quick-)?pid=.+', a):
-                    pids += a.partition('=')[2].split(',')
-                elif re.fullmatch(r'-[pq].+', a):
-                    pids += a[2:].split(',')
-                elif '/' in a:
-                    return False
+                if a in ('-p', '--pid', '-q', '--quick-pid', '-o', '--format') and k + 1 < len(ex):
+                    pids += ex[k + 1].split(',') if a not in ('-o', '--format') else []
+                    k += 2
+                    continue
+                m = re.fullmatch(r'--(?:quick-)?pid=(.+)|-[pq](\d[\d,]*)', a)
+                if m:
+                    pids += (m.group(1) or m.group(2)).split(',')
+                elif not re.fullmatch(r'-o.+|--format=.+|-h|--no-headers?', a):
+                    return False                 # another selector (-e, -C, -u, --ppid) widens it to anyone
                 k += 1
             return bool(pids) and all(self._own_pid(p) for p in pids)
-        if word in ('pgrep', 'pidof', 'curl', 'wget'):
-            return False
         if word in TESTS:
-            ops = [a for a in ex if not a.startswith('-') and a not in ('[', ']', ']]', '!', '=', '==', '!=')]
-            return bool(ops) and all(self.own.path(a) for a in ops)
-        if word == 'find':
-            roots = []
-            for a in ex:
-                if a.startswith(('-', '(', '!')):
-                    break
-                roots.append(a)
-            rest = ex[len(roots):]
-            return bool(roots) and all(self.own.path(a) for a in roots) and \
-                all(self.own.path(a) for a in rest if '/' in a)
-        # ls, stat and the readers: every word is an option, a number (`-n 1`), the pattern or filter (grep, rg,
-        # jq: the first other word), a file of its own, or /dev/null; at least one file of its own
-        own, first = False, word in ('grep', 'egrep', 'fgrep', 'rg', 'jq')
-        for a in ex:
-            if a.startswith('--pid='):           # tail --pid=<pid>
-                if not self._own_pid(a.partition('=')[2]):
+            close = {'[': ']', '[[': ']]'}.get(word)
+            if close and ex[-1:] != [close]:     # `[[ own || other ]]` reaches here split at the ||
+                return False
+            w = ex[:-1] if close else ex
+            w = w[1:] if w[:1] == ['!'] else w
+            return len(w) == 2 and ((w[0] in OWN_TEST_FILE and self.own.path(w[1])) or
+                                    (w[0] in OWN_TEST_PROC and self.own.proc(w[1])))
+        if word not in OWN_READ:                 # find (-exec), rg (--pre), jq, pgrep, curl ...: never its own
+            return False
+        letters, valued, longs = OWN_READ[word]
+        number = re.compile(r'[+-]?\d+[kKmMbB]?')
+        own, pattern, k = False, word in ('grep', 'egrep', 'fgrep'), 0
+        while k < len(ex):
+            a = ex[k]
+            if a.startswith('--'):
+                name, eq, val = a.partition('=')
+                if word == 'tail' and name == '--pid':
+                    if not self._own_pid(val):
+                        return False
+                    own = True
+                elif not ((word in ('tail', 'head') and name in ('--lines', '--bytes') and number.fullmatch(val))
+                          or (word == 'stat' and name in ('--format', '--printf') and '$' not in val)
+                          or (not eq and name in longs)):
                     return False
-                own = True
-            elif a.startswith('-') or a.isdigit() or a in NEUTRAL:
-                continue
+            elif word in ('tail', 'head') and re.fullmatch(r'-\d+', a):
+                pass
+            elif a.startswith('-') and len(a) > 1:
+                for j, c in enumerate(a[1:]):    # a cluster of short options; one with a value ends it (-n5)
+                    if '-' + c in valued:
+                        val = a[j + 2:]
+                        if not val:
+                            k += 1
+                            val = ex[k] if k < len(ex) else '$'
+                        if '$' in val or (c != 'c' or word != 'stat') and not number.fullmatch(val):
+                            return False
+                        break
+                    if c not in letters:
+                        return False
+            elif pattern:                        # grep's pattern: its first other word
+                if '$' in a:
+                    return False
+                pattern = False
+            elif a == '/dev/null':
+                pass
             elif self.own.path(a):
                 own = True
-            elif first and '/' not in a and '$' not in a:
-                first = False
             else:
                 return False
+            k += 1
         return own
 
     def _in_loop(self):
@@ -608,17 +744,18 @@ class Reading:
             if not args:
                 return
             word, args = os.path.basename(args[0]), args[1:]
-        if word in OWN_LIST:
+        if word in OWN_LIST:                   # `declare -n f=..` (a reference) and the like: not known
+            options = any(a.startswith(('-', '+')) for a in args)
             for a in args:
                 if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', a, re.S):
-                    self._assign(a)
+                    self._assign(a, self.plain and not options)
         prev, kills = self.prev, word == 'kill' and not {'-0', '-s0', '--signal=0'} & set(args)
         if word not in SHELLS and word not in ('eval', 'watch'):
             self.into_kill += kills                # kill $(pgrep -f x): that pgrep feeds a kill
             for a in args:                         # [ "$(gh pr view 5 -q .state)" = OPEN ]: its inside runs too
                 if '$(' in a:
                     for inner in substitutions(a):
-                        self.read(inner, depth + 1)
+                        self._nested(inner, depth + 1)
             self.into_kill -= kills
         self.prev = (word, args)
         fed = prev and prev[0] == 'kill' and prev[1][-1:] == ['$'] and not {'-0', '-s0'} & set(prev[1])
@@ -632,10 +769,10 @@ class Reading:
         elif word in SHELLS:
             for k, a in enumerate(args):
                 if re.fullmatch(r'-[a-z]*c[a-z]*', a) and k + 1 < len(args):
-                    self.read(args[k + 1], depth + 1)
+                    self._nested(args[k + 1], depth + 1)
                     break
         elif word == 'eval':
-            self.read(' '.join(args), depth + 1)
+            self._nested(' '.join(args), depth + 1)
         elif word == 'watch':              # `watch -n 60 gh pr checks 1`: a loop with its interval as the sleep
             interval = 2.0
             while args and args[0].startswith('-'):
@@ -651,7 +788,7 @@ class Reading:
             if args:
                 self.stack.append(frame('while', math.inf))
                 self._sleep(interval)
-                self.read(' '.join(shlex.quote(a) if len(args) > 1 else a for a in args), depth + 1)
+                self._nested(' '.join(shlex.quote(a) if len(args) > 1 else a for a in args), depth + 1)
                 self._close()
         elif word == 'gh':
             sub = [a for a in args if not a.startswith('-')]
@@ -660,8 +797,9 @@ class Reading:
                                                    any(a == '--watch' or a.startswith('--watch=') for a in args)):
                     self.watch.append('gh ' + ' '.join(sub[:2]))
                 self._check('ci', 'gh ' + ' '.join(sub[:2]))
-        elif word in ('curl', 'wget'):
-            self._check('ci' if any('github.com' in a for a in args) else 'local', word)
+        elif word in ('curl', 'wget'):         # in a Monitor, any curl that is not to this machine is external
+            ci = any('github.com' in a for a in args) or (self.monitor and not local_url(args))
+            self._check('ci' if ci else 'local', word)
         elif word == 'kill':
             if '-0' in args:
                 self._check('own' if self._own_call(word, args) else 'local', 'kill -0')
@@ -681,7 +819,7 @@ def verdict(command, settings, background=False, own=None, monitor=False):
     pkill/pgrep that kills its own shell. A background command is only checked for that (the host wakes the agent
     when it ends, so a wait there is fine; a self-kill is not). `own` (an Own): checks of the agent's own background
     job are no wait. `monitor`: the command is a Monitor's, where only a wait on CI counts."""
-    r = Reading(settings, command, own)
+    r = Reading(settings, command, own, monitor)
     r.read(command)
     if r.kills:
         return r.kills[0][0], r.kills[0][1], 'kill'

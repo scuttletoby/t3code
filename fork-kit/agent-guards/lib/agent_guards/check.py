@@ -150,7 +150,7 @@ def speed_cases(tmp, sid, bash):
         out.append(('poll-loop-guard', 'PreToolUse', 'a sleep loop on CI', bash(loop), 'refused', None))
     out.append(('poll-loop-guard', 'PreToolUse', 'the same in the background',
                 dict(bash(loop), tool_input={'command': loop, 'run_in_background': True}), 'passed', None))
-    own = os.path.join(tmp, sid, 'tasks', 'job.output')   # a background job's output file of this session
+    own = f'/tmp/claude-{os.getuid()}/agent-guards-check/{sid}/tasks/job.output'   # its background job's output
     out.append(('poll-loop-guard', 'PreToolUse', 'a wait on its own background job',
                 bash(f'until [ -s {own} ]; do sleep {poll["maxSleepSeconds"] + 1}; done'), 'passed', None))
     kill = 'pkill -f agent-guards-self-check'
