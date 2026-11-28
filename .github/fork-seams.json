@@ -253,12 +253,19 @@
       ]
     },
     "apps/server/src/orchestration-v2/ThreadManagementService.ts": {
-      "why": "An awaited t3_background_wait on a task that already ended answers with that task under a new \"ended\" field (its status and summary), read from the ended-task memory the Claude adapter fills (fork/backgroundWait.ts), instead of refusing it unmatched (#1094, F7). Additions only.",
+      "why": "An awaited t3_background_wait on a task that already ended answers with that task under a new \"ended\" field (its status and summary), read from the ended-task memory the Claude adapter fills (fork/backgroundWait.ts), instead of refusing it unmatched (#1094, F7). Additions only. The model policy backstop (fork issue 876, M4): every thread command an agent dispatches through an MCP call (a calling thread here, or a linked machine's agent) that names a model, or forks a thread onto its source's model, is checked against modelPolicy before it is dispatched, unless the call's own route already checked its picks. One import and one step in dispatch, beside upstream's own check of the target instance; the logic is in apps/server/src/fork/modelPolicyBackstop.ts.",
       "added": [
         "import * as BackgroundWait from \"../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
         "const ended = yield* BackgroundWait.read(providerThread, input.taskIds, matched); // Fork: background wait (F7)",
         "if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import * as ModelPolicyBackstop from \"../fork/modelPolicyBackstop.ts\"; // Fork: model policy backstop",
+          "Effect.andThen(ModelPolicyBackstop.checkAgentCommand(command, orchestrator)), // Fork: model policy backstop"
+        ]
+      }
     },
     "apps/server/src/orchestration-v2/ProviderTurnStartService.ts": {
       "why": "MCP profiles part 2: a Claude turn its MCP profile refuses never reached Claude, like the other refusals in this list.",
