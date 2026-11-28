@@ -18,7 +18,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as LaneState from "./laneState.ts";
 
-export const LANES_DIRECTORY = "lanes";
+const LANES_DIRECTORY = "lanes";
 
 /** A refused step: why, in words an agent can act on. */
 export class LaneStoreRefused extends Schema.TaggedError<LaneStoreRefused>()("LaneStoreRefused", {

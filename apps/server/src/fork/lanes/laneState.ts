@@ -18,13 +18,13 @@ import {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-export const LANE_STATE_VERSION = 1;
+const LANE_STATE_VERSION = 1;
 /** Notes kept per lane, newest last; older ones drop. */
 export const NOTES_PER_LANE = 50;
 /** Escalations waiting for delivery; one more is refused (never dropped) until some are delivered. */
-export const OUTBOX_LIMIT = 200;
+const OUTBOX_LIMIT = 200;
 /** Threads remembered per lane (run records find a lane by any of them). */
-export const THREADS_PER_LANE = 50;
+const THREADS_PER_LANE = 50;
 
 const LaneThread = Schema.Struct({
   generation: Schema.Number,
