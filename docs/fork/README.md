@@ -71,6 +71,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.threadRoles`](#serverthreadroles)                                   | `{"assistant":null,"orchestrators":{}}` | yes | [#138](https://github.com/scuttletoby/t3code/issues/138)   |
 | [`server.assistant`](#serverassistant)                                       | `{"enabled":false}`                     | yes | [#879](https://github.com/scuttletoby/t3code/issues/879)   |
 | [`server.stopFinishedChildren`](#serverstopfinishedchildren)                 | `{"enabled":false}`                     | yes | [#925](https://github.com/scuttletoby/t3code/issues/925)   |
+| [`server.armedSweep`](#serverarmedsweep)                                     | `{"mode":"off"}`                        | yes | [#880](https://github.com/scuttletoby/t3code/issues/880)   |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                                 | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)     |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                                 | yes | [#260](https://github.com/scuttletoby/t3code/issues/260)   |
 | [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                                 | yes | [#291](https://github.com/scuttletoby/t3code/issues/291)   |
@@ -82,8 +83,8 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`client.ownerQuestionsPage`](#clientownerquestionspage)                     | `true`                                  | no  | [#828](https://github.com/scuttletoby/t3code/issues/828)   |
 | [`client.workPanelEnabled`](#clientworkpanelenabled)                         | `false`                                 | yes | [#1136](https://github.com/scuttletoby/t3code/issues/1136) |
 
-For `waitFor`, `agentSlots`, `playtest` and `stopFinishedChildren` only the `enabled` switch is pinned, and for `handoff`
-and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
+For `waitFor`, `agentSlots`, `playtest` and `stopFinishedChildren` only the `enabled` switch is pinned, and for `handoff`,
+`placement` and `armedSweep` only `mode`; their other fields are tuning that does nothing while the switch is off.
 
 ## Each setting
 
@@ -1493,6 +1494,50 @@ process as any resumed thread does.
 Switch on: **Settings → Fork**, section Stop finished sub-agents, or in `settings.json`:
 `"stopFinishedChildren": { "enabled": true, "graceSeconds": 60 }`. Anything but `"enabled": true`
 reads as off, and a bad `graceSeconds` as 60; a save with a bad value is refused.
+
+### `server.armedSweep`
+
+The armed pull request sweep: a red or conflicted pull request with auto-merge on wakes the thread
+that owns it within 10 minutes, once per head, with nothing registered.
+
+- Every `intervalSeconds` (default 300, at least 60) T3 makes one GitHub request (`gh api graphql`
+  on the server, with its login): every open pull request of the repositories it knows (each
+  repository a thread links a pull request of; with `scope: "all"` also each project's own), and,
+  by id, each one the last sweep followed. A second request only while a search has another page.
+- It follows a pull request while auto-merge is on, and wakes for:
+  - `conflict`: GitHub says it conflicts with its base (it gets no CI runs, so it never goes green);
+  - `red`: every check ended and one failed, `rerunGraceMinutes` (default 12) after the last failure
+    ended, so the fork-ci re-run ([fork-ci-rerun.md](../../.github/fork-ci-rerun.md), every 10
+    minutes) has had its one try ([#160](https://github.com/scuttletoby/t3code/issues/160)); a
+    re-run starts the checks again, which is not red. Use 0 in a project without that re-run;
+  - `stalled`: not green (checks pending, or none) for `stallMinutes` (default 30) on one head;
+  - `disarmed`: auto-merge off for 15 minutes (the merge queue turns it off for a moment itself);
+  - `closed`: closed without merging. A merge is forgotten without a word.
+- The owner: the newest thread that links the pull request (`link_pull_request`), up the parent
+  chain to its top-level thread. When that thread is archived, the project's orchestrator
+  ([`server.threadRoles`](#serverthreadroles)) gets it. With `scope: "all"`, a pull request no
+  thread links (armed by hand) goes to the orchestrator too
+  ([#162](https://github.com/scuttletoby/t3code/issues/162)); with `linked` (default) it is left out.
+- Delivery: one message per thread per sweep, all its pull requests in it, queued after the
+  thread's current run and through the agent slot gate. Once per pull request, head and reason, and
+  at most `maxWakesPerHead` (default 3) per head; a new head starts again. No slot, or no thread to
+  send to: asked again next sweep.
+- `wait_list` shows, while the sweep is `dry` or `on`, its last sweep's armed pull requests that are
+  not green (`armedSweep.pullRequests`: pull request, head, reason or the failing checks, since
+  when, the thread, and whether a wake was sent): scope `thread` those that wake the caller,
+  `project` every one of the caller's project.
+- `dry`: the same lists and a log line for each wake it would send; it sends nothing and marks
+  nothing sent, so turning it `on` sends what is due then.
+- State: `fork-armed-sweep.json` in the server's state directory, written atomically. A wake is
+  written as pending before its send and settled from the engine's receipt after, so a sweep that
+  stops half-way neither loses nor repeats one. A missing or unreadable file starts empty (a red
+  already there wakes once); a file of a newer T3 stops the sweep and is never overwritten. A
+  GitHub error sends nothing and leaves the file as it was. A held server (`serve --hold-work`)
+  does not sweep.
+
+In `settings.json`: `"armedSweep": { "mode": "dry", "scope": "linked" }`. A mode other than `dry`
+or `on` reads as off, a scope other than `all` as `linked`, a bad number as its default; a save
+with a bad value is refused.
 
 ### `projectOverride.waitChecks`
 

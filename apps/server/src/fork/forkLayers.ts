@@ -18,6 +18,7 @@ import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
+import * as ArmedSweep from "./armedSweep/ArmedSweepLayer.ts";
 import * as DelegatedOrphanScan from "./delegatedResults/DelegatedOrphanScan.ts";
 import * as DelegatedResultReminder from "./delegatedResults/DelegatedResultReminder.ts";
 import * as FactsCommands from "./factsCommand.ts";
@@ -118,6 +119,8 @@ export const layerRoutes = Layer.mergeAll(
   RemoteTaskPromptWakes.layer,
   // POST/GET /api/fork/delegate: the slot filler starts and counts a thread's children; a session token only.
   FillerDelegate.layer,
+  // Armed pull requests that cannot merge by themselves: their thread woken once per head and reason.
+  ArmedSweep.layer,
 );
 
 /**

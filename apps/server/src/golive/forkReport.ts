@@ -108,6 +108,8 @@ export interface ForkReport {
       readonly activityProbe: "on" | "off";
       /** Stopping a finished delegated child's idle provider process. */
       readonly stopFinishedChildren: "on" | "off";
+      /** The armed pull request sweep's mode: `dry` lists and logs, `on` also wakes. */
+      readonly armedSweep: "off" | "dry" | "on";
     };
     readonly featuresOn: ReadonlyArray<string>;
     /**
@@ -549,6 +551,7 @@ function readSettings(
     modelPolicy: settings.modelPolicy.mode,
     activityProbe: onOff("activityProbe"),
     stopFinishedChildren: onOff("stopFinishedChildren"),
+    armedSweep: settings.armedSweep.mode,
   } as const;
   return {
     settings: {
@@ -591,6 +594,7 @@ function readSettings(
         waitCheckNames: Object.keys(settings.waitChecks).toSorted(),
         agentSlots: settings.agentSlots,
         stopFinishedChildren: settings.stopFinishedChildren,
+        armedSweep: settings.armedSweep,
         headlessUsageRefreshIntervalMs: Duration.toMillis(settings.headlessUsageRefreshInterval),
       },
     },

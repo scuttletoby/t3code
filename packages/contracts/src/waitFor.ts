@@ -519,6 +519,25 @@ export const SlotRuleStatus = Schema.Struct({
 });
 export type SlotRuleStatus = typeof SlotRuleStatus.Type;
 
+/**
+ * Fork (issue 880): one armed pull request the armed PR sweep follows that is not green, as its
+ * last sweep judged it. `state` is the judge's reason (`waiting`: not green, not yet a reason).
+ * `wake`: sent, would be sent (dry mode), held by the cap per head, no thread to send to, or
+ * nothing to send.
+ */
+export const WaitArmedPullRequest = Schema.Struct({
+  pullRequest: Schema.String,
+  url: Schema.String,
+  title: Schema.String,
+  head: Schema.String,
+  state: Schema.Literals(["waiting", "conflict", "red", "stalled", "disarmed", "closed"]),
+  detail: Schema.String,
+  notGreenSince: Schema.NullOr(IsoDateTime),
+  threadId: Schema.NullOr(ThreadId),
+  wake: Schema.Literals(["none", "sent", "would-send", "capped", "no-thread", "retry"]),
+});
+export type WaitArmedPullRequest = typeof WaitArmedPullRequest.Type;
+
 export const WaitListResult = Schema.Struct({
   enabled: Schema.Boolean,
   /** Set when the store cannot be read, for example a file from a newer build. */
@@ -548,6 +567,15 @@ export const WaitListResult = Schema.Struct({
       machine: SlotUse,
       accounts: Schema.Array(Schema.Struct({ id: ProviderInstanceId, ...SlotUse.fields })),
       freeMemoryMb: Schema.NullOr(NonNegativeInt),
+    }),
+  ),
+  /** Fork (issue 880): while the armed PR sweep is on or dry, its last sweep's not-green rows. */
+  armedSweep: Schema.optionalKey(
+    Schema.Struct({
+      mode: Schema.Literals(["dry", "on"]),
+      sweptAt: Schema.NullOr(IsoDateTime),
+      error: Schema.optionalKey(Schema.String),
+      pullRequests: Schema.Array(WaitArmedPullRequest),
     }),
   ),
 });

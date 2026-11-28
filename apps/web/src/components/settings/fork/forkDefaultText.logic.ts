@@ -42,6 +42,7 @@ export const FORK_DEFAULT_TEXT = {
   playtest: onOff(D.playtest.enabled),
   assistant: onOff(D.assistant.enabled),
   stopFinishedChildren: onOff(D.stopFinishedChildren.enabled),
+  armedSweep: D.armedSweep.mode,
   mcpProfile: D.mcpProfile,
   mcpSubagentProfile: D.mcpSubagentProfile,
   mcpThreadProfiles: Object.keys(D.mcpThreadProfiles).length === 0 ? "none" : "set",

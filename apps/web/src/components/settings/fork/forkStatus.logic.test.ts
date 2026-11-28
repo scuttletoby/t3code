@@ -22,6 +22,7 @@ describe("forkFeatureStatuses", () => {
       "Limit on running agents: Off",
       "Stop finished sub-agents: Off",
       "Agent waits: Off",
+      "Armed pull request sweep: Off",
       "Models agents may use: Off",
       "Handoff instead of compaction: Off",
       "Review rules: Off",
@@ -43,6 +44,7 @@ describe("forkFeatureStatuses", () => {
         automaticUpdates: true,
         activityProbe: true,
         stopFinishedChildren: { enabled: true },
+        armedSweep: { mode: "dry" },
         handoff: { mode: "compact", threads: { "thread-1": "handoff", "thread-2": "compact" } },
       }),
     );
@@ -52,6 +54,7 @@ describe("forkFeatureStatuses", () => {
       "Limit on running agents: On",
       "Stop finished sub-agents: On",
       "Agent waits: On",
+      "Armed pull request sweep: On: dry (lists, wakes no thread)",
       "Models agents may use: On: enforce",
       "Handoff instead of compaction: On for 1 thread",
       "Review rules: On",

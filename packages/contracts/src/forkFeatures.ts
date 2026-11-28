@@ -23,6 +23,7 @@ export const FORK_FEATURES = [
   "modelPolicy",
   "activityProbe",
   "stopFinishedChildren",
+  "armedSweep",
 ] as const;
 export type ForkFeature = (typeof FORK_FEATURES)[number];
 
@@ -72,6 +73,7 @@ export function forkFeaturesWhere(
     modelPolicy: server(settings.modelPolicy.mode !== "off"),
     activityProbe: server(settings.activityProbe),
     stopFinishedChildren: server(settings.stopFinishedChildren.enabled),
+    armedSweep: server(settings.armedSweep.mode !== "off"),
   };
 }
 

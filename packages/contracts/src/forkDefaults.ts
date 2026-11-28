@@ -248,6 +248,16 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     decidedIn: "#925",
   },
   {
+    scope: "server",
+    key: "armedSweep",
+    default: { mode: "off" },
+    fields: true,
+    off: true,
+    reason:
+      "No armed pull request is listed or judged; a red or conflicted one wakes no thread by itself.",
+    decidedIn: "#880",
+  },
+  {
     scope: "projectOverride",
     key: "mcpProfile",
     default: undefined,
