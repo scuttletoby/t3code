@@ -237,6 +237,7 @@ class Caps(Base):
                                        'north has no writer slot (1/1 writers))') for l in self.log_lines()))
 
     def test_the_start_asks_for_the_model_effort_parent_and_machine(self):
+        self.cfg['machines']['north']['worktreeIsolation'] = True     # opted in: its project is a git checkout
         self.item('w1', machines=['north'], role='worker', isolation='worktree')
         self.run_filler()
         b = self.w.api.starts[0]
@@ -575,6 +576,51 @@ class AccountFallback(Base):
         self.assertEqual([b['requestId'] for b in self.w.api.starts], ['w1:1'])
         self.assertEqual(self.w.api.starts[0]['task']['target']['providerInstanceId'], 'claudeAgent')
         self.assertEqual(self.started_ids(), ['w1'])
+
+
+class LinkedMachines(Base):
+    def test_a_machine_with_a_project_id_sends_it_and_one_without_does_not(self):
+        self.cfg['machines']['north']['projectId'] = 'project-north'
+        self.item('w1', machines=['north'])
+        self.item('w2', machines=['local'])
+        self.run_filler()
+        targets = {b['task']['title']: b['task']['target'] for b in self.w.api.starts}
+        self.assertEqual((targets['Task w1']['environmentId'], targets['Task w1']['projectId']),
+                         ('env-north', 'project-north'))
+        self.assertNotIn('projectId', targets['Task w2'])
+
+    def test_worktree_isolation_on_a_machine_without_it_is_refused_when_read(self):
+        self.item('wt1', machines=['north'], isolation='worktree')            # linked: off by default
+        self.cfg['machines']['local']['worktreeIsolation'] = False            # not a git checkout
+        self.item('wt2', machines=['local'], isolation='worktree')
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        lines = self.log_lines()
+        for iid, name in (('wt1', 'north'), ('wt2', 'local')):
+            self.assertEqual(len([l for l in lines if f'refused {iid}.json: "isolation": "worktree" cannot run on '
+                                  f'{name}' in l]), 1, iid)
+        self.run_filler()
+        self.assertEqual(self.log_lines(), lines)                              # once, not every run
+        self.assertTrue(os.path.exists(os.path.join(self.q, 'wt1.json')))     # kept
+
+    def test_a_worktree_item_without_machines_runs_only_where_it_can(self):
+        self.cfg['machines']['local']['maxAgents'] = 0
+        self.item('wt1', isolation='worktree')
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        line = [l for l in self.log_lines() if 'waiting wt1' in l][0]
+        self.assertIn('north has no worktree isolation', line)
+        self.cfg['machines']['local']['maxAgents'] = 3
+        self.run_filler()
+        self.assertEqual([b['task']['target'].get('environmentId') for b in self.w.api.starts], [None])
+        self.cfg['machines']['local']['worktreeIsolation'] = False             # no machine can: refused
+        self.item('wt2', isolation='worktree')
+        self.run_filler()
+        self.assertTrue(any('refused wt2.json: "isolation": "worktree" cannot run on local, north' in l
+                            for l in self.log_lines()))
+        self.item('w3', machines=['north'])                                    # no isolation: fine there
+        self.run_filler()
+        self.assertIn('w3', self.started_ids())
 
 
 class ReadyWhen(Base):
@@ -1020,6 +1066,10 @@ MUTATIONS = {
         "            if r is None:\n                return account, '; '.join(skipped) or None\n",
         "            if True:\n                return account, None\n",
         'AccountFallback.test_a_full_first_account_falls_back_to_the_second'),
+    'worktree isolation is checked': (
+        "        return bool(m.get('worktreeIsolation', not m.get('environmentId')))\n",
+        "        return True\n",
+        'LinkedMachines.test_worktree_isolation_on_a_machine_without_it_is_refused_when_read'),
     'lens rounds': (
         "if len(rounds) >= int(lw.get('maxRounds', 2)):", "if False:",
         'Lenses.test_a_new_head_is_a_new_round_and_rounds_stop_at_the_limit'),

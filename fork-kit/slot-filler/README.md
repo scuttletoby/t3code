@@ -104,12 +104,45 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
         }
       }
     },
-    "spare": { "environmentId": "<linked environment id>", "maxAgents": 6, "maxWriters": 3 }
+    "spare": { "environmentId": "<linked environment id>", "maxAgents": 6, "maxWriters": 3 },
+    "wsl": {
+      "environmentId": "<linked environment id>",
+      "projectId": "<that machine's project id>",
+      "maxAgents": 2,
+      "maxWriters": 1
+    },
+    "mac": {
+      "environmentId": "<linked environment id>",
+      "projectId": "<that machine's project id>",
+      "worktreeIsolation": false,
+      "maxAgents": 2,
+      "maxWriters": 1
+    }
   }
 }
 ```
 
+A queue item for a linked machine names it and leaves out `isolation`, since the child runs in that project's
+checkout:
+
+```json
+{
+  "id": "fix-login-43",
+  "title": "Fix the login retry on Windows",
+  "kind": "writer",
+  "brief": "/abs/path/brief.md",
+  "machines": ["wsl", "mac"],
+  "account": ["claudeAgent"]
+}
+```
+
 - A machine without `environmentId` is the server's own machine.
+- `projectId`: the project the child runs in, sent as `target.projectId`. A linked machine needs it; without it,
+  T3 refuses the start ("Pass target.projectId").
+- `worktreeIsolation` (default: false when the machine has an `environmentId`, else true): whether T3 can give a
+  child its own worktree there. Set it to false for a project that is not a git checkout. An item with
+  `"isolation": "worktree"` is refused when it is read (logged once, kept) if one of the machines it names, or
+  every machine when it names none, has this false. When it names no machines, it runs only where this is true.
 - `inlineBrief` (default: true when the machine has an `environmentId`): the brief's text goes in the task
   text, since another machine cannot read this machine's files (at most 100,000 characters, else refused).
 - `capacity.<kind>` (or `default`): a command that must exit 0, or, with `free`, whose

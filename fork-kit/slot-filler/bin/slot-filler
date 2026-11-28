@@ -296,6 +296,16 @@ class Filler:
         if machines is not None and (not isinstance(machines, list) or not machines
                                      or any(m not in self.cfg['machines'] for m in machines)):
             return None, f'"machines" must list names from the config ({", ".join(self.cfg["machines"])})'
+        if it.get('isolation') == 'worktree':
+            # T3 refuses a worktree child on a linked machine (it runs in that project's checkout) and on a project
+            # that is not a git checkout (no VCS driver): refuse it here, not at every start.
+            named = it.get('machines')
+            pool = named or list(self.cfg['machines'])
+            no = [m for m in pool if not self.worktree_ok(m)]
+            if no and (named or len(no) == len(pool)):
+                return None, (f'"isolation": "worktree" cannot run on {", ".join(no)} (a linked machine runs in its '
+                              'project\'s checkout; worktreeIsolation is false there): drop "isolation" or name '
+                              'other machines')
         if 'account' in it and account_list(it['account']) is None:
             return None, '"account" must be an account or a non-empty list of accounts, in order of preference'
         return it, None
@@ -399,6 +409,11 @@ class Filler:
         self.log(f'queued {iid}: PR #{pr} green on {head[:7]}, lens {lens["lens"]} (from lens-watch)')
 
     # --- slots -----------------------------------------------------------------------------------------------
+    def worktree_ok(self, name):
+        """Whether T3 can give a child its own worktree there: off by default on a linked machine."""
+        m = self.cfg['machines'][name]
+        return bool(m.get('worktreeIsolation', not m.get('environmentId')))
+
     def machine_of_env(self, env):
         for name, m in self.cfg['machines'].items():
             if (m.get('environmentId') or None) == (env or None):
@@ -535,6 +550,8 @@ class Filler:
                   'options': [{'id': 'effort', 'value': it.get('effort') or d.get('effort', 'high')}]}
         if self.cfg['machines'].get(name, {}).get('environmentId'):
             target['environmentId'] = self.cfg['machines'][name]['environmentId']
+        if self.cfg['machines'].get(name, {}).get('projectId'):
+            target['projectId'] = self.cfg['machines'][name]['projectId']
         return target
 
     def body(self, it, name, request_id, parent, lookup=False):
@@ -808,6 +825,9 @@ class Filler:
             for name in allowed:
                 if name in full:
                     reasons.append(f'{name} full')
+                    continue
+                if it.get('isolation') == 'worktree' and not self.worktree_ok(name):
+                    reasons.append(f'{name} has no worktree isolation')
                     continue
                 backoff = self.waiting_on(it['id'], name)
                 if backoff:
