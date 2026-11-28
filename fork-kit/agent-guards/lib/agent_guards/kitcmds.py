@@ -2,7 +2,7 @@
 fork-ci-why (why a pull request's required checks fail), fork-clone (a blob-less clone with its dependencies),
 fork-precheck (format, lint and test what a change touches). Python 3 standard library only; each command's
 `main(argv)` returns its exit code. Tests: fork-kit/agent-guards/tests/kitcmds.test.py."""
-import fcntl, filecmp, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
+import fcntl, filecmp, hashlib, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
 from agent_guards import facts
 
@@ -37,13 +37,16 @@ ERROR = re.compile(r'##\[error\]|\b(?:error|ERROR|Error|FAIL(?:ED|URE)?|Failed|f
                    r'|AssertionError|✖|✗|×|\bnot ok\b|exit (?:code|status) [1-9]')
 NOT_ERROR = re.compile(r'\b0 (?:errors?|failed|failures?)\b|^##\[(?:group|endgroup)\]|--no-error-on|^\s*[✔✓√]')
 JOB_LINK = re.compile(r'^https://[^/]+/([^/]+/[^/]+)/actions/runs/\d+/job/(\d+)')
+FORK_REPO = 'scuttletoby/t3code'   # the fork: gh is always told the repository (its own pick may be another remote)
 CI_WHY_USAGE = """usage: fork-ci-why PR [-R OWNER/REPO] [--all] [--lines N]
 
-For each failing required check on the pull request's head: its name, its job link, and only the error lines of
-its job log (ANSI colours and timestamps stripped; at most N lines a job, 40 by default). A check that is not an
-Actions job (a status or an app's check) is its name and link alone. Required: the base branch's rules and branch
-protection; --all: every failing check, required or not (also used, with a note, when no required check can be read). Exit 0: none failing; 1: failing checks
-shown; 2: a wrong call or gh failed."""
+The pull request is read from OWNER/REPO, by default the fork (""" + FORK_REPO + """), never from the repository gh
+would pick; its URL is the first line printed. For each failing required check on the pull request's head: its
+name, its job link, and only the error lines of its job log (ANSI colours and timestamps stripped; at most N lines a
+job, 40 by default). A check that is not an Actions job (a status or an app's check) is its name and link alone.
+Required: the base branch's rules and branch protection; --all: every failing check, required or not (also used, with
+a note, when no required check can be read). Exit 0: none failing; 1: failing checks shown; 2: a wrong call or gh
+failed."""
 
 
 def clean_log(text):
@@ -123,16 +126,19 @@ def ci_why(argv):
     if pr is None:
         print(CI_WHY_USAGE, file=sys.stderr)
         return 2
-    code, out, err = _run([GH, 'pr', 'view', str(pr), '--json', 'url,baseRefName,statusCheckRollup']
-                          + (['-R', repo] if repo else []), timeout=60)
+    repo = repo or FORK_REPO
+    code, out, err = _run([GH, 'pr', 'view', str(pr), '--json', 'url,baseRefName,statusCheckRollup', '-R', repo],
+                          timeout=60)
     try:
         view = json.loads(out)
         checks = [_check(i) for i in view.get('statusCheckRollup') or []]
         m = PR_URL.match(view.get('url') or '')
-        repo = repo or (m[1] if m else None)
+        repo = m[1] if m else repo
     except (ValueError, AttributeError):
-        _say(prog, f'cannot read the checks of {pr}: {(err or out).strip()[:300] or f"gh exit {code}"}', err=True)
+        _say(prog, f'cannot read the checks of {pr} in {repo}: {(err or out).strip()[:300] or f"gh exit {code}"}',
+             err=True)
         return 2
+    _say(prog, f'PR {view.get("url") or f"{pr} in {repo}"}')
     missing = []
     if not every:
         required = _required(repo, view.get('baseRefName') or '') if repo else []
@@ -181,6 +187,7 @@ def ci_why(argv):
 
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 PENDING = 'fork-clone-pending'    # in the clone's .git: written before the install, removed once it finished
+INSTALLED = 'fork-clone-installed'   # in the clone's .git: the sha256 of the pnpm-lock.yaml last installed
 LOCK = 'pnpm-lock.yaml'
 CLONE_USAGE = """usage: fork-clone NAME [BRANCH] [--repo URL] [--into DIR]
 
@@ -188,8 +195,10 @@ A blob-less clone (file contents download on demand) at DIR/NAME; DIR is $FORK_W
 is URL, else $FORK_CLONE_REPO, else the origin of the checkout you are in. BRANCH: checked out when the remote has it,
 else made from the remote's default branch. With a pnpm-lock.yaml: when another clone in DIR has the same lockfile
 and its own installed node_modules, the install is offline from the package store those use (seconds); else one
-install. Run again: a clone of the same repository at DIR/NAME is fetched and reused (a half-done install is done
-again); a folder that is something else is never touched. A clone stopped half-way is made again."""
+install. Run again: a clone of the same repository at DIR/NAME is fetched and reused; its checked-out branch is
+fast-forwarded to the remote's when it has no uncommitted changes and no commits of its own (else it is left as it
+was, with a note); the install runs again when it did not finish or when pnpm-lock.yaml is not the one installed. A
+folder that is something else is never touched. A clone stopped half-way is made again."""
 
 
 def _install_cmd():
@@ -245,11 +254,36 @@ def _git(dest, *args, timeout=600):
     return _run([GIT, '-C', dest, *args], timeout=timeout)
 
 
+def _lock_hash(dest):
+    try:
+        with open(os.path.join(dest, LOCK), 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _fast_forward(prog, dest):
+    """A reused clone's checked-out branch, moved to its remote branch when that is only ahead and nothing is
+    uncommitted; else left as it was, with a note."""
+    code, up, _ = _git(dest, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}')
+    if code != 0 or not up.strip():
+        return     # no remote branch (a branch made here)
+    up = up.strip()
+    if _git(dest, 'merge-base', '--is-ancestor', up, 'HEAD')[0] == 0:
+        return     # up to date, or only ahead
+    _, cur, _ = _git(dest, 'rev-parse', '--abbrev-ref', 'HEAD')
+    code, status, _ = _git(dest, 'status', '--porcelain', '--untracked-files=no')
+    if code == 0 and not status.strip() and _git(dest, 'merge', '--ff-only', '-q', up)[0] == 0:
+        _say(prog, f'{cur.strip()} fast-forwarded to {up}')
+        return
+    _say(prog, f'note: {cur.strip()} is left as it was, not at {up} (uncommitted changes or commits of its own)')
+
+
 def _checkout(prog, dest, branch, reused):
-    if not branch:
-        return True
     code, cur, _ = _git(dest, 'rev-parse', '--abbrev-ref', 'HEAD')
-    if code == 0 and cur.strip() == branch:
+    if not branch or code == 0 and cur.strip() == branch:
+        if reused:
+            _fast_forward(prog, dest)
         return True
     if reused:
         code, status, _ = _git(dest, 'status', '--porcelain')
@@ -269,6 +303,8 @@ def _checkout(prog, dest, branch, reused):
     if code != 0:
         _say(prog, f'cannot check out {branch}: {err.strip()[:300]}', err=True)
         return False
+    if reused and has_local:
+        _fast_forward(prog, dest)
     return True
 
 
@@ -341,16 +377,26 @@ def clone(argv):
         os.rename(partial, dest)
     if not _checkout(prog, dest, branch, reused):
         return 1
-    pending = os.path.join(dest, '.git', PENDING)
-    mods = os.path.join(dest, 'node_modules')
-    if reused and not os.path.exists(pending) and (os.path.isdir(mods) or not os.path.isfile(
-            os.path.join(dest, LOCK))):
-        how = 'kept (already installed)' if os.path.isdir(mods) else 'skipped (no pnpm-lock.yaml)'
+    pending, record = os.path.join(dest, '.git', PENDING), os.path.join(dest, '.git', INSTALLED)
+    mods, lock_hash = os.path.join(dest, 'node_modules'), _lock_hash(dest)
+    try:
+        with open(record) as f:
+            installed = f.read().strip()
+    except OSError:
+        installed = None
+    if reused and not os.path.exists(pending) and (lock_hash is None or os.path.isdir(mods) and
+                                                   installed == lock_hash):
+        how = 'kept (already installed)' if lock_hash else 'skipped (no pnpm-lock.yaml)'
     else:
+        if reused and not os.path.exists(pending) and os.path.isdir(mods):
+            _say(prog, f'{LOCK} is not the one installed: installing again')
         open(pending, 'w').close()
         how = _install(prog, work, dest)
         if how is None:
             return 1
+        if lock_hash:
+            with open(record, 'w') as f:
+                f.write(lock_hash + '\n')
         os.unlink(pending)
     _, head, _ = _git(dest, 'log', '-1', '--format=%h %s')
     _, cur, _ = _git(dest, 'rev-parse', '--abbrev-ref', 'HEAD')
@@ -365,17 +411,20 @@ NODE_TEST_DIRS = ('.github/', 'fork-ci/', 'fork-kit/')   # node --test there (th
 SOURCE_EXT = ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.py', '.sh')
 PRECHECK_USAGE = """usage: fork-precheck [--base REF] [--no-tests] [--no-fork-checks] [--kind KIND]
 
-In a checkout: the files changed against REF (default the remote's default branch, from its merge-base: commits,
-staged, unstaged and new files; deleted ones skipped) are formatted (vp fmt), then linted (vp lint). Then the fork
-checks behind most "Fork checks" reds run as that workflow runs them (.github/workflows/fork-checks.yml at REF, with
-REF's scripts): the schema check, the upstream-files check and the seam check, on the commits from the merge-base to
-HEAD (uncommitted changes are not in them); only a failing check's lines are printed. Then the test files the change
-touches (changed test files, and each changed source file's own NAME.test.* beside it) run, once the machine's
-capacity check (t3-capacity [--kind KIND], where it is installed) says OK. *.test.py: python3 -B; *.test.sh: bash;
+In a checkout: the files changed against REF (default the remote's default branch, fetched first; the base's commit
+and age are printed), from its merge-base: commits, staged, unstaged and new files; deleted ones skipped) are
+formatted (vp fmt), then linted (vp lint). Then the fork checks behind most "Fork checks" reds run as that workflow
+runs them (.github/workflows/fork-checks.yml at REF, with REF's scripts): the schema check, the upstream-files check
+and the seam check, on the commits from the merge-base to HEAD (uncommitted changes are not in them); only a failing
+check's lines are printed. Then the test files the change touches (changed test files, and each changed source file's
+own NAME.test.* beside it, else in the nearest tests/ folder above it) run, once the machine's capacity check
+(t3-capacity [--kind KIND], where it is installed) says OK. *.test.py: python3 -B; *.test.sh: bash;
 *.test.{js,cjs,mjs} under .github/, fork-ci/ or fork-kit/: node --test; other *.test.*: vp test run.
 --no-fork-checks skips the fork checks (a repository without them; a missing check otherwise fails).
-Exit 0: all passed; 1: a step failed (each step still runs); 2: a wrong call or not a checkout; 3: the capacity check
-said NOT OK (fmt, lint and the fork checks ran, no test did: run it again later)."""
+Exit 0: all passed; 1: a step failed (each step still runs; also when the capacity check then said NOT OK); 2: a
+wrong call, not a checkout, or the capacity check could not answer (any exit but 0 or 1, as a t3-capacity that takes
+no --kind gives); 3: the capacity check said NOT OK and nothing had failed (fmt, lint and the fork checks ran, no
+test did: run it again later)."""
 
 # The fork checks fork-checks.yml runs on every pull request (37 of 40 "Fork checks" reds were one of these). Each
 # runs from REF's script with the arguments of REF's workflow step: "$NAME" words come from the step's env (CI's
@@ -494,8 +543,14 @@ def touched_tests(top, files):
         if TEST_FILE.search(f):
             cands = [f]
         elif f.endswith(SOURCE_EXT):
-            stem = f.rsplit('.', 1)[0]
-            cands = [f'{stem}.test.{e}' for e in ('ts', 'tsx', 'mts', 'js', 'mjs', 'cjs', 'py', 'sh')]
+            exts = ('ts', 'tsx', 'mts', 'js', 'mjs', 'cjs', 'py', 'sh')
+            folder, name = os.path.split(f.rsplit('.', 1)[0])
+            cands = [c for c in (f'{os.path.join(folder, name)}.test.{e}' for e in exts)
+                     if os.path.isfile(os.path.join(top, c))]
+            while not cands and folder:    # else the nearest tests/ folder above it (the kit's layout)
+                folder = os.path.dirname(folder)
+                cands = [c for c in (os.path.join(folder, 'tests', f'{name}.test.{e}') for e in exts)
+                         if os.path.isfile(os.path.join(top, c))]
         else:
             cands = []
         for c in cands:
@@ -546,6 +601,15 @@ def precheck(argv):
     if not base:
         code, head, _ = _run([GIT, '-C', top, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], timeout=10)
         base = head.strip() if code == 0 and head.strip() else 'origin/main'
+        name = base.split('/', 1)[1]
+        code, _, err = _run([GIT, '-C', top, 'fetch', '-q', 'origin', f'+refs/heads/{name}:refs/remotes/{base}'],
+                            timeout=120)
+        if code != 0:
+            _say(prog, f'note: cannot fetch {base} ({(err.strip().splitlines() or [f"exit {code}"])[-1][:200]}): '
+                       'it is as last fetched')
+    code, when, _ = _run([GIT, '-C', top, 'log', '-1', '--format=%h, committed %cr', base, '--'], timeout=10)
+    if code == 0 and when.strip():
+        _say(prog, f'base {base}: {when.strip()}')
     files, problem = changed_files(top, base)
     if files is None:
         _say(prog, problem, err=True)
@@ -572,10 +636,20 @@ def precheck(argv):
         gate = shutil.which('t3-capacity')
         if gate:
             code, out, err = _run([gate] + (['--kind', kind] if kind else []), timeout=30)
-            last = (out.strip().splitlines() or [err.strip() or f'exit {code}'])[-1]
-            if code != 0:
+            last = (out.strip().splitlines() or err.strip().splitlines() or [f'exit {code}'])[-1]
+            if code not in (0, 1):     # not an answer: a wrong call (exit 2), or no answer in time (124)
+                _say(prog, f'capacity check failed (exit {code}): {last[:200]}: the {len(tests)} test file(s) did '
+                           'not run' + (f' (exit 2 is a wrong call: this {gate} likely does not take --kind; run '
+                                        'fork-precheck without --kind)' if kind and code == 2 else '')
+                     + (f'; already failed: {", ".join(failed)}' if failed else ''), err=True)
+                return 2
+            if code == 1 and failed:
+                _say(prog, f'capacity check: {last}: the {len(tests)} test file(s) did not run')
+                _say(prog, 'FAILED: ' + '; '.join(failed))
+                return 1
+            if code == 1:
                 _say(prog, f'capacity check: {last}: the {len(tests)} test file(s) did not run; run fork-precheck '
-                           'again later' + (f'; already failed: {", ".join(failed)}' if failed else ''))
+                           'again later')
                 return 3
             _say(prog, f'capacity check: {last}')
         else:

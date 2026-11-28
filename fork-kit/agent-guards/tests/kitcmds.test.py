@@ -136,6 +136,13 @@ sys.stderr.write('HTTP 404: Not Found\\n'); sys.exit(1)''')
         self.assertIn(['api', 'repos/o/r/rules/branches/main'], calls)
         self.assertIn(['api', 'repos/o/r/actions/jobs/22/logs'], calls)
 
+    def test_without_r_it_reads_the_fork_s_pr_and_says_which_one_first(self):
+        self.gh()
+        r = self.run_cmd('fork-ci-why', '42')
+        self.assertEqual(r.stdout.splitlines()[0], 'fork-ci-why: PR https://github.com/o/r/pull/42')
+        self.assertEqual(self.calls('gh')[0][2:], ['pr', 'view', '42', '--json', 'url,baseRefName,statusCheckRollup',
+                                                   '-R', 'scuttletoby/t3code'])
+
     def test_all_shows_failing_checks_that_are_not_required(self):
         self.gh(logs={'22': LOG, '24': 'Error: optional broke\n'})
         r = self.run_cmd('fork-ci-why', '42', '--all')
@@ -151,7 +158,7 @@ sys.stderr.write('HTTP 404: Not Found\\n'); sys.exit(1)''')
     def test_no_failing_check_is_exit_0(self):
         self.gh(checks=[CHECKS[1], CHECKS[3]], required=['Lint', 'Build'])
         r = self.run_cmd('fork-ci-why', '42')
-        self.assertEqual((r.returncode, r.stdout.strip()),
+        self.assertEqual((r.returncode, r.stdout.strip().splitlines()[-1]),
                          (0, 'fork-ci-why: no failing required check (2 required checks, 1 pending)'))
 
     def test_no_readable_required_checks_falls_back_to_every_check_with_a_note(self):
@@ -173,7 +180,7 @@ sys.stderr.write('HTTP 404: Not Found\\n'); sys.exit(1)''')
         self.gh(view_fails=True)
         r = self.run_cmd('fork-ci-why', '42')
         self.assertEqual(r.returncode, 2)
-        self.assertIn('cannot read the checks of 42: gh: not logged in', r.stderr)
+        self.assertIn('cannot read the checks of 42 in scuttletoby/t3code: gh: not logged in', r.stderr)
         self.assertEqual(self.run_cmd('fork-ci-why').returncode, 2)
         self.assertEqual(self.run_cmd('fork-ci-why', '42', '--lines', 'x').returncode, 2)
         self.assertEqual(self.run_cmd('fork-ci-why', '--help').returncode, 0)
@@ -190,6 +197,7 @@ class Clone(Base):
         git('config', 'uploadpack.allowFilter', 'true', cwd=self.origin)
         write(os.path.join(self.origin, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
         write(os.path.join(self.origin, 'README.md'), 'x\n')
+        write(os.path.join(self.origin, '.gitignore'), 'node_modules\n')   # as the fork's own
         git('add', '-A', cwd=self.origin)
         git('commit', '-q', '-m', 'base', cwd=self.origin)
         git('branch', 'feature', cwd=self.origin)
@@ -244,6 +252,34 @@ open('node_modules/.modules.yaml', 'w').close()''')
         self.assertIn('dependencies: kept (already installed)', r.stdout)
         self.assertEqual(len(self.installs()), 1)
         self.assertEqual(git('log', '-1', '--format=%s', 'origin/main', cwd=os.path.join(self.work, 'a')), 'newer')
+        self.assertEqual(git('log', '-1', '--format=%s', 'main', cwd=os.path.join(self.work, 'a')), 'newer',
+                         'the checked-out branch is fast-forwarded')
+        self.assertIn('newer', r.stdout)
+
+    def test_run_again_leaves_a_branch_with_its_own_commits_and_says_so(self):
+        self.clone('a')
+        dest = os.path.join(self.work, 'a')
+        git('commit', '-q', '--allow-empty', '-m', 'mine', cwd=dest)
+        git('commit', '-q', '--allow-empty', '-m', 'newer', cwd=self.origin)
+        r = self.clone('a')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(git('log', '-1', '--format=%s', 'main', cwd=dest), 'mine')
+        self.assertIn('note: main is left as it was, not at origin/main', r.stdout)
+
+    def test_run_again_on_a_branch_with_another_lockfile_installs_again(self):
+        git('checkout', '-q', 'feature', cwd=self.origin)
+        write(os.path.join(self.origin, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nother: 1\n')
+        git('commit', '-q', '-am', 'other lock', cwd=self.origin)
+        git('checkout', '-q', 'main', cwd=self.origin)
+        self.clone('a', 'main')
+        r = self.clone('a', 'feature')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('pnpm-lock.yaml is not the one installed: installing again', r.stdout)
+        self.assertIn('dependencies: installed', r.stdout)
+        self.assertEqual(len(self.installs()), 2)
+        r = self.clone('a', 'feature')
+        self.assertIn('dependencies: kept (already installed)', r.stdout)
+        self.assertEqual(len(self.installs()), 2)
 
     def test_a_branch_the_remote_has_is_checked_out_and_a_new_one_is_made_from_the_default_branch(self):
         self.clone('a', 'feature')
@@ -407,6 +443,45 @@ class Precheck(Base):
         self.assertIn('capacity check: NOT OK: busy: the 2 test file(s) did not run', r.stdout)
         self.assertEqual([w[0] for w in self.words('vp')], ['fmt', 'lint'])
         self.assertNotIn('x ok', r.stdout)
+
+    def test_a_capacity_check_that_cannot_take_the_call_is_exit_2_never_the_retry_code(self):
+        # the shell t3-capacity takes only [MB]: --kind is "not a number", exit 2
+        self.fake('t3-capacity', 'print("NOT OK: \'--kind\' is not a number of MB", file=sys.stderr); sys.exit(2)')
+        r = self.precheck('--kind', 'agent-writer')
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn('capacity check failed (exit 2)', r.stderr)
+        self.assertIn('does not take --kind', r.stderr)
+        self.assertNotIn('again later', r.stdout + r.stderr)
+        self.assertNotIn('x ok', r.stdout)
+
+    def test_capacity_not_ok_after_a_lint_failure_is_exit_1(self):
+        self.capacity()
+        r = self.precheck(env={'FAKE_CAPACITY': '1', 'FAKE_LINT_FAIL': '1'})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('FAILED: lint (exit 1)', r.stdout)
+        self.assertIn('the 2 test file(s) did not run', r.stdout)
+
+    def test_a_source_file_s_test_in_a_tests_folder_above_it_runs(self):
+        self.commit({'tools/lib/pkg/y.py': 'y\n', 'tools/tests/y.test.py': 'print("y ok")\n'})
+        write(os.path.join(self.repo, 'tools/lib/pkg/y.py'), 'y2\n')
+        r = self.precheck('--base', 'HEAD', '--no-fork-checks')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('y ok', r.stdout)
+
+    def test_the_default_base_is_fetched_first_and_its_commit_named(self):
+        old = git('rev-parse', 'origin/main', cwd=self.repo)
+        self.on_main(lambda: self.commit({'tools/z.py': 'z\n'}, 'later on main'))
+        new = git('rev-parse', 'origin/main', cwd=self.repo)
+        git('update-ref', 'refs/remotes/origin/main', old, cwd=self.repo)      # as last fetched long ago
+        r = self.precheck('--no-tests', '--no-fork-checks')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(git('rev-parse', 'origin/main', cwd=self.repo), new)
+        self.assertIn(f'base origin/main: {new[:7]}', r.stdout)
+        git('remote', 'set-url', 'origin', os.path.join(self.tmp, 'gone.git'), cwd=self.repo)
+        r = self.precheck('--no-tests', '--no-fork-checks')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('note: cannot fetch origin/main', r.stdout)
+        self.assertRegex(r.stdout, rf'base origin/main: {new[:7]}.* ago')
 
     def test_no_capacity_check_on_the_machine_runs_the_tests_with_a_note(self):
         r = self.precheck()
