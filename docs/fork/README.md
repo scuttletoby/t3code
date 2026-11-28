@@ -1512,12 +1512,21 @@ the calling thread's project, and each repeats safely:
   and never for a lane it starts itself), and returns its generation. That thread passes the lane
   and generation to `lane_claim` and `lane_release`; a thread that is not the lane's current one
   is refused.
-- `lane_stop`: switches a lane off and releases its claims. Only the thread that started the lane
-  stops it (another lane's thread or worker is refused with `not-starter`).
+- `lane_stop`: switches a lane off and releases its claims. The thread that started the lane stops
+  it (another lane's thread or worker is refused with `not-starter`); once that thread is no longer
+  a live thread of the project (deleted, or moved to another project), or none is recorded, any
+  thread of the project stops it, so a lane never outlives everyone who may stop it.
 - `lane_board`: every defined lane (`off` when it never ran, `undefined` when settings no longer
   define it) with its thread and generation, the claims (stale ones marked), the escalations
-  waiting and each lane's last 3 notes. Settings that cannot be read: refused, not a board of
-  `undefined` lanes.
+  waiting and each lane's last 3 notes, and who started each lane (`startedBy`). Settings that
+  cannot be read: refused with `settings-unreadable` (not `lanes-off`), not a board of `undefined`
+  lanes.
+
+Rollback: the lane file keeps its version 1 with `startedBy` as an optional key. A server from
+before it decodes the file and drops the key on its next write; that lane then has no starter
+recorded, so any thread of the project may stop it (as before the key existed). Nothing is lost
+or locked.
+
 - `lane_claim`, `lane_release`: from the lane's thread, one owner per item, as the store above.
 
 ```json

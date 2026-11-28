@@ -30,6 +30,7 @@ export const BOARD_NOTES_PER_LANE = 3;
  */
 const LANE_REFUSAL_REASON_KEYS: { readonly [Reason in LaneRefusalReason]: true } = {
   "lanes-off": true,
+  "settings-unreadable": true,
   "store-unreadable": true,
   "store-unwritable": true,
   "unknown-lane": true,
@@ -90,6 +91,8 @@ const BoardLane = Schema.Struct({
   status: Schema.Literals(["running", "stopped", "off", "undefined"]),
   generation: Schema.NullOr(Schema.Number),
   threadId: Schema.NullOr(ThreadId),
+  /** The thread that started it, the one that stops it while live. Null: none recorded (any thread). */
+  startedBy: Schema.NullOr(ThreadId),
   startedAt: Schema.NullOr(Schema.String),
   stoppedAt: Schema.NullOr(Schema.String),
 });
@@ -122,7 +125,7 @@ const callingThread = () =>
   threadOfCaller("Lanes belong to a project. This MCP client is not running inside a T3 thread.");
 
 /** A lane tool always acts as the calling thread, never as the owner. */
-const asThread = (threadId: ThreadId): LaneOperator => ({ _tag: "thread", threadId });
+const asThread = (threadId: ThreadId) => ({ _tag: "thread", threadId }) as const;
 
 const failure = (refusal: LaneStoreRefused) =>
   new LaneToolFailure({
@@ -168,16 +171,42 @@ export const laneStartCall = Effect.fn("laneTools.start")(function* (
   };
 });
 
-/** `lane_stop`: only from the thread that started the lane. */
+/**
+ * `lane_stop`: from the thread that started the lane; once that thread is no longer a live thread
+ * of the project (deleted, or moved to another project), from any thread of it, so a lane never
+ * outlives everyone who may stop it.
+ */
 export const laneStopCall = Effect.fn("laneTools.stop")(function* (
   input: typeof LaneStopInput.Type,
 ) {
   const calling = yield* callingThread();
+  const projectId = calling.caller.projectId;
   const store = yield* LaneStore;
-  const released = yield* refusedAs(
-    store.stopLane(calling.caller.projectId, input.lane, asThread(calling.caller.id)),
+  const stop = (by: LaneOperator) =>
+    refusedAs(store.stopLane(projectId, input.lane, by)).pipe(
+      Effect.map((released) => ({ lane: input.lane, released: released.map((c) => c.item) })),
+    );
+  const by = asThread(calling.caller.id);
+  return yield* stop(by).pipe(
+    Effect.catchIf(
+      (refusal) => refusal._tag === "LaneToolFailure" && refusal.code === "not-starter",
+      (refusal) =>
+        Effect.gen(function* () {
+          const starter = own(
+            (yield* refusedAs(store.board(projectId))).lanes,
+            input.lane,
+          )?.startedBy;
+          if (starter === undefined) return yield* refusal;
+          const shell = yield* calling.threads
+            .getThreadShell(starter)
+            .pipe(Effect.mapError(unavailable));
+          const live = shell !== null && shell.deletedAt === null && shell.projectId === projectId;
+          if (live) return yield* refusal;
+          // The store stops only while the lane still names this starter (no restart in between).
+          return yield* stop({ ...by, goneStarter: starter });
+        }),
+    ),
   );
-  return { lane: input.lane, released: released.map((claim) => claim.item) };
 });
 
 export const laneBoardCall = Effect.fn("laneTools.board")(function* () {
@@ -201,6 +230,7 @@ export const laneBoardCall = Effect.fn("laneTools.board")(function* () {
             : entry.status,
       generation: entry?.generation ?? null,
       threadId: entry?.threadId ?? null,
+      startedBy: entry?.startedBy ?? null,
       startedAt: entry?.startedAt ?? null,
       stoppedAt: entry?.stoppedAt ?? null,
     };

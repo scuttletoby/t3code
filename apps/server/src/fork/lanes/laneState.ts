@@ -41,8 +41,9 @@ const LaneEntry = Schema.Struct({
   threadId: ThreadId,
   startedAt: Schema.String,
   /**
-   * The thread that started it (an orchestrator), the one thread that may stop it. Absent: the
-   * owner started it, and only the owner stops it.
+   * The thread that started it (an orchestrator): while it is a live thread of the project, it
+   * alone (or the owner) stops the lane. Absent (the owner started it, or an older server rewrote
+   * the file and dropped the key): no starter to wait for, so any thread of the project stops it.
    */
   startedBy: Schema.optionalKey(ThreadId),
   stoppedAt: Schema.NullOr(Schema.String),
@@ -119,6 +120,8 @@ export const encodeLaneState = (state: LaneProjectState): string =>
 export type LaneRefusalReason =
   /** `server.lanes.enabled` is off. */
   | "lanes-off"
+  /** The server settings cannot be read now, so whether lanes are on is unknown. */
+  | "settings-unreadable"
   /** The project's lane file exists but cannot be read or decoded. */
   | "store-unreadable"
   /** The project's lane file cannot be written now (a full disk, no permission). */
@@ -131,7 +134,7 @@ export type LaneRefusalReason =
   | "stale-owner"
   /** A thread named as the lane's thread is the thread that starts the lane. */
   | "self-lane"
-  /** Only the thread that started a lane, or the owner, stops it. */
+  /** Only the thread that started a lane (while it is a live thread of the project), or the owner, stops it. */
   | "not-starter"
   /** The lane's definition does not own this kind of item. */
   | "kind-not-owned"
@@ -182,9 +185,13 @@ const ok = <A>(state: LaneProjectState, value: A, changed = true): LaneStep<A> =
 /** The lanes the settings define, by name. */
 export type LaneDefinitions = { readonly [name: string]: LaneDefinition };
 
-/** Who starts or stops a lane: a thread (an orchestrator, through the lane tools), or the owner. */
+/**
+ * Who starts or stops a lane: a thread (an orchestrator, through the lane tools), or the owner.
+ * `goneStarter`: a starter the caller found is no longer a live thread of the project; a stop
+ * passes the starter check only while the lane still names that same starter.
+ */
 export type LaneOperator =
-  | { readonly _tag: "thread"; readonly threadId: ThreadId }
+  | { readonly _tag: "thread"; readonly threadId: ThreadId; readonly goneStarter?: ThreadId }
   | { readonly _tag: "owner" };
 
 const definitionOf = (definitions: LaneDefinitions, lane: string): LaneDefinition | undefined =>
@@ -403,16 +410,16 @@ export function stopLane(
   input: { readonly lane: string; readonly by: LaneOperator; readonly now: string },
 ): LaneStepResult<ReadonlyArray<LaneClaim>> {
   const current = own(state.lanes, input.lane);
+  const starter = current?.startedBy;
   if (
-    current !== undefined &&
+    starter !== undefined &&
     input.by._tag === "thread" &&
-    current.startedBy !== input.by.threadId
+    starter !== input.by.threadId &&
+    starter !== input.by.goneStarter
   ) {
     return refuse(
       "not-starter",
-      current.startedBy === undefined
-        ? `The owner started the lane '${input.lane}'; only the owner stops it.`
-        : `Thread ${current.startedBy} started the lane '${input.lane}'; only it (or the owner) stops it.`,
+      `Thread ${starter} started the lane '${input.lane}'; while it is a live thread of the project, only it (or the owner) stops it.`,
     );
   }
   const released = Object.values(state.claims).filter((claim) => claim.lane === input.lane);

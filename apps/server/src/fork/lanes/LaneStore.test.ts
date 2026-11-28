@@ -1,7 +1,7 @@
 /** Fork (issue 1156, phase 2): the lane store over a real folder, one store per server start. */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import { type LaneDefinition, ProjectId, ThreadId } from "@t3tools/contracts";
+import { type LaneDefinition, ProjectId, ServerSettingsError, ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -411,7 +411,7 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
 
   it.effect("lets only the thread that started a lane, or the owner, stop it", () =>
     Effect.gen(function* () {
-      const { start, fs, file, readFile } = yield* harness;
+      const { start } = yield* harness;
       const store = yield* start;
       const by = (threadId: ThreadId) => ({ _tag: "thread", threadId }) as const;
       // A thread cannot start a lane as its own thread.
@@ -436,17 +436,59 @@ it.layer(NodeServices.layer)("LaneStore", (it) => {
       yield* store.stopLane(PROJECT, "pr-queue", by(B));
       yield* store.startLane(PROJECT, "ci", C, by(B));
       yield* store.stopLane(PROJECT, "ci", OWNER);
-      // A lane the owner started (or an older file without a starter): only the owner stops it.
-      yield* store.startLane(PROJECT, "issues", ISSUES, OWNER);
+      // A gone starter the caller names lets it stop, but only while the lane names that starter.
+      yield* store.startLane(PROJECT, "pr-queue", A, by(B));
       assert.strictEqual(
-        reasonOf(yield* Effect.exit(store.stopLane(PROJECT, "issues", by(B)))),
+        reasonOf(
+          yield* Effect.exit(store.stopLane(PROJECT, "pr-queue", { ...by(C), goneStarter: A })),
+        ),
         "not-starter",
       );
+      yield* store.stopLane(PROJECT, "pr-queue", { ...by(C), goneStarter: B });
+    }),
+  );
+
+  it.effect("lets any thread stop a lane with no starter recorded (an older server's write)", () =>
+    Effect.gen(function* () {
+      const { start, fs, file, readFile } = yield* harness;
+      const store = yield* start;
+      yield* store.startLane(PROJECT, "ci", C, { _tag: "thread", threadId: B });
+      yield* store.startLane(PROJECT, "issues", ISSUES, OWNER);
       const raw = JSON.parse(yield* readFile);
-      assert.isFalse("startedBy" in raw.lanes.issues);
       assert.strictEqual(raw.lanes.ci.startedBy, B);
+      assert.isFalse("startedBy" in raw.lanes.issues);
+      // An older server (no `startedBy` in its schema) rewrote the file: the key is gone.
+      delete raw.lanes.ci.startedBy;
       yield* fs.writeFileString(file, JSON.stringify(raw));
-      yield* store.stopLane(PROJECT, "issues", OWNER);
+      for (const lane of ["ci", "issues"]) {
+        assert.deepStrictEqual(
+          yield* store.stopLane(PROJECT, lane, { _tag: "thread", threadId: A }),
+          [],
+        );
+      }
+    }),
+  );
+
+  it.effect("says settings that cannot be read are unreadable, not lanes off", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = path.join(yield* fs.makeTempDirectoryScoped({ prefix: "lanes-" }), "lanes");
+      const store = yield* LaneStore.make({ directory }).pipe(
+        Effect.provide(
+          Layer.mock(ServerSettingsService)({
+            getSettings: Effect.fail(
+              new ServerSettingsError({ settingsPath: "test", operation: "read-file" }),
+            ),
+          }),
+        ),
+      );
+      assert.strictEqual(
+        reasonOf(yield* Effect.exit(store.startLane(PROJECT, "ci", C, OWNER))),
+        "settings-unreadable",
+      );
+      assert.strictEqual(reasonOf(yield* Effect.exit(store.board(PROJECT))), "settings-unreadable");
+      assert.isFalse(yield* fs.exists(directory));
     }),
   );
 

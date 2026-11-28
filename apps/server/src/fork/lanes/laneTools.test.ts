@@ -9,6 +9,7 @@ import {
   ServerSettingsError,
   ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -368,6 +369,7 @@ it.layer(NodeServices.layer)("lane tools", (it) => {
             status: "stopped",
             generation: 1,
             threadId: CI_LANE,
+            startedBy: MAIN,
             startedAt: expect.any(String),
             stoppedAt: expect.any(String),
           },
@@ -377,6 +379,7 @@ it.layer(NodeServices.layer)("lane tools", (it) => {
             status: "off",
             generation: null,
             threadId: null,
+            startedBy: null,
             startedAt: null,
             stoppedAt: null,
           },
@@ -386,6 +389,7 @@ it.layer(NodeServices.layer)("lane tools", (it) => {
             status: "running",
             generation: 1,
             threadId: PR_LANE,
+            startedBy: MAIN,
             startedAt: expect.any(String),
             stoppedAt: null,
           },
@@ -473,6 +477,72 @@ it.layer(NodeServices.layer)("lane tools", (it) => {
     }),
   );
 
+  it.effect(
+    "lane_stop: once the starter is no longer a live thread of the project, any thread stops",
+    () =>
+      Effect.gen(function* () {
+        const { directory } = yield* workspace;
+        const OLD_ORCHESTRATOR = ThreadId.make("thread-old-orchestrator");
+        const NEW_ORCHESTRATOR = ThreadId.make("thread-new-orchestrator");
+        const MOVED = ThreadId.make("thread-moved-orchestrator");
+        const live = McpToolAccessTestkit.liveThreadShell;
+        yield* Effect.gen(function* () {
+          succeeded(
+            yield* call(OLD_ORCHESTRATOR, "lane_start", { lane: "pr-queue", threadId: PR_LANE }),
+          );
+          succeeded(
+            yield* call(PR_LANE, "lane_claim", { lane: "pr-queue", generation: 1, item: PR }),
+          );
+          succeeded(yield* call(MOVED, "lane_start", { lane: "ci", threadId: CI_LANE }));
+          // While the starter lives, another live thread is still refused.
+          expect(
+            failed(yield* call(NEW_ORCHESTRATOR, "lane_stop", { lane: "pr-queue" })),
+          ).toMatchObject({ code: "not-starter" });
+          // The starter is deleted; the other moved to another project.
+          shells.set(OLD_ORCHESTRATOR, {
+            ...live(OLD_ORCHESTRATOR),
+            deletedAt: DateTime.makeUnsafe("2026-01-01T00:00:00.000Z"),
+          });
+          shells.set(MOVED, { ...live(MOVED), projectId: OTHER_PROJECT });
+          expect(
+            failed(
+              yield* call(NEW_ORCHESTRATOR, "lane_start", {
+                lane: "pr-queue",
+                threadId: ISSUES_THREAD,
+              }),
+            ),
+          ).toMatchObject({ code: "already-running" });
+          expect(
+            succeeded(yield* call(NEW_ORCHESTRATOR, "lane_stop", { lane: "pr-queue" })),
+          ).toEqual({
+            lane: "pr-queue",
+            released: [PR],
+          });
+          succeeded(yield* call(NEW_ORCHESTRATOR, "lane_stop", { lane: "ci" }));
+          // Restarted on the same thread by the new orchestrator: it is the starter now.
+          expect(
+            succeeded(
+              yield* call(NEW_ORCHESTRATOR, "lane_start", { lane: "pr-queue", threadId: PR_LANE }),
+            ),
+          ).toMatchObject({ generation: 2 });
+          expect(succeeded(yield* call(MAIN, "lane_board", {})).lanes).toContainEqual(
+            expect.objectContaining({ lane: "pr-queue", startedBy: NEW_ORCHESTRATOR }),
+          );
+          expect(failed(yield* call(CI_LANE, "lane_stop", { lane: "pr-queue" }))).toMatchObject({
+            code: "not-starter",
+          });
+        }).pipe(
+          Effect.provide(toolsLayer(directory, ON)),
+          Effect.ensuring(
+            Effect.sync(() => {
+              shells.delete(OLD_ORCHESTRATOR);
+              shells.delete(MOVED);
+            }),
+          ),
+        );
+      }),
+  );
+
   it.effect("a lane file that cannot be written: the store's refusal, not a crash", () =>
     Effect.gen(function* () {
       const { fs, directory, file } = yield* workspace;
@@ -506,7 +576,7 @@ it.layer(NodeServices.layer)("lane tools", (it) => {
         // Settings that cannot be read at all: a plain refusal, not a board of undefined lanes.
         settings.allow(0);
         expect(failed(yield* call(MAIN, "lane_board", {}))).toMatchObject({
-          code: "lanes-off",
+          code: "settings-unreadable",
           message: expect.stringContaining("cannot be read"),
         });
       }).pipe(Effect.provide(toolsLayerWith(directory, settings.layer)));

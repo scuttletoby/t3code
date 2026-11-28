@@ -143,7 +143,12 @@ export const make = Effect.fn("LaneStore.make")(function* (options: {
   /** The lanes that exist (built-in, then the stored ones over them) while lanes are on; else refused. */
   const definitionsNow = settings.getSettings.pipe(
     Effect.mapError(() =>
-      refused(LaneState.refuse("lanes-off", "The server settings cannot be read now.")),
+      refused(
+        LaneState.refuse(
+          "settings-unreadable",
+          "The server settings cannot be read now; nothing is changed until they read again.",
+        ),
+      ),
     ),
     Effect.flatMap((current) =>
       current.lanes.enabled
