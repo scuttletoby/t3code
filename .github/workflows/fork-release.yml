@@ -198,7 +198,7 @@ jobs:
           git checkout -q --detach FETCH_HEAD
 
       - name: Setup dependencies
-        uses: ./.github/actions/setup-ci-deps
+        uses: ./.github/actions/fork-setup-ci-deps
         with:
           install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
 
@@ -524,7 +524,7 @@ jobs:
           git checkout -q --detach FETCH_HEAD
 
       - name: Setup dependencies
-        uses: ./.github/actions/setup-ci-deps
+        uses: ./.github/actions/fork-setup-ci-deps
         with:
           install-args: --filter=@t3tools/scripts...
 

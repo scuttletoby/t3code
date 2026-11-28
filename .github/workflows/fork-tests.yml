@@ -7,7 +7,10 @@ name: Fork tests
 # private remote cache), Test splits over two runners and Test Web over three.
 # Upstream's composite actions and change detector (.github/actions,
 # .github/scripts/ci-changes.cjs) are used as they are, so a rebase brings their
-# changes. The `workflows` job lints the fork workflows (actionlint) and the
+# changes. One exception: setup-ci-deps runs as the fork's copy,
+# .github/actions/fork-setup-ci-deps, which also caches node_modules; the
+# `workflows` job fails when upstream's file changed and the copy did not follow
+# (.github/scripts/fork-setup-copy-check.cjs). The `workflows` job lints the fork workflows (actionlint) and the
 # fleet launcher (shellcheck), and fails
 # when upstream's ci.yml or release.yml test jobs change and this copy did not
 # follow (.github/scripts/fork-tests-drift.cjs). The fork's own script tests run
@@ -494,6 +497,11 @@ jobs:
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs
 
+      # The fork's copy of upstream's setup-ci-deps follows upstream's file (its recorded blob id), and
+      # no fork workflow uses upstream's action instead of the copy.
+      - name: Compare upstream's setup-ci-deps with the fork's copy
+        run: node .github/scripts/fork-setup-copy-check.cjs
+
       # Fork lines in upstream files stay the seam lines pinned in .github/fork-seams.json (a fork
       # setting goes in forkSettings.ts, not upstream's settings.ts). A pull request's run checks out
       # its merge commit, whose first parent is the base: the lines the pull request adds. Its two
@@ -811,7 +819,7 @@ jobs:
           fi
 
       - name: Setup Vite+
-        uses: ./.github/actions/setup-ci-deps
+        uses: ./.github/actions/fork-setup-ci-deps
 
       # Here, not in `workflows`: it greps app code, so it needs the whole tree (#254). Lint runs on every
       # pull request, fork-only ones too. Listed in .github/fork-ci-tests.txt as run by this file.
@@ -915,9 +923,9 @@ jobs:
           fi
 
       - name: Setup Vite+
-        uses: ./.github/actions/setup-ci-deps
+        uses: ./.github/actions/fork-setup-ci-deps
         with:
-          # Lint saves the pnpm store; the others only restore it.
+          # Lint saves the pnpm store and node_modules; the others only restore them.
           save-pnpm-store: false
 
       - name: Cache Electron download
@@ -1114,9 +1122,9 @@ jobs:
 
       - name: Setup Vite+
         if: steps.shard.outputs.any == 'true'
-        uses: ./.github/actions/setup-ci-deps
+        uses: ./.github/actions/fork-setup-ci-deps
         with:
-          # Lint saves the pnpm store; the others only restore it.
+          # Lint saves the pnpm store and node_modules; the others only restore them.
           save-pnpm-store: false
 
       - name: Cache Electron download
@@ -1238,9 +1246,9 @@ jobs:
         run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       - name: Setup Vite+
-        uses: ./.github/actions/setup-ci-deps
+        uses: ./.github/actions/fork-setup-ci-deps
         with:
-          # Lint saves the pnpm store; the others only restore it.
+          # Lint saves the pnpm store and node_modules; the others only restore them.
           save-pnpm-store: false
 
       - name: Resolve Playwright version
@@ -1333,9 +1341,9 @@ jobs:
         run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       - name: Setup Vite+
-        uses: ./.github/actions/setup-ci-deps
+        uses: ./.github/actions/fork-setup-ci-deps
         with:
-          # Lint saves the pnpm store; the others only restore it.
+          # Lint saves the pnpm store and node_modules; the others only restore them.
           save-pnpm-store: false
 
       # Upstream reads a private remote task cache (a secret the fork has not
@@ -1552,9 +1560,9 @@ jobs:
         run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       - name: Setup Vite+
-        uses: ./.github/actions/setup-ci-deps
+        uses: ./.github/actions/fork-setup-ci-deps
         with:
-          # Lint saves the pnpm store; the others only restore it.
+          # Lint saves the pnpm store and node_modules; the others only restore them.
           save-pnpm-store: false
 
       - name: Exercise release-only workflow steps

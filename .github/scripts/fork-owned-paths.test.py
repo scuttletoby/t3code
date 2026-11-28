@@ -144,6 +144,8 @@ for label, change, base in [
     ("a change to fork-tests.yml", {".github/workflows/fork-tests.yml": "x\n"}, None),
     ("a change to another fork workflow", {".github/workflows/fork-pr-queue.yml": "x\n"}, None),
     ("a change to a composite action", {".github/actions/setup-ci-deps/action.yml": "x\n"}, None),
+    ("a change to the fork's copy of a composite action", {".github/actions/fork-setup-ci-deps/action.yml": "x\n"}, None),
+    ("a change to the copy's key script", {".github/actions/fork-setup-ci-deps/node-modules-key.sh": "x\n"}, None),
     ("a change to upstream's detector", {".github/scripts/ci-changes.cjs": "x\n"}, None),
     ("a file an app job reads (fork-test-shards.cjs)", {".github/scripts/fork-test-shards.cjs": "x\n"}, None),
     ("the runner routing (fork-fleet.py)", {".github/scripts/fork-fleet.py": "x\n"}, None),
