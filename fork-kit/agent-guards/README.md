@@ -1,6 +1,6 @@
 # agent-guards: Claude Code hooks that guard every agent on a machine
 
-Nine Claude Code hooks and a lookup command. Each hook stops one mistake that agents made on a shared machine, at
+Nine Claude Code hooks, a lookup command and ready-made commands for agents ([below](#ready-made-commands)). Each hook stops one mistake that agents made on a shared machine, at
 the moment they make it. A line in the agents' instructions did not stop any of them. The hooks are general: a project gives only its facts
 (file paths, a command name, a budget) in the machine file's `"agent-guards"` section.
 
@@ -109,6 +109,25 @@ the end time. The file is
 others, no link), at most 24 hours. An earlier draft used a session environment variable; every nested session
 inherited it, so it is not read any more. Anyone who can become root without a password (sudo `NOPASSWD`, the
 `docker` group) can write the file: `agent-guards self-check` warns about both for the agents' user.
+
+## Ready-made commands
+
+Commands for what agents otherwise rebuild as long pipelines, each costing several turns (#1094). Linked beside the
+hooks in `/usr/local/bin/` by the installer; each prints its usage with `--help`.
+
+| Command                 | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fork-lens-packet <pr>` | Writes one Markdown file for a review lens and prints its path: the title and body, base, merge-base and head SHAs, the lens questions of the head's `.github/fork-lens-*.md`, the state question (runs again / stops half-way / old or empty state) with the files that store data, migrate or retry by path and word rules, the linked issues (Fixes / Part of #N, first 3000 characters), the tests added or changed, each touched file's touched lines with 20 lines of context from the head, and the diff merge-base..head |
+
+`fork-lens-packet` runs in a clone of the repository (or `-C DIR`) and fetches the pull request's head and base when
+they are not there. The file goes to the temp folder's `fork-lens-packet/` (or `--out-dir`), never inside the
+repository, and only into a folder of the user's own that no one else can write to. The diff and the touched lines
+are each cut at 200000 characters (`--max-diff`, `--max-context`), on a line, with a note naming the full command.
+The file name is `<owner>-<repo>-pr<N>-<head>.md` and it holds nothing time-dependent, so a second run at the same
+head writes the same bytes to the same path (written to a temporary file first, then renamed: a run stopped half-way
+leaves the old packet or none). The pull request's and issues' text is quoted (`> `) so none of it reads as one of
+the packet's headings. Code: [lib/agent_guards/lenspacket.py](lib/agent_guards/lenspacket.py); tests:
+`tests/lens-packet.test.py`.
 
 ## What the guards are and are not
 
