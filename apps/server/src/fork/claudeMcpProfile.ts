@@ -816,6 +816,7 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
     // The hooks go in before the options are made lazy, so adding them reads nothing early.
     const hooked = withBackgroundAgentGuidance(
       withAgentModelPolicy(plan, yield* agentPolicy),
+      thread,
       overrides,
     );
     return fixedWhenOpened(hooked, thread.id, set, turn);
