@@ -1,7 +1,8 @@
 /**
  * Fork (placement P1): a `delegate_task` child a linked agent sends here runs on this machine's
  * accounts, so this machine's `usagePacingGate` decides, as for a task started here: the owner's
- * lowered effort applies here, the account is never moved. A hold is `usage_pacing_hold`.
+ * lowered effort applies here unless `modelPolicy` refuses it, the account is never moved. A hold
+ * is `usage_pacing_hold`.
  */
 import type { ModelSelection, ServerProvider } from "@t3tools/contracts";
 import { OrchestratorMcpFailure } from "@t3tools/contracts";
@@ -10,6 +11,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettingsService from "../serverSettings.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
@@ -20,6 +22,8 @@ export interface PacedLaunch {
   readonly modelSelection: ModelSelection;
   /** Set on a `delegate_task` child that another machine sends; the owner's launches have none. */
   readonly delegatedFrom?: unknown;
+  /** `false`: the call named no model (it inherits one), as the launch's own policy check reads it. */
+  readonly namesModel?: boolean;
 }
 
 /**
@@ -90,11 +94,29 @@ export const checkLinkedLaunchPacing = Effect.fn("LinkedLaunchPacing.check")(fun
   }
   if (outcome.action !== "lowerEffort") return undefined;
   const { optionId, to } = outcome.step;
-  return {
+  const lowered: ModelSelection = {
     ...launch.modelSelection,
     options: [
       ...(options ?? []).filter((option) => option.id !== optionId),
       { id: optionId, value: to },
     ],
   };
+  // The policy checked the pick as asked; it checks what runs too. A refused lowered effort keeps
+  // the checked one, as a task started here does (delegateChecks.ts).
+  const checkPick = yield* ModelPolicyCheck.makePickCheck;
+  const refused = yield* checkPick(
+    "t3_thread_launch",
+    Effect.succeed(
+      ModelPolicyCheck.pickOfSelection(providers, lowered, launch.namesModel !== false),
+    ),
+    { logAs: "model policy paced pick" },
+  ).pipe(
+    Effect.as(false),
+    Effect.catch((refusal) =>
+      Effect.logWarning(
+        "usagePacingLowerEffort lowered an effort that modelPolicy does not allow: the task keeps its checked effort",
+      ).pipe(Effect.annotateLogs({ refusal: refusal.message }), Effect.as(true)),
+    ),
+  );
+  return refused ? undefined : lowered;
 });

@@ -189,8 +189,8 @@ lower effort (`usagePacingLowerEffort`), or is refused for now and the agent ask
 
 A `delegate_task` child that a linked machine sends here runs on this machine's accounts, so this
 machine's own setting decides it, before its agent slot, as for a task started here: the
-`usagePacingLowerEffort` step applies here, once, and the child starts at the lowered effort. It
-never moves to another account: the reply does not offer one, as this machine cannot tell whether
+`usagePacingLowerEffort` step applies here, once, and the child starts at the lowered effort (an
+effort this machine's `modelPolicy` does not allow keeps the checked one). It never moves to another account: the reply does not offer one, as this machine cannot tell whether
 the project there allows it. A refusal has the code `usage_pacing_hold`, which the sending machine
 gets back as it is; the owner's own launches from a linked machine are not paced.
 

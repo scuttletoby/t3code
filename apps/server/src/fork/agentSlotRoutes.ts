@@ -158,6 +158,7 @@ const admitNamed = (
 interface LaunchInput {
   readonly message?: string | undefined;
   readonly delegatedFrom?: unknown;
+  readonly modelSelection?: unknown;
 }
 
 /**
@@ -178,6 +179,7 @@ export const launchGate = Effect.fn("AgentSlotRoutes.launchGate")(function* (
   const lowered = yield* checkLinkedLaunchPacing({
     modelSelection,
     delegatedFrom: input.delegatedFrom,
+    namesModel: input.modelSelection !== undefined,
   });
   yield* admitNamed(yield* Effect.serviceOption(SlotGate.SlotGate), {
     callerThreadId: caller?.id ?? null,

@@ -19,6 +19,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import { TestClock } from "effect/testing";
 
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
@@ -90,7 +91,7 @@ type Caller = "linked agent" | "linked agent, no sender thread" | "linked owner"
 
 interface World {
   readonly settings?: Partial<
-    Pick<ServerSettingsValue, "usagePacingGate" | "usagePacingLowerEffort">
+    Pick<ServerSettingsValue, "usagePacingGate" | "usagePacingLowerEffort" | "modelPolicy">
   >;
   readonly providers?: ReadonlyArray<ServerProvider>;
   readonly caller?: Caller;
@@ -192,7 +193,11 @@ const launch = (
       ThreadId.make("thread:child"),
       modelSelection,
       options.replaying === true,
-      { message: "Do the task.", ...(options.delegated === false ? {} : { delegatedFrom }) },
+      {
+        message: "Do the task.",
+        modelSelection,
+        ...(options.delegated === false ? {} : { delegatedFrom }),
+      },
       [],
     ).pipe(Effect.result, Effect.provide(layers));
     return outcome._tag === "Failure"
@@ -296,6 +301,47 @@ describe("a delegated task a linked machine sends (placement P1)", () => {
       const medium = yield* launch({ settings }, { effort: "medium" });
       assert.isUndefined(medium.failure);
       assert.strictEqual(effort(medium.started), "high");
+    }),
+  );
+
+  // The model policy checks what runs: a lowered effort off the policy's row keeps the checked one,
+  // as a task started here does (fork/delegateChecks.ts).
+  it.effect("an effort lowered off the model policy's row keeps the checked effort", () =>
+    Effect.gen(function* () {
+      const row = {
+        driver: "codex",
+        model: MODEL,
+        efforts: ["medium", "high"],
+        defaultEffort: "high",
+        useFor: "paced work",
+      };
+      const settings = (efforts: ReadonlyArray<string>) =>
+        ({
+          usagePacingGate: "enforce",
+          usagePacingLowerEffort: { medium: "low" },
+          modelPolicy: { mode: "enforce", allow: [{ ...row, efforts }] },
+        }) as never;
+      const logs: Array<string> = [];
+      const kept = yield* launch({ settings: settings(row.efforts) }, { effort: "medium" }).pipe(
+        Effect.provide(
+          Logger.layer([Logger.make((entry) => logs.push(Logger.formatLogFmt.log(entry)))], {
+            mergeWithExisting: false,
+          }),
+        ),
+      );
+      assert.isUndefined(kept.failure);
+      assert.strictEqual(kept.asks.length, 1);
+      assert.strictEqual(effort(kept.started), "medium");
+      const warning = logs.filter((line) => line.includes("the task keeps its checked effort"));
+      assert.lengthOf(warning, 1);
+      assert.include(warning[0], "usagePacingLowerEffort lowered an effort that modelPolicy");
+      // With the lower level in the row it runs there.
+      const allowed = yield* launch(
+        { settings: settings(["low", "medium", "high"]) },
+        { effort: "medium" },
+      );
+      assert.isUndefined(allowed.failure);
+      assert.strictEqual(effort(allowed.started), "low");
     }),
   );
 
