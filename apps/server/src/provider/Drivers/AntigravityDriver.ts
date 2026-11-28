@@ -39,6 +39,7 @@ import { makeAntigravityAuth, type AntigravityAuth } from "../AntigravityAuth.ts
 import * as AntigravityInstallation from "../AntigravityInstallation.ts";
 import { brokenRuntimeError } from "../providerCompatibility.ts";
 import * as AntigravityUsage from "./AntigravityUsage.ts";
+import * as ForkLimits from "../../fork/antigravityUsage/antigravityLimits.ts"; // Fork: limits
 import {
   antigravityAuthConfigIssue,
   antigravityAuthLabel,
@@ -786,6 +787,7 @@ export const AntigravityDriver: ProviderDriver<
       accentColor,
       enabled,
       snapshot: provider.snapshot,
+      ...(yield* ForkLimits.overlay(provider.snapshot, settings, prepareSpawn, processEnvironment)),
       snapshotForCwd: (cwd) =>
         !enabled
           ? provider.snapshot.getSnapshot
