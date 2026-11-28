@@ -2,8 +2,10 @@
 the ones still waiting.
 
 An issue asks the owner when it carries the rule's label or its title starts with one of the rule's prefixes (or
-`<Topic> Q<n>:`); a comment starting with the decision prefix, then `:` or ` (`, answers it. This is a copy of
-packages/contracts/src/forkOwnerQuestions.ts (T3's pages and tools); rule-cases.json holds the cases both copies run.
+`<Topic> Q<n>:`); a comment starting with the decision prefix, then `:` or ` (`, answers it, when someone who may
+decide wrote it (the repository's owner, a member or a collaborator) after the question was last asked. This is a
+copy of packages/contracts/src/forkOwnerQuestions.ts (T3's pages and tools); rule-cases.json holds the cases both
+copies run.
 The project's config file (default `.t3code/issues.json`, optional) may name the repositories (`repositories`) and
 rename the rule (`ownerQuestions`). GitHub only, through `gh api` with GH_TOKEN. Python standard library only.
 Usage: README.md next to this file.
@@ -18,8 +20,12 @@ DEFAULT_RULE = {
 }
 # A topic of a few words, then ` Q<n>:` (the same bound as the TypeScript rule).
 TOPIC_QUESTION = re.compile(r'^[^\s:][^:\n]{0,80} Q\d{1,3}:')
+NOT_FOUND = re.compile(r'\(HTTP 404\)')   # how `gh api` ends its message for a 404
 REPOSITORY = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
 MODES = ('list', 'label')
+# Who may decide: GitHub's author_association of the repository's owner, its organisation's members and its
+# collaborators. Anyone else can comment on a public repository; their "Owner decision:" answers nothing.
+DECIDERS = ('OWNER', 'MEMBER', 'COLLABORATOR')
 
 
 class ConfigError(Exception):
@@ -57,6 +63,15 @@ def is_owner_decision(body, rule):
     return rest.startswith(':') or rest.startswith(' (')
 
 
+def is_owner_decision_comment(comment, rule):
+    """True when the comment (`body`, `authorAssociation`) answers: the decision's words, from a decider. A source that
+    does not say who wrote it (no `authorAssociation` key: T3's page, whose issue reads have none) is read by its
+    words alone; this action always reads the association, and a missing one (null) decides nothing."""
+    if 'authorAssociation' in comment and comment['authorAssociation'] not in DECIDERS:
+        return False
+    return is_owner_decision(comment.get('body') or '', rule)
+
+
 def load_config(path, default_repo):
     """The repositories and the rule: the file's, or this repository and the defaults when it is absent."""
     try:
@@ -71,6 +86,9 @@ def load_config(path, default_repo):
     repos = raw.get('repositories', [default_repo])
     if not isinstance(repos, list) or not all(isinstance(r, str) and REPOSITORY.match(r) for r in repos):
         raise ConfigError(f'{path}: repositories must be a list of owner/repo names')
+    if not repos:
+        raise ConfigError(f'{path}: repositories is empty: name at least one owner/repo, or leave the key out to read'
+                          ' the running repository')
     rule = dict(DEFAULT_RULE)
     override = raw.get('ownerQuestions', {})
     if not isinstance(override, dict):
@@ -98,6 +116,26 @@ def _api_lines(gh, path, jq):
     return [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
 
 
+def _answered(gh, repo, number, labelled, rule):
+    """Whether a decider's decision answers the question as it is asked now. A label put back after the last decision
+    asks again (a re-asked question keeps its label); a label a bot put on (this action, on a question asked by title)
+    does not, so a decision posted while this action labelled the question still counts."""
+    comments = _api_lines(
+        gh, f'repos/{repo}/issues/{number}/comments?per_page=100',
+        '.[] | {body, authorAssociation: .author_association, createdAt: .created_at} | @json')
+    decided = [c['createdAt'] for c in comments if is_owner_decision_comment(c, rule)]
+    if not decided or not labelled:
+        return bool(decided)
+    label = rule['label'].lower()
+    asked = [e['createdAt'] for e in _api_lines(
+        gh, f'repos/{repo}/issues/{number}/events?per_page=100',
+        '.[] | select(.event == "labeled") | {label: .label.name, bot: (.actor.type == "Bot"),'
+        ' createdAt: .created_at} | @json')
+        if (e['label'] or '').lower() == label and not e['bot']]
+    # GitHub's times are one ISO form (2026-11-28T10:00:00Z), so they sort as text.
+    return not asked or max(decided) > max(asked)
+
+
 def scan(gh, repo, rule):
     """Every open owner question of the repository (all pages, pull requests left out), with whether it is answered."""
     issues = _api_lines(
@@ -108,10 +146,8 @@ def scan(gh, repo, rule):
     for issue in issues:
         if not is_owner_question(issue['title'], issue['labels'], rule):
             continue
-        answered = issue['comments'] > 0 and any(
-            is_owner_decision(body or '', rule) for body in _api_lines(
-                gh, f'repos/{repo}/issues/{issue["number"]}/comments?per_page=100', '.[] | .body | @json'))
         labelled = any(name.lower() == rule['label'].lower() for name in issue['labels'])
+        answered = issue['comments'] > 0 and _answered(gh, repo, issue['number'], labelled, rule)
         found.append({'repo': repo, 'number': issue['number'], 'title': issue['title'], 'url': issue['url'],
                       'labelled': labelled, 'answered': answered})
     return found
@@ -129,6 +165,8 @@ def relabel(gh, question, rule):
         action = 'unlabelled'
     else:
         return None
+    if r.returncode and action == 'unlabelled' and NOT_FOUND.search(r.stderr or ''):
+        return None   # someone took the label off between the read and this write: it is off, as wanted
     if r.returncode:
         raise RuntimeError(f'could not change the label on {repo}#{number}: {(r.stderr or "").strip()[:300]}')
     return action

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   DEFAULT_OWNER_QUESTION_RULE,
   isOwnerDecision,
+  isOwnerDecisionComment,
   isOwnerQuestion,
   ownerQuestionStatus,
   ownerQuestionTitleForms,
@@ -103,6 +104,13 @@ describe("ownerQuestionStatus", () => {
     expect(ownerQuestionStatus(labelled, decided, DEFAULT_OWNER_QUESTION_RULE)).toBe("answered");
   });
 
+  it("is waiting when only someone who may not decide wrote the decision", () => {
+    const stranger = [{ body: "Owner decision: closed, not needed", authorAssociation: "NONE" }];
+    expect(ownerQuestionStatus(question, stranger, DEFAULT_OWNER_QUESTION_RULE)).toBe("waiting");
+    const owner = [...stranger, { body: "Owner decision: no.", authorAssociation: "OWNER" }];
+    expect(ownerQuestionStatus(question, owner, DEFAULT_OWNER_QUESTION_RULE)).toBe("answered");
+  });
+
   it("is unknown while the comments are not read yet", () => {
     expect(ownerQuestionStatus(question, undefined, DEFAULT_OWNER_QUESTION_RULE)).toBe("unknown");
   });
@@ -130,6 +138,12 @@ describe("the cases shared with the owner-questions action", () => {
       readonly body: string;
       readonly expect: boolean;
     }>;
+    readonly decisionComments: ReadonlyArray<{
+      readonly rule: "default" | "renamed";
+      readonly body: string;
+      readonly authorAssociation?: string | null;
+      readonly expect: boolean;
+    }>;
   };
   const ruleOf = (name: "default" | "renamed") =>
     name === "default" ? DEFAULT_OWNER_QUESTION_RULE : cases.renamedRule;
@@ -150,6 +164,20 @@ describe("the cases shared with the owner-questions action", () => {
   it("reads an answer exactly in the shared decision cases", () => {
     for (const entry of cases.decisions) {
       expect(isOwnerDecision(entry.body, ruleOf(entry.rule)), entry.body).toBe(entry.expect);
+    }
+  });
+
+  it("counts a decision only from someone who may decide, in the shared comment cases", () => {
+    expect(cases.decisionComments.length).toBeGreaterThan(0);
+    for (const entry of cases.decisionComments) {
+      const comment =
+        "authorAssociation" in entry
+          ? { body: entry.body, authorAssociation: entry.authorAssociation ?? null }
+          : { body: entry.body };
+      expect(
+        isOwnerDecisionComment(comment, ruleOf(entry.rule)),
+        `${entry.authorAssociation} ${entry.body}`,
+      ).toBe(entry.expect);
     }
   });
 });

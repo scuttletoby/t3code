@@ -16,8 +16,18 @@ RULES = {'default': oq.DEFAULT_RULE, 'renamed': CASES['renamedRule']}
 LABEL = oq.DEFAULT_RULE['label']
 
 
-def issue(number, title, labels=(), comments=(), pull=False):
-    return {'number': number, 'title': title, 'labels': list(labels), 'comments': list(comments), 'pull': pull}
+DECIDED_AT = '2026-11-20T10:00:00Z'
+
+
+def comment(body, association='OWNER', at=DECIDED_AT):
+    return {'body': body, 'authorAssociation': association, 'createdAt': at}
+
+
+def issue(number, title, labels=(), comments=(), pull=False, labelled_at=()):
+    """A plain string comment is the owner's; `labelled_at` holds the rule label's events as (time, by a bot)."""
+    return {'number': number, 'title': title, 'labels': list(labels), 'pull': pull,
+            'comments': [c if isinstance(c, dict) else comment(c) for c in comments],
+            'events': [{'label': LABEL, 'bot': bot, 'createdAt': at} for at, bot in labelled_at]}
 
 
 class FakeGh:
@@ -32,6 +42,8 @@ class FakeGh:
         if '-X' in args:
             method, path = args[args.index('-X') + 1], args[args.index('-X') + 2]
             self.writes.append((method, path, json.loads(input) if input else None))
+            if self.fail == method + ' 404':
+                return done(code=1, err='gh: Not Found (HTTP 404)')
             return done(code=1, err='refused') if self.fail == method else done()
         path = args[args.index('--paginate') + 1]
         if self.fail == path:
@@ -43,9 +55,8 @@ class FakeGh:
                      'comments': len(i['comments']), 'labels': i['labels']}
                     for i in self.repos[repo] if not i['pull']]
             return done(''.join(json.dumps(r) + '\n' for r in rows))
-        number = int(parts[4])
-        bodies = next(i['comments'] for i in self.repos[repo] if i['number'] == number)
-        return done(''.join(json.dumps(b) + '\n' for b in bodies))
+        found = next(i for i in self.repos[repo] if i['number'] == int(parts[4]))
+        return done(''.join(json.dumps(row) + '\n' for row in found[parts[5]]))   # comments or events
 
 
 def run(repos, mode='list', config=None, fail=None):
@@ -82,6 +93,14 @@ class SharedRuleCases(unittest.TestCase):
             with self.subTest(case['body']):
                 self.assertIs(oq.is_owner_decision(case['body'], RULES[case['rule']]), case['expect'])
 
+    def test_decision_comment_cases(self):
+        """Fix round 1 of #1121: only the owner, a member or a collaborator decides."""
+        self.assertTrue(CASES['decisionComments'])
+        for case in CASES['decisionComments']:
+            given = {k: case[k] for k in ('body', 'authorAssociation') if k in case}
+            with self.subTest(given):
+                self.assertIs(oq.is_owner_decision_comment(given, RULES[case['rule']]), case['expect'])
+
 
 class Config(unittest.TestCase):
     """Which repositories and rule does a project's config give, and is a broken one refused?"""
@@ -109,6 +128,14 @@ class Config(unittest.TestCase):
                      '{"ownerQuestions": {"topicQuestionTitles": "yes"}}'):
             with self.subTest(text), self.assertRaises(oq.ConfigError):
                 self.load(text)
+
+    def test_an_empty_repository_list_is_refused_with_a_clear_message(self):
+        """Fix round 1 of #1121: `"repositories": []` read nothing and went green with a count of 0."""
+        with self.assertRaisesRegex(oq.ConfigError, 'repositories is empty'):
+            self.load('{"repositories": []}')
+        code, writes, outputs, _, lines = run(REPO, mode='label', config={'repositories': []})
+        self.assertEqual((code, writes, outputs), (1, [], {}))
+        self.assertIn('repositories is empty', lines[0])
 
 
 REPO = {'acme/web': [
@@ -176,6 +203,55 @@ class LabelMode(unittest.TestCase):
         self.assertEqual(writes, [('POST', 'repos/acme/web/issues/1/labels', {'labels': ['needs-decision']})])
 
 
+class WhoDecides(unittest.TestCase):
+    """Fix round 1 of #1121: does only a decider's decision, newer than the question's last asking, answer it?"""
+
+    STRANGER = comment('Owner decision: closed, not needed', association='NONE')
+
+    def test_a_strangers_decision_leaves_a_label_only_question_labelled(self):
+        repos = {'acme/web': [issue(7, 'Pick the default region', labels=[LABEL], comments=[self.STRANGER])]}
+        code, writes, outputs, _, _ = run(repos, mode='label')
+        self.assertEqual((code, writes), (0, []))
+        self.assertEqual([q['number'] for q in json.loads(outputs['questions'])], [7])
+
+    def test_a_strangers_decision_does_not_answer_a_title_question(self):
+        repos = {'acme/web': [issue(1, 'Owner question: x', comments=[self.STRANGER])]}
+        _, writes, outputs, _, _ = run(repos, mode='label')
+        self.assertEqual(writes, [('POST', 'repos/acme/web/issues/1/labels', {'labels': [LABEL]})])
+        self.assertEqual(outputs['count'], '1')
+
+    def test_a_member_or_collaborator_decides(self):
+        for who in ('MEMBER', 'COLLABORATOR'):
+            repos = {'acme/web': [issue(2, 'Bug', labels=[LABEL], comments=[self.STRANGER,
+                                                                             comment('Owner decision: B', who)])]}
+            with self.subTest(who):
+                _, writes, outputs, _, _ = run(repos, mode='label')
+                self.assertEqual(writes, [('DELETE', 'repos/acme/web/issues/2/labels/status%3Aneeds-owner-decision',
+                                           None)])
+                self.assertEqual(outputs['count'], '0')
+
+    def test_a_question_asked_again_after_an_old_decision_keeps_its_label(self):
+        repos = {'acme/web': [issue(7, 'Deploy plan', labels=[LABEL], comments=['Owner decision: use A'],
+                                    labelled_at=[('2026-11-01T00:00:00Z', False), ('2026-11-25T00:00:00Z', False)])]}
+        for _ in range(2):   # every hourly run, not only the first
+            _, writes, outputs, _, _ = run(repos, mode='label')
+            self.assertEqual(writes, [])
+            self.assertEqual(outputs['count'], '1')
+
+    def test_a_decision_after_the_label_answers(self):
+        repos = {'acme/web': [issue(7, 'Deploy plan', labels=[LABEL], comments=['Owner decision: use A'],
+                                    labelled_at=[('2026-11-01T00:00:00Z', False)])]}
+        _, writes, _, _, _ = run(repos, mode='label')
+        self.assertEqual(writes, [('DELETE', 'repos/acme/web/issues/7/labels/status%3Aneeds-owner-decision', None)])
+
+    def test_a_label_this_action_put_on_after_the_decision_does_not_ask_again(self):
+        # the owner decided while a run labelled the title question: the next run takes the label off
+        repos = {'acme/web': [issue(1, 'Owner question: x', labels=[LABEL], comments=['Owner decision: no'],
+                                    labelled_at=[('2026-11-20T10:00:05Z', True)])]}
+        _, writes, _, _, _ = run(repos, mode='label')
+        self.assertEqual(writes, [('DELETE', 'repos/acme/web/issues/1/labels/status%3Aneeds-owner-decision', None)])
+
+
 class Failures(unittest.TestCase):
     """Does a failed read, write or config stop the step red, with no outputs claiming a count?"""
 
@@ -196,10 +272,34 @@ class Failures(unittest.TestCase):
         self.assertEqual(outputs, {})
         self.assertIn('could not change the label on acme/web#1', lines[0])
 
+    def test_a_label_already_gone_before_the_delete_is_not_an_error(self):
+        """Fix round 1 of #1121: someone took the label off between the read and the DELETE (a 404)."""
+        code, writes, outputs, _, lines = run(REPO, mode='label', fail='DELETE 404')
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(len(writes), 3)
+        self.assertEqual(outputs['changed'], '2')
+        self.assertNotIn('unlabelled: acme/web#3', lines)
+
+    def test_another_failed_delete_still_fails_the_step(self):
+        code, _, outputs, _, lines = run(REPO, mode='label', fail='DELETE')
+        self.assertEqual((code, outputs), (1, {}))
+        self.assertIn('could not change the label on acme/web#3', lines[0])
+
     def test_a_broken_config_fails_before_any_read(self):
         code, writes, outputs, _, lines = run(REPO, config='{ nope')
         self.assertEqual((code, writes, outputs), (1, [], {}))
         self.assertIn('could not be read', lines[0])
+
+
+class Readme(unittest.TestCase):
+    def test_the_example_workflow_runs_on_the_default_branch_only(self):
+        """Fix round 1 of #1121: a workflow_dispatch on a branch read that branch's config (any label)."""
+        with open(os.path.join(HERE, 'README.md'), encoding='utf-8') as f:
+            text = f.read()
+        example = text.split('```yaml\n', 1)[1].split('```', 1)[0]
+        self.assertIn('workflow_dispatch', example)
+        self.assertIn("    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)\n",
+                      example.split('  label:\n', 1)[1])
 
 
 if __name__ == '__main__':

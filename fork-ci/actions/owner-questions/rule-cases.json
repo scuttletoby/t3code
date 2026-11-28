@@ -90,5 +90,83 @@
     { "rule": "default", "body": "", "expect": false },
     { "rule": "renamed", "body": "Decided: go.", "expect": true },
     { "rule": "renamed", "body": "Owner decision: go.", "expect": false }
+  ],
+  "//decisionComments": "Who wrote it: GitHub's author_association. Only the owner, a member or a collaborator decides; anyone can comment on a public repository. No authorAssociation key: the source does not say (T3's page), so the words alone count; null decides nothing.",
+  "decisionComments": [
+    {
+      "rule": "default",
+      "authorAssociation": "OWNER",
+      "body": "Owner decision: yes.",
+      "expect": true
+    },
+    {
+      "rule": "default",
+      "authorAssociation": "MEMBER",
+      "body": "Owner decision: yes.",
+      "expect": true
+    },
+    {
+      "rule": "default",
+      "authorAssociation": "COLLABORATOR",
+      "body": "Owner decision: yes.",
+      "expect": true
+    },
+    {
+      "rule": "default",
+      "authorAssociation": "NONE",
+      "body": "Owner decision: closed, not needed",
+      "expect": false
+    },
+    {
+      "rule": "default",
+      "authorAssociation": "CONTRIBUTOR",
+      "body": "Owner decision: yes.",
+      "expect": false
+    },
+    {
+      "rule": "default",
+      "authorAssociation": "FIRST_TIME_CONTRIBUTOR",
+      "body": "Owner decision: yes.",
+      "expect": false
+    },
+    {
+      "rule": "default",
+      "authorAssociation": "FIRST_TIMER",
+      "body": "Owner decision: yes.",
+      "expect": false
+    },
+    {
+      "rule": "default",
+      "authorAssociation": "MANNEQUIN",
+      "body": "Owner decision: yes.",
+      "expect": false
+    },
+    {
+      "rule": "default",
+      "authorAssociation": "owner",
+      "body": "Owner decision: yes.",
+      "expect": false
+    },
+    {
+      "rule": "default",
+      "authorAssociation": null,
+      "body": "Owner decision: yes.",
+      "expect": false
+    },
+    {
+      "rule": "default",
+      "authorAssociation": "OWNER",
+      "body": "Owner decision needed soon",
+      "expect": false
+    },
+    { "rule": "default", "body": "Owner decision: yes.", "expect": true },
+    { "rule": "default", "body": "A note", "expect": false },
+    {
+      "rule": "renamed",
+      "authorAssociation": "COLLABORATOR",
+      "body": "Decided: go.",
+      "expect": true
+    },
+    { "rule": "renamed", "authorAssociation": "NONE", "body": "Decided: go.", "expect": false }
   ]
 }

@@ -11,7 +11,10 @@ An issue (not a pull request) **asks the owner** when it carries the label, or i
 prefixes as a word (`Owner question: ...`, not `Owner questions are ...`), or, with `topicQuestionTitles`, it reads
 `<Topic> Q<n>: ...` (`Issues page Q1: how far?`). Case does not matter. A comment **answers** it when it starts with
 the decision prefix and then `:` or ` (` (`Owner decision: yes`, `Owner decision (in chat): yes`, bold allowed);
-`Owner decision needed ...` does not. The defaults:
+`Owner decision needed ...` does not. Only someone who may decide answers: the comment's GitHub `author_association` is
+`OWNER`, `MEMBER` or `COLLABORATOR`. Anyone can comment on a public repository, and a stranger's `Owner decision:`
+answers nothing. A question asked again (its label put back by a person after the last decision) waits again until a
+newer decision; a label a bot put on (this action, on a question asked by title) does not ask again. The defaults:
 
 | Key                   | Default                       |
 | --------------------- | ----------------------------- |
@@ -25,11 +28,13 @@ cases in [`rule-cases.json`](rule-cases.json), so they cannot drift.
 
 ## What it does
 
-- Reads every open issue of each repository (all pages) and the comments of each owner question that has any.
+- Reads every open issue of each repository (all pages) and the comments of each owner question that has any, and the
+  label events of a labelled one that a decider has answered.
 - Writes the waiting questions to the job summary (a table) and the log, and sets the outputs.
 - **`label` mode:** puts the label on a waiting question that lacks it (a question asked by title), and takes it off an
   answered one that still has it. Nothing else is written, and a second run changes nothing. GitHub creates the label
-  on its first use if the repository has none.
+  on its first use if the repository has none. A label someone took off between the read and the write (a 404) is
+  already off: no change, no error.
 - **Fails the step** (exit 1, an `::error::` line, no outputs) when the config cannot be read or is not valid, or a
   read or label write fails. It never guesses: a question whose comments could not be read is neither listed nor
   relabelled.
@@ -46,7 +51,8 @@ project). Without it, the action reads the running repository with the defaults.
 }
 ```
 
-- `repositories`: the `owner/repo` names to read; default the running repository (`repo` input).
+- `repositories`: the `owner/repo` names to read; default the running repository (`repo` input). An empty list is
+  refused.
 - `ownerQuestions`: any of the rule's keys, replacing the default; an unknown key or a wrong type is refused. T3's
   pages use the defaults until they read this key, so rename only a project that does not rely on them.
 
@@ -85,6 +91,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   label:
+    # The default branch only: a workflow_dispatch may pick any branch, whose config could rename the label.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
