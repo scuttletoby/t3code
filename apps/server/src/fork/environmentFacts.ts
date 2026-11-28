@@ -57,8 +57,11 @@ export const ResultFields = {
   fileLinks: Schema.optionalKey(Schema.String),
 };
 
-/** The gate's own read waits up to `COUNT_READ_TIMEOUT`; one second more, then it is unread. */
-const USAGE_READ_TIMEOUT = Duration.sum(SlotGate.COUNT_READ_TIMEOUT, Duration.seconds(1));
+/**
+ * The gate's own read waits up to `COUNT_READ_TIMEOUT`; one second more, then it is unread. The
+ * longest this machine's `read` takes, so a reader of another machine's facts waits longer.
+ */
+export const USAGE_READ_TIMEOUT = Duration.sum(SlotGate.COUNT_READ_TIMEOUT, Duration.seconds(1));
 
 /**
  * The host sample's own limit (a Linux read is a few files; macOS runs `vm_stat`). Longer, and the
@@ -109,6 +112,8 @@ const slotFacts = Effect.fn("EnvironmentFacts.slotFacts")(
       slotsFree,
       memoryFloorMb,
       freeMemoryMb,
+      // Not a placement fact: the work panel's capacity bar reads it (`readWithSlotLimit`).
+      slotLimit: machine.max,
     };
   },
   Effect.catchCause(() => Effect.succeed(unavailable(REASON_GATE_UNREAD))),
@@ -143,10 +148,10 @@ const selfFacts = Effect.fn("EnvironmentFacts.selfFacts")(
 );
 
 /**
- * The facts for this machine's `t3_environment_read`. `hostResources` is left out when the host
- * sampler is not there or its read fails; `placement` is always given.
+ * The facts for this machine's `t3_environment_read`, and the gate's machine limit (`null`: none;
+ * absent: not counted), which `slotsFree` (clamped at 0) cannot give back once the gate is over it.
  */
-export const read = Effect.gen(function* () {
+export const readWithSlotLimit = Effect.gen(function* () {
   const host = yield* Effect.serviceOption(HostResources.HostResources);
   const hostRead = Option.isNone(host)
     ? Effect.succeedNone
@@ -169,18 +174,28 @@ export const read = Effect.gen(function* () {
   const reasons = [slots.available ? undefined : slots.reason, self.notAvailable].filter(
     (reason) => reason !== undefined,
   );
+  const { slotLimit, ...placementSlots } = { slotLimit: undefined, ...slots };
   const placement: Placement = {
-    ...slots,
+    ...placementSlots,
     labels: self.labels,
     ...(reasons.length === 0 ? {} : { available: false, reason: reasons.join(" ") }),
     factsAt: yield* Clock.currentTimeMillis,
   };
   return {
-    ...(Option.isSome(hostResources) ? { hostResources: hostResources.value } : {}),
-    placement,
-    fileLinks: ENVIRONMENT_FILE_LINK_AGENT_HINT,
+    facts: {
+      ...(Option.isSome(hostResources) ? { hostResources: hostResources.value } : {}),
+      placement,
+      fileLinks: ENVIRONMENT_FILE_LINK_AGENT_HINT,
+    },
+    slotLimit: slotLimit as number | null | undefined,
   };
 }).pipe(Effect.withSpan("EnvironmentFacts.read"));
+
+/**
+ * The facts for this machine's `t3_environment_read`. `hostResources` is left out when the host
+ * sampler is not there or its read fails; `placement` is always given.
+ */
+export const read = Effect.map(readWithSlotLimit, ({ facts }) => facts);
 
 const AnswerFacts = Schema.Struct(ResultFields);
 const decodeAnswerFacts = Schema.decodeUnknownSync(AnswerFacts);

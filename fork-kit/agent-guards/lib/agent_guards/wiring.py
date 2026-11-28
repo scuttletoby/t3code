@@ -45,7 +45,7 @@ WHAT_IS_LOST = {
     'bg-guard': 'hook skipped, background commands are NOT checked',
     'agent-slots': 'hook skipped, agent slots are NOT counted',
     'facts-hook': 'hook skipped, the state tables are NOT shown',
-    'poll-loop-guard': 'hook skipped, wait loops are NOT checked',
+    'poll-loop-guard': 'hook skipped, wait loops and self-kills are NOT checked',
     'read-size-guard': 'hook skipped, Read sizes are NOT checked',
     'batch-nudge': 'hook skipped, no batching hint',
 }

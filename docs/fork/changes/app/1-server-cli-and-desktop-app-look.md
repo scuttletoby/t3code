@@ -1,0 +1,5 @@
+- Change: The server, the CLI and the desktop app look for updates in this fork's releases, not upstream's.
+- Why: A fork build must never "update" to an upstream build and lose the fork's changes.
+- Setting: none
+- Default: always
+- PR: [#1](https://github.com/scuttletoby/t3code/pull/1)

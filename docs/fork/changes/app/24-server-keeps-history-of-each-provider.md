@@ -1,0 +1,5 @@
+- Change: The server keeps a history of each provider account's usage-limit readings.
+- Why: Pacing needs to know how fast a limit is being used, not only where it stands.
+- Setting: none
+- Default: always (read only)
+- PR: [#24](https://github.com/scuttletoby/t3code/pull/24)

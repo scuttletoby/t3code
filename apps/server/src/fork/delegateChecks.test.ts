@@ -8,6 +8,7 @@ import * as NodeFS from "node:fs";
 
 import { assert, describe, it } from "@effect/vitest";
 import {
+  DEFAULT_PLACEMENT_SETTINGS,
   DEFAULT_SERVER_SETTINGS,
   type OrchestratorMcpTarget,
   ProjectId,
@@ -25,6 +26,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as DelegateChecks from "./delegateChecks.ts";
+import * as PlacementAdvice from "./placementAdvice.ts";
 
 const UPSTREAM_FILE = new URL("../mcp/OrchestratorMcpService.ts", import.meta.url);
 
@@ -227,6 +229,63 @@ describe("fork delegation checks: runs again", () => {
       assert.deepStrictEqual(before, { target: withAgent });
       assert.strictEqual(reads.count, 2, "the retries read nothing");
     }).pipe(Effect.provide(settingsCounted(reads))),
+  );
+});
+
+/** Pacing and the model policy off; placement in `mode`; slots off, so this machine is free. */
+const placementIn = (mode: "off" | "advise") =>
+  Layer.mergeAll(
+    Layer.mock(ServerSettings.ServerSettingsService)({
+      getSettings: Effect.succeed({
+        ...DEFAULT_SERVER_SETTINGS,
+        usagePacingGate: "off",
+        agentSlots: { ...DEFAULT_SERVER_SETTINGS.agentSlots, enabled: false },
+        placement: { ...DEFAULT_PLACEMENT_SETTINGS, mode },
+      }),
+    }),
+    Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+    Layer.mock(ProviderRegistry.ProviderRegistry)({
+      getProviders: Effect.succeed([] as ReadonlyArray<ServerProvider>),
+    }),
+    Layer.mock(SlotGate.SlotGate)({}),
+  );
+
+describe("fork delegation checks: placement advice (P6)", () => {
+  const ask = (isRetry: boolean) =>
+    Effect.gen(function* () {
+      const checks = yield* DelegateChecks.make(host);
+      return yield* checks.beforeWorkspace({
+        isRetry,
+        parent,
+        requested: undefined,
+        runtimeMode: undefined,
+        cwd: undefined,
+        target,
+      });
+    });
+
+  it.effect("advise adds the pick to the reply's note and keeps the target", () =>
+    Effect.gen(function* () {
+      const before = yield* ask(false);
+      assert.strictEqual(before.target.modelSelection, target.modelSelection);
+      assert.isDefined(before.note);
+      assert.isTrue(before.note.startsWith(PlacementAdvice.NOTE_PREFIX), before.note);
+      assert.include(before.note, "a worktree child would run here.");
+      // No MCP caller in this test, so no linked machine was asked.
+      assert.include(before.note, PlacementAdvice.NOTE_NO_CALLER);
+    }).pipe(Effect.provide(placementIn("advise"))),
+  );
+
+  it.effect("a retry adds no advice", () =>
+    Effect.gen(function* () {
+      assert.deepStrictEqual(yield* ask(true), { target });
+    }).pipe(Effect.provide(placementIn("advise"))),
+  );
+
+  it.effect("placement off adds no note", () =>
+    Effect.gen(function* () {
+      assert.isUndefined((yield* ask(false)).note);
+    }).pipe(Effect.provide(placementIn("off"))),
   );
 });
 

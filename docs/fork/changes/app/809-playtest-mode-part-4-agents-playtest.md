@@ -1,0 +1,5 @@
+- Change: Playtest mode, part 4: the agent's `playtest` tool (start, push, status, end) on its own thread's session, in its own `playtest` tool group. The thread comes from the credential; the tool takes no setting; start and push need a full-access thread.
+- Why: A person tries an agent's unfinished work on a test target, round after round, no PR per round.
+- Setting: `server.playtest`, `projectOverride.playtest`
+- Default: off
+- PR: [#809](https://github.com/scuttletoby/t3code/pull/809)

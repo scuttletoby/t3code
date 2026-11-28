@@ -119,12 +119,15 @@ class Transcripts(unittest.TestCase):
                 self.assertEqual((r.returncode, r.stdout), (0, ''))
         big = self.transcript(*([turn(f'x{k}', READ, READ) for k in range(20000)] + lines))
         self.assertGreater(os.path.getsize(big), S['tailBytes'])
+        with fx.bytes_read(G) as reads:
+            self.assertEqual(G.streak(big, S), 3)
+        self.assertLessEqual(sum(reads), S['tailBytes'])           # only the last tailBytes are read
         took = []
         for _ in range(3):                                         # the best of 3: a busy test machine is no bug
             start = time.perf_counter()
             self.assertEqual(G.streak(big, S), 3)
             took.append(time.perf_counter() - start)
-        self.assertLess(min(took), 0.05)                           # only the last tailBytes are read
+        self.assertLess(min(took), 0.5)                            # a whole read or a quadratic parse is far slower
 
     def test_odd_input_adds_nothing_and_its_own_failure_says_so(self):
         for raw in ('{}', '[]', '{"hook_event_name": "PreToolUse", "tool_name": "Read"}'):

@@ -1,0 +1,25 @@
+name: Fork canary (517)
+
+# Fork only. An experiment for #517 (something sets some of the fork's
+# workflows to "disabled_manually" and the cause is not known yet). This file
+# does no work: it has no push, pull request or schedule trigger, only a
+# manual dispatch whose one job prints a line and exits. It is here to be
+# listed among the workflows on the default branch. If it gets switched off
+# too, whatever does it picks workflows from that list (by name or by
+# listing); if it is never switched off while the others are, it works from
+# a fixed list or reacts to runs. A watcher outside the repo records its
+# state changes and does not switch it back on. Delete this file when #517
+# is settled.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  canary:
+    name: Canary (no work)
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Say hello
+        run: echo "Issue 517 canary, no work done"

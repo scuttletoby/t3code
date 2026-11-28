@@ -1,0 +1,5 @@
+- Change: Fork tests: upstream's test jobs, run on GitHub-hosted runners or on the repository's own machines chosen per run.
+- Why: Fast CI that does not need upstream's runner labels.
+- Setting: repository variable `CI_RUNNERS`
+- Default: `auto`
+- PR: [#6](https://github.com/scuttletoby/t3code/pull/6), [#8](https://github.com/scuttletoby/t3code/pull/8), [#13](https://github.com/scuttletoby/t3code/pull/13)
