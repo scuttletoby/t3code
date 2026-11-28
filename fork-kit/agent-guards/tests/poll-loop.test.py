@@ -105,6 +105,70 @@ PASSED = [
     '',
 ]
 
+# F7: a pkill -f whose pattern is in the command's own text kills the shell that runs it (exit 143/144)
+SELF_KILLS = [
+    'pkill -f "vitest run"',
+    'pkill -f vitest; sleep 1; pnpm test',
+    'sudo pkill -9 -f vitest',
+    'pkill -KILL -f vitest',
+    'pkill -SIGTERM --full vitest',
+    'pkill -fi VITEST',
+    'pkill -u builder -f vitest',
+    'pkill -f -- vitest',
+    'timeout 5 pkill -f vitest',
+    "bash -c 'pkill -f vitest'",
+    'ls; pkill -f "node .*vitest" || true',
+    'kill $(pgrep -f vitest)',
+    'kill -9 "$(pgrep -f vitest)"',
+    'pgrep -f vitest | xargs kill',
+    'pgrep -f vitest | xargs -r kill -9',
+    "pkill -f '[v]itest'; cd /work/vitest",     # the bracket helps only if the name is nowhere else
+    'pkill -f bash',                             # the shell's own name
+    'pkill -ABRT -f vitest',                     # a signal name is not an option cluster (A is -A)
+    "pkill -f \"vitest'[[:punct:]]''\"",            # matches only the text as the host quotes it ('\\'')
+    "bash -c 'pkill -f \"c .[p]kill\"'",           # matches only the text as written (a host that passes it as is)
+    "pkill -fi '[V]ITEST'; cd /work/vitest",     # -i: any case
+    "pkill -f '[[:alpha:]]itest'; cd /work/vitest",   # a POSIX class
+]
+KILL_PASSES = [
+    "pkill -f '[v]itest run'",
+    "pkill -f '[v]itest'; echo stopped",
+    "pkill -f '[V]ITEST'; cd /work/vitest",     # no -i: case counts
+    'pkill vitest',
+    'pkill -x -f vitest',
+    'pkill -A -f vitest',
+    'pkill --ignore-ancestors -f vitest',
+    'pkill -F run.pid',
+    'pkill -f -F run.pid vitest',
+    'pkill -f "$PAT"',
+    "pkill -f '^node .*vitest'",
+    "pkill -f 'vitest$'",
+    'pkill -f "(unclosed"',
+    "pkill -f '[[:alpha:]]itest'",
+    'kill "$(cat run.pid)"',
+    'pgrep -f vitest',
+    'pgrep -f vitest | wc -l',
+    'kill -0 $(pgrep -f vitest)',
+    'echo "pkill -f vitest"',
+    'git commit -m "stop pkill -f vitest"',
+    'cat > notes.md <<EOF\npkill -f vitest\nEOF',
+    '# pkill -f vitest\nls',
+]
+KILL_GAPS = [
+    'PAT=vitest; pkill -f "$PAT"',             # a pattern from a variable is not read
+    'for p in $(pgrep -f vitest); do kill $p; done',
+]
+# the same shapes run for real: {m} is a marker no other process has, {h}{t} the marker split after its first letter
+REAL = [
+    'pkill -f {m}', 'pkill -9 -f {m}', 'pkill --full {m}', 'timeout 5 pkill -f {m}', "bash -c 'pkill -f {m}'",
+    'kill $(pgrep -f {m})', 'kill "$(pgrep -f {m})"', 'pgrep -f {m} | xargs kill', 'pkill -fi {M}',
+    "pkill -f '[{h}]{t}'; echo {m}", "pkill -f '[{h}]{t}'", 'pkill {m}', 'pkill -x -f {m}', 'pkill -A -f {m}',
+    "pkill -f '^{m}'", "pkill -f '{m}$'", 'pkill -f "({m}"', "pkill -f '[[:alpha:]]{t}'", 'echo pkill -f {m}',
+    'pgrep -f {m}', 'kill -0 $(pgrep -f {m})', 'pkill -USR1 -f {m}', 'pkill -ABRT -f {m}',
+    'pkill -f "{m}\'[[:punct:]]\'\'"',
+    "pkill -fi '[{H}]{T}'; echo {m}", "pkill -f '[{H}]{T}'; echo {m}", "pkill -f '[[:alpha:]]{t}'; echo {m}",
+]
+
 
 def bash(command, **more):
     return {'hook_event_name': 'PreToolUse', 'tool_name': 'Bash', 'tool_input': {'command': command, **more},
@@ -149,6 +213,54 @@ class Reads(unittest.TestCase):
                     '$(' * 200 + 'sleep 1', 'bash -c ' * 30 + 'ls', 'x' * 200000):
             with self.subTest(cmd[:30]):
                 G.verdict(cmd, DEFAULTS)
+
+
+class SelfKill(unittest.TestCase):
+    """F7: `pkill -f X` killed its own shell 107 times in two weeks (exit 144, the rest of the command never ran)."""
+
+    def test_a_pattern_in_its_own_text_is_refused_in_the_foreground_and_the_background(self):
+        for cmd in SELF_KILLS:
+            with self.subTest(cmd):
+                self.assertEqual(G.verdict(cmd, DEFAULTS)[2], 'kill')
+                self.assertEqual(G.verdict(cmd, DEFAULTS, background=True)[2], 'kill')
+
+    def test_a_pattern_that_misses_its_own_text_passes(self):
+        for cmd in KILL_PASSES + KILL_GAPS:
+            with self.subTest(cmd):
+                self.assertIsNone(G.verdict(cmd, DEFAULTS, background=True))
+                self.assertIsNone(G.verdict(cmd, DEFAULTS))
+
+    def test_a_background_wait_still_passes(self):
+        self.assertIsNone(G.verdict('while ! gh pr checks 1; do sleep 60; done', DEFAULTS, background=True))
+
+    def test_the_refusal_names_the_way_out(self):
+        text = G.reason(*G.verdict('pkill -f "vitest run"', DEFAULTS), DEFAULTS)
+        self.assertTrue(text.startswith("Refused by poll-loop-guard: `pkill -f 'vitest run'` also matches"), text)
+        for said in ("'[v]itest run'", 'kill "$(cat run.pid)"', '-x, -A', 'exit 143/144'):
+            self.assertIn(said, text)
+        self.assertNotIn('sleeping', text)
+
+    def test_the_hook_refuses_a_background_self_kill(self):
+        r = subprocess.run([sys.executable, '-I', HOOK], input=json.dumps(bash('pkill -f x1', run_in_background=True)),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual((r.returncode, r.stdout), (2, ''))
+        self.assertIn('kills that shell', r.stderr)
+
+    @unittest.skipUnless(shutil.which('pkill') and shutil.which('pgrep'), 'no procps here')
+    def test_it_refuses_exactly_what_really_kills_its_shell(self):
+        """The contract: run each shape the way the host does (`bash -c` around an `eval '<text>'`) with a marker
+        only that shell has; the guard refuses it exactly when the shell really dies."""
+        died_any = lived_any = False
+        for shape in REAL:
+            m = 'zq' + uuid.uuid4().hex[:8]
+            cmd = shape.format(m=m, M=m.upper(), h=m[0], t=m[1:], H=m[0].upper(), T=m[1:].upper())
+            with self.subTest(cmd):
+                r = subprocess.run(['bash', '-c', "eval '" + cmd.replace("'", "'\\''") + "'\necho __alive__"],
+                                   capture_output=True, text=True, timeout=30)
+                died = '__alive__' not in r.stdout
+                died_any, lived_any = died_any or died, lived_any or not died
+                self.assertEqual(G.verdict(cmd, DEFAULTS) is not None, died, (r.returncode, r.stderr[-300:]))
+        self.assertTrue(died_any and lived_any)
 
 
 class Hook(unittest.TestCase):
