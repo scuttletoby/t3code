@@ -115,7 +115,7 @@ describe("ownerQuestionStatus", () => {
 });
 
 // Do this rule and the fork-ci owner-questions action's copy answer every shared case alike?
-describe("the cases shared with the fork-ci action", () => {
+describe("the cases shared with the owner-questions action", () => {
   const cases = JSON.parse(RULE_CASES_SOURCE) as {
     readonly defaultRule: OwnerQuestionRule;
     readonly renamedRule: OwnerQuestionRule;
