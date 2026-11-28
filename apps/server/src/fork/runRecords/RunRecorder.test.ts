@@ -27,7 +27,8 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { ProjectionStoreThreadNotFoundError } from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
-import { parseRunRecordLines } from "./runRecord.ts";
+import { LaneStore } from "../lanes/LaneStore.ts";
+import { parseRunRecordLines, runRecordLane } from "./runRecord.ts";
 import * as RunRecorder from "./RunRecorder.ts";
 import { summarizeRunRecords } from "./runRecordsSummary.ts";
 import {
@@ -681,6 +682,40 @@ it.layer(NodeServices.layer)("RunRecorder", (it) => {
       assert.strictEqual(record?.parent, null);
       assert.strictEqual(record?.kind, null);
       assert.strictEqual(record?.threadTitle, "Orchestrator");
+    }),
+  );
+  it.effect("writes a lane run's lane and keeps reading records written before lanes", () =>
+    Effect.gen(function* () {
+      const { world, start, records, runsFile, path } = yield* harness;
+      // Written by a recorder without the lane store: as every record before issue 1156.
+      endRun(world, run("child", "old-run"), { answer: "Done." });
+      yield* start;
+      // The orchestrator thread now runs the pr-queue lane; its child is one of its workers.
+      const lanes = Layer.mock(LaneStore)({
+        laneOfRun: (_projectId, threadId, parentThreadId, _endedAt) =>
+          Effect.succeed(threadId === "parent" || parentThreadId === "parent" ? "pr-queue" : null),
+      });
+      const withLanes = RunRecorder.make({ directory: path.dirname(runsFile) }).pipe(
+        Effect.provide(Layer.merge(dependencies(world), lanes)),
+      );
+      endRun(world, run("child", "worker-run"), { answer: "Done." });
+      endRun(world, run("parent", "lane-run"), { answer: "Done." });
+      world.threads.set("alone", thread("alone"));
+      endRun(world, run("alone", "no-lane-run"), { answer: "Done." });
+      yield* (yield* withLanes).follow;
+      const byRun = new Map((yield* records).map((record) => [record.runId, record]));
+      assert.deepStrictEqual(
+        ["old-run", "worker-run", "lane-run", "no-lane-run"].map((id) => {
+          const record = byRun.get(id);
+          return record === undefined ? "missing" : runRecordLane(record);
+        }),
+        [null, "pr-queue", "pr-queue", null],
+      );
+      // Runs outside a lane, old ones included, carry no lane field at all.
+      assert.isFalse("lane" in byRun.get("old-run")!);
+      assert.isFalse("lane" in byRun.get("no-lane-run")!);
+      const summary = summarizeRunRecords([...byRun.values()], { toMs: NOW_MS + 1 });
+      assert.strictEqual(summary.runs, 4);
     }),
   );
 });

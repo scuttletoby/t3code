@@ -1449,8 +1449,8 @@ reads as off, and a bad `graceSeconds` as 60; a save with a bad value is refused
 Lanes under a project's orchestrator
 ([#1156](https://github.com/scuttletoby/t3code/issues/1156)): the orchestrator stays the one thread
 the person talks to, and each lane (a long-lived child thread) owns one kind of work, such as the
-pull request queue, with its own workers. Settings only so far: nothing reads them yet, and no lane
-runs.
+pull request queue, with its own workers. So far: the settings, and the lane store below. No tool
+starts a lane yet (part 3), so no lane runs.
 
 - `enabled` (off): no lane can be switched on, whatever is defined.
 - `definitions`: changes to the lanes that exist. The built-in lanes `pr-queue` (owns `pr`) and
@@ -1472,6 +1472,36 @@ lane no longer defined keeps the name; whatever acts on it treats the lane as un
 An item a lane claims is written `pr:<owner>/<repo>#<n>` or `issue:<owner>/<repo>#<n>`, owner and
 repository in lower case (GitHub ignores case, so one item has one reference); `.` and `..` are
 never an owner or repository.
+
+**The lane store** (part 2) keeps each project's lanes in `<stateDir>/lanes/<projectId>.json`,
+written whole and atomically after each change, one change at a time, so it survives a restart:
+
+- **Registry:** each lane that ran, `running` or `stopped`, and the thread that acts for it now
+  with its **generation**. A start or a replacement (a new thread for a lane whose thread died or
+  was switched out) takes the next generation; a number is never used twice, so a replaced thread
+  can no longer act for the lane: its steps are refused. Repeating a start or a replacement that
+  already happened changes nothing, so a step half-done can be run again.
+- **Claims:** one owner per item (`pr:owner/repo#12`, `issue:owner/repo#3`; owner and repository
+  in any case are one item, kept lower-case), and only an item of a kind the lane `owns`. A second
+  lane's claim is refused while the first lane runs. The claims of a lane whose thread died stay
+  its own and move to its next thread. A claim of a lane stopped, no longer defined, or no longer
+  owning that kind of item is stale: the next claim on the item takes it. Stopping a lane releases
+  its claims.
+- **Outbox:** escalations for the main orchestrator, kept until delivered and keyed by lane and
+  trimmed id: the same lane's id twice is kept once while it waits (once delivered, the id is free
+  again), and at 200 waiting a new one is refused (never dropped).
+- **Notes:** short reports for the board; each lane keeps its last 50.
+
+While `enabled` is off every step is refused and no lane file is read or written: claims on disk
+wait unchanged until lanes are on again. A lane file that exists but cannot be read (not JSON,
+another version, a broken entry) counts as unknown, not empty: every step for that project is
+refused and the file is kept until it reads again. A file that cannot be written (disk,
+permissions) refuses the step as `store-unwritable` and changes nothing. No step writes a file a
+later read would refuse: text that could not be read back (empty, over 2000 characters, an item
+that is not one) is refused, and every new state is checked before it is written. Lane and item
+names are looked up as the file's own keys only, so a name like `constructor` finds nothing. Run
+records name the lane a run worked for (a lane's thread, or one of its workers) in `lane`; for a
+stopped lane, only runs that ended by its stop.
 
 ```json
 {

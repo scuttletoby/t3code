@@ -24,6 +24,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import { forkParked } from "../../serverActivation.ts";
+import { LaneStore } from "../lanes/LaneStore.ts";
 import { buildRunRecord, type RunRecord, TERMINAL_RUN_STATUSES } from "./runRecord.ts";
 
 const RUN_RECORDS_DIRECTORY = "run-records";
@@ -76,6 +77,8 @@ export const make = Effect.fn("RunRecorder.make")(function* (options: {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const projects = yield* ProjectStore.ProjectStoreV2;
   const events = yield* OrchestrationEventStore.OrchestrationEventStore;
+  // Optional: without it (or with lanes off) records carry no lane, as before issue 1156.
+  const lanes = Option.getOrNull(yield* Effect.serviceOption(LaneStore));
   const runsFile = path.join(options.directory, RUNS_FILE);
   const cursorFile = path.join(options.directory, CURSOR_FILE);
   const writeAtomically = (filePath: string, contents: string) =>
@@ -156,6 +159,15 @@ export const make = Effect.fn("RunRecorder.make")(function* (options: {
     const ms = (value: DateTime.Utc) => DateTime.toEpochMillis(value);
     const endedMs =
       run.completedAt === null ? DateTime.toEpochMillis(yield* DateTime.now) : ms(run.completedAt);
+    const lane =
+      lanes === null
+        ? null
+        : yield* lanes.laneOfRun(
+            thread.projectId,
+            run.threadId,
+            parentThreadId,
+            DateTime.formatIso(DateTime.makeUnsafe(endedMs)),
+          );
     return buildRunRecord({
       run,
       thread: {
@@ -166,6 +178,7 @@ export const make = Effect.fn("RunRecorder.make")(function* (options: {
       },
       projectTitle: Option.isSome(project) ? project.value.title : null,
       task,
+      lane,
       runMessage: prompts[0]?.text ?? null,
       finalMessage: answers.some((message) => message.text.trim() !== ""),
       providerTurns,
