@@ -16,8 +16,8 @@ import {
 } from "./baseSchemas.ts";
 
 /** Lower-case words of letters and digits joined by `-`, starting with a letter: `pr-queue`. */
-export const LANE_NAME_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
-export const LANE_NAME_MAX_CHARS = 40;
+const LANE_NAME_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
+const LANE_NAME_MAX_CHARS = 40;
 
 /** A lane's name, the key of its definition in `lanes.definitions`. */
 export const LaneName = Schema.String.check(
@@ -26,11 +26,11 @@ export const LaneName = Schema.String.check(
 ).pipe(Schema.brand("LaneName"));
 export type LaneName = typeof LaneName.Type;
 
-export const isLaneName = (value: unknown): value is LaneName =>
+const isLaneName = (value: unknown): value is LaneName =>
   typeof value === "string" && value.length <= LANE_NAME_MAX_CHARS && LANE_NAME_PATTERN.test(value);
 
 /** The kinds of item a lane can own. */
-export const LANE_ITEM_KINDS = ["pr", "issue"] as const;
+const LANE_ITEM_KINDS = ["pr", "issue"] as const;
 export const LaneItemKind = Schema.Literals(LANE_ITEM_KINDS);
 export type LaneItemKind = typeof LaneItemKind.Type;
 
@@ -38,11 +38,11 @@ export type LaneItemKind = typeof LaneItemKind.Type;
  * Who runs a lane. Only `agent` for now: a delegated child thread with the lane's brief. A program
  * driver comes later; until then a definition naming another driver drops on read.
  */
-export const LANE_DRIVERS = ["agent"] as const;
+const LANE_DRIVERS = ["agent"] as const;
 export const LaneDriver = Schema.Literals(LANE_DRIVERS);
 export type LaneDriver = typeof LaneDriver.Type;
 
-export const LANE_DESCRIPTION_MAX_CHARS = 2_000;
+const LANE_DESCRIPTION_MAX_CHARS = 2_000;
 
 /** One lane: what it does (its thread's brief starts from this), what it owns, who runs it. */
 export const LaneDefinition = Schema.Struct({
@@ -82,7 +82,7 @@ export const LanesSettings = Schema.Struct({
 export type LanesSettings = typeof LanesSettings.Type;
 
 /** Off, with the built-in lanes defined: what a settings file without `lanes` reads as. */
-export const DEFAULT_LANES_SETTINGS: LanesSettings = {
+const DEFAULT_LANES_SETTINGS: LanesSettings = {
   enabled: false,
   definitions: DEFAULT_LANE_DEFINITIONS as LanesSettings["definitions"],
 };
@@ -152,8 +152,7 @@ export function findLaneDefinition(
 }
 
 /** `pr:<owner>/<repo>#<n>` or `issue:<owner>/<repo>#<n>`. */
-export const LANE_ITEM_PATTERN =
-  /^(pr|issue):([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#([1-9][0-9]{0,9})$/u;
+const LANE_ITEM_PATTERN = /^(pr|issue):([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#([1-9][0-9]{0,9})$/u;
 
 /** One item a lane can own, as text: `pr:owner/repo#12`. */
 export const LaneItemRef = Schema.String.check(Schema.isPattern(LANE_ITEM_PATTERN)).pipe(
@@ -204,7 +203,7 @@ export const LaneClaim = Schema.Struct({
 });
 export type LaneClaim = typeof LaneClaim.Type;
 
-export const LANE_REPORT_MAX_CHARS = 2_000;
+const LANE_REPORT_MAX_CHARS = 2_000;
 
 const ReportText = TrimmedNonEmptyString.check(Schema.isMaxLength(LANE_REPORT_MAX_CHARS));
 
