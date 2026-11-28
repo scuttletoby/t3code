@@ -1,0 +1,5 @@
+- Change: Placement, part 1: the settings, and `advise`. `placement` (off, advise or enforce; this machine's labels, an optional facts command, label groups that must never meet on one machine, and a weight per linked machine) and `placementNeeds` (labels a project's work needs). Person-only; a bad `placement` reads as off and a bad `placementNeeds` fits no machine, each kept as written. The machine facts read uses the labels and the facts command. `advise` adds to the `delegate_task` reply where a worktree child would run and why; nothing is moved yet.
+- Why: Delegated work should go to a machine that has what it needs, and never where it must not run.
+- Setting: `server.placement`, `server.placementNeeds`, `projectOverride.placementNeeds`
+- Default: off
+- PR: [#134](https://github.com/scuttletoby/t3code/issues/134)

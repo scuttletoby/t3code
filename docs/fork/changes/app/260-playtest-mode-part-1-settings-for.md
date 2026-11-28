@@ -1,0 +1,5 @@
+- Change: Playtest mode, part 1: settings for a project's playtest adapter (claim, renew, push and release steps only the person sets) and the contract those steps follow. Nothing starts a session yet.
+- Why: A person tries an agent's unfinished work on a test target, round after round, no PR per round.
+- Setting: `server.playtest`, `projectOverride.playtest`
+- Default: off
+- PR: [#260](https://github.com/scuttletoby/t3code/pull/260)

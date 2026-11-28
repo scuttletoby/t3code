@@ -36,6 +36,7 @@
           ".github/fork-review-kit.json",
           ".github/fork-secret-sweep-gone-tips.txt",
           ".github/fork-seams.json",
+          ".github/fork-test-seconds.json",
           ".github/fork-tests-upstream.json",
           ".github/fork-upstream.json",
           ".github/fork-windows-tests-upstream.json",

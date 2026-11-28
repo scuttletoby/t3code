@@ -1,0 +1,5 @@
+- Change: Secret scan on every push and pull request. Known false alarm: a new pre-release version of a package with "key" in its name, in `pnpm-lock.yaml`, is a finding until its exact value is allowed in `.gitleaks.toml`.
+- Why: The fork is public: no token or key may land in it.
+- Setting: none
+- Default: always
+- PR: [#75](https://github.com/scuttletoby/t3code/pull/75), [#206](https://github.com/scuttletoby/t3code/pull/206), [#207](https://github.com/scuttletoby/t3code/pull/207), [#212](https://github.com/scuttletoby/t3code/pull/212), [#299](https://github.com/scuttletoby/t3code/pull/299)

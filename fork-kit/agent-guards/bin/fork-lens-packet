@@ -1,0 +1,16 @@
+#!/usr/bin/python3 -IB
+"""fork-lens-packet: one file with what a review lens needs to start (the pull request, its SHAs, the diff, the touched
+lines with context, the tests, the linked issues, the state question); prints its path.
+`fork-lens-packet --help` for the usage (lib/agent_guards/lenspacket.py; README.md, Ready-made commands).
+Tests: fork-kit/agent-guards/tests/lens-packet.test.py
+"""
+import os, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+
+if __name__ == '__main__':
+    from agent_guards import lenspacket
+    try:
+        sys.exit(lenspacket.main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

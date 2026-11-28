@@ -1,0 +1,5 @@
+- Change: `t3 serve --hold-work` starts a server on a copy of a T3 home with all agent work and T3 Connect held.
+- Why: Look at a new build's threads and migrations on a copy before it replaces a running T3.
+- Setting: none
+- Default: only with the flag
+- PR: [#175](https://github.com/scuttletoby/t3code/pull/175)

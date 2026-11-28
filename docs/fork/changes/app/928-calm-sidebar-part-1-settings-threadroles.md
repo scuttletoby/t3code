@@ -1,0 +1,5 @@
+- Change: Calm sidebar, part 1: the settings. `threadRoles` names the assistant thread and one orchestrator per project; the server refuses a role for a thread that is missing, deleted, a sub-agent, a side chat, delegated from a linked machine or in another project. `calmSidebarEnabled` is the per-device switch. Nothing shows them yet.
+- Why: A short sidebar: the threads that matter on top, the rest folded.
+- Setting: `server.threadRoles`, `client.calmSidebarEnabled`
+- Default: off
+- PR: [#928](https://github.com/scuttletoby/t3code/pull/928)

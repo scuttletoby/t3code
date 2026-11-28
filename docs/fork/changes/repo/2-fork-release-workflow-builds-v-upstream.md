@@ -1,0 +1,5 @@
+- Change: Fork release workflow: builds `v<upstream>.fork.<n>` with the Linux and Windows CLI archives and unsigned desktop apps.
+- Why: The fork needs its own releases to install and update from.
+- Setting: none
+- Default: run by hand or by fork-follow
+- PR: [#2](https://github.com/scuttletoby/t3code/pull/2)

@@ -2,7 +2,7 @@
   "//": "Upstream files with fork lines, and every line the fork may add to each (indentation and blank lines ignored). Checked by .github/scripts/fork-seam-check.cjs against the base branch's copy of this file; see docs/fork/updates.md. A new line is first announced in its entry (\"announced\": {\"since\": day, \"added\": [lines]}), then added by a later pull request that moves it to \"added\" (docs/fork/updates.md, Adding a seam line).",
   "files": {
     "packages/contracts/src/settings.ts": {
-      "why": "Fork settings live in forkSettings.ts; settings.ts takes them with one spread per struct (the client settings patch's spread saves the client fork settings: the owner-questions page switch, and the calm sidebar's toggle). automaticUpdates stays inline: upstream's pending setting has the same name and place.",
+      "why": "Fork settings live in forkSettings.ts; settings.ts takes them with one spread per struct (the client settings patch's spread saves the client fork settings: the owner-questions page switch, the calm sidebar's toggle and the work panel's switch). automaticUpdates stays inline: upstream's pending setting has the same name and place.",
       "added": [
         "import * as ForkSettings from \"./forkSettings.ts\";",
         "export * from \"./forkSettings.ts\";",
@@ -179,7 +179,7 @@
       ]
     },
     "apps/server/src/peer/RemoteDelegation.ts": {
-      "why": "#386: a remote delegate_task interrupted after its launch there (the parent's turn moved on) still records and follows its task: the launch, record and follow run as one uninterruptible step. A launch recorded with no task here is stopped there with a warning, as a failed record is. Tested in apps/server/src/fork/remoteDelegationAbortSafe.test.ts. Upstream PR pingdotgg/t3code#30249 (record before launch) rewrites this block, and its intent differs: after an interrupted, uncertain launch it stops the child there, while this seam keeps the child and follows it. Whoever brings #30249 in through fork-follow must choose on purpose between stopping and keeping (and expect a merge conflict on this block), then drop this seam or keep it. Also #386: lastReply reads a task's reply through fork/remoteReplyRead.ts, which decodes the answer again without the thread's details when the full read does not decode, so a linked environment on another version (thread details missing a field this version requires) still delivers the reply. Tested in apps/server/src/fork/remoteReplyRead.test.ts. Also #532: a remote delegate_task carries its parent's resolved MCP profile in delegatedFrom (fork/remoteMcpProfile.ts), worked out before the uninterruptible launch so a refusal or an interrupt sends nothing; a profile narrower than all goes only to an environment whose GET /api/fork/features (fork/forkFeatures.ts, answered only to its link token) says mcpProfileCarry, and only to an instance there whose driver applies one (Claude; #661 asks that environment's orchestrator_capabilities for the launch's instance). Tested in apps/server/src/fork/remoteMcpProfile.test.ts.",
+      "why": "#386: a remote delegate_task interrupted after its launch there (the parent's turn moved on) still records and follows its task: the launch, record and follow run as one uninterruptible step. A launch recorded with no task here is stopped there with a warning, as a failed record is. Tested in apps/server/src/fork/remoteDelegationAbortSafe.test.ts. Upstream PR pingdotgg/t3code#30249 (record before launch) rewrites this block, and its intent differs: after an interrupted, uncertain launch it stops the child there, while this seam keeps the child and follows it. Whoever brings #30249 in through fork-follow must choose on purpose between stopping and keeping (and expect a merge conflict on this block), then drop this seam or keep it. Also #386: lastReply reads a task's reply through fork/remoteReplyRead.ts, which decodes the answer again without the thread's details when the full read does not decode, so a linked environment on another version (thread details missing a field this version requires) still delivers the reply. Tested in apps/server/src/fork/remoteReplyRead.test.ts. Also #532: a remote delegate_task carries its parent's resolved MCP profile in delegatedFrom (fork/remoteMcpProfile.ts), worked out before the uninterruptible launch so a refusal or an interrupt sends nothing; a profile narrower than all goes only to an environment whose GET /api/fork/features (fork/forkFeatures.ts, answered only to its link token) says mcpProfileCarry, and only to an instance there whose driver applies one (Claude; #661 asks that environment's orchestrator_capabilities for the launch's instance). Tested in apps/server/src/fork/remoteMcpProfile.test.ts. MCP profiles PR 6 (#875): the carry also gets the call's input, so a delegate_task to another machine that names a narrower `mcpProfile` carries that profile (checked within the parent's) instead of the parent's.",
       "added": [
         "// Fork: from the launch on, the task is recorded and followed even if this call is",
         "// interrupted (the parent's turn moved on), else the thread there runs with nothing here",
@@ -198,7 +198,13 @@
         "const carryMcpProfile = yield* RemoteMcpProfile.makeCarry(links); // Fork: MCP profile carry",
         "const carried = yield* carryMcpProfile(parent.thread, scope, target, instanceId); // Fork: before the launch",
         "...carried, // Fork: the parent's MCP profile"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-28",
+        "added": [
+          "const carried = yield* carryMcpProfile(parent.thread, scope, target, instanceId, input); // Fork: before the launch"
+        ]
+      }
     },
     "apps/web/src/components/ChatView.browser.test.tsx": {
       "why": "#474: upstream's test \"an interrupted image-only first send of a new thread says it may not have been sent\" presses Enter once the pasted image's tile shows. The tile shows while the image still compresses, and the composer refuses a send then (\"Still compressing a pasted image\"), so on a loaded runner the launch never came and the test went red. The fork line waits until the tile's preview button is enabled, which is when the image is ready. Drop this seam when upstream's test waits for the ready image itself.",
@@ -235,7 +241,14 @@
         "mcpProfileOptions: mcpProfile.options,",
         "...input.mcpProfileOptions?.hooks,",
         "Effect.tap(({ querySession }) => checkMcpProfile(querySession)),"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-28",
+        "added": [
+          "import * as BackgroundWait from \"../../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
+          "yield* BackgroundWait.remember(input.nativeThreadId, message); // Fork: background wait (F7)"
+        ]
+      }
     },
     "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts": {
       "why": "MCP profiles part 5: each Codex thread gets its profile's outside MCP servers switched off in its own per-thread config (mcp_servers.<name>.enabled = false for every server Codex's config/read lists for the thread's folder that the profile leaves out, launch-argument servers included; T3's own entries stay), and a turn is refused, saying why and the fix, when the thread's live servers (mcpServerStatus/list) still include one outside its profile. The adapter's app-server client factory is wrapped by apps/server/src/fork/codexMcpProfile.ts; the overrides travel per request, so other threads on the shared app-server keep their own sets. Additions only; tested in apps/server/src/fork/codexMcpProfile.test.ts.",
@@ -243,6 +256,18 @@
         "import * as CodexMcpProfile from \"../../fork/codexMcpProfile.ts\"; // Fork: MCP profiles",
         "...(yield* CodexMcpProfile.profiledClientFactory(clientFactory)), // Fork: MCP profiles"
       ]
+    },
+    "apps/server/src/orchestration-v2/ThreadManagementService.ts": {
+      "why": "An awaited t3_background_wait on a task that already ended answers with that task under a new \"ended\" field (its status and summary), read from the ended-task memory the Claude adapter fills (fork/backgroundWait.ts), instead of refusing it unmatched (#1094, F7). Additions only.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-28",
+        "added": [
+          "import * as BackgroundWait from \"../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
+          "const ended = yield* BackgroundWait.read(providerThread, input.taskIds, matched); // Fork: background wait (F7)",
+          "if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)"
+        ]
+      }
     },
     "apps/server/src/orchestration-v2/ProviderTurnStartService.ts": {
       "why": "MCP profiles part 2: a Claude turn its MCP profile refuses never reached Claude, like the other refusals in this list.",
@@ -311,22 +336,15 @@
       ]
     },
     "apps/server/src/mcp/toolkits/project/handlers.ts": {
-      "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681); a launch that starts a run takes a slot from the agent slot gate, or is refused slots_full (fork/agentSlotRoutes.ts, #706). An agent's t3_thread_launch (from a calling thread) is checked against the model policy once its model is known, before the slot gate: refused in enforce when the launch names no model, a model in no row, or an effort off its row (fork/modelPolicyCheck.ts, #731).",
+      "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681); a launch that starts a run takes a slot from the agent slot gate, or is refused slots_full (fork/agentSlotRoutes.ts, #706); a delegated task a linked machine sends first passes this machine's usage pacing gate, and the launch runs with the model selection it gives back, its effort lowered by usagePacingLowerEffort (fork/linkedLaunchPacing.ts, #1081). An agent's t3_thread_launch (from a calling thread) is checked against the model policy once its model is known, before the slot gate: refused in enforce when the launch names no model, a model in no row, or an effort off its row (fork/modelPolicyCheck.ts, #731).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch",
-        "import { checkLaunchSlot } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
-        "yield* checkLaunchSlot(caller, { threadId, modelSelection, replaying, input, attachments }); // Fork: agent slots",
+        "import { launchGate } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots, linked pacing",
+        "...(yield* launchGate(caller, threadId, modelSelection, replaying, input, attachments)), // Fork: agent slots, linked pacing",
         "import * as ModelPolicyCheck from \"../../../fork/modelPolicyCheck.ts\"; // Fork: model policy",
         "yield* ModelPolicyCheck.checkLaunch(caller, modelSelection, input, replaying); // Fork: model policy"
-      ],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import { launchGate } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots, linked pacing",
-          "...(yield* launchGate(caller, threadId, modelSelection, replaying, input, attachments)), // Fork: agent slots, linked pacing"
-        ]
-      }
+      ]
     },
     "apps/server/src/scheduledTasks/ScheduledTaskService.ts": {
       "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot (a direct one is stored for the stored-delivery worker on its first refusal, so a restart keeps it; one whose task is saved while it waits is not started on its old copy, and the stored-delivery worker keeps its row and runs it again on the task as saved, #719); a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706). A save records the MCP profile of the thread that made it, and refuses a narrower thread's change that would let the task's runs get more than its own profile; a run that starts a new thread is refused when that thread would get more than the recorded profile (fork/scheduledTaskMcpProfile.ts, #699). The stored-delivery worker names its own delivery to keepStored, and a delivery it removes before its run (payload not prepared, prompt too long) leaves its place in line at once rather than at the sweep (fork/agentSlotRoutes.ts, #941).",
@@ -353,6 +371,18 @@
         "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
         "yield* AgentSlotRoutes.checkSendSlot(scope.thread?.threadId, input.threadId); // Fork: agent slots"
       ]
+    },
+    "apps/server/src/mcp/toolkits/orchestrator/tools.ts": {
+      "why": "t3_background_wait takes taskId as an alias of taskIds (its parameters decode either into the taskIds upstream's handler reads, so the handler is unchanged) and its result may carry the \"ended\" field (fork/backgroundWait.ts, #1094, F7). Additions only.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-28",
+        "added": [
+          "import * as BackgroundWait from \"../../../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
+          ".setParameters(BackgroundWait.Parameters) // Fork: background wait (F7)",
+          ".setSuccess(BackgroundWait.Success) // Fork: background wait (F7)"
+        ]
+      }
     },
     "apps/server/src/mcp/toolkits/attachment/handlers.ts": {
       "why": "t3_thread_send_attachments from an agent that would start a run in an idle thread takes a slot from the agent slot gate like t3_thread_send, or is refused slots_full and nothing is sent (fork/agentSlotRoutes.ts, #711).",
@@ -478,10 +508,10 @@
       }
     },
     "apps/web/src/components/ChatView.tsx": {
-      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts). A thread whose playtest session is on shows the Playtest chip with its End button in the composer's banners (playtest F5, #889): one hook call and its items spread into both banner lists (fork/playtest/usePlaytestChipItems.tsx).",
+      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts). A thread whose playtest session is on shows the Playtest chip with its End button in the composer's banners (playtest F5, #889): one hook call and its items spread into both banner lists (fork/playtest/usePlaytestChipItems.tsx). A thread whose next turn names no effort while the model policy is on shows a warning in the composer's banners (model policy, #876): one hook call and its items spread into both banner lists (fork/modelPolicy/useForkNoEffortItems.ts).",
       "added": [],
       "announced": {
-        "since": "2026-11-27",
+        "since": "2026-11-28",
         "added": [
           "import { useForkHandoffWaitingItems } from \"./fork/handoff/useForkHandoffWaitingItems\"; // Fork (HO5)",
           "const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)",
@@ -490,7 +520,11 @@
           "import { useForkPlaytestItems } from \"./fork/playtest/usePlaytestChipItems\"; // Fork (playtest)",
           "const forkPlaytestItems = useForkPlaytestItems(routeThreadRef); // Fork (playtest)",
           "...forkPlaytestItems, // Fork (playtest)",
-          "...forkPlaytestItems, // Fork (playtest)"
+          "...forkPlaytestItems, // Fork (playtest)",
+          "import { useForkNoEffortItems } from \"./fork/modelPolicy/useForkNoEffortItems\"; // Fork (model policy)",
+          "const forkNoEffortItems = useForkNoEffortItems(routeThreadRef); // Fork (model policy)",
+          "...forkNoEffortItems, // Fork (model policy)",
+          "...forkNoEffortItems, // Fork (model policy)"
         ]
       }
     },
@@ -554,7 +588,7 @@
       ]
     },
     "packages/contracts/src/orchestratorMcp.ts": {
-      "why": "Usage pacing's note on a delegate_task result and the two refusal codes of the fork's delegation gates (usage pacing, agent slots), from before every upstream file was counted. The linked-child prompt fields (#817, design in #808) come in as one spread of the fork's own struct fields (forkOrchestratorMcp.ts), so later fork fields on this result need no new line here.",
+      "why": "Usage pacing's note on a delegate_task result and the two refusal codes of the fork's delegation gates (usage pacing, agent slots), from before every upstream file was counted. The linked-child prompt fields (#817, design in #808) come in as one spread of the fork's own struct fields (forkOrchestratorMcp.ts), so later fork fields on this result need no new line here. MCP profiles PR 6 (#875, owner decision #102): delegate_task takes the fork's own input fields with one spread of forkOrchestratorMcp.ts's ForkDelegateTaskInputFields (first `mcpProfile`, a narrower profile for the sub-agent), so later fork fields on this input need no new line here.",
       "added": [
         "// Fork: set only on the delegate_task call the usage pacing gate acted on or could not judge.",
         "usagePacingNote: Schema.optional(Schema.String).annotate({",
@@ -566,10 +600,16 @@
         "\"slots_full\",",
         "import * as ForkOrchestratorMcp from \"./forkOrchestratorMcp.ts\"; // Fork: its result fields",
         "...ForkOrchestratorMcp.ForkDelegateTaskResultFields,"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-28",
+        "added": [
+          "...ForkOrchestratorMcp.ForkDelegateTaskInputFields, // Fork: the sub-agent's MCP profile"
+        ]
+      }
     },
     "apps/server/src/mcp/OrchestratorMcpService.ts": {
-      "why": "The fork's delegation checks (fork/delegateChecks.ts: usage pacing, agent slots, a child's own options, a linked child's prompts) at their seats in delegate_task, create_threads and a remote task's status, from before every upstream file was counted. A pending secret request of a linked child ends a blocking wait (#817): one call in upstream's endsTaskWait, on the module's existing DelegateChecks import.",
+      "why": "The fork's delegation checks (fork/delegateChecks.ts: usage pacing, agent slots, a child's own options, a linked child's prompts) at their seats in delegate_task, create_threads and a remote task's status, from before every upstream file was counted. A pending secret request of a linked child ends a blocking wait (#817): one call in upstream's endsTaskWait, on the module's existing DelegateChecks import. MCP profiles PR 6 (#875): seat 2 also gets the call's command id and input, so a sub-agent's narrower MCP profile (delegate_task `mcpProfile`) is checked against the caller's and recorded for the child thread (its id follows from the command id) before the dispatch, never after its first turn could start.",
       "added": [
         "import * as DelegateChecks from \"../fork/delegateChecks.ts\";",
         "// Fork: the fork's delegation checks (pacing, slots, a child's own options) at their seats.",
@@ -607,7 +647,13 @@
         "target: resolvedTarget,",
         "});",
         "DelegateChecks.promptEndsWait(result) || // Fork: a secret request ends a wait"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-28",
+        "added": [
+          "request: { commandId, input }, // Fork: the sub-agent's narrower MCP profile, checked and recorded"
+        ]
+      }
     },
     "apps/server/src/peer/PeerLinks.ts": {
       "why": "#959: a link the peer turned away ends here as an expired one (fork/peerLinkRevoke.ts makeLinkRevokes). recordRevoked moves expires_at to now, only for the linked_at the refused call resolved, so a link made again since keeps its end. A renewal that answers a call made before the refusal (recordExpiry) skips the ended link's linked_at, so it cannot bring that link back; a link made again renews as before. Tested in apps/server/src/fork/peerLinkRevoke.test.ts.",
@@ -665,54 +711,78 @@
         "export { parseSkillFrontmatter }; // Fork: one frontmatter read for skills and the model policy"
       ]
     },
-    "packages/contracts/src/rpc.ts": {
-      "why": "The work panel (fork issue 1136) reads one fork RPC, `fork.workPanel`, defined in the fork file forkWorkPanel.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket.",
+    "apps/server/src/provider/Drivers/AntigravityDriver.ts": {
+      "why": "Antigravity limits come from the CLI's own `/usage` report since upstream stopped reading Google's internal quota API (upstream pull request 43026). The fork's overlay (fork/antigravityUsage) wraps the instance's snapshot service with one spread after upstream's snapshot line, reusing the driver's spawn setup; announced here, added by the feature pull request.",
       "added": [],
       "announced": {
         "since": "2026-11-27",
         "added": [
-          "import { WsForkWorkPanelRpc } from \"./forkWorkPanel.ts\"; // Fork (work panel)",
-          "WsForkWorkPanelRpc, // Fork (work panel)"
+          "import * as ForkLimits from \"../../fork/antigravityUsage/antigravityLimits.ts\"; // Fork: limits",
+          "...(yield* ForkLimits.overlay(provider.snapshot, settings, prepareSpawn, processEnvironment)),"
+        ]
+      }
+    },
+    "packages/contracts/src/rpc.ts": {
+      "why": "The work panel (fork issue 1136) reads one fork RPC, `fork.workPanel`, defined in the fork file forkWorkPanel.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket. The Usage tab's fleet list (fork issue 1146) reads one fork RPC, `fork.fleetUsage`, defined in the fork file forkFleetUsage.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket.",
+      "added": [
+        "import { WsForkWorkPanelRpc } from \"./forkWorkPanel.ts\"; // Fork (work panel)",
+        "WsForkWorkPanelRpc, // Fork (work panel)"
+      ],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import { WsForkFleetUsageRpc } from \"./forkFleetUsage.ts\"; // Fork (fleet usage)",
+          "WsForkFleetUsageRpc, // Fork (fleet usage)"
         ]
       }
     },
     "apps/server/src/auth/RpcAuthorization.ts": {
-      "why": "Every RPC in the group declares its scope (RpcAuthorization.test.ts holds the map to the group): the work panel's `fork.workPanel` (fork issue 1136) is a read, like upstream's host resources read.",
-      "added": [],
+      "why": "Every RPC in the group declares its scope (RpcAuthorization.test.ts holds the map to the group): the work panel's `fork.workPanel` (fork issue 1136) is a read, like upstream's host resources read. The fleet usage read `fork.fleetUsage` (fork issue 1146) is a read, like upstream's host resources read.",
+      "added": ["\"fork.workPanel\": AuthOrchestrationReadScope, // Fork (work panel)"],
       "announced": {
         "since": "2026-11-27",
-        "added": ["\"fork.workPanel\": AuthOrchestrationReadScope, // Fork (work panel)"]
+        "added": ["\"fork.fleetUsage\": AuthOrchestrationReadScope, // Fork (fleet usage)"]
       }
     },
     "apps/server/src/observability/RpcInstrumentation.ts": {
-      "why": "Every RPC in the group names its span category: the work panel's `fork.workPanel` (fork issue 1136) is a server read.",
-      "added": [],
+      "why": "Every RPC in the group names its span category: the work panel's `fork.workPanel` (fork issue 1136) is a server read. The fleet usage read `fork.fleetUsage` (fork issue 1146) is a server read.",
+      "added": ["\"fork.workPanel\": \"server\", // Fork (work panel)"],
       "announced": {
         "since": "2026-11-27",
-        "added": ["\"fork.workPanel\": \"server\", // Fork (work panel)"]
+        "added": ["\"fork.fleetUsage\": \"server\", // Fork (fleet usage)"]
       }
     },
     "apps/server/src/ws.ts": {
-      "why": "The work panel's `fork.workPanel` handler (fork issue 1136) is one line that hands the request to the fork file fork/workPanel/workPanel.ts, which reads its own service only if it is there, so upstream's handler requirements and ws tests do not change.",
+      "why": "The work panel's `fork.workPanel` handler (fork issue 1136) is one line that hands the request to the fork file fork/workPanel/workPanel.ts, which reads its own service only if it is there, so upstream's handler requirements and ws tests do not change. The fleet usage handler `fork.fleetUsage` (fork issue 1146) is one line that hands the request to the fork file fork/fleetUsage/fleetUsage.ts, which reads each service it needs only if it is there, so upstream's handler requirements and ws tests do not change.",
+      "added": [
+        "import * as ForkWorkPanel from \"./fork/workPanel/workPanel.ts\"; // Fork (work panel)",
+        "\"fork.workPanel\": (input) => ForkWorkPanel.read(input), // Fork (work panel)"
+      ],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import * as ForkFleetUsage from \"./fork/fleetUsage/fleetUsage.ts\"; // Fork (fleet usage)",
+          "\"fork.fleetUsage\": (input) => ForkFleetUsage.read(input), // Fork (fleet usage)"
+        ]
+      }
+    },
+    "apps/web/src/components/usage/UsageLimitsPooled.tsx": {
+      "why": "The Usage tab's limits (fork issue 1146) get the fork's fleet list first: one import and one element at the top of upstream's list, which renders nothing while the server it is connected to has no linked machine (components/fork/fleetUsage).",
       "added": [],
       "announced": {
         "since": "2026-11-27",
         "added": [
-          "import * as ForkWorkPanel from \"./fork/workPanel/workPanel.ts\"; // Fork (work panel)",
-          "\"fork.workPanel\": (input) => ForkWorkPanel.read(input), // Fork (work panel)"
+          "import { ForkFleetUsage } from \"../fork/fleetUsage/ForkFleetUsage\"; // Fork (fleet usage)",
+          "<ForkFleetUsage now={now} />"
         ]
       }
     },
     "apps/web/src/components/chat/ThreadDetailsPanel.tsx": {
       "why": "The work panel (fork issue 1136) sits in the thread's side panel right after its sub-agents (ThreadRelationshipsPanel): one import and one element, which renders nothing while the client fork setting workPanelEnabled is off (components/fork/workPanel).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import { ForkWorkPanel } from \"../fork/workPanel/ForkWorkPanel\"; // Fork (work panel)",
-          "<ForkWorkPanel {...props} density={density} />"
-        ]
-      }
+      "added": [
+        "import { ForkWorkPanel } from \"../fork/workPanel/ForkWorkPanel\"; // Fork (work panel)",
+        "<ForkWorkPanel {...props} density={density} />"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
