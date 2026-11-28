@@ -364,12 +364,15 @@
       ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/tools.ts": {
-      "why": "t3_background_wait takes taskId as an alias of taskIds (its parameters decode either into the taskIds upstream's handler reads, so the handler is unchanged) and its result may carry the \"ended\" field (fork/backgroundWait.ts, #1094, F7). Additions only.",
+      "why": "t3_background_wait's result may carry the \"ended\" field: tasks that had already ended, with their status and summary (fork/backgroundWait.ts, #1094, F7). Still announced, not spent: the taskId alias of taskIds. Advertising it grows upstream's tool-list budget (agentContextBudget.json stays upstream's), and McpHttpServer refuses an argument it does not advertise. Additions only.",
       "added": [
         "import * as BackgroundWait from \"../../../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
-        ".setParameters(BackgroundWait.Parameters) // Fork: background wait (F7)",
         ".setSuccess(BackgroundWait.Success) // Fork: background wait (F7)"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-28",
+        "added": [".setParameters(BackgroundWait.Parameters) // Fork: background wait (F7)"]
+      }
     },
     "apps/server/src/mcp/toolkits/attachment/handlers.ts": {
       "why": "t3_thread_send_attachments from an agent that would start a run in an idle thread takes a slot from the agent slot gate like t3_thread_send, or is refused slots_full and nothing is sent (fork/agentSlotRoutes.ts, #711).",

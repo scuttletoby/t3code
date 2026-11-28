@@ -166,7 +166,6 @@ const BackgroundWaitTool = Tool.make("t3_background_wait", {
   // Only marks which tasks keep the thread Working; Claude Plan mode blocks tools without this.
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
-  .setParameters(BackgroundWait.Parameters) // Fork: background wait (F7)
   .setSuccess(BackgroundWait.Success) // Fork: background wait (F7)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenWithoutBackgroundWait);
 

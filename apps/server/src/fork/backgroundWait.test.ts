@@ -18,7 +18,6 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -26,7 +25,6 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import { Tool } from "effect/ai";
 
 import { OrchestratorToolkit } from "../mcp/toolkits/orchestrator/tools.ts";
 import { makeTurnInput } from "../orchestration-v2/Adapters/AcpAdapterV2.testkit.ts";
@@ -44,38 +42,7 @@ const tool = OrchestratorToolkit.tools.t3_background_wait;
 const encodeSuccess = Schema.encodeUnknownSync(tool.successSchema);
 const CLAUDE_SETTINGS = Schema.decodeSync(ClaudeSettings)({});
 
-describe("t3_background_wait parameters", () => {
-  const decode = Schema.decodeUnknownExit(tool.parametersSchema);
-
-  it("takes taskId as an alias of taskIds", () => {
-    expect(decode({ taskId: "tests" })).toEqual(Exit.succeed({ taskIds: ["tests"] }));
-    expect(decode({ taskId: " tests ", waiting: false })).toEqual(
-      Exit.succeed({ taskIds: ["tests"], waiting: false }),
-    );
-    expect(decode({ taskIds: ["a", "b"] })).toEqual(Exit.succeed({ taskIds: ["a", "b"] }));
-    expect(decode({ taskIds: ["a"], taskId: "a" })).toEqual(Exit.succeed({ taskIds: ["a"] }));
-  });
-
-  it("refuses a call without any task ID, or with too many", () => {
-    expect(Exit.isFailure(decode({}))).toBe(true);
-    expect(Exit.isFailure(decode({ taskIds: [] }))).toBe(true);
-    expect(Exit.isFailure(decode({ taskId: "  " }))).toBe(true);
-    const many = Array.from({ length: 20 }, (_, index) => `t${index}`);
-    expect(Exit.isSuccess(decode({ taskIds: many }))).toBe(true);
-    expect(Exit.isFailure(decode({ taskIds: many, taskId: "one-more" }))).toBe(true);
-  });
-
-  it("advertises both fields and requires neither", () => {
-    const schema = Tool.getJsonSchema(tool) as {
-      readonly properties: Readonly<Record<string, unknown>>;
-      readonly required?: ReadonlyArray<string>;
-    };
-    expect(Object.keys(schema.properties)).toEqual(
-      expect.arrayContaining(["taskIds", "taskId", "waiting"]),
-    );
-    expect(schema.required ?? []).not.toContain("taskIds");
-  });
-
+describe("t3_background_wait result", () => {
   it("keeps the ended field in the encoded result", () => {
     const encoded = encodeSuccess({
       matched: [],

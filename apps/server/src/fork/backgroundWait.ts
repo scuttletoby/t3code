@@ -1,47 +1,14 @@
 /**
- * Fork: background wait (F7). `t3_background_wait` takes `taskId` as well as `taskIds`, and a task
- * that already ended is answered once under `ended` instead of refused as unmatched: the Claude
- * adapter drops ended tasks from its roster, so `remember` keeps a bounded memory of them.
+ * Fork: background wait (F7). A `t3_background_wait` on a task that already ended answers it once
+ * under `ended` instead of refusing it as unmatched: the Claude adapter drops ended tasks from its
+ * roster, so `remember` keeps a bounded memory of them.
  */
-import { TrimmedNonEmptyString } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import * as SchemaTransformation from "effect/SchemaTransformation";
 
-const MAX_TASK_IDS = 20;
 /** Ended tasks kept across all threads; the oldest goes first. */
 const MAX_REMEMBERED = 256;
 const MAX_SUMMARY_CHARS = 2_000;
-
-const TaskIds = Schema.Array(Schema.String).check(
-  Schema.isMinLength(1),
-  Schema.isMaxLength(MAX_TASK_IDS),
-);
-
-/** Either `taskIds` or `taskId` (or both); decodes to the `{ taskIds, waiting? }` upstream reads. */
-export const Parameters = Schema.Struct({
-  taskIds: Schema.optional(
-    Schema.Array(TrimmedNonEmptyString).check(Schema.isMaxLength(MAX_TASK_IDS)),
-  ),
-  taskId: Schema.optional(TrimmedNonEmptyString).annotate({
-    description: "One task ID; the same as `taskIds: [taskId]`.",
-  }),
-  waiting: Schema.optional(Schema.Boolean),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({ taskIds: TaskIds, waiting: Schema.optional(Schema.Boolean) }),
-    SchemaTransformation.transform({
-      decode: ({ taskIds, taskId, waiting }) => ({
-        taskIds: [...new Set([...(taskIds ?? []), ...(taskId === undefined ? [] : [taskId])])],
-        ...(waiting === undefined ? {} : { waiting }),
-      }),
-      encode: ({ taskIds, waiting }) => ({
-        taskIds,
-        ...(waiting === undefined ? {} : { waiting }),
-      }),
-    }),
-  ),
-);
 
 export const EndedTask = Schema.Struct({
   taskId: Schema.String,
