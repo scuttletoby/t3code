@@ -11,6 +11,7 @@ import {
   LaneGeneration,
   LaneItemKind,
   LaneNote,
+  laneDefinitions,
   OrchestratorMcpFailure,
   ThreadId,
 } from "@t3tools/contracts";
@@ -52,17 +53,13 @@ export const LaneToolsFailure = Schema.Union([LaneToolFailure, OrchestratorMcpFa
 
 // Plain strings: the store refuses an unknown lane or a bad item with its reason, and a short schema
 // keeps the tool list small.
-const laneField = Schema.String.annotate({ description: "A lane in settings, e.g. pr-queue." });
+const laneField = Schema.String.annotate({ description: "e.g. pr-queue" });
 const generationField = LaneGeneration.annotate({ description: "From lane_start." });
-const itemField = Schema.String.annotate({
-  description: "pr:owner/repo#12 or issue:owner/repo#3.",
-});
+const itemField = Schema.String.annotate({ description: "pr:owner/repo#12 or issue:owner/repo#3" });
 
 export const LaneStartInput = Schema.Struct({
   lane: laneField,
-  threadId: ThreadId.annotate({
-    description: "A thread of this project, e.g. from delegate_task.",
-  }),
+  threadId: ThreadId.annotate({ description: "A thread of this project." }),
 });
 export const LaneStartResult = Schema.Struct({
   lane: Schema.String,
@@ -175,7 +172,7 @@ export const laneBoardCall = Effect.fn("laneTools.board")(function* () {
   // The store read the settings an instant ago; a read error now only drops the defined-but-off rows.
   const definitions: Readonly<Record<string, LaneDefinition>> = yield* ServerSettingsService.pipe(
     Effect.flatMap((service) => service.getSettings),
-    Effect.map((settings) => settings.lanes.definitions),
+    Effect.map((settings) => laneDefinitions(settings.lanes)),
     Effect.orElseSucceed(() => ({})),
   );
   const names = [...new Set([...Object.keys(definitions), ...Object.keys(board.lanes)])].toSorted();

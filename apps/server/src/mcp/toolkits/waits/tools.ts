@@ -197,7 +197,7 @@ const laneDependencies = [
 // Each lane tool repeats safely: the same start, stop, claim or release twice changes nothing.
 const LaneStartTool = Tool.make("lane_start", {
   description:
-    "Switch a lane defined in settings on, with a thread of this project acting for it. Returns its generation, which that thread passes to lane_claim and lane_release.",
+    "Start a settings-defined lane with a thread of this project acting for it. Returns the generation that thread passes to lane_claim and lane_release.",
   parameters: LaneStartInput,
   success: LaneStartResult,
   failure: LaneToolsFailure,
@@ -212,7 +212,7 @@ const LaneStartTool = Tool.make("lane_start", {
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const LaneStopTool = Tool.make("lane_stop", {
-  description: "Switch a lane off for this project and release its claims.",
+  description: "Stop a lane and release its claims.",
   parameters: LaneStopInput,
   success: LaneStopResult,
   failure: LaneToolsFailure,
@@ -227,8 +227,7 @@ const LaneStopTool = Tool.make("lane_stop", {
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const LaneBoardTool = Tool.make("lane_board", {
-  description:
-    "This project's lanes and their threads, claimed items, waiting escalations and recent notes.",
+  description: "This project's lanes, their threads, claims, escalations and recent notes.",
   // No `parameters`: an empty Schema.Struct serializes to a schema MCP clients reject (worktree/tools.ts).
   success: LaneBoardResult,
   failure: LaneToolsFailure,
@@ -243,8 +242,7 @@ const LaneBoardTool = Tool.make("lane_board", {
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const LaneClaimTool = Tool.make("lane_claim", {
-  description:
-    "From a lane's thread: claim an item for the lane. One lane owns an item; another lane's claim is refused.",
+  description: "From a lane's thread: claim an item. One lane per item.",
   parameters: LaneClaimInput,
   success: LaneClaimResult,
   failure: LaneToolsFailure,
@@ -259,7 +257,7 @@ const LaneClaimTool = Tool.make("lane_claim", {
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const LaneReleaseTool = Tool.make("lane_release", {
-  description: "From a lane's thread: release the lane's claim on an item.",
+  description: "From a lane's thread: release its claim on an item.",
   parameters: LaneReleaseInput,
   success: LaneReleaseResult,
   failure: LaneToolsFailure,

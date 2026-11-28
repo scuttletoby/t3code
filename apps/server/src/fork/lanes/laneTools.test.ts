@@ -2,7 +2,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, expect, it } from "@effect/vitest";
 import {
-  DEFAULT_LANE_DEFINITIONS,
   EnvironmentId,
   type OrchestrationV2ThreadShell,
   ProjectId,
@@ -37,7 +36,7 @@ const PR = "pr:owner/repo#12";
 const ISSUE = "issue:owner/repo#3";
 
 const CI = { description: "Keeps CI green.", owns: ["pr" as const], driver: "agent" as const };
-const ON = { lanes: { enabled: true, definitions: { ...DEFAULT_LANE_DEFINITIONS, ci: CI } } };
+const ON = { lanes: { enabled: true, definitions: { ci: CI } } };
 
 const shells = new Map<ThreadId, OrchestrationV2ThreadShell>([
   [ELSEWHERE, { ...McpToolAccessTestkit.liveThreadShell(ELSEWHERE), projectId: OTHER_PROJECT }],
@@ -328,7 +327,7 @@ it.layer(NodeServices.layer)("lane tools", (it) => {
       }).pipe(
         Effect.provide(
           toolsLayer(directory, {
-            lanes: { enabled: true, definitions: DEFAULT_LANE_DEFINITIONS },
+            lanes: { enabled: true },
           }),
         ),
       );

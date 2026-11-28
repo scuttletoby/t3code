@@ -551,6 +551,8 @@ describe("the lane tools: off means off (lanes, fork issue #1156)", () => {
       Effect.gen(function* () {
         LaneToolsVisibility.__testing.clear();
         const listedNow = yield* list("all");
+        // None is sent, so while lanes are off they add 0 bytes to what the model sees.
+        expect(listedNow.filter((name) => name.startsWith("lane_"))).toEqual([]);
         for (const name of LANES) {
           expect(listedNow).not.toContain(name);
           const refused = yield* call("all", name, { lane: "pr-queue" });
