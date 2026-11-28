@@ -49,15 +49,27 @@ function readTable(text) {
   const values = entries.map(([, value]) => value).toSorted((a, b) => a - b);
   const mid = Math.floor(values.length / 2);
   const median = values.length % 2 ? values[mid] : (values[mid - 1] + values[mid]) / 2;
-  const model =
-    validMode(table.model?.whole) && validMode(table.model?.slice) ? table.model : DEFAULT_MODEL;
+  // Per mode: a refresh that could fit only one keeps it, the other is the default.
+  const model = Object.fromEntries(
+    Object.entries(DEFAULT_MODEL).map(([mode, fallback]) => [
+      mode,
+      validMode(table.model?.[mode]) ? table.model[mode] : fallback,
+    ]),
+  );
   return { files: new Map(entries), median, model, runs: table.runs?.length ?? 0 };
 }
 
-/** The files of each vitest `--shard i/count`, as vitest's BaseSequencer cuts them. */
-function vitestSlices(files, count) {
+// What vitest hashes for a file: its absolute path minus the root's length, so "/src/a.test.ts",
+// and for a file outside the package (apps/desktop's ../../native/...) a cut-off tail.
+const specPath = (dir, file) => `/${file}`.slice(dir.length + 1);
+
+/** The files (repo paths) of each vitest `--shard i/count` of `dir`, as vitest cuts them. */
+function vitestSlices(dir, files, count) {
   const sorted = files
-    .map((file) => ({ file, hash: crypto.createHash("sha1").update(`/${file}`).digest("hex") }))
+    .map((file) => ({
+      file,
+      hash: crypto.createHash("sha1").update(specPath(dir, file)).digest("hex"),
+    }))
     .toSorted((a, b) => (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0))
     .map((entry) => entry.file);
   const base = Math.floor(sorted.length / count);
@@ -79,15 +91,12 @@ function weigh(pkg, table, count) {
   const seconds = (file) => table.files.get(file) ?? table.median;
   const cost = (mode, list) =>
     round(list.reduce((total, file) => total + mode.perFile + mode.perSecond * seconds(file), 0));
-  const relative = pkg.testFiles.map((file) => file.slice(pkg.dir.length + 1));
   return {
     ...base,
+    missing: pkg.testFiles.filter((file) => !table.files.has(file)).length,
     weight: cost(table.model.whole, pkg.testFiles),
-    slices: vitestSlices(relative, count).map((slice) =>
-      cost(
-        table.model.slice,
-        slice.map((file) => `${pkg.dir}/${file}`),
-      ),
+    slices: vitestSlices(pkg.dir, pkg.testFiles, count).map((slice) =>
+      cost(table.model.slice, slice),
     ),
   };
 }
@@ -112,11 +121,41 @@ function assign(packages, count) {
   return shards;
 }
 
-function testFiles(dir) {
-  return childProcess
-    .execFileSync("git", ["ls-files", "-z", "--", dir], { encoding: "utf8", maxBuffer: 1 << 26 })
-    .split("\0")
-    .filter((file) => TEST_FILE.test(file));
+/**
+ * Tracked test files outside `dir` that its vitest config includes ("../../native/x/*.test.ts"
+ * in apps/desktop): quoted `../` paths naming a test file, `*` and `**` as globs.
+ */
+function outsideTests(dir, configText, tracked) {
+  const patterns = [...configText.matchAll(/["'](\.\.\/[^"'\s]*\.(?:test|spec)\.[^"'\s]*)["']/g)];
+  const globs = patterns.map(([, pattern]) => {
+    const full = path.posix.normalize(`${dir}/${pattern}`);
+    const source = full
+      .split(/(\*\*\/|\*)/)
+      .map((part) =>
+        part === "**/"
+          ? "(?:.*/)?"
+          : part === "*"
+            ? "[^/]*"
+            : part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"),
+      )
+      .join("");
+    return new RegExp(`^${source}$`);
+  });
+  return tracked.filter(
+    (file) => !file.startsWith(`${dir}/`) && globs.some((glob) => glob.test(file)),
+  );
+}
+
+function testFiles(dir, tracked) {
+  const config = ["vite.config.ts", "vitest.config.ts"]
+    .map((name) => path.join(path.resolve(__dirname, "../.."), dir, name))
+    .filter((file) => fs.existsSync(file))
+    .map((file) => fs.readFileSync(file, "utf8"))
+    .join("\n");
+  return [
+    ...tracked.filter((file) => file.startsWith(`${dir}/`)),
+    ...outsideTests(dir, config, tracked),
+  ];
 }
 
 function main() {
@@ -130,6 +169,10 @@ function main() {
   const table = readTable(fs.existsSync(TABLE) ? fs.readFileSync(TABLE, "utf8") : undefined);
   const only = (process.env.TEST_PACKAGES ?? "").split(/\s+/).filter(Boolean);
   const root = path.resolve(__dirname, "../..");
+  const tracked = childProcess
+    .execFileSync("git", ["ls-files", "-z"], { cwd: root, encoding: "utf8", maxBuffer: 1 << 26 })
+    .split("\0")
+    .filter((file) => TEST_FILE.test(file));
   const packages = readWorkspace()
     .filter((pkg) => pkg.hasTest && !OWN_JOB.has(pkg.name))
     .filter((pkg) => only.length === 0 || only.includes(pkg.name))
@@ -141,7 +184,7 @@ function main() {
         {
           name: pkg.name,
           dir: pkg.dir,
-          testFiles: testFiles(pkg.dir),
+          testFiles: testFiles(pkg.dir, tracked),
           // Run in its directory with --shard, so the script must be vitest itself.
           splittable: /^vp test run(\s|$)/.test(manifest.scripts.test),
         },
@@ -155,8 +198,12 @@ function main() {
 
   const shards = assign(packages, count);
   const unit = table.files ? "s" : " files";
+  const total = packages.reduce((sum, pkg) => sum + pkg.files, 0);
+  const missing = packages.reduce((sum, pkg) => sum + (pkg.missing ?? 0), 0);
   const by = table.files
-    ? `Balanced by measured seconds (.github/fork-test-seconds.json, ${table.runs} run(s); a file it lacks counts ${table.median} s).`
+    ? `Balanced by measured seconds (.github/fork-test-seconds.json, ${table.runs} run(s)). ` +
+      `${missing} of ${total} test files are not in it and count its median, ${table.median} s` +
+      `${missing ? " each (refresh: .github/fork-test-seconds.md)" : ""}.`
     : `Balanced by test file count: ${table.reason}.`;
   if (plan) {
     console.log(by);
@@ -192,6 +239,15 @@ function main() {
   }
 }
 
-module.exports = { assign, weigh, readTable, vitestSlices, DEFAULT_MODEL, SPLIT_AT };
+module.exports = {
+  assign,
+  weigh,
+  readTable,
+  vitestSlices,
+  specPath,
+  outsideTests,
+  DEFAULT_MODEL,
+  SPLIT_AT,
+};
 
 if (require.main === module) main();

@@ -7,8 +7,8 @@
       "perSecond": 0.135
     },
     "slice": {
-      "perFile": 0.269,
-      "perSecond": 0.818
+      "perFile": 0.268,
+      "perSecond": 0.819
     }
   },
   "files": {
@@ -551,6 +551,8 @@
     "infra/task-cache/src/runHook.test.ts": 3.49,
     "infra/task-cache/src/telemetry.test.ts": 0.11,
     "infra/task-cache/src/telemetryAuth.test.ts": 0.22,
+    "native/kde-snap-shot/src/activate.test.ts": 0.01,
+    "native/kde-snap-shot/src/feedbackGeometry.test.ts": 0.01,
     "oxlint-plugin-t3code/rules/max-settings-description-length.test.ts": 2.45,
     "oxlint-plugin-t3code/rules/namespace-node-imports.test.ts": 3.22,
     "oxlint-plugin-t3code/rules/no-ambiguous-detail-navigation.test.ts": 1.42,

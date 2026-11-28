@@ -28,6 +28,7 @@ const testFiles = [
   "packages/c/src/same.test.ts",
   "apps/mobile/src/screen.test.tsx",
   "apps/mobile/src/slow.test.ts",
+  "native/kde/src/outside.test.ts",
 ];
 
 // A `Test N` job log as GitHub serves it: timestamps, the step's env, whole packages, then slices.
@@ -40,7 +41,7 @@ const JOB = log([
   [0, "  WHOLE: @t/a @t/b"],
   [0, "##[endgroup]"],
   [2, " \\u2713 src/one.test.ts (3 tests) 1500ms"],
-  [3, " ✓ src/two.test.tsx (1 test) 2.5s"],
+  [3, " \x1b[32m✓\x1b[39m src/two.test.tsx \x1b[2m(1 test)\x1b[22m 2.5s"],
   [3, " \\u2713 src/same.test.ts (2 tests) 1000ms"],
   [4, " \\u2713 src/same.test.ts (2 tests) 3000ms"],
   [4, " \\u2193 src/gone.test.ts (1 test | 1 skipped)"],
@@ -48,6 +49,7 @@ const JOB = log([
   [10, "##[group]apps/mobile slice 1/2"],
   [11, "  \\u2713  react  src/screen.test.tsx (23 tests) 89ms"],
   [12, "  \\u2713  react  src/slow.test.ts (2 tests) 6000ms"],
+  [13, "  \\u2713  unit  ../../native/kde/src/outside.test.ts (2 tests) 700ms"],
   [30, "##[endgroup]"],
   [31, "##[group]Run timeout -k 5 40 python3 -I .github/scripts/fork-ci-pressure.py end"],
 ]);
@@ -60,6 +62,8 @@ test("parseTestLog reads whole and sliced file lines, in ms or s, escaped or not
   // A project label before the path; a slice line counts for its group's package.
   assert.equal(seconds.get("apps/mobile/src/screen.test.tsx"), 0.089);
   assert.equal(seconds.get("apps/mobile/src/slow.test.ts"), 6);
+  // A file the package's config takes from outside its folder: its own repo path.
+  assert.equal(seconds.get("native/kde/src/outside.test.ts"), 0.7);
   // src/same.test.ts: a and b (WHOLE) both hold it, c is not in WHOLE: 4 s shared by a and b.
   assert.equal(seconds.get("packages/a/src/same.test.ts"), 2);
   assert.equal(seconds.get("packages/b/src/same.test.ts"), 2);
@@ -71,7 +75,7 @@ test("parseTestLog reads whole and sliced file lines, in ms or s, escaped or not
     runs.map((run) => [run.mode, run.wall, run.files.length]),
     [
       ["whole", 10, 4],
-      ["slice", 20, 2],
+      ["slice", 20, 3],
     ],
   );
 });
@@ -155,6 +159,8 @@ test("the refresh gives the same file for the same logs", () => {
     assert.deepEqual(table.runs, ["100", "200"]);
     assert.equal(table.files["packages/a/src/one.test.ts"], 1);
     assert.ok(first.endsWith("}\n"));
+    // vp fmt's layout: the runs on one line, so a refresh leaves no format diff.
+    assert.ok(first.includes('  "runs": ["100", "200"],\n'), first.slice(0, 80));
 
     // The command line, twice, into the same file: byte for byte the same. It reads this
     // repository's workspace, so its log names one of this repository's sliced test files.

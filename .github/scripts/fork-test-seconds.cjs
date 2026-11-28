@@ -1,21 +1,19 @@
-// Fork only: writes .github/fork-test-seconds.json (see .github/fork-test-seconds.md) from the
-// `Test N` job logs of the last green pushes to main: each test file's median test seconds, and
-// per mode (whole, slice) the wall a file and a test second add, fitted to the jobs' walls.
-// Usage: fork-test-seconds.cjs [--runs 5] | --logs <dir of runId-jobId.log> [--out <file>]
+// Fork only: writes .github/fork-test-seconds.json (see .github/fork-test-seconds.md) from saved
+// `Test N` job logs of green pushes to main: each test file's median test seconds, and per mode
+// (whole, slice) the wall a file and a test second add. It never calls gh (fork-gh-guard.sh).
+// Usage: fork-test-seconds.cjs --logs <dir of runId-jobId.log> [--out <file>]
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 
 const { readWorkspace } = require("./ci-changes.cjs");
 
 const ROOT = path.resolve(__dirname, "../..");
 const TABLE = ".github/fork-test-seconds.json";
-const REPO = "scuttletoby/t3code";
 const TEST_FILE = /\.(?:test|spec)\.[cm]?[jt]sx?$/;
 const STAMP = /^\d{4}-\d\d-\d\dT[\d:.]+Z ?/;
 const SLICE = /^##\[group\](\S+) slice \d+\/\d+\s*$/;
-// The Test step runs output through a filter that writes ✓ and ↓ as ✓ and ↓.
+// The Test step's output filter writes the check and skip marks as the text \u2713 and \u2193.
 const FILE_LINE =
   /^\s*(?:✓|↓|\\u2713|\\u2193)\s+(?:\S+\s+)??(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+\(\d+ tests?[^)]*\)(?:\s+(\d+(?:\.\d+)?)(ms|s))?/;
 
@@ -58,7 +56,8 @@ function parseTestLog(text, packages, testFiles) {
   for (const raw of text.split(/\r?\n/)) {
     const stamp = raw.match(STAMP);
     const at = stamp ? Date.parse(stamp[0].trim()) : NaN;
-    const line = raw.replace(STAMP, "");
+    // Saved with gh's --allow-escape-sequences: colour codes are dropped here.
+    const line = raw.replace(STAMP, "").replace(/\x1b\[[0-9;]*m/g, "");
     if (line.startsWith("##[group]Run ")) {
       if (wholeWall && wholeWall.end === null) wholeWall.end = at;
       stepStart = at;
@@ -67,7 +66,7 @@ function parseTestLog(text, packages, testFiles) {
     if (env) {
       const names = new Set(env[1].split(/\s+/).filter(Boolean));
       whole = new Set(packages.filter((pkg) => names.has(pkg.name)).map((pkg) => pkg.dir));
-      wholeWall = { mode: "whole", start: stepStart, end: null };
+      wholeWall = { mode: "whole", start: stepStart, end: null, files: new Set() };
       walls.push(wholeWall);
       continue;
     }
@@ -75,7 +74,7 @@ function parseTestLog(text, packages, testFiles) {
     if (group) {
       slice = group[1];
       if (wholeWall && wholeWall.end === null) wholeWall.end = at;
-      current = { mode: "slice", dir: slice, start: at, end: null };
+      current = { mode: "slice", dir: slice, start: at, end: null, files: new Set() };
       walls.push(current);
       continue;
     }
@@ -89,13 +88,25 @@ function parseTestLog(text, packages, testFiles) {
     if (!match) continue;
     const [, rel, amount, unit] = match;
     const value = amount === undefined ? 0 : Number(amount) / (unit === "ms" ? 1000 : 1);
+    // A file outside its package (apps/desktop's ../../native/...) names its path from there.
+    const under = (dir) => path.posix.normalize(`${dir}/${rel}`);
     if (slice) {
-      if (known.has(`${slice}/${rel}`)) add(`${slice}/${rel}`, value);
-      else skipped += 1;
+      if (known.has(under(slice))) {
+        add(under(slice), value);
+        current?.files.add(under(slice));
+      } else skipped += 1;
       continue;
     }
     let owners = byRelative.get(rel) ?? [];
+    if (rel.startsWith("../") && whole)
+      owners = [...whole]
+        .map((dir) => ({ dir, file: under(dir) }))
+        .filter(
+          (owner, i, all) =>
+            known.has(owner.file) && all.findIndex((o) => o.file === owner.file) === i,
+        );
     if (owners.length > 1 && whole) owners = owners.filter((owner) => whole.has(owner.dir));
+    for (const owner of owners) wholeWall?.files.add(owner.file);
     if (owners.length === 0) skipped += 1;
     else if (owners.length === 1) add(owners[0].file, value);
     else {
@@ -106,20 +117,16 @@ function parseTestLog(text, packages, testFiles) {
   }
   for (const { owners, total } of shared.values())
     for (const owner of owners) add(owner.file, total / owners.length);
-  // Each wall with the files it ran: a slice its package's, the whole part every other one.
-  const sliced = walls.filter((wall) => wall.mode === "slice").map((wall) => `${wall.dir}/`);
+  // Each wall with the files it ran.
   const runs = walls
     .filter(
       (wall) => Number.isFinite(wall.start) && Number.isFinite(wall.end) && wall.end > wall.start,
     )
-    .map((wall) => {
-      const files = [...seconds.keys()].filter((file) =>
-        wall.mode === "slice"
-          ? file.startsWith(`${wall.dir}/`)
-          : !sliced.some((prefix) => file.startsWith(prefix)),
-      );
-      return { mode: wall.mode, wall: (wall.end - wall.start) / 1000, files };
-    })
+    .map((wall) => ({
+      mode: wall.mode,
+      wall: (wall.end - wall.start) / 1000,
+      files: [...wall.files].toSorted(),
+    }))
     .filter((run) => run.files.length > 0);
   return { seconds, skipped, runs };
 }
@@ -184,7 +191,13 @@ function buildTable(runs, walls = []) {
   return { unit: "seconds", runs: ids, model, files };
 }
 
-const render = (table) => `${JSON.stringify(table, null, 2)}\n`;
+// As `vp fmt` lays it out (runs on one line while it fits in 100 columns): a refresh leaves no
+// format diff.
+function render(table) {
+  const text = JSON.stringify(table, null, 2);
+  const inline = `  "runs": [${table.runs.map((run) => JSON.stringify(run)).join(", ")}],`;
+  return `${inline.length <= 100 ? text.replace(/ {2}"runs": \[[^\]]*\],/, inline) : text}\n`;
+}
 
 /** Reads <runId>-<jobId>.log files of `dir` into one table. */
 function tableFromLogs(dir, packages, testFiles) {
@@ -205,40 +218,6 @@ function tableFromLogs(dir, packages, testFiles) {
   return { table: buildTable(runs, walls), skipped };
 }
 
-const gh = (args) =>
-  childProcess.execFileSync("gh", args, { encoding: "utf8", maxBuffer: 1 << 28 });
-
-/** Downloads the `Test N` job logs of the last `count` green pushes to main into `dir`. */
-function fetchLogs(dir, count) {
-  const runs = JSON.parse(
-    gh(
-      ["run", "list", "-R", REPO, "--workflow", "fork-tests.yml", "--branch", "main"].concat([
-        "--event",
-        "push",
-        "--status",
-        "success",
-        "-L",
-        String(count),
-        "--json",
-        "databaseId",
-      ]),
-    ),
-  );
-  for (const { databaseId: run } of runs) {
-    const jobs = JSON.parse(
-      gh(["api", `repos/${REPO}/actions/runs/${run}/jobs?per_page=100`, "--jq", ".jobs"]),
-    ).filter((job) => /^Test \d+$/.test(job.name) && job.conclusion === "success");
-    for (const job of jobs) {
-      const log = gh([
-        "api",
-        "--allow-escape-sequences",
-        `repos/${REPO}/actions/jobs/${job.id}/logs`,
-      ]);
-      fs.writeFileSync(path.join(dir, `${run}-${job.id}.log`), log.replace(/\x1b\[[0-9;]*m/g, ""));
-    }
-  }
-}
-
 function main(argv) {
   const option = (name) => {
     const at = argv.indexOf(name);
@@ -250,11 +229,8 @@ function main(argv) {
     .execFileSync("git", ["ls-files", "-z"], { cwd: ROOT, encoding: "utf8", maxBuffer: 1 << 26 })
     .split("\0")
     .filter((file) => TEST_FILE.test(file));
-  let dir = option("--logs");
-  if (!dir) {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "fork-test-seconds-"));
-    fetchLogs(dir, Number(option("--runs") ?? 5));
-  }
+  const dir = option("--logs");
+  if (!dir) throw new Error("usage: fork-test-seconds.cjs --logs <dir> [--out <file>]");
   const { table, skipped } = tableFromLogs(dir, packages, testFiles);
   if (Object.keys(table.files).length === 0)
     throw new Error(`no test file times in the logs of ${dir}; ${TABLE} left as it was`);

@@ -21,7 +21,8 @@ limits how fast PRs merge. The split is balanced by measured seconds from
   way vitest's `--shard` does, so a slice with a slow file counts as slow.
 - Whole packages go longest first onto the shard with the fewest seconds so far. Ties go by name,
   so every shard computes the same split.
-- A test file the table doesn't have counts as the table's median.
+- A test file the table doesn't have counts as the table's median. The step summary and `--plan`
+  say how many there are.
 - If the table is missing, not JSON, empty or not in seconds, each test file counts as 1 (the old
   split). The step summary says so.
 
@@ -31,13 +32,24 @@ To see the split without running anything:
 
 ## Refresh
 
-When `--plan` or the jobs' times drift apart (a new slow test, a package that grew), refresh the
-table from the last green pushes to main. This needs `gh` with read access to the repository's
-Actions logs:
+When the step summary reports many test files that aren't in the table, or the two jobs' times drift
+apart, refresh the table from the `Test N` logs of the last green pushes to main. Save the logs first
+(this needs `gh` with read access to the Actions logs):
 
-    node .github/scripts/fork-test-seconds.cjs            # the last 5 runs
-    node .github/scripts/fork-test-seconds.cjs --runs 10
-    node .github/scripts/fork-test-seconds.cjs --logs <dir>  # logs saved earlier: <runId>-<jobId>.log
+    dir=$(mktemp -d)
+    for run in $(gh run list -w fork-tests.yml -b main -e push -s success -L 5 --json databaseId -q '.[].databaseId'); do
+      for job in $(gh api "repos/{owner}/{repo}/actions/runs/$run/jobs?per_page=100" \
+          -q '.jobs[] | select(.name | test("^Test [0-9]+$")) | .id'); do
+        gh api "repos/{owner}/{repo}/actions/jobs/$job/logs" --allow-escape-sequences > "$dir/$run-$job.log"
+      done
+    done
+    node .github/scripts/fork-test-seconds.cjs --logs "$dir"
 
-The same logs always give the same file. Commit the new table in a PR of its own. The table is never
-fork-owned (`!` in `.github/fork-owned-paths.txt`), so that PR runs the Test jobs with the new split.
+The script itself never calls `gh`: fork scripts reach `gh` only through `fork-gh-guard.sh`.
+
+- The same logs always give the same file, written in `vp fmt`'s layout.
+- A file vitest runs from outside its package's folder (`apps/desktop` includes
+  `../../native/kde-snap-shot/src/*.test.ts`) is timed under its own path. The split counts it with
+  that package.
+- Commit the new table in a PR of its own. The table is never fork-owned (`!` in
+  `.github/fork-owned-paths.txt`), so that PR runs the Test jobs with the new split.

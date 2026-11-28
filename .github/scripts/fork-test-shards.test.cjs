@@ -7,6 +7,8 @@ const {
   weigh,
   readTable,
   vitestSlices,
+  specPath,
+  outsideTests,
   DEFAULT_MODEL,
   SPLIT_AT,
 } = require("./fork-test-shards.cjs");
@@ -145,30 +147,69 @@ test("a table without a usable model uses the default one", () => {
   }
 });
 
+// Q: when a refresh could fit only one mode, is that mode kept (the other the default)?
+test("a model with one usable mode keeps it and defaults the other", () => {
+  const whole = { perFile: 1, perSecond: 2 };
+  assert.deepEqual(readTable(table({ "a.test.ts": 1 }, { whole })).model, {
+    whole,
+    slice: DEFAULT_MODEL.slice,
+  });
+});
+
+// Q: is drift visible: how many of a package's test files the table lacks?
+test("weigh counts the package's files missing from the table", () => {
+  const parsed = readTable(table({ "packages/x/src/f0.test.ts": 1 }, UNIT));
+  assert.equal(weigh(source("x", 3), parsed, 2).missing, 2);
+  assert.equal(weigh(source("x", 3), readTable(undefined), 2).missing, undefined);
+});
+
+// Q: are tests a package's vitest config includes from outside its folder weighed with it?
+test("outsideTests finds the ../ test globs of a package's vitest config", () => {
+  const config = `include: [...defaultInclude, "../../native/kde/src/*.test.ts"],
+    setupFiles: ["../../packages/shared/src/testing/gitEnv.ts"],`;
+  const tracked = [
+    "native/kde/src/a.test.ts",
+    "native/kde/src/deep/b.test.ts",
+    "native/other/c.test.ts",
+    "apps/desktop/src/d.test.ts",
+  ];
+  assert.deepEqual(outsideTests("apps/desktop", config, tracked), ["native/kde/src/a.test.ts"]);
+  assert.deepEqual(outsideTests("apps/desktop", "include: []", tracked), []);
+});
+
 // Q: do our slices match vitest's --shard (sha1 of "/<path>", sorted, the remainder to the first)?
 test("vitestSlices splits files as vitest's --shard does", () => {
-  const files = ["a.test.ts", "b.test.ts", "c.test.ts", "d.test.ts", "e.test.ts"];
-  const slices = vitestSlices(files, 2);
+  const files = ["a", "b", "c", "d", "e"].map((name) => `pkg/${name}.test.ts`);
+  const slices = vitestSlices("pkg", files, 2);
   const bySha = files.toSorted((a, b) => {
-    const [x, y] = [a, b].map((f) => crypto.createHash("sha1").update(`/${f}`).digest("hex"));
+    const [x, y] = [a, b].map((f) =>
+      crypto.createHash("sha1").update(f.slice("pkg".length)).digest("hex"),
+    );
     return x < y ? -1 : 1;
   });
   assert.deepEqual(slices, [bySha.slice(0, 3), bySha.slice(3)]);
   assert.deepEqual(
-    vitestSlices(files, 3).map((slice) => slice.length),
+    vitestSlices("pkg", files, 3).map((slice) => slice.length),
     [2, 2, 1],
+  );
+});
+
+// Q: does a file outside the package hash as vitest hashes it (absolute path cut at the root's length)?
+test("specPath is the path vitest hashes, also for a file outside the package", () => {
+  assert.equal(specPath("apps/desktop", "apps/desktop/src/a.test.ts"), "/src/a.test.ts");
+  // /home/x/t3code/native/kde-snap-shot/... cut at the length of /home/x/t3code/apps/desktop.
+  assert.equal(
+    specPath("apps/desktop", "native/kde-snap-shot/src/activate.test.ts"),
+    "nap-shot/src/activate.test.ts",
   );
 });
 
 // Q: when one vitest slice of a split package is heavier, do whole packages go to the other shard?
 test("a heavy slice on one shard sends the whole packages to the other", () => {
   const big = source("big", SPLIT_AT);
-  const [heavyFile] = vitestSlices(
-    big.testFiles.map((file) => file.slice(big.dir.length + 1)),
-    2,
-  )[0];
+  const [heavyFile] = vitestSlices(big.dir, big.testFiles, 2)[0];
   const files = Object.fromEntries(big.testFiles.map((file) => [file, 0]));
-  files[`${big.dir}/${heavyFile}`] = 50;
+  files[heavyFile] = 50;
   files["packages/a/src/f0.test.ts"] = 1;
   files["packages/b/src/f0.test.ts"] = 1;
   const parsed = readTable(table(files, UNIT));
