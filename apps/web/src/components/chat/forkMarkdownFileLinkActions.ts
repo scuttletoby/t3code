@@ -7,6 +7,7 @@ import {
   AuthFilesystemReadScope,
   type ContextMenuSource,
   type EnvironmentId,
+  type ScopedThreadRef,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
