@@ -16,7 +16,7 @@ problem in its answer (systemMessage, and additionalContext where the event take
     "bgGuard":        {"skipSessionsFiles": [], "maxBlocks": 3, "stateDir": "~/.local/state/bg-guard"},
     "agentSlots":     {"sessionsFile": "", "queue": "", "readyHeading": "## Ready", "maxAlive": 10,
                        "processName": "claude", "note": ""},
-    "leakGuard":      {"patternsFile": "/etc/fork-kit/leak-patterns", "maxPushBytes": 20000000},
+    "leakGuard":      {"patternsFile": "/etc/fork-kit/leak-patterns", "maxPushBytes": 20000000, "repos": []},
     "facts":          {"dirs": [], "staleDays": 30, "maxRows": 60, "indexLines": 40, "indexChars": 4000,
                        "projects": [{"match": "github.com/owner/repo", "dirs": ["/srv/repo-facts"], "text": "",
                                      "name": "repo"}],
@@ -104,6 +104,13 @@ def _tools(value):
     return None
 
 
+def _repos(value):
+    for v in value:
+        if not isinstance(v, str) or not re.match(r'^[\w.*?-]+/[\w.*?-]+$', v):
+            return f'every entry must be a GitHub repo as owner/name (globs * ? allowed), not {v!r}'
+    return None
+
+
 def _words(value):
     for v in value:
         if not isinstance(v, str) or not COMMAND_RE.match(v):
@@ -155,6 +162,7 @@ SPEC = {
     'leakGuard': {
         'patternsFile': (str, '/etc/fork-kit/leak-patterns', _path),
         'maxPushBytes': (int, 20_000_000, _positive),
+        'repos': (list, [], _repos),
     },
     'facts': {
         'dirs': (list, [], _paths),

@@ -32,28 +32,46 @@ self-check says so.
 
 ## What the hook checks
 
-For a command that posts or pushes (any `gh` command; `git commit`, `push`, `tag`, `notes`, `merge`, `commit-tree`;
-curl, wget or http naming github), it reads:
+A post is a `gh` command that can write (not `view`, `list`, `status`, `checks`, `diff`, `download`, `search`, ...;
+`gh api` only with `-f`/`-F`/`--input` or a `-X` other than GET), `git commit`, `push`, `tag`, `notes`, `merge`,
+`commit-tree`, or curl, wget or http sending data to github. It is found also behind a wrapper and its options
+(`env -u GH_TOKEN gh`, `sudo -u USER`, `timeout -k 5 30`, `nice -n 5`, `xargs -I X`, `stdbuf`, `flock`, ...), on a
+line continued with a backslash, and inside `bash -c '...'`, `sh -c` and `eval`. For a command that holds a post to
+a guarded repo, it reads:
 
-- the whole command text, heredocs included (a folder it only runs in, `cd DIR` or `git -C DIR`, is left out);
-- every file the command names (`--body-file f`, `-F f`, `-F body=@f`, `< f`, `git commit -F f`), up to 5 MB each;
-- for `git push`: every commit on no remote yet (`git log --branches --tags --not --remotes`), its message, author
-  and committer, and its added lines and file paths. Git runs with no pager, external diff, textconv or fsmonitor,
-  so the repo's own config runs nothing. More than `maxPushBytes` of changes (default 20 MB), or a push it cannot
-  read in 8 s, is refused: push fewer commits at once.
+- the command's words (quotes taken off, heredocs included, also with `%XX` URL-encoding decoded), leaving out only
+  words that are no text: the folder of `cd DIR` and `git -C DIR`, the target of a `>` redirect, and the name of a
+  file it reads (below). The whole command is checked, so a match in a part that posts nothing (a `grep` before the
+  post) refuses too: the answer says to run that part on its own;
+- the text, never the path, of the files the post reads, up to 5 MB each: the ones it names (`--body-file f`,
+  `-F f`, `-F body=@f`, `< f`, `git commit -F f`, read in the folder of `git -C DIR`), files read inside `$(...)` or
+  backquotes, and those of the commands piped into it (`cat f | gh pr comment 1 --body-file -`);
+- for `git push`: exactly what that push sends, the commits of its refspecs (`HEAD`, a branch, `HEAD:refs/heads/x`,
+  a sha, `--all`, `--tags`) that are not on the remote it pushes to yet (`git log <sources> --not
+  --remotes=<remote>`): their message, author and committer, added lines and file paths, and the message and tagger
+  of an annotated tag it pushes (named, `--tags`, `--follow-tags`). Other local branches and tags are not read. Git
+  runs with no pager, external diff, textconv or fsmonitor, so the repo's own config runs nothing. More than
+  `maxPushBytes` of changes (default 20 MB), or a push it cannot read in 8 s, is refused: push fewer commits at once.
+
+Which repos are guarded: `leakGuard.repos` lists the public ones (`owner/name`, globs allowed, for example
+`["example/public-fork"]`). Empty (the default), every post and push is checked. With a list, a post or push to a
+repo not on it (a private notes repo, a remote that is no GitHub repo) is not checked; one whose repo is not known
+(a gh post with no `-R` outside a checkout, `gh gist`) is.
 
 On a match it refuses (exit 2) with the pattern file's **line number** only: the refusal never holds the pattern or
 the matched text, so it can be pasted anywhere. It writes nothing (no log). Commands that post nothing (echo, grep,
-a file written locally) always run.
+read-only gh, a file written locally) always run, and the fast path passes a command that names no posting program
+(gh, git, curl, wget, http, xh) without starting the hook.
 
-Like the other guards it stops mistakes, not a hostile agent: text built at run time, a program it does not know
-(`python3 -c` that posts), or `bash -c '...'` around a post are not read. The repo's permissions and review are the
-wall; this catches the slip before it is public.
+Like the other guards it stops mistakes, not a hostile agent. Not read: text built at run time (a split string such
+as `'Alex Ex''ample'` is read as one word, but `"Alex Ex$x"` is not), other encodings than `%XX` (base64, `\u`
+escapes), a program it does not know (`python3 -c` that posts), a commit made by a script. The repo's permissions
+and review are the wall; this catches the slip before it is public.
 
 ## What happens on a match
 
 The agent takes the detail out and runs the command again. If it is already in a commit, amend or rebase that
-commit before pushing (the push check reads every commit not yet on a remote).
+commit before pushing (the push check reads every commit the push sends).
 
 ## Old text: leak-scan
 

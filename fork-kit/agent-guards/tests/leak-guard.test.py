@@ -12,8 +12,10 @@ import guards_fixture as fx  # noqa: E402
 from agent_guards import leak  # noqa: E402
 
 FAKE_NAME, FAKE_HOST = 'Alex Example', 'box-17.lan'
-PATTERNS = f"# made-up patterns for the tests\n\n{FAKE_NAME}\nre:box-\\d+\\.lan\nre:fake-user@example\\.org\n"
-SECRETS = (FAKE_NAME, FAKE_NAME.lower(), FAKE_HOST, 'box-', 'fake-user')
+FAKE_PLACE = 'alexbox'   # a made-up private folder name (line 6)
+PATTERNS = (f"# made-up patterns for the tests\n\n{FAKE_NAME}\nre:box-\\d+\\.lan\nre:fake-user@example\\.org\n"
+            f"{FAKE_PLACE}\n")
+SECRETS = (FAKE_NAME, FAKE_NAME.lower(), FAKE_HOST, 'box-', 'fake-user', FAKE_PLACE)
 GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_AUTHOR_NAME': 'Agent',
            'GIT_AUTHOR_EMAIL': 'agent@example.com', 'GIT_COMMITTER_NAME': 'Agent',
            'GIT_COMMITTER_EMAIL': 'agent@example.com'}
@@ -148,6 +150,155 @@ class PushTest(Case):
         self.commit('q.txt', 'x' * 100 + '\n', 'big')
         self.refused('git push', cwd=self.repo, says='push fewer at once')
 
+    def test_a_detached_head_or_sha_push_reads_what_it_sends(self):
+        """Major: `git push origin HEAD:refs/heads/x` from a detached HEAD, or by sha, sent a commit no branch or tag
+        holds, so it was not read."""
+        self.git('checkout', '-q', '--detach')
+        self.commit('d.txt', f'{FAKE_NAME}\n', 'detached')
+        sha = self.git('rev-parse', 'HEAD').strip()
+        self.refused('git push origin HEAD:refs/heads/x', f'git push origin {sha}:refs/heads/y',
+                     f'git push origin +{sha[:10]}:x', cwd=self.repo)
+
+    def test_a_clean_push_is_not_refused_over_other_local_refs(self):
+        """Major: every local branch and tag that no remote holds was read, so a clean push was refused (and slow)
+        over another branch, another worktree's branch or an old tag-only commit."""
+        self.git('checkout', '-q', '-b', 'other')
+        self.commit('e.txt', f'{FAKE_HOST}\n', 'other work')
+        self.git('tag', 'old-tag')
+        self.git('checkout', '-q', 'main')
+        self.commit('f.txt', 'clean\n', 'clean')
+        self.passes('git push origin main', 'git push origin HEAD', 'git push', 'git push origin main:main',
+                    cwd=self.repo)
+        self.refused('git push origin other', 'git push origin old-tag', 'git push --all origin',
+                     'git push origin --tags', 'git push origin main other', cwd=self.repo)
+
+    def test_a_push_to_another_remote_reads_what_that_remote_lacks(self):
+        """Major: a commit on origin's tracking refs was taken as pushed, also by a push to another remote."""
+        other = os.path.join(self.dir, 'other.git')
+        self.git('init', '-q', '--bare', other, cwd=self.dir)
+        self.git('remote', 'add', 'pub', other)
+        self.commit('g.txt', 'ok\n', f'by {FAKE_NAME}')
+        self.git('push', '-q', 'origin', 'main')
+        self.passes('git push origin main', cwd=self.repo)
+        self.refused('git push pub main', f'git push {other} main', 'git push pub', cwd=self.repo)
+
+    def test_an_annotated_tag_push_reads_the_tag(self):
+        """What a tag push sends: the tag's message and tagger, not only the commits."""
+        self.git('tag', '-a', 'v2', '-m', f'release by {FAKE_NAME}')
+        self.git('tag', '-a', 'v3', '-m', 'clean')
+        self.refused('git push origin v2', 'git push origin tag v2', 'git push origin --tags',
+                     'git push --follow-tags', cwd=self.repo)
+        self.passes('git push origin v3', 'git push origin main', 'git push origin :old', cwd=self.repo)
+
+    def test_pushes_to_unlisted_repos_pass_when_there_is_a_list(self):
+        """Major (state lens): a push to a private repo was refused. With leakGuard.repos it is checked only when it
+        goes to a listed GitHub repo; a remote that is no GitHub repo is no listed one."""
+        self.commit('h.txt', f'{FAKE_NAME}\n', 'notes')
+        self.g.SETTINGS['repos'] = ['o/public']
+        self.passes('git push origin main', cwd=self.repo)
+        self.git('remote', 'add', 'gpub', 'https://github.com/o/public.git')
+        self.git('remote', 'add', 'gpriv', 'git@github.com:o/private.git')
+        self.refused('git push gpub main', 'git push https://github.com/O/public main', cwd=self.repo)
+        self.passes('git push gpriv main', cwd=self.repo)
+
+
+class RoundOnePostTest(Case):
+    """The repros of review round 1 of #1118 (lenses code and state); each one got the wrong answer at 852df457."""
+
+    def setUp(self):
+        super().setUp()
+        self.write('body.md', f'Thanks to {FAKE_NAME}.\n')
+        self.write('clean.md', 'Nothing personal here.\n')
+
+    def test_a_post_behind_a_wrapper_with_options_is_read(self):
+        """Blocker: `env -u NAME gh` (the fleet's way to run gh) and `sudo -u USER gh` took NAME or USER as the
+        command, so nothing was checked."""
+        body = f"--body 'hi {FAKE_NAME}'"
+        self.refused(f'env -u GH_TOKEN gh pr comment 1 {body}', f'sudo -u bob gh pr comment 1 {body}',
+                     f'env -u GH_TOKEN -u GITHUB_TOKEN GH_REPO=o/r gh pr comment 1 {body}',
+                     f'env -i -C /tmp gh pr comment 1 {body}', f'sudo -E -u bob -- gh pr comment 1 {body}',
+                     f'timeout -k 5 30 gh pr comment 1 {body}', f'timeout --signal=KILL 2m gh pr comment 1 {body}',
+                     f'nice -n 5 gh pr comment 1 {body}', f'nice -5 gh pr comment 1 {body}',
+                     f'echo 1 | xargs -I X gh pr comment X {body}', f'stdbuf -o L gh pr comment 1 {body}',
+                     f'/usr/bin/env -u GH_TOKEN /usr/bin/gh pr comment 1 {body}',
+                     f'env -u GH_TOKEN git commit -m "by {FAKE_NAME}"', f'sudo -u bob git -C . tag -m "{FAKE_HOST}" v1',
+                     f'''bash -c "gh pr comment 1 --body '{FAKE_NAME}'"''',
+                     f'''sh -ec "gh pr comment 1 --body '{FAKE_NAME}'"''',
+                     f'''eval "gh pr comment 1 --body '{FAKE_NAME}'"''',
+                     f"env -S 'gh pr comment 1' --body '{FAKE_NAME}'")
+        self.passes('env -u GH_TOKEN gh pr comment 1 --body ok', 'sudo -u bob gh pr view 1')
+
+    def test_a_body_file_named_in_other_ways_is_read(self):
+        """Major: a body file on a backslash-continued line, in `$(cat f)`, and piped in (`cat f | gh ... -`)."""
+        self.refused('gh pr create --title t \\\n  --body-file body.md', 'gh pr comment 1 --body "$(cat body.md)"',
+                     'gh pr comment 1 --body "`cat body.md`"', 'cat body.md | gh pr comment 1 --body-file -',
+                     'cat body.md | tee /dev/null | gh pr comment 1 -F -',
+                     'env -u GH_TOKEN gh pr create -t t \\\n  -F body.md')
+        self.passes('gh pr create --title t \\\n  --body-file clean.md', 'cat clean.md | gh pr comment 1 --body-file -',
+                    'gh pr comment 1 --body "$(cat clean.md)"')
+
+    def test_only_the_folder_word_of_cd_and_git_C_is_left_out(self):
+        """Major: the folder of `cd DIR` / `git -C DIR` was taken out of the whole text, so the same private path in
+        the body passed."""
+        place = f'/srv/{FAKE_PLACE}'
+        self.refused(f"cd {place}/work && gh pr comment 1 --body 'log: {place}/work/out.log'",
+                     f"git -C {place}/r commit -m 'see {place}/r/notes'")
+        self.passes(f'cd {place}/work && gh pr comment 1 --body ok', f"git -C {place}/r commit -m 'fix'")
+
+    def test_commands_that_post_nothing_pass(self):
+        """Major: read-only gh, the other parts of a command, `>` targets and output under a private path were read
+        as a post."""
+        self.write('out.txt', f'{FAKE_NAME}\n')
+        self.passes(f"gh pr view 3 --json body | grep -c '{FAKE_NAME}'", f"grep -rn '{FAKE_NAME}' ~/notes; gh pr list",
+                    'gh run view 1 --log > out.txt', f'gh pr view 1 --json body > /srv/{FAKE_PLACE}/b.json',
+                    'gh pr diff 1 > out.txt', f'gh api repos/o/r/pulls/1 > /srv/{FAKE_PLACE}/p.json',
+                    f'gh api -X GET repos/o/r/issues -f q={FAKE_PLACE}', 'gh pr checks 1 --watch',
+                    f'env -u GH_TOKEN gh search issues "{FAKE_NAME}"', 'gh run download 1 -D out',
+                    f'gh pr comment 1 --body ok > /srv/{FAKE_PLACE}/log.txt')
+        self.refused(f'gh api -X PATCH repos/o/r/issues/1 -f title=x -f body="{FAKE_NAME}"',
+                     'gh api repos/o/r/issues --input body.md', f"gh issue comment 1 -b '{FAKE_NAME}' | grep x")
+
+    def test_a_clean_file_in_a_folder_whose_path_matches_passes(self):
+        """Major: the body file's path was matched as well as its text, so a clean body in a private folder was
+        refused, naming a file that holds nothing."""
+        folder = os.path.join(self.dir, f'{FAKE_PLACE}-x')
+        self.write(f'{FAKE_PLACE}-x/clean.md', 'Nothing personal here.\n')
+        self.write(f'{FAKE_PLACE}-x/body.md', f'by {FAKE_NAME}\n')
+        self.passes('gh pr comment 1 --body-file clean.md', 'git commit -F clean.md', cwd=folder)
+        self.passes(f'gh pr comment 1 --body-file {folder}/clean.md')
+        self.refused('gh pr comment 1 --body-file body.md', cwd=folder)
+
+    def test_a_here_string_or_arithmetic_starts_no_heredoc(self):
+        """Minor: `<<<` and `$((1<<2))` were read as a heredoc start, so every line after them was taken as text."""
+        self.refused('grep x <<< hello\ngh pr comment 1 --body-file body.md',
+                     'echo $((1<<2))\ngh pr comment 1 --body-file body.md',
+                     "echo '<<E'\ngh pr comment 1 --body-file body.md")
+        self.refused(f"gh pr comment 1 -F - <<'E'\nby {FAKE_NAME}\nE\nls")
+
+    def test_git_C_commit_F_reads_the_file_in_that_folder(self):
+        """Minor: `git -C DIR commit -F msg` read msg in the cwd, not in DIR."""
+        self.write('sub/msg.txt', f'Fix it on {FAKE_HOST}\n')
+        self.write('msg.txt', 'clean\n')
+        self.refused('git -C sub commit -F msg.txt', 'cd sub && git commit -F msg.txt')
+        self.passes('git commit -F msg.txt')
+
+    def test_url_encoded_text_is_read(self):
+        """Minor: `%20`-encoded text passed (split strings stay out of reach: LEAK.md names them)."""
+        self.refused("gh api repos/o/r/issues -f body='Alex%20Example'",
+                     "curl -d 'body=Alex%20Example' https://api.github.com/repos/o/r/issues")
+
+    def test_only_listed_repos_are_checked_when_there_is_a_list(self):
+        """Major (state lens): posts to a private repo, which may hold personal details by design, were refused.
+        With leakGuard.repos, only those repos are checked; a post whose repo is not known is checked."""
+        self.g.SETTINGS['repos'] = ['o/public', 'pub-org/*']
+        body = f"--body '{FAKE_NAME}'"
+        self.refused(f'gh pr comment 1 -R o/public {body}', f'gh pr comment 1 --repo pub-org/x {body}',
+                     f'GH_REPO=o/public gh pr comment 1 {body}', f'gh api repos/o/public/issues -f body={FAKE_PLACE}',
+                     f'gh pr comment 1 {body}',   # no remote here: not known, checked
+                     'gh gist create body.md')
+        self.passes(f'gh pr comment 1 -R o/private {body}', f'gh api repos/o/private/issues -f body={FAKE_PLACE}',
+                    f'gh pr comment 1 -R https://github.com/o/private {body}')
+
 
 class HookTest(Case):
     def event(self, cmd, tool='Bash'):
@@ -165,6 +316,13 @@ class HookTest(Case):
         for ev in (self.event("gh pr comment 1 --body 'ok'"), self.event(FAKE_NAME, 'Write')):
             r = fx.run_hook('leak-guard', ev, self.machine)
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, '', ''))
+
+    def test_through_the_settings_entry_wrapper_forms_are_refused(self):
+        """The blocker as Claude Code runs it: `env -u GH_TOKEN gh` with a leak exits 2."""
+        r = fx.run_hook('leak-guard', self.event(f"env -u GH_TOKEN gh pr comment 1 --body '{FAKE_NAME}'"),
+                        self.machine)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertQuiet(r.stderr + r.stdout)
 
     def test_broken_input_refuses(self):
         """Closed: does input the hook cannot read refuse, without saying more than the error's kind?"""
@@ -188,7 +346,7 @@ class PatternFileTest(Case):
         """Does self-check name a missing file, a broken one, and one inside a git checkout, never a pattern?"""
         cli = fx.load_hook('agent-guards', self.machine)
         for text, want, problems in ((None, 'no pattern file', 0), ('re:(\n', 'line 1 of the pattern file', 1),
-                                     (PATTERNS, '3 pattern(s)', 0)):
+                                     (PATTERNS, '4 pattern(s)', 0)):
             with self.subTest(want):
                 if text is None:
                     os.unlink(self.pfile)
@@ -198,6 +356,17 @@ class PatternFileTest(Case):
                 got = cli.leak_notes(self.pfile, notes)
                 self.assertEqual(len(got), problems)
                 self.assertIn(want, ' '.join(notes + got))
+        for text in ('', '# only a comment\n\n'):   # fix round 1 of #1118: checks nothing, as no file does
+            with self.subTest(text=text):
+                self.write('private/leak-patterns', text)
+                notes = []
+                self.assertEqual(cli.leak_notes(self.pfile, notes), [])
+                self.assertIn('WARNING: leak-guard: the pattern file', ' '.join(notes))
+                self.assertIn('holds no pattern', ' '.join(notes))
+        notes = []
+        cli.leak_notes(self.pfile, notes, ['o/public'])
+        self.assertIn('posts and pushes to o/public are checked', ' '.join(notes))
+        self.write('private/leak-patterns', PATTERNS)
         os.makedirs(os.path.join(self.dir, 'private', '.git'))
         got = cli.leak_notes(self.pfile, [])
         self.assertIn('inside the git checkout', ' '.join(got))

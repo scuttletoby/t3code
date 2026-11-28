@@ -1,37 +1,83 @@
 #!/usr/bin/python3 -IB
 """Claude Code PreToolUse hook (Bash, Monitor): refuse a post or a push whose text matches a private pattern.
-Part of fork-kit/agent-guards (README.md there: install, settings entry, the machine file's "agent-guards" section).
+Part of fork-kit/agent-guards (README.md there: install, settings entry, the machine file's "agent-guards" section;
+LEAK.md there: the pattern file and what is read).
 
 Why: a public fork must hold nothing personal (names, addresses, machine names, private paths). A scan found old PR
 text and a commit trailer that did; the rule was only a line in the agents' instructions (#892).
 
-What it reads, for a command that posts or pushes (a `gh` command, `git commit|push|tag|notes|merge|commit-tree`,
-or curl/wget/http naming github): the whole command text (with its heredocs), every file the command names (a
---body-file, `-F f`, `-F key=@f`, `< f`, `git commit -F f`), and for `git push` every commit that is on no remote
-yet (`git log --branches --tags --not --remotes`): its message, author and committer, and its added lines and file
-paths. A match with any line of the pattern file refuses the command. The answer names the line number only, never
+A post is a `gh` command that is not read-only (not `view`, `list`, `status`, `checks`, `diff`, ..., not a `gh api`
+GET), `git commit|push|tag|notes|merge|commit-tree`, or curl/wget/httpie sending data to github, found also behind a
+wrapper (`env -u NAME`, `sudo -u USER`, `timeout -k 5 30`, `xargs -I X`, ...) and inside `bash -c '...'` or `eval`.
+For a command that holds a post to a guarded repo (leakGuard.repos; empty: every repo), it reads:
+  - the command's words (quotes taken off, heredocs included), leaving out only the words that are no text: the
+    folder of `cd DIR` and `git -C DIR`, the target of a `>` redirect, the name of a file whose text is read below;
+  - the text of the files the post reads: the files it names (`--body-file f`, `-F f`, `-F key=@f`, `< f`, `git -C D
+    commit -F f` read in D), files read inside `$(...)` or backquotes, and those of the commands piped into it
+    (`cat f | gh ... --body-file -`). A file's text is matched, never its path;
+  - for `git push`: what that push sends, its refspecs' commits that are not on the remote it pushes to yet
+    (`git log <sources> --not --remotes=<remote>`): message, author, committer, added lines and file paths, and the
+    message of an annotated tag it pushes.
+A match with any line of the pattern file refuses the whole command. The answer names the line number only, never
 the pattern or the text: the refusal itself must not leak.
 
 The pattern file (leakGuard.patternsFile, default /etc/fork-kit/leak-patterns; format in lib/agent_guards/leak.py)
 is private and never in a repo. No file: nothing to check, the command runs (`agent-guards self-check` says so). A
 file that cannot be used whole (unreadable, a line that is no valid pattern): every post or push is refused until it
-is fixed. Other commands always run.
+is fixed. Other commands always run; the fast path (lib/agent_guards/fast.py) passes a command without the name of
+a posting program in its text without loading this file.
 
 Fails closed: the settings entry refuses the call when this file is missing or the hook fails, as for
 actions-disable-guard: a leak cannot be taken back (an edit keeps the old text in GitHub's history). Like the other
 guards it stops mistakes, not a hostile agent (text built at run time, a program it does not know). It writes
 nothing. Tests: fork-kit/agent-guards/tests/leak-guard.test.py
 """
-import json, os, re, shlex, subprocess, sys, time
+import fnmatch, json, os, re, shlex, subprocess, sys, time
+from urllib.parse import unquote
 
 NAME = 'leak-guard'
 START = time.monotonic()
 BUDGET = 8.0          # the settings entry gives 10 s; past this it refuses a push it could not read whole
 MAX_NAMED = 5_000_000  # a named file bigger than this is not read (an upload, an archive)
+MAX_DEPTH = 4         # bash -c 'bash -c ...': how deep a command string inside a command is read
 TOOLS = {'Bash', 'Monitor'}
-WRAPPERS = {'sudo', 'env', 'command', 'exec', 'nohup', 'time', 'nice', 'timeout', 'stdbuf', 'setsid', 'doas', 'xargs'}
+# wrappers and their options that take a value (`-u NAME`); POSITIONAL: the words a wrapper takes before the command
+WRAPPERS = {
+    'sudo': {'-u', '-g', '-C', '-D', '-h', '-p', '-r', '-t', '-T', '-U', '--user', '--group', '--close-from',
+             '--chdir', '--host', '--prompt', '--role', '--type', '--command-timeout', '--other-user'},
+    'doas': {'-u', '-C'},
+    'env': {'-u', '--unset', '-C', '--chdir', '-S', '--split-string'},
+    'timeout': {'-k', '--kill-after', '-s', '--signal'},
+    'nice': {'-n', '--adjustment'},
+    'ionice': {'-c', '--class', '-n', '--classdata', '-p', '--pid', '-P', '--pgid', '-u', '--uid'},
+    'xargs': {'-I', '-i', '-L', '-l', '-n', '-P', '-d', '-E', '-e', '-s', '-a', '--arg-file', '--delimiter',
+              '--max-args', '--max-procs', '--replace', '--max-lines', '--eof', '--max-chars', '--process-slot-var'},
+    'stdbuf': {'-i', '-o', '-e', '--input', '--output', '--error'},
+    'time': {'-f', '--format', '-o', '--output'},
+    'exec': {'-a'},
+    'flock': {'-w', '--wait', '--timeout', '-E', '--conflict-exit-code'},
+    'chronic': set(), 'command': set(), 'nohup': set(), 'setsid': set(), 'builtin': set(), 'caffeinate': set(),
+}
+POSITIONAL = {'timeout': 1, 'flock': 1}
+SHELLS = {'bash', 'sh', 'dash', 'zsh', 'ksh'}
 GIT_POSTS = {'commit', 'push', 'tag', 'notes', 'merge', 'commit-tree'}
-NET = {'curl', 'wget', 'http', 'https', 'xh'}
+NET = {'curl', 'wget', 'http', 'https', 'xh', 'xhs'}
+# gh commands that post nothing: `gh <group> <one of these>` and the groups that never post
+GH_READ = {'view', 'list', 'ls', 'status', 'checks', 'diff', 'download', 'watch', 'checkout', 'co', 'clone'}
+GH_READ_GROUPS = {'search', 'status', 'browse', 'help', 'version', 'completion', 'auth', '--help', '-h', '--version'}
+GH_API_WRITES = ('-f', '-F', '--field', '--raw-field', '--input')
+CURL_WRITES = ('-d', '--data', '--data-raw', '--data-binary', '--data-urlencode', '--data-ascii', '--json', '-F',
+               '--form', '--form-string', '-T', '--upload-file')
+WGET_WRITES = ('--post-data', '--post-file', '--body-data', '--body-file')
+# options whose value is a file the program reads as the text it sends (the file's name is not sent)
+FILE_FLAGS = {'gh': {'--body-file', '--notes-file', '--input', '-F'},   # -F: a body file, except in `gh api`
+              'git': {'-F', '--file'},
+              'net': {'-T', '--upload-file', '--post-file', '--body-file'}}
+# options of a gh post whose value is a repo
+GH_REPO_FLAGS = {'-R', '--repo'}
+# git push options that take a value
+PUSH_VALUE = {'-o', '--push-option', '--repo', '--receive-pack', '--exec'}
+REDIRECT_OUT = {'>', '>>', '>|', '&>', '&>>', '>&'}
 PREFIX = f'Refused by {NAME}: '
 FIX = (' Take the personal detail out (a name, an address, a machine name, a private path) and run it again. The '
        'rule (#892): nothing personal goes into the public fork, its PRs, issues, comments or commits. Text posted '
@@ -44,114 +90,360 @@ def _settings():
         from agent_guards import config
         return config.load('leakGuard')
     except BaseException as e:   # noqa: BLE001 - the guard works without its config
-        return ({'patternsFile': '/etc/fork-kit/leak-patterns', 'maxPushBytes': 20_000_000},
+        return ({'patternsFile': '/etc/fork-kit/leak-patterns', 'maxPushBytes': 20_000_000, 'repos': []},
                 f'cannot load the kit\'s config code ({type(e).__name__}: {e})')
 
 
 SETTINGS, SETTINGS_PROBLEM = _settings()
 
 
-def words(line):
-    try:
-        lx = shlex.shlex(line, posix=True, punctuation_chars=';&|()<>')
-        lx.whitespace_split = True
-        lx.commenters = '#'
-        return list(lx)
-    except ValueError:   # an unclosed quote: the plain words
-        return line.split()
+# ---- reading the command text ------------------------------------------------------------------------------------
+
+HEREDOC = re.compile(r'(?<![<\d])<<(?!<)-?[ \t]*([\'"]?)([\w.@+-]+)\1')
+
+
+def scan(line):
+    """(the line with its comment cut off, the line with quoted text and arithmetic blanked out, the quote still open
+    at its end or None). The blanked copy has the same length: what is found in it is no quoted text."""
+    out, mask, q, j = [], [], None, 0
+    while j < len(line):
+        c = line[j]
+        if q is None:
+            if c == '\\' and j + 1 < len(line):
+                out.append(line[j:j + 2])
+                mask.append('  ')
+                j += 2
+                continue
+            if c == '#' and (j == 0 or line[j - 1] in ' \t;&|()'):
+                break
+            if c in '\'"':
+                q = c
+            out.append(c)
+            mask.append(c)
+        else:
+            if q == '"' and c == '\\' and j + 1 < len(line):
+                out.append(line[j:j + 2])
+                mask.append('  ')
+                j += 2
+                continue
+            if c == q:
+                q = None
+                mask.append(c)
+            else:
+                mask.append(' ')
+            out.append(c)
+        j += 1
+    m = re.sub(r'\(\([^()]*\)\)', lambda x: ' ' * len(x.group()), ''.join(mask))
+    return ''.join(out), m, q
 
 
 def lines_and_bodies(text):
-    """(command lines, heredoc bodies): a line after `<<WORD` up to WORD is text, not a command."""
-    cmds, bodies, ends = [], [], []
+    """(command lines, heredoc bodies). A line ending in a backslash goes on in the next one; a quote open at a line's
+    end goes on too (its newline is text); the lines after `<<WORD` up to WORD are text, not commands. `<<<` (a
+    here-string) and `<<` inside quotes or arithmetic start nothing."""
+    cmds, bodies, ends, cur, q = [], [], [], [], None
     for line in text.split('\n'):
-        if ends:
+        if ends and q is None and not cur:
             if line.strip() == ends[0] or line.lstrip('\t') == ends[0]:
                 ends.pop(0)
             else:
                 bodies.append(line)
             continue
-        cmds.append(line)
-        ends += [m.group(2) for m in re.finditer(r'<<-?\s*([\'"]?)([\w.-]+)\1', line)]
+        if q is not None:   # inside a quote that a line before opened: rescan with it open
+            kept, mask, q = scan(q + line)
+            kept, mask = kept[1:], mask[1:]
+        else:
+            kept, mask, q = scan(line)
+        cont = q is None and re.search(r'(?<!\\)(\\\\)*\\$', kept)
+        cur.append((kept[:-1] if cont else kept, mask[:-1] if cont else mask))
+        if cont or q is not None:
+            continue
+        logical = '\n'.join(k for k, _ in cur)
+        masked = '\n'.join(m for _, m in cur)
+        cur = []
+        cmds.append(logical)
+        for m in HEREDOC.finditer(masked):
+            d = HEREDOC.match(logical, m.start())
+            if d:
+                ends.append(d.group(2))
+    if cur:
+        cmds.append('\n'.join(k for k, _ in cur))
     return cmds, bodies
 
 
-def segments(text):
-    """The simple commands of the text's command lines, as word lists."""
+def words(line):
+    try:
+        lx = shlex.shlex(line, posix=True, punctuation_chars=';&|()<>')
+        lx.whitespace_split = True
+        lx.commenters = ''
+        return list(lx)
+    except ValueError:   # an unclosed quote: the plain words
+        return line.split()
+
+
+class Seg:
+    """One simple command: its words, whether its input is piped from the one before, and the pipeline it is in."""
+
+    def __init__(self, words, piped, pipeline, skip=()):
+        self.words, self.piped, self.pipeline = words, piped, pipeline
+        self.skip = set(skip)   # the words read as commands of their own (the string of `bash -c`): not text here
+
+
+def segments(text, depth=0):
+    """The simple commands of the text's command lines, with `bash -c '...'`, `eval ...` and `env -S '...'` read as
+    the commands they run."""
     cmds, _ = lines_and_bodies(text)
-    out, cur = [], []
-    for w in words('\n'.join(cmds).replace('\n', ' ; ')):
-        if w in (';', '&', '&&', '|', '||', '|&', '(', ')', '{', '}', '$('):
-            if cur:
-                out.append(cur)
-            cur = []
+    out, cur, piped, pipeline = [], [], False, 0
+    toks = [w for line in cmds for w in words(line) + [';']]
+
+    def close(sep):
+        nonlocal cur, piped, pipeline
+        if cur:
+            more, skip = inner(cur, depth)
+            out.append(Seg(cur, piped, pipeline, skip))
+            for m in more:   # their own pipelines, apart from the outer ones
+                m.pipeline += (depth + 1) * 100000
+            out.extend(more)
+        piped = sep in ('|', '|&')
+        if not piped:
+            pipeline += 1
+        cur = []
+
+    for w in toks:
+        if w in (';', '&', '&&', '|', '||', '|&', '(', ')', '{', '}', ';;'):
+            close(w)
         else:
             cur.append(w)
-    return out + ([cur] if cur else [])
+    close(';')
+    return out
+
+
+def inner(seg, depth):
+    """The commands a shell, eval or env -S runs from a string (as Segs), and the indexes of the words they come
+    from; ([], ()) for any other command."""
+    if depth >= MAX_DEPTH:
+        return [], ()
+    h, name = command_word(seg)
+    h = len(seg) if h is None else h
+    for i in range(h):   # env -S 'gh ...' [more words]: the string split into words, then the words after it
+        if any(os.path.basename(x) == 'env' for x in seg[:i]):
+            if seg[i] in ('-S', '--split-string') and i + 1 < len(seg):
+                return segments(' '.join(seg[i + 1:]), depth + 1), tuple(range(i + 1, len(seg)))
+            if seg[i].startswith('--split-string='):
+                return (segments(' '.join([seg[i].split('=', 1)[1], *seg[i + 1:]]), depth + 1),
+                        tuple(range(i, len(seg))))
+    at = ()
+    if name in SHELLS:
+        for i in range(h + 1, len(seg)):
+            a = seg[i]
+            if re.match(r'^-[A-Za-z]*c[A-Za-z]*$', a) and i + 1 < len(seg):
+                at = (i + 1,)
+                break
+            if not a.startswith('-'):
+                break
+    elif name == 'eval':
+        at = tuple(range(h + 1, len(seg)))
+    if not at:
+        return [], ()
+    return segments(' '.join(seg[i] for i in at), depth + 1), at
 
 
 def command_word(seg):
-    """(index of the command word, its name) after NAME=value and wrappers, or (None, '')."""
+    """(index of the command word, its name) after NAME=value words and wrappers with their options, or (None, '')."""
     i = 0
     while i < len(seg):
         w = seg[i]
-        if re.match(r'^[A-Za-z_]\w*=', w) or w.startswith('-') or re.match(r'^\d+[smhd]?$', w):
+        if re.match(r'^[A-Za-z_]\w*=', w):
             i += 1
             continue
         base = os.path.basename(w)
-        if base in WRAPPERS:
-            i += 1
-            continue
-        return i, base
+        if base not in WRAPPERS:
+            return i, base
+        takes, i = WRAPPERS[base], i + 1
+        while i < len(seg) and seg[i].startswith('-') and len(seg[i]) > 1:
+            o = seg[i]
+            if o == '--':
+                i += 1
+                break
+            i += 2 if o in takes else 1   # -u NAME takes the next word; -uNAME, --user=NAME, -10 do not
+        i += POSITIONAL.get(base, 0)
     return None, ''
 
 
 def git_sub(args):
-    """The git subcommand after git's own flags, and the folder of `-C dir` (or None)."""
+    """The git subcommand after git's own flags, its index in args, and the folder of `-C dir` (or None)."""
     i, where = 0, None
     while i < len(args):
         a = args[i]
         if a == '-C' and i + 1 < len(args):
-            where = os.path.join(where or '', args[i + 1]) if where else args[i + 1]
+            where = os.path.join(where, args[i + 1]) if where else args[i + 1]
             i += 2
         elif a in ('-c', '--git-dir', '--work-tree', '--namespace') and i + 1 < len(args):
             i += 2
         elif a.startswith('-'):
             i += 1
         else:
-            return a, where
-    return '', where
+            return a, i, where
+    return '', len(args), where
+
+
+def gh_posts(args):
+    """Whether `gh ARGS` can post: anything but the read-only commands and a `gh api` GET."""
+    if not args or args[0] in GH_READ_GROUPS:
+        return False
+    if args[0] == 'api':   # gh's own rule: GET, or POST once a field or --input is given; -X says which
+        method = None
+        for i, a in enumerate(args):
+            if a in ('-X', '--method') and i + 1 < len(args):
+                method = args[i + 1]
+            elif a.startswith('--method='):
+                method = a.split('=', 1)[1]
+            elif a.startswith('-X') and len(a) > 2:
+                method = a[2:]
+        if method is not None:
+            return method.upper() != 'GET'
+        return any(a in GH_API_WRITES or a.startswith(('--field=', '--raw-field=', '--input=', '-f', '-F'))
+                   for a in args)
+    return not (len(args) > 1 and args[1] in GH_READ)
+
+
+def net_posts(name, args):
+    if not any('github' in a.lower() for a in args):
+        return False
+    if name in ('curl',):
+        return any(a in CURL_WRITES or any(a.startswith(f + '=') for f in CURL_WRITES if f.startswith('--'))
+                   or re.match(r'^-[dFT].', a) for a in args) or method_writes(args, ('-X', '--request'))
+    if name == 'wget':
+        return any(a.split('=', 1)[0] in WGET_WRITES for a in args) or method_writes(args, ('--method',))
+    return True   # httpie: any field sends data; not worth telling apart
+
+
+def method_writes(args, flags):
+    for i, a in enumerate(args):
+        if a in flags and i + 1 < len(args) and args[i + 1].upper() not in ('GET', 'HEAD'):
+            return True
+        for f in flags:
+            if a.startswith(f) and a != f:
+                v = a[len(f):].lstrip('=')
+                if v and v.upper() not in ('GET', 'HEAD'):
+                    return True
+    return False
 
 
 def posts(seg):
-    """('gh'|'git'|'net', its args) for a command that posts or pushes, else None."""
+    """('gh'|'git'|'net', index of the command word) for a command that posts or pushes, else None."""
     h, name = command_word(seg)
     if h is None:
         return None
     args = seg[h + 1:]
-    if name == 'gh':
-        return 'gh', args
+    if name == 'gh' and gh_posts(args):
+        return 'gh', h
     if name == 'git' and git_sub(args)[0] in GIT_POSTS:
-        return 'git', args
-    if name in NET and any('github' in a.lower() for a in args):
-        return 'net', args
+        return 'git', h
+    if name in NET and net_posts(name, args):
+        return 'net', h
     return None
 
 
-def named_files(args, cwd):
-    """The files a command names that are there: words, `key=@f`, `@f`, `--flag=f`."""
-    out = []
-    for a in args:
-        for cand in {a, a.split('=', 1)[-1], a.split('=@', 1)[-1], a.lstrip('@')}:
-            if not cand or cand == '-' or '\0' in cand:
-                continue
-            p = os.path.join(cwd, os.path.expanduser(cand))
-            try:
-                if os.path.isfile(p) and os.path.getsize(p) <= MAX_NAMED and p not in out:
-                    out.append(p)
-            except OSError:
-                pass
-    return out
+# ---- where a post goes -------------------------------------------------------------------------------------------
+
+GH_URL = re.compile(r'github\.com(?::\d+)?[:/]+(?:repos/)?([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[/?#]|$)', re.I)
+
+
+def repo_of(text):
+    """owner/name of a GitHub URL or remote, or None."""
+    m = GH_URL.search(text or '')
+    return f'{m.group(1)}/{m.group(2)}'.lower() if m else None
+
+
+def guarded(repo):
+    """Whether a post or push to `repo` (owner/name, None: not known) is checked: leakGuard.repos lists the public
+    repos (globs); empty, every repo is."""
+    pats = SETTINGS.get('repos') or []
+    if not pats or repo is None:
+        return True
+    return any(fnmatch.fnmatchcase(repo, p.lower()) for p in pats)
+
+
+def git_config(where):
+    """{key: [values]} of the repo's config (remotes, branches, push), and the current branch or None."""
+    out = {}
+    try:
+        text = git(where, 'config', '-z', '--get-regexp',
+                   r'^(remote\..*\.(url|pushurl|push)|branch\..*\.(remote|pushremote)|remote\.pushdefault)$')
+    except RuntimeError:   # exit 1: no such key
+        text = ''
+    for item in filter(None, text.split('\0')):
+        k, _, v = item.partition('\n')
+        out.setdefault(k.lower(), []).append(v)
+    try:
+        branch = git(where, 'symbolic-ref', '-q', '--short', 'HEAD').strip() or None
+    except RuntimeError:
+        branch = None
+    return out, branch
+
+
+def remote_urls(cfg, name):
+    return cfg.get(f'remote.{name.lower()}.pushurl') or cfg.get(f'remote.{name.lower()}.url') or []
+
+
+def remotes(cfg):
+    return sorted({k.split('.', 1)[1].rsplit('.', 1)[0] for k in cfg if k.startswith('remote.') and k.endswith('.url')})
+
+
+def gh_targets(seg, h, here):
+    """The repos a gh post goes to: its -R, GH_REPO, a `gh api repos/OWNER/NAME` path, else the folder's GitHub
+    remotes (gh picks one of them). None in the list: not known (the post is checked)."""
+    args = seg[h + 1:]
+    for i, a in enumerate(args):
+        if a in GH_REPO_FLAGS and i + 1 < len(args):
+            v = args[i + 1]
+            return [repo_of('github.com/' + v.split('github.com/')[-1]) if '/' in v else None]
+        if a.startswith('--repo='):
+            return [repo_of('github.com/' + a.split('=', 1)[1].split('github.com/')[-1])]
+    for w in seg[:h]:
+        if w.startswith('GH_REPO='):
+            return [repo_of('github.com/' + w.split('=', 1)[1].split('github.com/')[-1])]
+    if args and args[0] == 'api':
+        path = next((a for a in args[1:] if not a.startswith('-') and 'repos/' in a), None)
+        return [repo_of('github.com/' + path.lstrip('/'))] if path else [None]
+    if args and args[0] in ('gist', 'repo', 'org', 'ssh-key', 'gpg-key', 'secret', 'variable', 'codespace'):
+        return [None]
+    return checkout_targets(here)
+
+
+def checkout_targets(here):
+    """The GitHub repos of the checkout's remotes (a commit or a gh post there goes to one of them), [None]: not
+    known. Without leakGuard.repos every repo is checked: nothing to look up."""
+    if not SETTINGS.get('repos'):
+        return [None]
+    try:
+        cfg, _ = git_config(here)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return [None]
+    found = [repo_of(u) for r in remotes(cfg) for u in remote_urls(cfg, r)]
+    return [r for r in found if r] or [None]
+
+
+def net_targets(seg, h):
+    if not SETTINGS.get('repos'):
+        return [None]
+    found = [repo_of(a) for a in seg[h + 1:] if 'github' in a.lower()]
+    return [r for r in found if r] or [None]
+
+
+# ---- files the post reads ----------------------------------------------------------------------------------------
+
+def existing(word, base):
+    if not word or word == '-' or '\0' in word:
+        return None
+    p = os.path.join(base, os.path.expanduser(word))
+    try:
+        if os.path.isfile(p) and os.path.getsize(p) <= MAX_NAMED:
+            return p
+    except OSError:
+        pass
+    return None
 
 
 def read(path):
@@ -161,6 +453,43 @@ def read(path):
     except OSError:
         return ''
 
+
+def file_words(seg, kind, h, api):
+    """{index of a word: the file name it holds} for the words of a post whose value is a file it reads as text:
+    --body-file f, -F f (a body file, except in `gh api`), key=@f, @f, < f."""
+    out = {}
+    flags = FILE_FLAGS.get(kind, set()) - ({'-F'} if api else set())
+    for i, w in enumerate(seg):
+        prev = seg[i - 1] if i else ''
+        if i > h and prev in flags:
+            out[i] = w
+        elif i > h and '=' in w and w.split('=', 1)[0] in flags and w.startswith('--'):
+            out[i] = w.split('=', 1)[1]
+        elif i > h and '=@' in w:
+            out[i] = w.split('=@', 1)[1]
+        elif i > h and w.startswith('@') and len(w) > 1:
+            out[i] = w[1:]
+        elif prev == '<':
+            out[i] = w
+    return out
+
+
+def substitutions(text):
+    """The text inside every `$(...)`, `<(...)` and backquote pair of the command lines."""
+    cmds, _ = lines_and_bodies(text)
+    out = []
+    for line in cmds:
+        for m in re.finditer(r'[$<]\(', line):
+            depth, j = 1, m.end()
+            while j < len(line) and depth:
+                depth += {'(': 1, ')': -1}.get(line[j], 0)
+                j += 1
+            out.append(line[m.end():j - 1])
+        out += re.findall(r'`([^`]*)`', line)
+    return out
+
+
+# ---- the push ----------------------------------------------------------------------------------------------------
 
 def left():
     return BUDGET - (time.monotonic() - START)
@@ -177,23 +506,110 @@ def git(where, *args):
     return r.stdout.decode('utf-8', 'replace')
 
 
-def push_reason(where, pats):
-    """Why the commits on no remote yet may not be pushed, or None."""
-    span = ['--branches', '--tags', '--not', '--remotes']
+def push_plan(args, where):
+    """What `git push ARGS` sends from `where`: (repo it goes to or None, [rev-list sources], [the --not side],
+    which tags' messages to read: a set of names or 'all'). None: it sends nothing (a delete, a dry run)."""
+    pos, opts, i = [], set(), 0
+    while i < len(args):
+        a = args[i]
+        if a == '--':
+            pos += args[i + 1:]
+            break
+        if a in PUSH_VALUE:
+            i += 2
+            continue
+        if a.startswith('-'):
+            opts.add(a.split('=', 1)[0])
+            if a.startswith('--repo='):
+                pos[:0] = [a.split('=', 1)[1]]
+        else:
+            pos.append(a)
+        i += 1
+    if opts & {'-d', '--delete', '-n', '--dry-run'}:
+        return None
+    cfg, branch = git_config(where)
+    if pos:
+        remote, specs = pos[0], pos[1:]
+    else:
+        remote = ((cfg.get(f'branch.{branch.lower()}.pushremote') if branch else None)
+                  or cfg.get('remote.pushdefault') or (cfg.get(f'branch.{branch.lower()}.remote') if branch else None)
+                  or ['origin'])[-1]
+        specs = []
+    names = remotes(cfg)
+    if remote in names:
+        urls, known = remote_urls(cfg, remote), [f'--remotes={remote}']
+        specs = specs or cfg.get(f'remote.{remote.lower()}.push') or []
+    else:   # a URL or a path: the configured remote with that URL, if there is one
+        same = [r for r in names if remote in remote_urls(cfg, r)]
+        urls, known = [remote], [f'--remotes={same[0]}'] if same else ['--remotes']
+    repo = next((repo_of(u) for u in urls if repo_of(u)), None)
+    if repo is None and SETTINGS.get('repos') and urls:
+        repo = 'not github'   # a remote that is no GitHub repo is no listed public one
+    sources, tags = [], set()
+    if opts & {'--mirror'}:
+        sources, tags = ['--all'], 'all'
+    elif opts & {'--all', '--branches'}:
+        sources = ['--branches']
+    if opts & {'--tags'}:
+        sources.append('--tags')
+        tags = 'all'
+    j = 0
+    while j < len(specs):
+        s = specs[j]
+        if s == 'tag' and j + 1 < len(specs):
+            s = f'refs/tags/{specs[j + 1]}'
+            j += 1
+        src = s.lstrip('+').split(':', 1)[0]
+        if src:
+            if '*' in src:
+                sources.append('--glob=' + (src if src.startswith('refs/') else f'refs/heads/{src}'))
+                if tags != 'all':
+                    tags = 'all' if src.startswith('refs/tags/') else tags
+            else:
+                sources.append(src)
+                if isinstance(tags, set):
+                    tags.add(src)
+        j += 1
+    if not specs and not sources:
+        sources = ['HEAD']
+    if not sources:   # only deletes (`:branch`): no commit is sent
+        return None
+    if '--follow-tags' in opts:   # the annotated tags on what it pushes that the remote lacks: not known here, all
+        tags = 'all'
+    return repo, sources, known, tags
+
+
+def push_reason(where, args, pats):
+    """Why this push may not run, or None."""
     try:
+        plan = push_plan(args, where)
+        if plan is None:
+            return None
+        repo, sources, known, tags = plan
+        if not guarded(repo):
+            return None
+        span = [*sources, '--not', *known, '--']
         meta = git(where, 'log', '--format=%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x01', *span)
+        sent = set()
         for entry in filter(str.strip, meta.split('\x01')):
             sha, *fields = entry.strip('\n').split('\x00')
+            sent.add(sha)
             n = pats.first('\n'.join(fields))
             if n:
                 return f'commit {sha[:12]} (its message, author or committer) matches line {n} of the pattern file'
-        diff = git(where, 'log', '-p', '--no-ext-diff', '--no-textconv', '--no-color', '--format=%x01%H', *span)
+        why = tag_reason(where, tags, pats)
+        if why:
+            return why
+        diff = git(where, 'log', '-p', '--no-ext-diff', '--no-textconv', '--no-color', '--format=%x01%H', *span) \
+            if sent else ''
     except subprocess.TimeoutExpired:
-        return f'the commits to push could not be read within {BUDGET:g} s; push fewer at once'
+        return (f'the commits to push could not be read within {BUDGET:g} s; push fewer at once (one commit this '
+                'big: the owner pushes it)')
     except (OSError, RuntimeError) as e:
         return f'the commits to push could not be read ({e}); run the push where `git log` works'
     if len(diff.encode()) > SETTINGS['maxPushBytes']:
-        return f'the commits to push hold more than {SETTINGS["maxPushBytes"]} bytes of changes; push fewer at once'
+        return (f'the commits to push hold more than {SETTINGS["maxPushBytes"]} bytes of changes; push fewer at once '
+                '(one commit this big: the owner pushes it)')
     for chunk in diff.split('\x01'):
         sha, _, rest = chunk.partition('\n')
         added = '\n'.join(x[1:] for x in rest.split('\n') if x.startswith('+'))
@@ -203,9 +619,29 @@ def push_reason(where, pats):
     return None
 
 
+def tag_reason(where, tags, pats):
+    """The message and tagger of the annotated tags the push sends: those it names, or every one (`--tags`,
+    `--follow-tags`, `--mirror`)."""
+    if not tags:
+        return None
+    text = git(where, 'for-each-ref', 'refs/tags', '--format=%(objecttype)%00%(refname)%00%(taggername) '
+               '%(taggeremail)%00%(contents)%01')
+    for entry in filter(str.strip, text.split('\x01')):
+        kind, ref, *fields = entry.strip('\n').split('\x00')
+        short = ref[len('refs/tags/'):]
+        if kind == 'tag' and (tags == 'all' or ref in tags or short in tags):
+            n = pats.first('\n'.join(fields))
+            if n:
+                return f'the tag {short} (its message or tagger) matches line {n} of the pattern file'
+    return None
+
+
+# ---- the decision ------------------------------------------------------------------------------------------------
+
 def decide(cmd, cwd, pats):
     """None to let the command run, else the reason (no pattern and no matched text in it)."""
-    found = [(seg, p) for seg in segments(cmd) for p in [posts(seg)] if p]
+    segs = segments(cmd)
+    found = [(s, p) for s in segs for p in [posts(s.words)] if p]
     if not found:
         return None
     if pats.problem:
@@ -213,35 +649,93 @@ def decide(cmd, cwd, pats):
                 'fixes the file.')
     if not pats.rows:
         return None
-    text = cmd
-    for seg in segments(cmd):   # a folder the command only runs in (`cd DIR`, `git -C DIR`) is posted nowhere
+    here, places, checked, files, pushes = cwd, {}, False, [], []
+    for k, s in enumerate(segs):
+        seg = s.words
+        for i in s.skip:
+            places[(k, i)] = True
         h, name = command_word(seg)
-        places = seg[h + 1:h + 2] if name == 'cd' else [git_sub(seg[h + 1:])[1] or ''] if name == 'git' else []
-        for place in filter(None, places):
-            text = text.replace(place, '')
-    n = pats.first(text)
-    if n:
-        return f'the command text matches line {n} of the pattern file ({pats.path}).'
-    here = cwd
-    for seg in segments(cmd):   # `cd dir && git push`: the folder the push runs in
-        h, name = command_word(seg)
-        if name == 'cd' and h is not None and len(seg) > h + 1:
+        if h is None:
+            continue
+        if name == 'cd' and len(seg) > h + 1:
+            places[(k, h + 1)] = True
             here = os.path.join(here, os.path.expanduser(seg[h + 1]))
             continue
+        drop = {i + 1 for i, w in enumerate(seg) if w in REDIRECT_OUT and i + 1 < len(seg)}
+        if name == 'git':
+            sub, si, where = git_sub(seg[h + 1:])
+            drop |= {h + 1 + i + 1 for i, w in enumerate(seg[h + 1:h + 1 + si]) if w == '-C'}
+            base = os.path.join(here, os.path.expanduser(where)) if where else here
+        else:
+            sub, where, base = '', None, here
+        for i in drop:
+            places[(k, i)] = True
         p = posts(seg)
         if not p:
             continue
-        kind, args = p
-        for f in named_files(args + [w for i, w in enumerate(seg) if i and seg[i - 1] in ('<', '<<<')], here):
-            n = pats.first(read(f)) or pats.first(f)
+        kind = p[0]
+        targets = (gh_targets(seg, h, base) if kind == 'gh' else net_targets(seg, h) if kind == 'net'
+                   else checkout_targets(base))
+        if sub == 'push':
+            pushes.append((base, seg[h + 1 + git_sub(seg[h + 1:])[1] + 1:]))
+            continue
+        if not any(guarded(t) for t in targets):
+            continue
+        checked = True
+        api = kind == 'gh' and seg[h + 1:h + 2] == ['api']
+        fw = file_words(seg, kind, h, api)
+        for i, w in fw.items():
+            f = existing(w, base)
+            if f:
+                files.append(f)
+                places[(k, i)] = w
+        for i, w in enumerate(seg[h + 1:], h + 1):   # other files a post names (gh gist create f, curl ... @f)
+            if i not in fw and i not in drop and existing(w, base):
+                files.append(existing(w, base))
+        if s.piped:   # the commands piped into it: the files they read are its input
+            for kk in range(k - 1, -1, -1):
+                f_seg = segs[kk]
+                if f_seg.pipeline != s.pipeline:
+                    break
+                fh, _ = command_word(f_seg.words)
+                for i, w in enumerate(f_seg.words[(fh or 0) + 1:], (fh or 0) + 1):
+                    if f_seg.words[i - 1] in REDIRECT_OUT:
+                        continue
+                    f = existing(w, here)
+                    if f:
+                        files.append(f)
+                        places[(kk, i)] = w
+        for text in substitutions(cmd):
+            for ss in segments(text, MAX_DEPTH - 1):
+                for w in ss.words:
+                    f = existing(w, base)
+                    if f:
+                        files.append(f)
+    if checked or any(guarded_push(b, a) for b, a in pushes):
+        _, bodies = lines_and_bodies(cmd)
+        kept = [w for k, s in enumerate(segs) for i, w in enumerate(s.words) if (k, i) not in places]
+        text = ' '.join(kept) + '\n' + '\n'.join(bodies)
+        n = pats.first(text) or ('%' in text and pats.first(unquote(text)))
+        if n:
+            return (f'the command text matches line {n} of the pattern file ({pats.path}). If the match is in a '
+                    'part that posts nothing, run that part in a call of its own.')
+        for f in dict.fromkeys(files):
+            n = pats.first(read(f))
             if n:
                 return f'the file {os.path.basename(f)} that the command posts matches line {n} of the pattern file.'
-        sub, where = git_sub(args) if kind == 'git' else ('', None)
-        if sub == 'push':
-            why = push_reason(os.path.join(here, os.path.expanduser(where)) if where else here, pats)
-            if why:
-                return why + f' ({pats.path}).'
+    for base, args in pushes:
+        why = push_reason(base, args, pats)
+        if why:
+            return why + f' ({pats.path}).'
     return None
+
+
+def guarded_push(base, args):
+    try:
+        plan = push_plan(args, base)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return True
+    return plan is not None and guarded(plan[0])
 
 
 def main(argv=None):

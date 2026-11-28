@@ -40,7 +40,7 @@ HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard', '
          'leak-guard')
 CLOSED = {'actions-disable-guard', 'leak-guard'}   # a missing or failed hook refuses
 FAST = 'agent-guards-fast'                       # the fast path (bin/agent-guards-fast), linked beside the hooks
-FAST_HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard')   # run on every Bash call
+FAST_HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'leak-guard', 'memory-index-guard')   # run on every Bash call
 WHAT_IS_LOST = {
     'actions-disable-guard': 'every Bash and Monitor command is refused until it is back',
     'capacity-pipe-guard': 'hook skipped, commands are NOT checked',
