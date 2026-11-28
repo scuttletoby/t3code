@@ -82,6 +82,15 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
   },
   {
     scope: "server",
+    key: "accountOrder",
+    default: [],
+    off: true,
+    reason:
+      "A delegated task stays on its account when that account is spent; none moves by order.",
+    decidedIn: "#881",
+  },
+  {
+    scope: "server",
     key: "waitFor",
     default: { enabled: false },
     fields: true,

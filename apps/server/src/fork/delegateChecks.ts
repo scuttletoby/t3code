@@ -18,6 +18,7 @@ import {
   type ProviderOptionSelection,
   type RuntimeMode,
   type ServerProvider,
+  type ServerSettings as ServerSettingsValue,
   type ThreadId,
 } from "@t3tools/contracts";
 import { kindOfRole } from "@t3tools/shared/slotObserve";
@@ -33,6 +34,7 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
+import * as AccountOrder from "../usage/accountOrder.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
 import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
@@ -350,26 +352,18 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
       : Effect.map(ownOptionsOn, (on) => (on ? withOwnOptions(target, requested) : target));
 
   /**
-   * The usage pacing gate (`usagePacingGate` setting, off by default). A setting or a pace that
-   * cannot be read lets the task through as asked. The pacer moves a task only to a target with
-   * the same runtime mode, so the mode the caller checked on the requested target still holds.
+   * The same model, options and runtime mode as `input.target` on another instance this project may
+   * use, or why not. `mayScan`: a model the instance does not list may be looked for with a folder
+   * scan (`advise` runs none). Shared by the account order and the pacing gate.
    */
-  const paceTarget = Effect.fn("DelegateChecks.paceTarget")(function* (
+  const targetOnFor = (
     input: BeforeWorkspaceInput,
-  ): Effect.fn.Return<BeforeWorkspaceResult, OrchestratorMcpFailure> {
-    const settings = yield* serverSettings.getSettings.pipe(Effect.option);
-    if (Option.isNone(settings) || settings.value.usagePacingGate === "off") {
-      return { target: input.target };
-    }
-    const { instanceId, model, options } = input.target.modelSelection;
-    const nowMs = yield* Clock.currentTimeMillis;
-    // `advise` only says what `enforce` would do, so it runs no folder scan (a scan publishes a
-    // snapshot and takes the driver's probe time). A named instance still scans in `enforce`: the
-    // answer decides between holding the task and lowering its effort.
-    const mayScan = settings.value.usagePacingGate === "enforce";
-    // Read after the target lookup, so any refresh or folder scan it ran is in the list.
-    const providers = withFolderModels(yield* providerRegistry.getProviders, input.cwd);
-    const provider = providers.find((candidate) => candidate.instanceId === instanceId);
+    settings: ServerSettingsValue,
+    providers: ReadonlyArray<ServerProvider>,
+    nowMs: number,
+    mayScan: boolean,
+  ) => {
+    const { model, options } = input.target.modelSelection;
     const parentMode = input.parent.thread.runtimeMode;
     const modeOn = (target: DelegateTarget) =>
       resolveRuntimeMode(parentMode, input.runtimeMode, target).pipe(Effect.option);
@@ -388,9 +382,164 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
           providers: withFolderModels(list, input.cwd),
         })
         .pipe(Effect.result);
+    return Effect.fnUntraced(function* (
+      candidate: ServerProvider["instanceId"],
+    ): Effect.fn.Return<UsagePacingGate.TargetOn<DelegateTarget>> {
+      const enabled = yield* threadManagement.isProviderInstanceEnabledForProject({
+        projectId: input.parent.thread.projectId,
+        instanceId: candidate,
+      });
+      if (!enabled) return { cannot: "this project turned it off" };
+      let resolved = yield* sameTaskOn(candidate, providers);
+      const missing = (result: typeof resolved) =>
+        result._tag === "Failure" && result.failure.code === "model_unavailable";
+      // The lookup scanned the folder for the requested instance only, and a fresh scan of one
+      // instance drops the others' snapshots of it: scan it for this one too, then look again.
+      // Only a missing model is worth a scan; any other refusal stands as it is.
+      if (input.cwd !== undefined && missing(resolved)) {
+        const cwd = input.cwd;
+        const notListed = { cannot: `it does not list ${model} for this folder` };
+        // A current model list is an answer, whoever published it (another path may have, during
+        // a back-off): the reply gives it, not "no result".
+        const before = folderScan(providers, candidate, cwd, nowMs);
+        const key = `${candidate}\u0000${cwd}`;
+        const noAnswer = (retryAtMs: number) => ({
+          cannot: `it does not list ${model} and its scan of this folder gave no result (scanned again after ${DateTime.formatIso(DateTime.makeUnsafe(retryAtMs))})`,
+        });
+        const retryAtMs = (yield* Ref.get(failedScans)).get(key);
+        // `enforce` scans unless a back-off holds, and the registry runs a probe for any snapshot
+        // that is not settled (slash commands still loading too). So the advice answers from the
+        // list only where `enforce` would: during a back-off, or from a settled list.
+        if (before.models && (backingOff(retryAtMs, nowMs) || (!mayScan && before.settled))) {
+          return notListed;
+        }
+        // A back-off that `enforce` recorded holds in `advise` too: `enforce` would not scan now,
+        // so the advice must not say it would.
+        if (backingOff(retryAtMs, nowMs)) return noAnswer(retryAtMs);
+        if (!mayScan) {
+          return {
+            cannot: before.models
+              ? `it does not list ${model} for this folder in a scan that is still loading its slash commands (advice only, so it was not scanned again)`
+              : `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
+            wouldScan: true,
+          };
+        }
+        const scanned = yield* host.scanWorkspace(candidate, cwd);
+        resolved = yield* sameTaskOn(candidate, scanned);
+        // A failed scan leaves the list as it was, and a pending one is scanned again on every
+        // call: do not scan again on every call. Say "no result" only without a model list.
+        const after = folderScan(scanned, candidate, cwd, nowMs);
+        const backOff = missing(resolved) && !after.settled;
+        const nextRetryMs = nowMs + FAILED_SCAN_BACKOFF_MS;
+        yield* Ref.update(failedScans, (current) => {
+          const next = new Map([...current].filter(([, until]) => backingOff(until, nowMs)));
+          if (backOff) next.set(key, nextRetryMs);
+          else next.delete(key);
+          return next;
+        });
+        if (missing(resolved) && !after.models) return noAnswer(nextRetryMs);
+      }
+      if (resolved._tag === "Failure") {
+        return {
+          cannot:
+            resolved.failure.code === "model_unavailable"
+              ? `it does not list ${model}${input.cwd === undefined ? "" : " for this folder"}`
+              : `the task cannot run there (${resolved.failure.code})`,
+        };
+      }
+      const modes = yield* Effect.all([modeOn(input.target), modeOn(resolved.success)]);
+      return Option.isSome(modes[1]) && Option.getOrNull(modes[0]) === modes[1].value
+        ? {
+            target: policyOn(settings)
+              ? withOwnOptions(resolved.success, input.requested)
+              : resolved.success,
+          }
+        : { cannot: "it would run the task in another runtime mode" };
+    });
+  };
+
+  /**
+   * The account order (`accountOrder`, empty by default): a task with no named instance, on a spent
+   * account, moves to the first account in the order with room that can run it. Unknown usage takes
+   * no work; with no room anywhere the task stays (holding is the pacing gate's call).
+   */
+  const orderTarget = Effect.fn("DelegateChecks.orderTarget")(function* (
+    input: BeforeWorkspaceInput,
+    settings: ServerSettingsValue,
+  ) {
+    const unchanged: BeforeWorkspaceResult = { target: input.target };
+    if (settings.accountOrder.length === 0 || input.requested?.providerInstanceId !== undefined) {
+      return unchanged;
+    }
+    const paceOf = (id: ServerProvider["instanceId"]) =>
+      Option.match(usagePacer, {
+        onNone: () => Effect.undefined,
+        onSome: (pacer) => pacer.paceOf(id).pipe(Effect.orElseSucceed(() => undefined)),
+      });
+    const from = input.target.modelSelection.instanceId;
+    const providers = withFolderModels(yield* providerRegistry.getProviders, input.cwd);
+    const current = providers.find((provider) => provider.instanceId === from);
+    if (current === undefined) return unchanged;
+    const nowMs = yield* Clock.currentTimeMillis;
+    const fromState = AccountOrder.accountStateOf(yield* paceOf(from));
+    if (fromState.kind !== "spent") return unchanged;
+    const ids = AccountOrder.orderCandidateIds({
+      order: settings.accountOrder,
+      current,
+      providers,
+    });
+    if (ids.length === 0) return unchanged;
+    const paces = yield* Effect.forEach(ids, paceOf);
+    const candidates = ids.map((instanceId, index): AccountOrder.OrderCandidate => ({
+      instanceId,
+      state: AccountOrder.accountStateOf(paces[index]),
+    }));
+    const full = `${from} is at its limit (${AccountOrder.describeSpent(fromState.windows)})`;
+    const targetOn = targetOnFor(input, settings, providers, nowMs, true);
+    const skipped: Array<string> = [];
+    for (const candidate of candidates) {
+      if (candidate.state.kind !== "open") {
+        skipped.push(AccountOrder.describeSkipped(candidate));
+        continue;
+      }
+      const on = yield* targetOn(candidate.instanceId);
+      if ("cannot" in on) {
+        skipped.push(`${candidate.instanceId} has room, but ${on.cannot}`);
+        continue;
+      }
+      const passed = skipped.length === 0 ? "" : ` (passed over: ${skipped.join("; ")})`;
+      return {
+        target: on.target,
+        note: `Account order: ${full}, so this task runs on ${candidate.instanceId}, the first account in the order with room${passed}.`,
+      };
+    }
+    return {
+      target: input.target,
+      note: `Account order: ${full} and no account in the order can take this task (${skipped.join("; ")}), so it runs on ${from} as asked.`,
+    };
+  });
+
+  /**
+   * The usage pacing gate (`usagePacingGate` setting, off by default). A setting or a pace that
+   * cannot be read lets the task through as asked. The pacer moves a task only to a target with
+   * the same runtime mode, so the mode the caller checked on the requested target still holds.
+   */
+  const gateTarget = Effect.fn("DelegateChecks.gateTarget")(function* (
+    input: BeforeWorkspaceInput,
+    settings: ServerSettingsValue,
+  ): Effect.fn.Return<BeforeWorkspaceResult, OrchestratorMcpFailure> {
+    const { instanceId, model, options } = input.target.modelSelection;
+    const nowMs = yield* Clock.currentTimeMillis;
+    // `advise` only says what `enforce` would do, so it runs no folder scan (a scan publishes a
+    // snapshot and takes the driver's probe time). A named instance still scans in `enforce`: the
+    // answer decides between holding the task and lowering its effort.
+    const mayScan = settings.usagePacingGate === "enforce";
+    // Read after the target lookup, so any refresh or folder scan it ran is in the list.
+    const providers = withFolderModels(yield* providerRegistry.getProviders, input.cwd);
+    const provider = providers.find((candidate) => candidate.instanceId === instanceId);
     const outcome = yield* UsagePacingGate.decide({
-      mode: settings.value.usagePacingGate,
-      lowerEffort: settings.value.usagePacingLowerEffort,
+      mode: settings.usagePacingGate,
+      lowerEffort: settings.usagePacingLowerEffort,
       nowMs,
       instanceId,
       pinned: input.requested?.providerInstanceId !== undefined,
@@ -405,79 +554,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
           onNone: () => Effect.undefined,
           onSome: (pacer) => pacer.paceOf(id).pipe(Effect.orElseSucceed(() => undefined)),
         }),
-      // The same model, options and runtime mode on an instance this project may use, or why not.
-      targetOn: Effect.fnUntraced(function* (candidate) {
-        const enabled = yield* threadManagement.isProviderInstanceEnabledForProject({
-          projectId: input.parent.thread.projectId,
-          instanceId: candidate,
-        });
-        if (!enabled) return { cannot: "this project turned it off" };
-        let resolved = yield* sameTaskOn(candidate, providers);
-        const missing = (result: typeof resolved) =>
-          result._tag === "Failure" && result.failure.code === "model_unavailable";
-        // The lookup scanned the folder for the requested instance only, and a fresh scan of one
-        // instance drops the others' snapshots of it: scan it for this one too, then look again.
-        // Only a missing model is worth a scan; any other refusal stands as it is.
-        if (input.cwd !== undefined && missing(resolved)) {
-          const cwd = input.cwd;
-          const notListed = { cannot: `it does not list ${model} for this folder` };
-          // A current model list is an answer, whoever published it (another path may have, during
-          // a back-off): the reply gives it, not "no result".
-          const before = folderScan(providers, candidate, cwd, nowMs);
-          const key = `${candidate}\u0000${cwd}`;
-          const noAnswer = (retryAtMs: number) => ({
-            cannot: `it does not list ${model} and its scan of this folder gave no result (scanned again after ${DateTime.formatIso(DateTime.makeUnsafe(retryAtMs))})`,
-          });
-          const retryAtMs = (yield* Ref.get(failedScans)).get(key);
-          // `enforce` scans unless a back-off holds, and the registry runs a probe for any snapshot
-          // that is not settled (slash commands still loading too). So the advice answers from the
-          // list only where `enforce` would: during a back-off, or from a settled list.
-          if (before.models && (backingOff(retryAtMs, nowMs) || (!mayScan && before.settled))) {
-            return notListed;
-          }
-          // A back-off that `enforce` recorded holds in `advise` too: `enforce` would not scan now,
-          // so the advice must not say it would.
-          if (backingOff(retryAtMs, nowMs)) return noAnswer(retryAtMs);
-          if (!mayScan) {
-            return {
-              cannot: before.models
-                ? `it does not list ${model} for this folder in a scan that is still loading its slash commands (advice only, so it was not scanned again)`
-                : `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
-              wouldScan: true,
-            };
-          }
-          const scanned = yield* host.scanWorkspace(candidate, cwd);
-          resolved = yield* sameTaskOn(candidate, scanned);
-          // A failed scan leaves the list as it was, and a pending one is scanned again on every
-          // call: do not scan again on every call. Say "no result" only without a model list.
-          const after = folderScan(scanned, candidate, cwd, nowMs);
-          const backOff = missing(resolved) && !after.settled;
-          const nextRetryMs = nowMs + FAILED_SCAN_BACKOFF_MS;
-          yield* Ref.update(failedScans, (current) => {
-            const next = new Map([...current].filter(([, until]) => backingOff(until, nowMs)));
-            if (backOff) next.set(key, nextRetryMs);
-            else next.delete(key);
-            return next;
-          });
-          if (missing(resolved) && !after.models) return noAnswer(nextRetryMs);
-        }
-        if (resolved._tag === "Failure") {
-          return {
-            cannot:
-              resolved.failure.code === "model_unavailable"
-                ? `it does not list ${model}${input.cwd === undefined ? "" : " for this folder"}`
-                : `the task cannot run there (${resolved.failure.code})`,
-          };
-        }
-        const modes = yield* Effect.all([modeOn(input.target), modeOn(resolved.success)]);
-        return Option.isSome(modes[1]) && Option.getOrNull(modes[0]) === modes[1].value
-          ? {
-              target: policyOn(settings.value)
-                ? withOwnOptions(resolved.success, input.requested)
-                : resolved.success,
-            }
-          : { cannot: "it would run the task in another runtime mode" };
-      }),
+      targetOn: targetOnFor(input, settings, providers, nowMs, mayScan),
     });
     switch (outcome.action) {
       case "hold":
@@ -504,6 +581,19 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
           ...(outcome.note === undefined ? {} : { note: outcome.note }),
         };
     }
+  });
+
+  /** The account order, then the pacing gate on the task where the order left it. */
+  const paceTarget = Effect.fn("DelegateChecks.paceTarget")(function* (
+    input: BeforeWorkspaceInput,
+  ): Effect.fn.Return<BeforeWorkspaceResult, OrchestratorMcpFailure> {
+    const settings = yield* serverSettings.getSettings.pipe(Effect.option);
+    if (Option.isNone(settings)) return { target: input.target };
+    const ordered = yield* orderTarget(input, settings.value);
+    if (settings.value.usagePacingGate === "off") return ordered;
+    const gated = yield* gateTarget({ ...input, target: ordered.target }, settings.value);
+    const notes = [ordered.note, gated.note].filter((note) => note !== undefined);
+    return { target: gated.target, ...(notes.length === 0 ? {} : { note: notes.join(" ") }) };
   });
 
   /**
