@@ -102,6 +102,7 @@ fork-ci/actions/pr-queue/review_config.test.py unittest
 fork-ci/actions/pr-queue/review_glob.test.py unittest
 fork-ci/actions/pr-queue/review_judge.test.py unittest
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py unittest
+fork-ci/actions/pressure-note/pressure_note.test.py unittest
 fork-ci/actions/test-select/test-select.test.py ~26s unittest
 fork-ci/actions/test-select/trace-check.test.py unittest
 fork-ci/actions/weakened-tests/weakened_tests.test.py unittest
