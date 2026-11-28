@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""claude-settings: keep chosen keys in a user's Claude Code settings.json, the same on every machine (README.md).
+
+  claude-settings apply --config CONFIG [--file SETTINGS ...]   merge the config's keys in (backup first)
+  claude-settings check --config CONFIG [--file SETTINGS ...]   exit 1 when a file is not in step, change nothing
+
+SETTINGS defaults to $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json. Output names only the keys
+the config sets, never a value: settings files can hold env values.
+Exit 0 in step (or brought in step), 1 not in step (check), 2 error (nothing written).
+"""
+import datetime, json, os, sys, tempfile
+
+CONFIG_KEYS = {'version', 'settings', '_comment'}
+
+
+class Refused(Exception):
+    pass
+
+
+def load_config(path):
+    try:
+        with open(path, encoding='utf-8-sig') as f:
+            config = json.load(f)
+    except OSError as e:
+        raise Refused(f'config {path}: cannot read it ({e.strerror})')
+    except ValueError as e:
+        raise Refused(f'config {path}: not JSON ({e})')
+    if not isinstance(config, dict):
+        raise Refused(f'config {path}: not a JSON object')
+    unknown = sorted(set(config) - CONFIG_KEYS)
+    if unknown:
+        raise Refused(f'config {path}: unknown keys {unknown} (known: settings, version)')
+    if config.get('version') != 1:
+        raise Refused(f'config {path}: "version" must be 1')
+    settings = config.get('settings')
+    if not isinstance(settings, dict) or not settings:
+        raise Refused(f'config {path}: "settings" must be a non-empty object')
+    return settings
+
+
+def default_file():
+    base = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.path.expanduser('~'), '.claude')
+    return os.path.join(base, 'settings.json')
+
+
+def merge(current, wanted, prefix=''):
+    """The settings with every key of `wanted` in place. Objects merge key by key (keys `wanted` does not name
+    are kept); any other value is set as given. Returns (merged, [key paths that change])."""
+    merged = dict(current)
+    changed = []
+    for key, value in wanted.items():
+        path = f'{prefix}{key}'
+        old = current.get(key)
+        if isinstance(value, dict) and isinstance(old, dict):
+            merged[key], sub = merge(old, value, path + '.')
+            changed += sub
+        elif key not in current or old != value or type(old) is not type(value):
+            merged[key] = value
+            changed.append(path)
+    return merged, changed
+
+
+def read_settings(path):
+    """(raw bytes or None when the file is missing, parsed object)."""
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None, {}
+    except OSError as e:
+        raise Refused(f'{path}: cannot read it ({e.strerror})')
+    if not raw.strip():
+        return raw, {}
+    try:
+        current = json.loads(raw.decode('utf-8-sig'))
+    except ValueError as e:
+        raise Refused(f'{path}: not JSON ({e}); left as it is')
+    if not isinstance(current, dict):
+        raise Refused(f'{path}: not a JSON object; left as it is')
+    return raw, current
+
+
+def backup_path(path):
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    candidate, n = f'{path}.bak-claude-settings-{stamp}', 1
+    while os.path.lexists(candidate):
+        n += 1
+        candidate = f'{path}.bak-claude-settings-{stamp}-{n}'
+    return candidate
+
+
+def write_new(path, data, mode):
+    """Write `data` to a new file at `path` (fails if it exists)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def apply_file(path, wanted, out):
+    real = os.path.realpath(path)  # a linked settings.json stays a link: write the file it points to
+    raw, current = read_settings(real)
+    merged, changed = merge(current, wanted)
+    if not changed:
+        print(f'{path}: in step', file=out)
+        return
+    folder = os.path.dirname(real)
+    if not os.path.isdir(folder):
+        raise Refused(f'{path}: folder {folder} is missing (is Claude Code set up for this user?)')
+    mode = 0o600
+    if raw is not None:
+        mode = os.stat(real).st_mode & 0o777
+        backup = backup_path(real)
+        write_new(backup, raw, mode)
+        print(f'{path}: backup {backup}', file=out)
+    data = (json.dumps(merged, indent=2, ensure_ascii=False) + '\n').encode('utf-8')
+    fd, tmp = tempfile.mkstemp(prefix=f'.{os.path.basename(real)}.', suffix='.claude-settings.tmp', dir=folder)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if hasattr(os, 'chmod'):
+            os.chmod(tmp, mode)
+        if read_settings(real)[0] != raw:  # someone wrote the file while we worked: theirs wins, run again
+            raise Refused(f'{path}: changed while this ran; nothing written, run again')
+        os.replace(tmp, real)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    for key in changed:
+        print(f'{path}: set {key}', file=out)
+
+
+def check_file(path, wanted, out):
+    _, current = read_settings(os.path.realpath(path))
+    _, changed = merge(current, wanted)
+    for key in changed:
+        print(f'{path}: not in step: {key}', file=out)
+    if not changed:
+        print(f'{path}: in step', file=out)
+    return not changed
+
+
+def parse_args(argv):
+    if not argv or argv[0] in ('-h', '--help') or argv[0] not in ('apply', 'check'):
+        return None
+    command, config, files, rest = argv[0], None, [], argv[1:]
+    while rest:
+        flag = rest.pop(0)
+        if flag in ('--config', '--file') and rest:
+            value = rest.pop(0)
+            if flag == '--config':
+                config = value
+            else:
+                files.append(value)
+        else:
+            return None
+    if config is None:
+        return None
+    return command, config, files or [default_file()]
+
+
+def main(argv, out=sys.stdout, err=sys.stderr):
+    parsed = parse_args(argv)
+    if parsed is None:
+        print(__doc__.strip(), file=err if argv not in (['-h'], ['--help']) else out)
+        return 0 if argv in (['-h'], ['--help']) else 2
+    command, config, files = parsed
+    try:
+        wanted = load_config(config)
+    except Refused as e:
+        print(f'claude-settings: {e}', file=err)
+        return 2
+    code = 0
+    for f in files:  # one file's error leaves the others to be done
+        try:
+            if command == 'check':
+                if not check_file(f, wanted, out):
+                    code = max(code, 1)
+            else:
+                apply_file(f, wanted, out)
+        except Refused as e:
+            print(f'claude-settings: {e}', file=err)
+            code = 2
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
