@@ -13,8 +13,12 @@ import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./
 /** The method name. Not in upstream's `WS_METHODS`: it is the fork's own. */
 export const FORK_WORK_PANEL_METHOD = "fork.workPanel" as const;
 
-/** Read for one thread: the server reads that thread's family (its root, forks and sub-agents). */
-export const ForkWorkPanelInput = Schema.Struct({ threadId: ThreadId });
+/**
+ * With `threadId`, the server reads that thread's family (its root, forks and sub-agents) for CI
+ * only; without it, only the machine's capacity. Two reads, so a slow slot gate never holds back
+ * the CI answer.
+ */
+export const ForkWorkPanelInput = Schema.Struct({ threadId: Schema.optionalKey(ThreadId) });
 export type ForkWorkPanelInput = typeof ForkWorkPanelInput.Type;
 
 export const ForkWorkPanelPartState = Schema.Literals(["answered", "unknown"]);
@@ -63,12 +67,38 @@ export const ForkPullRequestRuns = Schema.Struct({
 });
 export type ForkPullRequestRuns = typeof ForkPullRequestRuns.Type;
 
+/** One capacity number of a machine: `used` of `total` (`null`: no limit), and where it is from. */
+export const ForkCapacityPart = Schema.Struct({
+  state: ForkWorkPanelPartState,
+  reason: Schema.optionalKey(Schema.String),
+  used: Schema.optionalKey(NonNegativeInt),
+  total: Schema.optionalKey(Schema.NullOr(NonNegativeInt)),
+  /** Where the numbers come from, in words. */
+  source: Schema.String,
+});
+export type ForkCapacityPart = typeof ForkCapacityPart.Type;
+
+/** The machine's capacity, from the same facts placement reads (`t3_environment_read`). */
+export const ForkMachineCapacity = Schema.Struct({
+  /** Agent sessions running or holding a slot, of those the slot gate allows. */
+  agents: ForkCapacityPart,
+  /** Memory in use of the machine's total, in MB. */
+  memoryMb: ForkCapacityPart,
+  /** The free memory the slot gate keeps, in MB; `null`: none set. */
+  memoryFloorMb: Schema.optionalKey(Schema.NullOr(NonNegativeInt)),
+  /** When the facts were read (ms); absent when no source gave a time. */
+  factsAt: Schema.optionalKey(NonNegativeInt),
+});
+export type ForkMachineCapacity = typeof ForkMachineCapacity.Type;
+
 export const ForkWorkPanelAnswer = Schema.Struct({
   /** The server's clock when it answered (ms), for the ages the panel shows. */
   answeredAt: NonNegativeInt,
   repoQueues: Schema.Array(ForkRepoQueue),
   /** Only pull requests whose repository read answered and whose head has runs in it. */
   pullRequests: Schema.Array(ForkPullRequestRuns),
+  /** Absent from a server that predates the capacity bar: the panel says unknown. */
+  capacity: Schema.optionalKey(ForkMachineCapacity),
 });
 export type ForkWorkPanelAnswer = typeof ForkWorkPanelAnswer.Type;
 

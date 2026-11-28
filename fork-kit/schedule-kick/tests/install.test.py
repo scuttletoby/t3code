@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(KIT), 'common', 'tests'))
 import install_fixture as fx  # noqa: E402
 
 SHA1, SHA2 = fx.SHA1, fx.SHA2
-UNITS = ('/etc/systemd/user/schedule-kick.service', '/etc/systemd/user/schedule-kick.timer')
+UNITS = ('/etc/systemd/user/schedule-kick.service', '/etc/systemd/user/schedule-kick.timer',
+         '/etc/systemd/user/schedule-kick-keep-on.service', '/etc/systemd/user/schedule-kick-keep-on.timer')
 FOREIGN = '[Timer]\nOnCalendar=daily\n'
 
 
@@ -32,7 +33,7 @@ class Install(fx.FakeHost):
         code, out, err = self.install()
         self.assertEqual(code, 0, err)
         self.assertEqual(self.config(), {'version': 1, 'timer': False})
-        self.assertEqual(self.units(), [False, False])                 # no timer unless asked
+        self.assertEqual(self.units(), [False] * 4)                 # no timer unless asked
         self.assertIn(', no timer', out)
         self.assertEqual(self.run_main('self-check')[0], 0)
 
@@ -57,7 +58,7 @@ class Install(fx.FakeHost):
                     self.assertTrue(os.path.islink(self.path('/usr/local/bin/schedule-kick')))
                 code, _, err = self.install('--timer')
                 self.assertEqual(code, 0, err)
-                self.assertEqual(self.units(), [True, True])
+                self.assertEqual(self.units(), [True] * 4)
                 self.assertEqual(self.run_main('self-check')[0], 0)
 
     def test_a_config_it_cannot_read_is_refused(self):
@@ -87,25 +88,37 @@ class Install(fx.FakeHost):
         self.assertIn('OnCalendar=*:0/5\n', text)
         self.assertIn('WantedBy=timers.target\n', text)
         names = os.listdir(self.path('/etc/systemd/user'))
-        self.assertEqual(sorted(n for n in names if n.endswith('.timer')), ['schedule-kick.timer'])   # one timer only
+        self.assertEqual(sorted(n for n in names if n.endswith('.timer')),
+                         ['schedule-kick-keep-on.timer', 'schedule-kick.timer'])   # the tick and keep-on, no other
+        with open(self.path(UNITS[2])) as f:
+            text = f.read()
+        self.assertIn('ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/schedule-kick/current/bin/schedule-kick '
+                      'keep-on\n', text)
+        self.assertIn('UMask=0077\n', text)
+        with open(self.path(UNITS[3])) as f:
+            self.assertIn('OnUnitActiveSec=15s\n', f.read())
+        version = self.path(f'/usr/local/libexec/schedule-kick/versions/{SHA1}')
+        for name in ('common/alert.py', 'common/machine_file.py', 'lib/schedulekick/heads.py',
+                     'lib/schedulekick/keepon.py'):
+            self.assertTrue(os.path.isfile(os.path.join(version, name)), name)   # keep-on's alert channel, the parts
         self.assertTrue(self.config()['timer'])
         self.assertEqual(self.run_main('self-check')[0], 0)
 
     def test_timer_kept_by_an_upgrade_and_removed_by_no_timer_and_uninstall(self):
         self.assertEqual(self.install('--timer')[0], 0)
         self.assertEqual(self.install(sha=SHA2)[0], 0)                 # upgrade without the option: kept
-        self.assertEqual(self.units(), [True, True])
+        self.assertEqual(self.units(), [True] * 4)
         self.assertTrue(os.path.isdir(self.path(f'/usr/local/libexec/schedule-kick/versions/{SHA1}')))
         code, out, _ = self.install('--no-timer', sha=SHA2)
         self.assertEqual(code, 0)
         self.assertIn('systemctl --user disable --now schedule-kick.timer', out)
-        self.assertEqual(self.units(), [False, False])
+        self.assertEqual(self.units(), [False] * 4)
         self.assertEqual(self.install(sha=SHA2)[0], 0)                 # again without the option: still off
-        self.assertEqual(self.units(), [False, False])
+        self.assertEqual(self.units(), [False] * 4)
         self.assertEqual(self.run_main('self-check')[0], 0)
         self.assertEqual(self.install('--timer', sha=SHA2)[0], 0)
         self.assertEqual(self.run_main('uninstall')[0], 0)
-        self.assertEqual(self.units(), [False, False])
+        self.assertEqual(self.units(), [False] * 4)
         for gone in ('/usr/local/libexec/schedule-kick', '/etc/schedule-kick', '/usr/local/bin/schedule-kick',
                      '/usr/local/sbin/schedule-kick-install'):
             self.assertFalse(os.path.lexists(self.path(gone)), gone)

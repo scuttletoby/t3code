@@ -442,13 +442,17 @@
       }
     },
     "apps/web/src/hooks/useThreadActionMenu.ts": {
-      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" before it builds the menu and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The thread menu's hook fills the MCP profile entry's state as it builds the menu and hands the entry's clicks to the fork, which saves that one thread's pick (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The state is read synchronously, so the menu still opens at once. The thread menu's hook fills the Role entry's state (read synchronously) and hands its picks to the fork, which saves one threadRoles pointer (calm sidebar, #878 CAL4; fork/calmSidebar/threadRoleMenu.ts).",
+      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" when the menu opens (openMenu, before it builds the menu, and only for a thread on the app's own server, so a menu for any other thread still opens at once; the command palette's synchronous readMenu has no handoff entry) and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The thread menu's hook fills the MCP profile entry's state as it builds the menu and hands the entry's clicks to the fork, which saves that one thread's pick (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The state is read synchronously, so the menu still opens at once. The thread menu's hook fills the Role entry's state (read synchronously) and hands its picks to the fork, which saves one threadRoles pointer (calm sidebar, #878 CAL4; fork/calmSidebar/threadRoleMenu.ts).",
       "added": [],
       "announced": {
-        "since": "2026-11-27",
+        "since": "2026-11-28",
         "added": [
           "import * as ForkHandoffMenu from \"../components/fork/handoff/handoffMenu\"; // Fork (HO5)",
-          "forkHandoff: await ForkHandoffMenu.readHandoffMenuState(threadRef), // Fork (HO5)",
+          "const forkHandoff: { state: ForkHandoffMenu.HandoffMenuState } = { state: null }; // Fork (HO5): openMenu fills it",
+          "forkHandoff: forkHandoff.state, // Fork (HO5)",
+          "if (threadRef.environmentId === primaryEnvironmentId)",
+          "// Fork (HO5): only the app's own server hands off",
+          "forkHandoff.state = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
           "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
           "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
           "import * as ForkMcp from \"../components/fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
@@ -498,19 +502,24 @@
       }
     },
     "apps/web/src/components/ChatView.tsx": {
-      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts). A thread whose playtest session is on shows the Playtest chip with its End button in the composer's banners (playtest F5, #889): one hook call and its items spread into both banner lists (fork/playtest/usePlaytestChipItems.tsx).",
-      "added": [],
+      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts). A thread whose playtest session is on shows the Playtest chip with its End button in the composer's banners (playtest F5, #889): one hook call and its items spread into both banner lists (fork/playtest/usePlaytestChipItems.tsx). A thread whose next turn names no effort while the model policy is on shows a warning in the composer's banners (model policy, #876): one hook call and its items spread into both banner lists (fork/modelPolicy/useForkNoEffortItems.ts).",
+      "added": [
+        "import { useForkPlaytestItems } from \"./fork/playtest/usePlaytestChipItems\"; // Fork (playtest)",
+        "const forkPlaytestItems = useForkPlaytestItems(routeThreadRef); // Fork (playtest)",
+        "...forkPlaytestItems, // Fork (playtest)",
+        "...forkPlaytestItems, // Fork (playtest)"
+      ],
       "announced": {
-        "since": "2026-11-27",
+        "since": "2026-11-28",
         "added": [
           "import { useForkHandoffWaitingItems } from \"./fork/handoff/useForkHandoffWaitingItems\"; // Fork (HO5)",
           "const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)",
           "...forkHandoffWaitingItems, // Fork (HO5)",
           "...forkHandoffWaitingItems, // Fork (HO5)",
-          "import { useForkPlaytestItems } from \"./fork/playtest/usePlaytestChipItems\"; // Fork (playtest)",
-          "const forkPlaytestItems = useForkPlaytestItems(routeThreadRef); // Fork (playtest)",
-          "...forkPlaytestItems, // Fork (playtest)",
-          "...forkPlaytestItems, // Fork (playtest)"
+          "import { useForkNoEffortItems } from \"./fork/modelPolicy/useForkNoEffortItems\"; // Fork (model policy)",
+          "const forkNoEffortItems = useForkNoEffortItems(routeThreadRef); // Fork (model policy)",
+          "...forkNoEffortItems, // Fork (model policy)",
+          "...forkNoEffortItems, // Fork (model policy)"
         ]
       }
     },

@@ -27,6 +27,7 @@ export interface ForkStatusTarget {
 /** Typed by every feature, so a feature the report counts cannot be left off the page. */
 const LABELS: Record<ForkFeature, string> = {
   usagePacingGate: "Plan usage pacing",
+  accountOrder: "Account order",
   agentSlots: "Limit on running agents",
   stopFinishedChildren: "Stop finished sub-agents",
   waitFor: "Agent waits",
@@ -41,6 +42,7 @@ const LABELS: Record<ForkFeature, string> = {
 /** The page's order: the groups below it, top to bottom. */
 const ORDER: ReadonlyArray<ForkFeature> = [
   "usagePacingGate",
+  "accountOrder",
   "agentSlots",
   "stopFinishedChildren",
   "waitFor",

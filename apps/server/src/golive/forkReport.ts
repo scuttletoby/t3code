@@ -93,6 +93,8 @@ export interface ForkReport {
       readonly agentSlots: "on" | "off";
       readonly waitFor: "on" | "off";
       readonly usagePacingGate: "off" | "advise" | "enforce";
+      /** Moving a delegated task off a spent account by the account order. */
+      readonly accountOrder: "on" | "off";
       readonly automaticUpdates: "on" | "off";
       /** On when the server's or any project's rules are on (a project override can switch it on). */
       readonly reviewRules: "on" | "off";
@@ -539,6 +541,7 @@ function readSettings(
     agentSlots: onOff("agentSlots"),
     waitFor: onOff("waitFor"),
     usagePacingGate: settings.usagePacingGate,
+    accountOrder: onOff("accountOrder"),
     automaticUpdates: onOff("automaticUpdates"),
     reviewRules: onOff("reviewRules"),
     handoff: onOff("handoff"),
@@ -583,6 +586,7 @@ function readSettings(
         ),
         usagePacingGate: settings.usagePacingGate,
         usagePacingLowerEffort: settings.usagePacingLowerEffort,
+        accountOrder: settings.accountOrder,
         waitFor: settings.waitFor,
         waitCheckNames: Object.keys(settings.waitChecks).toSorted(),
         agentSlots: settings.agentSlots,

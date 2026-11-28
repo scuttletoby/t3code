@@ -443,3 +443,52 @@ export const PlaytestToolResult = Schema.Struct({
   session: Schema.NullOr(PlaytestSessionView),
 });
 export type PlaytestToolResult = typeof PlaytestToolResult.Type;
+
+/**
+ * The web app's two playtest calls (the thread chip, F5): `GET` the thread's session that is on
+ * (read scope) and `POST` its end with `{ threadId }` (operate scope). End is the tool's `end`
+ * action with the reason `person`.
+ */
+export const PLAYTEST_STATE_PATH = "/api/fork/playtest/state";
+export const PLAYTEST_END_PATH = "/api/fork/playtest/end";
+
+/**
+ * A session as the chip sees it: only what it shows. No worktree, no step output, no problem text
+ * (any read-scope connection may ask); `releaseProblem` says a release has failed and T3 retries.
+ */
+export const PlaytestChipSession = Schema.Struct({
+  id: PlaytestSessionId,
+  target: PlaytestTarget,
+  state: PlaytestSessionState,
+  /** The agent's one-line reason, as it gave it at start (at most 200 characters). */
+  note: Schema.String.check(Schema.isMaxLength(PLAYTEST_NOTE_MAX)),
+  rounds: NonNegativeInt,
+  lastRound: Schema.optionalKey(
+    Schema.Struct({ number: PositiveInt, state: PlaytestRoundState, step: PlaytestStepName }),
+  ),
+  running: Schema.optionalKey(Schema.Literals(["claim", "round", "release"])),
+  releaseProblem: Schema.Boolean,
+});
+export type PlaytestChipSession = typeof PlaytestChipSession.Type;
+
+/** The thread's session that is not ended, else null (none, the last one ended, or not readable). */
+export const PlaytestRouteState = Schema.Struct({ session: Schema.NullOr(PlaytestChipSession) });
+export type PlaytestRouteState = typeof PlaytestRouteState.Type;
+
+/**
+ * What a press of End did: as the tool's `end` (`ended`, `nothing-to-end`, `release-failed`),
+ * `ended-unreleased` when it ended but its release could not even start (the claim expires on the
+ * target by itself), or `unavailable` when T3 could not try (its playtest file cannot be read now).
+ */
+export const PlaytestRouteEndAnswer = Schema.Struct({
+  outcome: Schema.Literals([
+    "ended",
+    "ended-unreleased",
+    "nothing-to-end",
+    "release-failed",
+    "unavailable",
+  ]),
+  session: Schema.NullOr(PlaytestChipSession),
+  message: Schema.optionalKey(Schema.String),
+});
+export type PlaytestRouteEndAnswer = typeof PlaytestRouteEndAnswer.Type;

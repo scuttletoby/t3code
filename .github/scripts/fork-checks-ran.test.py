@@ -82,9 +82,10 @@ class Fake:
     """GitHub's runs of fork-checks.yml on SHA (one list per poll, the last one repeats) and each run's jobs (the
     latest attempt only: the script must ask for filter=latest)."""
 
-    def __init__(self, polls, errors=()):
+    def __init__(self, polls, errors=(), pulls=None):
         self.polls, self.errors, self.paths = list(polls), list(errors), []
         self.current = []
+        self.pulls = pulls          # the open pull requests a head run looks up (pulls?head=OWNER:BRANCH)
 
     def get(self, path):
         self.paths.append(path)
@@ -94,6 +95,9 @@ class Fake:
                 raise e
         url = urllib.parse.urlsplit(path)
         q = urllib.parse.parse_qs(url.query)
+        if url.path == 'pulls' and self.pulls is not None:
+            assert q['state'] == ['open'] and q['head'] == ['o:feature'], path
+            return self.pulls
         if url.path == 'actions/workflows/fork-checks.yml/runs':
             assert q['head_sha'] == [SHA], path
             self.current = self.polls.pop(0) if len(self.polls) > 1 else self.polls[0]
@@ -181,6 +185,69 @@ class Check(unittest.TestCase):
                     {'GITHUB_WORKFLOW_REF': 'o/r/.github/workflows/fork-tests.yml'}):
             code, out, _ = check(Fake([[]]), EVENT_NAME='workflow_dispatch', GITHUB_REF='refs/heads/main', **env)
             self.assertEqual(code, 1, f'{env}: {out}')
+
+    # --- a head run (#1157): a dispatch from the head-runs reconciler, judged as its branch's pull request's run -------
+    HEAD_ENV = {'EVENT_NAME': 'workflow_dispatch', 'HEAD_RUN': 'true', 'GITHUB_REF': 'refs/heads/feature',
+                'GITHUB_SHA': SHA, 'HEAD_SHA': '', 'BASE_SHA': '', 'PR_NUMBER': '', 'OUTSIDE_PR': 'false',
+                'GITHUB_WORKFLOW_REF': 'o/r/.github/workflows/fork-tests.yml@refs/heads/feature'}
+
+    @staticmethod
+    def open_pr(number=7, repo='o/r', ref='feature'):
+        return {'number': number, 'head': {'ref': ref, 'sha': SHA, 'repo': {'full_name': repo}},
+                'base': {'ref': 'main', 'sha': BASE, 'repo': {'full_name': 'o/r'}}}
+
+    def test_a_head_run_is_judged_as_its_pull_requests_run(self):
+        fake = Fake([[wr(1, [job(CFG['check'], steps=real_steps())])]], pulls=[self.open_pr()])
+        code, out, _ = check(fake, **self.HEAD_ENV)
+        self.assertEqual(code, 0, out)
+        self.assertIn("judged as pull request #7's run", out)
+        self.assertTrue(fake.paths[0].startswith('pulls?'))
+
+    def test_a_head_run_whose_fork_checks_failed_fails(self):
+        fake = Fake([[wr(1, [job(CFG['check'], conclusion='failure', steps=real_steps(conclusion='failure'))])]],
+                    pulls=[self.open_pr()])
+        self.assertEqual(check(fake, **self.HEAD_ENV)[0], 1)
+
+    def test_a_head_run_without_exactly_one_open_pull_request_fails(self):
+        for pulls in ([], [self.open_pr(7), self.open_pr(8)], [self.open_pr(repo='x/r')],
+                      [self.open_pr(ref='other')], {'message': 'odd'}):
+            with self.subTest(pulls=pulls):
+                fake = Fake([[]], pulls=pulls)
+                code, out, _ = check(fake, **self.HEAD_ENV)
+                self.assertEqual(code, 1, out)
+                self.assertIn('#430', out)
+                self.assertEqual(len(fake.paths), 1)            # the lookup only: no fork-checks run is read
+
+    def test_a_head_run_whose_lookup_fails_fails_closed(self):
+        fake = Fake([[]], errors=[fcr.Transient('HTTP 502 on pulls')], pulls=[])
+        code, out, _ = check(fake, **self.HEAD_ENV)
+        self.assertEqual(code, 1)
+        self.assertIn('failing closed', out)
+
+    def test_a_head_run_on_the_default_branch_needs_no_check(self):
+        fake = Fake([[]], pulls=[])
+        code, out, _ = check(fake, **{**self.HEAD_ENV, 'GITHUB_REF': 'refs/heads/main',
+                                      'GITHUB_WORKFLOW_REF': 'o/r/.github/workflows/fork-tests.yml@refs/heads/main'})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(fake.paths, [])
+
+    def test_head_run_from_another_workflow_takes_the_direct_run_path(self):
+        # HEAD_RUN=true only counts in fork-tests.yml's own run: another workflow's dispatch fails as before (#430)
+        fake = Fake([[]], pulls=[self.open_pr()])
+        code, out, _ = check(fake, **{**self.HEAD_ENV,
+                                      'GITHUB_WORKFLOW_REF': 'o/r/.github/workflows/other.yml@refs/heads/feature'})
+        self.assertEqual(code, 0, out)                      # a called or other workflow's run: nothing to check
+        self.assertEqual(fake.paths, [])
+        code, out, _ = check(fake, **{**self.HEAD_ENV,
+                                      'GITHUB_WORKFLOW_REF': 'x/r/.github/workflows/fork-tests.yml@refs/heads/feature'})
+        self.assertEqual(code, 1, out)
+        self.assertEqual(fake.paths, [])
+
+    def test_a_dispatch_on_a_branch_that_is_no_head_run_still_fails(self):
+        fake = Fake([[]], pulls=[self.open_pr()])
+        code, out, _ = check(fake, **{**self.HEAD_ENV, 'HEAD_RUN': 'false'})
+        self.assertEqual(code, 1, out)
+        self.assertEqual(fake.paths, [])
 
     # --- the pull request's fork-checks job must succeed (#430 item 4) ------------------------------------------------
     def test_success_at_once_passes_without_sleeping(self):
