@@ -367,18 +367,25 @@ fork-follow (`.github/workflows/fork-follow.yml`) rebases the fork onto upstream
 once a day, tests, and publishes only when the tests are green. On a conflict, a red test or a schema
 change, or a fork line beyond the seams, it stops and opens one issue. Then:
 
-1. Rebase by hand as the workflow's report says. Never take upstream's side of a fork setting's
+1. First, before the rest of the sync: if upstream changed a composite action the fork keeps its
+   own copy of (today `.github/actions/setup-ci-deps`, copied as
+   `.github/actions/fork-setup-ci-deps`), port that change into the copy and record it:
+   `node .github/scripts/fork-setup-copy-check.cjs` names the change and the `git diff` to read;
+   after porting, `node .github/scripts/fork-setup-copy-check.cjs --record`. Fork tests fail
+   ("Compare upstream's setup-ci-deps with the fork's copy") until the copy's recorded blob id
+   matches upstream's file, so a sync cannot land with the copy behind it.
+2. Rebase by hand as the workflow's report says. Never take upstream's side of a fork setting's
    default: keep the fork's value (and the `Fork:` comment of the inline `automaticUpdates`).
-2. Check that the fork's lines in upstream files are only the seams:
+3. Check that the fork's lines in upstream files are only the seams:
    `node .github/scripts/fork-seam-check.cjs --from-upstream <upstream tag> HEAD`. A refused line moves into the
    fork's own file (a setting into `forkSettings.ts`, a server layer into
    `apps/server/src/fork/forkLayers.ts`); a changed seam line is fixed in
    `.github/fork-seams.json`. A `pending` ceiling or `lost` count that rose with upstream's own
    change (the refusal says "after the rebase") is raised in the rebased series' list (or, once
    pushed, with a list-only pull request to main).
-3. Run the pin tests before pushing:
+4. Run the pin tests before pushing:
    `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts apps/web/src/forkRouteTree.test.ts`.
-4. Push with `--force-with-lease` and start fork-follow once, as its report says.
+5. Push with `--force-with-lease` and start fork-follow once, as its report says.
 
 ### The sync that brings upstream's updater
 
