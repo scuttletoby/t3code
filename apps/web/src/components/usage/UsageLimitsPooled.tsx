@@ -47,6 +47,7 @@ import {
   formatResetsIn,
   resetCreditChoices,
 } from "@t3tools/shared/usageLimitsCopy";
+import { ForkFleetUsage } from "../fork/fleetUsage/ForkFleetUsage"; // Fork (fleet usage)
 
 function accountInitials(email: string): string {
   const [local = "", domain = ""] = email.split("@");
@@ -696,6 +697,7 @@ export function UsageLimitsPooled({
   const externalLinks = collectExternalUsageLinks(presentations, m);
   return (
     <div className="flex flex-col gap-8">
+      <ForkFleetUsage now={now} />
       {pools.length === 0 &&
       notices.length === 0 &&
       externalLinks.length === 0 &&

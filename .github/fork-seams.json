@@ -673,56 +673,40 @@
       "why": "The work panel (fork issue 1136) reads one fork RPC, `fork.workPanel`, defined in the fork file forkWorkPanel.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket. The Usage tab's fleet list (fork issue 1146) reads one fork RPC, `fork.fleetUsage`, defined in the fork file forkFleetUsage.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket.",
       "added": [
         "import { WsForkWorkPanelRpc } from \"./forkWorkPanel.ts\"; // Fork (work panel)",
-        "WsForkWorkPanelRpc, // Fork (work panel)"
-      ],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import { WsForkFleetUsageRpc } from \"./forkFleetUsage.ts\"; // Fork (fleet usage)",
-          "WsForkFleetUsageRpc, // Fork (fleet usage)"
-        ]
-      }
+        "WsForkWorkPanelRpc, // Fork (work panel)",
+        "import { WsForkFleetUsageRpc } from \"./forkFleetUsage.ts\"; // Fork (fleet usage)",
+        "WsForkFleetUsageRpc, // Fork (fleet usage)"
+      ]
     },
     "apps/server/src/auth/RpcAuthorization.ts": {
       "why": "Every RPC in the group declares its scope (RpcAuthorization.test.ts holds the map to the group): the work panel's `fork.workPanel` (fork issue 1136) is a read, like upstream's host resources read. The fleet usage read `fork.fleetUsage` (fork issue 1146) is a read, like upstream's host resources read.",
-      "added": ["\"fork.workPanel\": AuthOrchestrationReadScope, // Fork (work panel)"],
-      "announced": {
-        "since": "2026-11-27",
-        "added": ["\"fork.fleetUsage\": AuthOrchestrationReadScope, // Fork (fleet usage)"]
-      }
+      "added": [
+        "\"fork.workPanel\": AuthOrchestrationReadScope, // Fork (work panel)",
+        "\"fork.fleetUsage\": AuthOrchestrationReadScope, // Fork (fleet usage)"
+      ]
     },
     "apps/server/src/observability/RpcInstrumentation.ts": {
       "why": "Every RPC in the group names its span category: the work panel's `fork.workPanel` (fork issue 1136) is a server read. The fleet usage read `fork.fleetUsage` (fork issue 1146) is a server read.",
-      "added": ["\"fork.workPanel\": \"server\", // Fork (work panel)"],
-      "announced": {
-        "since": "2026-11-27",
-        "added": ["\"fork.fleetUsage\": \"server\", // Fork (fleet usage)"]
-      }
+      "added": [
+        "\"fork.workPanel\": \"server\", // Fork (work panel)",
+        "\"fork.fleetUsage\": \"server\", // Fork (fleet usage)"
+      ]
     },
     "apps/server/src/ws.ts": {
       "why": "The work panel's `fork.workPanel` handler (fork issue 1136) is one line that hands the request to the fork file fork/workPanel/workPanel.ts, which reads its own service only if it is there, so upstream's handler requirements and ws tests do not change. The fleet usage handler `fork.fleetUsage` (fork issue 1146) is one line that hands the request to the fork file fork/fleetUsage/fleetUsage.ts, which reads each service it needs only if it is there, so upstream's handler requirements and ws tests do not change.",
       "added": [
         "import * as ForkWorkPanel from \"./fork/workPanel/workPanel.ts\"; // Fork (work panel)",
-        "\"fork.workPanel\": (input) => ForkWorkPanel.read(input), // Fork (work panel)"
-      ],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import * as ForkFleetUsage from \"./fork/fleetUsage/fleetUsage.ts\"; // Fork (fleet usage)",
-          "\"fork.fleetUsage\": (input) => ForkFleetUsage.read(input), // Fork (fleet usage)"
-        ]
-      }
+        "\"fork.workPanel\": (input) => ForkWorkPanel.read(input), // Fork (work panel)",
+        "import * as ForkFleetUsage from \"./fork/fleetUsage/fleetUsage.ts\"; // Fork (fleet usage)",
+        "\"fork.fleetUsage\": (input) => ForkFleetUsage.read(input), // Fork (fleet usage)"
+      ]
     },
     "apps/web/src/components/usage/UsageLimitsPooled.tsx": {
       "why": "The Usage tab's limits (fork issue 1146) get the fork's fleet list first: one import and one element at the top of upstream's list, which renders nothing while the server it is connected to has no linked machine (components/fork/fleetUsage).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import { ForkFleetUsage } from \"../fork/fleetUsage/ForkFleetUsage\"; // Fork (fleet usage)",
-          "<ForkFleetUsage now={now} />"
-        ]
-      }
+      "added": [
+        "import { ForkFleetUsage } from \"../fork/fleetUsage/ForkFleetUsage\"; // Fork (fleet usage)",
+        "<ForkFleetUsage now={now} />"
+      ]
     },
     "apps/web/src/components/chat/ThreadDetailsPanel.tsx": {
       "why": "The work panel (fork issue 1136) sits in the thread's side panel right after its sub-agents (ThreadRelationshipsPanel): one import and one element, which renders nothing while the client fork setting workPanelEnabled is off (components/fork/workPanel).",

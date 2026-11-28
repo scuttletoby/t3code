@@ -6,6 +6,7 @@
 import {
   canonicalPlacementLabels,
   ENVIRONMENT_FILE_LINK_AGENT_HINT,
+  ForkUsageSnapshot,
   HostResourcesSnapshot,
   NonNegativeInt,
   type ServerSettings,
@@ -21,6 +22,7 @@ import * as Settings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import { type FactsCommandResult, FactsCommands } from "./factsCommand.ts";
 import { readPlacementForThisOs } from "./placementRead.ts";
+import * as FleetUsageSnapshot from "./fleetUsage/usageSnapshot.ts";
 
 /**
  * Placement facts. Every field but `labels`, `available` and `factsAt` is optional, so a machine on
@@ -55,6 +57,11 @@ export const ResultFields = {
   placement: Schema.optionalKey(Placement),
   /** How to link a file on this environment in a reply on another one. */
   fileLinks: Schema.optionalKey(Schema.String),
+  /**
+   * This machine's provider accounts and their limits (fork issue 1146), for the fleet's Usage
+   * tab: names and windows only, each account's id hashed. Left out on a server without them.
+   */
+  usage: Schema.optionalKey(ForkUsageSnapshot),
 };
 
 /** The gate's own read waits up to `COUNT_READ_TIMEOUT`; one second more, then it is unread. */
@@ -161,9 +168,9 @@ export const read = Effect.gen(function* () {
         Effect.option,
         Effect.catchCause(() => Effect.succeedNone),
       );
-  const [hostResources, slots, self] = yield* Effect.all(
-    [hostRead, slotFacts(settings), selfFacts(settings)],
-    { concurrency: 3 },
+  const [hostResources, slots, self, usage] = yield* Effect.all(
+    [hostRead, slotFacts(settings), selfFacts(settings), FleetUsageSnapshot.readSnapshot()],
+    { concurrency: 4 },
   );
   // Not available if either says so; each "no" keeps its reason, slots first.
   const reasons = [slots.available ? undefined : slots.reason, self.notAvailable].filter(
@@ -179,10 +186,13 @@ export const read = Effect.gen(function* () {
     ...(Option.isSome(hostResources) ? { hostResources: hostResources.value } : {}),
     placement,
     fileLinks: ENVIRONMENT_FILE_LINK_AGENT_HINT,
+    ...(usage === null ? {} : { usage }),
   };
 }).pipe(Effect.withSpan("EnvironmentFacts.read"));
 
-const AnswerFacts = Schema.Struct(ResultFields);
+// Placement's decode leaves `usage` out: a usage answer it cannot read never refuses a machine.
+const { usage: _usage, ...PlacementResultFields } = ResultFields;
+const AnswerFacts = Schema.Struct(PlacementResultFields);
 const decodeAnswerFacts = Schema.decodeUnknownSync(AnswerFacts);
 
 /**

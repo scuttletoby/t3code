@@ -1587,6 +1587,9 @@ upstream's, for this machine and for a linked one (the read is forwarded there a
   reason, the slot gate's first; the counts stay. With `agentSlots` off it is `true`, with a
   reason and no counts: the machine sets no limit and does not count its agents. With no
   `factsCommand` set, only the slots decide.
+- `usage` (fork issue 1146): this machine's provider accounts for the fleet's Usage tab, below.
+  Left out on a server without a provider registry or usage hubs. Placement never reads it: a
+  `usage` it cannot decode never refuses a machine.
 
 When the slot gate cannot be read (its count read fails or takes longer than its own limit, the
 gate is not running, or the settings cannot be read), `placement` says `available: false` with a
@@ -1620,6 +1623,35 @@ rule passes, ranked last; a linked machine without them is not. Its weight still
 or an unknown word keeps it out), and so does upstream's 5 % free-memory limit when memory was
 measured. With agent slots on, its gate checks again at launch; with them off, nothing checks,
 as in upstream's own launch on this machine.
+
+## Usage across linked machines
+
+Fork issue 1146. While the server the app is connected to has a linked machine (Linked
+environments in Settings → Labs, and at least one link), the Usage tab's limits start with
+**Across linked machines**: every provider account of that server and of every linked machine,
+once each. Without a linked machine nothing is added and the tab is upstream's.
+
+- **Read where they live.** Each machine reports its own accounts in its `t3_environment_read`
+  answer (`usage`, above): its providers with limits (as its own Limits show them) and the
+  accounts of its usage hubs. The server the app is connected to asks each linked machine for that
+  read over the existing link, the read placement makes: no new tool, credential or token. Sources
+  are one list in `apps/server/src/fork/fleetUsage/usageSnapshot.ts`; a new kind of usage (such as
+  the Antigravity usage command) joins it as one more entry.
+- **Once each, without the id.** An account is matched across machines by a hash of its stable id
+  (the provider's e-mail or credential fingerprint, with the workspace, as upstream's Limits key
+  it); no e-mail, fingerprint or instance id leaves the machine. It is named as the provider shows
+  it (the instance's name and the plan). An account with no stable id is shown per machine, never
+  merged. The hash is not salted (every machine must compute the same one), so it hides the id
+  from a casual reader, not from someone who already guesses the e-mail.
+- **Fresh or unknown.** The shown reading is the freshest one from a machine that answered now; its
+  age counts on that machine's own clock, so machines with different clocks are not mixed. A
+  reading older than 30 minutes, an account the provider gives no limits for, and an account only
+  on a machine that did not answer are grey "unknown" with why, never 0 or 100. A machine that
+  does not answer within 10 seconds, or whose version does not report usage, is unknown with why;
+  its accounts from its last answer stay listed, unknown.
+- **Cost.** Nothing runs while nobody looks. One round asks every linked machine at once and serves
+  every reader for a minute; the tab asks once a minute while it shows. Nothing is stored: the
+  last answers live in memory until the server stops.
 
 ## Install the fork today
 
