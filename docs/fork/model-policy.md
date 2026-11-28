@@ -10,13 +10,24 @@ setting's section of the [README](README.md#servermodelpolicy); the hook's are i
 ## One check per route
 
 Each route gets one check. The T3 server checks everything that reaches it. The model-guard hook,
-which runs inside Claude Code, is for what the server cannot see. Until its copies of the server's
-routes are removed (#876, M7), the hook checks the first two rows too, against its own policy file.
+which runs inside Claude Code, is for what the server cannot see. On a machine where the running
+T3 has loaded a managed policy that locks `modelPolicy` (the lock step below), the hook leaves
+`delegate_task` and `create_threads` to the server. On a machine without that lock, it checks them
+too, against its own policy file, so skipping the lock step never leaves those routes checked only
+by a policy an agent can edit.
+
+The hook keeps `t3_thread_launch`, `t3_thread_configure` and `t3_thread_transfer` in every case. The
+server checks those only when an agent's thread calls them. A Claude Code session that T3 did not
+open (a CLI on the machine) reaches T3's MCP without a calling thread, and the server reads that
+call as the owner's. In a session T3 opened, both check these three, and the hook refuses every
+fork in `enforce`.
 
 | Route                                                                                                                                                                         | Checked by                                                                                                                                   |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `delegate_task`, `create_threads`, `t3_thread_launch`, `t3_thread_configure` (here and on linked machines)                                                                    | the server, by the route's own check                                                                                                         |
-| every other thread command an agent's MCP call dispatches with a model, a thread fork (`t3_thread_transfer`), and `run_scheduled_task_now` on a task that starts a new thread | the server's backstop (below)                                                                                                                |
+| `delegate_task`, `create_threads` (here and on linked machines)                                                                                                               | the server, by the route's own check (the hook too, until the lock step)                                                                     |
+| `t3_thread_launch`, `t3_thread_configure` from an agent's thread                                                                                                              | the server, by the route's own check, and the hook                                                                                           |
+| every other thread command an agent's MCP call dispatches with a model, a thread fork (`t3_thread_transfer`), and `run_scheduled_task_now` on a task that starts a new thread | the server's backstop (below), and the hook for a fork                                                                                       |
+| `t3_thread_launch`, `t3_thread_configure`, `t3_thread_transfer` from a client with no calling thread                                                                          | the model-guard hook (the server reads it as the owner)                                                                                      |
 | Claude's `Agent` tool and a skill that starts a sub-agent or names a model, in a session T3 opened                                                                            | T3's own PreToolUse hook, which reads the server's policy (the model-guard hook reads `Agent` too: it cannot tell T3's sessions from others) |
 | Claude's `Agent` tool in a Claude Code session T3 did not open, `Workflow` scripts, `RemoteTrigger`                                                                           | the model-guard hook                                                                                                                         |
 | a project's default model (`t3_project_create`, `t3_project_update`) and `schedule_task`                                                                                      | the model-guard hook (the owner left these to the hook, [#769](https://github.com/scuttletoby/t3code/issues/769))                            |
@@ -29,7 +40,7 @@ against the policy when all of these hold:
 
 - it comes from an agent's MCP call: a thread bound to the session here, or a linked machine's call
   that names its agent's thread;
-- that call's route did not check its picks itself (the four routes in the table's first row do);
+- that call's route did not check its picks itself (the four routes in the table's first two rows do);
 - the command names a model (a new thread, a model change, a message, a queued run's edit or a
   delegated task with its own model, a task sent to a linked machine) or forks a thread, which runs
   on its source thread's model;
@@ -72,16 +83,115 @@ The server reads the policy from its `settings.json`, which an agent with a shel
 can edit. To stop that, lock it in T3's managed policy, a file only root can change:
 `/etc/t3code/policy.json` on Linux, `/Library/Application Support/T3Code/policy.json` on macOS,
 `C:\Program Files\T3Code\policy.json` on Windows. A locked `modelPolicy` wins over the settings file
-and cannot be changed in Settings; it is locked as a whole value, not one field inside it. The
-model-guard hook reads its own root-owned policy file; give it the same rows.
+and cannot be changed in Settings; it is locked as a whole value, not one field inside it.
+
+The hook leaves `delegate_task` and `create_threads` to T3 only while all of these hold:
+
+- the file is root-owned, not writable by group or others, and not a link;
+- it locks `modelPolicy` at the hook's mode or a stricter one, with no row or effort the hook's own
+  rows do not cover (a locked row without `efforts` is covered only by a hook row without them);
+- T3 reads the locked value as written: only `mode` and `allow`, both given, and rows with only
+  T3's keys (`driver`, `model`, `efforts`, `defaultEffort`, `useFor`; not the hook's `aliases` or
+  option ids), at least one effort in a row's `efforts`, a `defaultEffort` among them, and no
+  spaces around a text. T3 still starts on a value it cannot read, but reads it as enforce with
+  nothing allowed (and refuses every agent pick on its routes); the hook's self-check reports it;
+- every T3 server named in the hook's machine file (`t3ServerStates`, each T3 home's
+  `userdata/server-runtime.json`) is running, says it loaded this file, and started after the file
+  last changed. T3 reads its managed policy only when it starts, so a T3 started before the lock
+  was written or changed still runs the old policy until it restarts;
+- each of those servers wrote `fork-capabilities.json` beside its `server-runtime.json` when it
+  started (`apps/server/src/fork/modelPolicyRoutesMarker.ts`), naming its own process and both
+  routes: a T3 older than that loads the lock too, but does not check both routes itself.
+
+In any other state it keeps checking them. So give both the same rows, and switch both to
+`enforce` together. Name every T3 home on the machine: the hook cannot see a server that is not
+named. An agent able to write a T3 home's `server-runtime.json` could make the hook think T3 has
+restarted. That opens only the window until T3's next start, when it loads the lock.
+
+### The lock step (each machine, as root)
+
+Linux. The rows are the fork's start rows (#126), in `advise`, as in the hook's paste-ready
+install. T3 reads the managed policy only when it starts. It refuses to start while the file is not
+valid (a top-level key or setting it does not know counts), so write it with this command, not by
+hand. Inside `modelPolicy`'s value it does not refuse: a key or value it cannot read there makes it
+start with every agent pick refused (see the list above). A policy file that is
+already there is kept (`set -C`): merge the `modelPolicy` entry into its `settings` instead.
+
+```sh
+umask 022 && mkdir -p /etc/t3code
+( set -C; cat > /etc/t3code/policy.json ) <<'JSON' || echo "kept the policy already in /etc/t3code/policy.json: add the modelPolicy entry to its settings"
+{
+  "schemaVersion": 1,
+  "organization": "Machine owner",
+  "settings": {
+    "modelPolicy": {
+      "locked": true,
+      "value": {
+        "mode": "advise",
+        "allow": [
+          { "driver": "claudeAgent", "model": "claude-opus-5-5", "efforts": ["medium", "high", "xhigh"], "defaultEffort": "high" },
+          { "driver": "claudeAgent", "model": "claude-fable-5-2", "efforts": ["medium", "high", "xhigh"], "defaultEffort": "high" }
+        ]
+      }
+    }
+  }
+}
+JSON
+python3 -c 'import json; json.load(open("/etc/t3code/policy.json"))' && echo "policy.json is JSON"
+# Name this T3 home's runtime state in the hook's machine file, beside any home named already.
+# Run it again for each T3 home on the machine. Fill in the folder T3 keeps its state in first.
+T3_HOME=/path/to/t3-home
+T3_HOME="$T3_HOME" python3 - <<'PY'
+import json, os, sys
+home = os.environ.get('T3_HOME', '')
+if not os.path.isabs(home) or not os.path.isdir(os.path.join(home, 'userdata')):
+    sys.exit(f'T3_HOME ({home!r}) is not a T3 home: set it to the folder T3 keeps its state in')
+path = '/etc/fork-kit/machine.json'
+data = json.load(open(path))
+state = os.path.join(home, 'userdata', 'server-runtime.json')
+states = data.setdefault('model-guard', {}).setdefault('t3ServerStates', [])
+if state not in states:
+    states.append(state)
+with open(path + '.tmp', 'w') as out:
+    json.dump(data, out, indent=2)
+    out.write('\n')
+os.replace(path + '.tmp', path)
+PY
+```
+
+Then restart T3 (as its own service, or the app), so it reads the lock, and only then check:
+
+```sh
+model-guard --self-check   # "T3 server routes (...): left to T3" once T3 loaded the lock; "checked here too: <why>" otherwise
+```
+
+Until T3 restarts, the self-check says "restart T3 first", and the hook keeps checking the routes.
+**Settings → Fork → Models agents may use** can no longer change the setting. For macOS, use the
+same file at `/Library/Application Support/T3Code/policy.json`. Do not also deploy a configuration
+profile there: T3 refuses to start when it finds both.
+
+**Later, enforce:** in the same file, `"mode": "advise"` becomes `"mode": "enforce"`. Switch the hook's
+own policy to `enforce` at the same time (its README, "Later, enforce"), then restart T3 and run the
+self-check. The changed file counts only once T3 has restarted after it, and a lock at `advise`
+under an `enforce` hook does not count. So the hook goes on checking the server's routes until both
+say `enforce` and T3 has restarted.
 
 ## The way back
 
 - **Turn it down at once:** set `"mode": "advise"` (agents are only told) or `"mode": "off"` in
   `server.modelPolicy`, in Settings or in `settings.json` (read again at once). While the managed
-  policy locks it, root changes it there instead.
+  policy locks it, root changes it there instead, and T3 reads it at its next start. Changing the
+  file makes the hook check the server's routes again from its next call, until T3 has restarted.
+- **Undo the lock step:** as root, remove the `modelPolicy` entry (or the whole file, if it holds
+  nothing else) and restart T3. The hook checks the server's routes again from its next call.
+- **An older hook kit:** first remove `t3ServerStates` from the `model-guard` section of
+  `/etc/fork-kit/machine.json`. A kit from before it reads the key as unknown, and refuses every
+  checked call (fail closed) until it is gone. Install a newer kit before adding the key again.
+- **An older T3:** a T3 without `fork-capabilities.json` leaves the hook checking both routes, so a
+  lock only stops counting. A T3 from before the `modelPolicy` setting refuses to start with it
+  locked: undo the lock step before going back that far.
 - **The hook:** `/usr/local/sbin/model-guard-install uninstall`, as root (see its README). Or set
   its own policy file's `mode` to `off`.
 - **The backstop alone:** revert the pull request that adds it. Its two lines in
   `ThreadManagementService.ts` are listed in `.github/fork-seams.json`; with them gone, the
-  routes in the table's second row are not checked by the server.
+  routes in the table's third row are not checked by the server.

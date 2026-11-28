@@ -16,6 +16,17 @@ LIB = os.path.join(KIT, 'lib', 'model_guard.py')
 sys.path.insert(0, os.path.join(KIT, 'lib'))
 import model_guard  # noqa: E402
 
+
+def in_kit_checkout(path):
+    """Whether the Fork kit job's sparse checkout (.github/workflows/fork-tests.yml) has `path`."""
+    with open(os.path.join(REPO, '.github', 'workflows', 'fork-tests.yml'), encoding='utf-8') as f:
+        workflow = f.read()
+    job = workflow[:workflow.index('- name: Fork kit tests')]
+    listed = job[job.rindex('sparse-checkout: |'):].splitlines()[1:]
+    entries = [line.strip() for line in listed if line.strip().startswith('/')]
+    return any(e == f'/{path}' or (e.endswith('/') and f'/{path}'.startswith(e)) for e in entries)
+
+
 LARGE = {'driver': 'claudeAgent', 'model': 'example-large-1', 'efforts': ['medium', 'high'], 'defaultEffort': 'high',
          'aliases': ['large'], 'useFor': 'most work'}
 DEEP = {'driver': 'claudeAgent', 'model': 'example-deep-2', 'efforts': ['high'], 'aliases': ['deep']}
@@ -64,6 +75,9 @@ class Guard(unittest.TestCase):
         self.policy_path = os.path.join(self.dir, 'policy.json')
         self.machine({'policyFile': self.policy_path})
         self.policy(POLICY)
+        self.t3_path = os.path.join(self.dir, 't3-policy.json')   # T3's managed policy: none until a test writes it
+        self.state_path = os.path.join(self.dir, 'server-runtime.json')   # a T3 server's runtime state (t3_server)
+        self.marker_path = os.path.join(self.dir, 'fork-capabilities.json')   # its marker beside it (t3_marker)
         self.records = []   # the owner's record (the system log outside tests)
 
     def close(self):
@@ -85,7 +99,7 @@ class Guard(unittest.TestCase):
         out = io.StringIO()
         text = raw if raw is not None else json.dumps({'tool_name': tool, 'tool_input': tool_input or {}})
         self.assertEqual(self.m.run_hook(io.StringIO(text), out, self.machine_path, os.getuid(),
-                                           record=self.records.append), 0)
+                                           record=self.records.append, t3_policy=self.t3_path), 0)
         return json.loads(out.getvalue())['hookSpecificOutput'] if out.getvalue() else None
 
     def refused(self, tool, tool_input=None, *parts, raw=None):
@@ -202,6 +216,368 @@ class Guard(unittest.TestCase):
     def test_enforce_with_no_rows_refuses_every_pick(self):
         self.policy({'mode': 'enforce', 'allow': []})
         self.refused('Agent', {'model': 'large', 'effort': 'high'}, 'none (every pick is refused)')
+
+    # ---- the tools the T3 server checks, while T3's managed policy locks its policy and the running T3 loaded it
+
+    def t3_lock(self, mode='enforce', rows=None, locked=True, file_mode=0o644):
+        """T3's managed policy, locking modelPolicy at `mode` with `rows` (rows within the guard's by default)."""
+        rows = rows if rows is not None else [{'driver': 'claudeAgent', 'model': 'example-large-1',
+                                               'efforts': ['high']}]
+        self.write(self.t3_path, {'schemaVersion': 1, 'organization': 'Owner', 'settings': {
+            'modelPolicy': {'value': {'mode': mode, 'allow': rows}, 'locked': locked}}})
+        os.chmod(self.t3_path, file_mode)
+
+    def t3_server(self, after=10, source=None, pid=None, named=True, marker=True):
+        """A running T3 server that loaded `source` (the lock by default), started `after` seconds after the lock
+        last changed (negative: before) and wrote the marker that it checks the server routes itself (unless
+        `marker` is false), named in the machine file unless `named` is false."""
+        state = self.state_path
+        self.write(state, {'version': 1, 'pid': pid or os.getpid(), 'port': 1, 'origin': 'http://127.0.0.1:1',
+                           'startedAt': '2026-01-01T00:00:00Z', 'managedPolicy': {
+                               'source': source or self.t3_path, 'organization': 'Owner', 'fingerprint': 'x'}})
+        self.machine(dict({'policyFile': self.policy_path}, **({'t3ServerStates': [state]} if named else {})))
+        def started(_pid):
+            st = os.stat(self.t3_path)
+            return max(st.st_mtime, st.st_ctime) + after
+        patcher = mock.patch.object(self.m, 'process_started', started)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        if os.path.lexists(self.marker_path):
+            os.unlink(self.marker_path)
+        if marker and os.path.exists(self.t3_path):
+            self.t3_marker(pid or os.getpid())
+
+    def t3_marker(self, pid, data=None, written=1):
+        """The marker the T3 server writes beside its runtime state at start, `written` seconds after it started."""
+        self.write(self.marker_path, data if data is not None else {
+            'version': 1, 'pid': pid, 'modelPolicyRoutes': ['delegate_task', 'create_threads']})
+        when = self.m.process_started(pid) + written
+        os.utime(self.marker_path, (when, when))
+
+    def lock_reason(self):
+        return self.m.server_lock(self.m.parse_policy(json.dumps(POLICY), 'p'), self.t3_path, os.getuid(),
+                                  [os.path.join(self.dir, 'server-runtime.json')])
+
+    OUTSIDE = {'task': 'x', 'target': {'model': 'other', 'options': {'effort': 'high'}}}
+    OUTSIDE_SELECTION = {'modelSelection': {'model': 'other', 'options': {'effort': 'high'}}}
+
+    def test_a_server_route_is_left_to_t3_while_its_loaded_managed_policy_locks_it(self):
+        """The T3 server checks delegate_task and create_threads against the locked policy, which an agent cannot
+        change: the guard's copy of the check would only repeat it. Every other checked tool stays the guard's."""
+        self.t3_lock()
+        self.t3_server()
+        for tool in ('delegate_task', 'create_threads'):
+            self.assertIsNone(self.hook(f'mcp__t3-code__{tool}', self.OUTSIDE), tool)
+        self.passed('mcp__t3-code__delegate_task', self.delegate(GOOD_TARGET))
+        self.refused('Agent', {'model': 'other', 'effort': 'high'}, "model 'other'")
+        self.refused('mcp__t3-code__t3_project_create', {'defaultModelSelection': {'model': 'other'}}, "'other'")
+        self.refused('mcp__t3-code__schedule_task', {'model': 'other'}, 'takes no model')
+        # A lock at a stricter mode than the guard's counts too, and so does a lock with no rows (T3 refuses all).
+        self.policy(dict(POLICY, mode='advise'))
+        self.assertIsNone(self.hook('mcp__t3-code__delegate_task', self.OUTSIDE))
+        self.policy(POLICY)
+        self.t3_lock(rows=[])
+        self.t3_server()
+        self.assertIsNone(self.hook('mcp__t3-code__delegate_task', self.OUTSIDE))
+
+    def test_routes_a_client_without_a_calling_thread_reaches_stay_the_guards(self):
+        """The server checks launch, configure and a fork only from an agent's thread: a Claude Code session T3 did
+        not open reaches T3's MCP without one, and the server reads it as the owner. So the guard keeps them."""
+        self.t3_lock()
+        self.t3_server()
+        # Even a server that says it checks all five routes: it cannot check a client without a calling thread.
+        self.t3_marker(os.getpid(), {'version': 1, 'pid': os.getpid(), 'modelPolicyRoutes': [
+            'delegate_task', 'create_threads', 't3_thread_launch', 't3_thread_configure', 't3_thread_transfer']})
+        for tool in ('t3_thread_launch', 't3_thread_configure'):
+            self.refused(f'mcp__t3-code__{tool}', self.OUTSIDE_SELECTION, "model 'other'")
+            self.passed(f'mcp__t3-code__{tool}', {'modelSelection': GOOD_TARGET})
+        self.refused('mcp__t3-code__t3_thread_transfer', {'threadId': 't', 'action': 'fork'}, 'source thread')
+        self.passed('mcp__t3-code__t3_thread_transfer', {'threadId': 't', 'action': 'merge_back',
+                                                         'targetThreadId': 'u'})
+
+    def test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes(self):
+        """Fail closed: each state where an agent could turn the server's check off, where the running T3 has not
+        loaded the lock, or where it would allow more than the guard does, keeps the guard's own check. The allowed
+        pick passes in each."""
+        tool = 'mcp__t3-code__delegate_task'
+        link = os.path.join(self.dir, 'elsewhere.json')
+        def locked(**kw):
+            self.t3_lock(**kw)
+            self.t3_server()
+        states = {
+            'missing': lambda: self.t3_server(),
+            'not locked': lambda: locked(locked=False),
+            'writable by others': lambda: locked(file_mode=0o666),
+            'a link': lambda: (locked(), os.rename(self.t3_path, link), os.symlink(link, self.t3_path)),
+            'not JSON': lambda: (self.t3_server(), self.write(self.t3_path, '{"settings":')),
+            'no modelPolicy': lambda: (self.t3_server(), self.write(self.t3_path, {'schemaVersion': 1,
+                                                                                   'settings': {}})),
+            'no mode': lambda: (self.t3_server(), self.write(self.t3_path, {'settings': {'modelPolicy': {
+                'value': {'allow': []}, 'locked': True}}})),
+            'locked at advise': lambda: locked(mode='advise'),
+            'locked at off': lambda: locked(mode='off'),
+            'a row the guard lacks': lambda: locked(rows=[{'driver': 'claudeAgent', 'model': 'other',
+                                                           'efforts': ['high']}]),
+            'an effort the guard lacks': lambda: locked(rows=[{'driver': 'claudeAgent', 'model': 'example-large-1',
+                                                               'efforts': ['high', 'max']}]),
+            'no efforts under a guard row with efforts': lambda: locked(rows=[{'driver': 'claudeAgent',
+                                                                               'model': 'example-large-1'}]),
+            'no T3 server named': lambda: (self.t3_lock(), self.t3_server(named=False)),
+            'the named T3 server is not running': lambda: (self.t3_lock(), self.t3_server(pid=2 ** 22 + 12345)),
+            'the T3 server loaded another policy': lambda: (self.t3_lock(), self.t3_server(source=link)),
+            'the T3 server started before the lock changed': lambda: (self.t3_lock(), self.t3_server(after=-1)),
+        }
+        for state, make in states.items():
+            with self.subTest(state=state):
+                for path in (self.t3_path, link):
+                    if os.path.lexists(path):
+                        os.unlink(path)
+                make()
+                self.refused(tool, self.OUTSIDE, "model 'other'")
+                self.passed(tool, self.delegate(GOOD_TARGET))
+
+    def test_a_locked_row_without_efforts_leaves_a_pick_without_effort_to_the_guard(self):
+        """A row with efforts refuses a pick that names none; a T3 row without efforts lets it run at the model's
+        default. So such a lock does not cover the guard's row, and the guard keeps refusing the pick."""
+        tool = 'mcp__t3-code__delegate_task'
+        no_effort = self.delegate({'model': 'example-large-1', 'options': {'ultracode': False}})
+        self.refused(tool, no_effort, 'no effort')
+        self.t3_lock(rows=[{'driver': 'claudeAgent', 'model': 'example-large-1'}])
+        self.t3_server()
+        self.refused(tool, no_effort, 'no effort')
+        self.passed(tool, self.delegate(GOOD_TARGET))
+        # Without efforts on both sides it is covered.
+        self.t3_lock(rows=[{'driver': 'otherDriver', 'model': 'example-plain'}])
+        self.t3_server()
+        self.assertIsNone(self.m.server_lock(self.m.parse_policy(json.dumps(POLICY), 'p'), self.t3_path, os.getuid(),
+                                             [os.path.join(self.dir, 'server-runtime.json')]))
+
+    def test_a_lock_file_root_does_not_own_is_no_lock(self):
+        self.t3_lock()
+        self.t3_server()
+        servers = [os.path.join(self.dir, 'server-runtime.json')]
+        self.assertIsNone(self.m.server_lock(POLICY, self.t3_path, os.getuid(), servers))
+        self.assertIn('not usable', self.m.server_lock(POLICY, self.t3_path, os.getuid() + 1, servers))
+
+    def test_the_self_check_says_who_checks_the_server_routes(self):
+        """The owner sees whether the lock step is done, T3 restarted after it included: until then the guard checks
+        the server's routes too."""
+        lock = self.dir + self.m.t3_policy_path()
+        def check():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.m.self_check(self.machine_path, os.getuid(), prefix=self.dir)
+            return out.getvalue()
+        self.assertIn('T3 server routes (delegate_task, create_threads)', check())
+        self.assertIn('checked here too', check())
+        os.makedirs(os.path.dirname(lock), mode=0o755, exist_ok=True)
+        self.t3_path = lock
+        self.t3_lock()
+        self.t3_server(after=-1)
+        self.assertIn('restart T3 first', check())
+        self.t3_server()
+        self.assertIn('left to T3, whose managed policy locks modelPolicy', check())
+
+    def test_a_t3_server_that_does_not_say_it_checks_the_routes_keeps_the_guards_check(self):
+        """A T3 build from before the server checked these routes also loads the lock and names it in its runtime
+        state. Only the marker the checking build writes at start, for its own process, lets the guard stand
+        down: one missing, from another process, older than this start, or naming fewer routes does not."""
+        tool = 'mcp__t3-code__delegate_task'
+        good = {'version': 1, 'pid': os.getpid(), 'modelPolicyRoutes': ['delegate_task', 'create_threads']}
+        elsewhere = os.path.join(self.dir, 'marker-elsewhere.json')
+        states = {
+            'no marker': lambda: os.unlink(self.marker_path),
+            'another process': lambda: self.t3_marker(os.getpid(), dict(good, pid=os.getpid() + 1)),
+            'pid true': lambda: self.t3_marker(os.getpid(), dict(good, pid=True)),
+            'written before this process started': lambda: self.t3_marker(os.getpid(), written=-5),
+            'one route only': lambda: self.t3_marker(os.getpid(), dict(good, modelPolicyRoutes=['delegate_task'])),
+            'routes not a list': lambda: self.t3_marker(os.getpid(), dict(good, modelPolicyRoutes=1)),
+            'another version': lambda: self.t3_marker(os.getpid(), dict(good, version=2)),
+            'not JSON': lambda: self.t3_marker(os.getpid(), '{'),
+            'a link': lambda: (os.rename(self.marker_path, elsewhere), os.symlink(elsewhere, self.marker_path)),
+            'a folder': lambda: (os.unlink(self.marker_path), os.mkdir(self.marker_path)),
+        }
+        for state, make in states.items():
+            with self.subTest(state=state):
+                self.t3_lock()
+                if os.path.isdir(self.marker_path) and not os.path.islink(self.marker_path):
+                    os.rmdir(self.marker_path)
+                self.t3_server()
+                self.assertIsNone(self.hook(tool, self.OUTSIDE), 'the marker as written stands the guard down')
+                make()
+                self.refused(tool, self.OUTSIDE, "model 'other'")
+                self.passed(tool, self.delegate(GOOD_TARGET))
+                self.assertIn('did not say it checks delegate_task, create_threads itself', self.lock_reason())
+                if os.path.lexists(elsewhere):
+                    os.unlink(elsewhere)
+
+    def test_only_t3s_own_server_name_is_left_to_t3(self):
+        """Another MCP server's tool of the same name never reaches T3: the guard checks it whatever T3 locks."""
+        self.t3_lock()
+        self.t3_server()
+        self.assertIsNone(self.hook('mcp__t3-code__delegate_task', self.OUTSIDE))
+        threads = {'threads': [{'target': self.OUTSIDE['target']}]}
+        for name in ('mcp__other__delegate_task', 'mcp__t3__create_threads', 'mcp__a__t3-code__delegate_task',
+                     'mcp__t3-code-2__create_threads'):
+            self.refused(name, threads if name.endswith('create_threads') else self.OUTSIDE, "model 'other'")
+
+    def test_a_lock_check_that_breaks_keeps_the_guards_check(self):
+        """Fail closed for the guard's own check, and never block an allowed call by crashing."""
+        tool = 'mcp__t3-code__delegate_task'
+        cfg, policy = self.m.load_policy(self.machine_path, os.getuid())
+        def broken(*_):
+            raise RuntimeError('broken')
+        self.assertEqual(self.m.decide({'tool_name': tool, 'tool_input': self.OUTSIDE}, lambda: (cfg, policy),
+                                       None, broken)['hookSpecificOutput']['permissionDecision'], 'deny')
+        allowed = self.m.decide({'tool_name': tool, 'tool_input': self.delegate(GOOD_TARGET)},
+                                lambda: (cfg, policy), None, broken)
+        self.assertNotIn('permissionDecision', (allowed or {}).get('hookSpecificOutput', {}))
+
+    UNREADABLE = {
+        # the hook policy's own keys, copied into T3's
+        'a row with aliases': ([dict(driver='claudeAgent', model='example-large-1', efforts=['high'],
+                                     aliases=['large'])], "allow[0] has a key T3 does not read ('aliases')"),
+        'a row with ultracodeOption': ([dict(driver='claudeAgent', model='example-large-1', efforts=['high'],
+                                             ultracodeOption=False)], "('ultracodeOption')"),
+        'no efforts in the list': ([dict(driver='claudeAgent', model='example-large-1', efforts=[])],
+                                   'efforts must be a list of one or more'),
+        'an effort that is blank': ([dict(driver='claudeAgent', model='example-large-1', efforts=[' '])],
+                                    'efforts must be a list of one or more'),
+        'a default effort not in the list': ([dict(driver='claudeAgent', model='example-large-1', efforts=['high'],
+                                                   defaultEffort='medium')], 'defaultEffort must be one of'),
+        'a model with spaces around it': ([dict(driver='claudeAgent', model=' example-large-1', efforts=['high'])],
+                                          'model must be a non-empty text'),
+        'a driver that is no driver name': ([dict(driver='claude agent', model='example-large-1',
+                                                  efforts=['high'])], 'driver must be a driver name'),
+        'a driver too long': ([dict(driver='c' * 65, model='example-large-1', efforts=['high'])],
+                              'driver must be a driver name'),
+        'useFor not a text': ([dict(driver='claudeAgent', model='example-large-1', efforts=['high'], useFor=1)],
+                              'useFor must be a text'),
+        'a row not an object': (['x'], 'allow[0] is not a JSON object'),
+    }
+
+    def test_a_locked_value_t3_reads_as_unreadable_is_no_lock(self):
+        """T3 starts on a locked value it cannot read and reads it as `unreadable`: enforce with nothing allowed.
+        That is not the guard's policy, so the guard keeps checking, and the self-check says why."""
+        tool = 'mcp__t3-code__delegate_task'
+        def value(v):
+            self.write(self.t3_path, {'schemaVersion': 1, 'settings': {'modelPolicy': {'value': v, 'locked': True}}})
+            self.t3_server()
+        cases = {name: (lambda rows=rows: value({'mode': 'enforce', 'allow': rows}), reason)
+                 for name, (rows, reason) in self.UNREADABLE.items()}
+        cases.update({
+            'a key beside mode and allow': (lambda: value({'mode': 'enforce', 'allow': [], 'version': 1}),
+                                            "its value has a key T3 does not read ('version')"),
+            # T3 refuses to start on {mode} alone (it writes allow back): no running T3 has this lock
+            'allow left out': (lambda: value({'mode': 'enforce'}), 'its value needs a list of allow rows'),
+            'mode left out': (lambda: value({'allow': []}), 'its value needs a mode of off, advise, enforce'),
+            'not an object': (lambda: value([]), 'its value is not a JSON object'),
+            'a key twice': (lambda: (value({'mode': 'enforce', 'allow': []}), self.write(self.t3_path, (
+                '{"settings": {"modelPolicy": {"locked": true, "value": {"mode": "enforce", "allow": [], '
+                '"allow": []}}}}'))), "key 'allow' is given twice"),
+            'nested too deep': (lambda: (value({'mode': 'enforce', 'allow': []}),
+                                         self.write(self.t3_path, '[' * 100000 + ']' * 100000)), 'not JSON'),
+        })
+        for name, (make, reason) in cases.items():
+            with self.subTest(name):
+                make()
+                self.refused(tool, self.OUTSIDE, "model 'other'")
+                self.passed(tool, self.delegate(GOOD_TARGET))
+                self.assertIn(reason, self.lock_reason())
+        # the self-check says why, and counts an unreadable lock as a problem: T3 refuses every agent pick
+        lock = self.dir + self.m.t3_policy_path()
+        os.makedirs(os.path.dirname(lock), mode=0o755, exist_ok=True)
+        self.t3_path = lock
+        value({'mode': 'enforce', 'allow': self.UNREADABLE['no efforts in the list'][0]})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.m.self_check(self.machine_path, os.getuid(), prefix=self.dir), 1)
+        self.assertIn('PROBLEM: ' + lock + ' locks a modelPolicy T3 reads as unreadable (allow[0]: efforts must',
+                      out.getvalue())
+        # A value T3 reads as written counts, every optional key included.
+        value({'mode': 'enforce', 'allow': [{'driver': 'claudeAgent', 'model': 'example-large-1',
+                                             'efforts': ['high'], 'defaultEffort': 'high', 'useFor': ''}]})
+        self.assertIsNone(self.m.server_lock(self.m.parse_policy(json.dumps(POLICY), 'p'), lock, os.getuid(),
+                                             [os.path.join(self.dir, 'server-runtime.json')]))
+
+    def test_a_runtime_state_that_cannot_be_read_keeps_the_guards_check_and_never_hangs_or_crashes(self):
+        """The runtime state is a file an agent can write: a pipe there must not hang the hook, and a path or
+        document the guard cannot read must not crash it (which blocks every call). Each keeps the guard's check."""
+        tool = 'mcp__t3-code__delegate_task'
+        class Hung(BaseException):
+            pass
+        def stop(*_):
+            raise Hung()
+        good = os.path.join(self.dir, 'state-elsewhere.json')
+        def state(data):
+            self.write(self.state_path, data)
+        cases = {
+            'a pipe': lambda: (os.unlink(self.state_path), os.mkfifo(self.state_path)),
+            'a link to a good state': lambda: (os.rename(self.state_path, good), os.symlink(good, self.state_path)),
+            'a folder': lambda: (os.unlink(self.state_path), os.mkdir(self.state_path)),
+            'a NUL in the source': lambda: state({'version': 1, 'pid': os.getpid(),
+                                                  'managedPolicy': {'source': self.t3_path + '\0x'}}),
+            'nested too deep': lambda: state('[' * 100000 + ']' * 100000),
+            'a key twice': lambda: state('{"pid": 1, "pid": %d}' % os.getpid()),
+            'too large': lambda: state(' ' * (2 << 20) + '{}'),
+            'a source that is not text': lambda: state({'version': 1, 'pid': os.getpid(), 'managedPolicy': {
+                'source': ['x']}}),
+        }
+        for name, make in cases.items():
+            with self.subTest(name):
+                self.t3_lock()
+                if os.path.isdir(self.state_path) and not os.path.islink(self.state_path):
+                    os.rmdir(self.state_path)
+                if os.path.lexists(self.state_path):
+                    os.unlink(self.state_path)
+                self.t3_server()
+                make()
+                old = signal.signal(signal.SIGALRM, stop)
+                signal.setitimer(signal.ITIMER_REAL, 5)
+                try:
+                    self.refused(tool, self.OUTSIDE, "model 'other'")
+                    self.passed(tool, self.delegate(GOOD_TARGET))
+                    self.assertIsInstance(self.lock_reason(), str)
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        self.m.self_check(self.machine_path, os.getuid(), prefix=self.dir)
+                except Hung:
+                    self.fail('the hook waited on the runtime state')
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                    signal.signal(signal.SIGALRM, old)
+                if os.path.lexists(good):
+                    os.unlink(good)
+
+    def test_a_lock_put_in_place_with_an_old_time_counts_from_when_it_changed(self):
+        """`cp -p`, `rsync -t` and `install -p` keep the file's old mtime; its ctime is when it changed. A T3 that
+        started between the two still runs the old policy, so the guard keeps checking."""
+        tool = 'mcp__t3-code__delegate_task'
+        self.t3_lock()
+        old = os.stat(self.t3_path).st_mtime - 1000
+        os.utime(self.t3_path, (old, old))
+        self.t3_server()
+        between = mock.patch.object(self.m, 'process_started', lambda _pid: old + 10)
+        with between:
+            self.t3_marker(os.getpid())
+            self.refused(tool, self.OUTSIDE, "model 'other'")
+            self.assertIn('started before', self.lock_reason())
+
+    def test_on_macos_the_start_is_read_from_the_elapsed_time_in_any_time_zone(self):
+        """`ps -o lstart` prints the system zone's time, which the hook's own TZ reads an hour or more off; the
+        elapsed time has no zone. The earliest start it allows is taken (ps counts whole seconds)."""
+        def ps(out):
+            return mock.patch.object(self.m.subprocess, 'run', lambda *a, **k: types.SimpleNamespace(stdout=out))
+        cases = {'01-02:03:04\n': 93784, '02:03:04': 7384, '03:04': 184, ' 00:07 ': 7}
+        for zone in ('UTC', 'America/Los_Angeles', 'Europe/Copenhagen'):
+            for out, elapsed in cases.items():
+                with self.subTest(zone=zone, out=out), mock.patch.dict(os.environ, {'TZ': zone}), \
+                        mock.patch.object(self.m.sys, 'platform', 'darwin'), ps(out), \
+                        mock.patch.object(self.m.time, 'time', lambda: 2_000_000_000.0):
+                    self.assertEqual(self.m.process_started(1234), 2_000_000_000.0 - elapsed - 1)
+        for out in ('', 'Fri Nov 28 10:00:00 2026', '1:2:3:4', 'x'):
+            with self.subTest(out=out), mock.patch.object(self.m.sys, 'platform', 'darwin'), ps(out):
+                self.assertIsNone(self.m.process_started(1234))
 
     # ---- delegate_task, create_threads, t3_thread_launch, t3_thread_configure
 
@@ -1990,8 +2366,58 @@ class Contract(unittest.TestCase):
     }
 
     def read_repo(self, path):
+        # CI's Fork kit job checks out only the files its sparse list names: a file read here must be in it.
+        self.assertTrue(in_kit_checkout(path), f"{path}: add it to the Fork kit job's checkout in fork-tests.yml")
         with open(os.path.join(REPO, *path.split('/')), encoding='utf-8') as f:
             return f.read()
+
+    def test_the_routes_marker_is_the_one_the_server_writes(self):
+        """The marker's name and routes, as apps/server/src/fork/modelPolicyRoutesMarker.ts writes them."""
+        src = self.read_repo('apps/server/src/fork/modelPolicyRoutesMarker.ts')
+        self.assertIn(f'export const MODEL_POLICY_ROUTES_MARKER = "{model_guard.T3_ROUTES_MARKER}";', src)
+        routes = re.search(r'MODEL_POLICY_CHECKED_ROUTES = \[([^\]]*)\]', src).group(1)
+        self.assertEqual(tuple(re.findall(r'"([^"]+)"', routes)), model_guard.SERVER_CHECKED_TOOLS)
+        self.assertIn('version: 1,', src)
+        self.assertIn('modelPolicyRoutes: [...MODEL_POLICY_CHECKED_ROUTES]', src)
+
+    def test_the_lock_steps_machine_file_writer_names_each_home_once(self):
+        """docs/fork/model-policy.md's writer, run as written against a scratch machine file: a second home is added
+        beside the first, a home named already is not added again, and a T3_HOME left empty or not a T3 home is
+        refused with the reason, the file unchanged."""
+        doc = self.read_repo('docs/fork/model-policy.md')
+        step = re.search(r"\nT3_HOME=/path/to/t3-home\nT3_HOME=\"\$T3_HOME\" python3 - <<'PY'\n(.*?)\nPY\n", doc, re.S)
+        self.assertIsNotNone(step, 'the lock step no longer has its machine-file writer')
+        work = os.path.realpath(tempfile.mkdtemp(prefix='model-guard-lock-step-'))
+        self.addCleanup(shutil.rmtree, work, True)
+        machine = os.path.join(work, 'machine.json')
+        script = step.group(1)
+        self.assertEqual(script.count("'/etc/fork-kit/machine.json'"), 1)
+        script = script.replace("'/etc/fork-kit/machine.json'", repr(machine))
+        homes = []
+        for name in ('a', 'b'):
+            homes.append(os.path.join(work, name))
+            os.makedirs(os.path.join(homes[-1], 'userdata'))
+        with open(machine, 'w', encoding='utf-8') as f:
+            json.dump({'version': 1, 'model-guard': {'policyFile': '/p.json'}, 'other': {'k': 1}}, f)
+        def run(home):
+            return subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True, timeout=30,
+                                  env={'PATH': os.environ.get('PATH', ''), 'T3_HOME': home})
+        def states():
+            with open(machine, encoding='utf-8') as f:
+                data = json.load(f)
+            self.assertEqual(data['other'], {'k': 1})
+            self.assertEqual(data['model-guard']['policyFile'], '/p.json')
+            return data['model-guard']['t3ServerStates']
+        want = [os.path.join(h, 'userdata', 'server-runtime.json') for h in homes]
+        for home in (homes[0], homes[1], homes[0], homes[1]):
+            self.assertEqual(run(home).returncode, 0)
+        self.assertEqual(states(), want)
+        for home in ('', 'relative/home', os.path.join(work, 'missing')):
+            with self.subTest(home=home):
+                result = run(home)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('is not a T3 home', result.stderr)
+                self.assertEqual(states(), want)
 
     def test_each_built_in_driver_reads_its_effort_where_the_guard_looks(self):
         """#629 (major): the guard pins the effort id of each of T3's built-in drivers. Read from T3's code: the list
@@ -2074,6 +2500,88 @@ class Command(unittest.TestCase):
 
 # rule: (text in lib/model_guard.py, what it becomes, the test that must then fail)
 MUTATIONS = {
+    'the self-check names the lock': ("'left to T3, whose managed policy locks modelPolicy' if why is None",
+                                      "'left to T3, whose managed policy locks modelPolicy' if False",
+                                      'test_the_self_check_says_who_checks_the_server_routes'),
+    'server routes left to a locked T3 policy': ("    if _left_to_t3(tool, kind, cfg, policy, lock):\n        return None\n", "",
+        'test_a_server_route_is_left_to_t3_while_its_loaded_managed_policy_locks_it'),
+    'only the routes the server checks for every client': ("SERVER_CHECKED_TOOLS = ('delegate_task', 'create_threads')",
+        "SERVER_CHECKED_TOOLS = ('delegate_task', 'create_threads', 't3_thread_launch', 't3_thread_configure', 't3_thread_transfer')",
+        'test_routes_a_client_without_a_calling_thread_reaches_stay_the_guards'),
+    'only a server route is left to T3': ("if kind not in SERVER_CHECKED_TOOLS or tool != f'mcp__t3-code__{kind}'",
+        "if tool != f'mcp__t3-code__{kind}'", 'test_routes_a_client_without_a_calling_thread_reaches_stay_the_guards'),
+    "only T3's own server name is left to T3": (" or tool != f'mcp__t3-code__{kind}'", "",
+        'test_only_t3s_own_server_name_is_left_to_t3'),
+    'a lock check that breaks keeps the check': ("    except Exception:  # noqa: BLE001 - fail closed for the guard's own check",
+        "    except ZeroDivisionError:  # noqa: BLE001 - fail closed for the guard's own check",
+        'test_a_lock_check_that_breaks_keeps_the_guards_check'),
+    'the lock must say locked': ("entry.get('locked') is not True", "False",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the lock must have a mode': ("    if value.get('mode') not in MODES:\n", "    if False:\n",
+        'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    'the lock must name its allow rows': ("    if not isinstance(value.get('allow'), list):",
+        "    if not isinstance(value.get('allow', []), list):", 'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    'the lock value has only the keys T3 reads': ("        return f'its value has a key T3 does not read ({extra[0]!r})'",
+        "        pass", 'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    'a locked row has only the keys T3 reads': ("            return f'{where} has a key T3 does not read ({extra[0]!r})'",
+        "            pass", 'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    'a locked row lists one or more efforts': ("(not isinstance(efforts, list) or not efforts\n",
+        "(not isinstance(efforts, list)\n", 'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    "a locked row's default effort is one of its efforts": ("or (efforts is not None and row['defaultEffort'] not in efforts)",
+        "or False", 'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    'a locked text is as T3 trims it': ("js_trim(value) == value and ", "",
+        'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    'a locked driver is a driver name': ("or not T3_DRIVER.fullmatch(driver)", "",
+        'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    'the lock gives no key twice': (",\n                              object_pairs_hook=_no_duplicates)", ")",
+        'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    'the self-check counts an unreadable lock': ("            problems.append(why)    # T3 refuses", "            pass    # T3 refuses",
+        'test_a_locked_value_t3_reads_as_unreadable_is_no_lock'),
+    'the lock must be at least as strict': ("if MODES.index(value['mode']) < MODES.index(mode):", "if False:",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the locked rows must be within the guard rows': ("    if wider is not None:\n", "    if False:\n",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the locked efforts must be within the guard row': (" and all(e in h['efforts'] for e in efforts)", "",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'a locked row without efforts needs a guard row without': ("        return h['efforts'] is None\n", "        return True\n",
+        'test_a_locked_row_without_efforts_leaves_a_pick_without_effort_to_the_guard'),
+    'the lock file is read as a protected file': ("machine_file.read_protected_text(path, owner_uid=owner_uid)",
+        "open(path, encoding='utf-8').read()",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'a T3 server must be named': ("    if not servers:\n", "    servers = servers or []\n    if False:\n",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the named T3 server must run': ("or pid <= 0 or not _alive(pid):", "or pid <= 0:",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the T3 server must have loaded the lock': ("or os.path.realpath(source) != os.path.realpath(lock_path):", "or False:",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
+    'the lock changes when its ctime does': ("max(st.st_mtime, st.st_ctime)", "st.st_mtime",
+        'test_a_lock_put_in_place_with_an_old_time_counts_from_when_it_changed'),
+    'the T3 server must have written the marker': ("    except FileNotFoundError:\n        return old\n",
+        "    except FileNotFoundError:\n        return None\n",
+        'test_a_t3_server_that_does_not_say_it_checks_the_routes_keeps_the_guards_check'),
+    "the marker is the running server's": ("or marker.get('pid') != pid ", "",
+        'test_a_t3_server_that_does_not_say_it_checks_the_routes_keeps_the_guards_check'),
+    'the marker was written at this start': (" or marker_st.st_mtime < started", "",
+        'test_a_t3_server_that_does_not_say_it_checks_the_routes_keeps_the_guards_check'),
+    'a marker that cannot be read is said as one': ("    except (OSError, ValueError, RecursionError) as e:   # a marker there",
+        "    except ZeroDivisionError as e:   # a marker there",
+        'test_a_t3_server_that_does_not_say_it_checks_the_routes_keeps_the_guards_check'),
+    'the marker names both routes': (" or not all(t in routes for t in SERVER_CHECKED_TOOLS)", "",
+        'test_a_t3_server_that_does_not_say_it_checks_the_routes_keeps_the_guards_check'),
+    'the runtime files are read without waiting': ("os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))\n    try:\n        st = os.fstat(fd)",
+        "os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))\n    try:\n        st = os.fstat(fd)",
+        'test_a_runtime_state_that_cannot_be_read_keeps_the_guards_check_and_never_hangs_or_crashes'),
+    'the runtime files are not followed through a link': ("os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))\n    try:\n        st = os.fstat(fd)",
+        "os.O_RDONLY | os.O_NONBLOCK)\n    try:\n        st = os.fstat(fd)",
+        'test_a_runtime_state_that_cannot_be_read_keeps_the_guards_check_and_never_hangs_or_crashes'),
+    'a runtime file that breaks the reader is a reason': ("    except (OSError, ValueError, RecursionError, TypeError, OverflowError) as e:\n        return f'{state_path}: no running",
+        "    except (OSError, ValueError, TypeError, OverflowError) as e:\n        return f'{state_path}: no running",
+        'test_a_runtime_state_that_cannot_be_read_keeps_the_guards_check_and_never_hangs_or_crashes'),
+    'macOS reads the elapsed time': ("            return time.time() - (((days * 24 + hours) * 60 + minutes) * 60 + seconds) - 1",
+        "            return time.time() - (((days * 24 + hours) * 60 + minutes) * 60 + seconds)",
+        'test_on_macos_the_start_is_read_from_the_elapsed_time_in_any_time_zone'),
+    'the T3 server must have started after the lock changed': ("if started is None or started <= changed:", "if started is None:",
+        'test_without_a_usable_lock_the_guard_keeps_checking_the_server_routes'),
     'broken policy fails closed': ("        _record(record, payload, reason)\n        return _out('deny', reason)",
                                    "        _record(record, payload, reason)\n        return _out(None, reason)",
                                    'test_missing_policy_file_refuses_and_names_it'),
@@ -2207,9 +2715,10 @@ MUTATIONS = {
                            'test_refusals_and_advise_notes_are_recorded'),
     'record is cut': ('        record(line[:RECORD_MAX])', '        record(line)',
                       'test_refusals_and_advise_notes_are_recorded'),
-    'a failing record changes nothing': ('    except Exception:  # noqa: BLE001', '    except ZeroDivisionError:  # noqa: BLE001',
+    'a failing record changes nothing': ('    except Exception:  # noqa: BLE001 - the record is best effort',
+                                         '    except ZeroDivisionError:  # noqa: BLE001 - the record is best effort',
                                          'test_a_record_that_fails_never_changes_the_answer'),
-    'the hook records to the system log': ('owner_uid=0, record=syslog_record)', 'owner_uid=0, record=None)',
+    'the hook records to the system log': ('owner_uid=0, record=syslog_record, t3_policy=None)', 'owner_uid=0, record=None, t3_policy=None)',
                                            'test_the_default_record_is_the_system_log'),
     'Workflow: of[ is a member access': ("and (prev[1] != 'of' or k - 1 in of_words)", '',
                                          'test_workflow_of_and_keyword_properties_before_a_bracket'),
@@ -2291,7 +2800,8 @@ MUTATIONS = {
                       'False for a in aliases)', 'test_t3_model_list_drift_is_reported'),
     'the worst entry wins': ("            found = 'no list'", "            return 'no list'",
                              'test_t3_model_list_drift_is_reported'),
-    'no links': ("os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0)", 'os.O_RDONLY | os.O_NONBLOCK',
+    'no links': ("        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))",
+                 '        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)',
                  'test_a_t3_model_list_that_cannot_be_used_is_said'),
     'plain files only': ('        if not stat.S_ISREG(os.fstat(fd).st_mode):', '        if False:',
                          'test_a_t3_model_list_that_cannot_be_used_is_said'),
@@ -2342,7 +2852,8 @@ MUTATIONS = {
                                       'test_t3_model_lists_in_the_machine_file_are_checked'),
     'no NUL in the policy path': ("        if not os.path.isabs(v) or '\\0' in v:", '        if not os.path.isabs(v):',
                                   'test_t3_model_lists_in_the_machine_file_are_checked'),
-    'a pipe never blocks the read': ('os.O_RDONLY | os.O_NONBLOCK | ', 'os.O_RDONLY | ',
+    'a pipe never blocks the read': ('        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | ',
+                                     '        fd = os.open(path, os.O_RDONLY | ',
                                      'test_a_t3_model_list_that_cannot_be_used_is_said'),
     'the first entry with the option decides': ("            return 'option'\n", "            found = 'option'\n",
                                                 'test_t3_model_list_drift_is_reported'),

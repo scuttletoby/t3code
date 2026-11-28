@@ -13,7 +13,29 @@ the self-check are made from it:
 
 Every other tool passes untouched. This is version 0 of the fork's model policy: a hook on the agent's side. The T3
 server checks an agent's pick too, against its own setting (`modelPolicy`, **Settings → Fork → Model policy**, #731):
-`delegate_task`, `create_threads`, `t3_thread_launch` and `t3_thread_configure`. Give both the same rows.
+`delegate_task`, `create_threads`, `t3_thread_launch` and `t3_thread_configure`, and a thread fork
+(`t3_thread_transfer`) by its backstop. Give both the same rows.
+
+**Left to the T3 server once it is locked and loaded.** `delegate_task` and `create_threads` (`SERVER_CHECKED_TOOLS`),
+under T3's own server name (`mcp__t3-code__`; the same tool name on any other MCP server is checked as ever), pass
+the hook untouched while T3's managed policy (`/etc/t3code/policy.json` on Linux, `/Library/Application
+Support/T3Code/policy.json` on macOS) locks `modelPolicy` and the running T3 has loaded it. Then an agent cannot turn
+the server's check off, and each pick is checked once. On every call the hook reads that file, under the same rules as
+its own policy file, and the runtime state of each T3 server the machine file names (`t3ServerStates`, each T3 home's
+`userdata/server-runtime.json`). It fails closed: it keeps checking the two tools when the file is missing, not
+root-owned, writable by group or others, behind a link, not JSON (a key twice included), or not locked. It keeps
+checking them too when the locked value is one T3 reads as `unreadable` (a key T3 does not read, such as this hook's
+`aliases`, a missing `mode` or `allow`, an empty `efforts` list, a `defaultEffort` outside it; the self-check reports
+it, as T3 then refuses every agent pick on its routes), at a mode below the hook's (`advise` under an `enforce` hook,
+or `off`), or with a row or effort no row of the hook's policy covers. Finally, it keeps checking them when no server
+is named, or a named server is not running, did not load this file, started before the file last changed (its mtime
+or, for a file copied in with its old time, its ctime), or did not write `fork-capabilities.json` beside its runtime
+state at that start, naming its own process and both tools (a T3 from before the server checked both loads the lock
+too). T3 reads its managed policy only at start. The runtime files are read as plain files, not through a link and
+without waiting; one the hook cannot read keeps the check, and never crashes the hook. `t3_thread_launch`, `t3_thread_configure` and `t3_thread_transfer` stay the hook's in every case: the
+server does not check them for a client with no calling thread (a Claude Code session T3 did not open).
+`model-guard --self-check` prints which way it goes ("restart T3 first" until T3 has loaded the lock). The lock step
+is in [docs/fork/model-policy.md](../../docs/fork/model-policy.md).
 
 Linux, Python 3 standard library only. No state: the hook reads the machine file and the policy again on every call.
 
@@ -401,11 +423,12 @@ mode Advise in T3; both count from the next call.
    }
    ```
 
-   | Key                | Required | What                                                                    |
-   | ------------------ | -------- | ----------------------------------------------------------------------- |
-   | `policyFile`       | yes      | the policy; an absolute path                                            |
-   | `allowOtherHooks`  | no       | `true` accepts user and project hooks next to the guard (default false) |
-   | `t3ModelManifests` | no       | T3's model lists the self-check reads (#600); absolute paths            |
+   | Key                | Required | What                                                                                                                                                                           |
+   | ------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+   | `policyFile`       | yes      | the policy; an absolute path                                                                                                                                                   |
+   | `allowOtherHooks`  | no       | `true` accepts user and project hooks next to the guard (default false)                                                                                                        |
+   | `t3ModelManifests` | no       | T3's model lists the self-check reads (#600); absolute paths                                                                                                                   |
+   | `t3ServerStates`   | no       | each T3 home's `userdata/server-runtime.json`: proof that the running T3 loaded its managed policy and checks the two tools itself (docs/fork/model-policy.md); absolute paths |
 
    `t3ModelManifests` is needed when the policy has an `"ultracodeOption": false` row or a `claudeAgent` row with
    `efforts` (#643), which is nearly every policy, the example one too (the self-check reports it missing
