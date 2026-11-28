@@ -401,10 +401,10 @@
       ]
     },
     "apps/web/src/components/threadActionMenu.logic.ts": {
-      "why": "The thread menu gets \"Hand off now\" (handoff, HO5): one more menu id, one optional state field the menu's callers fill, and the item spread into the list; the item and its rules are in fork/handoff/handoffMenu.ts. The thread menu gets the MCP profile entry (MCP profile design PR 3): the thread's effective profile and, for a client that may change settings, the owner's pick or clear. One more menu id type, one optional state field the menu's callers fill, and the entry spread into the list before Copy; the entry and its rules are in fork/mcpProfile/threadMcpProfile.logic.ts.",
+      "why": "The thread menu gets \"Hand off now\" (handoff, HO5): one more menu id, one optional state field the menu's callers fill, and the item spread into the list; the item and its rules are in fork/handoff/handoffMenu.ts. The thread menu gets the MCP profile entry (MCP profile design PR 3): the thread's effective profile and, for a client that may change settings, the owner's pick or clear. One more menu id type, one optional state field the menu's callers fill, and the entry spread into the list before Copy; the entry and its rules are in fork/mcpProfile/threadMcpProfile.logic.ts. The thread menu gets Role (calm sidebar, #878 CAL4): one more menu id type, one optional state field the callers fill, and the entry spread in before Copy; the entry and its rules are in fork/calmSidebar/threadRoleMenu.logic.ts.",
       "added": [],
       "announced": {
-        "since": "2026-11-21",
+        "since": "2026-11-27",
         "added": [
           "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
           "| typeof ForkHandoffMenu.HAND_OFF_NOW; // Fork (HO5)",
@@ -413,15 +413,19 @@
           "import * as ForkMcpMenu from \"./fork/mcpProfile/threadMcpProfile.logic\"; // Fork (MCP profile)",
           "| ForkMcpMenu.McpProfileMenuId // Fork (MCP profile)",
           "readonly forkMcpProfile?: ForkMcpMenu.McpProfileMenuState | undefined; // Fork (MCP profile)",
-          "...ForkMcpMenu.mcpProfileMenuItems(state.forkMcpProfile), // Fork (MCP profile)"
+          "...ForkMcpMenu.mcpProfileMenuItems(state.forkMcpProfile), // Fork (MCP profile)",
+          "import * as ForkRoleMenu from \"./fork/calmSidebar/threadRoleMenu.logic\"; // Fork (calm sidebar)",
+          "| ForkRoleMenu.ThreadRoleMenuId // Fork (calm sidebar)",
+          "readonly forkThreadRole?: ForkRoleMenu.ThreadRoleMenuState | undefined; // Fork (calm sidebar)",
+          "...ForkRoleMenu.threadRoleMenuItems(state.forkThreadRole), // Fork (calm sidebar)"
         ]
       }
     },
     "apps/web/src/hooks/useThreadActionMenu.ts": {
-      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" before it builds the menu and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The thread menu's hook fills the MCP profile entry's state as it builds the menu and hands the entry's clicks to the fork, which saves that one thread's pick (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The state is read synchronously, so the menu still opens at once.",
+      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" before it builds the menu and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The thread menu's hook fills the MCP profile entry's state as it builds the menu and hands the entry's clicks to the fork, which saves that one thread's pick (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The state is read synchronously, so the menu still opens at once. The thread menu's hook fills the Role entry's state (read synchronously) and hands its picks to the fork, which saves one threadRoles pointer (calm sidebar, #878 CAL4; fork/calmSidebar/threadRoleMenu.ts).",
       "added": [],
       "announced": {
-        "since": "2026-11-21",
+        "since": "2026-11-27",
         "added": [
           "import * as ForkHandoffMenu from \"../components/fork/handoff/handoffMenu\"; // Fork (HO5)",
           "forkHandoff: await ForkHandoffMenu.readHandoffMenuState(threadRef), // Fork (HO5)",
@@ -429,15 +433,18 @@
           "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
           "import * as ForkMcp from \"../components/fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
           "forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)",
-          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, action)) return; // Fork (MCP profile)"
+          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, action)) return; // Fork (MCP profile)",
+          "import * as ForkRoles from \"../components/fork/calmSidebar/threadRoleMenu\"; // Fork (calm sidebar)",
+          "forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)",
+          "if (ForkRoles.runIfThreadRoleMenuAction(threadRef, action)) return; // Fork (calm sidebar)"
         ]
       }
     },
     "apps/web/src/components/Sidebar.tsx": {
-      "why": "The sidebar builds its own thread menu: it reads the handoff state for \"Hand off now\" before the menu opens (the menu is built in a callback that does not await) and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The sidebar builds its own thread menu: it fills the MCP profile entry's state and hands the entry's clicks to the fork, like the thread menu's hook (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts).",
+      "why": "The sidebar builds its own thread menu: it reads the handoff state for \"Hand off now\" before the menu opens (the menu is built in a callback that does not await) and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The sidebar builds its own thread menu: it fills the MCP profile entry's state and hands the entry's clicks to the fork, like the thread menu's hook (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The calm sidebar (#878 CAL3, CAL4; fork/calmSidebar): one hook call; its list input spread after upstream's `threads:` (empty while calm is off); its top rows (role rows drawn with the list's own row, the Other threads group) spread first into the rows; a role row's thread for the menu, which the list no longer holds; and the menu's Role entry, filled and run like the MCP profile entry's.",
       "added": [],
       "announced": {
-        "since": "2026-11-21",
+        "since": "2026-11-27",
         "added": [
           "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
           "const forkHandoff = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
@@ -446,7 +453,27 @@
           "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
           "import * as ForkMcp from \"./fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
           "forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)",
-          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, clicked.value)) return; // Fork (MCP profile)"
+          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, clicked.value)) return; // Fork (MCP profile)",
+          "import * as ForkRoles from \"./fork/calmSidebar/threadRoleMenu\"; // Fork (calm sidebar)",
+          "import { useForkCalmSidebar } from \"./fork/calmSidebar/useForkCalmSidebar\"; // Fork (calm sidebar)",
+          "// Fork (calm sidebar): role rows on top, other threads folded (fork/calmSidebar).",
+          "const forkCalm = useForkCalmSidebar({ listedThreads, scopedProjectKeys, isSearchingThreads });",
+          "...forkCalm.sidebarInput(routeRowThreadKey), // Fork (calm sidebar)",
+          "forkCalm.roleThread(threadKey) ?? // Fork (calm sidebar): role rows are not in the list",
+          "forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)",
+          "if (ForkRoles.runIfThreadRoleMenuAction(threadRef, clicked.value)) return; // Fork (calm sidebar)",
+          "...forkCalm.topRows(renderThreadRow), // Fork (calm sidebar)"
+        ]
+      }
+    },
+    "apps/web/src/components/chat/ChatHeader.tsx": {
+      "why": "The thread header shows the thread's role badge, Assistant or Orchestrator (calm sidebar, #878 CAL3): one import and one element after upstream's linked-environment badge, hidden while the title is renamed; the badge and its rule are in fork/calmSidebar/ForkThreadRoleBadge.tsx.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import { ForkThreadRoleBadge } from \"../fork/calmSidebar/ForkThreadRoleBadge\"; // Fork (calm sidebar)",
+          "{renamingTitle === null ? <ForkThreadRoleBadge threadRef={activeThreadRef} /> : null}"
         ]
       }
     },
