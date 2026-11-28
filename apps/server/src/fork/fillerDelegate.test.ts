@@ -180,6 +180,44 @@ describe("a slot filler start", () => {
   );
 });
 
+describe("a slot filler message to its parent", () => {
+  const note = { parentThreadId: parentId, requestId: "idle-alarm:1", text: "  slots idle: x  " };
+
+  it.effect("sent through the wake, under its request id, trimmed and cut to the limit", () =>
+    Effect.gen(function* () {
+      const w = world([started]);
+      expect(yield* FillerDelegate.runFillerNotify(w.value, note)).toEqual({ type: "sent" });
+      const long = "y".repeat(FillerDelegate.NOTIFY_TEXT_MAX + 50);
+      yield* FillerDelegate.runFillerNotify(w.value, {
+        ...note,
+        requestId: "idle-alarm:2",
+        text: long,
+      });
+      expect(w.wakes).toEqual([
+        "idle-alarm:1: slots idle: x",
+        `idle-alarm:2: ${"y".repeat(FillerDelegate.NOTIFY_TEXT_MAX)}`,
+      ]);
+      expect(w.asked).toEqual([]);
+    }),
+  );
+
+  it.effect("no slot, a gone parent or no text: refused, nothing sent", () =>
+    Effect.gen(function* () {
+      const full = world([started], { wake: "no_slot" });
+      const a = yield* FillerDelegate.runFillerNotify(full.value, note);
+      expect(a.type === "refused" && a.code).toBe("slots_full");
+      const gone = world([started], { parentGone: true });
+      const b = yield* FillerDelegate.runFillerNotify(gone.value, note);
+      expect(b.type === "refused" && b.code).toBe("parent_missing");
+      expect(gone.wakes).toEqual([]);
+      const empty = world([started]);
+      const c = yield* FillerDelegate.runFillerNotify(empty.value, { ...note, text: "   " });
+      expect(c.type === "refused" && c.code).toBe("bad_request");
+      expect(empty.wakes).toEqual([]);
+    }),
+  );
+});
+
 describe("the children list", () => {
   it("keeps the parent's own children, live or not, with their machine", () => {
     const base = {
@@ -336,6 +374,14 @@ const serve = (store: Store) =>
         client
           .execute(
             HttpClientRequest.post(path0, { headers }).pipe(
+              HttpClientRequest.bodyText(typeof body === "string" ? body : JSON.stringify(body)),
+            ),
+          )
+          .pipe(Effect.flatMap((r) => Effect.map(r.text, (text) => ({ status: r.status, text })))),
+      notify: (headers: Record<string, string>, body: unknown) =>
+        client
+          .execute(
+            HttpClientRequest.post(FillerDelegate.FILLER_NOTIFY_PATH, { headers }).pipe(
               HttpClientRequest.bodyText(typeof body === "string" ? body : JSON.stringify(body)),
             ),
           )
@@ -512,6 +558,38 @@ describe("the slot filler routes in the server's router", () => {
         expect((yield* server.get({})).status).toBe(401);
         store.shell = null;
         expect((yield* server.get({ authorization: "Bearer reader" })).status).toBe(404);
+      }),
+    ),
+  );
+
+  it.effect("a message to the parent: one dispatch per request id; refusals send nothing", () =>
+    provided(
+      Effect.gen(function* () {
+        const store: Store = { shell: { activeRunId: "run:1" }, dispatched: [], calls: [] };
+        const server = yield* serve(store);
+        const note = { parentThreadId: parentId, requestId: "idle-alarm:1", text: "slots idle: m" };
+        const sent = yield* server.notify(operate, note);
+        expect(sent.status).toBe(200);
+        expect(JSON.parse(sent.text)).toEqual({ state: "sent" });
+        expect(store.dispatched).toHaveLength(1);
+        expect(store.dispatched[0]).toMatchObject({
+          type: "message.dispatch",
+          threadId: parentId,
+          text: "slots idle: m",
+          dispatchMode: { type: "queue_after_active" },
+        });
+        // Asked again with the same id (a lost answer): still one message.
+        expect((yield* server.notify(operate, note)).status).toBe(200);
+        expect(store.dispatched).toHaveLength(1);
+        expect(store.calls).toEqual([]);
+        expect((yield* server.notify(operate, { ...note, text: " " })).status).toBe(400);
+        expect((yield* server.notify(operate, "{not json")).status).toBe(400);
+        expect((yield* server.notify({ authorization: "Bearer reader" }, note)).status).toBe(403);
+        expect((yield* server.notify({}, note)).status).toBe(401);
+        store.shell = null;
+        const gone = yield* server.notify(operate, { ...note, requestId: "idle-alarm:2" });
+        expect(gone.status).toBe(404);
+        expect(store.dispatched).toHaveLength(1);
       }),
     ),
   );

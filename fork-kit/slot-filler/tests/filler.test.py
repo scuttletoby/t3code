@@ -46,6 +46,8 @@ class FakeApi:
         self.settled = False    # the parent was settled by hand
         self.down = False
         self.crash_after_start = False
+        self.notified = []      # (parent, requestId, text) of every message sent
+        self.notify_refuse = None   # None: sent; 'gone': this T3 has no notify route; else a refusal code
 
     def children(self, parent):
         if self.down:
@@ -79,6 +81,15 @@ class FakeApi:
             self.crash_after_start = False
             raise Crash()
         return {'state': 'started', 'taskId': self.by_request[rid], 'childThreadId': 'thread-' + self.by_request[rid]}
+
+
+    def notify(self, parent, request_id, text):
+        if self.down or self.notify_refuse == 'gone':
+            raise sf.ApiError('POST /api/fork/delegate/notify: HTTP 404')
+        if self.notify_refuse:
+            return {'state': 'refused', 'code': self.notify_refuse, 'message': 'no slot to wake the parent'}
+        self.notified.append((parent, request_id, text))
+        return {'state': 'sent'}
 
 
 class FakeWorld:
@@ -154,11 +165,12 @@ class Base(unittest.TestCase):
         with open(os.path.join(self.caches, name + '.json'), 'w') as f:
             json.dump({'usageLimits': {'checkedAt': checked, 'windows': win}}, f)
 
-    def item(self, iid, kind='writer', priority=0, mtime=None, **extra):
+    def item(self, iid, kind='writer', priority=0, mtime=None, folder=None, **extra):
         brief = self.write(f'briefs/{iid}.md', f'Brief for {iid}.\n')
         it = {'id': iid, 'title': f'Task {iid}', 'kind': kind, 'brief': brief, 'priority': priority}
         it.update(extra)
-        path = os.path.join(self.q, iid + '.json')
+        os.makedirs(folder or self.q, exist_ok=True)
+        path = os.path.join(folder or self.q, iid + '.json')
         with open(path, 'w') as f:
             json.dump(it, f)
         if mtime is not None:
@@ -1002,6 +1014,260 @@ class Lenses(Base):
         self.assertEqual(self.started_ids(), [])
 
 
+class Backlog(Base):
+    """Standing work in backlog/ next to the queue folder: started only into slots no ready queue item fits."""
+
+    def setUp(self):
+        super().setUp()
+        self.backlog = os.path.join(self.tmp, 'backlog')
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.cfg['machines']['local']['maxAgents'] = 1
+
+    def standing(self, iid, **extra):
+        return self.item(iid, folder=self.backlog, **extra)
+
+    def settle_all(self):
+        for c in self.w.api.live:
+            c['status'], c['live'] = 'completed', False
+
+    def test_queue_items_go_before_backlog_items(self):
+        self.standing('b1', priority=99)
+        self.item('w1', priority=0)
+        self.run_filler()
+        self.assertEqual([b['task']['title'] for b in self.w.api.starts], ['Task w1'])
+        self.assertTrue(os.path.exists(os.path.join(self.backlog, 'b1.json')))
+        self.settle_all()                                   # w1 is done: its slot is free, the queue is empty
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['b1', 'w1'])
+        rec = json.load(open(os.path.join(self.q, 'started', 'b1.json')))
+        self.assertEqual(rec['backlog'], 'b1')
+        self.assertFalse(os.path.exists(os.path.join(self.backlog, 'b1.json')))   # a one-off moves like a queue item
+        self.assertTrue(any('started b1 from the backlog on local' in l for l in self.log_lines()))
+
+    def test_a_queue_item_that_cannot_run_does_not_hold_back_the_backlog(self):
+        self.item('w1', machines=['north'])                 # north has no slots: the queue has nothing for local
+        self.item('w2', readyWhen={'type': 'pr-merged', 'pr': 7})
+        self.w.prs[7] = {'state': 'OPEN', 'headRefOid': HEAD, 'checks': []}
+        self.standing('b1')
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['b1'])
+        self.assertTrue(os.path.exists(os.path.join(self.q, 'w1.json')))
+
+    def test_a_backlog_item_killed_half_way_is_never_started_twice(self):
+        self.standing('b1')
+        self.w.api.crash_after_start = True
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.w.now = lambda: NOW + datetime.timedelta(minutes=1)
+        self.run_filler()                                   # asks again with the same request id: the same task
+        self.settle_all()
+        self.run_filler()
+        self.run_filler()
+        self.assertEqual(len(self.w.api.by_request), 1)
+        self.assertEqual(self.started_ids(), ['b1'])
+        self.assertFalse(os.path.exists(os.path.join(self.backlog, 'b1.json')))
+
+    def test_a_repeating_item_runs_again_only_after_its_last_run_and_gap(self):
+        self.standing('r', repeat=30)
+        self.w.api.crash_after_start = True
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.run_filler()                                   # killed half-way: finished, not started again
+        self.assertEqual((len(self.w.api.by_request), self.started_ids()), (1, ['r.r1']))
+        self.cfg['machines']['local']['maxAgents'] = 3
+        self.run_filler()                                   # room, but r.r1 is still live
+        self.assertEqual(len(self.w.api.by_request), 1)
+        self.assertTrue(any('waiting backlog/r.json: its last run r.r1 is still live' in l for l in self.log_lines()))
+        self.settle_all()
+        self.w.now = lambda: NOW + datetime.timedelta(minutes=29)
+        self.run_filler()
+        self.assertEqual(len(self.w.api.by_request), 1)
+        self.assertTrue(any('repeats every 30 min, next after 2026-11-21T12:30:00Z' in l for l in self.log_lines()))
+        self.w.now = lambda: NOW + datetime.timedelta(minutes=31)
+        self.run_filler()
+        self.assertEqual(self.started_ids(), ['r.r1', 'r.r2'])
+        self.assertEqual(len({b['requestId'] for b in self.w.api.starts}), 2)
+        self.assertTrue(os.path.exists(os.path.join(self.backlog, 'r.json')))     # standing: it stays
+
+    def test_expired_broken_and_clashing_backlog_items_are_refused_and_kept(self):
+        self.standing('old', expires='2026-11-21T11:00:00Z')
+        self.standing('bad', repeat=-1)
+        self.standing('badexp', expires='tomorrow')
+        self.standing('w1')
+        self.item('w1', machines=['north'])
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        lines = self.log_lines()
+        for frag in ('not starting backlog/old.json: it expired at 2026-11-21T11:00:00Z',
+                     'refused backlog/bad.json: "repeat" must be', 'refused backlog/badexp.json: "expires" must be',
+                     'refused backlog/w1.json: the queue has an item with the same id'):
+            self.assertTrue(any(frag in l for l in lines), frag)
+        self.assertEqual(sorted(os.listdir(self.backlog)), ['bad.json', 'badexp.json', 'old.json', 'w1.json'])
+        self.run_filler()
+        self.assertEqual(self.log_lines(), lines)           # once, not every run
+        self.standing('later', expires='2026-11-22T00:00:00Z')
+        self.run_filler()
+        self.assertIn('later', self.started_ids())
+
+    def test_an_old_config_without_a_backlog_folder_or_alarm_settings_works(self):
+        cfg = {k: v for k, v in self.cfg.items() if k not in ('backlogDir', 'idleAlarm')}
+        path = self.write('old-cfg.json', json.dumps(cfg))
+        loaded = sf.load_config(path)
+        self.assertEqual(loaded['backlogDir'], self.backlog)                       # next to the queue folder
+        self.assertFalse(os.path.exists(self.backlog))
+        self.item('w1')
+        self.assertEqual(sf.run_once(loaded, self.w), 0)
+        self.assertEqual(self.started_ids(), ['w1'])
+        self.assertFalse(os.path.exists(self.backlog))                             # never made by the filler
+
+
+class IdleAlarm(Base):
+    """Free slots with nothing ready for them: one message to the parent after 3 runs in a row, at most every 15
+    minutes; never when the slots are full or no account has usage left there."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg['machines']['north']['maxAgents'] = 0
+
+    def at(self, minutes):
+        self.w.now = lambda: NOW + datetime.timedelta(minutes=minutes)
+
+    def runs(self, n, start=0.0):
+        for i in range(n):
+            self.at(start + i)
+            self.assertEqual(self.run_filler(), 0)
+
+    def alarm_lines(self):
+        return [l for l in self.log_lines() if 'idle alarm' in l]
+
+    def test_three_idle_runs_send_one_message_then_at_most_every_15_minutes(self):
+        self.runs(2)
+        self.assertEqual(self.w.api.notified, [])
+        self.runs(1, start=2)
+        self.assertEqual(len(self.w.api.notified), 1)
+        parent, rid, text = self.w.api.notified[0]
+        self.assertEqual(parent, 'thread-orch')
+        self.assertTrue(rid.startswith('idle-alarm:'))
+        self.assertIn('slots idle: local 3/3 agents (2/2 writers) free since 2026-11-21T12:00:00Z', text)
+        self.assertIn('queue+backlog empty for those machines', text)
+        self.assertNotIn('north', text)
+        self.runs(14, start=3)                              # still idle: no second message inside 15 minutes
+        self.assertEqual(len(self.w.api.notified), 1)
+        self.runs(1, start=17)
+        self.assertEqual(len(self.w.api.notified), 2)
+        self.assertEqual(len(self.alarm_lines()), 2)        # every alarm is logged
+        self.assertTrue(all('idle alarm sent to thread-orch' in l for l in self.alarm_lines()))
+
+    def test_a_busy_run_restarts_the_count(self):
+        self.runs(2)
+        self.w.api.live = [{'taskId': f't{i}', 'status': 'running', 'live': True, 'environmentId': None}
+                           for i in range(3)]
+        self.runs(1, start=2)                               # full now
+        self.assertEqual(sf.read_json(os.path.join(self.state, 'idle.json'))['machines'], {})
+        self.w.api.live = []
+        self.runs(2, start=3)
+        self.assertEqual(self.w.api.notified, [])
+        self.runs(1, start=5)
+        self.assertEqual(len(self.w.api.notified), 1)
+
+    def test_never_when_the_slots_are_full(self):
+        self.w.api.live = [{'taskId': f't{i}', 'status': 'running', 'live': True, 'environmentId': None}
+                           for i in range(3)]
+        self.runs(6)
+        self.assertEqual(self.w.api.notified, [])
+        self.assertEqual(self.alarm_lines(), [])
+
+    def test_never_when_the_usage_guard_would_refuse_every_account(self):
+        self.cfg['defaults']['account'] = ['claude-anne', 'claudeAgent']
+        self.meter('claude-anne', 99)
+        self.meter('claudeAgent', 96)
+        self.runs(6)
+        self.assertEqual(self.w.api.notified, [])
+        self.meter('claudeAgent', 10, age_min=200)          # an old reading refuses too
+        self.runs(4, start=6)
+        self.assertEqual(self.w.api.notified, [])
+        self.meter('claude-anne', 10)                       # one account has usage: idle slots are a bug again
+        self.runs(3, start=10)
+        self.assertEqual(len(self.w.api.notified), 1)
+
+    def test_a_ready_item_that_fits_is_waiting_not_idle_but_only_writers_with_no_writer_slot_is(self):
+        self.cfg['machines']['local']['capacity'] = {}
+        self.meter('claudeAgent', 99)                       # the item is ready and fits, its account is full
+        self.cfg['defaults']['account'] = ['claudeAgent', 'claude-anne']
+        self.meter('claude-anne', 99)
+        self.item('w1', account='claudeAgent')
+        self.runs(5)
+        self.assertEqual(self.w.api.notified, [])
+        os.remove(os.path.join(self.q, 'w1.json'))
+        self.meter('claudeAgent', 10)
+        self.w.api.live = [{'taskId': f't{i}', 'status': 'running', 'live': True, 'environmentId': None}
+                           for i in range(2)]           # 2 writers: the last slot takes only a lens or other
+        self.item('w2')
+        self.runs(3, start=5)
+        self.assertEqual(len(self.w.api.notified), 1)
+        self.assertIn('local 1/3 agents (0/2 writers) free', self.w.api.notified[0][2])
+
+    def test_a_t3_without_the_route_is_logged_and_the_run_goes_on(self):
+        self.w.api.notify_refuse = 'gone'
+        self.runs(3)
+        self.assertEqual(len(self.alarm_lines()), 1)
+        self.assertIn('idle alarm NOT delivered (POST /api/fork/delegate/notify: HTTP 404', self.alarm_lines()[0])
+        self.runs(5, start=3)                               # the 15 minutes hold for an undelivered alarm too
+        self.assertEqual(len(self.alarm_lines()), 1)
+        self.w.api.notify_refuse = 'slots_full'
+        self.runs(1, start=17)
+        self.assertEqual(len(self.alarm_lines()), 2)
+        self.assertIn('idle alarm NOT delivered (slots_full', self.alarm_lines()[-1])
+        self.item('w1')
+        self.runs(1, start=18)
+        self.assertEqual(self.started_ids(), ['w1'])
+
+    def test_a_stop_during_the_alarm_never_sends_a_second_one_within_15_minutes(self):
+        self.runs(2)
+        sent = self.w.api.notify
+        def crash(*a):
+            sent(*a)
+            raise Crash()
+        self.w.api.notify = crash
+        self.at(2)
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.w.api.notify = sent
+        self.runs(10, start=3)
+        self.assertEqual(len(self.w.api.notified), 1)
+
+    def test_idle_runs_go_quiet_and_status_shows_the_idle_line(self):
+        self.runs(3)
+        before, lines = self.snapshot(), self.log_lines()
+        self.runs(3, start=3)                               # the count stops at 3: nothing written
+        self.assertEqual((self.snapshot(), self.log_lines()), (before, lines))
+        import io
+        out = io.StringIO()
+        self.assertEqual(sf.status(self.cfg, self.w, out), 0)
+        text = out.getvalue()
+        self.assertIn('local: 0/3 agents, 0/2 writers live (T3); 3 agent / 2 writer slots free', text)
+        self.assertIn('queue: 0 item(s); backlog: 0 item(s)', text)
+        self.assertIn('idle: local 3/3 agents (2/2 writers) free since 2026-11-21T12:00:00Z, 3/3 runs with nothing '
+                      'ready for it; last alarm 2026-11-21T12:02:00Z', text)
+        self.assertEqual(self.snapshot(), before)           # status writes nothing
+        self.w.api.down = True
+        out = io.StringIO()
+        self.assertEqual(sf.status(self.cfg, self.w, out), 1)
+        self.assertIn('T3: no answer', out.getvalue())
+        self.assertIn('idle: local', out.getvalue())
+
+    def test_status_from_the_command_line(self):
+        self.cfg['server'] = {'url': 'http://127.0.0.1:9', 'tokenFile': self.write('tok', 'x'), 'timeoutSeconds': 2}
+        os.chmod(self.cfg['server']['tokenFile'], 0o600)
+        path = self.write('cfg.json', json.dumps(self.cfg))
+        r = subprocess.run([sys.executable, '-I', '-B', BIN, 'status', '--config', path], capture_output=True,
+                           text=True, timeout=60)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('T3: no answer', r.stdout)
+        self.assertIn('idle: none (last run); no alarm sent yet', r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'idle.json')))
+
+
 MUTATIONS = {
     'settled children free their slot': (
         "if not c.get('live', c.get('status') not in SETTLED):", "if False:",
@@ -1070,6 +1336,33 @@ MUTATIONS = {
         "        return bool(m.get('worktreeIsolation', not m.get('environmentId')))\n",
         "        return True\n",
         'LinkedMachines.test_worktree_isolation_on_a_machine_without_it_is_refused_when_read'),
+    'queue items go first': (
+        "        self.fill(queue, counts, pinned, full, wanted)     # queue items always go first\n"
+        "        self.fill(backlog, counts, pinned, full, wanted)",
+        "        self.fill(backlog, counts, pinned, full, wanted)     # swapped\n"
+        "        self.fill(queue, counts, pinned, full, wanted)",
+        'Backlog.test_queue_items_go_before_backlog_items'),
+    'a repeat waits for its live run': (
+        "                if last is not None and last.get('taskId') in self.live_tasks:\n",
+        "                if False:\n",
+        'Backlog.test_a_repeating_item_runs_again_only_after_its_last_run_and_gap'),
+    'a one-off backlog item moves to started': (
+        "                run, keep = dict(it, backlog=bid), False\n", "                run, keep = dict(it, backlog=bid), True\n",
+        'Backlog.test_a_backlog_item_killed_half_way_is_never_started_twice'),
+    'the alarm waits for its runs': (
+        "        ripe = [n for n, v in idle.items() if v['passes'] >= passes]\n",
+        "        ripe = list(idle)\n",
+        'IdleAlarm.test_three_idle_runs_send_one_message_then_at_most_every_15_minutes'),
+    'the alarm debounce': (
+        "0 <= now.timestamp() - last < every", "False",
+        'IdleAlarm.test_three_idle_runs_send_one_message_then_at_most_every_15_minutes'),
+    'no alarm without usage': (
+        "            if self.capacity(name, 'other') or self.startable(name):\n",
+        "            if self.capacity(name, 'other'):\n",
+        'IdleAlarm.test_never_when_the_usage_guard_would_refuse_every_account'),
+    'no alarm when full': (
+        "            if free_a == 0:\n                continue\n", "",
+        'IdleAlarm.test_never_when_the_slots_are_full'),
     'lens rounds': (
         "if len(rounds) >= int(lw.get('maxRounds', 2)):", "if False:",
         'Lenses.test_a_new_head_is_a_new_round_and_rounds_stop_at_the_limit'),

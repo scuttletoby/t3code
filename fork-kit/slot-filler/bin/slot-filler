@@ -21,7 +21,14 @@ Each run (one at a time: a flock; a second run exits at once):
     the first one with usage left on that machine is used, and kept in the marker. Each start writes the intent
     marker first, then asks
     POST /api/fork/delegate (the server's own delegate_task as the parent thread), then moves the item to started/
-    with the task id, then removes the marker.
+    with the task id, then removes the marker;
+ 5. when no ready queue item fits a free slot, starts the highest-priority ready item of the backlog folder
+    (backlogDir, default: `backlog/` next to the queue folder) by the same rules: standing items, optionally
+    `repeat` (minutes between runs) and `expires`. Queue items always go first;
+ 6. counts idle machines: free agent slots that no ready queue or backlog item fits, while a usage meter would
+    let an account start there. After idleAlarm.passes such runs in a row (3) it sends the parent ONE message
+    (POST /api/fork/delegate/notify), at most every idleAlarm.everyMinutes (15), and logs every alarm.
+`slot-filler status` prints the live counts from T3, the queue, backlog and in-flight starts, and an `idle` line.
 Every decision is one log line; a waiting item is logged again only when its reason changes, so a run with nothing
 new writes nothing. A broken, empty or incomplete queue file is refused (logged) and kept where it is.
 
@@ -38,6 +45,9 @@ DEFAULT_TASK = ('Act as the {kind} sub-agent for this task.\n\n'
 INLINE_TASK = ('Act as the {kind} sub-agent for this task. Your whole brief follows (from {brief}, a file on the '
                'machine that queued this task).\n\n{text}')
 MAX_INLINE = 100_000
+IDLE_PASSES = 3
+IDLE_EVERY_S = 15 * 60
+NOTIFY_MAX = 1500
 BACKOFF_FIRST_S = 60
 BACKOFF_MAX_S = 15 * 60
 # Refusals T3 gives before anything is dispatched: nothing started. Any other answer (orchestration_error, a linked
@@ -75,6 +85,17 @@ def write_json(path, data):
     os.replace(tmp, path)
 
 
+def parse_time(v):
+    """An ISO time with a zone as an aware datetime, else None."""
+    if not isinstance(v, str):
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(v.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return t if t.tzinfo else None
+
+
 def read_json(path):
     with open(path) as f:
         return json.load(f)
@@ -103,10 +124,11 @@ def load_config(path):
             raise ConfigError(f'config {path}: "{k}" is required')
     if not isinstance(c['machines'], dict) or not c['machines']:
         raise ConfigError(f'config {path}: "machines" must name at least one machine')
-    for k in ('queueDir', 'stateDir', 'log', 'lensRules'):
+    for k in ('queueDir', 'stateDir', 'log', 'lensRules', 'backlogDir'):
         if k in c:
             c[k] = expand(c[k])
     c.setdefault('log', os.path.join(c['stateDir'], 'filler.log'))
+    c.setdefault('backlogDir', os.path.join(os.path.dirname(c['queueDir'].rstrip('/')) or '.', 'backlog'))
     c.setdefault('defaults', {})
     c.setdefault('usage', {})
     if 'account' in c['defaults'] and account_list(c['defaults']['account']) is None:
@@ -175,6 +197,11 @@ class Api:
     def start(self, body):
         return self._call('POST', '/api/fork/delegate', body)[1]
 
+    def notify(self, parent, request_id, text):
+        """One message to the parent thread (queued after its turn): {'state': 'sent'} or a refusal."""
+        return self._call('POST', '/api/fork/delegate/notify',
+                          {'parentThreadId': parent, 'requestId': request_id, 'text': text})[1]
+
 
 def gh_json(cfg, args):
     cmd = list(cfg.get('gh') or ['env', '-u', 'GH_TOKEN', '-u', 'GITHUB_TOKEN', 'gh']) + args
@@ -209,6 +236,9 @@ class Filler:
         self.q = cfg['queueDir']
         self.state = cfg['stateDir']
         self.started_dir = os.path.join(self.q, 'started')
+        self.backlog_dir = cfg.get('backlogDir') or os.path.join(os.path.dirname(self.q.rstrip('/')), 'backlog')
+        self.idle_path = os.path.join(self.state, 'idle.json')
+        self.live_tasks = set()
         self.inflight_dir = os.path.join(self.state, 'inflight')
         self.requests_dir = os.path.join(self.state, 'requests')
         self.notes_path = os.path.join(self.state, 'notes.json')
@@ -245,15 +275,16 @@ class Filler:
             write_json(self.notes_path, self.notes)
 
     # --- queue -----------------------------------------------------------------------------------------------
-    def queue_files(self):
+    def queue_files(self, d=None):
+        d = d or self.q
         try:
-            names = sorted(n for n in os.listdir(self.q) if n.endswith('.json'))
-        except FileNotFoundError:
+            names = sorted(n for n in os.listdir(d) if n.endswith('.json'))
+        except (FileNotFoundError, NotADirectoryError):
             return []
-        return [os.path.join(self.q, n) for n in names if os.path.isfile(os.path.join(self.q, n))]
+        return [os.path.join(d, n) for n in names if os.path.isfile(os.path.join(d, n))]
 
-    def read_item(self, path):
-        """(item, None) or (None, why refused)."""
+    def read_item(self, path, backlog=False):
+        """(item, None) or (None, why refused). A backlog item may also have `repeat` and `expires`."""
         stem = os.path.basename(path)[:-5]
         try:
             with open(path) as f:
@@ -308,6 +339,12 @@ class Filler:
                               'other machines')
         if 'account' in it and account_list(it['account']) is None:
             return None, '"account" must be an account or a non-empty list of accounts, in order of preference'
+        if backlog:
+            rep = it.get('repeat')
+            if rep is not None and (isinstance(rep, bool) or not isinstance(rep, (int, float)) or rep < 0):
+                return None, '"repeat" must be the minutes between runs (a number, 0 or more)'
+            if 'expires' in it and parse_time(it['expires']) is None:
+                return None, '"expires" must be a UTC time like 2026-12-01T00:00:00Z'
         return it, None
 
     # --- GitHub ----------------------------------------------------------------------------------------------
@@ -642,7 +679,11 @@ class Filler:
         write_json(self.request_path(iid), req)
         return then
 
-    def start(self, it, name, account=None, skipped=None):
+    def source(self, intent):
+        """The file a start came from: a backlog file (kept when it repeats), else the queue file."""
+        return intent.get('from') or os.path.join(self.q, intent['item']['id'] + '.json')
+
+    def start(self, it, name, account=None, skipped=None, src=None, keep=False):
         """'started' | 'unknown' (no clear answer: the marker stays, pinned to its machine) | a refusal code |
         raises ApiError (no answer: the marker stays, the next run asks again). A new start runs as `account`
         (picked by usage); a left-over marker keeps the account it asked with, so a retry never moves the request
@@ -657,6 +698,8 @@ class Filler:
                       'item': dict(it, account=account) if account else it}
             if skipped:
                 intent['skipped'] = skipped
+            if src:
+                intent['from'], intent['keep'] = src, bool(keep)
         parent = intent.get('parentThreadId') or current
         machine, rid = intent['machine'], intent['requestId']
         # A start left under another parent (a handover) is only looked up there, never started fresh.
@@ -706,15 +749,17 @@ class Filler:
                    requestId=intent['requestId'], parentThreadId=intent.get('parentThreadId'),
                    startedAt=iso(self.w.now()))
         write_json(os.path.join(self.started_dir, it['id'] + '.json'), rec)
-        try:
-            os.remove(os.path.join(self.q, it['id'] + '.json'))
-        except FileNotFoundError:
-            pass
+        if not intent.get('keep'):
+            try:
+                os.remove(self.source(intent))
+            except FileNotFoundError:
+                pass
         os.remove(self.marker(it['id']))
         self.forget_request(it['id'])
         skipped = f' (skipped: {intent["skipped"]})' if intent.get('skipped') else ''
-        self.log(f'started {it["id"]} on {intent["machine"]} as {self.accounts(it)[0]}{skipped}: task {ans["taskId"]} '
-                 f'({it["kind"]}, "{it["title"][:80]}")')
+        frm = ' from the backlog' if it.get('backlog') else ''
+        self.log(f'started {it["id"]}{frm} on {intent["machine"]} as {self.accounts(it)[0]}{skipped}: task '
+                 f'{ans["taskId"]} ({it["kind"]}, "{it["title"][:80]}")')
 
     def forget_request(self, iid):
         try:
@@ -750,18 +795,21 @@ class Filler:
                 os.remove(path)
                 continue
             done = os.path.join(self.started_dir, iid + '.json')
+            src = self.source(intent)
             if os.path.exists(done) and (read_json(done).get('requestId') == intent.get('requestId')):
-                try:
-                    os.remove(os.path.join(self.q, iid + '.json'))
-                except FileNotFoundError:
-                    pass
+                if not intent.get('keep'):
+                    try:
+                        os.remove(src)
+                    except FileNotFoundError:
+                        pass
                 os.remove(path)
                 self.forget_request(iid)
                 self.log(f'finished {iid}: it was started and recorded before a stop')
                 continue
-            if not os.path.exists(os.path.join(self.q, iid + '.json')):
+            if not os.path.exists(src):
                 os.remove(path)
-                self.log(f'dropped the intent for {iid}: its queue file is gone (if it had started, T3 shows it)')
+                self.log(f'dropped the intent for {iid}: its {"backlog" if intent.get("from") else "queue"} file is '
+                         'gone (if it had started, T3 shows it)')
                 continue
             if (intent.get('parentThreadId') or self.cfg['parentThreadId']) == self.cfg['parentThreadId']:
                 why = self.waiting_on(iid, machine)
@@ -775,23 +823,8 @@ class Filler:
                 raise ApiError('the parent thread is gone; nothing more starts')
         return bool(names)
 
-    # --- one run ---------------------------------------------------------------------------------------------
-    def children(self):
-        answer = self.w.api.children(self.cfg['parentThreadId'])
-        if answer.get('parentSettled') is True:
-            raise ApiError(f'the parent thread {self.cfg["parentThreadId"]} was settled by hand (handed over to a '
-                           'new orchestrator?): set parentThreadId to the orchestrator that runs now; nothing starts')
-        return answer.get('children') or []
-
-    def run(self):
-        children = self.children()     # a settled parent stops the run before anything is asked
-        if self.recover():
-            children = self.children()
-        self.render_lenses()
-        counts = self.count(children)
-        pinned = self.pinned()
-        for name in pinned.values():   # an unclear start may hold a slot there that T3 does not show yet
-            counts.setdefault(name, {'agents': 0, 'writers': 0})['agents'] += 1
+    def collect_queue(self):
+        """The queue's items that may start: [(item, mtime, note key, source path, keep)]."""
         items = []
         for path in self.queue_files():
             it, why = self.read_item(path)
@@ -802,25 +835,87 @@ class Filler:
             if os.path.exists(os.path.join(self.started_dir, name)):
                 self.note(f'item/{name}', f'refused {name}: started/{name} exists (already started); use a new id; kept')
                 continue
-            items.append((it, os.path.getmtime(path)))
+            items.append((it, os.path.getmtime(path), f'item/{name}', None, False))
+        return items
+
+    def backlog_runs(self, bid):
+        """The started records of a repeating backlog item's runs (<id>.r<n>), oldest first."""
+        out = []
+        prefix = bid + '.r'
+        if os.path.isdir(self.started_dir):
+            for n in os.listdir(self.started_dir):
+                if n.startswith(prefix) and n.endswith('.json') and n[len(prefix):-5].isdigit():
+                    try:
+                        out.append((int(n[len(prefix):-5]), read_json(os.path.join(self.started_dir, n))))
+                    except (OSError, ValueError):
+                        out.append((int(n[len(prefix):-5]), {}))
+        return sorted(out, key=lambda x: x[0])
+
+    def collect_backlog(self, queue_ids):
+        """The backlog's items that may start now, each as the run it would be: a one-off keeps its id and moves to
+        started/ like a queue item; a repeating one stays and each run is <id>.r<n>, never two runs at once."""
+        items, run_ids = [], set()
+        for path in self.queue_files(self.backlog_dir):
+            name = os.path.basename(path)
+            key = f'backlog/{name}'
+            it, why = self.read_item(path, backlog=True)
+            if why:
+                self.note(key, f'refused backlog/{name}: {why}; kept')
+                continue
+            bid = it['id']
+            if bid in queue_ids:
+                self.note(key, f'refused backlog/{name}: the queue has an item with the same id; kept')
+                continue
+            exp = parse_time(it.get('expires'))
+            if exp is not None and self.w.now() >= exp:
+                self.note(key, f'not starting backlog/{name}: it expired at {it["expires"]}; delete it')
+                continue
+            rep = it.get('repeat')
+            if rep is None:
+                if os.path.exists(os.path.join(self.started_dir, name)):
+                    self.note(key, f'refused backlog/{name}: started/{name} exists (a one-off ran already; give it '
+                              '"repeat" to make it standing); kept')
+                    continue
+                run, keep = dict(it, backlog=bid), False
+            else:
+                runs = self.backlog_runs(bid)
+                n = runs[-1][0] + 1 if runs else 1
+                run, keep = dict(it, id=f'{bid}.r{n}', backlog=bid), True
+                run_ids.add(run['id'])
+                last = runs[-1][1] if runs else None
+                if last is not None and last.get('taskId') in self.live_tasks:
+                    self.note(key, f'waiting backlog/{name}: its last run {bid}.r{n - 1} is still live')
+                    continue
+                at = parse_time((last or {}).get('startedAt'))
+                if at is not None and (self.w.now() - at).total_seconds() < rep * 60:
+                    nxt = iso(at + datetime.timedelta(minutes=rep))
+                    self.note(key, f'waiting backlog/{name}: repeats every {rep:g} min, next after {nxt}')
+                    continue
+            run_ids.add(run['id'])
+            items.append((run, os.path.getmtime(path), key, path, keep))
+        return items, run_ids
+
+    def fill(self, items, counts, pinned, full, wanted):
+        """Starts the ready items, highest priority first, on the first allowed machine with room. `wanted` gets,
+        per machine, the kinds of the ready items that could run there (the idle alarm reads it)."""
         items.sort(key=lambda x: (-x[0]['priority'], x[1], x[0]['id']))
-        queued = {os.path.basename(p)[:-5] for p in self.queue_files()}
-        if os.path.isdir(self.requests_dir):
-            for n in os.listdir(self.requests_dir):
-                if n.endswith('.json') and n[:-5] not in queued:
-                    self.forget_request(n[:-5])   # its queue file is gone
-        full = set()
-        for it, _ in items:
-            key = f'item/{it["id"]}.json'
+        for it, _, key, src, keep in items:
+            if len(full) == len(self.cfg['machines']):
+                break
             if it['id'] in pinned:
                 self.note(key, f'waiting {it["id"]}: its start on {pinned[it["id"]]} has no clear answer yet; asked '
                           'again only there')
+                for name in (it.get('machines') or list(self.cfg['machines'])):
+                    wanted.setdefault(name, set()).add(it['kind'])
                 continue
             why = self.ready(it)
             if why:
                 self.note(key, f'waiting {it["id"]}: {why}')
                 continue
             allowed = it.get('machines') or list(self.cfg['machines'])
+            for name in allowed:
+                if not (it.get('isolation') == 'worktree' and not self.worktree_ok(name)):
+                    wanted.setdefault(name, set()).add(it['kind'])
             reasons = []
             for name in allowed:
                 if name in full:
@@ -844,7 +939,7 @@ class Filler:
                     if self.room(name, 'other', counts):
                         full.add(name)
                     continue
-                got = self.start(it, name, account, skipped)
+                got = self.start(it, name, account, skipped, src, keep)
                 if got == 'started':
                     counts.setdefault(name, {'agents': 0, 'writers': 0})['agents'] += 1
                     if it['kind'] == 'writer':
@@ -860,8 +955,117 @@ class Filler:
                 reasons.append(f'{name} refused {got}')
             else:
                 self.note(key, f'waiting {it["id"]}: no machine has room ({"; ".join(reasons)})')
-            if len(full) == len(self.cfg['machines']):
-                break
+
+    # --- idle alarm ------------------------------------------------------------------------------------------
+    def alarm_cfg(self):
+        a = self.cfg.get('idleAlarm') or {}
+        return (a.get('enabled', True), int(a.get('passes') or IDLE_PASSES),
+                float(a.get('everyMinutes') or IDLE_EVERY_S / 60) * 60)
+
+    def free(self, name, counts):
+        m = self.cfg['machines'][name]
+        c = counts.get(name, {'agents': 0, 'writers': 0})
+        max_a = int(m.get('maxAgents', 0))
+        max_w = int(m.get('maxWriters', max_a))
+        free_a = max(0, max_a - c['agents'])
+        return free_a, max_a, max(0, min(max_w - c['writers'], free_a)), max_w
+
+    def startable(self, name):
+        """None when some account could start there now (usage), else why none can."""
+        model = self.cfg['defaults'].get('model', 'claude-opus-5-5')
+        why = []
+        for account in dict.fromkeys(self.accounts({}) + ['claudeAgent']):
+            r = self.usage(name, account, model)
+            if r is None:
+                return None
+            why.append(r)
+        return '; '.join(why)
+
+    def read_idle(self):
+        try:
+            st = read_json(self.idle_path)
+        except (OSError, ValueError):
+            return {}
+        return st if isinstance(st, dict) else {}
+
+    def idle_check(self, counts, wanted):
+        """Machines with free slots that no ready item fits, while an account could start there: after `passes`
+        such runs in a row, one message to the parent, at most every `everyMinutes`. Writes idle.json only when
+        it changes (the run-of-idle-passes counter stops at `passes`)."""
+        enabled, passes, every = self.alarm_cfg()
+        old = self.read_idle()
+        prev = old.get('machines') if isinstance(old.get('machines'), dict) else {}
+        now = self.w.now()
+        idle = {}
+        for name in self.cfg['machines']:
+            free_a, max_a, free_w, max_w = self.free(name, counts)
+            if free_a == 0:
+                continue
+            kinds = wanted.get(name, set())
+            if kinds - {'writer'} or ('writer' in kinds and free_w > 0):
+                continue                                    # a ready item fits there: not idle, just waiting
+            if self.capacity(name, 'other') or self.startable(name):
+                continue                                    # low memory or no usage left: nothing could start
+            p = prev.get(name) if isinstance(prev.get(name), dict) else {}
+            idle[name] = {'passes': min(passes, int(p.get('passes') or 0) + 1),
+                          'since': p.get('since') or iso(now),
+                          'free': f'{free_a}/{max_a} agents ({free_w}/{max_w} writers)'}
+        st = {'machines': idle}
+        for k in ('lastAlarmAt', 'lastAlarm'):
+            if k in old:
+                st[k] = old[k]
+        ripe = [n for n, v in idle.items() if v['passes'] >= passes]
+        last = old.get('lastAlarmAt')
+        if enabled and ripe and not (isinstance(last, (int, float)) and 0 <= now.timestamp() - last < every):
+            text = ('[slot filler] slots idle: ' + '; '.join(f'{n} {idle[n]["free"]} free since {idle[n]["since"]}'
+                                                             for n in ripe)
+                    + '; queue+backlog empty for those machines. Queue work (queue/ or backlog/ of the slot '
+                    'filler) or lower their caps.')[:NOTIFY_MAX]
+            st['lastAlarmAt'], st['lastAlarm'] = now.timestamp(), iso(now)
+            rid = f'idle-alarm:{int(now.timestamp())}'
+            write_json(self.idle_path, st)                  # first: a stop after it never sends a second one
+            old = st
+            try:
+                ans = self.w.api.notify(self.cfg['parentThreadId'], rid, text)
+                ok = isinstance(ans, dict) and ans.get('state') == 'sent'
+                self.log(f'idle alarm sent to {self.cfg["parentThreadId"]}: {text}' if ok else
+                         f'idle alarm NOT delivered ({ans.get("code") if isinstance(ans, dict) else ans}: '
+                         f'{str((ans or {}).get("message"))[:120] if isinstance(ans, dict) else ""}): {text}')
+            except ApiError as e:
+                self.log(f'idle alarm NOT delivered ({e}; a T3 without /api/fork/delegate/notify?): {text}')
+        if st != old:
+            write_json(self.idle_path, st)
+
+    # --- one run ---------------------------------------------------------------------------------------------
+    def children(self):
+        answer = self.w.api.children(self.cfg['parentThreadId'])
+        if answer.get('parentSettled') is True:
+            raise ApiError(f'the parent thread {self.cfg["parentThreadId"]} was settled by hand (handed over to a '
+                           'new orchestrator?): set parentThreadId to the orchestrator that runs now; nothing starts')
+        return answer.get('children') or []
+
+    def run(self):
+        children = self.children()     # a settled parent stops the run before anything is asked
+        if self.recover():
+            children = self.children()
+        self.render_lenses()
+        # Slots are counted from T3's live children (never from started/ files, which only give a child's kind).
+        self.live_tasks = {c.get('taskId') for c in children if c.get('live', c.get('status') not in SETTLED)}
+        counts = self.count(children)
+        pinned = self.pinned()
+        for name in pinned.values():   # an unclear start may hold a slot there that T3 does not show yet
+            counts.setdefault(name, {'agents': 0, 'writers': 0})['agents'] += 1
+        queue = self.collect_queue()
+        queued = {os.path.basename(p)[:-5] for p in self.queue_files()}
+        backlog, backlog_ids = self.collect_backlog(queued)
+        if os.path.isdir(self.requests_dir):
+            for n in os.listdir(self.requests_dir):
+                if n.endswith('.json') and n[:-5] not in queued and n[:-5] not in backlog_ids:
+                    self.forget_request(n[:-5])   # its queue or backlog file is gone
+        full, wanted = set(), {}
+        self.fill(queue, counts, pinned, full, wanted)     # queue items always go first
+        self.fill(backlog, counts, pinned, full, wanted)   # then standing work, into what is still free
+        self.idle_check(counts, wanted)
 
 
 def run_once(cfg, world=None):
@@ -889,8 +1093,48 @@ def run_once(cfg, world=None):
         os.close(fd)
 
 
+def status(cfg, world=None, out=None):
+    """Read-only: live counts from T3, the queue, backlog and in-flight starts, and the idle state of the last run.
+    Takes no lock and writes nothing. 0, or 1 when T3 did not answer (the rest is still printed)."""
+    out = out or sys.stdout
+    f = Filler(cfg, world or World(cfg))
+    rc = 0
+    try:
+        children = f.w.api.children(cfg['parentThreadId'])
+        settled = children.get('parentSettled') is True
+        counts = f.count(children.get('children') or [])
+        for name in cfg['machines']:
+            free_a, max_a, free_w, max_w = f.free(name, counts)
+            c = counts.get(name, {'agents': 0, 'writers': 0})
+            print(f'{name}: {c["agents"]}/{max_a} agents, {c["writers"]}/{max_w} writers live (T3); '
+                  f'{free_a} agent / {free_w} writer slots free', file=out)
+        if counts.get(None, {}).get('agents'):
+            print(f'unknown machine: {counts[None]["agents"]} live', file=out)
+        if settled:
+            print(f'parent {cfg["parentThreadId"]} was settled by hand: the filler starts nothing', file=out)
+    except ApiError as e:
+        print(f'T3: no answer ({e})', file=out)
+        rc = 1
+    inflight = sorted(f.pinned().items())
+    print(f'queue: {len(f.queue_files())} item(s); backlog: {len(f.queue_files(f.backlog_dir))} item(s) in '
+          f'{f.backlog_dir}; in flight: {", ".join(f"{i} on {m}" for i, m in inflight) or "none"}', file=out)
+    _, passes, every = f.alarm_cfg()
+    st = f.read_idle()
+    idle = st.get('machines') if isinstance(st.get('machines'), dict) else {}
+    alarm = f'; last alarm {st["lastAlarm"]}' if st.get('lastAlarm') else '; no alarm sent yet'
+    if idle:
+        for name, v in sorted(idle.items()):
+            print(f'idle: {name} {v.get("free")} free since {v.get("since")}, {v.get("passes")}/{passes} runs with '
+                  f'nothing ready for it{alarm}', file=out)
+    else:
+        print(f'idle: none (last run){alarm}', file=out)
+    return rc
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description='Fill free agent slots from a queue folder (one run).')
+    ap = argparse.ArgumentParser(description='Fill free agent slots from a queue folder (one run), or show the '
+                                             'state (status).')
+    ap.add_argument('command', nargs='?', default='run', choices=('run', 'status'))
     ap.add_argument('--config', default=os.environ.get('SLOT_FILLER_CONFIG', '~/.config/slot-filler/config.json'))
     a = ap.parse_args(argv)
     try:
@@ -898,7 +1142,7 @@ def main(argv=None):
     except ConfigError as e:
         print(f'slot-filler: {e}', file=sys.stderr)
         return 2
-    return run_once(cfg)
+    return status(cfg) if a.command == 'status' else run_once(cfg)
 
 
 if __name__ == '__main__':

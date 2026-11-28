@@ -32,6 +32,10 @@ import * as SlotGate from "../slots/SlotGate.ts";
 import { admitSend } from "./agentSlotRoutes.ts";
 
 export const FILLER_DELEGATE_PATH = "/api/fork/delegate";
+/** One short message to the parent (the filler's idle alarm), sent as the wake is. */
+export const FILLER_NOTIFY_PATH = "/api/fork/delegate/notify";
+/** The longest notify text; a longer one is cut. */
+export const NOTIFY_TEXT_MAX = 1500;
 
 /** One namespace per parent thread: the same request id gives the same task after a restart. */
 const fillerNamespace = (threadId: string) => `slot_filler:${threadId}`;
@@ -124,6 +128,15 @@ export const FillerStartInput = Schema.Struct({
 export type FillerStartInput = typeof FillerStartInput.Type;
 const decodeStart = Schema.decodeUnknownOption(Schema.fromJsonString(FillerStartInput));
 const encodeDelegate = Schema.encodeSync(OrchestratorMcpDelegateTaskInput);
+
+export const FillerNotifyInput = Schema.Struct({
+  parentThreadId: ThreadId,
+  /** One message per request id (and wake window): asking again with it never sends a second. */
+  requestId: RequestId,
+  text: Schema.String,
+});
+export type FillerNotifyInput = typeof FillerNotifyInput.Type;
+const decodeNotify = Schema.decodeUnknownOption(Schema.fromJsonString(FillerNotifyInput));
 
 export type StartAnswer =
   | { readonly type: "started"; readonly taskId: string; readonly childThreadId: string | null }
@@ -230,6 +243,36 @@ export const runFillerStart = Effect.fn("FillerDelegate.start")(function* (
       return yield* settle(answer);
   }
   return yield* settle(answer);
+});
+
+/** One message to the parent, through the wake (queued after its run, once per request id, the slot gate's admission). */
+export type NotifyAnswer =
+  | { readonly type: "sent" }
+  | Extract<StartAnswer, { readonly type: "refused" }>;
+
+const notifyRefused = (code: string, message: string): NotifyAnswer => ({
+  type: "refused",
+  code,
+  message,
+});
+
+export const runFillerNotify = Effect.fn("FillerDelegate.notify")(function* (
+  world: FillerWorld,
+  input: FillerNotifyInput,
+): Effect.fn.Return<NotifyAnswer> {
+  const text = input.text.trim().slice(0, NOTIFY_TEXT_MAX);
+  if (text === "") return notifyRefused("bad_request", "text is empty; nothing sent");
+  const parent = yield* world.parent(input.parentThreadId);
+  if (parent === null) {
+    return notifyRefused(
+      "parent_missing",
+      `thread ${input.parentThreadId} is gone, deleted or archived; nothing sent`,
+    );
+  }
+  const sent = yield* world.wake(parent, input.requestId, text);
+  return sent === "sent"
+    ? ({ type: "sent" } as const)
+    : notifyRefused("slots_full", "no agent slot is free to give the parent a run; nothing sent");
 });
 
 /** One `delegate_task` answer, read from its tool result. */
@@ -351,6 +394,31 @@ const handleStart = Effect.fn("FillerDelegate.handleStart")(function* (
     });
   }
   return json(answer.code === "parent_missing" ? 404 : 409, {
+    state: "refused",
+    code: answer.code,
+    message: answer.message,
+  });
+});
+
+const handleNotify = Effect.fn("FillerDelegate.handleNotify")(function* (
+  auth: Auth,
+  world: FillerWorld,
+) {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const denied = yield* admitCaller(auth, request, AuthOrchestrationOperateScope);
+  if (denied !== null) return denied;
+  const body = yield* request.text.pipe(Effect.option);
+  const input = Option.flatMap(body, decodeNotify);
+  if (Option.isNone(input)) {
+    return json(400, {
+      state: "refused",
+      code: "bad_request",
+      message: "body must be { parentThreadId, requestId, text }",
+    });
+  }
+  const answer = yield* runFillerNotify(world, input.value);
+  if (answer.type === "sent") return json(200, { state: "sent" });
+  return json(answer.code === "parent_missing" ? 404 : answer.code === "bad_request" ? 400 : 409, {
     state: "refused",
     code: answer.code,
     message: answer.message,
@@ -510,7 +578,7 @@ const makeWorld = (
   pause: Effect.sleep(Duration.seconds(2)),
 });
 
-/** The two routes, given the receipt store and the gate (tests give fakes). */
+/** The routes, given the receipt store and the gate (tests give fakes). */
 export const layerRoutes = Layer.unwrap(
   Effect.gen(function* () {
     const auth = yield* EnvironmentAuth.EnvironmentAuth;
@@ -521,11 +589,12 @@ export const layerRoutes = Layer.unwrap(
     return Layer.mergeAll(
       HttpRouter.add("POST", FILLER_DELEGATE_PATH, handleStart(auth, world)),
       HttpRouter.add("GET", FILLER_DELEGATE_PATH, handleList(auth, threads)),
+      HttpRouter.add("POST", FILLER_NOTIFY_PATH, handleNotify(auth, world)),
     );
   }),
 );
 
-/** The two routes in the server's routes (fork/forkLayers.ts). */
+/** The routes in the server's routes (fork/forkLayers.ts). */
 export const layer = layerRoutes.pipe(
   Layer.provide(
     // The server's one gate and receipt store: layers memoize by reference.
