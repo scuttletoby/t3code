@@ -13,6 +13,27 @@ nothing.
 
 ## After ci/v14
 
+### nightly-lock, mutation-report: two scheduled-run tools move in (#936)
+
+New actions, ported from a project's own copies, with project facts as inputs or config.
+
+- **nightly-lock** runs a heavy command under a machine-wide flock, so a long step (a mutation run) and a short one
+  (a soak, `first: true`, which goes first) never run at once. The wait is bounded (`wait` or `until`); a give-up exits
+  75 with the output `gave_up` naming the holder. The lock is held until everything the command started has ended. A
+  lock folder that cannot be used is exit 71, not a traceback. The step `exec`s the tool, so a cancel's signal reaches
+  it. A caller now always looks once and says why it waits, and its give-up line names what it saw at its last look.
+  A `wait` or `until` that is not finite or is negative (`nan` never ran out) is exit 2, and a holder note that is
+  not text no longer crashes a caller that waits.
+- **mutation-report** writes the kill rates, the trend and the red issue. It now reads every issue with its title,
+  open or closed: a closed rolling issue is reopened with its trend (it was replaced by a new one, and the trend
+  started again), two open copies are merged into the oldest and the other closed. Only issues opened by the
+  config's `author` (default `app/github-actions`) count: a stranger's issue with the same title is never merged,
+  closed or written. Titles, labels and the author come from a config (defaults: no labels). A token that writes as
+  another account than `author` fails the step, naming the login to set, and leaves no new issue open.
+
+**Upgrade:** a project with its own copies passes its old lock `name` (and `dir`) and its old issue titles in the
+config, so the action continues the same lock and issue; then it deletes its copies.
+
 ### checkout-state: a lint for checkout state a self-hosted runner keeps (#932)
 
 New action. It fails a workflow whose jobs on a self-hosted runner could leave checkout state in the shared work

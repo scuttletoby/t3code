@@ -94,6 +94,8 @@ fork-ci/actions/head-check/head_check.test.py ~69s unittest
 fork-ci/actions/head-check/head_gate.test.py unittest
 fork-ci/actions/head-check/review_guide.test.py unittest
 fork-ci/actions/job-changed/job-changed.test.py ~21s unittest
+fork-ci/actions/mutation-report/mutation_report.test.py unittest
+fork-ci/actions/nightly-lock/nightly_lock.test.py ~16s unittest
 fork-ci/actions/pinned/pinned.test.py unittest
 fork-ci/actions/pr-queue/lens.test.py unittest
 fork-ci/actions/pr-queue/pr_queue.test.py ~42s unittest
