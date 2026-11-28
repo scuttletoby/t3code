@@ -10,7 +10,8 @@ A hook's answer never depends on who runs the test: run_hook starts it under a s
 to the real Claude Code of an agent running the tests and blocked whenever that agent had another command running in
 the background (config.test.py failed 4 of 15 that way while several suites ran at once).
 """
-import importlib.machinery, importlib.util, json, os, signal, subprocess, sys
+import builtins, contextlib, importlib.machinery, importlib.util, json, os, signal, subprocess, sys
+from unittest import mock
 
 sys.dont_write_bytecode = True   # the CI runner has no -B: no __pycache__ beside the hooks
 
@@ -93,6 +94,35 @@ def load_hook(name, machine=NO_MACHINE):
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
+
+
+@contextlib.contextmanager
+def bytes_read(mod):
+    """A list that gets the size of every read() the hook module `mod` makes on a file it opens while the block
+    runs. A speed test checks this (what the hook reads), not the wall time a busy test machine adds."""
+    reads, real_open = [], builtins.open
+
+    class Counted:
+        def __init__(self, f):
+            self._f = f
+
+        def read(self, *args):
+            data = self._f.read(*args)
+            reads.append(len(data))
+            return data
+
+        def __getattr__(self, name):
+            return getattr(self._f, name)
+
+        def __enter__(self):
+            self._f.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._f.__exit__(*exc)
+
+    with mock.patch.object(mod, 'open', lambda *a, **k: Counted(real_open(*a, **k)), create=True):
+        yield reads
 
 
 def run_hook(name, event, machine=NO_MACHINE, env=None, cwd=None, timeout=60, args=(), hook=None, parent='claude'):
