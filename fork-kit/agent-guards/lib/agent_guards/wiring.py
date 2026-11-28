@@ -20,7 +20,8 @@ the hook through agent-guards-fast (FAST) when that file is there: it passes wha
 hook file on the same event for everything else, from bytecode the installer wrote (agent_guards.fast). Without it
 the entry runs the hook file as before. Python starts with -S (no site: the hooks use the standard library only).
 
-The same entries go in the managed settings drop-in the installer writes (--settings) or, by hand, in any settings
+The same entries go in the managed settings drop-in the installer writes (--settings, with the machine's
+"harnessEnv" as its "env": config.harness_env) or, by hand, in any settings
 file (`agent-guards hooks`). Monitor runs shell text like Bash, so every hook that reads a command reads it for
 Monitor too, except poll-loop-guard: an until-condition in a Monitor is the right way to wait for a file, so it
 is wired for Bash only.
@@ -89,8 +90,49 @@ def hooks(bin_dir=BIN, python='/usr/bin/python3'):
     return out
 
 
-def drop_in_text(bin_dir=BIN):
-    return json.dumps({'hooks': hooks(bin_dir)}, indent=2) + '\n'
+def drop_in_text(bin_dir=BIN, env=None):
+    """The drop-in: the hooks, and the "env" (config.harness_env) when it has a variable."""
+    return json.dumps(dict({'hooks': hooks(bin_dir)}, **({'env': dict(env)} if env else {})), indent=2) + '\n'
+
+
+def other_env(drop_in):
+    """[(path, [names])]: the env variables managed-settings.json and the other managed-settings.d/*.json files set
+    (the folders of `drop_in`, a real path). Claude Code merges those with the drop-in key by key, the later file
+    winning, so the kit leaves such a variable to them. A file that cannot be read or parsed is skipped."""
+    import glob, os
+    folder = os.path.dirname(drop_in)
+    out = []
+    for f in [os.path.join(os.path.dirname(folder), 'managed-settings.json')] + \
+            sorted(glob.glob(os.path.join(folder, '*.json'))):
+        if os.path.abspath(f) == os.path.abspath(drop_in):
+            continue
+        try:
+            with open(f, encoding='utf-8') as fh:
+                env = json.load(fh).get('env')
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(env, dict) and env:
+            out.append((f, sorted(env)))
+    return out
+
+
+def env_for(env, drop_in):
+    """(the drop-in's env: `env` less what other managed files set, [(path, [names left to it])])."""
+    env, left = dict(env), []
+    for f, names in other_env(drop_in):
+        taken = [n for n in names if n in env]
+        if taken:
+            left.append((f, taken))
+            for n in taken:
+                del env[n]
+    return env, left
+
+
+def env_ok(env):
+    """An "env" this kit may write: an object of variable names to text."""
+    import re
+    return isinstance(env, dict) and all(isinstance(k, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', k)
+                                         and isinstance(v, str) for k, v in env.items())
 
 
 def commands_in(settings):
@@ -131,8 +173,10 @@ def find(settings, hook, event, tool=None):
 
 
 def ours(settings):
-    """True for a settings object this kit wrote: only "hooks", and every command one of the kit's hooks."""
-    if not isinstance(settings, dict) or set(settings) != {'hooks'}:
+    """True for a settings object this kit wrote: "hooks", every command one of the kit's hooks, and maybe an "env"
+    of text values (a drop-in of an earlier release has no "env")."""
+    if not isinstance(settings, dict) or 'hooks' not in settings or set(settings) - {'hooks', 'env'} \
+            or ('env' in settings and not env_ok(settings['env'])):
         return False
     import re
     cmds = commands_in(settings)

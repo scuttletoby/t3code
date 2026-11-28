@@ -40,6 +40,8 @@ import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
 import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
 import * as LaunchMcpProfile from "./launchMcpProfile.ts";
 import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
+import * as PlacementAdvice from "./placementAdvice.ts";
+import { readPlacementForThisOs } from "./placementRead.ts";
 import * as RemoteTaskPrompts from "./remoteTaskPrompts.ts";
 
 /** A checked delegation target (the same shape as the service's resolved target). */
@@ -306,6 +308,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
   const launchMcpProfile = yield* LaunchMcpProfile.makeLaunchMcpProfileCheck;
   const checkPick = yield* ModelPolicyCheck.makePickCheck;
   const remoteStatus = yield* RemoteTaskPrompts.makeStatusReport();
+  const placementAdvice = yield* PlacementAdvice.make();
   /**
    * The model policy's check of the agent's pick on a resolved target (`modelPolicyCheck.ts`): a
    * call that names no model inherits one, which reads as no model.
@@ -621,6 +624,38 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
       })),
     );
 
+  /**
+   * Placement advice (`placement.mode` advise, row P6) on the final target, last, after the note of
+   * the checks that may move the task. It moves nothing; its text joins the note. A settings read,
+   * a runtime mode or a provider list that cannot be read gives no advice; the task goes on.
+   */
+  const withPlacementAdvice = Effect.fn("DelegateChecks.withPlacementAdvice")(function* (
+    input: BeforeWorkspaceInput,
+    result: BeforeWorkspaceResult,
+  ) {
+    const settings = yield* serverSettings.getSettings.pipe(Effect.option);
+    if (Option.isNone(settings) || (yield* readPlacementForThisOs(settings.value)).mode === "off") {
+      return result;
+    }
+    const runtimeMode = yield* resolveRuntimeMode(
+      input.parent.thread.runtimeMode,
+      input.runtimeMode,
+      result.target,
+    ).pipe(Effect.option);
+    if (Option.isNone(runtimeMode)) return result;
+    const { instanceId, model } = result.target.modelSelection;
+    const providers = yield* providerRegistry.getProviders;
+    const advice = yield* placementAdvice.advise({
+      settings: settings.value,
+      projectId: input.parent.thread.projectId,
+      runtimeMode: runtimeMode.value,
+      driverKind: providers.find((provider) => provider.instanceId === instanceId)?.driver,
+      model,
+    });
+    if (advice === undefined) return result;
+    return { ...result, note: result.note === undefined ? advice : `${result.note} ${advice}` };
+  });
+
   const checks: DelegateChecks = {
     // Before the pacer, so it paces the child's own options; a target it moves to keeps them too.
     // The model policy checks the agent's pick first (a refusal holds and paces nothing), and again
@@ -663,7 +698,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
             ];
             const note = notes.filter((text) => text !== undefined).join(" ");
             return { target: paced.target, ...(note === "" ? {} : { note }) };
-          })
+          }).pipe(Effect.flatMap((result) => withPlacementAdvice(input, result)))
       ).pipe(
         // The task's kind rides on the final target to the slot gate (`afterWorkspace`); a retry
         // holds no slot, so its target stays as it came.
