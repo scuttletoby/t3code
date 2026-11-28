@@ -327,16 +327,39 @@ open('node_modules/.modules.yaml', 'w').close()''')
 
 # fork-precheck --------------------------------------------------------------------------------------------------
 
+# The fork checks fork-precheck runs: the real scripts and workflow, so the test breaks when CI's steps change shape.
+REPO_TOP = os.path.dirname(os.path.dirname(KIT))
+FORK_CHECK_FILES = ('.github/workflows/fork-checks.yml', '.github/scripts/fork-schema-check.cjs',
+                    '.github/scripts/fork-upstream-files-check.cjs', '.github/scripts/fork-seam-check.cjs')
+with open(os.path.join(REPO_TOP, FORK_CHECK_FILES[0])) as _f:   # the upstream-files check's list, as CI has it
+    UPSTREAM_FILES = next(ln.split(':', 1)[1].strip() for ln in _f if ln.strip().startswith('UPSTREAM_FILES:'))
+ORCHESTRATOR = UPSTREAM_FILES.split()[0]   # one file it guards
+# A stand-in check script (node): logs its name and words to $FAKE_LOG, then passes.
+NODE_LOGGER = ('const fs = require("node:fs"), path = require("node:path");\n'
+               'fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify([path.basename(process.argv[1]), '
+               'process.cwd(), ...process.argv.slice(2)]) + "\\n");\n')
+
+
 class Precheck(Base):
     def setUp(self):
         super().setUp()
+        node = shutil.which('node')
+        self.assertTrue(node, 'the fork checks need node on PATH')
+        real = subprocess.run([node, '-p', 'process.execPath'], capture_output=True, text=True).stdout.strip()
+        os.symlink(real or node, os.path.join(self.bin, 'node'))
         bare = os.path.join(self.tmp, 'bare.git')
         git('init', '-q', '--bare', '-b', 'main', bare, cwd=self.tmp)
         self.repo = os.path.join(self.tmp, 'repo')
         git('clone', '-q', bare, self.repo, cwd=self.tmp)
         for f, text in {'src/a.ts': 'a\n', 'src/a.test.ts': 't\n', 'src/b.ts': 'b\n', 'tools/x.py': 'x\n',
-                        'tools/x.test.py': 'print("x ok")\n', 'gone.ts': 'g\n', 'README.md': 'r\n'}.items():
+                        'tools/x.test.py': 'print("x ok")\n', 'gone.ts': 'g\n', 'README.md': 'r\n',
+                        **{f: 'up\n' for f in UPSTREAM_FILES.split()},
+                        '.github/fork-seams.json': json.dumps({'files': {}, 'forkFiles': ['src/', 'tools/', 'gone.ts']})
+                        }.items():
             write(os.path.join(self.repo, f), text)
+        for f in FORK_CHECK_FILES:
+            shutil.copy(os.path.join(REPO_TOP, f), os.path.join(os.makedirs(os.path.join(self.repo, os.path.dirname(f)),
+                                                                             exist_ok=True) or self.repo, f))
         git('add', '-A', cwd=self.repo)
         git('commit', '-q', '-m', 'base', cwd=self.repo)
         git('push', '-q', 'origin', 'main', cwd=self.repo)
@@ -372,7 +395,10 @@ class Precheck(Base):
         self.assertTrue(all(c[1] == self.repo for c in self.calls('vp')), 'run from the checkout\'s top')
         self.assertIn('x ok 2', r.stdout, 'the touched Python test ran')
         self.assertIn('capacity check: OK', r.stdout)
-        self.assertIn('OK: fmt, lint and 2 test file(s)', r.stdout)
+        self.assertIn('OK: fmt, lint, fork checks and 2 test file(s)', r.stdout)
+        self.assertIn('note: uncommitted changes are not in the fork checks', r.stdout)
+        self.assertNotIn('FAILED', r.stdout + r.stderr)
+        self.assertNotIn('No database schema changes', r.stdout + r.stderr, 'a passing check prints nothing')
 
     def test_capacity_not_ok_runs_fmt_and_lint_and_no_test(self):
         self.capacity()
@@ -399,6 +425,77 @@ class Precheck(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([w[-1] for w in self.words('vp')], ['new notes.md', 'new notes.md'],
                          'against HEAD: only the uncommitted files')
+
+    def commit(self, files, msg='more'):
+        for f, text in files.items():
+            write(os.path.join(self.repo, f), text)
+        git('add', '-A', '--', *files, cwd=self.repo)
+        git('commit', '-q', '-m', msg, cwd=self.repo)
+
+    def on_main(self, change):
+        """Commits change(files) on main (pushed: origin/main moves past the merge-base) and comes back."""
+        git('checkout', '-q', 'main', cwd=self.repo)
+        change()
+        git('push', '-q', 'origin', 'main', cwd=self.repo)
+        git('checkout', '-q', 'change', cwd=self.repo)
+        git('fetch', '-q', 'origin', cwd=self.repo)
+
+    def test_each_fork_check_a_change_breaks_fails_with_its_message(self):
+        cases = {
+            'schema': ({'apps/server/src/persistence/Migrations/099_Fork.ts': 'm\n'},
+                       'Fork changes must not change the database schema'),
+            'upstream-files': ({ORCHESTRATOR: 'o2\n'},
+                               f'- {ORCHESTRATOR}: this branch changes it'),
+            'seam': ({'README.md': 'r2\n'}, 'README.md: upstream file with 1 fork line but no entry'),
+        }
+        for name, (files, message) in cases.items():
+            with self.subTest(name):
+                git('reset', '-q', '--hard', 'change', cwd=self.repo)
+                git('checkout', '-q', '-B', f'break-{name}', 'change', cwd=self.repo)
+                self.commit(files)
+                r = self.precheck('--no-tests')
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn(f'fork-precheck: {name} check FAILED (exit 1):', r.stderr)
+                self.assertIn(message, r.stderr)
+                self.assertIn(f'FAILED: {name} check (exit 1)', r.stdout)
+                for other in set(cases) - {name}:
+                    if not (name == 'upstream-files' and other == 'seam'):   # that file is an upstream file too
+                        self.assertNotIn(f'{other} check FAILED', r.stderr)
+                git('checkout', '-q', 'change', cwd=self.repo)
+
+    def test_the_fork_checks_get_ci_s_words_and_the_default_branch_s_scripts(self):
+        def stand_ins():
+            for f in FORK_CHECK_FILES[1:]:
+                write(os.path.join(self.repo, f), NODE_LOGGER)
+            git('commit', '-q', '-am', 'stand-in checks', cwd=self.repo)
+        mb = git('rev-parse', 'HEAD~1', cwd=self.repo)
+        self.on_main(stand_ins)
+        r = self.precheck('--no-tests')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        head, main = git('rev-parse', 'HEAD', cwd=self.repo), git('rev-parse', 'origin/main', cwd=self.repo)
+        self.assertEqual([c[2:] for c in self.calls() if c[0].endswith('.cjs')], [
+            [mb, head], [mb, head, UPSTREAM_FILES], ['--config-ref', main, mb, head]])
+        self.assertEqual([c[0] for c in self.calls() if c[0].endswith('.cjs')],
+                         ['fork-schema-check.cjs', 'fork-upstream-files-check.cjs', 'fork-seam-check.cjs'])
+        self.assertTrue(all(c[1] == self.repo for c in self.calls() if c[0].endswith('.cjs')))
+
+    def test_a_missing_check_script_or_workflow_fails_never_passes(self):
+        self.on_main(lambda: git('rm', '-q', '.github/scripts/fork-seam-check.cjs', cwd=self.repo) or
+                     git('commit', '-q', '-m', 'no seam check', cwd=self.repo))
+        r = self.precheck('--no-tests')
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('.github/scripts/fork-seam-check.cjs is not in origin/main: the seam check cannot run', r.stderr)
+        self.assertIn('FAILED: fork checks (not runnable)', r.stdout)
+        self.assertNotIn('OK:', r.stdout)
+        self.on_main(lambda: git('rm', '-q', FORK_CHECK_FILES[0], cwd=self.repo) or
+                     git('commit', '-q', '-m', 'no workflow', cwd=self.repo))
+        r = self.precheck('--no-tests')
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('.github/workflows/fork-checks.yml is not in origin/main', r.stderr)
+        r = self.precheck('--no-tests', '--no-fork-checks')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('OK: fmt, lint', r.stdout)
+        self.assertNotIn('fork checks', r.stdout)
 
     def test_no_change_runs_nothing_and_outside_a_checkout_is_exit_2(self):
         git('reset', '-q', '--hard', 'origin/main', cwd=self.repo)

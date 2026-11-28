@@ -2,7 +2,7 @@
 fork-ci-why (why a pull request's required checks fail), fork-clone (a blob-less clone with its dependencies),
 fork-precheck (format, lint and test what a change touches). Python 3 standard library only; each command's
 `main(argv)` returns its exit code. Tests: fork-kit/agent-guards/tests/kitcmds.test.py."""
-import fcntl, filecmp, json, os, re, shutil, subprocess, sys, time
+import fcntl, filecmp, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
 from agent_guards import facts
 
@@ -363,15 +363,110 @@ def clone(argv):
 TEST_FILE = re.compile(r'\.test\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|sh)$')
 NODE_TEST_DIRS = ('.github/', 'fork-ci/', 'fork-kit/')   # node --test there (the fork's runner); vitest elsewhere
 SOURCE_EXT = ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.py', '.sh')
-PRECHECK_USAGE = """usage: fork-precheck [--base REF] [--no-tests] [--kind KIND]
+PRECHECK_USAGE = """usage: fork-precheck [--base REF] [--no-tests] [--no-fork-checks] [--kind KIND]
 
 In a checkout: the files changed against REF (default the remote's default branch, from its merge-base: commits,
-staged, unstaged and new files; deleted ones skipped) are formatted (vp fmt), then linted (vp lint); then the test
-files the change touches (changed test files, and each changed source file's own NAME.test.* beside it) run, once
-the machine's capacity check (t3-capacity [--kind KIND], where it is installed) says OK. *.test.py: python3 -B;
-*.test.sh: bash; *.test.{js,cjs,mjs} under .github/, fork-ci/ or fork-kit/: node --test; other *.test.*: vp test run.
+staged, unstaged and new files; deleted ones skipped) are formatted (vp fmt), then linted (vp lint). Then the fork
+checks behind most "Fork checks" reds run as that workflow runs them (.github/workflows/fork-checks.yml at REF, with
+REF's scripts): the schema check, the upstream-files check and the seam check, on the commits from the merge-base to
+HEAD (uncommitted changes are not in them); only a failing check's lines are printed. Then the test files the change
+touches (changed test files, and each changed source file's own NAME.test.* beside it) run, once the machine's
+capacity check (t3-capacity [--kind KIND], where it is installed) says OK. *.test.py: python3 -B; *.test.sh: bash;
+*.test.{js,cjs,mjs} under .github/, fork-ci/ or fork-kit/: node --test; other *.test.*: vp test run.
+--no-fork-checks skips the fork checks (a repository without them; a missing check otherwise fails).
 Exit 0: all passed; 1: a step failed (each step still runs); 2: a wrong call or not a checkout; 3: the capacity check
-said NOT OK (fmt and lint ran, no test did: run it again later)."""
+said NOT OK (fmt, lint and the fork checks ran, no test did: run it again later)."""
+
+# The fork checks fork-checks.yml runs on every pull request (37 of 40 "Fork checks" reds were one of these). Each
+# runs from REF's script with the arguments of REF's workflow step: "$NAME" words come from the step's env (CI's
+# names for the default branch, the base and the head) or from the workflow's own env lines (UPSTREAM_FILES).
+FORK_CHECKS = (('schema', 'fork-schema-check.cjs'), ('upstream-files', 'fork-upstream-files-check.cjs'),
+               ('seam', 'fork-seam-check.cjs'))
+FORK_CHECKS_WORKFLOW = '.github/workflows/fork-checks.yml'
+FORK_SCRIPTS = '.github/scripts/'
+LOCAL_REQUIRE = re.compile(r'require\(\s*["\']\./([^"\']+)["\']\s*\)')
+FORK_CHECK_LINES = 40     # a failing check's lines printed at most
+
+
+def _show(top, ref, path):
+    code, out, _ = _run([GIT, '-C', top, 'show', f'{ref}:{path}'], timeout=60)
+    return out if code == 0 else None
+
+
+def fork_check_commands(top, ref, values, tmp):
+    """[(name, argv)] to run each fork check as REF's fork-checks.yml does, with REF's scripts copied into tmp;
+    or (None, problem). values: CI's $NAME words (DEFAULT_SHA, BASE_SHA, HEAD_SHA)."""
+    wf = _show(top, ref, FORK_CHECKS_WORKFLOW)
+    if wf is None:
+        return None, f'{FORK_CHECKS_WORKFLOW} is not in {ref}: the fork checks cannot run (--no-fork-checks skips them)'
+    env = dict(values)
+    for m in re.finditer(r'^\s+([A-Z_]+): (?![$][{])(.+?)\s*$', wf, re.M):
+        env.setdefault(m[1], m[2])
+    cmds = []
+    for name, script in FORK_CHECKS:
+        m = re.search(r'^\s+run: node ' + re.escape(FORK_SCRIPTS + script) + r'((?: .*)?)$', wf, re.M)
+        if not m:
+            return None, f'{FORK_CHECKS_WORKFLOW} in {ref} runs no {script}: the {name} check cannot run as CI does'
+        try:
+            words = shlex.split(m[1])
+        except ValueError as e:
+            return None, f'{FORK_CHECKS_WORKFLOW} in {ref}: the {script} step cannot be read: {e}'
+        argv = []
+        for w in words:
+            if '$' in w:
+                var = re.fullmatch(r'[$]\{?([A-Z_]+)\}?', w)
+                if not var or var[1] not in env:
+                    return None, f'{FORK_CHECKS_WORKFLOW} in {ref}: the {script} step uses {w}, unknown here'
+                w = env[var[1]]
+            argv.append(w)
+        todo = [script]
+        while todo:   # the script and the scripts it requires beside it, as REF has them
+            f = todo.pop()
+            dest = os.path.join(tmp, FORK_SCRIPTS, f)
+            if os.path.exists(dest):
+                continue
+            text = _show(top, ref, FORK_SCRIPTS + f)
+            if text is None:
+                return None, f'{FORK_SCRIPTS}{f} is not in {ref}: the {name} check cannot run'
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, 'w') as fh:
+                fh.write(text)
+            todo += [r if r.endswith(('.cjs', '.js', '.json')) else r + '.cjs' for r in LOCAL_REQUIRE.findall(text)]
+        cmds.append((name, ['node', os.path.join(tmp, FORK_SCRIPTS, script), *argv]))
+    return cmds, None
+
+
+def fork_checks(prog, top, base):
+    """Runs the fork checks; returns the failed steps' names (printing only their lines)."""
+    code, default, err = _run([GIT, '-C', top, 'rev-parse', '--verify', '--quiet', f'{base}^{{commit}}'], timeout=30)
+    code2, mb, err2 = _run([GIT, '-C', top, 'merge-base', base, 'HEAD'], timeout=30)
+    code3, head, err3 = _run([GIT, '-C', top, 'rev-parse', 'HEAD'], timeout=30)
+    if code or code2 or code3:
+        _say(prog, f'fork checks: cannot resolve {base}, its merge-base or HEAD: '
+                   f'{(err or err2 or err3).strip()[:200]}', err=True)
+        return ['fork checks (no base)']
+    values = {'DEFAULT_SHA': default.strip(), 'BASE_SHA': mb.strip(), 'HEAD_SHA': head.strip()}
+    tmp = tempfile.mkdtemp(prefix='fork-precheck-')
+    try:
+        cmds, problem = fork_check_commands(top, base, values, tmp)
+        if cmds is None:
+            _say(prog, f'fork checks FAILED: {problem}', err=True)
+            return ['fork checks (not runnable)']
+        failed = []
+        for name, cmd in cmds:
+            code, out, err = _run(cmd, cwd=top, timeout=900)
+            if code == 0:
+                continue
+            lines = [ln for ln in (err or out).splitlines() if ln.strip()] or [f'exit {code}, no output']
+            _say(prog, f'{name} check FAILED (exit {code}):', err=True)
+            for ln in lines[:FORK_CHECK_LINES]:
+                print(f'  {ln}', file=sys.stderr)
+            if len(lines) > FORK_CHECK_LINES:
+                print(f'  ... +{len(lines) - FORK_CHECK_LINES} more', file=sys.stderr)
+            failed.append(f'{name} check (exit {code})')
+        return failed
+    finally:
+        shutil.rmtree(tmp, True)
 
 
 def changed_files(top, base):
@@ -426,7 +521,7 @@ def test_commands(tests):
 
 def precheck(argv):
     prog = 'fork-precheck'
-    args, base, tests_on, kind = list(argv), None, True, None
+    args, base, tests_on, kind, fork_on = list(argv), None, True, None, True
     while args:
         a = args.pop(0)
         if a in ('-h', '--help'):
@@ -438,6 +533,8 @@ def precheck(argv):
             kind = args.pop(0)
         elif a == '--no-tests':
             tests_on = False
+        elif a == '--no-fork-checks':
+            fork_on = False
         else:
             print(PRECHECK_USAGE, file=sys.stderr)
             return 2
@@ -464,6 +561,12 @@ def precheck(argv):
         code, _, _ = _run(step + paths, cwd=top, capture=False)
         if code != 0:
             failed.append(f'{step[1]} (exit {code})')
+    if fork_on:
+        _say(prog, 'fork checks (schema, upstream files, seams; commits to HEAD)')
+        code, dirty, _ = _run([GIT, '-C', top, 'status', '--porcelain', '--untracked-files=no'], timeout=60)
+        if code == 0 and dirty.strip():
+            _say(prog, 'note: uncommitted changes are not in the fork checks (they read commits, as CI does)')
+        failed += fork_checks(prog, top, base)
     tests = touched_tests(top, files) if tests_on else []
     if tests:
         gate = shutil.which('t3-capacity')
@@ -487,5 +590,6 @@ def precheck(argv):
     if failed:
         _say(prog, 'FAILED: ' + '; '.join(failed))
         return 1
-    _say(prog, f'OK: fmt, lint' + (f' and {len(tests)} test file(s)' if tests else ''))
+    done = 'fmt, lint' + (', fork checks' if fork_on else '')
+    _say(prog, f'OK: {done}' + (f' and {len(tests)} test file(s)' if tests else ''))
     return 0

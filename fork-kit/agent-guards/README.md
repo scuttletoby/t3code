@@ -264,8 +264,11 @@ Pipelines agents used to rebuild each time, several turns each, as one command (
   is offline from the package store when another clone there has the same `pnpm-lock.yaml` and its own installed
   `node_modules` (never a link to that clone's `node_modules`: a workspace's links would point into the other
   clone), else one install.
-- `fork-precheck`: `vp fmt` and `vp lint` on the files changed against the base, then the test files the change
-  touches, once `t3-capacity` says OK where it is installed.
+- `fork-precheck`: `vp fmt` and `vp lint` on the files changed against the base; then the fork checks behind most
+  "Fork checks" reds (the schema, upstream-files and seam checks), run as `.github/workflows/fork-checks.yml` runs
+  them, with the base branch's scripts and the same arguments (base: the merge-base, head: `HEAD`'s commits), printing
+  only a failing check's lines (a check it cannot run fails; `--no-fork-checks` skips them); then the test files the
+  change touches, once `t3-capacity` says OK where it is installed.
 
 COMMANDS.md is a state table that `facts` reads on every machine with the kit, after the configured ones, so
 `facts --index` and the session-start context list the commands with no setting ([FACTS.md](FACTS.md)).
