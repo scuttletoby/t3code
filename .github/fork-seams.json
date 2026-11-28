@@ -2,7 +2,7 @@
   "//": "Upstream files with fork lines, and every line the fork may add to each (indentation and blank lines ignored). Checked by .github/scripts/fork-seam-check.cjs against the base branch's copy of this file; see docs/fork/updates.md. A new line is first announced in its entry (\"announced\": {\"since\": day, \"added\": [lines]}), then added by a later pull request that moves it to \"added\" (docs/fork/updates.md, Adding a seam line).",
   "files": {
     "packages/contracts/src/settings.ts": {
-      "why": "Fork settings live in forkSettings.ts; settings.ts takes them with one spread per struct (the client settings patch's spread is announced for the calm sidebar's toggle, which saves the first client fork setting). automaticUpdates stays inline: upstream's pending setting has the same name and place.",
+      "why": "Fork settings live in forkSettings.ts; settings.ts takes them with one spread per struct (the client settings patch's spread saves the client fork settings: the owner-questions page switch, and the calm sidebar's toggle). automaticUpdates stays inline: upstream's pending setting has the same name and place.",
       "added": [
         "import * as ForkSettings from \"./forkSettings.ts\";",
         "export * from \"./forkSettings.ts\";",
@@ -18,23 +18,16 @@
         "* one when it lands (upstream defaults it on). A file saying `autoUpdateServer` is renamed on load.",
         "*/",
         "automaticUpdates: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),",
-        "automaticUpdates: Schema.optionalKey(Schema.Boolean),"
-      ],
-      "announced": {
-        "since": "2026-11-22",
-        "added": ["...ForkSettings.ForkClientSettingsPatchFields,"]
-      }
+        "automaticUpdates: Schema.optionalKey(Schema.Boolean),",
+        "...ForkSettings.ForkClientSettingsPatchFields,"
+      ]
     },
     "apps/web/src/routes/_chat.issues.tsx": {
       "why": "The Issues page swaps to the fork's owner-question page (Waiting on you, components/fork/ownerQuestions) while the fork setting ownerQuestionsPage is on (fork issue 828). One import and one spread after upstream's component line, so upstream's page files never change; announced with the page, added with the setting.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-22",
-        "added": [
-          "import { ForkIssuesRoute } from \"../components/fork/ownerQuestions/ForkIssuesRoute\"; // Fork (owner questions)",
-          "...ForkIssuesRoute, // Fork (owner questions): the fork page while ownerQuestionsPage is on"
-        ]
-      }
+      "added": [
+        "import { ForkIssuesRoute } from \"../components/fork/ownerQuestions/ForkIssuesRoute\"; // Fork (owner questions)",
+        "...ForkIssuesRoute, // Fork (owner questions): the fork page while ownerQuestionsPage is on"
+      ]
     },
     "apps/server/src/issue/IssueService.ts": {
       "why": "A project's .t3code/issues.json names the repositories its Issues page lists and its issue tools may write to, replacing the ones guessed from git remotes, so a fork checkout's upstream is neither listed nor writable (fork issue 887 row 2, owner decision in 830). One import and one pipe step after upstream's binding resolution; the file and its rule are in fork/issueRepos.ts, and a project without the file keeps upstream's guess.",

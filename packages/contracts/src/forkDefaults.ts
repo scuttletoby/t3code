@@ -302,6 +302,15 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     reason: "Each device shows upstream's thread list until its owner turns the calm view on.",
     decidedIn: "#139",
   },
+  {
+    scope: "client",
+    key: "ownerQuestionsPage",
+    default: true,
+    off: false,
+    reason:
+      "On by default (the owner's decision): Issues opens Waiting on you, the open owner questions of every project, instead of upstream's Issues page. It changes which page the Issues entry opens, nothing else; turn it off in Settings > Fork for upstream's page.",
+    decidedIn: "#828",
+  },
 ];
 
 const FIELDS: Readonly<Record<ForkSettingScope, Readonly<Record<string, Schema.Top>>>> = {

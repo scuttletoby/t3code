@@ -78,6 +78,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                                 | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                                 | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 | [`client.calmSidebarEnabled`](#clientcalmsidebarenabled)                     | `false`                                 | yes | [#139](https://github.com/scuttletoby/t3code/issues/139) |
+| [`client.ownerQuestionsPage`](#clientownerquestionspage)                     | `true`                                  | no  | [#828](https://github.com/scuttletoby/t3code/issues/828) |
 
 For `waitFor`, `agentSlots`, `playtest` and `stopFinishedChildren` only the `enabled` switch is pinned, and for `handoff`
 and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
@@ -1508,6 +1509,15 @@ other top-level threads fold into one closed group with a count of those waiting
 ([#139](https://github.com/scuttletoby/t3code/issues/139)). Off (the default): upstream's sidebar.
 It is a client setting, so each device chooses: calm on a phone, the full list on a desktop. A
 client settings file without it reads as off.
+
+### `client.ownerQuestionsPage`
+
+On (the default, the owner's decision in [#828](https://github.com/scuttletoby/t3code/issues/828)):
+the Issues entry opens **Waiting on you**, the open owner questions of every project on every
+connected server, instead of upstream's Issues page. Off: upstream's page. It changes which page the
+Issues entry opens, nothing else; upstream's page files stay as they are (one seam in
+`apps/web/src/routes/_chat.issues.tsx`). A client setting, so each device chooses; a client settings
+file without it reads as on. Settings → Fork → Issues page.
 
 ### A setting the fork removed
 

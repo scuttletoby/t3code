@@ -283,4 +283,11 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     environmentOnly: true,
     scope: "environment-defaults",
   },
+  {
+    id: "owner-questions-page",
+    title: "Issues opens Waiting on you",
+    to: FORK_PAGE,
+    searchTerms: ["issues owner questions waiting on you decision inbox page"],
+    environmentOnly: true,
+  },
 ] as const;
