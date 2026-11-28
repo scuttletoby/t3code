@@ -15,6 +15,7 @@ import { T3ProjectFile } from "./t3ProjectFile.ts";
 const decodeServer = Schema.decodeUnknownSync(ServerSettings);
 const decodeProject = Schema.decodeUnknownSync(ProjectSettingsOverrides);
 const decodeHandoff = Schema.decodeSync(HandoffSettings);
+const decodeUnknownHandoff = Schema.decodeUnknownSync(HandoffSettings);
 const readFile = (handoff: unknown) =>
   decodeServer(handoff === undefined ? {} : { handoff }).handoff;
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
@@ -125,7 +126,7 @@ describe("handoff settings", () => {
     expect(resolveHandoffSettings(server, project, "t2", true).mode).toBe("compact");
     // Old settings without `roles` read as before.
     expect(DEFAULT_HANDOFF_SETTINGS.roles).toBeUndefined();
-    expect(() => decodeHandoff({ roles: "sometimes" })).toThrow();
+    expect(() => decodeUnknownHandoff({ roles: "sometimes" })).toThrow();
   });
 
   it("knows the assistant and a project's own orchestrator as holding a role (HO6)", () => {
