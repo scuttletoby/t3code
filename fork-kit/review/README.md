@@ -13,6 +13,7 @@ checkout of the fork.
 | [COMMENTS.md](COMMENTS.md)                         | the lens comment format, with examples checked against the gate's own parser             |
 | [review-kit.example.json](review-kit.example.json) | the kit settings (`.github/review-kit.json` in the project; optional)                    |
 | [lib/review_kit.py](lib/review_kit.py)             | `plan` (which lenses a change needs), `check` (how the gate reads a comment), `doc`      |
+| [lens-packet](lens-packet)                         | one Markdown file a lens reads first: PR, issues, diff, context, lens prompt, its rounds |
 | [eval/](eval/README.md)                            | the model eval: which model and effort finds the confirmed bugs, from one config file    |
 
 The kit holds no project facts: which paths are critical and which lenses they need are the project's `review` block
@@ -33,4 +34,5 @@ Tests (no network, no host changes):
 python3 -I -B fork-kit/review/tests/comments.test.py
 python3 -I -B fork-kit/review/tests/plan.test.py
 python3 -I -B fork-kit/review/tests/eval.test.py
+python3 -I -B fork-kit/review/tests/packet.test.py
 ```

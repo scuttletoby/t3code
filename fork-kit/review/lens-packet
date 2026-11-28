@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""lens-packet: one Markdown file a review lens reads first, instead of 10-20 separate gh and git commands.
+
+  python3 -I fork-kit/review/lens-packet <PR> --lens <name> --out FILE [--repo DIR] [-R OWNER/REPO]
+      [--settings FILE] [--all-lenses] [--max-diff-lines N] [--max-context-lines N]
+
+The packet holds, in this order: the pull request's title and body; each linked issue's body and its last 5 comments
+(shortened); the changed files with +/- counts; the diff, capped per file with a note when cut; for each changed
+place of a changed file, the file at the head around it (30 lines before and after, overlapping places merged); the
+lens's prompt file (the one the review block of the queue config names for that lens, read with the kit's own
+loader); and the pull request's earlier reads of this lens, so round 2 sees round 1, with the `not a lens:` notes
+between rounds (picked with the gate's own lens_header and lens_key). Other lenses' reports are only counted, since a
+lens does not read another lens's report (SKILL.md, "Order", step 4); --all-lenses adds them.
+
+It needs a clone checked out at the pull request's head (--repo, default the current folder) that has the base commit:
+the diff and the files are read with git from that clone's HEAD, never from the working tree, and the run refuses a
+clone whose HEAD is not the pull request's head. The first line of the packet, and of what it prints, is
+`head: <sha>`, so a stale packet is easy to spot. The same head and the same comments give the same bytes: nothing
+in it comes from the clock or the machine.
+
+Exit 0: packet written. Exit 1: packet written with gaps (a linked issue or the comments gh could not read); each gap
+is listed under "Gaps" at the top of the packet and as a WARN line on stderr. Exit 2: no packet (wrong head, unknown
+lens, no base commit, gh failed on the pull request itself); the message says what to do.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True   # keep the kit and fork-ci folders free of __pycache__
+
+KIT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(KIT, 'lib'))
+import review_kit  # noqa: E402
+
+lens = review_kit.lens
+CONTEXT = 30           # lines before and after each changed place
+ISSUE_COMMENTS = 5     # the last N comments of each linked issue
+ISSUE_BODY_CHARS = 6000
+ISSUE_COMMENT_CHARS = 1200
+LENS_COMMENT_CHARS = 8000
+MAX_ISSUES = 4
+REF_RE = re.compile(r'(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|part\s+of|refs?|see)\s*:?\s+#(\d+)')
+TITLE_REF_RE = re.compile(r'#(\d+)\b')
+HUNK_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$')
+
+
+class Stop(Exception):
+    """No packet: a plain message, exit 2."""
+
+
+def run(cmd, cwd=None, ok=(0,)):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True)
+    if r.returncode not in ok:
+        raise Stop(f'{" ".join(cmd[:4])} ... failed ({r.returncode}): '
+                   f'{r.stderr.decode("utf-8", "replace").strip()[:500]}')
+    return r.stdout
+
+
+def git(repo, *args):
+    return run(['git', '-C', repo, '-c', 'core.quotePath=false', *args])
+
+
+def gh(args, cwd):
+    """(stdout text, None) or (None, error text)."""
+    try:
+        r = subprocess.run(['gh', *args], cwd=cwd, capture_output=True,
+                           env={**os.environ, 'GH_PAGER': '', 'NO_COLOR': '1', 'GH_PROMPT_DISABLED': '1'})
+    except FileNotFoundError:
+        return None, 'gh is not installed'
+    if r.returncode != 0:
+        return None, (r.stderr.decode('utf-8', 'replace').strip() or f'exit {r.returncode}')[:300]
+    return r.stdout.decode('utf-8', 'replace'), None
+
+
+def json_values(text):
+    """Every JSON value in text, one after another: `gh api --paginate` prints one array per page."""
+    dec, i, out = json.JSONDecoder(), 0, []
+    text = text.strip()
+    while i < len(text):
+        value, i = dec.raw_decode(text, i)
+        out.append(value)
+        while i < len(text) and text[i].isspace():
+            i += 1
+    return out
+
+
+def shorten(text, limit):
+    text = (text or '').strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f'\n\n[cut: {limit} of {len(text)} characters shown]'
+
+
+def demote(text):
+    """Embedded Markdown (a body, a comment) with its headings moved below the packet's own (#### and deeper), so a
+    `## Why` in a pull request body does not read as a packet section; lines inside a code fence stay as written."""
+    out, open_fence = [], None
+    for line in (text or '').split('\n'):
+        m = re.match(r' {0,3}(`{3,}|~{3,})', line)
+        if m and (open_fence is None or (m.group(1)[0] == open_fence[0] and len(m.group(1)) >= len(open_fence))):
+            open_fence = m.group(1) if open_fence is None else None
+        elif open_fence is None:
+            h = re.match(r'( {0,3})(#{1,6})(?=\s|$)', line)
+            if h:
+                line = h.group(1) + '#' * min(6, len(h.group(2)) + 3) + line[h.end():]
+        out.append(line)
+    return '\n'.join(out)
+
+
+def fence(text, info=''):
+    """A fence longer than any backtick run in text, so the text cannot close it."""
+    runs = [len(m) for m in re.findall(r'`{3,}', text)]
+    ticks = '`' * max([3] + [n + 1 for n in runs])
+    return f'{ticks}{info}\n{text.rstrip(chr(10))}\n{ticks}'
+
+
+def lens_prompt(repo, name, settings_path):
+    """(prompt path, its text at HEAD). The prompt is the one the review block names for the lens, read with the
+    kit's loaders from the clone; Stop when the lens is not in the block."""
+    if settings_path is None and not os.path.exists(os.path.join(repo, review_kit.SETTINGS)):
+        others = review_kit.other_settings(repo)
+        settings_path = others[0] if len(others) == 1 else None
+    try:
+        settings, _ = review_kit.load_settings(repo, settings_path)
+        cfg, note = review_kit.load_queue_config(repo, settings)
+    except review_kit.Problem as e:
+        raise Stop(str(e)) from None
+    if cfg is None or cfg.review is None:
+        raise Stop(f'{note}; lens-packet needs the review block to find the lens prompt')
+    prompts = {x.name: x.prompt for x in cfg.review.lenses}
+    if name not in prompts:
+        raise Stop(f'no lens {name!r} in the review block of {settings["queue_config"]} '
+                   f'(lenses: {", ".join(sorted(prompts))})')
+    path = prompts[name]
+    try:
+        text = git(repo, 'show', f'HEAD:{path}').decode('utf-8', 'replace')
+    except Stop:
+        raise Stop(f'the lens prompt {path} of lens {name!r} is not in the clone at HEAD') from None
+    return path, text
+
+
+def linked_issues(pr):
+    """The issues the body references with a closing or linking word (`Fixes #N`, `Part of #N`), then any `#N` in the
+    title; never the pull request itself; at most MAX_ISSUES."""
+    nums = [int(n) for n in REF_RE.findall(pr.get('body') or '')]
+    nums += [int(n) for n in TITLE_REF_RE.findall(pr.get('title') or '')]
+    out = []
+    for n in nums:
+        if n != pr['number'] and n not in out:
+            out.append(n)
+    return out[:MAX_ISSUES]
+
+
+def changed_files(repo, base, head):
+    """[(status, old path, new path, added, deleted)]; added/deleted None for a binary file."""
+    status = git(repo, 'diff', '--no-ext-diff', '-M', '--name-status', '-z', base, head).decode('utf-8', 'replace')
+    tok = status.split('\0')
+    files, i = [], 0
+    while i < len(tok) and tok[i]:
+        st = tok[i]
+        if st[0] in 'RC':
+            files.append([st[0], tok[i + 1], tok[i + 2]])
+            i += 3
+        else:
+            files.append([st[0], tok[i + 1], tok[i + 1]])
+            i += 2
+    counts = {}
+    num = git(repo, 'diff', '--no-ext-diff', '-M', '--numstat', '-z', base, head).decode('utf-8', 'replace')
+    tok, i = num.split('\0'), 0
+    while i < len(tok) and tok[i]:
+        a, d, path = tok[i].split('\t', 2)
+        if path == '':
+            path = tok[i + 2]
+            i += 3
+        else:
+            i += 1
+        counts[path] = (None, None) if a == '-' else (int(a), int(d))
+    return [(st, old, new, *counts.get(new, (None, None))) for st, old, new in files]
+
+
+def file_diff(repo, base, head, old, new, max_lines):
+    paths = [old, new] if old != new else [new]
+    text = git(repo, 'diff', '--no-color', '--no-ext-diff', '-M', base, head, '--', *paths).decode('utf-8', 'replace')
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text, None
+    return '\n'.join(lines[:max_lines]), (f'[cut: {max_lines} of {len(lines)} diff lines shown; the rest: '
+                                          f'git diff {base[:12]} {head[:12]} -- {new}]')
+
+
+def places(repo, base, head, old, new):
+    """[(first, last, labels)] of the head file: each changed place +-CONTEXT lines, overlapping ones merged; labels
+    are git's function names from the hunk headers."""
+    paths = [old, new] if old != new else [new]
+    text = git(repo, 'diff', '--no-color', '--no-ext-diff', '-M', '-U0', base, head, '--', *paths).decode('utf-8', 'replace')
+    spans = []
+    for line in text.splitlines():
+        m = HUNK_RE.match(line)
+        if not m:
+            continue
+        start, count = int(m.group(3)), int(m.group(4) if m.group(4) is not None else 1)
+        last = start + count - 1 if count else start
+        spans.append([max(1, start - CONTEXT), last + CONTEXT, [m.group(5).strip()] if m.group(5).strip() else []])
+    merged = []
+    for s in sorted(spans, key=lambda x: (x[0], x[1])):
+        if merged and s[0] <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], s[1])
+            merged[-1][2] += [x for x in s[2] if x not in merged[-1][2]]
+        else:
+            merged.append(s)
+    return merged
+
+
+def context_block(repo, head, path, spans, max_lines):
+    blob = git(repo, 'show', f'{head}:{path}')
+    if b'\0' in blob[:8000]:
+        return None
+    lines = blob.decode('utf-8', 'replace').splitlines()
+    width = len(str(len(lines)))
+    out, shown = [], 0
+    for first, last, labels in spans:
+        last = min(last, len(lines))
+        if first > last:
+            continue
+        if shown + (last - first + 1) > max_lines:
+            out.append(f'[cut: context capped at {max_lines} lines for this file; read the rest at the head]')
+            break
+        head_line = f'lines {first}-{last}' + (f' (in: {"; ".join(labels)})' if labels else '')
+        body = '\n'.join(f'{n:>{width}}  {lines[n - 1]}' for n in range(first, last + 1))
+        out.append(f'{head_line}\n\n{fence(body)}')
+        shown += last - first + 1
+    return '\n\n'.join(out)
+
+
+def round_kind(body, name):
+    """'own' for a read of this lens (the gate's lens_key, so `code r2` is `code`) or a `not a lens:` note between
+    rounds, 'other' for another lens's report (anything carrying the gate's lens marker), None for the rest."""
+    body = body or ''
+    if body.lstrip().lower().startswith('not a lens:'):
+        return 'own'
+    try:
+        header = lens.lens_header(body)
+        if header and lens.lens_key(header[0]) == lens.lens_key(name):
+            return 'own'
+        return 'other' if lens.has_marker(body) else None
+    except lens.UnicodeDrift:
+        return 'other'   # the gate blocks on it; --all-lenses shows it
+
+
+def build(args):
+    repo = os.path.abspath(args.repo)
+    head = git(repo, 'rev-parse', 'HEAD').decode().strip()
+    slug = args.R
+    if not slug:
+        text, err = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], repo)
+        if err or not text.strip():
+            raise Stop(f'gh cannot tell the repository of {repo}: {err or "no name"}; pass -R OWNER/REPO')
+        slug = text.strip()
+    text, err = gh(['api', f'repos/{slug}/pulls/{args.pr}'], repo)
+    if err:
+        raise Stop(f'gh could not read pull request #{args.pr} of {slug}: {err}')
+    raw = json.loads(text)
+    pr = {'number': raw.get('number'), 'title': raw.get('title') or '', 'body': raw.get('body') or '',
+          'url': raw.get('html_url') or ''}
+    pr_head = (raw.get('head') or {}).get('sha')
+    base_tip, base_ref = (raw.get('base') or {}).get('sha') or '', (raw.get('base') or {}).get('ref')
+    if pr_head != head:
+        raise Stop(f'the clone {repo} is at {head}, but the head of #{args.pr} is {pr_head}: check out the head '
+                   f'(git fetch origin pull/{args.pr}/head && git checkout --detach FETCH_HEAD)')
+    if subprocess.run(['git', '-C', repo, 'cat-file', '-e', f'{base_tip}^{{commit}}'], capture_output=True).returncode:
+        raise Stop(f'the clone has no base commit {base_tip!r}: git -C {repo} fetch origin {base_ref}')
+    base = git(repo, 'merge-base', base_tip, head).decode().strip()
+    prompt_path, prompt_text = lens_prompt(repo, args.lens, args.settings)
+
+    gaps, out = [], []
+    out.append(f'head: {head}')
+    out.append(f'base: {base} (merge base with {base_ref})')
+    out.append(f'pr: #{pr["number"]} {pr.get("url", "")} · lens: {args.lens}')
+    out.append('')
+    out.append(f'# Lens packet: #{pr["number"]} {pr.get("title", "")}')
+    out.append('')
+    out.append('Made by fork-kit/review/lens-packet. Read this first; open only what it lacks. Everything below is '
+               'read at the head above: if `git rev-parse HEAD` differs, make a new packet.')
+    gap_at = len(out)
+
+    out += ['', '## Pull request', '', f'**{pr.get("title", "")}**', '', demote((pr.get('body') or '(no body)').strip())]
+
+    out += ['', '## Linked issues']
+    issues = linked_issues(pr)
+    if not issues:
+        out += ['', '(none referenced)']
+    for n in issues:
+        text, err = gh(['issue', 'view', str(n), '-R', slug, '--json', 'number,title,state,body,comments'], repo)
+        if err:
+            gaps.append(f'issue #{n}: gh could not read it: {err}')
+            out += ['', f'### #{n}: not read ({err})']
+            continue
+        issue = json.loads(text)
+        comments = issue.get('comments') or []
+        out += ['', f'### #{n} {issue.get("title", "")} ({issue.get("state", "").lower()})', '',
+                demote(shorten(issue.get('body') or '(no body)', ISSUE_BODY_CHARS))]
+        if comments:
+            shown = comments[-ISSUE_COMMENTS:]
+            out += ['', f'Last {len(shown)} of {len(comments)} comments:']
+            for c in shown:
+                who = (c.get('author') or {}).get('login', '?')
+                out += ['', f'- {who}, {c.get("createdAt", "")}:', '',
+                        '  ' + demote(shorten(c.get('body'), ISSUE_COMMENT_CHARS)).replace('\n', '\n  ')]
+
+    files = changed_files(repo, base, head)
+    out += ['', f'## Changed files ({len(files)})', '']
+    for st, old, new, a, d in files:
+        name = f'{old} -> {new}' if old != new else new
+        out.append(f'- {st} {name} ' + ('(binary)' if a is None else f'+{a} -{d}'))
+
+    out += ['', '## Diff']
+    for st, old, new, a, d in files:
+        text, note = file_diff(repo, base, head, old, new, args.max_diff_lines)
+        out += ['', f'### {new}', '', fence(text, 'diff')]
+        if note:
+            out += ['', note]
+
+    out += ['', f'## Around each change (the head, {CONTEXT} lines before and after)']
+    for st, old, new, a, d in files:
+        if st == 'D':
+            continue
+        if a is None:
+            out += ['', f'### {new}', '', '(binary: no text)']
+            continue
+        if st == 'A':
+            out += ['', f'### {new}', '', '(new file: all of it is in the diff above'
+                    + (', which is cut: read it at the head)' if a + 1 > args.max_diff_lines else ')')]
+            continue
+        spans = places(repo, base, head, old, new)
+        if not spans:
+            continue
+        block = context_block(repo, head, new, spans, args.max_context_lines)
+        out += ['', f'### {new}', '', block if block is not None else '(binary: no text)']
+
+    out += ['', f'## Lens prompt: {prompt_path}', '', prompt_text.strip()]
+
+    out += ['', '## Earlier lens comments on this pull request',
+            '', 'Rounds before this one: check whether their findings are fixed at this head; form your own view of '
+            'the rest.']
+    text, err = gh(['api', '--paginate', f'repos/{slug}/issues/{pr["number"]}/comments?per_page=100'], repo)
+    if err:
+        gaps.append(f'pull request comments: gh could not read them: {err}')
+        out += ['', f'(not read: {err})']
+    else:
+        comments = [c for page in json_values(text) for c in (page if isinstance(page, list) else [])]
+        kinds = [(round_kind(c.get('body'), args.lens), c) for c in comments]
+        keep = ('own', 'other') if args.all_lenses else ('own',)
+        rounds = sorted((c for k, c in kinds if k in keep), key=lambda c: (c.get('created_at') or '', c.get('id') or 0))
+        others = sum(1 for k, _ in kinds if k == 'other')
+        if not args.all_lenses and others:
+            out += ['', f'{others} report(s) of other lenses left out: a lens does not read another lens\'s report '
+                    f'(SKILL.md, "Order", step 4); --all-lenses adds them.']
+        if not rounds:
+            out += ['', '(none)']
+        for c in rounds:
+            who = (c.get('user') or {}).get('login', '?')
+            out += ['', f'### {who}, {c.get("created_at", "")} ({c.get("html_url", "")})', '',
+                    fence(shorten(c.get('body'), LENS_COMMENT_CHARS))]
+
+    if gaps:
+        out[gap_at:gap_at] = ['', '## Gaps', ''] + [f'- {g}' for g in gaps]
+    return head, '\n'.join(out) + '\n', gaps
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog='lens-packet', description=__doc__.split('\n')[0])
+    p.add_argument('pr', type=int)
+    p.add_argument('--lens', required=True)
+    p.add_argument('--out', required=True)
+    p.add_argument('--repo', default='.')
+    p.add_argument('-R', help='OWNER/REPO, else gh finds it from the clone')
+    p.add_argument('--settings', help='the kit settings, as for review_kit.py (default: found in .github)')
+    p.add_argument('--all-lenses', action='store_true', help="also other lenses' reports (default: this lens's only)")
+    p.add_argument('--max-diff-lines', type=int, default=400, help='diff lines per file (default 400)')
+    p.add_argument('--max-context-lines', type=int, default=400, help='context lines per file (default 400)')
+    args = p.parse_args(argv)
+    try:
+        head, text, gaps = build(args)
+    except Stop as e:
+        print(f'lens-packet: {e}', file=sys.stderr)
+        return 2
+    except ValueError as e:
+        print(f'lens-packet: gh printed something that is not JSON: {e}', file=sys.stderr)
+        return 2
+    tmp = f'{args.out}.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(text)
+    os.replace(tmp, args.out)
+    print(f'head: {head}')
+    print(f'wrote {args.out}: {len(text)} characters')
+    for g in gaps:
+        print(f'WARN lens-packet: {g}', file=sys.stderr)
+    return 1 if gaps else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

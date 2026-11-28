@@ -184,6 +184,11 @@ A lens with no prompt file of its own (the fallback lens `review`) uses this tex
 > blocker or major exits 1 by design: post it as found, never softened); never edit a posted comment (post a new
 > one).
 
+**Lenses: run lens-packet first, read the packet, then only open what it lacks.**
+`python3 -I fork-kit/review/lens-packet <PR> --lens <lens> --repo <clone at the head> --out <file>` writes the pull
+request, its linked issues, the changed files, the diff, the head around each change, the lens prompt and this lens's
+earlier rounds into one file; its first line is the head it read (a different head: make a new packet).
+
 ## 5. Who runs what
 
 Runners are kit settings, not rules: `runner` (default `claude-opus-5-5`, effort `high`) for every lens, `lens_runners`

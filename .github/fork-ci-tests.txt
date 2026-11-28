@@ -170,6 +170,7 @@ fork-kit/pc-agents/tests/update.test.py ~66s unittest
 fork-kit/placement-facts/tests/scripts.test.py unittest
 fork-kit/review/tests/comments.test.py unittest
 fork-kit/review/tests/eval.test.py unittest
+fork-kit/review/tests/packet.test.py unittest
 fork-kit/review/tests/plan.test.py unittest
 fork-kit/schedule-kick/tests/cron.test.py unittest
 fork-kit/schedule-kick/tests/install.test.py unittest
