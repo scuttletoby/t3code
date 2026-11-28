@@ -52,7 +52,9 @@ Where a tool enforces a rule, the tool is the authority.
 - Small, focused pull requests; one push per fix round. _Why: each push restarts CI._
 - A test that fails the same way twice is known-failing: its fix goes first, no reruns. _Why: reruns waste CI._
 - "Fixes #N" only when the fix is proven; else "Part of #N". _Why: merging closes the issue._
-- Never update pull request branches by hand when a merge queue does it. _Why: it restarts every CI at once._
+- Update a pull request branch from its base (`gh pr update-branch`, Update branch) only for the one you merge next,
+  at most once, right before it merges; never the others that wait, never on each move of the base, never by hand
+  when a merge queue does it. _Why: each update is a full CI run; they were a quarter of all extra pushes._
 - Reports, handoffs and review notes go in the pull request or an issue. _Why: the repository holds current text._
 - Reviews follow the [review skill](../../fork-kit/review/SKILL.md) (weights, the state question, round limit);
   never restate it; its `plan` and `check` take `--settings .github/fork-review-kit.json` here. _Why: one source;
