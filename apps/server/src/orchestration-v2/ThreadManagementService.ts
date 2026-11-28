@@ -75,6 +75,7 @@ import { cancelledBeforeStart } from "./RestartBackgroundNote.ts";
 import { contextBoundaryOrdinal } from "./contextBoundary.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ModelPolicyBackstop from "../fork/modelPolicyBackstop.ts"; // Fork: model policy backstop
 import { ThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
 import { checkOutput, outputRequestProblem } from "./runOutput.ts";
 import { routineSpan } from "@t3tools/shared/observability";
@@ -850,6 +851,7 @@ const make = Effect.gen(function* () {
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
+      Effect.andThen(ModelPolicyBackstop.check(command, orchestrator, receipts, serverSettings)), // Fork: model policy backstop
       Effect.andThen(orchestrator.dispatch(command)),
     );
 

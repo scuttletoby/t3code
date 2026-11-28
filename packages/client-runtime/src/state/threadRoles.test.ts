@@ -106,7 +106,7 @@ const shown = (
     kind: partition.kind,
     top: partition.roleRows.map(({ thread, role }) => `${role}:${thread.id}`),
     other: partition.otherThreads.map((thread) => String(thread.id)),
-    waiting: partition.waitingCount,
+    waiting: partition.otherThreads.filter(isWaitingOnPerson).length,
   };
 };
 

@@ -44,7 +44,11 @@ import { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
-import { withUltracodeToggle } from "../provider/ClaudeModelCatalog.ts";
+import {
+  BUNDLED_CLAUDE_MODEL_CATALOG,
+  claudeReportedModels,
+  withUltracodeToggle,
+} from "../provider/ClaudeModelCatalog.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -55,6 +59,14 @@ import {
   OPTION_CASES,
   type OptionCase,
 } from "./modelPolicyOptions.testkit.ts";
+
+/** The Settings section's heading as the web app shows it, which the refusals name. */
+const SETTINGS_HEADING = /id="model-policy-section" title="([^"]+)"/.exec(
+  NodeFS.readFileSync(
+    new URL("../../../web/src/components/settings/fork/ModelPolicySettings.tsx", import.meta.url),
+    "utf8",
+  ),
+)?.[1];
 
 const OPUS = "claude-opus-5-5";
 const FABLE = "claude-fable-5-2";
@@ -217,7 +229,7 @@ describe("the answer for a pick, per policy state", () => {
         JSON.stringify(raw),
       );
       assert.include(text, "so every agent pick is refused", JSON.stringify(raw));
-      assert.include(text, "Settings → Fork → Model policy");
+      assert.include(text, `Settings → Fork → ${SETTINGS_HEADING}`);
     }
     const advise = answer(unreadable({ mode: "advise", allow: [{ model: OPUS }] }), claude("x"));
     assert.isFalse("refuse" in advise);
@@ -252,6 +264,7 @@ describe("the answer for a pick, per policy state", () => {
     assert.include(text("create_threads"), "target.model");
     assert.include(text("t3_thread_launch"), "modelSelection.model");
     assert.include(text("t3_thread_configure"), "modelSelection.model");
+    assert.include(text("agent command"), "source thread's model");
   });
 });
 
@@ -549,6 +562,56 @@ describe("a selection as the policy reads it", () => {
       options: [{ id: "variant", value: DEFAULT_VARIANT_CHOICE_ID }],
     };
     assert.deepStrictEqual(modelPolicyPickEfforts(pick), []);
+  });
+
+  it("Claude's default effort choice for a gateway model, which sends no effort, is no effort", () => {
+    // The model as the Claude driver lists one outside its catalog: its effort select's default.
+    const { models } = claudeReportedModels(
+      BUNDLED_CLAUDE_MODEL_CATALOG,
+      [],
+      [
+        {
+          value: "my-gateway-model",
+          displayName: "Gateway",
+          description: "",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "high"],
+        },
+      ],
+    );
+    const descriptor = models[0]?.capabilities?.optionDescriptors?.find(
+      (candidate) => candidate.id === "effort",
+    );
+    const choice =
+      descriptor?.type === "select"
+        ? descriptor.options.find((option) => option.isDefault === true)?.id
+        : undefined;
+    assert.isDefined(choice);
+    const INSTANCE = ProviderInstanceId.make("claudeAgent");
+    const gateway = {
+      instanceId: INSTANCE,
+      driver: ProviderDriverKind.make("claudeAgent"),
+      models,
+    } as unknown as ServerProvider;
+    const rows: ReadonlyArray<ModelPolicyRow> = [
+      {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        model: "my-gateway-model",
+        efforts: ["low", "high"],
+      },
+    ];
+    const read = (value: string) =>
+      ModelPolicyCheck.pickOfSelection(
+        [gateway],
+        { instanceId: INSTANCE, model: "my-gateway-model", options: [{ id: "effort", value }] },
+        true,
+      );
+    assert.deepStrictEqual(modelPolicyPickEfforts(read(choice!)), []);
+    assert.include(
+      refusal(policy("enforce", rows), read(choice!)),
+      "needs an effort from its row, and the pick names none",
+    );
+    assert.isUndefined(refusal(policy("enforce", rows), read("high")));
   });
 });
 
