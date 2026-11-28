@@ -85,7 +85,10 @@ No outputs.
 ```
 
 `author` is the login the `token` writes as, as `gh` names it: `app/NAME` for an app (the workflow token is
-`app/github-actions`), the user's login for a personal token. Issues by any other account are ignored.
+`app/github-actions`), the user's login for a personal token. Issues by any other account are ignored. When the
+report creates an issue, it reads the new issue's author back. If that is not `author` (a token that writes as
+another account), the step fails, naming the login to set, and closes the new issue. It opens no red issue with that
+token, so a wrong `author` never leaves a new issue open on every run.
 
 A key this release does not know (a newer release's) is a bad config: the report and files are still written, no
 issue is read or written, and the step fails. Labels must exist in the repository.

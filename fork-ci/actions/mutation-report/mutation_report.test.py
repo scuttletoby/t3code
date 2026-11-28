@@ -23,6 +23,16 @@ def result(name, rate, surv=()):
             'survivors': [{'line': ln, 'what': '`==` -> `!=`', 'code': 'x == y', 'why': 'tests pass'} for ln in surv]}
 
 
+def gh_write(cmd):
+    """What gh prints for a write: create, the new issue's URL; view (of the new issue), its author, the workflow
+    token's account."""
+    if cmd[2:3] == ['create']:
+        return 'https://github.com/o/r/issues/99\n'
+    if cmd[2:3] == ['view']:
+        return json.dumps({'author': {'login': 'app/github-actions', 'is_bot': True}})
+    return ''
+
+
 class Report(unittest.TestCase):
     def test_judge(self):
         base = {'a': {'kill_rate': 60.0}, 'b': {'kill_rate': 50.0}, 'gone': {'kill_rate': 1.0}}
@@ -96,7 +106,7 @@ class Report(unittest.TestCase):
             def run(cmd, stdin=None):
                 calls.append((cmd, stdin))
                 if cmd[1:3] != ['issue', 'list']:
-                    return ''
+                    return gh_write(cmd)
                 red = f'"{R.RED_TITLE}" in:title' in cmd
                 return json.dumps([{'number': n, 'title': R.RED_TITLE, 'author': BOT} for n in open_red] if red else [])
             with contextlib.redirect_stdout(io.StringIO()):
@@ -280,12 +290,12 @@ class Report(unittest.TestCase):
 
             def run(cmd, stdin=None):
                 calls.append((cmd, stdin))
-                return json.dumps(issues) if cmd[1:3] == ['issue', 'list'] else ''
+                return json.dumps(issues) if cmd[1:3] == ['issue', 'list'] else gh_write(cmd)
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = R.main(['--results', p('r.json'), '--baseline', p('base.json'), '--expect', p('targets.json'),
                              '--issue', '--repo', 'o/r', '--suggest', p('s.json')], run=run)
             self.assertEqual(rc, 0)
-            writes = [c for c in calls if c[0][1:3] != ['issue', 'list']]
+            writes = [c for c in calls if c[0][1:3] not in (['issue', 'list'], ['issue', 'view'])]
             # green, no red issue open: nothing to close but a second open copy of the report
             self.assertEqual([w[0][1:1 + len(v)] for w, v in zip(writes, verbs)], verbs)
             self.assertEqual(len(writes), len(verbs), calls)
@@ -359,6 +369,8 @@ class FakeGitHub:
             self.issues[n] = {'title': arg('--title'), 'state': 'OPEN', 'body': stdin, 'author': self.me}
             return f'https://github.com/o/r/issues/{n}\n'
         issue = self.issues[int(cmd[3])]
+        if verb == 'view':
+            return json.dumps({'author': {'login': issue['author'], 'is_bot': issue['author'].startswith('app/')}})
         if verb == 'edit':
             issue['body'] = stdin
         elif verb == 'reopen':
@@ -545,6 +557,32 @@ class RedIssueAuthor(unittest.TestCase):
         self.assertFalse([c for c in gh.calls if c[2] in ('comment', 'close') and c[3] == '3'], gh.calls)
 
 
+class TokenOfAnotherAccount(unittest.TestCase):
+    def test_a_token_that_writes_as_another_account_fails_and_leaves_no_issue_open(self):
+        """The token writes as someone other than `author` (a personal token, an app's): does every run silently open
+        a new report issue (and a red one) that the next run never finds? No: the run fails naming the login to set,
+        closes what it just opened, and opens no red issue with that token."""
+        t = RollingIssue('test_no_report_issue_yet_creates_one_and_the_next_run_finds_it')
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        gh = FakeGitHub(me='some-user')
+        for run in ('u/1', 'u/2'):
+            rc, out = t.report(gh, run)
+            self.assertEqual(rc, 1, out)
+            self.assertIn('set "author": "some-user"', out)
+        with open(t.p('r.json'), 'w') as f:
+            json.dump({'modules': [{'module': 'a', 'error': 'stopped'}]}, f)
+        rc, out = t.report(gh, 'u/3')
+        self.assertEqual(rc, 1, out)
+        self.assertEqual({n: (i['title'], i['state']) for n, i in gh.issues.items()},
+                         {n: (R.TITLE, 'CLOSED') for n in (1, 2, 3)}, 'no red issue, none left open')
+        with open(t.p('c.json'), 'w') as f:
+            json.dump({'author': 'some-user'}, f)
+        gh = FakeGitHub(me='some-user')   # `author` set to it: the report and the red issue, both open
+        self.assertEqual(t.report(gh, 'u/1', '--config', t.p('c.json'))[0], 1)   # (still red)
+        self.assertEqual({n: i['state'] for n, i in gh.issues.items()}, {1: 'OPEN', 2: 'OPEN'})
+
+
 class ConfigTitles(unittest.TestCase):
     """The project's titles and labels come from the config; a config this release cannot read writes no issue."""
     def setUp(self):
@@ -606,6 +644,9 @@ if verb == 'list':
                       and author in (None, i.get('author', 'app/github-actions'))]))
 elif verb == 'create':
     issues[str(len(issues) + 1)] = {'title': arg('--title'), 'state': 'OPEN', 'body': sys.stdin.read()}
+    print(f'https://github.com/o/r/issues/{len(issues)}')
+elif verb == 'view':
+    print(json.dumps({'author': {'login': issues[cmd[2]].get('author', 'app/github-actions')}}))
 elif verb == 'edit':
     issues[cmd[2]]['body'] = sys.stdin.read()
 elif verb in ('reopen', 'close'):

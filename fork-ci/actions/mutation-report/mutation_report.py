@@ -8,7 +8,8 @@ GitHub issue with a trend table of the last TREND_KEEP runs, kept in the issue b
 
 A kill rate below the baseline is a number to read, never a failure: the report marks it as a drop. Exit 1 only when a
 module has no score (did not finish, failed, far fewer planted bugs than its baseline), the baseline is missing,
-unreadable or names a module that is no longer a target, the config is bad, or GitHub could not be read or written: a
+unreadable or names a module that is no longer a target, the config is bad, GitHub could not be read or written, or
+an issue it created is not the config's `author`'s (the token writes as another account: the new issue is closed): a
 run that measured nothing must stay loud. The baseline file is only ever changed by a pull request; --suggest writes
 this run's numbers in its format. A module without a result this run keeps its last section, marked as not refreshed.
 The rolling issue: every issue with the configured title, open or closed, is read and their trends are merged (a run
@@ -343,6 +344,34 @@ def merged_trend(issues):
     return runs[-TREND_KEEP:], note
 
 
+class WrongAuthor(ValueError):
+    """The token writes as another account than the config's `author`."""
+
+
+def create(run, repo, cmd, body, author):
+    """gh issue create, then reads the new issue's author back. A token that writes as another account than `author`
+    (a personal token, an app's) would open a new issue every run that the next run never finds (it searches by
+    `author`): WrongAuthor then, naming the login to set, and the new issue is closed, so no run leaves one open."""
+    out = run(cmd, stdin=body)
+    m = re.search(r'/issues/(\d+)\s*\Z', out or '')
+    if not m:
+        raise ValueError(f'gh issue create printed no issue URL ({str(out)[:200]!r}): cannot check who wrote it')
+    number = m.group(1)
+    got = ((json.loads(run(['gh', 'issue', 'view', number, '--repo', repo, '--json', 'author']) or '{}')
+            .get('author') or {}).get('login'))
+    if login(got) == login(author):
+        return
+    name = str(got or '?')[:60]
+    try:
+        run(['gh', 'issue', 'close', number, '--repo', repo, '--comment',
+             f'Closed by the mutation report: the token writes as `{name}`, not as the config\'s "author" '
+             f'`{author}`, so the next run would not find this issue. Set "author" to `{name}`.'])
+    except (subprocess.CalledProcessError, OSError):
+        pass
+    raise WrongAuthor(f'the new issue #{number} was written as {name}, not as the config\'s "author" ({author}): '
+                      f'set "author": "{name}" in the config (the new issue is closed; the next run would not find it)')
+
+
 def alert(run, repo, problems, run_url, commit, config=None):
     """One open issue red_title while runs are red (a module without a score): created or commented on (a comment
     notifies and bumps it), and closed by the first green run. Raises what gh raises."""
@@ -361,8 +390,8 @@ def alert(run, repo, problems, run_url, commit, config=None):
     if number:
         run(['gh', 'issue', 'comment', str(number), '--repo', repo, '--body-file', '-'], stdin=body)
     else:
-        run(['gh', 'issue', 'create', '--repo', repo, '--title', red_title, '--body-file', '-',
-             *[x for lab in config['red_labels'] for x in ('--label', lab)]], stdin=body)
+        create(run, repo, ['gh', 'issue', 'create', '--repo', repo, '--title', red_title, '--body-file', '-',
+                           *[x for lab in config['red_labels'] for x in ('--label', lab)]], body, config['author'])
 
 
 def write_issue(run, repo, config, target, extra, body):
@@ -370,8 +399,8 @@ def write_issue(run, repo, config, target, extra, body):
     alone leaves state the next run finishes: an edited issue still closed is the newest closed one, reopened next
     time; a copy still open is closed next time, its trend already merged."""
     if target is None:
-        run(['gh', 'issue', 'create', '--repo', repo, '--title', config['title'], '--body-file', '-',
-             *[x for lab in config['labels'] for x in ('--label', lab)]], stdin=body)
+        create(run, repo, ['gh', 'issue', 'create', '--repo', repo, '--title', config['title'], '--body-file', '-',
+                           *[x for lab in config['labels'] for x in ('--label', lab)]], body, config['author'])
         return
     number = str(target['number'])
     run(['gh', 'issue', 'edit', number, '--repo', repo, '--body-file', '-'], stdin=body)
@@ -454,12 +483,16 @@ def main(argv=None, run=default_run, now=None):
     print(body if not a.issue else '\n'.join(body.split('\n')[:20]))
     for p in problems:   # the verdict is logged before anything can fail on GitHub
         print(f'::error::{p}')
+    wrong_author = False
     if a.issue and not issue_error:   # never create a second issue when the first couldn't be read
         try:
             write_issue(run, a.repo, config, target, extra, body)
-        except (subprocess.CalledProcessError, OSError) as e:
+        except (subprocess.CalledProcessError, OSError, ValueError, TypeError, AttributeError) as e:
+            wrong_author = isinstance(e, WrongAuthor)
             issue_error = f'could not write the rolling issue: {gh_error(e)}'
-    if a.issue and not config_error:   # also when the rolling issue failed: the alert is the part that reaches someone
+    # Also when the rolling issue failed (the alert is the part that reaches someone), but not with a token that
+    # writes as another account: its red issue would be one more that no run finds.
+    if a.issue and not config_error and not wrong_author:
         try:
             alert(run, a.repo, problems, a.run_url, a.commit, config)
         except (subprocess.CalledProcessError, OSError, ValueError, TypeError, KeyError) as e:

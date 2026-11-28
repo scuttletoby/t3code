@@ -28,7 +28,8 @@ New actions, ported from a project's own copies, with project facts as inputs or
   open or closed: a closed rolling issue is reopened with its trend (it was replaced by a new one, and the trend
   started again), two open copies are merged into the oldest and the other closed. Only issues opened by the
   config's `author` (default `app/github-actions`) count: a stranger's issue with the same title is never merged,
-  closed or written. Titles, labels and the author come from a config (defaults: no labels).
+  closed or written. Titles, labels and the author come from a config (defaults: no labels). A token that writes as
+  another account than `author` fails the step, naming the login to set, and leaves no new issue open.
 
 **Upgrade:** a project with its own copies passes its old lock `name` (and `dir`) and its old issue titles in the
 config, so the action continues the same lock and issue; then it deletes its copies.
