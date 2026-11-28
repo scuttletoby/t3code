@@ -46,8 +46,9 @@ name: Fork tests
 #   commit (github.sha, where its checks land). On a pull request's branch it is
 #   never weaker than that pull request's own run: it tests the pull request's
 #   merge commit (whose head parent must be github.sha), scans for secrets as
-#   that pull request's run does (fork-secret-scan.yml's head_ref), and
-#   fork_checks_ran judges it as that pull request's run (fork-checks-ran.py).
+#   that pull request's run does (fork-secret-scan.yml's head_ref), checks the
+#   fork lines in upstream files on that merge commit, and fork_checks_ran
+#   judges it as that pull request's run (fork-checks-ran.py).
 #   Test: fork-contracts.test.py (head-run).
 on:
   pull_request:
@@ -555,9 +556,11 @@ jobs:
       # setting goes in forkSettings.ts, not upstream's settings.ts). A pull request's run checks out
       # its merge commit, whose first parent is the base: the lines the pull request adds. Its two
       # commits have no upstream base, so the seam entries it changes are counted from upstream by
-      # fork-checks (the pull request's head, full history), not here: --no-upstream.
+      # fork-checks (the pull request's head, full history), not here: --no-upstream. A head run on a
+      # pull request's branch checks out that merge commit too (changes/resolve), so it checks the same
+      # lines; on main a head run is a release run of main's tip, which has no base here (as on a push).
       - name: Fork lines in upstream files
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ github.event_name == 'pull_request' || (inputs.head && github.ref_name != github.event.repository.default_branch) }}
         run: node .github/scripts/fork-seam-check.cjs --no-upstream HEAD^1 HEAD
 
   # The composite actions' tests (fork-ci/) and the fleet walls' (.github/scripts/fork-fleet-walls*),
