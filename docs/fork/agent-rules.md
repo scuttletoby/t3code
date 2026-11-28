@@ -50,6 +50,9 @@ Where a tool enforces a rule, the tool is the authority.
 - CI decides: fix the cause of red CI, never bypass it. No CI-skip marker in a commit message, even quoted.
   _Why: it silently skips the real CI._
 - Small, focused pull requests; one push per fix round. _Why: each push restarts CI._
+- Before every push, in a checkout of a repository with fork checks: `fork-kit/agent-guards/bin/fork-precheck --push`
+  (fmt check, lint and the fork checks, as CI runs them, on the commits); exit 1: fix, do not push.
+  _Why: a push CI would refuse for these wastes a whole run._
 - A test that fails the same way twice is known-failing: its fix goes first, no reruns. _Why: reruns waste CI._
 - "Fixes #N" only when the fix is proven; else "Part of #N". _Why: merging closes the issue._
 - Never update pull request branches by hand when a merge queue does it. _Why: it restarts every CI at once._

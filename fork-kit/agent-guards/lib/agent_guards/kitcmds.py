@@ -410,6 +410,7 @@ TEST_FILE = re.compile(r'\.test\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|sh)$')
 NODE_TEST_DIRS = ('.github/', 'fork-ci/', 'fork-kit/')   # node --test there (the fork's runner); vitest elsewhere
 SOURCE_EXT = ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.py', '.sh')
 PRECHECK_USAGE = """usage: fork-precheck [--base REF] [--no-tests] [--no-fork-checks] [--kind KIND]
+       fork-precheck --push [--base REF]
 
 In a checkout: the files changed against REF (default the remote's default branch, fetched first; the base's commit
 and age are printed), from its merge-base: commits, staged, unstaged and new files; deleted ones skipped) are
@@ -425,13 +426,17 @@ machine's capacity check (t3-capacity [--kind KIND], where it is installed) says
 Exit 0: all passed; 1: a step failed (each step still runs; also when the capacity check then said NOT OK); 2: a
 wrong call, not a checkout, or the capacity check could not answer (any exit but 0 or 1, as a t3-capacity that takes
 no --kind gives) when nothing had failed; 3: the capacity check said NOT OK and nothing had failed (fmt, lint and
-the fork checks ran, no test did: run it again later)."""
+the fork checks ran, no test did: run it again later).
+--push: the step before every push (docs/fork/agent-rules.md), the cheap checks CI would otherwise fail: it fetches
+REF first when it is a remote branch (origin/main), then checks the committed changes only (what the push sends):
+vp fmt --check (it writes nothing), vp lint and the fork checks; no tests. Exit 1: CI would be red, do not push."""
 
-# The fork checks fork-checks.yml runs on every pull request (37 of 40 "Fork checks" reds were one of these). Each
-# runs from REF's script with the arguments of REF's workflow step: "$NAME" words come from the step's env (CI's
-# names for the default branch, the base and the head) or from the workflow's own env lines (UPSTREAM_FILES).
-FORK_CHECKS = (('schema', 'fork-schema-check.cjs'), ('upstream-files', 'fork-upstream-files-check.cjs'),
-               ('seam', 'fork-seam-check.cjs'))
+# The fork checks fork-checks.yml runs on every pull request (37 of 40 "Fork checks" reds were one of these): every
+# step of REF's workflow whose run: line is `node .github/scripts/fork-NAME[-check].cjs WORDS` (the workflow is the
+# one list; `node --test` is not such a line), named NAME. Each runs from REF's script with the words of its step:
+# "$NAME" words come from CI's names for the default branch, the base and the head, or from the workflow's own env
+# lines (UPSTREAM_FILES).
+FORK_CHECK_STEP = re.compile(r'^\s+run: node \.github/scripts/(fork-([\w.-]+?)(?:-check)?\.cjs)((?: .*)?)$', re.M)
 FORK_CHECKS_WORKFLOW = '.github/workflows/fork-checks.yml'
 FORK_SCRIPTS = '.github/scripts/'
 LOCAL_REQUIRE = re.compile(r'require\(\s*["\']\./([^"\']+)["\']\s*\)')
@@ -453,12 +458,12 @@ def fork_check_commands(top, ref, values, tmp):
     for m in re.finditer(r'^\s+([A-Z_]+): (?![$][{])(.+?)\s*$', wf, re.M):
         env.setdefault(m[1], m[2])
     cmds = []
-    for name, script in FORK_CHECKS:
-        m = re.search(r'^\s+run: node ' + re.escape(FORK_SCRIPTS + script) + r'((?: .*)?)$', wf, re.M)
-        if not m:
-            return None, f'{FORK_CHECKS_WORKFLOW} in {ref} runs no {script}: the {name} check cannot run as CI does'
+    steps = FORK_CHECK_STEP.findall(wf)
+    if not steps:
+        return None, f'{FORK_CHECKS_WORKFLOW} in {ref} runs no node {FORK_SCRIPTS}fork-*.cjs check: none can run as CI does'
+    for script, name, rest in steps:
         try:
-            words = shlex.split(m[1])
+            words = shlex.split(rest)
         except ValueError as e:
             return None, f'{FORK_CHECKS_WORKFLOW} in {ref}: the {script} step cannot be read: {e}'
         argv = []
@@ -519,13 +524,16 @@ def fork_checks(prog, top, base):
         shutil.rmtree(tmp, True)
 
 
-def changed_files(top, base):
+def changed_files(top, base, committed=False):
+    """The files changed against base's merge-base: commits, staged, unstaged and new files; committed: the commits'
+    only (what a push sends). Deleted files are left out."""
     code, mb, err = _run([GIT, '-C', top, 'merge-base', base, 'HEAD'], timeout=30)
     if code != 0:
         return None, f'no merge-base with {base}: {err.strip()[:200]}'
     files = []
-    for cmd in (['diff', '--name-only', '-z', '--diff-filter=ACMR', mb.strip()],
-                ['ls-files', '-z', '--others', '--exclude-standard']):
+    for cmd in ((['diff', '--name-only', '-z', '--diff-filter=ACMR', mb.strip(), 'HEAD'],) if committed else
+                (['diff', '--name-only', '-z', '--diff-filter=ACMR', mb.strip()],
+                 ['ls-files', '-z', '--others', '--exclude-standard'])):
         code, out, err = _run([GIT, '-C', top, *cmd], timeout=60)
         if code != 0:
             return None, err.strip()[:200]
@@ -578,9 +586,24 @@ def test_commands(tests):
     return ([['vp', 'test', 'run', *vitest]] if vitest else []) + cmds
 
 
+def fetch_base(prog, top, base):
+    """The default base, and --push's: fetched when it names a remote's branch (origin/main), so the merge-base, the
+    fork checks' default branch and their scripts are the remote's now, as CI's are; a fetch that fails is a note
+    (the last fetch is used)."""
+    code, remotes, _ = _run([GIT, '-C', top, 'remote'], timeout=10)
+    remote, _, branch = base.partition('/')
+    if code != 0 or not branch or remote not in remotes.split():
+        return
+    code, _, err = _run([GIT, '-C', top, 'fetch', '-q', '--no-tags', remote,
+                         f'+refs/heads/{branch}:refs/remotes/{remote}/{branch}'], timeout=120)
+    if code != 0:
+        _say(prog, f'note: cannot fetch {base} ({(err.strip().splitlines() or [f"exit {code}"])[-1][:200]}): '
+                   'it is as last fetched')
+
+
 def precheck(argv):
     prog = 'fork-precheck'
-    args, base, tests_on, kind, fork_on = list(argv), None, True, None, True
+    args, base, tests_on, kind, fork_on, push, fetch = list(argv), None, True, None, True, False, False
     while args:
         a = args.pop(0)
         if a in ('-h', '--help'):
@@ -592,6 +615,8 @@ def precheck(argv):
             kind = args.pop(0)
         elif a == '--no-tests':
             tests_on = False
+        elif a == '--push':
+            push, tests_on = True, False
         elif a == '--no-fork-checks':
             fork_on = False
         else:
@@ -605,16 +630,13 @@ def precheck(argv):
     if not base:
         code, head, _ = _run([GIT, '-C', top, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], timeout=10)
         base = head.strip() if code == 0 and head.strip() else 'origin/main'
-        name = base.split('/', 1)[1]
-        code, _, err = _run([GIT, '-C', top, 'fetch', '-q', 'origin', f'+refs/heads/{name}:refs/remotes/{base}'],
-                            timeout=120)
-        if code != 0:
-            _say(prog, f'note: cannot fetch {base} ({(err.strip().splitlines() or [f"exit {code}"])[-1][:200]}): '
-                       'it is as last fetched')
+        fetch = True
+    if fetch or push:
+        fetch_base(prog, top, base)
     code, when, _ = _run([GIT, '-C', top, 'log', '-1', '--format=%h, committed %cr', base, '--'], timeout=10)
     if code == 0 and when.strip():
         _say(prog, f'base {base}: {when.strip()}')
-    files, problem = changed_files(top, base)
+    files, problem = changed_files(top, base, committed=push)
     if files is None:
         _say(prog, problem, err=True)
         return 2
@@ -624,15 +646,19 @@ def precheck(argv):
     _say(prog, f'{len(files)} changed file(s) against {base}')
     paths = [f if not f.startswith('-') else f'./{f}' for f in files]
     failed = []
-    for step in (['vp', 'fmt', '--no-error-on-unmatched-pattern'], ['vp', 'lint', '--no-error-on-unmatched-pattern']):
-        _say(prog, ' '.join(step[:2]))
-        code, _, _ = _run(step + paths, cwd=top, capture=False)
+    fmt = ['vp', 'fmt', '--check'] if push else ['vp', 'fmt']
+    for label, step in (('fmt check' if push else 'fmt', fmt), ('lint', ['vp', 'lint'])):
+        _say(prog, ' '.join(step))
+        code, _, _ = _run(step + ['--no-error-on-unmatched-pattern'] + paths, cwd=top, capture=False)
         if code != 0:
-            failed.append(f'{step[1]} (exit {code})')
+            failed.append(f'{label} (exit {code})')
+    code, dirty, _ = _run([GIT, '-C', top, 'status', '--porcelain', '--untracked-files=no'], timeout=60)
+    if push and code == 0 and dirty.strip():
+        _say(prog, 'note: uncommitted changes are not in the push; fmt and lint read the working tree, '
+                   'the fork checks read the commits')
     if fork_on:
-        _say(prog, 'fork checks (schema, upstream files, seams; commits to HEAD)')
-        code, dirty, _ = _run([GIT, '-C', top, 'status', '--porcelain', '--untracked-files=no'], timeout=60)
-        if code == 0 and dirty.strip():
+        _say(prog, 'fork checks (fork-checks.yml\'s node steps; commits to HEAD)')
+        if not push and code == 0 and dirty.strip():
             _say(prog, 'note: uncommitted changes are not in the fork checks (they read commits, as CI does)')
         failed += fork_checks(prog, top, base)
     tests = touched_tests(top, files) if tests_on else []
@@ -671,6 +697,6 @@ def precheck(argv):
     if failed:
         _say(prog, 'FAILED: ' + '; '.join(failed))
         return 1
-    done = 'fmt, lint' + (', fork checks' if fork_on else '')
+    done = ('fmt check' if push else 'fmt') + ', lint' + (', fork checks' if fork_on else '')
     _say(prog, f'OK: {done}' + (f' and {len(tests)} test file(s)' if tests else ''))
     return 0
