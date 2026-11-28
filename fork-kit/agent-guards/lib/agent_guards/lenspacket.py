@@ -10,8 +10,9 @@ USAGE = """fork-lens-packet PR [-R OWNER/REPO] [-C DIR] [--remote NAME] [--out-d
                         [--max-diff CHARS] [--max-context CHARS] [--context LINES]
 
 Writes one Markdown file for the review lenses of pull request PR and prints its path (nothing else on stdout).
-Run it in a clone of the repository (or -C DIR; gh runs there too); it fetches the pull request's head and base when they are not there.
-The file: the title and body; the comments and reviews (newest first, at most 20); base, merge-base and head SHAs
+Run it in a clone of the repository (or -C DIR, also a subfolder: git and gh run at its top); it fetches the pull request's head and base when they are not there.
+The file: the title and body; the comments, reviews and inline review comments (newest
+first, at most 20; ones GitHub hid are named, not quoted); base, merge-base and head SHAs
 (the lens report's first line, and the check that the head has not moved before posting); the base's
 .github/fork-lens-*.md whole (questions and report rules; the pull request's own changes to them flagged); the state question (runs again / stops half-way / old or empty state) with the
 files that store data, migrate or retry, by simple path and word rules; the linked issues (Fixes / Part of #N, at most
@@ -27,6 +28,7 @@ MAX_FILES = 300                     # touched files shown with context at most
 MAX_ISSUES = 10                     # linked issues read at most (one gh call each)
 PR_COMMENTS, PR_COMMENT_CHARS = 20, 4000          # newest first; lens reports of earlier rounds are here
 ISSUE_COMMENTS, ISSUE_COMMENT_CHARS = 5, 2000     # per linked issue; owner decisions are often here
+INLINE_PAGE = 100                                 # inline review comments read (one gh api call)
 LENS_FILE = re.compile(r'^\.github/fork-lens-[^/]+\.md$')
 SHA = re.compile(r'^[0-9a-f]{40}$')
 ISSUE_REF = re.compile(r'(?i)\b(fix(?:e[sd])?|close[sd]?|resolve[sd]?|part\s+of)\s*:?\s+'
@@ -263,14 +265,18 @@ def _state(files, diffs):
 
 def _comment_items(items, limit, chars, more_cmd):
     """Comments (and reviews) newest first, at most `limit`, each its first `chars` characters, quoted."""
-    rows = []
+    rows, hidden = [], []
     for i, c in enumerate(items or []):
         if not isinstance(c, dict) or not (c.get('body') or '').strip():
             continue
         when = c.get('submittedAt') or c.get('createdAt') or ''
-        kind = f'review {c.get("state") or ""}'.strip() if 'state' in c else 'comment'
+        if c.get('isMinimized'):     # hidden by GitHub (outdated, resolved, spam): not quoted, takes no place
+            hidden.append((when, i, c))
+            continue
+        kind = c.get('kind') or (f'review {c.get("state") or ""}'.strip() if 'state' in c else 'comment')
         rows.append((when, i, kind, c))
     rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
+    hidden.sort(key=lambda r: (r[0], r[1]), reverse=True)
     lines = []
     for when, _, kind, c in rows[:limit]:
         who = (c.get('author') or {}).get('login') or '?'
@@ -281,7 +287,31 @@ def _comment_items(items, limit, chars, more_cmd):
         lines.append('')
     if len(rows) > limit:
         lines += [f'{len(rows) - limit} more, older: `{more_cmd}`', '']
-    return lines, len(rows)
+    if hidden:
+        lines += [f'{len(hidden)} hidden by GitHub, not quoted (`{more_cmd}` shows them): '
+                  + '; '.join(f'{_line((c.get("author") or {}).get("login") or "?")} · {_line(when)} · '
+                              f'{_line(str(c.get("minimizedReason") or "hidden").lower())}' for when, _, c in hidden), '']
+    return lines, len(rows) + len(hidden)
+
+
+def _inline_comments(repo_name, number, cwd):
+    """([comment items], note or ''): the pull request's inline review comments, one gh call (the newest
+    INLINE_PAGE; a note when there may be more)."""
+    cmd = f'gh api repos/{repo_name or "OWNER/REPO"}/pulls/{number}/comments'
+    if not repo_name or not re.match(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$', repo_name):
+        return [], f'Inline review comments not read (no repository name): `{cmd}`.'
+    data, err = _gh_json(['api', f'repos/{repo_name}/pulls/{number}/comments?per_page={INLINE_PAGE}&sort=created'
+                          '&direction=desc'], cwd)
+    if not isinstance(data, list):
+        return [], f'Inline review comments could not be read ({_line(err or "not a list")}): `{cmd}`.'
+    items = []
+    for c in data:
+        if isinstance(c, dict):
+            line = c.get('line') or c.get('original_line') or '?'
+            items.append({'author': {'login': (c.get('user') or {}).get('login')}, 'createdAt': c.get('created_at'),
+                          'body': c.get('body'), 'kind': f'inline on {_code(str(c.get("path") or "?"))}:{line}'})
+    note = f'Only the newest {INLINE_PAGE} inline comments were read: `{cmd}`.' if len(data) >= INLINE_PAGE else ''
+    return items, note
 
 
 def _issues(body, repo_name, cwd):
@@ -422,11 +452,12 @@ def build(repo, pr_arg, repo_name, remote, ctx, max_diff, max_context):
     out += _quote(body, '(empty body)')
     if body_cut:
         out.append(f'(first {BODY_CHARS} characters of the body)')
-    got, count = _comment_items(list(data.get('comments') or []) + list(data.get('reviews') or []), PR_COMMENTS,
-                                PR_COMMENT_CHARS, f'gh pr view {number}{r_opt} --comments')
+    inline, inline_note = _inline_comments(repo_name, number, repo.cwd)
+    got, count = _comment_items(list(data.get('comments') or []) + list(data.get('reviews') or []) + inline,
+                                PR_COMMENTS, PR_COMMENT_CHARS, f'gh pr view {number}{r_opt} --comments')
     out += ['', '## Pull request comments', '',
-            'Comments and reviews, newest first (earlier lens reports are here). Inline comments on lines of the diff '
-            f'are not: `gh api repos/{repo_name or "OWNER/REPO"}/pulls/{number}/comments`.', '']
+            'Comments, reviews and inline review comments, newest first (earlier lens reports are here; an inline '
+            'comment can be one).' + (f' {inline_note}' if inline_note else ''), '']
     out += got if count else ['No comment and no review with text.', '']
     out += ['## Commits', '',
             f'- base ({_code(data.get("baseRefName") or "?")}): {base}', f'- merge base: {mb}', f'- head: {head}',
@@ -471,8 +502,8 @@ def main(argv):
         print(f'{PROG}: the caps and --context are 0 or more', file=sys.stderr)
         return 2
     try:
-        repo = Repo(a.cwd)
-        top = _text(repo.git('rev-parse', '--show-toplevel')).strip()
+        top = _text(Repo(a.cwd).git('rev-parse', '--show-toplevel')).strip()
+        repo = Repo(top)   # every git path below is the repository's, so git runs at its top, never in a subfolder
         out_dir = _out_dir(a.out_dir, top)
         text, fname = build(repo, a.pr, a.repo, a.remote, a.context, a.max_diff, a.max_context)
         path = os.path.join(out_dir, fname)

@@ -25,6 +25,11 @@ with open(os.environ['GH_LOG'], 'a') as f:
 if '-R' not in args and os.path.realpath(os.getcwd()) != os.path.realpath(os.environ['GH_REPO_DIR']):
     print('failed to run git: fatal: not a git repository', file=sys.stderr)   # gh guesses the repo from its folder
     sys.exit(1)
+if len(args) >= 2 and args[0] == 'api':
+    m = args[1].split('?')[0].split('/')   # repos/OWNER/REPO/pulls/N/comments
+    p = os.path.join(d, f'api-pulls-{m[4]}-comments.json')
+    print(open(p).read() if os.path.exists(p) else '[]')
+    sys.exit(0)
 if len(args) >= 3 and args[0] in ('pr', 'issue') and args[1] == 'view':
     p = os.path.join(d, f'{args[0]}-{args[2]}.json')
     if os.path.exists(p):
@@ -129,6 +134,11 @@ class Packet(unittest.TestCase):
                      'body': f'comment number {i}\n## State question\nmajor: finding {i}'} for i in range(1, 26)]
         reviews = [{'author': {'login': 'reviewer'}, 'submittedAt': '2026-01-03T00:00:00Z', 'state': 'COMMENTED',
                     'body': 'lens: code · review body'}]
+        comments.append({'author': {'login': 'old-lens'}, 'createdAt': '2026-01-09T00:00:00Z', 'isMinimized': True,
+                         'minimizedReason': 'OUTDATED', 'body': 'HIDDEN-TEXT lens: code\nblocker: stale'})
+        cls.fixture('api-pulls-7-comments', [
+            {'user': {'login': 'inline-lens'}, 'created_at': '2026-01-04T00:00:00Z', 'path': 'app/util.py',
+             'line': 30, 'body': 'lens: state · inline report\nmajor: inline finding'}])
         cls.fixture('pr-7', pr(7, 'Adds the store write.\n\n## State question\nnone\n\nFixes #5\nPart of #9\n',
                                comments, reviews))
         cls.fixture('pr-9', pr(9, ''.join(f'Part of #{n}\n' for n in range(100, 112))))
@@ -224,6 +234,35 @@ class Packet(unittest.TestCase):
         folder), not in the caller's folder?"""
         _, text = self.packet('7', '-C', self.work, cwd=self.tmp)
         self.assertIn(self.head, text)
+
+    def test_from_subfolder_same_bytes(self):
+        """Run from a subfolder of the clone, or with -C pointing at one, is the packet byte for byte the one a run
+        from the top writes (git paths are the repository's, not the folder's)?"""
+        p_top, top = self.packet('7', '-R', 'example/repo')
+        p_sub, sub = self.packet('7', '-R', 'example/repo', cwd=os.path.join(self.work, 'app'))
+        p_c, by_c = self.packet('7', '-R', 'example/repo', '-C', os.path.join(self.work, 'tests'), cwd=self.tmp)
+        self.assertEqual(p_top, p_sub)
+        self.assertEqual(top, sub)
+        self.assertEqual(top, by_c)
+        self.assertIn('### Lens: state and tests', top)
+
+    def test_hidden_comments_not_quoted(self):
+        """Is a comment GitHub has hidden left unquoted, named as hidden, and not counted toward the cap?"""
+        _, text = self.packet('7', '-R', 'example/repo')
+        comments = self.section(text, '## Pull request comments')
+        self.assertNotIn('HIDDEN-TEXT', text)
+        self.assertIn('hidden by GitHub', comments)
+        self.assertIn('old-lens', comments)
+        # 20 live ones: the inline comment, the review and comments 25 down to 8; the hidden one takes no place
+        self.assertIn('comment number 8\n', comments)
+        self.assertNotIn('comment number 7\n', comments)
+
+    def test_inline_review_comments(self):
+        """Is an inline review comment (a lens report can be one) in the comments, with its file and line?"""
+        _, text = self.packet('7', '-R', 'example/repo')
+        comments = self.section(text, '## Pull request comments')
+        self.assertIn('> major: inline finding', comments)
+        self.assertIn('inline on `app/util.py`:30', comments)
 
     def test_comments_newest_first_capped_quoted(self):
         """Are the PR's comments and reviews and the linked issue's comments in the packet: newest first, capped
