@@ -4,7 +4,12 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { FORK_AGENT_WRITABLE_KEYS, FORK_PERSON_ONLY_KEYS } from "./forkSettings.ts";
-import { ClientSettingsSchema, ServerSettings, ServerSettingsPatch } from "./settings.ts";
+import {
+  ClientSettingsPatch,
+  ClientSettingsSchema,
+  ServerSettings,
+  ServerSettingsPatch,
+} from "./settings.ts";
 import { EMPTY_THREAD_ROLES, ThreadRolesFromSettingsFile } from "./threadRoles.ts";
 
 const decodeServer = Schema.decodeUnknownSync(ServerSettings);
@@ -106,6 +111,13 @@ describe("calmSidebarEnabled in a client's settings", () => {
   it("is off in an old file and reads as written", () => {
     expect(decodeClient({}).calmSidebarEnabled).toBe(false);
     expect(decodeClient({ calmSidebarEnabled: true }).calmSidebarEnabled).toBe(true);
+  });
+
+  it("a client save can change it, and a save without it keeps the stored value", () => {
+    const decodeClientPatch = Schema.decodeUnknownSync(ClientSettingsPatch);
+    expect(decodeClientPatch({ calmSidebarEnabled: true })).toEqual({ calmSidebarEnabled: true });
+    expect(decodeClientPatch({})).toEqual({});
+    expect(() => decodeClientPatch({ calmSidebarEnabled: "yes" })).toThrow();
   });
 });
 

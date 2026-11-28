@@ -13,6 +13,7 @@ import { SettingsPageContainer, SettingsRow, SettingsSection } from "../settings
 import { useSearchableSetting } from "../settingsSearch";
 import { AgentSlotsSettings, WaitsSettings } from "../WaitsAndSlotsSettings";
 import { AssistantSettings } from "./AssistantSettings";
+import { CalmSidebarSettings } from "./CalmSidebarSettings";
 import { forkFeatureStatuses } from "./forkStatus.logic";
 import { HandoffSettings } from "./HandoffSettings";
 import { McpProfileSettings } from "./McpProfileSettings";
@@ -69,6 +70,7 @@ export function ForkSettingsPanel() {
       <ReviewRulesSettings isProjectScope={isProjectScope} />
       {server(<AssistantSettings />)}
       {server(<WorkPanelSettings />)}
+      {server(<CalmSidebarSettings />)}
       <PlaytestSettings isProjectScope={isProjectScope} />
       {server(<UpdatesSettings />)}
       {server(<OwnerQuestionsSettings />)}
