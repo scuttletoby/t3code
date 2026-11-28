@@ -417,14 +417,15 @@ formatted (vp fmt), then linted (vp lint). Then the fork checks behind most "For
 runs them (.github/workflows/fork-checks.yml at REF, with REF's scripts): the schema check, the upstream-files check
 and the seam check, on the commits from the merge-base to HEAD (uncommitted changes are not in them); only a failing
 check's lines are printed. Then the test files the change touches (changed test files, and each changed source file's
-own NAME.test.* beside it, else in the nearest tests/ folder above it) run, once the machine's capacity check
-(t3-capacity [--kind KIND], where it is installed) says OK. *.test.py: python3 -B; *.test.sh: bash;
+own NAME.test.* beside it, else in the nearest tests/ folder: its own folder's, then each one above) run, once the
+machine's capacity check (t3-capacity [--kind KIND], where it is installed) says OK. *.test.py: python3 -B;
+*.test.sh: bash;
 *.test.{js,cjs,mjs} under .github/, fork-ci/ or fork-kit/: node --test; other *.test.*: vp test run.
 --no-fork-checks skips the fork checks (a repository without them; a missing check otherwise fails).
 Exit 0: all passed; 1: a step failed (each step still runs; also when the capacity check then said NOT OK); 2: a
 wrong call, not a checkout, or the capacity check could not answer (any exit but 0 or 1, as a t3-capacity that takes
-no --kind gives); 3: the capacity check said NOT OK and nothing had failed (fmt, lint and the fork checks ran, no
-test did: run it again later)."""
+no --kind gives) when nothing had failed; 3: the capacity check said NOT OK and nothing had failed (fmt, lint and
+the fork checks ran, no test did: run it again later)."""
 
 # The fork checks fork-checks.yml runs on every pull request (37 of 40 "Fork checks" reds were one of these). Each
 # runs from REF's script with the arguments of REF's workflow step: "$NAME" words come from the step's env (CI's
@@ -547,10 +548,13 @@ def touched_tests(top, files):
             folder, name = os.path.split(f.rsplit('.', 1)[0])
             cands = [c for c in (f'{os.path.join(folder, name)}.test.{e}' for e in exts)
                      if os.path.isfile(os.path.join(top, c))]
-            while not cands and folder:    # else the nearest tests/ folder above it (the kit's layout)
-                folder = os.path.dirname(folder)
-                cands = [c for c in (os.path.join(folder, 'tests', f'{name}.test.{e}') for e in exts)
+            up = folder
+            while not cands:    # else the nearest tests/ folder: its own folder's, then each one above (the kit's)
+                cands = [c for c in (os.path.join(up, 'tests', f'{name}.test.{e}') for e in exts)
                          if os.path.isfile(os.path.join(top, c))]
+                if not up:
+                    break
+                up = os.path.dirname(up)
         else:
             cands = []
         for c in cands:
@@ -642,6 +646,9 @@ def precheck(argv):
                            'not run' + (f' (exit 2 is a wrong call: this {gate} likely does not take --kind; run '
                                         'fork-precheck without --kind)' if kind and code == 2 else '')
                      + (f'; already failed: {", ".join(failed)}' if failed else ''), err=True)
+                if failed:     # a failure already seen wins over the wrong call
+                    _say(prog, 'FAILED: ' + '; '.join(failed))
+                    return 1
                 return 2
             if code == 1 and failed:
                 _say(prog, f'capacity check: {last}: the {len(tests)} test file(s) did not run')

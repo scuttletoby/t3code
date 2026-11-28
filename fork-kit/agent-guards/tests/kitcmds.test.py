@@ -468,6 +468,20 @@ class Precheck(Base):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('y ok', r.stdout)
 
+    def test_a_source_file_s_test_in_the_tests_folder_beside_it_runs(self):
+        self.commit({'tools/common/w.py': 'w\n', 'tools/common/tests/w.test.py': 'print("w ok")\n'})
+        write(os.path.join(self.repo, 'tools/common/w.py'), 'w2\n')
+        r = self.precheck('--base', 'HEAD', '--no-fork-checks')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('w ok', r.stdout)
+
+    def test_a_capacity_check_that_cannot_answer_after_a_lint_failure_is_exit_1(self):
+        self.fake('t3-capacity', 'print("NOT OK: \'--kind\' is not a number of MB", file=sys.stderr); sys.exit(2)')
+        r = self.precheck('--kind', 'agent-writer', env={'FAKE_LINT_FAIL': '1'})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('capacity check failed (exit 2)', r.stderr)
+        self.assertIn('FAILED: lint (exit 1)', r.stdout)
+
     def test_the_default_base_is_fetched_first_and_its_commit_named(self):
         old = git('rev-parse', 'origin/main', cwd=self.repo)
         self.on_main(lambda: self.commit({'tools/z.py': 'z\n'}, 'later on main'))

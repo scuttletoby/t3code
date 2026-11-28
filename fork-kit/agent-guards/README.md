@@ -271,10 +271,10 @@ Pipelines agents used to rebuild each time, several turns each, as one command (
   "Fork checks" reds (the schema, upstream-files and seam checks), run as `.github/workflows/fork-checks.yml` runs
   them, with the base branch's scripts and the same arguments (base: the merge-base, head: `HEAD`'s commits), printing
   only a failing check's lines (a check it cannot run fails; `--no-fork-checks` skips them); then the test files the
-  change touches (a source file's own `NAME.test.*` beside it, else in the nearest `tests/` folder above it), once
+  change touches (a source file's own `NAME.test.*` beside it, else in the nearest `tests/` folder: its own folder's, then each one above), once
   `t3-capacity` says OK where it is installed. Only its exit 1 (NOT OK) gives exit 3, "run it again later", and only
   when no step had failed (then it is exit 1); any other exit of `t3-capacity` (2: a wrong call, as `--kind` to one
-  that takes only MB) gives exit 2 and says so.
+  that takes only MB) gives exit 2 and says so, or exit 1 when a step had already failed.
 
 COMMANDS.md is a state table that `facts` reads on every machine with the kit, after the configured ones, so
 `facts --index` and the session-start context list the commands with no setting ([FACTS.md](FACTS.md)).
