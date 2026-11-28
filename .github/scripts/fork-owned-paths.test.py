@@ -234,6 +234,7 @@ REAL = owned([
     ".github/fork-owned-paths.txt", ".github/scripts/fork-owned-paths.cjs", ".github/workflows/fork-tests.yml",
     ".github/workflows/fork-checks.yml", ".github/actions/ci-changes/action.yml", ".github/scripts/ci-changes.cjs",
     ".github/scripts/fork-fleet.py", ".github/scripts/fork-test-shards.cjs", ".github/scripts/fork-vitest-gc-check.cjs",
+    ".github/scripts/fork-server-shards.cjs", ".github/fork-server-test-seconds.json",
     ".github/fork-fleet.json", "fork-ci/package.json", "fork-kit/x/tsconfig.json", "package.json", "apps/web/src/a.ts",
     "docs/fork/README.md", "scripts/release-smoke.ts", "fork-ci", "fork-cix/a",
     "fork-ci/actions/pr-queue/review.vectors.json", "fork-ci/actions/pr-queue/testdata/lens-corpus.jsonl",
@@ -404,7 +405,7 @@ check("workflow: a partly fork-owned server change runs Build, Test and Test Ser
       "Release Smoke and the macOS lint", ran_narrow == ["build", "test", "test_server"], ", ".join(ran_narrow))
 web_only = {**NARROW_SERVER, "test_web": "true", "test_server": "false", "test_packages": "@t3tools/scripts"}
 ran_web = sorted(j for j in app_jobs if job_if(j, web_only))
-check("workflow: a change the server does not depend on skips all eight Test Server shards at the job level",
+check("workflow: a change the server does not depend on skips every Test Server shard at the job level",
       "test_server" not in ran_web and "test_web" in ran_web, ", ".join(ran_web))
 ran_blank = [j for j in app_jobs if not job_if(j, {})]
 check("workflow: with no gate outputs at all (a broken `changes`), every app job's if: still runs it",

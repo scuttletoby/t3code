@@ -271,7 +271,8 @@ class Config(unittest.TestCase):
                 self.assertTrue(any(word in p for p in problems), problems)
 
     def test_shards_expand_to_keys(self):
-        self.assertIn('test_server-8', KEYS)
+        self.assertIn('test_server-6', KEYS)
+        self.assertNotIn('test_server-7', KEYS)
         self.assertNotIn('test_server', KEYS)
         self.assertIn('lint', KEYS)
 

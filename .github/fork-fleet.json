@@ -54,7 +54,7 @@
     { "job": "build", "gates": ["build", "typecheck"], "memory_mb": 4096 },
     { "job": "lint", "gates": [], "memory_mb": 3072 },
     { "job": "rust", "gates": ["rust"], "memory_mb": 2048 },
-    { "job": "test_server", "shards": 8, "gates": ["test_server"], "memory_mb": 3072 },
+    { "job": "test_server", "shards": 6, "gates": ["test_server"], "memory_mb": 3072 },
     { "job": "release_smoke", "gates": ["release_smoke"], "memory_mb": 2048 }
   ]
 }

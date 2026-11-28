@@ -72,6 +72,7 @@
 .github/scripts/fork-reusable-permissions.test.py ok lines
 .github/scripts/fork-schema-check.test.cjs ~6s
 .github/scripts/fork-seam-check.test.cjs ~23s
+.github/scripts/fork-server-shards.test.cjs
 .github/scripts/fork-temp-files.test.sh
 .github/scripts/fork-secret-scan.test.sh run by .github/workflows/fork-secret-scan.yml
 .github/scripts/fork-test-shards.test.cjs

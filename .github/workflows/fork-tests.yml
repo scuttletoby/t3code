@@ -1311,7 +1311,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        # Fork: 6, not upstream's 8. Balanced by measured seconds (the Test step) each runs ~240 s of tests,
+        # under the Test jobs, and two fewer runners pay the ~70 s setup (fork issue 1090).
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1387,11 +1389,17 @@ jobs:
           T3CODE_TRANSFER_BUDGET_RESULT_PATH: ${{ runner.temp }}/thread-transfer-result.json
           T3CODE_TRANSFER_BUDGET_SCENARIOS_PATH: ${{ runner.temp }}/thread-transfer-scenarios.json
         # As upstream: one process per file spends ~2s starting before its tests run; one file per
-        # vCPU overlaps that.
-        run: >-
-          vp run test:cached -- --shard ${{ matrix.shard }}/${{ strategy.job-total }} --concurrency 4
-          --uncached apps/server/integration/transferBudgetV2.integration.test.ts
-          --verify-hits 1 apps/server
+        # vCPU overlaps that. Fork: this shard's files come from fork-server-shards.cjs, which cuts
+        # upstream's file list as upstream's sequencer does but by .github/fork-server-test-seconds.json
+        # (upstream's shardWeights.json lacks most fork files); test:cached runs exactly the files named.
+        run: |
+          list=$(node .github/scripts/fork-server-shards.cjs --shard ${{ matrix.shard }}/${{ strategy.job-total }})
+          mapfile -t files <<< "$list"
+          # With no file arguments test:cached would run every server test.
+          if [ "${#files[@]}" -eq 0 ] || [ -z "${files[0]}" ]; then echo "::error::no test files for this shard"; exit 1; fi
+          vp run test:cached -- --concurrency 4 \
+            --uncached apps/server/integration/transferBudgetV2.integration.test.ts \
+            --verify-hits 1 "${files[@]}"
 
       - name: Save Vitest module cache
         if: github.event_name == 'push'
