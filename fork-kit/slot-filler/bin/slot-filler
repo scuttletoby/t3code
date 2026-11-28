@@ -38,6 +38,7 @@ DEFAULT_TASK = ('Act as the {kind} sub-agent for this task.\n\n'
 INLINE_TASK = ('Act as the {kind} sub-agent for this task. Your whole brief follows (from {brief}, a file on the '
                'machine that queued this task).\n\n{text}')
 MAX_INLINE = 100_000
+AGE_RE = re.compile(r'is \d+ min old')
 BACKOFF_FIRST_S = 60
 BACKOFF_MAX_S = 15 * 60
 # Refusals T3 gives before anything is dispatched: nothing started. Any other answer (orchestration_error, a linked
@@ -75,6 +76,17 @@ def write_json(path, data):
     os.replace(tmp, path)
 
 
+def set_in(d, keys, value):
+    """A copy of `d` with value at the path `keys` (missing or non-object levels become objects)."""
+    out = dict(d)
+    cur = out
+    for k in keys[:-1]:
+        cur[k] = dict(cur[k]) if isinstance(cur.get(k), dict) else {}
+        cur = cur[k]
+    cur[keys[-1]] = value
+    return out
+
+
 def read_json(path):
     with open(path) as f:
         return json.load(f)
@@ -109,7 +121,7 @@ def load_config(path):
     c.setdefault('log', os.path.join(c['stateDir'], 'filler.log'))
     c.setdefault('defaults', {})
     c.setdefault('usage', {})
-    if 'account' in c['defaults'] and account_list(c['defaults']['account']) is None:
+    if c['defaults'].get('account') is not None and account_list(c['defaults']['account']) is None:
         raise ConfigError(f'config {path}: "defaults.account" must be an account or a non-empty list of accounts')
     return c
 
@@ -230,9 +242,10 @@ class Filler:
             f.write(text + '\n')
 
     def note(self, key, line):
-        """A waiting or refused state: logged once, again only when it changes."""
+        """A waiting or refused state: logged once, again only when it changes (a stale reading's age growing
+        by the minute is not a change)."""
         self.notes_seen.add(key)
-        if self.notes.get(key) != line:
+        if AGE_RE.sub('is old', self.notes.get(key) or '') != AGE_RE.sub('is old', line):
             self.notes[key] = line
             self.notes_changed = True
             self.log(line)
@@ -306,7 +319,7 @@ class Filler:
                 return None, (f'"isolation": "worktree" cannot run on {", ".join(no)} (a linked machine runs in its '
                               'project\'s checkout; worktreeIsolation is false there): drop "isolation" or name '
                               'other machines')
-        if 'account' in it and account_list(it['account']) is None:
+        if it.get('account') is not None and account_list(it['account']) is None:
             return None, '"account" must be an account or a non-empty list of accounts, in order of preference'
         return it, None
 
@@ -368,6 +381,9 @@ class Filler:
                 assert all(isinstance(x, dict) and ID_RE.match(str(x.get('lens', ''))) for x in lenses)
             except Exception:  # noqa: BLE001
                 self.note(key, f'refused {key}: needs {{"pr": <n>, "lenses": [{{"lens": "code", "focus": "..."}}]}}; kept')
+                continue
+            if lw.get('account') is not None and account_list(lw['account']) is None:
+                self.note(key, f'refused {key}: "account" must be an account or a non-empty list of accounts; kept')
                 continue
             if not rules or not os.path.isfile(rules):
                 self.note(key, f'waiting {key}: the lens rules file (config "lensRules") is missing')
@@ -536,7 +552,7 @@ class Filler:
         model = it.get('model') or self.cfg['defaults'].get('model', 'claude-opus-5-5')
         skipped = []
         for account in self.accounts(it):
-            r = self.usage(name, account, model)
+            r = self.held(it['id'], name, account) or self.usage(name, account, model)
             if r is None:
                 return account, '; '.join(skipped) or None
             skipped.append(r)
@@ -601,41 +617,58 @@ class Filler:
         refused for good; also each machine's backoff."""
         req = self.read_request(iid)
         if req is None or req.get('parentThreadId', parent) != parent:
-            machines = (req or {}).get('machines')
+            machines, accounts = (req or {}).get('machines'), (req or {}).get('accounts')
             req = {'requestId': self.new_request_id(iid, (req or {}).get('requestId')), 'parentThreadId': parent,
-                   'machines': machines if isinstance(machines, dict) else {}}
+                   'machines': machines if isinstance(machines, dict) else {},
+                   'accounts': accounts if isinstance(accounts, dict) else {}}
             write_json(self.request_path(iid), req)
         return req
 
     def waiting_on(self, iid, name):
-        """Why the item waits on this machine after refusals, or None. A wait set more than the longest backoff
-        ahead (the clock was set back) is cut to the longest backoff from now."""
+        """Why the item waits on this machine after refusals, or None."""
+        return self.backoff(iid, ('machines', name), name)
+
+    def held(self, iid, name, account):
+        """Why this account waits on this machine after the server's usage refusals, or None."""
+        return self.backoff(iid, ('accounts', name, account), f'{account} on {name}')
+
+    def backoff(self, iid, keys, label):
+        """The wait recorded at `keys` in the item's request file, or None. A wait set more than the longest
+        backoff ahead (the clock was set back) is cut to the longest backoff from now."""
         req = self.read_request(iid) or {}
-        m = (req.get('machines') or {}).get(name)
+        m = req
+        for k in keys:
+            m = m.get(k) if isinstance(m, dict) else None
         nxt = m.get('nextAt') if isinstance(m, dict) else None
         if not isinstance(nxt, (int, float)):
             return None
         now = self.w.now().timestamp()
         if nxt - now > BACKOFF_MAX_S:
             nxt = now + BACKOFF_MAX_S
-            write_json(self.request_path(iid), dict(req, machines=dict(req['machines'], **{name: dict(m, nextAt=nxt)})))
+            write_json(self.request_path(iid), set_in(req, keys, dict(m, nextAt=nxt)))
         if now >= nxt:
             return None
         at = iso(datetime.datetime.fromtimestamp(nxt, datetime.timezone.utc))
-        return f'{name} backing off after {m.get("refusals")} refusal(s) (last: {m.get("lastCode")}) until {at}'
+        return f'{label} backing off after {m.get("refusals")} refusal(s) (last: {m.get("lastCode")}) until {at}'
 
-    def refused(self, iid, name, code, parent):
-        """After a refusal or an unclear answer on one machine: that machine backs off for this item, doubling;
+    def refused(self, iid, name, code, parent, account=None):
+        """After a refusal or an unclear answer on one machine: that machine backs off for this item, doubling.
+        A usage refusal (usage_pacing_hold: the server's guard holds that account, maybe well under the meter's
+        limit) backs off only that account there, so the next run moves on to the item's next account.
         request_rejected (T3 refused that id for good) also gets a new id, and the count stays."""
         req = self.request_of(iid, parent)
-        machines = dict(req.get('machines') or {})
-        m = machines.get(name) if isinstance(machines.get(name), dict) else {}
+        usage = bool(account) and code.startswith('usage_')
+        keys = ('accounts', name, account) if usage else ('machines', name)
+        m = req
+        for k in keys:
+            m = m.get(k) if isinstance(m, dict) else None
+        m = m if isinstance(m, dict) else {}
         n = int(m.get('refusals') or 0) + 1
         wait = min(BACKOFF_MAX_S, BACKOFF_FIRST_S * 2 ** (n - 1))
         nxt = self.w.now().timestamp() + wait
-        machines[name] = {'refusals': n, 'lastCode': code, 'nextAt': nxt}
-        req = dict(req, machines=machines)
-        then = f'next try on {name} after {iso(datetime.datetime.fromtimestamp(nxt, datetime.timezone.utc))}'
+        req = set_in(req, keys, {'refusals': n, 'lastCode': code, 'nextAt': nxt})
+        at = iso(datetime.datetime.fromtimestamp(nxt, datetime.timezone.utc))
+        then = f'next try of {account} on {name} after {at}' if usage else f'next try on {name} after {at}'
         if code == 'request_rejected':
             req['requestId'] = self.new_request_id(iid, req['requestId'])
             then += ', with a new request id'
@@ -691,7 +724,7 @@ class Filler:
         if code in DEFINITE:
             # A clear refusal: nothing started under this id (the server looks a started one up first).
             os.remove(mk)
-            then = self.refused(it['id'], machine, code, parent)
+            then = self.refused(it['id'], machine, code, parent, self.accounts(intent['item'])[0])
             self.note(key, f'refused {it["id"]} on {machine}: {code}: {msg}; {then}')
             return code
         # No clear answer (a linked machine that stopped answering may have launched it): ask only there again.

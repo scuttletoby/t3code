@@ -293,7 +293,7 @@ class Caps(Base):
 
     def test_refusals_back_off_doubling_under_one_request_id(self):
         self.cfg['machines']['local']['maxAgents'] = 0
-        self.w.api.refuse['env-north'] = ('usage_pacing_hold', 'the account is paced')
+        self.w.api.refuse['env-north'] = ('provider_unavailable', 'north is offline')
         self.item('w1')
         at = lambda s: (lambda: NOW + datetime.timedelta(seconds=s))
         for t in (0, 30, 61, 120, 181):
@@ -303,8 +303,8 @@ class Caps(Base):
         self.assertEqual(len(self.w.api.starts), 3)
         self.assertEqual(len({b['requestId'] for b in self.w.api.starts}), 1)   # so the wake goes once
         req = json.load(open(os.path.join(self.state, 'requests', 'w1.json')))['machines']['north']
-        self.assertEqual((req['refusals'], req['lastCode']), (3, 'usage_pacing_hold'))
-        self.assertTrue(any('north backing off after 1 refusal(s) (last: usage_pacing_hold) until '
+        self.assertEqual((req['refusals'], req['lastCode']), (3, 'provider_unavailable'))
+        self.assertTrue(any('north backing off after 1 refusal(s) (last: provider_unavailable) until '
                             '2026-11-21T12:01:00Z' in l for l in self.log_lines()))
         self.w.api.refuse.clear()
         self.w.now = at(181 + 240)
@@ -363,7 +363,7 @@ class Caps(Base):
 
     def test_a_request_id_refused_for_good_keeps_its_backoff(self):
         self.cfg['machines']['north']['maxAgents'] = 0
-        self.w.api.refuse_next = [('usage_pacing_hold', 'paced'), ('usage_pacing_hold', 'paced'),
+        self.w.api.refuse_next = [('provider_unavailable', 'offline'), ('provider_unavailable', 'offline'),
                                   ('request_rejected', 'refused at its dispatch')]
         self.item('w1')
         for s in (0, 60, 180):
@@ -563,6 +563,65 @@ class AccountFallback(Base):
         self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts],
                          ['claude-anne', 'claudeAgent'])
         self.assertEqual(self.account_started(), 'claudeAgent')
+
+    def test_a_pacing_hold_on_the_first_moves_to_the_second_while_its_meter_is_low(self):
+        # the server's pacing gate holds an account ahead of pace well under 95%: the meter here still reads 40%
+        self.item('w1', account=self.ACCTS)
+        self.w.api.refuse_next = [('usage_pacing_hold', 'claude-anne is ahead of pace; claudeAgent has room')]
+        self.run_filler()
+        self.assertEqual(self.started_ids(), [])
+        self.w.now = lambda: NOW + datetime.timedelta(seconds=30)      # the next run, inside the first's wait
+        self.run_filler()
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts],
+                         ['claude-anne', 'claudeAgent'])
+        self.assertEqual(self.account_started(), 'claudeAgent')
+        self.assertEqual(len({b['requestId'] for b in self.w.api.starts}), 1)   # one request id: no double start
+
+    def test_a_held_account_is_tried_again_after_its_wait_and_doubles(self):
+        self.item('w1', account=self.ACCTS)
+        self.meter('claudeAgent', 99)
+        self.w.api.refuse[None] = ('usage_pacing_hold', 'paced')
+        at = lambda s: (lambda: NOW + datetime.timedelta(seconds=s))
+        for t in (0, 30, 61, 120, 181):
+            self.w.now = at(t)
+            self.run_filler()
+        self.assertEqual(len(self.w.api.starts), 3)                    # 0 s, 61 s, 181 s
+        with open(os.path.join(self.state, 'requests', 'w1.json')) as f:
+            req = json.load(f)
+        self.assertEqual(req['accounts']['local']['claude-anne']['refusals'], 3)
+        self.assertNotIn('local', req.get('machines') or {})           # the machine itself does not wait
+        self.w.now = at(200)
+        self.run_filler()
+        line = [l for l in self.log_lines() if 'waiting w1' in l][-1]
+        self.assertIn('claude-anne on local backing off after', line)
+        self.assertIn('claudeAgent is full', line)
+
+    def test_an_account_null_uses_the_default_as_on_main(self):
+        self.item('w1', account=None)
+        self.run_filler()
+        self.assertEqual(self.account_started(), 'claudeAgent')
+
+    def test_a_lens_watch_with_a_bad_account_is_refused_and_a_list_is_kept(self):
+        self.w.prs[7] = green()
+        self.write('queue/lens-watch/bad.json', json.dumps({'pr': 7, 'lenses': [{'lens': 'code'}], 'account': []}))
+        self.write('queue/lens-watch/good.json', json.dumps({'pr': 7, 'lenses': [{'lens': 'tests'}],
+                                                             'account': self.ACCTS}))
+        self.run_filler()
+        self.assertTrue(any('refused lens-watch/bad.json: "account" must be' in l for l in self.log_lines()))
+        self.assertFalse(any(n.startswith('lens-7-code-') for n in os.listdir(self.q)))
+        self.assertEqual(self.account_started('lens-7-tests-' + HEAD[:7]), 'claude-anne')
+
+    def test_a_stale_reading_is_logged_once_while_only_its_age_grows(self):
+        self.meter('claude-anne', 10, age_min=91)
+        self.meter('claudeAgent', 10, age_min=95)
+        self.item('w1', account=self.ACCTS)
+        for m in (0, 1, 2):
+            self.w.now = lambda m=m: NOW + datetime.timedelta(minutes=m)
+            self.run_filler()
+        self.assertEqual(len([l for l in self.log_lines() if 'waiting w1' in l]), 1)
+        self.meter('claudeAgent', 96)                                   # a real change is logged again
+        self.run_filler()
+        self.assertEqual(len([l for l in self.log_lines() if 'waiting w1' in l]), 2)
 
     def test_an_old_marker_without_a_chosen_account_still_recovers(self):
         self.item('w1')
@@ -1057,7 +1116,7 @@ MUTATIONS = {
         "        if answer.get('parentSettled') is True:\n", "        if False:\n",
         'Caps.test_a_parent_settled_by_hand_stops_the_run'),
     'notes stay quiet': (
-        "        if self.notes.get(key) != line:\n", "        if True:\n",
+        "        if AGE_RE.sub('is old', self.notes.get(key) or '') != AGE_RE.sub('is old', line):\n", "        if True:\n",
         'Quiet.test_a_second_run_with_nothing_new_writes_nothing'),
     'broken files are refused': (
         "        if not text.strip():\n            return None, 'empty file'\n", "",
@@ -1070,6 +1129,9 @@ MUTATIONS = {
         "        return bool(m.get('worktreeIsolation', not m.get('environmentId')))\n",
         "        return True\n",
         'LinkedMachines.test_worktree_isolation_on_a_machine_without_it_is_refused_when_read'),
+    'a usage refusal holds only that account': (
+        "        usage = bool(account) and code.startswith('usage_')\n", "        usage = False\n",
+        'AccountFallback.test_a_pacing_hold_on_the_first_moves_to_the_second_while_its_meter_is_low'),
     'lens rounds': (
         "if len(rounds) >= int(lw.get('maxRounds', 2)):", "if False:",
         'Lenses.test_a_new_head_is_a_new_round_and_rounds_stop_at_the_limit'),

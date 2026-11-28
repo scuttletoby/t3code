@@ -189,11 +189,17 @@ checkout:
   if it names one, is tried there.
 - **An account fills during a start:** the intent marker records the account it asked with. A start that stopped
   half-way, or got no clear answer, is asked again with the same request id on the same account, never moved to
-  the next one (it may have started there). A clear refusal (the server's usage guard: `usage_pacing_hold`)
-  removes the marker; after that machine's backoff the next run picks again from the list, so the next account is
-  used. The queue file is never rewritten: it keeps its list.
-- **Old queue files and markers:** an `account` string is a list of one; a marker from before account lists
-  holds the item with its string and is asked again as it was.
+  the next one (it may have started there). A usage refusal from the server (`usage_pacing_hold`: its guard
+  holds an account that is ahead of pace, possibly well under this meter's limit) removes the marker and backs off
+  only that account on that machine (1, 2, 4 ... 15 minutes, in `stateDir/requests/<id>.json` under `accounts`),
+  so the next run starts the item on its next account. Other refusals back off the whole machine. The queue
+  file is never rewritten: it keeps its list.
+- **Old queue files and markers:** an `account` string is a list of one, and `null` means the default, as before.
+  A marker from before account lists holds the item with its string and is asked again as it was. A request file
+  without `accounts` has no held account. A lens-watch `account` is checked like an item's: a bad one refuses
+  the watch file (logged once, kept).
+- **A stale reading:** "usage reading for X is N min old" is logged once; the minutes growing is not a new
+  reason.
 - **Brief deleted:** the item is refused and kept until the brief is back.
 - **PR closed:** `pr-green` and `pr-merged` items wait with a log line ("closed without a merge"). Delete them
   by hand.
