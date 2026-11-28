@@ -588,10 +588,13 @@ saves them; they are not the setting's default, so a file without rows keeps mea
 ### `server.placement`
 
 What this machine has, and how it places delegated work on linked machines. This machine's facts
-read (`t3_environment_read`, below) reads `labels` and runs `factsCommand`; the placing rows add
-the rest. Fields, each with its default:
+read (`t3_environment_read`, below) reads `labels` and runs `factsCommand`; `advise` is read too
+(below); `enforce`, which moves the work, comes with a later placement row. Fields, each with its
+default:
 
-- `mode`: `off` (an agent picks a machine as upstream's do), `advise` or `enforce`.
+- `mode`: `off` (an agent picks a machine as upstream's do), `advise` (the `delegate_task` reply
+  says where the child would run; nothing is moved) or `enforce` (not built yet: it reads as
+  `advise`, and the reply says so).
 - `labels`: `[]`. What this machine has, as free words (`"gpu"`, `"ci-runner"`, `"owner-logins"`):
   each is one word of at most 64 characters, at most 64 labels. They are stored trimmed and
   lower-cased (`"GPU"` is `"gpu"`), a repeat dropped. There is no Unicode normalisation: `café`
@@ -633,6 +636,21 @@ save of `placement` on this build drops it. Only a person changes it: no agent t
 managed policy can lock it as a whole value (not one field inside it, as for `modelPolicy`).
 "Person-only" means no T3 tool takes it; an agent with a shell can still edit the settings file or
 call the settings RPC, as for `modelPolicy`.
+
+`advise` (placement row P6, `apps/server/src/fork/placementAdvice.ts`): each new `delegate_task`
+(not a retry) reads this machine's facts and, when Linked environments is on here and the call came
+over MCP, each unexpired linked machine's facts, its checkouts of this project's repository and its
+providers, each linked read within 8 seconds (a facts read there may take 6, for its slot gate's
+status read) and all in parallel, beside this machine's own read. The placement rules then pick a
+machine, and the reply's note says which one a worktree child would run on, why, the order, and
+each machine left out with the rule it fails, named by its link's label. A machine whose read ran
+out of time is marked slow or unreachable, not only "did not answer". Only a worktree child is
+placed; the note says that a shared child (no isolation) stays here, since the check is not told
+the task's isolation yet (the row that moves work passes it). The pick is logged too. Nothing is
+moved: the task runs where it would without placement. The advice never fails or holds the task: a slow lookup here (the link
+store, this project's repository key: 2 seconds each) drops only its own part, so the advice still
+comes; a read that fails, or advice that takes longer than 13 seconds in all, gives a note that
+says so instead.
 
 Threat notes for the rows that act on it (P4 and later). `placement` (and `factsCommand` with it)
 is a guard against mistakes, not against an agent that sets out to get around it: an agent with a
