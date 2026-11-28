@@ -221,7 +221,7 @@ class Check(unittest.TestCase):
     def test_the_kit_entries_pass(self):
         code, lines = self.run_check(self.settings)
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 22, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 23, '\n'.join(lines))
         self.assertEqual(lines[-1], 'check: test settings: OK')
         # lens A nit: the hooks ran with HOME in check's own temporary folder; nothing (log, cache, state) is
         # written in the caller's HOME
@@ -239,7 +239,7 @@ class Check(unittest.TestCase):
                                                     hook=os.path.join(fx.BIN, 'leak-guard')))
         code, lines = self.run_check(self.settings)
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 23, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 24, '\n'.join(lines))
         self.assertIn('PASS leak-guard (PreToolUse) a comment that holds pattern line 2', '\n'.join(lines))
 
     def test_facts_hook_with_a_home_folder_table_wants_and_gets_context(self):
