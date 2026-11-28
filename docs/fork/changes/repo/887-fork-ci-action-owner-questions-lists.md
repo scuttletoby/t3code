@@ -1,0 +1,5 @@
+- Change: fork-ci action **owner-questions**: lists a repository's open owner questions (T3's rule, shared cases) and in `label` mode keeps the label on exactly the waiting ones.
+- Why: Waiting on you finds a title-asked question by its label, past the 200-issue cut.
+- Setting: none
+- Default: when a project adds it
+- PR: [#887](https://github.com/scuttletoby/t3code/issues/887)

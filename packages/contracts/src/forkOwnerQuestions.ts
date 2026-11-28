@@ -75,6 +75,37 @@ export function isOwnerDecision(body: string, rule: OwnerQuestionRule): boolean 
 }
 
 /**
+ * Who may decide: GitHub's `author_association` of the repository's owner, its organisation's
+ * members and its collaborators. Anyone can comment on a public repository; their "Owner decision:"
+ * answers nothing.
+ */
+const OWNER_DECISION_ASSOCIATIONS: ReadonlyArray<string> = ["OWNER", "MEMBER", "COLLABORATOR"];
+
+/** What the rule reads of a comment. */
+export interface OwnerDecisionComment {
+  readonly body: string;
+  /**
+   * GitHub's `author_association`. Absent when the source does not say who wrote the comment (the
+   * issue reads this page uses have none), and then the words alone count; null decides nothing.
+   */
+  readonly authorAssociation?: string | null;
+}
+
+/** True when the comment answers an owner question: the decision's words, from someone who may decide. */
+export function isOwnerDecisionComment(
+  comment: OwnerDecisionComment,
+  rule: OwnerQuestionRule,
+): boolean {
+  if (
+    comment.authorAssociation !== undefined &&
+    !OWNER_DECISION_ASSOCIATIONS.includes(comment.authorAssociation ?? "")
+  ) {
+    return false;
+  }
+  return isOwnerDecision(comment.body, rule);
+}
+
+/**
  * `waiting`: an open owner question no comment answers. `answered`: a comment answers it.
  * `unknown`: an open owner question whose comments are not read yet. `not-waiting`: closed, or not
  * an owner question.
@@ -83,10 +114,10 @@ export type OwnerQuestionStatus = "waiting" | "answered" | "unknown" | "not-wait
 
 export function ownerQuestionStatus(
   issue: OwnerQuestionIssue,
-  comments: ReadonlyArray<{ readonly body: string }> | undefined,
+  comments: ReadonlyArray<OwnerDecisionComment> | undefined,
   rule: OwnerQuestionRule,
 ): OwnerQuestionStatus {
   if (issue.state.category !== "open" || !isOwnerQuestion(issue, rule)) return "not-waiting";
   if (comments === undefined) return "unknown";
-  return comments.some((comment) => isOwnerDecision(comment.body, rule)) ? "answered" : "waiting";
+  return comments.some((comment) => isOwnerDecisionComment(comment, rule)) ? "answered" : "waiting";
 }

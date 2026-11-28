@@ -13,6 +13,13 @@ nothing.
 
 ## After ci/v14
 
+### owner-questions: a new action that lists and labels owner questions (#887)
+
+[owner-questions](actions/owner-questions/README.md) lists a repository's open owner questions (the label
+`status:needs-owner-decision`, or a title starting "Owner question" or "<Topic> Q<n>:", with no "Owner decision:"
+answer from the repository's owner, a member or a collaborator newer than its last asking) and, with `mode: label`,
+keeps the label on exactly the waiting ones. Its rule is T3's, checked against the same cases. New, so nothing changes for a project that does not add it.
+
 ### checkout-state: a lint for checkout state a self-hosted runner keeps (#932)
 
 New action. It fails a workflow whose jobs on a self-hosted runner could leave checkout state in the shared work

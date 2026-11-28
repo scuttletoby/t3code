@@ -21,6 +21,9 @@ fork-kit/
 # request changing the gate and its vectors runs that test too.
 !fork-ci/actions/pr-queue/review.vectors.json
 !fork-ci/actions/pr-queue/testdata/lens-corpus.jsonl
+# The owner-questions rule's shared cases: the contracts test (forkOwnerQuestions.test.ts) reads them, so a
+# pull request changing the cases runs that test too.
+!fork-ci/actions/owner-questions/rule-cases.json
 
 # The fork's scripts and settings under .github; the `workflows` job tests them.
 .github/scripts/fork-*
