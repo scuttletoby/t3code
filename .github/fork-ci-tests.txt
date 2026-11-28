@@ -43,6 +43,7 @@
 # A present test that is not listed fails. A listed file that is not present yet
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs ~24s
+.github/scripts/fork-ci-cache-keys.test.cjs
 .github/scripts/fork-checks-ran.test.py unittest
 .github/scripts/fork-ci-pressure.test.py unittest
 .github/scripts/fork-ci-rerun.test.py unittest
