@@ -234,6 +234,7 @@ REAL = owned([
     ".github/fork-owned-paths.txt", ".github/scripts/fork-owned-paths.cjs", ".github/workflows/fork-tests.yml",
     ".github/workflows/fork-checks.yml", ".github/actions/ci-changes/action.yml", ".github/scripts/ci-changes.cjs",
     ".github/scripts/fork-fleet.py", ".github/scripts/fork-test-shards.cjs", ".github/scripts/fork-vitest-gc-check.cjs",
+    ".github/fork-test-seconds.json",
     ".github/fork-fleet.json", "fork-ci/package.json", "fork-kit/x/tsconfig.json", "package.json", "apps/web/src/a.ts",
     "docs/fork/README.md", "scripts/release-smoke.ts", "fork-ci", "fork-cix/a",
     "fork-ci/actions/pr-queue/review.vectors.json", "fork-ci/actions/pr-queue/testdata/lens-corpus.jsonl",
