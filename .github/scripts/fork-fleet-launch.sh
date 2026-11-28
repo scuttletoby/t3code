@@ -22,7 +22,24 @@
 #   active       the NAME of every fork-fleet-* unit that is loaded (starting, running or stopping).
 #   fits MB      exit 0 when MemAvailable minus RESERVE_MB leaves MB megabytes and, with FREE_COMMAND set, that free
 #                script answers free (free/v1, fork-kit/common/FREE.md: run by FREE_CHECK, its reader).
-#   stop NAME    stops that unit (a job on it fails: its runner is gone).
+#   stop NAME    stops that unit (a job on it fails: its runner is gone). A lane job's unit that already ended
+#                (failed, below) is let go too, so it no longer holds its runner user.
+#   lane-start NAME
+#                stdin: the lines FORK_LANE_SHA= (40 hex), FORK_LANE_PART= (a plan part's name), FORK_LANE_SHARD=
+#                (I/N) and FORK_LANE_ATTEMPT= (1 or 2), nothing else; NAME must be lane-<sha:12>-<part>-<I>-<attempt>
+#                (fork-kit/ci-lane, the own CI lane). The same walls as start's runner (its own runner user, network
+#                namespace, sandbox and limits, the same one systemd-run), but no runner: an empty copy, and the
+#                lane job (LANE_JOB below, root's, in the unit's root) makes an anonymous checkout of that commit
+#                from LANE_REPO and runs that plan part's fork-ci-tests.cjs call with its records in the copy. Its
+#                unit is not collected: it stays (failed) once the job ended, for lane-result, and holds its runner
+#                user until then. Refused when LANE_REPO is not set.
+#   lane-result NAME
+#                one JSON line: {"state": "running"}, {"state": "gone"} (no such unit), or {"state": "done", "exit":
+#                N, "records": {...} or null}. N is the exit as systemd saw it, from outside the job (0 only for the
+#                lane job's own pass code, LANE_PASS); records the one records file the call wrote in the copy, read
+#                only once nothing of the job is left (kill_unit) and only a plain file of the runner user's. The
+#                answer is kept (RUN_DIR/NAME.result, root's) before the unit is let go, so asking again gives the same
+#                answer; prune removes it a day later.
 #   prune        removes the copies and environment files whose unit is gone.
 #   refresh-net  every dispatcher pass: looks this host's own public address up again (once its last answer is
 #                OWN_ADDRESS_SECONDS old, or the table is gone, or a unit still waits for its IPAddressDeny) and, when
@@ -67,6 +84,8 @@
 # URL), RUNNER_DOWNLOAD (the https base of its tarballs) and RUNNER_MIN (the oldest runner version refresh may install,
 # empty for none), FREE_COMMAND (a free/v1 script's absolute path, empty for none) and FREE_CHECK (its reader,
 # free_contract.py beside this launcher) have defaults below.
+# LANE_REPO (https://github.com/OWNER/NAME, empty by default: no lane job starts) is the repository lane-start's jobs
+# check out, anonymously: the lane names only a commit, never where it comes from.
 # Each job unit's own limits (job_limits), so a job that runs away is held or killed, never the host's own work:
 # JOB_MEMORY_MAX_MB (MemoryMax: the job is killed above it; empty, the default: MemTotal minus RESERVE_MB, shared by
 # the RUNNER_USERS, so all slots together never take the reserve; at least JOB_MEMORY_MIN), JOB_MEMORY_HIGH_MB
@@ -135,7 +154,8 @@ ALLOW_PATHS='' CANARY_DIR=/etc
 JOB_PATHS='' RUNNER_RELEASE=https://api.github.com/repos/actions/runner/releases/latest
 RUNNER_DOWNLOAD=https://github.com/actions/runner/releases/download RUNNER_MIN='' FREE_COMMAND='' FREE_CHECK=''
 JOB_MEMORY_MAX_MB='' JOB_MEMORY_HIGH_MB='' JOB_SWAP_MAX_MB=0 JOB_CPU_WEIGHT=50 JOB_CPU_QUOTA='' JOB_OOM_SCORE_ADJUST=500
-setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|OWN_ADDRESS_SECONDS|JOB_PATHS|ALLOW_PATHS|CANARY_DIR|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK|JOB_MEMORY_MAX_MB|JOB_MEMORY_HIGH_MB|JOB_SWAP_MAX_MB|JOB_CPU_WEIGHT|JOB_CPU_QUOTA|JOB_OOM_SCORE_ADJUST)=([^[:space:]]*)$'
+LANE_REPO=''
+setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|OWN_ADDRESS_SECONDS|JOB_PATHS|ALLOW_PATHS|CANARY_DIR|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK|JOB_MEMORY_MAX_MB|JOB_MEMORY_HIGH_MB|JOB_SWAP_MAX_MB|JOB_CPU_WEIGHT|JOB_CPU_QUOTA|JOB_OOM_SCORE_ADJUST|LANE_REPO)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
@@ -167,9 +187,19 @@ MB_SETTING='(0|[1-9][0-9]{0,6})'
 [[ $JOB_CPU_QUOTA =~ ^([1-9][0-9]{0,4})?$ ]] || die "$conf: JOB_CPU_QUOTA is a percent (100: one CPU), or empty for none"
 { [[ $JOB_OOM_SCORE_ADJUST =~ ^[1-9][0-9]{0,3}$ ]] && ((JOB_OOM_SCORE_ADJUST <= 1000)); } ||
   die "$conf: JOB_OOM_SCORE_ADJUST is 1 to 1000 (a job is killed before the host's own processes, never after)"
+[[ $LANE_REPO =~ ^(https://github\.com/[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100})?$ ]] ||
+  die "$conf: LANE_REPO is https://github.com/OWNER/NAME (the repository lane jobs check out, anonymously), or empty"
 
 NAME='^[a-z0-9][a-z0-9-]{0,62}-[0-9]{1,20}$'
 name_ok() { [[ $1 =~ $NAME ]] || die "not a runner name: $1"; }
+# A lane job's name (fork-kit/ci-lane: lane-<commit:12>-<part>-<shard>-<attempt>) and its part (the plan's PART_NAME,
+# fork-kit/ci-lane/lib/cilane/plan.py: a test keeps the two one).
+LANE_PART='^[a-z][a-z0-9-]{0,23}$'
+LANE_NAME='^lane-[0-9a-f]{12}-[a-z][a-z0-9-]{0,23}-[1-9][0-9]?-[12]$'
+lane_name_ok() {
+  name_ok "$1"
+  [[ $1 =~ $LANE_NAME ]] || die "not a lane job name: $1"
+}
 
 active() {
   local unit rest
@@ -1301,36 +1331,20 @@ job_limits() {
   ((mem_high <= mem_max)) || die "$conf: JOB_MEMORY_HIGH_MB ($mem_high) is over the job's MemoryMax ($mem_max MB)"
 }
 
-start() {
-  local name=$1 dir env_file line key value user resolv bad left own blocked seen from linked f real wait code
-  local mem_max mem_high
-  local -a props
+launch_job() {
+  local name=$1 kind=${2:-runner} dir env_file key user resolv own blocked seen from linked f real mem_max mem_high
+  local collect=inactive-or-failed
+  local -a props job_cmd
   local -A got=()
-  name_ok "$name"
-  while IFS= read -r line; do
-    [[ $line =~ ^(ACTIONS_RUNNER_INPUT_JITCONFIG|FORK_FLEET_RUN|FORK_FLEET_ATTEMPT)=(.*)$ ]] || die "start: an unexpected input line"
-    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
-    [[ -z ${got[$key]+set} ]] || die "start: $key twice"
-    case $key in
-      # A length check of its own: bash's regex refuses a bound above 255 (it would refuse every config).
-      ACTIONS_RUNNER_INPUT_JITCONFIG) [[ $value =~ ^[A-Za-z0-9+/=]+$ ]] && ((${#value} <= 65536)) ;;
-      *) [[ $value =~ ^[1-9][0-9]{0,19}$ ]] ;;
-    esac || die "start: $key is not well formed"
-    got[$key]=$value
-  done
-  ((${#got[@]} == 3)) || die "start: needs ACTIONS_RUNNER_INPUT_JITCONFIG, FORK_FLEET_RUN and FORK_FLEET_ATTEMPT"
+  if [[ $kind == lane ]]; then
+    lane_input "$name"
+  else
+    runner_input "$name"
+  fi
   # The unit's own limits (memory, CPU, OOM), before anything is made: a setting that cannot be used makes nothing.
   job_limits
 
-  # The template: an unconfigured runner nobody but this user can change (each copy hard-links its files).
-  owned_safe "$TEMPLATE"
-  [[ -x $TEMPLATE/run.sh ]] || die "$TEMPLATE has no run.sh"
-  for f in .env .path .runner .credentials .credentials_rsaparams; do
-    [[ ! -e $TEMPLATE/$f && ! -L $TEMPLATE/$f ]] || die "$TEMPLATE/$f exists: the template must be an unconfigured runner (.github/fork-fleet.md)"
-  done
-  bad=$(unsafe_file "$TEMPLATE")
-  [[ -z $bad ]] || die "$TEMPLATE has a file that is not this user's or that others may write, a special file or a" \
-    "setuid, setgid or sticky one: $bad"
+  [[ $kind == lane ]] || template_ok
   owned_safe "$HOOK"
   # The two files the hook runs: every job sees them (job_view), so no runner user may change them for the next one.
   # Its folder too (where it really is): they are checked here but bound later (job_view binds them if they exist
@@ -1338,14 +1352,14 @@ start() {
   real=$(real_path "$HOOK")
   owned_safe "${real%/*}"
   for f in "${HOOK%/*}/fork-fleet.py" "${HOOK%/*}/fork-fleet.json"; do [[ ! -e $f && ! -L $f ]] || owned_safe "$f"; done
-  template_version >/dev/null
+  [[ $kind == lane ]] || template_version >/dev/null
   check_users
   resolv=$(resolv_target)
   own=$(own_address)
 
   setup
   # cp -al hard-links the template's files: it cannot cross filesystems (and a full copy would be writable).
-  [[ $(stat -c %d -- "$TEMPLATE") == "$(stat -c %d -- "$WORK_ROOT")" ]] ||
+  [[ $kind == lane || $(stat -c %d -- "$TEMPLATE") == "$(stat -c %d -- "$WORK_ROOT")" ]] ||
     die "TEMPLATE ($TEMPLATE) and WORK_ROOT ($WORK_ROOT) must be on one filesystem: cp -al hard-links the template"
   dir=$WORK_ROOT/$name
   env_file=$RUN_DIR/$name.env
@@ -1360,7 +1374,18 @@ start() {
   # Expanded now: the trap runs at exit, after this function's locals are gone (set -u would fail it, file left).
   # shellcheck disable=SC2064
   trap "rm -f -- $(printf '%q' "$env_file")" EXIT
-  cp -al -- "$TEMPLATE" "$dir"
+  if [[ $kind == lane ]]; then
+    # An empty copy (no runner), and the lane job in the unit's own root (job_fs made it, root's, read-only in the
+    # unit): nothing a runner user can write decides what the job runs. Not collected: lane-result reads how it ended.
+    mkdir -m 0700 -- "$dir"
+    (set -o noclobber && printf '%s\n' "$LANE_JOB" >"$RUN_DIR/$name.root/fork-lane-job.sh") ||
+      die "lane-start: could not make the lane job in $RUN_DIR/$name.root, a new file: refused"
+    chmod 0644 -- "$RUN_DIR/$name.root/fork-lane-job.sh"
+    job_cmd=(/bin/bash /fork-lane-job.sh) collect=inactive
+  else
+    cp -al -- "$TEMPLATE" "$dir"
+    job_cmd=("$dir/run.sh")
+  fi
   # The copy's top directory, HOME and TMPDIR are the runner user's, and no one else's: no other runner user can
   # read its JIT config, tokens or caches. Everything else in it is the template's (root's, read-only).
   mkdir -m 0700 -- "$dir/home" "$dir/tmp"
@@ -1370,12 +1395,82 @@ start() {
   (
     set -o noclobber
     {
-      printf 'ACTIONS_RUNNER_INPUT_JITCONFIG=%s\n' "${got[ACTIONS_RUNNER_INPUT_JITCONFIG]}"
-      printf 'FORK_FLEET_RUN=%s\nFORK_FLEET_ATTEMPT=%s\n' "${got[FORK_FLEET_RUN]}" "${got[FORK_FLEET_ATTEMPT]}"
-      printf 'HOME=%s\nTMPDIR=%s\n' "$dir/home" "$dir/tmp"
-      printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HOOK"
+      if [[ $kind == lane ]]; then
+        for key in FORK_LANE_SHA FORK_LANE_PART FORK_LANE_SHARD FORK_LANE_ATTEMPT; do
+          printf '%s=%s\n' "$key" "${got[$key]}"
+        done
+        printf 'FORK_LANE_REPO=%s\nHOME=%s\nTMPDIR=%s\n' "$LANE_REPO" "$dir/home" "$dir/tmp"
+      else
+        printf 'ACTIONS_RUNNER_INPUT_JITCONFIG=%s\n' "${got[ACTIONS_RUNNER_INPUT_JITCONFIG]}"
+        printf 'FORK_FLEET_RUN=%s\nFORK_FLEET_ATTEMPT=%s\n' "${got[FORK_FLEET_RUN]}" "${got[FORK_FLEET_ATTEMPT]}"
+        printf 'HOME=%s\nTMPDIR=%s\n' "$dir/home" "$dir/tmp"
+        printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HOOK"
+      fi
     } >"$env_file"
   ) || die "start: could not make $env_file, a new file: refused"
+  start
+}
+
+# start's input lines (stdin) into got.
+runner_input() {
+  local line key value
+  name_ok "$1"
+  while IFS= read -r line; do
+    [[ $line =~ ^(ACTIONS_RUNNER_INPUT_JITCONFIG|FORK_FLEET_RUN|FORK_FLEET_ATTEMPT)=(.*)$ ]] || die "start: an unexpected input line"
+    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    [[ -z ${got[$key]+set} ]] || die "start: $key twice"
+    case $key in
+      # A length check of its own: bash's regex refuses a bound above 255 (it would refuse every config).
+      ACTIONS_RUNNER_INPUT_JITCONFIG) [[ $value =~ ^[A-Za-z0-9+/=]+$ ]] && ((${#value} <= 65536)) ;;
+      *) [[ $value =~ ^[1-9][0-9]{0,19}$ ]] ;;
+    esac || die "start: $key is not well formed"
+    got[$key]=$value
+  done
+  ((${#got[@]} == 3)) || die "start: needs ACTIONS_RUNNER_INPUT_JITCONFIG, FORK_FLEET_RUN and FORK_FLEET_ATTEMPT"
+}
+
+# lane-start's input lines (stdin) into got: one commit, plan part, shard and attempt, which NAME must name.
+lane_input() {
+  local line key value
+  lane_name_ok "$1"
+  [[ -n $LANE_REPO ]] || die "lane-start: LANE_REPO is not set in $conf: this host runs no lane job"
+  while IFS= read -r line; do
+    [[ $line =~ ^(FORK_LANE_SHA|FORK_LANE_PART|FORK_LANE_SHARD|FORK_LANE_ATTEMPT)=(.*)$ ]] ||
+      die "lane-start: an unexpected input line"
+    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    [[ -z ${got[$key]+set} ]] || die "lane-start: $key twice"
+    case $key in
+      FORK_LANE_SHA) [[ $value =~ ^[0-9a-f]{40}$ ]] ;;
+      FORK_LANE_PART) [[ $value =~ $LANE_PART ]] ;;
+      FORK_LANE_SHARD) [[ $value =~ ^([1-9][0-9]?)/([1-9][0-9]?)$ ]] && ((BASH_REMATCH[1] <= BASH_REMATCH[2])) ;;
+      *) [[ $value =~ ^[12]$ ]] ;;
+    esac || die "lane-start: $key is not well formed"
+    got[$key]=$value
+  done
+  ((${#got[@]} == 4)) || die "lane-start: needs FORK_LANE_SHA, FORK_LANE_PART, FORK_LANE_SHARD and FORK_LANE_ATTEMPT"
+  [[ $1 == "lane-${got[FORK_LANE_SHA]:0:12}-${got[FORK_LANE_PART]}-${got[FORK_LANE_SHARD]%/*}-${got[FORK_LANE_ATTEMPT]}" ]] ||
+    die "lane-start: $1 is not the name of this commit, part, shard and attempt"
+}
+
+# The template: an unconfigured runner nobody but this user can change (each copy hard-links its files).
+template_ok() {
+  local f bad
+
+  owned_safe "$TEMPLATE"
+  [[ -x $TEMPLATE/run.sh ]] || die "$TEMPLATE has no run.sh"
+  for f in .env .path .runner .credentials .credentials_rsaparams; do
+    [[ ! -e $TEMPLATE/$f && ! -L $TEMPLATE/$f ]] || die "$TEMPLATE/$f exists: the template must be an unconfigured runner (.github/fork-fleet.md)"
+  done
+  bad=$(unsafe_file "$TEMPLATE")
+  [[ -z $bad ]] || die "$TEMPLATE has a file that is not this user's or that others may write, a special file or a" \
+    "setuid, setgid or sticky one: $bad"
+}
+
+# The job's unit, from launch_job's locals (dynamic scope: name, kind, dir, env_file, user, props, job_cmd, collect,
+# mem_max, mem_high): the one systemd-run of this launcher, and its check. CollectMode: a runner's unit goes once it
+# ended (as --collect); a lane job's stays, failed, until lane-result has read how it ended.
+start() {
+  local wait code bad left why
   # Type=exec: systemd-run returns once run.sh started, so the environment file has been read and can go.
   # ProtectSystem=strict: the job writes its copy and its own memory file systems, nothing else.
   # Stop timeouts of its own (at most the walls' STOP_MAX): systemd's defaults never decide how long a job that ignores
@@ -1392,13 +1487,14 @@ start() {
     die "start: ${SECONDS}s in already, START_BY ($START_BY s) left too little time (under $START_MIN s) to start" \
       "and check a unit: refused"
   code=0
-  timeout -k 2 "$wait" "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" \
-    --working-directory "$dir" -p Type=exec -p KillMode=control-group -p "EnvironmentFile=$env_file" \
+  timeout -k 2 "$wait" "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --uid "$user" \
+    --working-directory "$dir" -p Type=exec -p KillMode=control-group -p "CollectMode=$collect" \
+    -p "EnvironmentFile=$env_file" \
     "${props[@]}" -p "ReadWritePaths=$dir" \
     -p "MemoryMax=${mem_max}M" -p "MemoryHigh=${mem_high}M" -p "MemorySwapMax=${JOB_SWAP_MAX_MB}M" \
     -p "CPUWeight=$JOB_CPU_WEIGHT" -p "CPUQuota=${JOB_CPU_QUOTA:+$JOB_CPU_QUOTA%}" \
     -p "OOMScoreAdjust=$JOB_OOM_SCORE_ADJUST" -p OOMPolicy=kill \
-    -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "$dir/run.sh" || code=$?
+    -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "${job_cmd[@]}" || code=$?
   # What systemd really applies (issues #365 item 1, #636), drop-ins and defaults included, not what was asked for: a
   # unit that could run on past its limit (a stop timeout over STOP_MAX, a RuntimeMaxSec over MAX_SECONDS, a kill that
   # leaves processes or never comes, a Type= that is not exec; or what cannot be read) is killed at once, and the start
@@ -1421,6 +1517,8 @@ start() {
       "could not kill it (${left:-unreadable}): refused; kill it by hand:" \
       "systemctl kill --signal=KILL -- fork-fleet-$name.service"
     warn "start: fork-fleet-$name.service $bad: $why; $left and refused"
+    # A lane unit is not collected: let go of it, so it no longer holds its runner user.
+    [[ $kind != lane ]] || systemctl_by reset-failed -- "fork-fleet-$name.service" 2>/dev/null || true
     ((code == 0 || code == 124 || code == 137)) || exit "$code"
     exit 1
   fi
@@ -1926,8 +2024,157 @@ check_net() {
     "allowed ones is there, and no mount of the host's reaches it later"
 }
 
+# The lane job (lane-start), run by bash as the runner user in its unit (cwd: its copy): an anonymous checkout of
+# FORK_LANE_SHA from FORK_LANE_REPO, then the plan part's call at that commit (.github/fork-ci-plan.json, the part
+# with lane true), with its records in the copy's out folder keyed lane-<part>, this attempt and this shard. Exit
+# LANE_PASS (100) only when that call exited 0; else its code (1 to 99, and 99 for anything higher), so a job that
+# ends 0 in any other way never reads as a pass, and the unit always ends failed: systemd keeps it, with its exit, for
+# lane-result, and stops whatever the job left behind.
+LANE_PASS=100
+read -r -d '' LANE_JOB <<'EOF' || true
+set +e -uo pipefail
+umask 077
+(
+  set -e
+  top=$PWD
+  git init -q -- "$top/src"
+  cd -- "$top/src"
+  git remote add origin "$FORK_LANE_REPO"
+  git fetch -q --no-tags --depth=1 origin "$FORK_LANE_SHA"
+  git -c advice.detachedHead=false checkout -q FETCH_HEAD
+  [[ $(git rev-parse HEAD) == "$FORK_LANE_SHA" ]]
+  args=$(python3 -I -c 'import json, sys
+parts = [p for p in json.load(open(".github/fork-ci-plan.json"))["parts"] if p.get("name") == sys.argv[1]]
+assert len(parts) == 1 and parts[0].get("lane") is True, "no such lane part in the plan at this commit"
+print("\n".join(parts[0]["args"]))' "$FORK_LANE_PART")
+  mapfile -t argv <<<"$args"
+  export FORK_CI_TEST_SHARD=$FORK_LANE_SHARD FORK_CI_TEST_RECORDS=$top/out GITHUB_JOB=lane-$FORK_LANE_PART \
+    GITHUB_RUN_ATTEMPT=$FORK_LANE_ATTEMPT GITHUB_RUN_ID=lane GITHUB_SHA=$FORK_LANE_SHA CI=true
+  node .github/scripts/fork-ci-tests.cjs "${argv[@]}"
+)
+code=$?
+((code != 0)) || exit 100
+((code < 100)) || code=99
+exit "$code"
+EOF
+# The largest records file lane-result reads (bytes).
+LANE_RECORDS_MAX=8388608
+
+# lane-result: how lane job NAME's unit is, and once it ended, its exit and records (the header above).
+lane_result() {
+  local name=$1 unit out line load='' state='' result='' how='' status='' user='' code left records kept
+  lane_name_ok "$name"
+  unit=fork-fleet-$name.service
+  setup
+  kept=$RUN_DIR/$name.result
+  if [[ -f $kept && ! -L $kept ]]; then
+    cat -- "$kept"
+    return 0
+  fi
+  out=$(systemctl_by show -p LoadState -p ActiveState -p Result -p ExecMainCode -p ExecMainStatus -p User --all \
+    -- "$unit") || die "lane-result: could not read $unit"
+  while IFS= read -r line; do
+    case $line in
+      LoadState=*) load=${line#*=} ;;
+      ActiveState=*) state=${line#*=} ;;
+      Result=*) result=${line#*=} ;;
+      ExecMainCode=*) how=${line#*=} ;;
+      ExecMainStatus=*) status=${line#*=} ;;
+      User=*) user=${line#*=} ;;
+    esac
+  done <<<"$out"
+  # A unit systemd no longer has, or one stopped and about to go (the lane's stop, its RuntimeMaxSec): gone.
+  if [[ $load == not-found || ($load == loaded && $state == inactive) ]]; then
+    printf '{"state": "gone"}\n'
+    return 0
+  fi
+  [[ $load == loaded ]] || die "lane-result: $unit is $load"
+  case $state in
+    active | activating | deactivating | reloading | refreshing)
+      printf '{"state": "running"}\n'
+      return 0
+      ;;
+    failed) ;;
+    *) die "lane-result: $unit is $state" ;;
+  esac
+  # Ended. How, as systemd saw it: CLD_EXITED (1) with its status, else a signal (128 + it). 0 only for the lane
+  # job's own pass code with nothing else wrong (Result exit-code: no timeout, no OOM kill, no signal).
+  [[ $how =~ ^[1-3]$ && $status =~ ^[0-9]{1,3}$ ]] || die "lane-result: $unit has no readable exit"
+  if ((how != 1)); then
+    code=$((128 + status))
+  elif ((status == LANE_PASS)) && [[ $result == exit-code ]]; then
+    code=0
+  elif ((status == 0 || status == LANE_PASS)); then
+    code=1
+  else
+    code=$status
+  fi
+  [[ ",$RUNNER_USERS," == *",$user,"* ]] || die "lane-result: $unit runs as $user, no runner user"
+  # Nothing of the job left before its records are read: no process of it can change them meanwhile.
+  left=$(kill_unit "$unit" "$user") || die "lane-result: $unit ended but could not be emptied (${left:-unreadable})"
+  records=$(lane_records "$WORK_ROOT/$name" "$user")
+  (set -o noclobber && printf '{"state": "done", "exit": %d, "records": %s}\n' "$code" "$records" >"$kept") ||
+    die "lane-result: could not keep the answer in $kept, a new file: refused"
+  # Let go of the unit: its runner user is free again, and prune removes the copy.
+  systemctl_by reset-failed -- "$unit" || warn "lane-result: could not let go of $unit (reset-failed)"
+  cat -- "$kept"
+}
+
+# The one records file (fork-ci-tests.cjs's) in copy $1's out folder, as one JSON line, or null: only a plain .json
+# file of runner user $2's own (no link, one name only), at most LANE_RECORDS_MAX bytes, that parses as an object.
+lane_records() {
+  local out=$1/out uid f file='' n=0 owner links size
+  uid=$(id -u -- "$2") || die "lane-result: no uid of $2"
+  if [[ ! -d $out || -L $out ]]; then
+    printf 'null'
+    return 0
+  fi
+  for f in "$out"/* "$out"/.[!.]*; do
+    [[ -e $f || -L $f ]] || continue
+    n=$((n + 1)) file=$f
+  done
+  read -r owner links size < <(stat -c '%u %h %s' -- "$file" 2>/dev/null) || true
+  if ((n != 1)) || [[ $file != *.json || ! -f $file || -L $file || $owner != "$uid" || $links != 1 ]] ||
+    ((size > LANE_RECORDS_MAX)); then
+    printf 'null'
+    return 0
+  fi
+  python3 -I -c 'import json, sys
+d = json.load(sys.stdin)
+print(json.dumps(d, separators=(",", ":")) if isinstance(d, dict) else "null", end="")' <"$file" 2>/dev/null ||
+    printf 'null'
+}
+
+# How long (seconds) an ended lane unit that no lane-result read is kept: then prune lets go of it. A lane that lost
+# its journal never asks for its old attempt's units again, and each would hold its runner user for good. Over the
+# lane's lease (40 minutes by default), so a lane that still knows the unit reads it first.
+LANE_KEEP_SECONDS=3600
+
+# prune's first step: lets go (reset-failed) of each lane unit that ended LANE_KEEP_SECONDS ago (failed, as every
+# lane unit ends); prune_now then removes its copy and root. A unit whose state or time cannot be read is kept.
+let_go_lanes() {
+  local name out line state when now
+  now=$(date +%s)
+  for name in $(active); do
+    [[ $name =~ $LANE_NAME ]] || continue
+    out=$("$SYSTEMCTL" show -p StateChangeTimestamp -p ActiveState -- "fork-fleet-$name.service") || continue
+    state='' when=''
+    while IFS= read -r line; do
+      case $line in
+        ActiveState=*) state=${line#*=} ;;
+        StateChangeTimestamp=*) when=${line#*=} ;;
+      esac
+    done <<<"$out"
+    [[ $state == failed && -n $when ]] || continue
+    when=$(date -d "$when" +%s 2>/dev/null) || continue
+    ((now - when > LANE_KEEP_SECONDS)) || continue
+    "$SYSTEMCTL" reset-failed -- "fork-fleet-$name.service" || warn "prune: could not let go of fork-fleet-$name.service"
+  done
+}
+
 prune() {
   setup
+  let_go_lanes
   prune_now
 }
 
@@ -1947,16 +2194,22 @@ prune_now() {
     if grep -qxF -- "$name" <<<"$live"; then continue; fi
     rm -rf --one-file-system -- "$entry"
   done
+  # lane-result's kept answers, a day after it gave them (its unit and copy are long gone by then).
+  find "$RUN_DIR" -maxdepth 1 -type f -name 'lane-*.result' -mmin +1440 -delete
 }
 
 case "${1-}:$#" in
-  start:2) start "$2" ;;
+  start:2) launch_job "$2" ;;
+  lane-start:2) launch_job "$2" lane ;;
+  lane-result:2) lane_result "$2" ;;
   ready:2) ready "$2" ;;
   active:1) active ;;
   fits:2) fits "$2" ;;
   stop:2)
     name_ok "$2"
     "$SYSTEMCTL" stop -- "fork-fleet-$2.service"
+    # A lane unit is not collected: one that had ended already stays failed until it is let go.
+    if [[ $2 =~ $LANE_NAME ]]; then "$SYSTEMCTL" reset-failed -- "fork-fleet-$2.service" 2>/dev/null || true; fi
     ;;
   prune:1) prune ;;
   refresh:1) refresh ;;
@@ -1968,5 +2221,5 @@ case "${1-}:$#" in
     shift
     check_net "$@"
     ;;
-  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh | refresh-net | paths | tools | check-net URL HOST:PORT..." ;;
+  *) die "usage: start NAME | lane-start NAME | lane-result NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh | refresh-net | paths | tools | check-net URL HOST:PORT..." ;;
 esac

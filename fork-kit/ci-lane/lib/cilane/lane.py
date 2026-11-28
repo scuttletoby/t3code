@@ -349,18 +349,31 @@ class Lane:
                 name = unit_name(sha, spec, job['attempt'])
                 try:
                     self.launcher.start(name, sha, spec, job['attempt'])
+                    how = 'STARTED'
                 except LaunchError as e:
-                    errors += 1
-                    job['tries'] += 1
-                    self.log(f'ERROR {sha[:12]} {key}: {e}')
-                    if job['tries'] >= START_TRIES:
-                        lose(job, f'start refused {START_TRIES} times', self.log, sha)
-                    continue
+                    if not self.there(name):
+                        errors += 1
+                        job['tries'] += 1
+                        self.log(f'ERROR {sha[:12]} {key}: {e}')
+                        if job['tries'] >= START_TRIES:
+                            lose(job, f'start refused {START_TRIES} times', self.log, sha)
+                        continue
+                    how = 'ADOPTED'
                 lease = self.now + datetime.timedelta(minutes=self.cfg['leaseMinutes'])
                 job.update(state='running', name=name, started=iso(self.now), lease=iso(lease))
                 running += 1
-                self.log(f'STARTED {sha[:12]} {key} attempt {job["attempt"]} as {name}')
+                self.log(f'{how} {sha[:12]} {key} attempt {job["attempt"]} as {name}')
         return errors
+
+    def there(self, name):
+        """A refused start whose unit is there all the same: a start that went through before the tick that made it
+        could write its journal (stopped half-way). The name is this commit, part, shard and attempt, and only this
+        lane starts lane units, so it is this job: adopted (its lease from now), never started twice. A lookup that
+        fails: not there (the refusal counts)."""
+        try:
+            return self.launcher.result(name)['state'] in ('running', 'done')
+        except LaunchError:
+            return False
 
     def finish(self):
         errors = 0

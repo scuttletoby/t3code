@@ -60,8 +60,17 @@ Every key is the commit, `<part>:<shard>` and the attempt; the launcher's unit i
   - Stopped before the check was posted: the head is planned again next tick; nothing ran.
   - Stopped after the check was posted (or the journal was lost while jobs ran): the next tick finds our
     `in_progress` check, reuses it, and runs the jobs as attempt 2: the one retry. Lost again: Actions counts. The
-    old attempt's units carry other names, and the launcher's lease and prune end them.
+    old attempt's units carry other names: their `RuntimeMaxSec` ends them, and the launcher's prune lets go of an
+    ended one no `lane-result` read an hour later, so it does not hold its runner user for good.
+  - Stopped after `lane-start` but before the journal: the next tick's start of that name is refused (the unit is
+    there); `lane-result` shows it running or done, so the lane adopts it (its lease from then) and never starts
+    it twice. A refused start with no unit of that name counts as a try, as before.
+  - Stopped after `lane-result` read a done job but before the journal: the launcher kept that answer, so the
+    next tick gets the same one, not `gone`.
   - A verdict or a cancel that GitHub refused is posted again next tick.
+- **Installer:** safe to run again (same release: nothing changes) and to stop at any step (the next run ends it);
+  the timer units are only written once the release they run is the one in use, never enabled by it, and a unit
+  file this kit did not write is refused and kept.
 - **Old or empty state:** a missing, broken or other-version journal is read as empty; GitHub's check runs (the
   lasting record) rebuild it as above. A check belongs to one commit, so it cannot meet a newer head.
 
@@ -92,7 +101,7 @@ note): the rows the T3 work panel (#1136) shows.
   "checkName": "fork-ci-own",
   "appId": 123456,
   "auth": { "ghAs": "/usr/local/bin/gh-as" },
-  "launch": ["/usr/bin/sudo", "-n", "/usr/local/sbin/fork-fleet-launch"],
+  "launch": ["/usr/bin/sudo", "-n", "/opt/fork-fleet/fork-fleet-launch.sh"],
   "maxJobs": 2,
   "leaseMinutes": 40,
   "explained": {}
@@ -109,28 +118,66 @@ ones for parity) and `lock`. Exit codes: 0 fine, 1 a pass with errors (each logg
 
 ## The launcher's side
 
-The lane calls three verbs of the fleet launcher, as root through `sudo -n`:
+The lane calls three verbs of the fleet launcher (`.github/scripts/fork-fleet-launch.sh`, installed by the desk kit
+as `/opt/fork-fleet/fork-fleet-launch.sh`), as root through `sudo -n`:
 
 - `lane-start NAME`, stdin exactly `FORK_LANE_SHA=<40 hex>`, `FORK_LANE_PART=<part>`, `FORK_LANE_SHARD=<i>/<n>`,
-  `FORK_LANE_ATTEMPT=<1|2>`: starts the job in the same walls as a runner job (its own runner user, network
-  namespace, sandbox and limits), with an anonymous checkout of that commit, and returns once it started. Inside,
-  the job reads the plan at its checkout and runs that part's call with `FORK_CI_TEST_SHARD`, and
-  `FORK_CI_TEST_RECORDS` with `GITHUB_JOB=lane-<part>` and `GITHUB_RUN_ATTEMPT=<attempt>`.
+  `FORK_LANE_ATTEMPT=<1|2>`, and NAME exactly `lane-<sha:12>-<part>-<i>-<attempt>`: starts the job in the same
+  walls as a runner job, through the same one `systemd-run` (a free runner user of its own, its network namespace,
+  sandbox and limits, `RuntimeMaxSec`), and returns once it started. No runner and no template: an empty copy, and
+  the lane job (the launcher's `LANE_JOB`, written root's into the unit's own root, so nothing a runner user can
+  write decides what runs) makes an anonymous checkout of that commit from the launcher's `LANE_REPO` (launch.conf:
+  the lane names a commit, never where it comes from), reads the plan at that checkout and runs that part's call
+  with `FORK_CI_TEST_SHARD`, and `FORK_CI_TEST_RECORDS` in the copy with `GITHUB_JOB=lane-<part>` and
+  `GITHUB_RUN_ATTEMPT=<attempt>`. It exits 100 only when that call exited 0, anything else 1 to 99, so the unit always
+  ends `failed` and systemd keeps it (`CollectMode=inactive`), with its exit, and ends whatever the job left running.
 - `lane-result NAME`: one JSON line, `{"state": "running"}`, `{"state": "gone"}`, or
-  `{"state": "done", "exit": N, "records": {...}}` (the exit status as systemd saw it, from outside the job).
-- `stop NAME` (the launcher's existing verb).
+  `{"state": "done", "exit": N, "records": {...} or null}`. N is the exit as systemd saw it, from outside the job:
+  0 only for the job's pass code with no timeout, OOM kill or signal; 128 + the signal for a killed job. The records
+  are read by root only once nothing of the job is left, and only from one plain `.json` file of the runner user's
+  own in the copy's `out` folder (no link, no second name), that parses as an object; else `null` (judged
+  `failed`). The answer is kept root's (`RUN_DIR/NAME.result`) before the unit is let go (`reset-failed`), so a lane
+  that stopped before writing its journal gets the same answer again, not `gone`; prune removes it a day later.
+- `stop NAME` (the launcher's existing verb): for a lane job, also lets go of a unit that had ended.
 
-These verbs are not in the launcher yet (see below); until they are, the lane is not installed.
+A lane job holds its runner user from its start until `lane-result` read it (or `stop`). The dispatcher's pools and
+the lane draw from the same `RUNNER_USERS`, so give the host at least the pools' slots plus `maxJobs` of them. The
+host's `/usr` (the jobs' view) needs `git`, `python3` and a Node the fork's scripts run with: a lane job sets up
+nothing itself, and a part whose tools are missing fails there, which the parity report shows.
+
+## Install
+
+As root, with the bootstrap (`fork-kit/common/bootstrap.sh`): `--kit ci-lane --repo OWNER/REPO --sha RELEASE_SHA
+[--timer | --no-timer]`, or `ci-lane-install install --source KIT_FOLDER --sha RELEASE_SHA [--timer | --no-timer]`.
+It copies the kit into `/usr/local/libexec/ci-lane/versions/<sha>/`, links `/usr/local/bin/ci-lane`, and with
+`--timer` writes the user units `ci-lane.service` and `ci-lane.timer` (a tick every 2 minutes) in
+`/etc/systemd/user/`. Written is not enabled: nothing runs until the service user enables the timer itself. Safe to
+run again and to stop at any step; `uninstall` removes it all (the users disable the timer first).
+
+The owner's steps, in this order:
+
+1. The CI App (Checks write; Actions, Contents and Pull requests read; this repository only), its key in the gh-apps
+   kit, and `gh-as` allowed for the service user.
+2. On the fleet host: the launcher release with these verbs (the walls pin moves with it),
+   `LANE_REPO=https://github.com/OWNER/REPO` in `/etc/fork-fleet/launch.conf`, and enough `RUNNER_USERS` (above).
+3. A service user with no other rights, and a sudoers rule for it that allows exactly these three:
+   `/opt/fork-fleet/fork-fleet-launch.sh lane-start *`, `... lane-result *` and `... stop lane-*`.
+4. The kit with `--timer`, that user's `~/.config/ci-lane/config.json` (Config, above), `loginctl enable-linger`
+   for it, then as it: `systemctl --user daemon-reload && systemctl --user enable --now ci-lane.timer`.
+
+To stop the lane: `mode: "off"` in the config (the next tick does nothing), or disable the timer. Jobs that run keep
+their lease; a done one keeps its runner user until a tick reads it, or by hand
+`sudo /opt/fork-fleet/fork-fleet-launch.sh stop NAME`.
 
 ## Not here yet
 
-- The launcher verbs above, with their walls proof (a root-run script with its own review), and the installer and
-  timer units for this kit.
-- Creating the CI App and its installation (owner step).
+- Creating the CI App and its installation, the sudoers rule, and enabling the timer (owner steps, above).
 - The T3 work panel side of the rows (#1136).
 
 ## Tests
 
 `python3 -I -B fork-kit/ci-lane/tests/<name>.test.py`: `lane` (the tick on a fake GitHub and launcher, the verdict
 rules with a RedCheck, the state question), `parity`, `parts` (the plan reader, the gh-as client, the launcher
-contract), and `.github/scripts/fork-ci-plan.test.py` (the plan against the workflow).
+contract, against the launcher's own text), `install` (the installer and its units, with a RedCheck), and
+`.github/scripts/fork-ci-plan.test.py` (the plan against the workflow). The launcher's verbs: the `Launcher` class
+of `.github/scripts/fork-fleet.test.py` (`lane` tests, on a fake systemd) and its `LaneJob` class (the job itself).

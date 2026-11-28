@@ -56,7 +56,8 @@ VERBS = {
 # the link: `serve` and the agent refuse them like an unknown verb, and the contract test counts them as the launcher's.
 # check-net connects, as root and from the machine's own network, to each HOST:PORT it is given and says which one it
 # cannot reach: through the link that would let the always-on host map the desktop's home network.
-LOCAL_ONLY = frozenset({'refresh', 'check-net', 'paths', 'tools'})
+# lane-start and lane-result: the own CI lane (fork-kit/ci-lane) runs on the launcher's own machine, through sudo.
+LOCAL_ONLY = frozenset({'refresh', 'check-net', 'paths', 'tools', 'lane-start', 'lane-result'})
 MARGIN = 10                   # seconds `launch` waits beyond a verb's limit, all told
 SERVE_MARGIN = 5              # seconds `serve` waits beyond it before it answers UNKNOWN itself
 UNKNOWN = 75                  # launch's exit when the verb may or may not have run (EX_TEMPFAIL)

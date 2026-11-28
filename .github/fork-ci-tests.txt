@@ -118,6 +118,7 @@ fork-kit/agent-guards/tests/memory-index.test.py unittest
 fork-kit/agent-guards/tests/poll-loop.test.py unittest
 fork-kit/agent-guards/tests/read-size.test.py unittest
 fork-kit/agent-guards/tests/wiring.test.py unittest
+fork-kit/ci-lane/tests/install.test.py unittest
 fork-kit/ci-lane/tests/lane.test.py unittest
 fork-kit/ci-lane/tests/parity.test.py unittest
 fork-kit/ci-lane/tests/parts.test.py unittest
