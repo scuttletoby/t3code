@@ -65,6 +65,13 @@ def data_roots():
     return roots
 
 
+def lane_job():
+    """The lane job's text, as the launcher writes it into a lane unit's root (LANE_JOB, its heredoc)."""
+    with open(LAUNCH, encoding='utf-8') as f:
+        text = f.read()
+    return re.search(r"^read -r -d '' LANE_JOB <<'EOF' \|\| true\n(.*?)\nEOF\n", text, re.M | re.S).group(1)
+
+
 def launcher_tmp():
     """A temp folder for the launcher's tests, which bind it (WORK_ROOT, HOOK, RESOLV_CONF): never under a folder that
     holds data, which the launcher refuses, even when TMPDIR is one (a local run with TMPDIR under /home)."""
@@ -1599,7 +1606,12 @@ class Launcher(unittest.TestCase):
                      # $REC/active-state, each look the next while there is one, else inactive; ControlGroup the
                      # first line of $REC/cgroup (the same way), else none; fails when $REC/state-fails exists.
                      # Without --all an empty property is left out, as some systemd versions do (#667).
-                     'show) if [[ $3 == ActiveState ]]; then printf "%s\\n" "$*" >> "$REC/states"; '
+                     # lane-result's look at a lane unit: $REC/lane-show, else a unit systemd does not have.
+                     # prune's look at a lane unit that may have ended: $REC/ended-<unit>, else nothing.
+                     'show) if [[ $3 == StateChangeTimestamp ]]; then cat -- "$REC/ended-${!#}" 2>/dev/null; exit 0; fi; '
+                     'if [[ $3 == LoadState ]]; then printf "%s\\n" "$*" >> "$REC/lane-shown"; '
+                     'cat -- "$REC/lane-show" 2>/dev/null || echo LoadState=not-found; exit 0; fi; '
+                     'if [[ $3 == ActiveState ]]; then printf "%s\\n" "$*" >> "$REC/states"; '
                      '[[ ! -e $REC/systemctl-hangs ]] || exec sleep 60; '
                      '[[ ! -e $REC/state-fails ]] || exit 1; for f in active-state cgroup; do v=; '
                      '[[ ! -e $REC/$f ]] || { v=$(head -n 1 -- "$REC/$f"); (($(wc -l < "$REC/$f") < 2)) || '
@@ -1621,6 +1633,7 @@ class Launcher(unittest.TestCase):
                      '[[ ! -e $REC/kill-leaves ]] || : > "$REC/$(cat -- "$REC/kill-leaves")"; '
                      '[[ ! -e $REC/kill-fails ]] ;; '
                      'set-property) printf "%s\\n" "$*" >> "$REC/set-property"; [[ ! -e $REC/set-property-fails ]] ;; '
+                     'reset-failed) printf "%s\\n" "$*" >> "$REC/reset-failed" ;; '
                      '*) exit 2 ;; esac\n',
         'chown': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/chown"\n',
         # Processes of a runner user: a file $REC/procs-UID; setpriv's kill(-1) ends them unless procs-stay exists.
@@ -1786,9 +1799,10 @@ class Launcher(unittest.TestCase):
         run_dir, dest = self.path('run'), self.path(f'var/runners/{self.NAME}')
         args = self.rec_text('systemd-run').splitlines()
         # Exactly these: no PrivateTmp (it leaves /dev/shm shared), nothing dropped.
-        self.assertEqual(args, ['--quiet', '--unit', f'fork-fleet-{self.NAME}', '--collect', '--uid', 'nobody',
+        # CollectMode=inactive-or-failed: the unit goes once it ended (as --collect).
+        self.assertEqual(args, ['--quiet', '--unit', f'fork-fleet-{self.NAME}', '--uid', 'nobody',
                                 '--working-directory', dest, '-p', 'Type=exec', '-p', 'KillMode=control-group',
-                                '-p', f'EnvironmentFile={run_dir}/{self.NAME}.env',
+                                '-p', 'CollectMode=inactive-or-failed', '-p', f'EnvironmentFile={run_dir}/{self.NAME}.env',
                                 *self.sandbox('nobody', f'{run_dir}/{self.NAME}.root', dest),
                                 '-p', f'ReadWritePaths={dest}', *self.LIMITS,
                                 '-p', 'RuntimeMaxSec=3600', '-p', 'TimeoutStopSec=90',
@@ -2971,6 +2985,238 @@ class Launcher(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(root)), ['fleet-vm-t3code-11', 'fleet-vm-t3code-13', 'notes'])
         self.assertEqual(os.listdir(run), ['launch.lock'])
         self.assertTrue(os.path.isdir(self.path('elsewhere')))
+
+    # Issue #1157 phase 2b: the own CI lane's verbs (fork-kit/ci-lane/README.md, The launcher's side).
+    LANE_SHA = 'ab' * 20
+    LANE_NAME = f'lane-{"ab" * 6}-kit-2-1'
+    LANE_INPUT = f'FORK_LANE_SHA={LANE_SHA}\nFORK_LANE_PART=kit\nFORK_LANE_SHARD=2/3\nFORK_LANE_ATTEMPT=1\n'
+    LANE_REPO = 'https://github.com/owner/repo'
+    LANE_RECORDS = {'v': 1, 'sha': LANE_SHA, 'job': 'lane-kit', 'run_attempt': 1, 'owed': ['a'], 'results': []}
+
+    def lane_unit(self, state, result='exit-code', how=1, status=100, user='nobody'):
+        """The lane unit as `systemctl show` prints it (the fake systemctl's $REC/lane-show)."""
+        self.write('rec/lane-show', f'LoadState=loaded\nActiveState={state}\nResult={result}\nExecMainCode={how}\n'
+                                    f'ExecMainStatus={status}\nUser={user}\n', 0o644)
+
+    def lane_copy(self, files=None):
+        """The lane job's copy with its out folder (one records file unless files says otherwise), all of it this
+        test's user's, whom the fake id names as the runner user."""
+        out = self.path(f'var/runners/{self.LANE_NAME}/out')
+        os.makedirs(out)
+        for d in (self.path('var'), self.path('var/runners')):
+            os.chmod(d, 0o755)
+        for name, text in (files if files is not None else
+                           {'part-2of3-fork-kit_.json': json.dumps(self.LANE_RECORDS, indent=1)}).items():
+            with open(os.path.join(out, name), 'w') as f:
+                f.write(text)
+        self.write('rec/id-u-nobody', f'{os.getuid()}\n', 0o644)
+        return out
+
+    def lane_result(self):
+        got = self.launch('lane-result', self.LANE_NAME)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        return json.loads(got.stdout)
+
+    def test_lane_start(self):
+        """A lane job starts in a runner's walls: the same systemd-run, sandbox and limits, as a free runner user. No
+        runner (no template needed): an empty copy, the lane job in the unit's own root (root's, read-only there),
+        the commit, part, shard, attempt and LANE_REPO from a root-only file, and its unit kept once it ended
+        (CollectMode=inactive) for lane-result."""
+        self.conf(LANE_REPO=self.LANE_REPO)
+        shutil.rmtree(self.template)
+        got = self.launch('lane-start', self.LANE_NAME, stdin=self.LANE_INPUT)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        run_dir, dest = self.path('run'), self.path(f'var/runners/{self.LANE_NAME}')
+        self.assertEqual(self.rec_text('systemd-run').splitlines(), [
+            '--quiet', '--unit', f'fork-fleet-{self.LANE_NAME}', '--uid', 'nobody', '--working-directory', dest,
+            '-p', 'Type=exec', '-p', 'KillMode=control-group', '-p', 'CollectMode=inactive',
+            '-p', f'EnvironmentFile={run_dir}/{self.LANE_NAME}.env',
+            *self.sandbox('nobody', f'{run_dir}/{self.LANE_NAME}.root', dest), '-p', f'ReadWritePaths={dest}',
+            *self.LIMITS, '-p', 'RuntimeMaxSec=3600', '-p', 'TimeoutStopSec=90', '-p', 'TimeoutAbortSec=90',
+            '--', '/bin/bash', '/fork-lane-job.sh'])
+        self.assertEqual(self.rec_text('env'), self.LANE_INPUT + f'FORK_LANE_REPO={self.LANE_REPO}\n'
+                                                                 f'HOME={dest}/home\nTMPDIR={dest}/tmp\n')
+        self.assertEqual(sorted(os.listdir(dest)), ['home', 'tmp'])
+        self.assertEqual(self.rec_text('chown'), f'-- nobody: {dest} {dest}/home {dest}/tmp\n')
+        self.assertFalse(os.path.exists(f'{run_dir}/{self.LANE_NAME}.env'))
+        job = f'{run_dir}/{self.LANE_NAME}.root/fork-lane-job.sh'
+        self.assertEqual(stat.S_IMODE(os.stat(job).st_mode), 0o644)
+        with open(job) as f:
+            self.assertEqual(f.read(), lane_job() + '\n')
+        self.assertEqual(self.rec_text('shown'), f'{SHOW_ARGS} fork-fleet-{self.LANE_NAME}.service\n')
+        self.assertIsNone(self.rec_text('killed'))
+        # A second start of the same name is refused: its copy is there until prune.
+        self.assertIn('exists', self.launch('lane-start', self.LANE_NAME, stdin=self.LANE_INPUT).stderr)
+
+    def test_lane_start_refuses_anything_but_one_commit_part_shard_and_attempt(self):
+        good = self.LANE_INPUT
+        got = self.launch('lane-start', self.LANE_NAME, stdin=good)        # no LANE_REPO: this host runs no lane
+        self.assertEqual(got.returncode, 1)
+        self.assertIn('LANE_REPO is not set', got.stderr)
+        for repo in ('http://github.com/o/r', 'https://example.com/o/r', 'https://github.com/o/r/x', 'o/r'):
+            self.conf(LANE_REPO=repo)
+            self.assertIn('LANE_REPO is https://github.com/OWNER/NAME', self.launch('prune').stderr, repo)
+        self.conf(LANE_REPO=self.LANE_REPO)
+        cases = ((good + 'X=1\n', 'an unexpected input line'),
+                 (good + 'FORK_LANE_PART=kit\n', 'FORK_LANE_PART twice'),
+                 (good.replace('FORK_LANE_ATTEMPT=1\n', ''), 'needs FORK_LANE_SHA, FORK_LANE_PART'),
+                 (good.replace(self.LANE_SHA, self.LANE_SHA[:39]), 'FORK_LANE_SHA is not well formed'),
+                 (good.replace(self.LANE_SHA, self.LANE_SHA.upper()), 'FORK_LANE_SHA is not well formed'),
+                 (good.replace('PART=kit', 'PART=Kit'), 'FORK_LANE_PART is not well formed'),
+                 (good.replace('PART=kit', 'PART=kit x'), 'FORK_LANE_PART is not well formed'),
+                 (good.replace('2/3', '4/3'), 'FORK_LANE_SHARD is not well formed'),
+                 (good.replace('2/3', '0/3'), 'FORK_LANE_SHARD is not well formed'),
+                 (good.replace('ATTEMPT=1', 'ATTEMPT=3'), 'FORK_LANE_ATTEMPT is not well formed'),
+                 (good.replace('ATTEMPT=1', 'ATTEMPT=2'), 'is not the name of this commit, part, shard and attempt'),
+                 (good.replace('2/3', '1/3'), 'is not the name of this commit, part, shard and attempt'),
+                 (good.replace('PART=kit', 'PART=kits'), 'is not the name of this commit, part, shard and attempt'))
+        for stdin, why in cases:
+            with self.subTest(why=why, stdin=stdin):
+                got = self.launch('lane-start', self.LANE_NAME, stdin=stdin)
+                self.assertEqual(got.returncode, 1)
+                self.assertIn(why, got.stderr)
+        for name in (self.NAME, f'lane-{"ab" * 6}-kit-2-3', f'lane-{"AB" * 6}-kit-2-1', 'lane-x-kit-2-1'):
+            with self.subTest(name=name):
+                self.assertRegex(self.launch('lane-start', name, stdin=good).stderr, 'not a (lane job|runner) name')
+        self.assertIsNone(self.rec_text('systemd-run'))
+        self.assertFalse(os.path.exists(self.path(f'var/runners/{self.LANE_NAME}')))
+
+    def test_lane_result_running_and_gone(self):
+        self.assertEqual(self.lane_result(), {'state': 'gone'})          # no such unit
+        for state in ('activating', 'active', 'deactivating'):
+            self.lane_unit(state)
+            self.assertEqual(self.lane_result(), {'state': 'running'}, state)
+        self.lane_unit('inactive')                                          # stopped, about to be let go
+        self.assertEqual(self.lane_result(), {'state': 'gone'})
+        self.assertEqual(self.rec_text('lane-shown').splitlines()[0],
+                         'show -p LoadState -p ActiveState -p Result -p ExecMainCode -p ExecMainStatus -p User --all '
+                         f'-- fork-fleet-{self.LANE_NAME}.service')
+        for name in ('killed', 'reset-failed'):
+            self.assertIsNone(self.rec_text(name), name)
+        self.assertFalse(os.path.exists(self.path(f'run/{self.LANE_NAME}.result')))
+
+    def test_lane_result_of_a_job_that_ended(self):
+        """Ended: its exit as systemd saw it, and its records once nothing of it is left (killed and checked first).
+        The answer is kept before the unit is let go (reset-failed), so asking again (the lane stopped before it
+        wrote its journal) gives the same answer, not `gone`."""
+        self.lane_copy()
+        self.lane_unit('failed')
+        want = {'state': 'done', 'exit': 0, 'records': self.LANE_RECORDS}
+        self.assertEqual(self.lane_result(), want)
+        self.assertEqual(self.rec_text('killed'), f'kill --signal=KILL -- fork-fleet-{self.LANE_NAME}.service\n')
+        self.assertEqual(self.rec_text('reset-failed'), f'reset-failed -- fork-fleet-{self.LANE_NAME}.service\n')
+        os.remove(os.path.join(self.rec, 'lane-show'))                     # the unit is gone now
+        self.assertEqual(self.lane_result(), want)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path(f'run/{self.LANE_NAME}.result')).st_mode), 0o600)
+
+    def test_lane_result_exit_is_systemds_and_only_the_jobs_pass_code_is_0(self):
+        self.lane_copy()
+        for how, status, result, code in ((1, 100, 'exit-code', 0), (1, 1, 'exit-code', 1), (1, 99, 'exit-code', 99),
+                                          (1, 100, 'timeout', 1), (1, 100, 'oom-kill', 1), (1, 0, 'exit-code', 1),
+                                          (1, 0, 'success', 1), (2, 9, 'signal', 137), (3, 6, 'core-dump', 134)):
+            with self.subTest(how=how, status=status, result=result):
+                self.lane_unit('failed', result=result, how=how, status=status)
+                self.assertEqual(self.lane_result()['exit'], code)
+                os.remove(self.path(f'run/{self.LANE_NAME}.result'))
+        for how, status in (('0', '100'), ('1', ''), ('x', '1')):
+            self.lane_unit('failed', how=how, status=status)
+            got = self.launch('lane-result', self.LANE_NAME)
+            self.assertEqual(got.returncode, 1)
+            self.assertIn('has no readable exit', got.stderr)
+        self.lane_unit('failed', user='root')
+        self.assertIn('runs as root, no runner user', self.launch('lane-result', self.LANE_NAME).stderr)
+        self.lane_unit('maintenance')
+        self.assertIn('is maintenance', self.launch('lane-result', self.LANE_NAME).stderr)
+        self.assertIn('not a lane job name', self.launch('lane-result', self.NAME).stderr)
+        self.assertFalse(os.path.exists(self.path(f'run/{self.LANE_NAME}.result')))
+
+    def test_lane_result_reads_only_the_jobs_own_plain_records_file(self):
+        """Root reads a file a job wrote: only one plain .json file of the runner user's own in the copy's out
+        folder (no link, no second name, no other owner), that parses as an object; anything else is no records
+        (null: the lane judges that `failed`), never a file the job pointed root at."""
+        good = json.dumps(self.LANE_RECORDS)
+        secret = self.write('secret.json', '{"secret": 1}', 0o600)
+
+        def answer(setup):
+            shutil.rmtree(self.path('var/runners'), ignore_errors=True)
+            for name in ('rec/lane-show', f'run/{self.LANE_NAME}.result'):
+                if os.path.exists(self.path(name)):
+                    os.remove(self.path(name))
+            setup()
+            self.lane_unit('failed')
+            return self.lane_result()['records']
+
+        self.assertEqual(answer(lambda: self.lane_copy()), self.LANE_RECORDS)
+        cases = {
+            'no out folder': lambda: os.makedirs(self.path(f'var/runners/{self.LANE_NAME}')),
+            'empty': lambda: self.lane_copy({}),
+            'two files': lambda: self.lane_copy({'a.json': good, 'b.json': good}),
+            'a hidden second file': lambda: self.lane_copy({'a.json': good, '.b': 'x'}),
+            'not .json': lambda: self.lane_copy({'a.txt': good}),
+            'not JSON': lambda: self.lane_copy({'a.json': '{'}),
+            'a list': lambda: self.lane_copy({'a.json': '[1]'}),
+            'a link to root\'s file': lambda: os.symlink(secret, os.path.join(self.lane_copy({}), 'a.json')),
+            'a hard link': lambda: os.link(secret, os.path.join(self.lane_copy({}), 'a.json')),
+            'the out folder a link': lambda: (shutil.rmtree(self.lane_copy({})), os.makedirs(self.path('other')),
+                                              shutil.copy(secret, self.path('other/a.json')),
+                                              os.symlink(self.path('other'),
+                                                         self.path(f'var/runners/{self.LANE_NAME}/out'))),
+            'another owner': lambda: (self.lane_copy(), self.write('rec/id-u-nobody', f'{os.getuid() + 1}\n', 0o644)),
+        }
+        for why, setup in cases.items():
+            with self.subTest(why=why):
+                self.assertIsNone(answer(setup))
+
+    def test_lane_result_waits_until_nothing_of_the_job_is_left(self):
+        """A unit whose processes cannot be ended: no answer (exit 1), nothing kept, the unit kept: asked again."""
+        self.lane_copy()
+        self.lane_unit('failed')
+        self.write('rec/active-state', 'active\n', 0o644)
+        got = self.launch('lane-result', self.LANE_NAME)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn('could not be emptied', got.stderr)
+        self.assertFalse(os.path.exists(self.path(f'run/{self.LANE_NAME}.result')))
+        self.assertIsNone(self.rec_text('reset-failed'))
+
+    def test_stop_lets_go_of_a_lane_unit_that_ended(self):
+        self.assertEqual(self.launch('stop', self.LANE_NAME).returncode, 0)
+        self.assertEqual(self.rec_text('stopped'), f'stop -- fork-fleet-{self.LANE_NAME}.service\n')
+        self.assertEqual(self.rec_text('reset-failed'), f'reset-failed -- fork-fleet-{self.LANE_NAME}.service\n')
+        os.remove(os.path.join(self.rec, 'reset-failed'))
+        self.assertEqual(self.launch('stop', self.NAME).returncode, 0)     # a runner's is collected anyway
+        self.assertIsNone(self.rec_text('reset-failed'))
+
+    def test_prune_lets_go_of_a_lane_unit_nobody_read_an_hour_after_it_ended(self):
+        """A lane that lost its journal never asks for its old attempt's units again: an hour after one ended
+        (failed: every lane unit ends so), prune lets go of it, so it no longer holds its runner user. One that ended
+        lately, one still running, one whose time cannot be read, and a runner's unit are left alone."""
+        names = [f'lane-{"ab" * 6}-kit-1-{i}' for i in (1, 2)] + [f'lane-{"cd" * 6}-kit-1-1', f'lane-{"ef" * 6}-kit-1-1',
+                                                                   self.NAME]
+        self.write('rec/units', ''.join(f'fork-fleet-{n}.service loaded failed failed x\n' for n in names), 0o644)
+
+        def ended(name, state, seconds_ago):
+            when = 'n/a' if seconds_ago is None else \
+                time.strftime('%a %Y-%m-%d %H:%M:%S UTC', time.gmtime(time.time() - seconds_ago))
+            self.write(f'rec/ended-fork-fleet-{name}.service', f'StateChangeTimestamp={when}\nActiveState={state}\n',
+                       0o644)
+        ended(names[0], 'failed', 2 * 3600)
+        ended(names[1], 'failed', 10 * 60)
+        ended(names[2], 'active', 2 * 3600)
+        ended(names[3], 'failed', None)
+        ended(names[4], 'failed', 2 * 3600)
+        self.assertEqual(self.launch('prune').returncode, 0)
+        self.assertEqual(self.rec_text('reset-failed'), f'reset-failed -- fork-fleet-{names[0]}.service\n')
+
+    def test_prune_removes_kept_lane_answers_a_day_later(self):
+        for d in ('var/runners', 'run'):
+            os.makedirs(self.path(d))
+        old, new = (self.write(f'run/lane-{"ab" * 6}-kit-1-{i}.result', '{}', 0o600) for i in (1, 2))
+        self.write('run/fleet-vm-t3code-11.keep', 'x', 0o600)
+        os.utime(old, (time.time() - 25 * 3600,) * 2)
+        os.utime(self.path('run/fleet-vm-t3code-11.keep'), (time.time() - 25 * 3600,) * 2)
+        self.assertEqual(self.launch('prune').returncode, 0)
+        self.assertEqual(sorted(os.listdir(self.path('run'))),
+                         sorted(['fleet-vm-t3code-11.keep', os.path.basename(new), 'launch.lock']))
 
     # Item 1 of round 3: each runner user's own network namespace, internet only, made (or found) before every start.
     NOBODY_NET, DAEMON_NET = '10.204.255.248', '10.204.0.4'   # uid % 16384 * 4 from NET_BASE: 65534 and 1
@@ -4293,6 +4539,92 @@ class WallsProof(unittest.TestCase):
         self.assertIn('-p IPAddressDeny=any', src)
         for key in ('JOB_PATHS=$tmp/job-paths.txt', 'HOOK=$tmp/hook.sh'):
             self.assertIn(key, src)
+
+
+class LaneJob(unittest.TestCase):
+    """The lane job itself (the launcher's LANE_JOB, what a lane unit runs): bash with a fake git and node, the real
+    python3. It runs the plan part's call at the commit it checked out, with that part's records keys, and exits 100
+    (LANE_PASS) only when that call exited 0: anything else is 1 to 99, so no other way of ending 0 reads as a pass."""
+    SHA = 'cd' * 20
+    PLAN = {'version': 1, 'parts': [{'name': 'kit', 'args': ['fork-kit/', '!fork-kit/x'], 'lane': True},
+                                    {'name': 'root', 'args': ['--run', 'x.test.py'], 'lane': False}]}
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix='lane-job-')
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.rec, self.copy = os.path.join(self.d, 'rec'), os.path.join(self.d, 'copy')
+        for d in (self.rec, self.copy, os.path.join(self.d, 'bin')):
+            os.mkdir(d)
+        fakes = {
+            'git': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/git"\ncase $1 in\n'
+                   '  init) mkdir -p -- "${@: -1}" ;;\n'
+                   '  fetch) [[ ! -e $REC/fetch-fails ]] || exit 128 ;;\n'
+                   '  -c) mkdir -p .github && cp -- "$REC/plan.json" .github/fork-ci-plan.json ;;\n'
+                   '  rev-parse) cat -- "$REC/head" ;;\nesac\n',
+            'node': '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$REC/node"\npwd > "$REC/node-cwd"\n'
+                    'env | grep -E "^(FORK_CI_|GITHUB_|CI=)" | sort > "$REC/node-env"\nexit "$(cat "$REC/node-exit")"\n',
+        }
+        for name, text in fakes.items():
+            p = os.path.join(self.d, 'bin', name)
+            with open(p, 'w') as f:
+                f.write(text.replace('$REC', self.rec))
+            os.chmod(p, 0o755)
+        self.put('plan.json', json.dumps(self.PLAN))
+        self.put('head', self.SHA)
+        self.put('node-exit', '0')
+        self.job = self.put('job.sh', lane_job())
+
+    def put(self, name, text):
+        p = os.path.join(self.rec, name)
+        with open(p, 'w') as f:
+            f.write(text)
+        return p
+
+    def rec_text(self, name):
+        try:
+            with open(os.path.join(self.rec, name)) as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def run_job(self, part='kit'):
+        env = {'PATH': f'{self.d}/bin:/usr/bin:/bin', 'HOME': self.copy, 'FORK_LANE_SHA': self.SHA,
+               'FORK_LANE_PART': part, 'FORK_LANE_SHARD': '2/3', 'FORK_LANE_ATTEMPT': '2',
+               'FORK_LANE_REPO': 'https://github.com/owner/repo'}
+        return subprocess.run(['bash', self.job], cwd=self.copy, env=env, capture_output=True, text=True,
+                              timeout=60).returncode
+
+    def test_runs_the_plan_parts_call_at_the_commit_it_checked_out(self):
+        self.assertEqual(self.run_job(), 100)
+        self.assertEqual(self.rec_text('git').splitlines(), [
+            f'init -q -- {self.copy}/src', 'remote add origin https://github.com/owner/repo',
+            f'fetch -q --no-tags --depth=1 origin {self.SHA}', '-c advice.detachedHead=false checkout -q FETCH_HEAD',
+            'rev-parse HEAD'])
+        self.assertEqual(self.rec_text('node').splitlines(),
+                         ['.github/scripts/fork-ci-tests.cjs', 'fork-kit/', '!fork-kit/x'])
+        self.assertEqual(self.rec_text('node-cwd').strip(), f'{self.copy}/src')
+        self.assertEqual(self.rec_text('node-env').splitlines(), [
+            'CI=true', f'FORK_CI_TEST_RECORDS={self.copy}/out', 'FORK_CI_TEST_SHARD=2/3', 'GITHUB_JOB=lane-kit',
+            'GITHUB_RUN_ATTEMPT=2', 'GITHUB_RUN_ID=lane', f'GITHUB_SHA={self.SHA}'])
+
+    def test_only_the_calls_exit_0_is_a_pass(self):
+        for code, want in (('1', 1), ('99', 99), ('100', 99), ('150', 99)):
+            with self.subTest(code=code):
+                self.put('node-exit', code)
+                self.assertEqual(self.run_job(), want)
+
+    def test_no_call_without_the_commit_and_a_lane_part_of_its_plan(self):
+        self.put('fetch-fails', '')
+        self.assertEqual(self.run_job(), 99)                   # git's 128
+        os.remove(os.path.join(self.rec, 'fetch-fails'))
+        shutil.rmtree(os.path.join(self.copy, 'src'))
+        self.put('head', 'ef' * 20)                             # another commit than asked for
+        self.assertEqual(self.run_job(), 1)
+        self.put('head', self.SHA)
+        for part in ('root', 'nope'):                           # Actions' part, or none
+            shutil.rmtree(os.path.join(self.copy, 'src'))
+            self.assertEqual(self.run_job(part), 1, part)
+        self.assertIsNone(self.rec_text('node'))
 
 
 @unittest.skipUnless(sys.platform.startswith('linux') and os.geteuid() == 0 and

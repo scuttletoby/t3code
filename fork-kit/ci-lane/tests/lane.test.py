@@ -95,6 +95,8 @@ class FakeLauncher:
     def start(self, name, sha, job, attempt):
         if self.refuse:
             raise lane.LaunchError(f'lane-start {name}: exit 1: no free runner user')
+        if name in self.units:       # the launcher refuses a name it ran already (its copy is there until prune)
+            raise lane.LaunchError(f'lane-start {name}: exit 1: /var/lib/fork-fleet/runners/{name} exists')
         if self.order is not None:
             self.order.append(f'start {name}')
         self.started.append(name)
@@ -340,6 +342,37 @@ class State(Case):
         self.tick()
         self.assertEqual(self.launcher.started, started)
         self.assertEqual(len(self.gh.checks), 2)
+
+    def test_stopped_after_a_start_before_the_journal_the_unit_is_adopted(self):
+        """The launcher started the jobs, then the tick stopped before it wrote its journal: next tick each start is
+        refused (the unit is there), and the lane takes that unit as its own, since its name is this commit, part,
+        shard and attempt and only this lane starts lane units. Each job runs once, is never lost for it, and its
+        result counts."""
+        self.launcher.refuse = True
+        self.tick()                                        # checks posted, jobs queued
+        journal = copy.deepcopy(self.state)
+        self.launcher.refuse = False
+        self.tick()                                        # started...
+        started = list(self.launcher.started)
+        self.assertEqual(len(started), 6)
+        self.state.clear()
+        self.state.update(journal)                         # ...but that tick's journal was never written
+        self.tick()
+        self.assertEqual(self.launcher.started, started)   # nothing started twice
+        jobs = [j for h in self.state['heads'].values() for j in h['jobs'].values()]
+        self.assertEqual(sorted(j['name'] for j in jobs), sorted(started))
+        self.assertTrue(all(j['state'] == 'running' and j['attempt'] == 1 for j in jobs))
+        self.assertTrue(any(line.startswith('ADOPTED ') for line in self.lines))
+        self.launcher.pass_all()
+        self.tick()
+        self.assertEqual((self.conclusion(MAIN), self.conclusion(PR1)), ('success', 'success'))
+
+    def test_a_refused_start_whose_unit_is_not_there_still_counts(self):
+        """Refused and no unit of that name (no free runner user): a try, as before; the lookup never adopts."""
+        self.launcher.refuse = True
+        self.tick()
+        job = self.state['heads'][PR1]['jobs']['kit:1']
+        self.assertEqual((job['state'], job['tries']), ('queued', 1))
 
     def test_empty_journal_with_a_completed_check_runs_nothing(self):
         self.tick()

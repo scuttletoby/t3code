@@ -1,0 +1,15 @@
+# ci-lane kit: written by ci-lane-install. Do not edit: run the installer again.
+[Unit]
+Description=ci-lane tick: the own CI lane, in shadow beside Actions (fork-kit/ci-lane)
+# runs the release in use; without one (an uninstall half-way) it does nothing
+ConditionPathExists=/usr/local/libexec/ci-lane/current/bin/ci-lane
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/ci-lane/current/bin/ci-lane tick
+Nice=5
+TimeoutStartSec=10min
+# files it makes are this user's only. NoNewPrivileges=, PrivateTmp=, ProtectSystem= and the like are left out on
+# purpose: gh-as reaches the App token and the lane reaches the fleet launcher through sudo, which NoNewPrivileges=
+# blocks, and in a user unit the others turn on PrivateUsers=, where sudo cannot become root either (README, Install).
+UMask=0077

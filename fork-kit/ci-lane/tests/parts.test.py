@@ -114,6 +114,28 @@ class Launcher(unittest.TestCase):
         name = lane.unit_name('a' * 40, plans.Job('a' * 24, 10, 10, 'x {shard}', 's'), 2)
         self.assertRegex(name, re.compile(r'^[a-z0-9][a-z0-9-]{0,62}-[0-9]{1,20}$'))
 
+    def test_the_launcher_has_the_lane_verbs_and_takes_what_this_lane_sends(self):
+        """The launcher's side (.github/scripts/fork-fleet-launch.sh): its lane-start and lane-result verbs, its part
+        rule the plan's, and every name and stdin line this lane makes one it accepts. A launcher without them (the
+        base of #1157 phase 2b) fails here."""
+        import re
+        with open(os.path.join(KIT, '..', '..', '.github', 'scripts', 'fork-fleet-launch.sh'), encoding='utf-8') as f:
+            text = f.read()
+        case = text[text.index('case "${1-}:$#" in'):]
+        self.assertRegex(case, r'\n  lane-start:2\) launch_job "\$2" lane ;;\n')
+        self.assertRegex(case, r'\n  lane-result:2\) lane_result "\$2" ;;\n')
+
+        def shell(name):
+            return re.compile(re.search(rf"^{name}='\^(.*)\$'$", text, re.M).group(1))
+        part, name_rule = shell('LANE_PART'), shell('LANE_NAME')
+        self.assertEqual(part.pattern, plans.PART_NAME.pattern)
+        for job, attempt in ((plans.Job('a' * 24, 10, 10, 'x {shard}', 's'), 2), (self.JOB, 1)):
+            self.assertRegex(lane.unit_name('0123456789abcdef' * 2 + '01234567', job, attempt), name_rule)
+        run = Recorder()
+        lane.Launcher(['/l'], run=run).start('n', 'a' * 40, self.JOB, 2)
+        keys = re.search(r'\[\[ \$line =~ \^\((FORK_LANE_[A-Z_|]+)\)=\(\.\*\)\$ \]\]', text).group(1).split('|')
+        self.assertEqual([line.split('=')[0] for line in run.calls[0][1]['input'].splitlines()], keys)
+
     def test_result_answers(self):
         ok = lane.Launcher(['/l'], run=Recorder(out='{"state": "done", "exit": 0, "records": {}}'))
         self.assertEqual(ok.result('n')['exit'], 0)

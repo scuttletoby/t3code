@@ -1021,7 +1021,7 @@ class EveryWallsFile(WallsRunner):
         fake = '-p TimeoutStopSec=90 -p TimeoutAbortSec=90'
         second = (f'start() {{\n  "$SYSTEMD_RUN" -p TimeoutStopSec=infinity -p TimeoutAbortSec=infinity -- x\n}}\n')
         infinite = real.replace(both, ' -p TimeoutStopSec=infinity -p TimeoutAbortSec=infinity ')
-        run_end = ' -- "$dir/run.sh"'   # the end of start()'s systemd-run line
+        run_end = ' -- "${job_cmd[@]}"'   # the end of start()'s systemd-run line
         self.assertEqual(old.count(run_end), 1)
         fails = {
             'in an end-of-line comment': old.replace(at, f'\n  true # {fake}' + at),

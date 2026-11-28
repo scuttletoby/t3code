@@ -65,6 +65,9 @@ RUN_PROPS = {'Type', 'KillMode', 'EnvironmentFile', 'ReadWritePaths', 'RuntimeMa
              'RemoveIPC', 'PrivateDevices', 'PrivateIPC', 'PrivateTmp', 'PrivateNetwork', 'PrivateUsers',
              'PrivateMounts', 'SystemCallFilter', 'SystemCallArchitectures', 'SystemCallErrorNumber', 'LockPersonality',
              'CapabilityBoundingSet', 'UMask',
+             # Only when systemd lets go of a unit that ended (a runner's at once, a lane job's once lane-result read
+             # it): nothing of the host's.
+             'CollectMode',
              # Only how the kernel kills a job: the launcher refuses an OOMScoreAdjust under 1 (a job never outlives
              # the host's own processes), OOMPolicy=kill ends the job's whole unit.
              'OOMScoreAdjust', 'OOMPolicy'}

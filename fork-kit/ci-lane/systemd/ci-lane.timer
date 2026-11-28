@@ -1,0 +1,11 @@
+# ci-lane kit: written by ci-lane-install. Do not edit: run the installer again.
+[Unit]
+Description=ci-lane tick every 2 minutes (fork-kit/ci-lane)
+
+[Timer]
+OnStartupSec=1min
+OnCalendar=*:0/2
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
