@@ -51,7 +51,7 @@
 .github/scripts/fork-fleet-desk-key.test.py ~10s unittest
 .github/scripts/fork-fleet-desk-seed.test.py ~34s unittest
 .github/scripts/fork-fleet-desk.test.py ~9s unittest
-.github/scripts/fork-fleet.test.py ~136s unittest
+.github/scripts/fork-fleet.test.py ~141s unittest
 .github/scripts/fork-fleet-refresh.test.py ~59s unittest
 .github/scripts/fork-fleet-walls.test.py ~71s unittest
 .github/scripts/fork-fleet-walls-contract.test.py ~96s unittest
