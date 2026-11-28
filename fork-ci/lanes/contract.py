@@ -152,17 +152,26 @@ class LaneContract:
                 self.assertFalse(os.path.exists(path))
                 self.c.release(t)
 
-    def test_a_claim_of_a_newer_version_holds_only_its_server(self):
-        # A claim a newer release wrote (its shape may be one this version cannot judge): never swept, and it holds
-        # the server it names (all of them when it names none); another server is free.
+    def test_a_claim_of_a_newer_version_holds_its_server_while_its_holder_lives(self):
+        # A claim a newer release wrote (on a host whose projects pin two releases). Does it wedge this release's
+        # lanes? No: a holder this version can judge is judged like any other (gone: swept, whatever the version); a
+        # live one, or one it cannot judge, holds only the server it names; one that names no server holds none.
         a, b = self.servers
-        path = self.plant('x' + claims_mod.SUFFIX, '{"v": 999, "kind": "claim", "server": "%s"}' % b)
-        self.granted(1, 'alone', server=a)
-        self.assertIn('newer release', self.refused(2, server=b))
+        newer = {'v': 999, 'kind': 'claim', 'mode': 'future', 'server': b, 'holder': holder(1), 'since': 1.0}
+        path = self.plant('x' + claims_mod.SUFFIX, json.dumps(newer))
+        self.c.release(self.granted(2, 'alone', server=a))
+        self.assertIn('newer release', self.refused(3, server=b))
+        self.assertTrue(os.path.exists(path))
+        self.dead.add(holder(1)['pid'])
+        self.c.release(self.granted(3, 'alone', server=b))
+        self.assertFalse(os.path.exists(path))
+        path = self.plant('y' + claims_mod.SUFFIX, '{"v": 999, "kind": "claim", "server": "%s"}' % b)
+        self.assertIn('newer release', self.refused(4, server=b))   # a holder it cannot judge: kept, holds b
         self.assertTrue(os.path.exists(path))
         os.unlink(path)
-        path = self.plant('y' + claims_mod.SUFFIX, '{"v": 999, "kind": "claim"}')
-        self.assertIn('newer release', self.refused(3, server=b))
+        path = self.plant('z' + claims_mod.SUFFIX, '{"v": 999}')
+        self.c.release(self.granted(5, 'alone', server=a))
+        self.c.release(self.granted(6, 'alone', server=b))
         self.assertTrue(os.path.exists(path))
 
     def test_a_claim_with_a_field_this_version_does_not_know_is_honoured(self):

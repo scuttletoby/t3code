@@ -37,8 +37,13 @@ A project's config can only tighten these: the lower `max_lanes`, the higher `re
 that names `claims_dir` is refused, and so is a relative `FORK_CI_LANES_DIR` (it would be one folder per working
 folder, and lanes in two checkouts would not see each other).
 
-Every lane on a host must use one folder: set `FORK_CI_LANES_DIR` to a folder every runner on the host can write
-when the runners are different users. Server names are shared in that folder, so two projects on one host name
+Every lane on a host must use one folder. When the runners are different users, set `FORK_CI_LANES_DIR` for every
+runner to one folder they share: group-writable (for example `chmod 2775`, one group for all runner users) and not
+sticky (`+t` is refused: one user could not remove another's dead claim). The lock is taken on a read-only open, and
+every file is written readable to all, whatever a runner's umask. Without the setting each user would get the default
+folder in its own home, and their lanes would not see each other, so a lane without it is refused (exit 2) while
+another user's `pool.py` runs (found by its command line, which every user can read unless `/proc` hides other
+users' processes). Server names are shared in that folder, so two projects on one host name
 their servers apart. Lanes that share a folder must also share one process view (pid namespace): a holder is
 checked by its pid. The pool is a cooperative rule between the host's own runners, not a security boundary.
 
@@ -52,9 +57,11 @@ python3 -I <fork-ci>/lanes/pool.py run --config .github/lanes.json --lane "$LANE
 ```
 
 It waits, polling, until each named server is claimed and the pool admits the lane. It then runs the command with
-`LANE_ID` and `LANE_PORT_<NAME>` set (`LANE_PORT_DB=4101`; `-` becomes `_`). It releases every claim when the
-command ends, and also on SIGTERM, SIGINT or SIGHUP (the command is stopped first, killed after 10 s, then the exit
-is 128 + the signal; a signal that comes before the command starts stops it as it starts). Under an outer `timeout`,
+`LANE_ID` and `LANE_PORT_<NAME>` set (`LANE_PORT_DB=4101`; `-` becomes `_`). It releases every claim once none of
+the lane runs: when the command ends, what it left running (a child, a server in the background) is stopped
+(SIGTERM, SIGKILL 10 s later) first. On SIGTERM, SIGINT or SIGHUP every process of the lane is stopped the same way,
+then the exit is 128 + the signal (a signal that comes before the command starts stops it as it starts). A process
+that still runs 5 s after its SIGKILL keeps the servers held until it ends. Under an outer `timeout`,
 give `-k` at least 10 s (`timeout -k 15 ...`), so `pool.py` stops its command and releases before it is killed
 itself. Then it records the lane's peak memory: its largest process, or its process group's sampled total when that
 is larger. `--alone` claims
@@ -69,7 +76,9 @@ of its servers, each wait with the time the lane began waiting, so the oldest wa
 servers it needs and a younger lane cannot take one of them meanwhile.
 
 **Its process group.** The lane runs in a process group that `pool.py` leads (it makes one when it does not lead
-one and its input is not a terminal). Its claims stay alive while any process of that group runs. A `pool.py` killed
+one, so the caller's group never holds its claims; when the terminal was the caller's, the new group takes it, so
+Ctrl-C still reaches the lane, and gives it back at the end). Its claims stay alive while any process of that group
+runs. A `pool.py` killed
 outright (SIGKILL: nothing released) takes its command with it (the kernel kills the command when `pool.py` dies),
 and keeps its servers until the processes that command started end, so no alone lane gets a server under them. Such
 a process left hanging holds its servers until it is stopped (the runner stops a job's processes at the job's end).
@@ -98,18 +107,20 @@ lane starts only when no other lane runs (one at a time); the next measurement s
   While it waits, the server grants no new claim, shared or alone, to anyone but the oldest waiter, so a stream of
   shared runs cannot starve it.
 - **Liveness and sweep.** A holder is a process, `{"pid", "start", "pgid"}` (its start time from `/proc`, so a
-  reused pid is another process; its process group, alive while any process of it runs), or a systemd unit,
+  reused pid is another process; the process group it leads, alive while any process of it runs), or a systemd unit,
   `{"unit"}` (gone when it is `inactive` or `failed`). Every call first removes the claims and waits whose holder is
   gone. A holder it cannot check counts as alive.
 - **One lock.** Every call reads and writes under `flock` on `<folder>/.lock`. A claim file is written whole (a
   temporary file renamed into place); a temporary file a crashed writer left is removed at the next call.
-- **Garbage is swept, a newer release fails closed.** A claim file this version does not write (junk, a wrong
-  shape, a holder with no start time) is removed: it would hold a server for ever. A field it does not know is kept
-  and ignored, so a claim is judged by the fields it knows: a release that changes what a claim means (who holds a
-  server, or how its holder is found alive) must raise `v`. A folder it cannot read refuses every claim and names the
-  reason. A claim from a newer release (its `v` above this one's) refuses every claim on the server it names (every
-  server when it names none; `pool.py` waits, then exits 75) and is never swept: when its holder dies, only that
-  release (or a person) removes it. Its lane is not counted against `max_lanes`. An empty folder holds nothing.
+- **Garbage is swept, a newer release is judged by its holder.** A claim file this version does not write (junk, a
+  wrong shape, a holder with no start time) is removed: it would hold a server for ever. A field it does not know is
+  kept and ignored, so a claim is judged by the fields it knows: a release that changes what a claim means (who holds
+  a server, the holder's shape, or how its holder is found alive) must raise `v`. A folder it cannot read refuses
+  every claim and names the reason. A claim from a newer release (its `v` above this one's) is judged by its holder
+  only, the way every release finds one alive: a holder that is gone is swept. A live holder, or one this version
+  cannot judge, refuses every claim on the server the claim names (`pool.py` waits, then exits 75); a claim that
+  names no server holds nothing and is left alone. Its lane is not counted against `max_lanes`. An empty folder
+  holds nothing.
 
 The API: `Claims(folder).claim(server, mode, holder, lane, restart=False, admit=None, keep_wait=False, since=None,
 note=None)` returns `(token, why)`, where `token` is `None` when refused. `admit(lanes)` gets one live claim per
@@ -123,11 +134,13 @@ claim), `withdraw(server, holder, lane)` (stop waiting), `sweep()` and `holders(
 claims (its lane ids, its server names, a unit as the holder) runs it against that code, as its docstring shows.
 The class covers the conflict table, a waiting restart that is not starved, the oldest waiter first, a dead holder
 or waiter swept, an empty, missing or unreadable folder, planted or garbage claim files swept, a newer release's
-claim, a crashed writer's temporary file, lanes counted by holder, a restart's place kept on every server, a
+claim (live, dead, or naming no server), a crashed writer's temporary file, lanes counted by holder, a restart's place kept on every server, a
 refused admission and two users of one folder, and a claim with a field this version does not know. The tests control the clock and who is alive: no test sleeps.
 
 ## Tests
 
 `python3 -B fork-ci/lanes/lanes.test.py`: the contract against `claims.Claims`, real process liveness, admission,
-the host's part of the config, stopping, and real lanes through `pool.py run` (one killed with SIGKILL while its
-command runs, one killed while it stops a command that ignores SIGTERM, one beside a newer release's claim).
+the host's part of the config, a folder shared by runner users, stopping, and real lanes through `pool.py run` (one
+killed with SIGKILL while its command runs, one killed while it stops a command that ignores SIGTERM, one stopped
+while its command's child runs, one whose command leaves a process running, one with a terminal as its input, one
+beside newer releases' claims).

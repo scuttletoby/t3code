@@ -8,25 +8,29 @@ project names: a server is any name the caller gives).
   - A waiting restart goes first: an `alone` claim made with restart=True that cannot be granted leaves a wait entry,
     and while one waits no new claim on that server is granted (shared or alone) except to the oldest waiter, so a
     stream of shared runs cannot starve it.
-  - A holder is a process (pid and its start time, so a reused pid is not the same holder; and its process group,
-    so a holder killed while its command runs on stays alive until the group's last process ends) or a service
-    unit; a claim or wait whose holder is gone is swept (removed) at every call. A holder it cannot check counts as
+  - A holder is a process (pid and its start time, so a reused pid is not the same holder; and the process group it
+    leads, so a holder killed while its command runs on stays alive until the group's last process ends) or a
+    service unit; a claim or wait whose holder is gone is swept (removed) at every call. A holder it cannot check counts as
     alive.
   - Every call reads and writes under one lock (flock on <folder>/.lock); claim files are written whole (a temporary
     file renamed into place), so a reader never sees half a claim; a temporary file a crashed writer left is removed.
+    Runners that are different users share one folder: the lock is taken on a read-only open, every file is made
+    readable to all, and a sticky folder (one user could not remove another's dead claim) is refused.
   - A claim file this version does not write (junk, a wrong shape, a holder with no start time) is swept: it would
     otherwise hold the server for ever. Fields it does not know are kept and ignored (judged by the ones it knows), so
-    a release that changes what a claim means must raise VERSION. Fails closed where it cannot judge: a folder it
-    cannot read refuses every claim; a claim a newer version wrote (`v` above VERSION) is never swept and refuses
-    every claim on the server it names (every server when it names none), naming why: a caller waits, and only that
-    release (or a person) removes it once its holder is gone. An empty or missing folder holds nothing.
+    a release that changes what a claim means (or how its holder is found alive) must raise VERSION. Fails closed
+    where it cannot judge: a folder it cannot read refuses every claim. A claim a newer version wrote (`v` above
+    VERSION) is judged by its holder alone (a holder is found alive the same way in every version): gone, it is
+    swept; alive, or a holder this version cannot judge, it refuses every claim on the server it names, naming why
+    (a caller waits); one that names no server holds nothing and is left alone. An empty or missing folder holds
+    nothing.
 """
-import fcntl, json, os, subprocess, time
+import fcntl, json, os, stat, subprocess, time
 
 MODES = ('shared', 'alone')
 SUFFIX = '.claim.json'
 TMP = '.tmp-'
-VERSION = 1   # the claim files' version: a file with a higher one is a newer release's (never swept on a guess)
+VERSION = 1   # the claim files' version: a file with a higher one is a newer release's (judged by its holder only)
 
 
 class ClaimsError(Exception):
@@ -49,11 +53,13 @@ def start_time(pid):
 
 
 def me():
-    """This process as a holder (with its process group: the command it runs is in it)."""
+    """This process as a holder, with its process group when it leads it (the command it runs is in it). A group it
+    does not lead is the caller's: the holder's claims would live as long as that."""
     start = start_time(os.getpid())
     if start is None:
         raise ClaimsError('cannot read this process\'s start time from /proc')
-    return {'pid': os.getpid(), 'start': start, 'pgid': os.getpgrp()}
+    pid = os.getpid()
+    return {'pid': pid, 'start': start, **({'pgid': pid} if os.getpgrp() == pid else {})}
 
 
 def _whole(v):
@@ -126,6 +132,11 @@ def group_alive(pgid):
     return True
 
 
+def readable(fd):
+    """Every runner user of a shared folder reads what one writes, whatever its umask."""
+    os.fchmod(fd, 0o644)
+
+
 class Claims:
     def __init__(self, folder, alive=alive, clock=time.time):
         self.folder, self.alive, self.clock = folder, alive, clock
@@ -133,9 +144,17 @@ class Claims:
     # ---------------------------------------------------------------- the folder, under one lock
 
     def _locked(self):
+        lock = os.path.join(self.folder, '.lock')
         try:
             os.makedirs(self.folder, exist_ok=True)
-            fd = os.open(os.path.join(self.folder, '.lock'), os.O_RDWR | os.O_CREAT, 0o644)
+            if os.stat(self.folder).st_mode & stat.S_ISVTX:
+                raise ClaimsError(f'the claims folder {self.folder} is sticky (+t): a runner could not remove another '
+                                  f'user\'s dead claim; give the runners one folder without it (chmod -t)')
+            try:   # read-only: the lock another runner user made is not this one's to write
+                fd = os.open(lock, os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                readable(fd)
+            except FileExistsError:
+                fd = os.open(lock, os.O_RDONLY)
         except OSError as e:
             raise ClaimsError(f'cannot use the claims folder {self.folder} ({e.strerror or e})')
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -145,8 +164,8 @@ class Claims:
         return self._scan()[0]
 
     def _scan(self):
-        """(entries, newer) under the lock. newer: (server or None, version, path) of each claim file a newer
-        release wrote (never swept: this version cannot judge it). Removes what a crash or a planter left:
+        """(entries, newer) under the lock. newer: (server, version, path) of each claim file a newer release wrote
+        whose holder is alive or cannot be judged (one whose holder is gone is removed). Removes what a crash or a planter left:
         temporary files (every write is under this lock, so none is half-way now) and claim files this version
         does not write."""
         try:
@@ -170,8 +189,11 @@ class Claims:
                 c = None
             v = c.get('v', VERSION) if isinstance(c, dict) else None
             if isinstance(v, int) and not isinstance(v, bool) and v > VERSION:
-                server = c.get('server')
-                newer.append((server if isinstance(server, str) and server else None, v, path))
+                h, server = c.get('holder'), c.get('server')
+                if valid_holder(h) and not self.alive(h):
+                    self._unlink(n)   # its holder is gone: judged the way every version judges one
+                elif isinstance(server, str) and server:
+                    newer.append((server, v, path))
                 continue
             if v != VERSION or not valid_entry(c):
                 self._unlink(n)   # not a claim any release wrote: it would hold the server for ever
@@ -193,6 +215,7 @@ class Claims:
         body = {'v': VERSION, **{k: v for k, v in entry.items() if k != 'id'}}
         tmp = os.path.join(self.folder, f'{TMP}{ident}')
         with open(tmp, 'w', encoding='utf-8') as f:
+            readable(f.fileno())
             json.dump(body, f)
             f.flush()
             os.fsync(f.fileno())
@@ -235,10 +258,10 @@ class Claims:
             waits = waiting(live, server)
             why = None
             clash = [c for c in held if conflicts(c['mode'], mode)]
-            newest = [n for n in newer if n[0] in (None, server)]
+            newest = [n for n in newer if n[0] == server]
             if newest:
                 why = (f'{server}: a claim from a newer release holds it ({newest[0][2]}, version {newest[0][1]}; '
-                       f'this release reads {VERSION}): that release removes it once its holder is gone')
+                       f'this release reads {VERSION}): its holder runs, or this release cannot judge it')
             elif clash:
                 why = (f'{server} is held {clash[0]["mode"]} by lane {clash[0].get("lane") or "?"}'
                        f'{f" (+{len(clash) - 1} more)" if len(clash) > 1 else ""}')

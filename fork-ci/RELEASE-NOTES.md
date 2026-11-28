@@ -21,8 +21,11 @@ rule (shared or alone, a waiting restart first on every server it needs, dead ho
 process group or by unit, garbage claim files swept, one lock); `contract.py` holds the contract tests a project runs
 against its own adapter. The claims folder and the limits a pull request must not loosen come from the runner's
 environment (`FORK_CI_LANES_*`), never from the project's config. A lane's cost is the larger of `lane_mb` and its
-own measured peaks (kept by config file and lane id); a newer release's claim holds only the server it names, and a
-lane that needs it waits.
+own measured peaks (kept by config file and lane id). A newer release's claim is swept when its holder is gone and
+otherwise holds only the server it names (a lane that needs it waits). Servers are released only once none of the
+lane's process group runs (on a signal, and when the command leaves a process running, that is stopped first).
+Runner users that share one folder (`FORK_CI_LANES_DIR`, group-writable, not sticky) can use each other's lock and
+claims; without it, a lane is refused while another user's lanes run.
 
 **Upgrade:** none (nothing used it before).
 

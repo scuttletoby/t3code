@@ -28,10 +28,12 @@ none runs (one at a time: the safe old way).
       [--wait-s 3600] -- command...
 Waits (polling) until every named server is claimed (shared, or alone with --alone; --restart: a waiting restart goes
 first, on every named server) and the pool admits the lane, then runs the command with LANE_ID and LANE_PORT_<NAME>
-set, releases on exit (also on SIGTERM/SIGINT/SIGHUP: the command is stopped first) and records the lane's peak
-memory. The lane runs in its own process group (pool.py makes one when it does not lead one and no terminal is its
-input); its claims stay alive while a process of that group runs. A pool.py killed outright (SIGKILL) takes its
-command with it (the kernel kills it), and holds its servers until the processes that command started end. Exit: the
+set, and releases once none of the lane runs (on SIGTERM/SIGINT/SIGHUP every process of the lane is stopped first,
+killed 10 s later; what the command leaves running when it ends is stopped too) and records the lane's peak memory.
+The lane runs in a process group pool.py leads (it makes one when it does not lead one; from a terminal the new
+group takes the terminal); its claims stay alive while a process of that group runs. A pool.py killed outright
+(SIGKILL) takes its command with it (the kernel kills it), and holds its servers until the processes that command
+started end. Without FORK_CI_LANES_DIR, a lane is refused while another user's pool.py runs (exit 2). Exit: the
 command's; 128 + the signal when stopped; 75 when it waited --wait-s without a start (also behind a newer release's
 claim on a server it needs); 2 for a config it cannot use.
 """
@@ -184,6 +186,114 @@ def group_rss_mb(pgid, proc='/proc'):
     return int(total * PAGE_MB)
 
 
+def _stat(pid, proc='/proc'):
+    """(state, process group) of a process, or None when it is gone."""
+    try:
+        with open(os.path.join(proc, str(pid), 'stat'), 'rb') as f:
+            stat = f.read().decode('ascii', 'replace')
+        fields = stat[stat.rindex(')') + 2:].split()
+        return fields[0], int(fields[2])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def group_pids(pgid, proc='/proc'):
+    """The processes of a group that still run (an ended one waiting to be reaped is left out), but this one."""
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if n.isdigit() and int(n) != os.getpid():
+            got = _stat(n, proc)
+            if got is not None and got[1] == pgid and got[0] != 'Z':
+                out.append(int(n))
+    return out
+
+
+def signal_group(pgid, sig):
+    """Signal every process of the lane's group but pool.py (os.killpg would stop pool.py too). Each one is held by a
+    pidfd before its group is checked, so a pid reused meanwhile is never signalled."""
+    for pid in group_pids(pgid):
+        fd = None
+        try:
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                continue
+            except (AttributeError, OSError):   # (no pidfds here: signalled by pid)
+                fd = None
+            got = _stat(pid)
+            if got is None or got[1] != pgid:
+                continue
+            if fd is not None:
+                signal.pidfd_send_signal(fd, sig)
+            else:
+                os.kill(pid, sig)
+        except OSError:
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def drain(group, stopper, sleep, clock, grace_s=10, kill_s=5):
+    """After the command ended: stop what it left running in the lane's group (SIGTERM, SIGKILL grace_s later; a
+    signal to pool.py already sent the SIGTERM). True once none of it runs; False when some still does kill_s after
+    the SIGKILL (the claims then stay: they live while the group runs)."""
+    termed = stopper.at if stopper.signum is not None else None
+    killed = None
+    while group_pids(group):
+        now = clock()
+        if termed is None:
+            signal_group(group, signal.SIGTERM)
+            termed = now
+        elif killed is None and now - termed >= grace_s:
+            signal_group(group, signal.SIGKILL)
+            killed = now
+        elif killed is not None and now - killed >= kill_s:
+            return False
+        sleep(0.05)
+    return True
+
+
+def other_users_lanes(proc='/proc', uid=None):
+    """The other users (uids) that run pool.py lanes now, by their command lines (every user may read them)."""
+    uid = os.getuid() if uid is None else uid
+    found = set()
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return []
+    for n in names:
+        if not n.isdigit():
+            continue
+        try:
+            owner = os.stat(os.path.join(proc, n)).st_uid
+            if owner == uid:
+                continue
+            with open(os.path.join(proc, n, 'cmdline'), 'rb') as f:
+                argv = f.read().split(b'\0')
+        except OSError:
+            continue
+        if any(os.path.basename(a) == b'pool.py' and b == b'run' for a, b in zip(argv, argv[1:])):
+            found.add(owner)
+    return sorted(found)
+
+
+def one_folder(env, proc='/proc', uid=None):
+    """Runners that are different users each get their own default folder (in their home), and lanes in two folders
+    do not see each other: without FORK_CI_LANES_DIR, a lane is refused while another user's pool.py runs."""
+    if env.get('FORK_CI_LANES_DIR'):
+        return
+    others = other_users_lanes(proc, uid)
+    if others:
+        raise ConfigError(f'another user (uid {others[0]}) runs pool.py lanes on this host, and FORK_CI_LANES_DIR is '
+                          f'not set (each user would get its own folder, and their lanes would not see each other): '
+                          f'set it for every runner to one group-shared folder')
+
+
 def pending_mb(lanes, rss=group_rss_mb):
     """What admitted lanes have not used of their cost yet: each lane's cost less its group's memory now (a lane
     with no group to measure counts its whole cost)."""
@@ -223,6 +333,7 @@ def record(folder, key, peak_mb):
             del got[old]
         tmp = os.path.join(folder, f'{claims_mod.TMP}measured-{os.getpid()}')
         with open(tmp, 'w', encoding='utf-8') as f:
+            claims_mod.readable(f.fileno())
             json.dump(got, f)
         os.replace(tmp, os.path.join(folder, MEASURED))
     finally:
@@ -264,12 +375,13 @@ def take(c, cfg, servers, mode, holder, lane, restart, free=available_mb, rss=gr
 
 
 class Stopper:
-    """SIGTERM/SIGINT/SIGHUP while a lane runs: stop its command, also when the signal came before the command
-    started (it is stopped the moment it starts: never a command run on with no claim or no one to stop it)."""
+    """SIGTERM/SIGINT/SIGHUP while a lane runs: stop its command and every process of the lane's group, also when
+    the signal came before the command started (it is stopped the moment it starts: never a command run on with no
+    claim or no one to stop it)."""
     SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
-    def __init__(self, clock=time.monotonic):
-        self.signum, self.at, self.proc, self.clock = None, None, None, clock
+    def __init__(self, clock=time.monotonic, group=None):
+        self.signum, self.at, self.proc, self.clock, self.group = None, None, None, clock, group
 
     def on_signal(self, signum, frame):
         if self.signum is None:
@@ -282,8 +394,18 @@ class Stopper:
             self._stop()
 
     def _stop(self):
-        if self.proc is not None and self.proc.poll() is None:
+        if self.proc is None:
+            return
+        if self.group:   # the whole group: a wrapper (sh -c, a script) that dies leaves its children running
+            signal_group(self.group, signal.SIGTERM)
+        elif self.proc.poll() is None:
             self.proc.terminate()
+
+    def kill(self):
+        if self.group:
+            signal_group(self.group, signal.SIGKILL)
+        elif self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
 
     def overdue(self, grace_s=10):
         return self.signum is not None and self.clock() - self.at >= grace_s
@@ -316,14 +438,40 @@ def die_with(parent):
 
 
 def own_group():
-    """Lead a process group (the lane's command runs in it, so the claims outlive a pool.py killed outright).
-    Not when a terminal is the input: the terminal's Ctrl-C must still reach the lane."""
-    if os.getpgrp() != os.getpid() and not os.isatty(0):
-        try:
-            os.setpgid(0, 0)
-        except OSError:
-            pass   # (a session leader cannot; its group is the holder's then)
-    return os.getpgrp() if os.getpgrp() == os.getpid() else None
+    """Lead a process group (the lane's command runs in it, so the claims outlive a pool.py killed outright, and the
+    caller's group never holds them). (group, terminal): when the terminal's foreground group was the caller's, the
+    new group takes the terminal, so Ctrl-C still reaches the lane; give_back() returns it."""
+    pid = os.getpid()
+    if os.getpgrp() == pid:
+        return pid, None
+    caller = os.getpgrp()
+    try:
+        fg = caller if os.isatty(0) and os.tcgetpgrp(0) == caller else None
+    except OSError:
+        fg = None
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        return None, None   # (a session leader cannot; it leads its group already)
+    if fg is not None and not _terminal_to(pid):
+        fg = None
+    return pid, fg
+
+
+def _terminal_to(pgid):
+    old = signal.signal(signal.SIGTTOU, signal.SIG_IGN)   # (a group not in the foreground may hand it over so)
+    try:
+        os.tcsetpgrp(0, pgid)
+        return True
+    except OSError:
+        return False
+    finally:
+        signal.signal(signal.SIGTTOU, old)
+
+
+def give_back(terminal):
+    if terminal is not None:
+        _terminal_to(terminal)
 
 
 def run(argv=None, sleep=time.sleep, clock=time.monotonic):
@@ -339,6 +487,7 @@ def run(argv=None, sleep=time.sleep, clock=time.monotonic):
     cmd = a.command[1:] if a.command[:1] == ['--'] else a.command
     try:
         cfg = load_config(a.config)
+        one_folder(os.environ)
         unknown = sorted(set(a.server) - set(cfg['servers']))
         if unknown or not cmd or (a.restart and not a.alone):
             raise ConfigError(f'unknown server {unknown[0]!r}' if unknown else
@@ -356,7 +505,15 @@ def run(argv=None, sleep=time.sleep, clock=time.monotonic):
 
 
 def lane(a, cmd, cfg, stopper, sleep, clock):
-    group = own_group()
+    group, terminal = own_group()
+    try:
+        return _lane(a, cmd, cfg, stopper, sleep, clock, group)
+    finally:
+        give_back(terminal)
+
+
+def _lane(a, cmd, cfg, stopper, sleep, clock, group):
+    stopper.group = group
     mode = 'alone' if a.alone else 'shared'
     c = claims_mod.Claims(cfg['claims_dir'])
     start, pause, said, since, holder = clock(), 0.2, None, time.time(), None
@@ -403,11 +560,17 @@ def lane(a, cmd, cfg, stopper, sleep, clock):
             if group:
                 sampled = max(sampled, group_rss_mb(group))
             if stopper.overdue():
-                child.kill()
+                stopper.kill()
         rc = stopper.code(rc)
     finally:
-        for t in tokens:
-            c.release(t)
+        # What the command left running (its children, a process in the background) still uses the servers: it is
+        # stopped first, and the claims are released only once none of the lane's group runs.
+        if group and not drain(group, stopper, sleep, clock):
+            print(f'pool: lane {a.lane}: some of its processes still run after SIGKILL; its servers stay held until '
+                  f'they end', file=sys.stderr)
+        else:
+            for t in tokens:
+                c.release(t)
     # Its peak: its largest process (kB on Linux), or the group's sampled total when larger.
     peak = max(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024, sampled)
     if peak > 0:

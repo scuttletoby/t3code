@@ -45,8 +45,67 @@ class Liveness(unittest.TestCase):
         orphan.wait()
         self.assertFalse(claims.alive({**h, 'pgid': orphan.pid}))
 
-    def test_this_process_as_a_holder_names_its_group(self):
-        self.assertEqual(claims.me()['pgid'], os.getpgrp())
+    def test_a_holder_names_its_group_only_when_it_leads_it(self):
+        # A holder that does not lead its group (the caller's): would its claims live as long as the caller's whole
+        # group? No: it names no group then; one that leads its group names it.
+        show = 'import json, sys; sys.path.insert(0, %r); import claims; print(json.dumps(claims.me()))' % HERE
+        for lead in (True, False):
+            with self.subTest(lead=lead):
+                p = subprocess.run([sys.executable, '-c', show], capture_output=True, text=True, check=True,
+                                   **({'process_group': 0} if lead else {}))
+                got = json.loads(p.stdout)
+                self.assertEqual(got.get('pgid'), got['pid'] if lead else None)
+
+
+class Folder(unittest.TestCase):
+    """The claims folder on a host whose runners are more than one user."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix='lanes-folder-')
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def test_a_lock_another_user_made_can_be_used(self):
+        # The lock file another runner user created (not writable by this one): does every lane of this user fail?
+        # No: the lock is taken on a read-only open.
+        open(os.path.join(self.d, '.lock'), 'w').close()
+        os.chmod(os.path.join(self.d, '.lock'), 0o444)
+        token, why = claims.Claims(self.d).claim('api', 'alone', claims.me(), 'one')
+        self.assertIsNotNone(token, why)
+
+    def test_what_it_writes_the_other_runner_users_can_read(self):
+        # A runner whose umask is 077: can another runner user read its claims and measurements? Yes.
+        old = os.umask(0o077)
+        try:
+            claims.Claims(os.path.join(self.d, 'c')).claim('api', 'alone', claims.me(), 'one')
+            pool.record(os.path.join(self.d, 'c'), 'k', 500)
+        finally:
+            os.umask(old)
+        for n in os.listdir(os.path.join(self.d, 'c')):
+            with self.subTest(n):
+                self.assertEqual(os.stat(os.path.join(self.d, 'c', n)).st_mode & 0o044, 0o044)
+
+    def test_a_sticky_folder_is_refused(self):
+        # A sticky folder (+t): one user could not sweep another's dead claim. Is that found only then? No: refused.
+        os.chmod(self.d, 0o1777)
+        with self.assertRaisesRegex(claims.ClaimsError, 'sticky'):
+            claims.Claims(self.d).claim('api', 'alone', claims.me(), 'one')
+
+    def test_another_users_lanes_without_a_shared_folder_are_refused(self):
+        # Runners that are different users, FORK_CI_LANES_DIR unset: does each silently get its own folder (lanes
+        # that do not see each other)? No: while another user's pool.py runs, a lane without the setting is refused.
+        proc = os.path.join(self.d, 'proc')
+        for pid, argv in (('101', ['python3', '-I', '/x/fork-ci/lanes/pool.py', 'run', '--config', 'c.json']),
+                          ('102', ['python3', 'pool.py', '--help']), ('103', ['bash'])):
+            os.makedirs(os.path.join(proc, pid))
+            with open(os.path.join(proc, pid, 'cmdline'), 'wb') as f:
+                f.write(b'\0'.join(a.encode() for a in argv) + b'\0')
+        me = os.getuid()
+        self.assertEqual(pool.other_users_lanes(proc, uid=me + 1), [me])   # (the fake's files are this user's)
+        self.assertEqual(pool.other_users_lanes(proc, uid=me), [])
+        with self.assertRaisesRegex(pool.ConfigError, 'FORK_CI_LANES_DIR'):
+            pool.one_folder({}, proc, uid=me + 1)
+        pool.one_folder({'FORK_CI_LANES_DIR': '/srv/lanes'}, proc, uid=me + 1)
+        pool.one_folder({}, proc, uid=me)
 
 
 class Stopping(unittest.TestCase):
@@ -287,10 +346,10 @@ class Run(unittest.TestCase):
         self.procs = []
         self.addCleanup(lambda: [p.kill() for p in self.procs if p.poll() is None])
 
-    def lane(self, lane, *args, code='pass', wait='60'):
+    def lane(self, lane, *args, code='pass', wait='60', stdin=subprocess.DEVNULL):
         p = subprocess.Popen([sys.executable, '-I', POOL, 'run', '--config', self.config, '--lane', lane, *args,
                               '--wait-s', wait, '--', sys.executable, '-c', code], cwd=self.d, env=self.env,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                             stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.procs.append(p)
         return p
 
@@ -386,20 +445,94 @@ class Run(unittest.TestCase):
         rc, out = self.done(self.lane('two', '--server', 'api', '--alone', wait='5'))
         self.assertEqual(rc, 0, out)
 
-    def test_a_newer_release_claim_holds_only_its_server(self):
-        # A claim a newer release wrote (on a host whose projects pin two releases), its holder dead: does it fail
-        # every lane at once? No: a lane that needs another server runs; one that needs its server waits (exit 75).
+    def kid(self, name):
+        """A process the command starts: it notes SIGTERM, ends half a second later, and runs until then."""
+        return ('import os, signal, sys, time\n'
+                f'def bye(*_):\n    open({self.path(name + ".term")!r}, "w").close()\n    time.sleep(0.5)\n'
+                '    sys.exit(0)\n'
+                'signal.signal(signal.SIGTERM, bye)\n'
+                f'open({self.path(name + ".in")!r}, "w").write(str(os.getpid()))\n'
+                'while True: time.sleep(0.02)\n')
+
+    def ended(self, pid):
+        try:
+            with open(f'/proc/{pid}/stat') as f:
+                return f.read().rsplit(')', 1)[1].split()[0] == 'Z'
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+
+    def test_sigterm_stops_what_the_command_started_before_it_releases(self):
+        # SIGTERM to pool.py while its command (a wrapper: sh -c, a test script) runs a child that outlives it: is
+        # the server released while the child still runs? No: the whole group is stopped, and the claims released
+        # only once none of it runs.
+        code = f'import subprocess, sys\nsubprocess.call([sys.executable, "-c", {self.kid("kid")!r}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+        a = self.lane('one', '--server', 'api', '--alone', code=code)
+        self.wait_for(self.path('kid.in'))
+        with open(self.path('kid.in')) as f:
+            kid = int(f.read())
+        self.addCleanup(lambda: subprocess.run(['kill', '-9', str(kid)], capture_output=True))
+        a.send_signal(signal.SIGTERM)
+        rc, out = self.done(a)
+        self.assertEqual(rc, 128 + signal.SIGTERM, out)
+        self.assertTrue(self.ended(kid), 'released while what the command started runs')
+        self.assertTrue(os.path.exists(self.path('kid.term')))
+        self.assertEqual(claims.Claims(os.path.join(self.d, 'claims')).holders(), [])
+
+    def test_a_command_that_leaves_a_process_running_releases_once_it_ends(self):
+        # A command that exits but leaves a process of the lane running (a server started in the background): is the
+        # server released under it? No: it is stopped first.
+        code = (f'import subprocess, sys, os, time\np = subprocess.Popen([sys.executable, "-c", {self.kid("kid")!r}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+                f'while not os.path.exists({self.path("kid.in")!r}): time.sleep(0.02)\n')
+        rc, out = self.done(self.lane('one', '--server', 'api', '--alone', code=code))
+        self.assertEqual(rc, 0, out)
+        with open(self.path('kid.in')) as f:
+            kid = int(f.read())
+        self.addCleanup(lambda: subprocess.run(['kill', '-9', str(kid)], capture_output=True))
+        self.assertTrue(self.ended(kid), 'released while a process of the lane runs')
+        self.assertEqual(claims.Claims(os.path.join(self.d, 'claims')).holders(), [])
+
+    def test_a_lane_whose_input_is_a_terminal_leads_its_own_group(self):
+        # pool.py run from a script in a terminal (not the leader of its group): would its claims live as long as the
+        # caller's group? No: it leads its own group there too.
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        code = f'import os\nopen({self.path("pgrp")!r}, "w").write(str(os.getpgrp()))\n'
+        try:
+            a = self.lane('one', '--server', 'api', code=code, stdin=slave)
+        finally:
+            os.close(slave)
+        rc, out = self.done(a)
+        self.assertEqual(rc, 0, out)
+        with open(self.path('pgrp')) as f:
+            self.assertEqual(int(f.read()), a.pid)
+
+    def test_a_newer_release_claim_holds_only_its_server_while_it_lives(self):
+        # A claim a newer release wrote (on a host whose projects pin two releases): does it fail every lane at once,
+        # or hold a server once its holder is gone? No: a live one holds only its server (a lane that needs it waits,
+        # exit 75); a dead one is swept; a planted {"v": 2} holds nothing.
         folder = os.path.join(self.d, 'claims')
         os.makedirs(folder)
-        with open(os.path.join(folder, 'x' + claims.SUFFIX), 'w') as f:
-            json.dump({'v': claims.VERSION + 1, 'kind': 'claim', 'mode': 'alone', 'server': 'db-main',
-                       'holder': {'pid': 999999999, 'start': '1'}, 'since': 1.0}, f)
+
+        def plant(name, body):
+            with open(os.path.join(folder, name + claims.SUFFIX), 'w') as f:
+                f.write(json.dumps(body) if isinstance(body, dict) else body)
+            return os.path.join(folder, name + claims.SUFFIX)
+        claim = {'v': claims.VERSION + 1, 'kind': 'claim', 'mode': 'alone', 'server': 'db-main', 'since': 1.0}
+        live = plant('x', {**claim, 'holder': claims.me()})
         rc, out = self.done(self.lane('one', '--server', 'api'))
         self.assertEqual(rc, 0, out)
         rc, out = self.done(self.lane('two', '--server', 'db-main', wait='0'))
         self.assertEqual(rc, 75, out)
         self.assertIn('newer release', out)
-        self.assertTrue(os.path.exists(os.path.join(folder, 'x' + claims.SUFFIX)))   # never swept by this one
+        self.assertTrue(os.path.exists(live))
+        os.unlink(live)
+        dead = plant('y', {**claim, 'holder': {'pid': 999999999, 'start': '1'}})
+        planted = plant('z', '{"v": %d}' % (claims.VERSION + 1))
+        rc, out = self.done(self.lane('three', '--server', 'db-main', '--server', 'api', wait='0'))
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(dead))
+        self.assertTrue(os.path.exists(planted))   # (not this release's to judge: kept, holding nothing)
 
     def test_a_lane_records_its_peak_memory(self):
         self.assertEqual(self.done(self.lane('one', '--server', 'api', code='x = bytearray(30 << 20)'))[0], 0)
