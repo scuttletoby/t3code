@@ -37,11 +37,18 @@ check, since its check runs are named "<caller job> / ... / fork-ci-result", nev
 direct run (push, workflow_dispatch) passes only on the default branch: on any other branch its passing fork-ci-result
 would land on that branch's tip, which may be an open pull request's head that fork-checks never passed (#430).
 
+A head run (workflow_dispatch with HEAD_RUN=true: the head-runs reconciler of fork-kit/schedule-kick, which sends
+one for a trusted head with no run, #1157) on a branch other than the default one tests the run's own commit
+(GITHUB_SHA), and its fork-ci-result lands there. So it is judged like that pull request's own run: the one open
+pull request whose head is this branch of this repository gives PR_NUMBER and BASE_SHA (one API call, inside the
+cap), and fork-checks must have passed on GITHUB_SHA in a run of that pull request. No such pull request, or more
+than one: fail (#430). On the default branch a head run needs no check, like any direct run there.
+
 --copy is fork-checks.yml's own check job on a title or body edit: it ends as the newest real check of the head ended
 (see copy()), so a skipped job never stands as "passed" next to a red check from a base change (#1134).
 
 Environment: EVENT_NAME, HEAD_SHA, BASE_SHA, PR_NUMBER, OUTSIDE_PR (true/false), DEFAULT_BRANCH, GITHUB_REF,
-GITHUB_WORKFLOW_REF, GITHUB_TOKEN (actions: read), GITHUB_REPOSITORY, GITHUB_API_URL. Test: fork-checks-ran.test.py.
+GITHUB_WORKFLOW_REF, HEAD_RUN (true/false; a head run also reads GITHUB_SHA), GITHUB_TOKEN (actions: read), GITHUB_REPOSITORY, GITHUB_API_URL. Test: fork-checks-ran.test.py.
 """
 import http.client, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 
@@ -246,9 +253,48 @@ def not_a_pull_request(env, say):
     return 1
 
 
+def head_run_env(env, api, say):
+    """A head run on a branch: the env of that branch's one open pull request (PR_NUMBER, HEAD_SHA = the run's own
+    commit, BASE_SHA, OUTSIDE_PR false, EVENT_NAME pull_request), or an exit code."""
+    ref, repo, sha = env.get('GITHUB_REF', ''), env.get('GITHUB_REPOSITORY', ''), env.get('GITHUB_SHA', '')
+    branch = ref[len('refs/heads/'):] if ref.startswith('refs/heads/') else ''
+    if not branch or '/' not in repo or not SHA.fullmatch(sha):
+        say(f'::error::a head run needs a branch, the repository and its commit (GITHUB_REF {ref!r}, GITHUB_SHA '
+            f'{sha!r}): failing closed')
+        return 1
+    try:
+        prs = api.get('pulls?' + urllib.parse.urlencode({'state': 'open', 'head': f'{repo.split("/")[0]}:{branch}',
+                                                         'per_page': 100}))
+    except (Transient, Fatal) as e:
+        say(f'::error::a head run: cannot list the open pull requests of {branch} (failing closed): {e}. Re-run the '
+            'failed jobs of this run.')
+        return 1
+    mine = [p for p in prs if isinstance(p, dict) and isinstance(p.get('head'), dict)
+            and p['head'].get('ref') == branch and isinstance(p['head'].get('repo'), dict)
+            and p['head']['repo'].get('full_name') == repo and isinstance(p.get('base'), dict)
+            and isinstance(p['base'].get('sha'), str)] if isinstance(prs, list) else []
+    if len(mine) != 1:
+        say(f'::error::a head run on {branch}: {len(mine)} open pull requests from this repository have it as their '
+            f'head, so this run cannot be judged as one pull request\'s run, and its fork-ci-result would land on {sha} '
+            'unchecked (#430): it fails. Push again, or run Fork tests from the pull request.')
+        return 1
+    p = mine[0]
+    say(f'A head run of {sha} on {branch}: judged as pull request #{p["number"]}\'s run.')
+    return {**env, 'EVENT_NAME': 'pull_request', 'HEAD_SHA': sha, 'BASE_SHA': p['base']['sha'],
+            'PR_NUMBER': str(p['number']), 'OUTSIDE_PR': 'false'}
+
+
 def check(env, api, config, now=time.time, sleep=time.sleep, say=print):
     """config(base_sha) -> the fork_checks dict (base_config in the workflow); raises ConfigError."""
+    start = now()   # the cap counts the pull request lookup of a head run and the git calls that read the config
     event = env.get('EVENT_NAME', '')
+    if event == 'workflow_dispatch' and env.get('HEAD_RUN') == 'true' \
+            and env.get('GITHUB_REF', '') != f'refs/heads/{env.get("DEFAULT_BRANCH", "")}' \
+            and env.get('GITHUB_WORKFLOW_REF', '').split('@')[0] == f'{env.get("GITHUB_REPOSITORY", "")}/{TESTS_WORKFLOW}':
+        env = head_run_env(env, api, say)
+        if not isinstance(env, dict):
+            return env
+        event = 'pull_request'
     if event != 'pull_request':
         return not_a_pull_request(env, say)
     sha, base, outside = env.get('HEAD_SHA', ''), env.get('BASE_SHA', ''), env.get('OUTSIDE_PR', '')
@@ -268,7 +314,6 @@ def check(env, api, config, now=time.time, sleep=time.sleep, say=print):
         say('::error::outside pull request: fork-checks does not check it (its Outside pull request job fails); '
             'a maintainer must review')
         return 1
-    start = now()   # the cap counts the git calls that read the config
     try:
         cfg = config(base)
     except ConfigError as e:

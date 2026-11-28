@@ -98,7 +98,7 @@ export function standingOf(pace: InstancePace, nowMs: number): PaceStanding {
 }
 
 /** The same login counts once: two instances of one account share one set of limits. */
-function sameAccount(left: ServerProvider, right: ServerProvider): boolean {
+export function sameAccount(left: ServerProvider, right: ServerProvider): boolean {
   const a = providerAccountIdentity(left);
   const b = providerAccountIdentity(right);
   if (a === null || b === null || a.base !== b.base) return false;

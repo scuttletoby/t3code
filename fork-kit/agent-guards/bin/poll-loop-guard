@@ -1,7 +1,7 @@
 #!/usr/bin/python3 -IB
 """Claude Code PreToolUse hook (Bash): refuse a command that waits on CI, a pull request or a background job by
-sleeping and checking again. Part of fork-kit/agent-guards (README.md there: install, settings entry, the machine
-file's "agent-guards" section).
+sleeping and checking again, or a `pkill -f` that kills its own shell. Part of fork-kit/agent-guards (README.md
+there: install, settings entry, the machine file's "agent-guards" section).
 
 Why: agents spent about 39% of their tool time in wait loops they wrote themselves (`for i in $(seq 1 40); do grep
 -q DONE "$F" && break; sleep 30; done`, `while ! gh pr checks 12; do sleep 60; done`, `sleep 300; gh run view`).
@@ -28,6 +28,10 @@ a heredoc into a file, a comment; a quoted "#1150" is no comment). Shell text ha
 `sudo -u x bash -c`, `eval`, `bash <<EOF`, `cat <<EOF | bash`) is read the same way.
 Known gaps (misses, on purpose: a false refusal costs more): a count it cannot read (`$(seq 1 $N)`, `[ $n -lt $MAX
 ]`, C-style `for ((..))`) is one round; a script file it does not open; a loop built with a function.
+Also refuses (foreground or background: F7, 107 calls in two weeks) a `pkill -f P`, `kill $(pgrep -f P)` or `pgrep -f
+P | xargs kill` whose pattern also matches this command's text: the host runs the command as `bash -c '<text>'`, so
+that shell's command line matches too, pkill spares only itself, and the shell dies (exit 143/144, nothing after it
+runs). Lets through -x, -A (--ignore-ancestors), -v, -F, no -f, and a pattern from a variable (not read: a gap).
 Settings (machine file, pollLoop): enabled (default true), maxSleepSeconds (120), loopSleepSeconds (5).
 Fail open: a broken settings part, a lib that cannot load, broken input or its own error lets the command run, with
 one line saying so. Exit 2 (refuse) only answers a wait it found. Tests: fork-kit/agent-guards/tests/poll-loop.test.py
@@ -75,6 +79,63 @@ HEREDOC = re.compile(r'<<(-?)\s*(["\']?)([A-Za-z_][A-Za-z0-9_]*)\2')
 INTO_SHELL = re.compile(r'\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\b')
 COUNTER = re.compile(r'\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|[A-Za-z_][A-Za-z0-9_]*|-?\d+')
 DEPTH = 8
+# pkill/pgrep (procps): the options that take a value (short, then long without "=")
+KILL_SHORT_VALUE = set('gGPstuUFrqOd')
+KILL_LONG_VALUE = {'--signal', '--group', '--parent', '--pgroup', '--session', '--terminal', '--euid', '--uid',
+                   '--runstates', '--older', '--queue', '--ns', '--nslist', '--delimiter', '--cgroup', '--env',
+                   '--pidfile'}
+KILL_LONG_FLAG = {'--full': 'f', '--exact': 'x', '--ignore-ancestors': 'A', '--inverse': 'v', '--ignore-case': 'i'}
+SIGNALS = set('HUP INT QUIT ILL TRAP ABRT IOT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM STKFLT CHLD CONT STOP TSTP '
+              'TTIN TTOU URG XCPU XFSZ VTALRM PROF WINCH IO POLL PWR SYS'.split())
+POSIX_CLASSES = {'alpha': 'a-zA-Z', 'digit': '0-9', 'alnum': 'a-zA-Z0-9', 'upper': 'A-Z', 'lower': 'a-z',
+                 'space': r' \t\n\r\f\v', 'blank': r' \t', 'punct': r'!-/:-@\[-`{-~', 'xdigit': '0-9A-Fa-f',
+                 'word': r'\w', 'print': r' -~', 'graph': '!-~', 'cntrl': r'\x00-\x1f\x7f'}
+
+
+def kill_pattern(args):
+    """The -f pattern of a pkill/pgrep call that also matches the shell running it, as text, or None: no -f, no
+    pattern, a pattern from a variable, or -x/-A/-v/-F (these do not match their own shell the same way)."""
+    flags, pattern, args = set(), None, list(args)
+    if args and (args[0][1:].isdigit() or args[0][1:].upper().removeprefix('SIG') in SIGNALS) and args[0][:1] == '-':
+        args.pop(0)                                    # pkill -9 / -KILL / -SIGTERM
+    while args:
+        a = args.pop(0)
+        if a == '--':
+            pattern = pattern if pattern is not None else (args[0] if args else None)
+            break
+        if a.startswith('--'):
+            name = a.partition('=')[0]
+            flags.add(KILL_LONG_FLAG.get(name, ''))
+            if name == '--pidfile':
+                flags.add('F')
+            if name in KILL_LONG_VALUE and '=' not in a and args:
+                args.pop(0)
+        elif a.startswith('-') and len(a) > 1:
+            for k, c in enumerate(a[1:]):
+                flags.add(c)
+                if c in KILL_SHORT_VALUE:
+                    if k + 2 == len(a) and args:
+                        args.pop(0)
+                    break
+        elif pattern is None:
+            pattern = a
+    if 'f' not in flags or flags & {'x', 'A', 'v', 'F'} or not pattern or re.search(r'\$[\w{(@*#?!-]', pattern):
+        return None
+    return pattern, 'i' in flags
+
+
+def matches_own_shell(pattern, ignore_case, command):
+    """True when the ERE also matches the command line of the shell that runs this command: `bash -c '<text>'`
+    (the host hands the text to a shell; a quote in it may come out as '\\'')."""
+    import warnings
+    ere = re.sub(r'\[:(\w+):\]', lambda m: POSIX_CLASSES.get(m.group(1), m.group(0)), pattern)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            rx = re.compile(ere, re.S | (re.I if ignore_case else 0))
+    except (re.error, RecursionError, OverflowError):
+        return False                                    # a pattern we cannot read: not ours to judge
+    return any(rx.search(f'/bin/bash -c {text} ;') for text in (command, command.replace("'", "'\\''")))
 
 
 def strip_heredocs(text):
@@ -212,10 +273,14 @@ class Reading:
     counts), or a check after top-level sleeps. A check elsewhere in the command (an `ls` before a retry loop, a
     `cat` of its log after it) does not make a retry loop a wait."""
 
-    def __init__(self, settings):
+    def __init__(self, settings, text=''):
         self.s = settings
+        self.text = text       # the whole command: the shell that runs it has this on its command line
         self.found = []        # (what it checks, why it is a wait, 'ci' or 'local')
         self.watch = []
+        self.kills = []        # the pkill/pgrep calls that also kill the shell running them
+        self.prev = None       # the command before this one (`pgrep -f x | xargs kill`)
+        self.into_kill = 0     # inside `kill $(...)`
         self.top_slept = 0.0   # the plain sleeps at the top so far (not inside a loop)
         self.stack = [frame('top')]
 
@@ -339,6 +404,11 @@ class Reading:
         up['ci'] += f['ci']
         up['local'] += f['local']
 
+    def _self_kill(self, word, args, tail=''):
+        found = kill_pattern(args)
+        if found and matches_own_shell(*found, self.text):
+            self.kills.append((f'{word} -f {shlex.quote(found[0])}{tail}', found[0]))
+
     def _command(self, word, args, piped, depth):
         """Notes the sleep and the checks of one simple command, and reads text it hands to a shell."""
         while word in WRAPPERS:
@@ -354,11 +424,21 @@ class Reading:
             if not args:
                 return
             word, args = os.path.basename(args[0]), args[1:]
+        prev, kills = self.prev, word == 'kill' and not {'-0', '-s0', '--signal=0'} & set(args)
         if word not in SHELLS and word not in ('eval', 'watch'):
+            self.into_kill += kills                # kill $(pgrep -f x): that pgrep feeds a kill
             for a in args:                         # [ "$(gh pr view 5 -q .state)" = OPEN ]: its inside runs too
                 if '$(' in a:
                     for inner in substitutions(a):
                         self.read(inner, depth + 1)
+            self.into_kill -= kills
+        self.prev = (word, args)
+        fed = prev and prev[0] == 'kill' and prev[1][-1:] == ['$'] and not {'-0', '-s0'} & set(prev[1])
+        if word == 'pkill' or (word == 'pgrep' and (self.into_kill or fed)):   # kill "$(pgrep ..)" / kill $(pgrep ..)
+            self._self_kill(word, args)
+        elif word == 'xargs' and piped and prev and prev[0] == 'pgrep' and \
+                any(os.path.basename(a) == 'kill' for a in args) and '-0' not in args:
+            self._self_kill('pgrep', prev[1], ' | xargs kill')
         if word == 'sleep':
             self._sleep(sum(seconds(a, self.s['loopSleepSeconds']) for a in args if not a.startswith('-')) or 0)
         elif word in SHELLS:
@@ -408,10 +488,16 @@ class Reading:
             self._check('local', word)
 
 
-def verdict(command, settings):
-    """None, or (what it checks, why it counts as a wait, 'ci' or 'local')."""
-    r = Reading(settings)
+def verdict(command, settings, background=False):
+    """None, or (what it checks, why it counts as a wait, 'ci' or 'local'), or (the call, its pattern, 'kill') for a
+    pkill/pgrep that kills its own shell. A background command is only checked for that (the host wakes the agent
+    when it ends, so a wait there is fine; a self-kill is not)."""
+    r = Reading(settings, command)
     r.read(command)
+    if r.kills:
+        return r.kills[0][0], r.kills[0][1], 'kill'
+    if background:
+        return None
     if r.watch:
         return ', '.join(sorted(set(r.watch))), 'it waits for CI to finish', 'ci'
     if not r.found:
@@ -420,6 +506,12 @@ def verdict(command, settings):
 
 
 def reason(what, why, kind, settings):
+    if kind == 'kill':
+        return (f'Refused by {NAME}: `{what}` also matches the shell that runs this command (its command line holds '
+                'this text), so it kills that shell: exit 143/144 and nothing after it runs. Make the pattern miss its '
+                "own text: bracket one letter (`pkill -f '[v]itest run'`, and don't name the process elsewhere in "
+                'the same command), or kill by PID (`kill "$(cat run.pid)"`). Not refused: -x, -A '
+                '(--ignore-ancestors), -F, or a pattern from a variable.')
     way = ('To wait for CI or a pull request: push and stop (or watch_pull_request); you are told when it ends.'
            if kind == 'ci' else
            'To wait for a job, a file or a process: run the job with run_in_background and wait with '
@@ -473,10 +565,10 @@ def main(argv=None):
             return 0
         ti = event.get('tool_input') or {}
         command = ti.get('command')
-        if not isinstance(command, str) or ti.get('run_in_background') is True:
+        if not isinstance(command, str):
             return 0
         try:
-            found = verdict(command, settings)
+            found = verdict(command, settings, ti.get('run_in_background') is True)
         except ValueError:   # text a shell reader cannot split (an open quote): not ours to judge
             return 0
     except BaseException as e:   # noqa: BLE001 - fail open: this guards a habit, not an attack

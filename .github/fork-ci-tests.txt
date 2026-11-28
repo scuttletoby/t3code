@@ -51,7 +51,7 @@
 .github/scripts/fork-fleet-desk-key.test.py ~10s unittest
 .github/scripts/fork-fleet-desk-seed.test.py ~34s unittest
 .github/scripts/fork-fleet-desk.test.py ~9s unittest
-.github/scripts/fork-fleet.test.py ~136s unittest
+.github/scripts/fork-fleet.test.py ~141s unittest
 .github/scripts/fork-fleet-refresh.test.py ~59s unittest
 .github/scripts/fork-fleet-walls.test.py ~71s unittest
 .github/scripts/fork-fleet-walls-contract.test.py ~96s unittest
@@ -68,12 +68,14 @@
 .github/scripts/fork-changes-list.test.cjs
 .github/scripts/fork-release-workflow.test.py ok lines
 .github/scripts/fork-release.test.sh ~5s
+.github/scripts/fork-release-downloads.test.py ~8s unittest
 .github/scripts/fork-run-alert.test.sh
 .github/scripts/fork-reusable-permissions.test.py ok lines
 .github/scripts/fork-schema-check.test.cjs ~6s
 .github/scripts/fork-seam-check.test.cjs ~23s
 .github/scripts/fork-temp-files.test.sh
 .github/scripts/fork-secret-scan.test.sh run by .github/workflows/fork-secret-scan.yml
+.github/scripts/fork-test-seconds.test.cjs
 .github/scripts/fork-test-shards.test.cjs
 .github/scripts/fork-tests-drift.test.cjs
 .github/scripts/fork-upstream-files-check.test.cjs
@@ -113,6 +115,7 @@ fork-kit/agent-guards/tests/config.test.py unittest
 fork-kit/agent-guards/tests/facts.test.py unittest
 fork-kit/agent-guards/tests/fast.test.py ~25s unittest
 fork-kit/agent-guards/tests/install.test.py ~20s unittest
+fork-kit/agent-guards/tests/lens-packet.test.py unittest
 fork-kit/agent-guards/tests/memory-index.test.py unittest
 fork-kit/agent-guards/tests/poll-loop.test.py unittest
 fork-kit/agent-guards/tests/read-size.test.py unittest
@@ -161,6 +164,8 @@ fork-kit/heavy/tests/queue.test.py ~18s unittest
 fork-kit/heavy/tests/sweep.test.py ~37s unittest
 # A real systemd user manager (the step starts one for the runner user).
 fork-kit/heavy/tests/heavy.test.py run by .github/workflows/fork-tests.yml unittest
+fork-kit/homelab/tests/check.test.py unittest
+fork-kit/homelab/tests/lease.test.py unittest
 fork-kit/model-guard/tests/guard.test.py unittest
 fork-kit/model-guard/tests/install.test.py ~21s unittest
 fork-kit/pc-agents/tests/check.test.py ~32s unittest
@@ -170,9 +175,12 @@ fork-kit/pc-agents/tests/update.test.py ~66s unittest
 fork-kit/placement-facts/tests/scripts.test.py unittest
 fork-kit/review/tests/comments.test.py unittest
 fork-kit/review/tests/eval.test.py unittest
+fork-kit/review/tests/packet.test.py unittest
 fork-kit/review/tests/plan.test.py unittest
 fork-kit/schedule-kick/tests/cron.test.py unittest
+fork-kit/schedule-kick/tests/heads.test.py unittest
 fork-kit/schedule-kick/tests/install.test.py unittest
+fork-kit/schedule-kick/tests/keepon.test.py unittest
 fork-kit/schedule-kick/tests/kick.test.py unittest
 fork-kit/schedule-kick/tests/late.test.py unittest
 fork-kit/slot-filler/tests/filler.test.py unittest

@@ -16,6 +16,7 @@ rounds, what happens to minors, the state question) and requiring the `state:` l
 No state: every run reads the files again, so the same input gives the same output. A missing, empty, old or broken
 file gives a plain message and exit 2, never a traceback.
 """
+import fnmatch
 import glob
 import json
 import os
@@ -87,13 +88,20 @@ def _runner_problem(v, where, forbidden):
     return None
 
 
-def load_settings(root, path=None):
-    """(settings, note). The project's kit settings over DEFAULTS; no file: DEFAULTS, and the note says so. Problem for an
-    empty file, a file that is not a JSON object, a newer or unknown version, an unknown key or a wrong value (every
-    problem named at once)."""
+def load_settings(root, path=None, base=None):
+    """(settings, note). The project's kit settings over DEFAULTS; no file: DEFAULTS, and the note says so. Read from
+    the commit `base` (a full sha) with git when given, as load_queue_config reads the queue config, else from the file.
+    Problem for an empty file, a file that is not a JSON object or not UTF-8, a newer or unknown version, an unknown key
+    or a wrong value (every problem named at once)."""
     rel = path or SETTINGS
-    full = os.path.join(root, rel)
-    text = read_text(full, 'the kit settings')
+    if base:
+        data = base_file(root, base, rel)
+        try:
+            text = None if data is None else data.decode('utf-8')
+        except UnicodeDecodeError:
+            raise Problem(f'the kit settings {rel} at {base[:12]} are not UTF-8 text') from None
+    else:
+        text = read_text(os.path.join(root, rel), 'the kit settings')
     if text is None:
         if path:
             raise Problem(f'the kit settings {rel} do not exist (given with --settings)')
@@ -168,9 +176,17 @@ def base_file(root, base, rel):
     return r.stdout
 
 
-def other_settings(root):
+def other_settings(root, base=None):
     """Files in `.github` named like kit settings under another name (the fork's `fork-review-kit.json`): the plan
-    names them when it found no settings and no queue config, as the likely missing --settings."""
+    names them when it found no settings and no queue config, as the likely missing --settings. With `base` (a full
+    sha), the files of that commit's `.github`, read with git."""
+    if base:
+        r = subprocess.run(['git', '-C', root, 'ls-tree', '-z', '--name-only', '--full-tree', base, '--', '.github/'],
+                           capture_output=True)
+        if r.returncode != 0:
+            raise Problem(f'git cannot read the tree of {base[:12]} in {root}: {_git_said(r)}')
+        names = [os.fsdecode(n) for n in r.stdout.split(b'\0') if n]
+        return sorted(n for n in names if fnmatch.fnmatchcase(n, '.github/*review-kit*.json') and n != SETTINGS)
     found = glob.glob(os.path.join(glob.escape(os.path.join(root, '.github')), '*review-kit*.json'))
     return sorted(os.path.relpath(f, root) for f in found if os.path.relpath(f, root) != SETTINGS)
 

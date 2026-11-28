@@ -693,6 +693,7 @@ describe("__fork-report on old, newer and empty state", () => {
       agentSlots: "off",
       waitFor: "off",
       usagePacingGate: "off",
+      accountOrder: "off",
       automaticUpdates: "off",
       reviewRules: "off",
       handoff: "off",
@@ -1489,6 +1490,7 @@ describe("__fork-report contract", () => {
       "settings",
     ]);
     expect(keys(report.fork.features)).toEqual([
+      "accountOrder",
       "activityProbe",
       "agentSlots",
       "automaticUpdates",
@@ -1502,6 +1504,7 @@ describe("__fork-report contract", () => {
     ]);
     expect(keys(report.fork.settings)).toEqual(
       [
+        "accountOrder",
         "activityProbe",
         "agentSlots",
         "automaticUpdates",

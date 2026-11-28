@@ -1,0 +1,5 @@
+- Change: Design notes: host tools (agents on a person's own computer).
+- Why: Design for review; no code yet.
+- Setting: none
+- Default: -
+- PR: [#26](https://github.com/scuttletoby/t3code/pull/26)

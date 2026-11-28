@@ -72,6 +72,16 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     scope: "environment-defaults",
   },
   {
+    id: "usage-pacing-account-order",
+    title: "Account order",
+    to: FORK_PAGE,
+    searchTerms: [
+      "accountOrder account failover fallback next account limit spent out of usage order provider",
+    ],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
     id: "usage-pacing",
     title: "Share of each plan kept for you",
     to: FORK_PAGE,
@@ -183,7 +193,7 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     id: "playtest",
     title: "Let agents run playtests",
     to: FORK_PAGE,
-    searchTerms: ["playtest test target staging round adapter"],
+    searchTerms: ["playtest test target staging round adapter chip end session"],
     environmentOnly: true,
     scope: "project-defaults",
   },
@@ -266,6 +276,13 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["finished child grace seconds stop process"],
     environmentOnly: true,
     scope: "environment-defaults",
+  },
+  {
+    id: "work-panel",
+    title: "Work panel",
+    to: FORK_PAGE,
+    searchTerms: ["work panel workPanelEnabled ci checks queue runs side panel capacity"],
+    environmentOnly: true,
   },
   {
     id: "assistant",

@@ -1187,11 +1187,12 @@ echo "read=found" >> "${GITHUB_OUTPUT:?}"
 echo "::notice title=Secret scan::the sweep's record from run $from: $(($(wc -l < "$dir/deleted-tips") - 1)) deleted tip(s) a scan read"
 '''
 RECORD_STEPS = {
-    "read": {"id": "read", "if": "${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}",
+    "read": {"id": "read",
+             "if": "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && !inputs.head_ref }}",
              "env": {"GH_TOKEN": "${{ github.token }}", "RESET": "${{ inputs.reset_record }}"},
              "run": READ_RECORD_TEXT},
     "keep": {"if": "${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') "
-                   "&& startsWith(github.ref, 'refs/heads/') "
+                   "&& !inputs.head_ref && startsWith(github.ref, 'refs/heads/') "
                    "&& (steps.scan.outputs.record == 'written' || steps.read.outputs.read == 'reset') }}",
              "uses": f"actions/upload-artifact@{UPLOAD_SHA}",
              "with": {"name": "fork-secret-sweep-record", "path": "${{ runner.temp }}/sweep-record/deleted-tips",
@@ -1575,7 +1576,7 @@ def lookup_problems(scan):
             if len(re.findall(r"\bOLD_HEADS\b", run)) != want:
                 problems.append(f"{SCAN_FILE}/{j}: OLD_HEADS is set or used outside the lookups")
             env = step.get("env") or {}
-            if env.get("HEAD_REF") != "${{ github.event.pull_request.head.ref }}":
+            if env.get("HEAD_REF") != "${{ github.event.pull_request.head.ref || inputs.head_ref }}":
                 problems.append(f"{SCAN_FILE}/{j}: HEAD_REF is not the pull request's branch")
             if env.get("LOOKUP_TOKEN") != "${{ github.token }}":
                 problems.append(f"{SCAN_FILE}/{j}: LOOKUP_TOKEN is not the job's token")
@@ -5001,6 +5002,7 @@ POLICY_ENV = {
     "PR_NUMBER": "${{ github.event.pull_request.number }}",
     "OUTSIDE_PR": "${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}",
     "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+    "HEAD_RUN": "${{ inputs.head == true }}",
     "GITHUB_TOKEN": "${{ github.token }}",
 }
 POLICY_CHECKOUT_ENV = {"REF": "${{ github.sha }}", "HISTORY": "tip", "SPARSE": "/.github/scripts/"}
@@ -5032,8 +5034,9 @@ def policy_job_problems(job, fc, limits=POLICY_LIMITS):
         problems.append(f"{where} has keys {sorted(set(job))}, not {sorted(POLICY_JOB_KEYS)} (continue-on-error, needs, env ...)")
     if expression(job.get("if", "")) != PR_GUARD:
         problems.append(f"{where}: if: is not the pull request guard alone")
-    if job.get("permissions") != {"actions": "read", "contents": "read"}:
-        problems.append(f"{where}: permissions are not exactly actions: read, contents: read")
+    if job.get("permissions") != {"actions": "read", "contents": "read", "pull-requests": "read"}:
+        problems.append(f"{where}: permissions are not exactly actions: read, contents: read, pull-requests: read "
+                        "(a head run's pull request lookup)")
     steps_ = job.get("steps") or []
     checkout_minutes = None
     if len(steps_) != 2:
@@ -5389,6 +5392,116 @@ for label, conc in {
     else:
         wf["concurrency"] = conc
     check(f"tests-concurrency: {label} fails", bool(tests_concurrency_problems(wf)))
+
+# --- head-run (#1157) -----------------------------------------------------------------------------
+# A head run (workflow_dispatch with head=true, fork-kit/schedule-kick's heads) on a pull request's branch must never be
+# weaker than that pull request's own run, since its fork-ci-result lands on the same head: it tests the pull request's
+# merge commit (whose head parent is the run's commit), scans for secrets as that pull request's run (head_ref), runs
+# the macOS lint, and checks the fork lines in upstream files on that merge commit (`workflows`, depth 2: its first
+# parent is the base). On main it is a release run of main's tip.
+HEAD_RUN_EXPR = "${{ inputs.head == true }}"
+SECRETS_IF = ("${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && "
+              "(inputs.ref == '' || (inputs.head && github.ref_name != github.event.repository.default_branch)) }}")
+# fork_ci_result lets `secrets` skip only in a release run: never in a head run on a pull request's branch, where
+# SECRETS_IF runs it (so a skip there is no reason to pass).
+RESULT_RELEASE = "${{ inputs.ref != '' && !(inputs.head && github.ref_name != github.event.repository.default_branch) }}"
+SEAM_STEP = "Fork lines in upstream files"
+SEAM_IF = "${{ github.event_name == 'pull_request' || (inputs.head && github.ref_name != github.event.repository.default_branch) }}"
+SEAM_RUN = "node .github/scripts/fork-seam-check.cjs --no-upstream HEAD^1 HEAD"
+
+
+def head_run_problems(tests, scan):
+    problems, jobs = [], tests.get("jobs") or {}
+    dispatch = ((tests.get(True) or tests.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {}
+    if (dispatch.get("head") or {}).get("type") != "boolean" or (dispatch.get("head") or {}).get("default") is not False:
+        problems.append("fork-tests.yml: no workflow_dispatch input head (boolean, default false)")
+    changes = jobs.get("changes") or {}
+    if (changes.get("permissions") or {}) != {"contents": "read", "pull-requests": "read"}:
+        problems.append("fork-tests.yml: changes: permissions are not exactly contents: read, pull-requests: read")
+    steps = {st.get("id") or st.get("name"): st for st in changes.get("steps") or []}
+    resolve, release = steps.get("resolve") or {}, steps.get("release") or {}
+    run = resolve.get("run") or ""
+    if (resolve.get("env") or {}).get("HEAD_RUN") != HEAD_RUN_EXPR or (resolve.get("env") or {}).get("RUN_SHA") \
+            != "${{ github.sha }}":
+        problems.append("fork-tests.yml: changes/resolve: HEAD_RUN or RUN_SHA is not the pinned expression")
+    for need, why in (('"+refs/pull/${prs[0]}/merge:', "fetches the pull request's merge commit"),
+                      ('if (( ${#prs[@]} != 1 )); then', "needs exactly one open pull request"),
+                      ('[[ "$(git rev-parse "$merge^2")" != "$RUN_SHA" ]]', "checks the merge commit is for this head"),
+                      ("sha=$merge\n", "tests the merge commit"),
+                      ("select(.head.repo.full_name == env.GITHUB_REPOSITORY and .head.ref == env.BRANCH)",
+                       "takes this repository's pull requests of this branch only")):
+        if need not in run:
+            problems.append(f"fork-tests.yml: changes/resolve no longer {why} in a head run")
+    if (release.get("env") or {}).get("HEAD_RUN") != HEAD_RUN_EXPR \
+            or 'echo "mobile_native=$HEAD_RUN" >> "$GITHUB_OUTPUT"' not in (release.get("run") or ""):
+        problems.append("fork-tests.yml: changes/release: a head run does not run the macOS lint")
+    secrets = jobs.get("secrets") or {}
+    if secrets.get("if") != SECRETS_IF or (secrets.get("with") or {}).get("head_ref") \
+            != "${{ inputs.head && github.ref_name || '' }}":
+        problems.append("fork-tests.yml: secrets: a head run on a pull request's branch does not scan as its run")
+    result = next((st for st in (jobs.get("fork_ci_result") or {}).get("steps") or []
+                   if st.get("name") == "Require every job to pass"), {})
+    if (result.get("env") or {}).get("RELEASE_RUN") != RESULT_RELEASE:
+        problems.append("fork-tests.yml: fork_ci_result: a head run on a pull request's branch may skip the secret scan")
+    wf_steps = (jobs.get("workflows") or {}).get("steps") or []
+    seam = next((st for st in wf_steps if st.get("name") == SEAM_STEP), {})
+    checkout = next((st for st in wf_steps if st.get("name") == "Checkout"), {})
+    if seam.get("if") != SEAM_IF or seam.get("run") != SEAM_RUN \
+            or (checkout.get("with") or {}).get("ref") != "${{ needs.changes.outputs.sha }}" \
+            or (checkout.get("with") or {}).get("fetch-depth") != 2:
+        problems.append("fork-tests.yml: workflows: a head run on a pull request's branch does not check the fork lines "
+                        "in upstream files on its merge commit")
+    scan_inputs = ((scan.get(True) or scan.get("on") or {}).get("workflow_call") or {}).get("inputs") or {}
+    if (scan_inputs.get("head_ref") or {}).get("default") != "":
+        problems.append("fork-secret-scan.yml: no workflow_call input head_ref (default empty)")
+    for job in (scan.get("jobs") or {}).values():
+        for st in job.get("steps") or []:
+            if st.get("id") == "scan":
+                env = st.get("env") or {}
+                if env.get("EVENT_NAME") != "${{ inputs.head_ref && 'pull_request' || github.event_name }}" \
+                        or env.get("HEAD_SHA") != "${{ github.event.pull_request.head.sha || (inputs.head_ref && github.sha) || '' }}":
+                    problems.append("fork-secret-scan.yml: the scan step does not take a head run as a pull request's")
+    return problems
+
+
+problems = head_run_problems(real.get("fork-tests.yml", {}), real.get("fork-secret-scan.yml", {}))
+check("head-run: a head run on a pull request branch tests its merge commit, scans as its run and runs the macOS lint",
+      not problems, "; ".join(problems))
+
+
+def _head_run_mutation(edit):
+    tests, scan = copy.deepcopy(real.get("fork-tests.yml", {})), copy.deepcopy(real.get("fork-secret-scan.yml", {}))
+    steps = {st.get("id"): st for st in tests["jobs"]["changes"]["steps"] if st.get("id")}
+    edit(tests, scan, steps)
+    return head_run_problems(tests, scan)
+
+
+for label, edit in {
+    "a head run that tests the head, not the merge commit": lambda t, s, st: st["resolve"].__setitem__(
+        "run", st["resolve"]["run"].replace("sha=$merge\n", "\n")),
+    "a head run that skips the macOS lint (ac72a7c)": lambda t, s, st: st["release"].__setitem__(
+        "run", st["release"]["run"].replace("mobile_native=$HEAD_RUN", "mobile_native=false")),
+    "a head run that skips the secret scan (ac72a7c)": lambda t, s, st: t["jobs"]["secrets"].__setitem__(
+        "if", t["jobs"]["secrets"]["if"].replace(" || (inputs.head && github.ref_name != "
+                                                  "github.event.repository.default_branch)", "")),
+    "a fork_ci_result that lets a head run skip the scan": lambda t, s, st: [
+        x.get("env", {}).__setitem__("RELEASE_RUN", "${{ inputs.ref != '' }}")
+        for x in t["jobs"]["fork_ci_result"]["steps"] if x.get("name") == "Require every job to pass"],
+    "a head run that skips the fork lines in upstream files": lambda t, s, st: [
+        x.__setitem__("if", "${{ github.event_name == 'pull_request' }}")
+        for x in t["jobs"]["workflows"]["steps"] if x.get("name") == SEAM_STEP],
+    "a head run's fork lines checked on a shallower checkout": lambda t, s, st: [
+        x["with"].__setitem__("fetch-depth", 1) for x in t["jobs"]["workflows"]["steps"] if x.get("name") == "Checkout"],
+    "a head run's scan as a sweep": lambda t, s, st: [
+        x.get("env", {}).__setitem__("EVENT_NAME", "${{ github.event_name }}")
+        for j in s["jobs"].values() for x in j.get("steps") or [] if x.get("id") == "scan"],
+    "a merge commit of another head": lambda t, s, st: st["resolve"].__setitem__(
+        "run", st["resolve"]["run"].replace('[[ "$(git rev-parse "$merge^2")" != "$RUN_SHA" ]]', "false")),
+    "any pull request of the branch": lambda t, s, st: st["resolve"].__setitem__(
+        "run", st["resolve"]["run"].replace("select(.head.repo.full_name == env.GITHUB_REPOSITORY and "
+                                            ".head.ref == env.BRANCH)", "select(true)")),
+}.items():
+    check(f"head-run: {label} fails", bool(_head_run_mutation(edit)))
 
 # --- checks-edited (#1090, #1134) ----------------------------------------------------------------
 # fork-checks.yml: on a title or body edit (base unchanged) the check job still runs, but only its first step, which

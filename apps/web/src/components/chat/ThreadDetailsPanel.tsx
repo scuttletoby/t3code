@@ -26,6 +26,7 @@ import { OpenInPicker } from "./OpenInPicker";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
 import { ThreadAutomationsPanel } from "./ThreadAutomationsPanel";
 import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
+import { ForkWorkPanel } from "../fork/workPanel/ForkWorkPanel"; // Fork (work panel)
 import { ThreadRepositorySections } from "./ThreadRepositorySections";
 import { ThreadServersPanel } from "./ThreadServersPanel";
 import {
@@ -326,6 +327,8 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   showSideChats={visible.sideChats}
                 />
               ) : null}
+
+              <ForkWorkPanel {...props} density={density} />
 
               {visible.usage ? <ThreadDetailsUsage {...props.usage} /> : null}
 

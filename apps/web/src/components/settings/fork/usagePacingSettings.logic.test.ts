@@ -3,6 +3,10 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  accountOrderAddable,
+  accountOrderRows,
+  accountOrderSummary,
+  moveInAccountOrder,
   burnFirstWindowsAfterToggle,
   formatLowerEffort,
   knownEffortLevels,
@@ -160,5 +164,40 @@ describe("lower effort field", () => {
     ]);
     expect(parseLowerEffort("deep=high", known)).toEqual({ value: { deep: "high" } });
     expect(parseLowerEffort("plan=high", known)).toHaveProperty("error");
+  });
+});
+
+describe("account order", () => {
+  const id = (value: string) => value as ProviderInstanceId;
+  const providers = [
+    { instanceId: id("claude_a"), displayName: "Claude A" },
+    { instanceId: id("claude_b") },
+    { instanceId: id("claude_c"), displayName: "Claude C" },
+  ];
+
+  it("lists the order by display name and marks an account the server no longer has", () => {
+    const rows = accountOrderRows(providers, [id("claude_b"), id("gone"), id("claude_a")]);
+    expect(rows).toEqual([
+      { instanceId: "claude_b", label: "claude_b", known: true },
+      { instanceId: "gone", label: "gone", known: false },
+      { instanceId: "claude_a", label: "Claude A", known: true },
+    ]);
+    expect(accountOrderSummary(rows)).toBe("First claude_b, then gone, then Claude A");
+    expect(accountOrderSummary([])).toBe("Off");
+  });
+
+  it("offers only accounts not in the order yet, once each", () => {
+    expect(accountOrderAddable([...providers, providers[2]!], [id("claude_a")])).toEqual([
+      { instanceId: "claude_b", label: "claude_b" },
+      { instanceId: "claude_c", label: "Claude C" },
+    ]);
+  });
+
+  it("moves one entry up or down, and leaves the ends as they are", () => {
+    const order = [id("claude_a"), id("claude_b"), id("claude_c")];
+    expect(moveInAccountOrder(order, 1, -1)).toEqual(["claude_b", "claude_a", "claude_c"]);
+    expect(moveInAccountOrder(order, 1, 1)).toEqual(["claude_a", "claude_c", "claude_b"]);
+    expect(moveInAccountOrder(order, 0, -1)).toBe(order);
+    expect(moveInAccountOrder(order, 2, 1)).toBe(order);
   });
 });

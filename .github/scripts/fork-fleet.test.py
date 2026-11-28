@@ -1582,12 +1582,12 @@ class Launcher(unittest.TestCase):
                        'printf "%s\\0" "$@" > "$REC/systemd-run.0"\n'
                        'for a in "$@"; do case $a in EnvironmentFile=*) f=${a#EnvironmentFile=}; '
                        'cp -- "$f" "$REC/env"; stat -c %a -- "$f" > "$REC/env-mode" ;; esac; done\n'
-                       # check-net's probe (--wait): prints $REC/probe-out and exits $REC/probe-exit when that file
-                       # exists, else runs here.
-                       'if [[ " $* " == *" --wait "* ]]; then a=("$@"); for i in "${!a[@]}"; do '
-                       '[[ ${a[i]} != --unit ]] || cp -- "$REC/systemd-run.0" "$REC/${a[i+1]}.0"; done; '
-                       '[[ ! -e $REC/probe-exit ]] || { cat -- "$REC/probe-out" 2>/dev/null; '
-                       'exit "$(cat "$REC/probe-exit")"; }; '
+                       # check-net's probes (--wait): each prints $REC/probe-out and exits $REC/probe-exit-UNIT, or
+                       # $REC/probe-exit, when that file exists, else runs here.
+                       'if [[ " $* " == *" --wait "* ]]; then a=("$@"); u=; for i in "${!a[@]}"; do '
+                       '[[ ${a[i]} != --unit ]] || { u=${a[i+1]}; cp -- "$REC/systemd-run.0" "$REC/$u.0"; }; done; '
+                       'e=$REC/probe-exit; [[ ! -e $REC/probe-exit-$u ]] || e=$REC/probe-exit-$u; '
+                       '[[ ! -e $e ]] || { cat -- "$REC/probe-out" 2>/dev/null; exit "$(cat "$e")"; }; '
                        'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"; fi\n'
                        'code=$(cat "$REC/systemd-run-exit" 2>/dev/null || echo 0)\n'
                        'if [[ $code == 0 ]]; then while (($#)); do case $1 in --unit) unit=$2 ;; --uid) user=$2 ;; '
@@ -1738,13 +1738,15 @@ class Launcher(unittest.TestCase):
         except FileNotFoundError:
             return None
 
-    def sandbox(self, user, root, rw=''):
-        """The unit's sandbox, start's and check-net's alike: its own network namespace, the private ranges refused in
-        the kernel too, of this host's files only the allow list (job_fs: its own root, the system paths read-only
+    def sandbox(self, user, root, rw='', own=True):
+        """The unit's sandbox, start's and check-net's alike: its own network namespace, the private ranges (and this
+        host's own public address, but in check-net's probe of the nft table alone: own=False) refused in the kernel
+        too, of this host's files only the allow list (job_fs: its own root, the system paths read-only
         and one mount each, its copy, no mount of the host's later), its own /run, /dev/shm, /tmp and /var/tmp (so
         root never cleans a shared one), no /home, no other user's processes, its own IPC, only the pseudo devices,
         and the walls (no AF_VSOCK, io_uring or 32-bit system calls)."""
-        props = (f'NetworkNamespacePath=/run/netns/fork-fleet-{user}', f'IPAddressDeny={self.PRIVATE4} {self.OWN} ::/0',
+        deny = f'{self.PRIVATE4} {self.OWN} ::/0' if own else f'{self.PRIVATE4} ::/0'
+        props = (f'NetworkNamespacePath=/run/netns/fork-fleet-{user}', f'IPAddressDeny={deny}',
                  'IPAddressAllow=localhost', f'RootDirectory={root}', 'MountAPIVFS=yes', 'MountFlags=private',
                  'BindReadOnlyPaths=' + ' '.join(f'{os.path.realpath(p)}:{p}:norbind' for p in self.allowed()),
                  *([f'BindPaths={rw}:{rw}:norbind'] if rw else []),
@@ -3415,7 +3417,19 @@ class Launcher(unittest.TestCase):
                                        '-p', 'RuntimeMaxSec=120'])
         self.assertEqual(args[dash + 1:dash + 4], ['/bin/bash', '--norc', '--noprofile'])
         self.assertEqual(args[dash + 4], '-c')
-        self.assertEqual(args[dash + 6:], ['check-net', 'https://example.com/', self.OWN, '127.0.0.1', str(port)])
+        self.assertEqual(args[dash + 6:], ['check-net', 'https://example.com/', self.OWN, 'refused', '127.0.0.1',
+                                           str(port)])
+        # The own-address probe: the same sandbox but this host's own address left out of IPAddressDeny (the nft
+        # table alone), run first: the probe above takes no answer from it as closed only after this one passed.
+        args = self.waited('fork-fleet-check-own')
+        dash = args.index('--')
+        self.assertEqual(args[:dash], ['--quiet', '--wait', '--pipe', '--collect', '--unit', 'fork-fleet-check-own',
+                                       '--uid', 'nobody',
+                                       *self.sandbox('nobody', self.path('run/check-net.root'), own=False),
+                                       '-p', 'RuntimeMaxSec=60'])
+        self.assertEqual(args[dash + 1:dash + 4], ['/bin/bash', '--norc', '--noprofile'])
+        self.assertEqual(args[dash + 4], '-c')
+        self.assertEqual(args[dash + 6:], ['check-own', self.OWN])
         # The walls' probe: a unit of its own, the same sandbox.
         args = self.waited('fork-fleet-check-walls')
         dash = args.index('--')
@@ -3430,6 +3444,120 @@ class Launcher(unittest.TestCase):
         got = self.check_net(f'127.0.0.1:{port}')
         self.assertNotEqual(got.returncode, 0)
         self.assertIn('NOT as they must be', got.stderr)
+        # The table alone did not refuse the own address (its rule missing, or the probe cut off): check-net fails,
+        # whatever the other two say, and the job's probe is told so (it then takes no answer as no proof).
+        self.write('rec/probe-exit', '0', 0o644)
+        self.write('rec/probe-exit-fork-fleet-check-own', '1', 0o644)
+        got = self.check_net(f'127.0.0.1:{port}')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('NOT as they must be', got.stderr)
+        args = self.waited('fork-fleet-check-net')
+        self.assertEqual(args[args.index('--') + 6:], ['check-net', 'https://example.com/', self.OWN, 'unproven',
+                                                       '127.0.0.1', str(port)])
+
+    def own_probe(self, name, outcome, *args):
+        """check-net's probe `name` (OWN_PROBE or PROBE, the launcher's own text) with a fake timeout whose connect
+        to this host's own address gets `outcome`: open (it answers), refused (the nft table's reject), drop (no
+        answer: the unit's IPAddressDeny drops the packet in the kernel, or a router), eperm (a filter's local
+        refusal), reset (a RST: the packet got through to a closed port), killed (the connect killed, SIGKILL or
+        the OOM killer: rc 137 and nothing said) or gone (no timeout to run: rc 127, nothing said); curl answers 200.
+        Every connect, own address and HOST PORT pair alike, gets the same outcome. Its exit and lines."""
+        with open(LAUNCH) as f:
+            code = f.read().split(f"read -r -d '' {name} <<'EOF' || true\n", 1)[1].split('\nEOF\n', 1)[0]
+        bin_ = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, bin_, True)
+        errors = {'refused': 'No route to host', 'eperm': 'Operation not permitted', 'reset': 'Connection refused'}
+        fake = {'open': 'exit 0', 'drop': 'exit 124', 'killed': 'exit 137', 'gone': 'exit 127'}.get(outcome) or (
+            f'echo "bash: connect: {errors[outcome]}" >&2; '
+            f'echo "bash: line 1: /dev/tcp/$5/443: {errors[outcome]}" >&2; exit 1')
+        for tool, body in (('timeout', fake), ('curl', 'printf 200')):
+            with open(os.path.join(bin_, tool), 'w') as f:
+                f.write(f'#!/bin/bash\n{body}\n')
+            os.chmod(os.path.join(bin_, tool), 0o755)
+        got = subprocess.run(['/bin/bash', '--norc', '--noprofile', '-c', code, 'probe', *args], capture_output=True,
+                             text=True, timeout=60, env={**os.environ, 'PATH': f'{bin_}:{os.environ["PATH"]}'})
+        return got.returncode, got.stdout
+
+    def test_own_address_with_no_answer_is_closed_only_once_the_table_alone_refused_it(self):
+        """Fleet switch-on (11-28): a job's unit has this host's own public address in IPAddressDeny, which drops the
+        packet in the kernel (no answer, rc 124) before the nft table's reject, so the probe could never pass. The
+        table is proven alone (OWN_PROBE, the address out of IPAddressDeny), then the job's own sandbox may give no
+        answer; a job that reaches the address, or a table that does not refuse it, still fails."""
+        own = self.OWN
+        # The nft table alone (OWN_PROBE): only its reject passes.
+        self.assertEqual(self.own_probe('OWN_PROBE', 'refused', own),
+                         (0, f"ok    this host's own public address {own} is refused by the table alone "
+                             '(No route to host)\n'))
+        for outcome, why in (('open', 'is reachable from inside with the table alone'),   # no rule, nothing else
+                             ('drop', 'is not refused by the table alone (no answer in 5 s)'),   # rule missing
+                             ('killed', 'is not refused by the table alone (exit 137, nothing said)'),
+                             ('eperm', 'is not refused by the table alone (bash: connect: Operation not permitted'),
+                             ('reset', 'is not refused by the table alone (bash: connect: Connection refused')):
+            with self.subTest(table=outcome):
+                rc, out = self.own_probe('OWN_PROBE', outcome, own)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"FAIL  this host's own public address {own} {why}", out)
+        for nothing in ('', ' \n\t'):
+            with self.subTest(own=nothing):
+                rc, out = self.own_probe('OWN_PROBE', 'refused', nothing)
+                self.assertEqual((rc, out), (1, 'FAIL  no own public address to try\n'))
+        # The job's own sandbox (PROBE), after the table alone refused it: dropped by IPAddressDeny passes, as does a
+        # refusal; reached, or a reset, fails.
+        url = 'https://example.com/'
+        for outcome, line in (('drop', 'gets no answer (the unit\'s IPAddressDeny drops it; the table alone refuses '
+                                       'it, above)'),
+                              ('refused', 'is refused (No route to host)'),
+                              ('eperm', 'is refused (Operation not permitted)')):
+            with self.subTest(job=outcome):
+                self.assertEqual(self.own_probe('PROBE', outcome, url, own, 'refused'),
+                                 (0, f"ok    this host's own public address {own} {line}\n"
+                                     f'ok    {url} answers (HTTP 200)\n'))
+        # Only a timeout (rc 124) with nothing said is the drop: a connect killed silently (rc 137) proves nothing.
+        for outcome, why in (('open', 'is reachable from inside'),
+                             ('reset', 'is not refused by the walls (bash: connect: Connection refused'),
+                             ('killed', 'is not refused by the walls (exit 137, nothing said)')):
+            with self.subTest(job=outcome):
+                rc, out = self.own_probe('PROBE', outcome, url, own, 'refused')
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"FAIL  this host's own public address {own} {why}", out)
+        # The table alone did not refuse it (unproven): no answer, or even a refusal, proves nothing; reached fails.
+        for outcome, why in (('drop', ': the table alone did not refuse it (above), so this proves nothing (no '
+                                      'answer in 5 s)'),
+                             ('killed', ': the table alone did not refuse it (above), so this proves nothing (exit '
+                                        '137, nothing said)'),
+                             ('refused', ': the table alone did not refuse it (above), so this proves nothing'),
+                             ('open', ' is reachable from inside')):
+            with self.subTest(unproven=outcome):
+                rc, out = self.own_probe('PROBE', outcome, url, own, 'unproven')
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"FAIL  this host's own public address {own}{why}", out)
+                self.assertNotIn("ok    this host's own public address", out)
+        # PROBE on its own is as strict as OWN_PROBE: no own address to try (empty, or only white space) fails.
+        for nothing in ('', ' \n\t'):
+            with self.subTest(job_own=nothing):
+                rc, out = self.own_probe('PROBE', 'refused', url, nothing, 'refused')
+                self.assertEqual(rc, 1, out)
+                self.assertIn('FAIL  no own public address to try\n', out)
+
+    def test_closed_pairs_are_closed_only_on_a_refusal_or_no_answer(self):
+        """PR #1192 review: a HOST PORT pair is closed only on a refusal (a reset included: nothing listens) or a
+        timeout (rc 124) with nothing said; a connect killed silently (rc 137) or no timeout to run (rc 127) proves
+        nothing, as for the own address."""
+        url, own = 'https://example.com/', self.OWN
+        for outcome, line in (('drop', 'ok    192.0.2.7:8080 is closed (no answer in 5 s)'),
+                              ('reset', 'ok    192.0.2.7:8080 is closed (Connection refused)'),
+                              ('refused', 'ok    192.0.2.7:8080 is closed (No route to host)')):
+            with self.subTest(pair=outcome):
+                rc, out = self.own_probe('PROBE', outcome, url, own, 'refused', '192.0.2.7', '8080')
+                self.assertIn(line + '\n', out)
+        for outcome, why in (('open', 'is reachable from inside'),
+                             ('killed', 'is not shown closed (exit 137, nothing said)'),
+                             ('gone', 'is not shown closed (exit 127, nothing said)')):
+            with self.subTest(pair=outcome):
+                rc, out = self.own_probe('PROBE', outcome, url, own, 'refused', '192.0.2.7', '8080')
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f'FAIL  192.0.2.7:8080 {why}\n', out)
+                self.assertNotIn('ok    192.0.2.7:8080', out)
 
     def waited(self, unit):
         with open(os.path.join(self.rec, f'{unit}.0')) as f:
@@ -3452,7 +3580,10 @@ class Launcher(unittest.TestCase):
         got = self.check_net(f'127.0.0.1:{port}', url=f'http://127.0.0.1:{port}/')
         self.assertNotEqual(got.returncode, 0)
         self.assertIn(f'FAIL  127.0.0.1:{port} is reachable from inside', got.stdout)
-        self.assertIn(f'FAIL  this host\'s own public address {self.OWN} is not refused by the walls', got.stdout)
+        # Here no table refuses it: the probe of the table alone fails, and so the job's probe (no answer proves
+        # nothing without it).
+        self.assertIn(f'FAIL  this host\'s own public address {self.OWN} is not refused by the table alone', got.stdout)
+        self.assertNotIn("ok    this host's own public address", got.stdout)
         if os.path.exists('/proc/sys/kernel/io_uring_disabled'):   # a kernel with io_uring
             self.assertRegex(got.stdout, r'FAIL  io_uring (gives a ring inside|is not refused by the unit)')
         self.assertIn(f'ok    http://127.0.0.1:{port}/ answers (HTTP 200)', got.stdout)
@@ -4579,6 +4710,8 @@ class LauncherAsRoot(unittest.TestCase):
         for target in targets:
             self.assertIn(f'ok    {target} is closed', got.stdout)
         self.assertIn('ok    http://203.0.113.2/ answers (HTTP 200)', got.stdout)
+        self.assertIn("ok    this host's own public address 203.0.113.3 is refused by the table alone (No route to host)",
+                      got.stdout)
         self.assertIn("ok    this host's own public address 203.0.113.3 is refused (No route to host)", got.stdout)
         self.assertIn(f'check-net: as {self.USERS[0]}, in its namespace fork-fleet-{self.USERS[0]}', got.stdout)
 

@@ -59,6 +59,10 @@ without printing it).
   field pins `pr-green` to one head.
 - `machines`: allowed machines, in order of preference (default: every machine in the config, in config order).
   `account`, `model`, `effort` default from the config's `defaults`.
+- `account` (in an item or in `defaults`): one account, or a list in order of preference, e.g.
+  `["claudeAgent_claude_annemette", "claudeAgent"]`. On each machine the filler uses the first account that passes
+  the usage rules below; when none does, the item waits and the log line gives each account's reason. The account
+  used is in the started record (`account`) and the log line ("started `<id>` on `<machine>` as `<account>`").
 - The task text is "Act as the `<kind>` sub-agent for this task. Read `<brief>` fully and do what it says. It is
   your whole brief." (`taskTemplate` changes it).
 
@@ -100,12 +104,45 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
         }
       }
     },
-    "spare": { "environmentId": "<linked environment id>", "maxAgents": 6, "maxWriters": 3 }
+    "spare": { "environmentId": "<linked environment id>", "maxAgents": 6, "maxWriters": 3 },
+    "wsl": {
+      "environmentId": "<linked environment id>",
+      "projectId": "<that machine's project id>",
+      "maxAgents": 2,
+      "maxWriters": 1
+    },
+    "mac": {
+      "environmentId": "<linked environment id>",
+      "projectId": "<that machine's project id>",
+      "worktreeIsolation": false,
+      "maxAgents": 2,
+      "maxWriters": 1
+    }
   }
 }
 ```
 
+A queue item for a linked machine names it and leaves out `isolation`, since the child runs in that project's
+checkout:
+
+```json
+{
+  "id": "fix-login-43",
+  "title": "Fix the login retry on Windows",
+  "kind": "writer",
+  "brief": "/abs/path/brief.md",
+  "machines": ["wsl", "mac"],
+  "account": ["claudeAgent"]
+}
+```
+
 - A machine without `environmentId` is the server's own machine.
+- `projectId`: the project the child runs in, sent as `target.projectId`. A linked machine needs it; without it,
+  T3 refuses the start ("Pass target.projectId").
+- `worktreeIsolation` (default: false when the machine has an `environmentId`, else true): whether T3 can give a
+  child its own worktree there. Set it to false for a project that is not a git checkout. An item with
+  `"isolation": "worktree"` is refused when it is read (logged once, kept) if one of the machines it names, or
+  every machine when it names none, has this false. When it names no machines, it runs only where this is true.
 - `inlineBrief` (default: true when the machine has an `environmentId`): the brief's text goes in the task
   text, since another machine cannot read this machine's files (at most 100,000 characters, else refused).
 - `capacity.<kind>` (or `default`): a command that must exit 0, or, with `free`, whose
@@ -148,7 +185,21 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
   logged as "<machine> backing off after N refusal(s) (last: code) until T", so a refusal the server checks after the
   wake does not wake the parent every minute, and a machine that keeps refusing does not hold back a free one. A
   wait more than 15 minutes ahead (the clock was set back) is cut to 15 minutes. A child on an environment no machine names still counts, under no machine.
-- **Meter missing or old:** that machine is skipped for that account, with a log line.
+- **Meter missing or old:** that machine is skipped for that account, with a log line; the item's next account,
+  if it names one, is tried there.
+- **An account fills during a start:** the intent marker records the account it asked with. A start that stopped
+  half-way, or got no clear answer, is asked again with the same request id on the same account, never moved to
+  the next one (it may have started there). A usage refusal from the server (`usage_pacing_hold`: its guard
+  holds an account that is ahead of pace, possibly well under this meter's limit) removes the marker and backs off
+  only that account on that machine (1, 2, 4 ... 15 minutes, in `stateDir/requests/<id>.json` under `accounts`),
+  so the next run starts the item on its next account. Other refusals back off the whole machine. The queue
+  file is never rewritten: it keeps its list.
+- **Old queue files and markers:** an `account` string is a list of one, and `null` means the default, as before.
+  A marker from before account lists holds the item with its string and is asked again as it was. A request file
+  without `accounts` has no held account. A lens-watch `account` is checked like an item's: a bad one refuses
+  the watch file (logged once, kept).
+- **A stale reading:** "usage reading for X is N min old" is logged once; the minutes growing is not a new
+  reason.
 - **Brief deleted:** the item is refused and kept until the brief is back.
 - **PR closed:** `pr-green` and `pr-merged` items wait with a log line ("closed without a merge"). Delete them
   by hand.

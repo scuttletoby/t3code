@@ -16,10 +16,15 @@ a lost or broken state file, or a clock that jumped back all end at step 4, whic
 while the host was off end in one run for the latest slot only. A rate limit (or under MIN_REMAINING calls left)
 stops the tick and pauses all entries until GitHub's reset (at most an hour). GitHub's late `schedule` run for a slot
 already started here ends early with `schedule-kick late-check` (late.py) as the workflow's first job.
+
+Two more parts share the config, the GitHub login and the API budget: `heads` (heads.py, in the same tick) sends
+one workflow_dispatch for a trusted head that has no run of the workflow, and `keepOn` (keepon.py, `schedule-kick
+keep-on`, its own timer) turns the named workflows back on when something switches them off.
 """
 import argparse, datetime, fcntl, json, os, re, stat, sys
 
 from . import cron as cronmod
+from . import heads as headsmod
 from .github import ApiError, GhAsApi, TokenApi, iso
 
 UTC = datetime.timezone.utc
@@ -42,15 +47,23 @@ WORKFLOW_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.ya?ml\Z')
 REF_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z')
 INPUT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]{0,99}\Z')
 ENTRY_KEYS = {'repo', 'workflow', 'cron', 'ref', 'inputs', 'graceMinutes'}
+HEADS_KEYS = {'repo', 'workflow', 'graceMinutes', 'maxPerPass'}
+KEEP_ON_KEYS = {'repo', 'workflows'}
+MAX_HEADS = 10
+MAX_KEEP_ON = 10
+MAX_KEEP_ON_WORKFLOWS = 20
 
 USAGE = """usage: schedule-kick tick [--config FILE] [--state-dir DIR]
+       schedule-kick keep-on [--config FILE] [--state-dir DIR]
        schedule-kick check [--config FILE]
-       schedule-kick status [--state-dir DIR]
+       schedule-kick status [--keep-on] [--state-dir DIR]
        schedule-kick late-check
 
-tick    start each listed workflow whose last cron slot has no run yet (one workflow_dispatch at most per entry)
+tick    start each listed workflow whose last cron slot has no run yet (one workflow_dispatch at most per entry),
+        then, for each `heads` entry, dispatch the workflow for trusted heads that have no run (at most maxPerPass)
+keep-on turn each workflow a `keepOn` entry names back on if it was switched off (never switches one off)
 check   read the config and print each entry's last slot; no network
-status  print the last tick's status file; exit 1 unless it was fine
+status  print the last tick's status file (--keep-on: the last keep-on pass's); exit 1 unless it was fine
 late-check  in a GitHub Actions job of a listed workflow: skip=true in $GITHUB_OUTPUT when this is the first
         attempt of a `schedule` run of the kicked line ($SCHEDULE_KICK_CRON) and a workflow_dispatch run on its
         branch was created since its slot (README, Late schedule runs)
@@ -76,9 +89,22 @@ class Entry:
         return self.cron.last_slot(now - self.grace)
 
 
+class HeadsEntry:
+    def __init__(self, repo, workflow, grace, per_pass):
+        self.repo, self.workflow, self.per_pass = repo, workflow, per_pass
+        self.grace = datetime.timedelta(minutes=grace)
+        self.key = f'heads {repo.lower()} {workflow}'
+
+
+class KeepOnEntry:
+    def __init__(self, repo, workflows):
+        self.repo, self.workflows = repo, workflows
+
+
 class Config:
-    def __init__(self, path, auth, entries):
+    def __init__(self, path, auth, entries, heads=(), keep_on=()):
         self.path, self.auth, self.entries = path, auth, entries
+        self.heads, self.keep_on = list(heads), list(keep_on)
 
 
 def _now():
@@ -192,8 +218,7 @@ def _entry(raw, n, default_grace=GRACE_MINUTES):
     for key in ('repo', 'workflow', 'cron', 'ref'):
         if not isinstance(raw.get(key), str):
             raise ConfigError(f'{where}.{key} is missing or not a string')
-    if not REPO_RE.match(raw['repo']) or raw['repo'].split('/')[1] in ('.', '..'):
-        raise ConfigError(f'{where}.repo {raw["repo"]!r} is not OWNER/NAME')
+    _repo(raw, where)
     if not WORKFLOW_RE.match(raw['workflow']):
         raise ConfigError(f'{where}.workflow {raw["workflow"]!r} is not a workflow file name (name.yml)')
     if not REF_RE.match(raw['ref']) or '..' in raw['ref'] or raw['ref'].endswith('/'):
@@ -221,6 +246,65 @@ def _entry(raw, n, default_grace=GRACE_MINUTES):
     return Entry(raw['repo'], raw['workflow'], line, raw['ref'], dict(inputs), wait)
 
 
+def _repo(raw, where):
+    if not isinstance(raw.get('repo'), str) or not REPO_RE.match(raw['repo']) or raw['repo'].split('/')[1] in ('.', '..'):
+        raise ConfigError(f'{where}.repo {raw.get("repo")!r} is not OWNER/NAME')
+    return raw['repo']
+
+
+def _workflow(value, where):
+    if not isinstance(value, str) or not WORKFLOW_RE.match(value):
+        raise ConfigError(f'{where} {value!r} is not a workflow file name (name.yml)')
+    return value
+
+
+def _object(raw, where, keys):
+    if not isinstance(raw, dict):
+        raise ConfigError(f'{where} must be an object')
+    unknown = set(raw) - keys
+    if unknown:
+        raise ConfigError(f'{where}: unknown key {sorted(unknown)[0]!r} (keys: {", ".join(sorted(keys))})')
+
+
+def _heads_entry(raw, n):
+    where = f'heads[{n}]'
+    _object(raw, where, HEADS_KEYS)
+    repo, workflow = _repo(raw, where), _workflow(raw.get('workflow'), f'{where}.workflow')
+    wait = raw.get('graceMinutes', headsmod.GRACE_MINUTES)
+    if type(wait) is not int or not 0 <= wait <= headsmod.MAX_GRACE_MINUTES:
+        raise ConfigError(f'{where}.graceMinutes must be a whole number of minutes, 0 to {headsmod.MAX_GRACE_MINUTES}')
+    per_pass = raw.get('maxPerPass', headsmod.PER_PASS)
+    if type(per_pass) is not int or not 1 <= per_pass <= headsmod.MAX_PER_PASS:
+        raise ConfigError(f'{where}.maxPerPass must be a whole number, 1 to {headsmod.MAX_PER_PASS}')
+    return HeadsEntry(repo, workflow, wait, per_pass)
+
+
+def _keep_on_entry(raw, n):
+    where = f'keepOn[{n}]'
+    _object(raw, where, KEEP_ON_KEYS)
+    repo, workflows = _repo(raw, where), raw.get('workflows')
+    if not isinstance(workflows, list) or not 1 <= len(workflows) <= MAX_KEEP_ON_WORKFLOWS:
+        raise ConfigError(f'{where}.workflows must be a list of 1 to {MAX_KEEP_ON_WORKFLOWS} workflow file names')
+    names = [_workflow(w, f'{where}.workflows[{i}]') for i, w in enumerate(workflows)]
+    if len(set(names)) != len(names):
+        raise ConfigError(f'{where}.workflows names a workflow twice')
+    return KeepOnEntry(repo, names)
+
+
+def _list(raw, key, most, parse, ident):
+    items = raw.get(key, [])
+    if not isinstance(items, list) or len(items) > most:
+        raise ConfigError(f'{key} must be a list of at most {most} entries')
+    out, seen = [], set()
+    for n, item in enumerate(items):
+        entry = parse(item, n)
+        if ident(entry) in seen:
+            raise ConfigError(f'{key}[{n}]: {ident(entry)} is listed twice')
+        seen.add(ident(entry))
+        out.append(entry)
+    return out
+
+
 def grace(raw, where, default):
     value = raw.get('graceMinutes', default)
     if type(value) is not int or not 0 <= value <= MAX_GRACE_MINUTES:
@@ -243,7 +327,7 @@ def load_config(path):
         raise ConfigError(f'{path}: not JSON ({e})') from None
     if not isinstance(raw, dict):
         raise ConfigError(f'{path}: must be a JSON object')
-    unknown = set(raw) - {'version', 'auth', 'entries', 'graceMinutes', '//'}
+    unknown = set(raw) - {'version', 'auth', 'entries', 'graceMinutes', 'heads', 'keepOn', '//'}
     if unknown:
         raise ConfigError(f'{path}: unknown key {sorted(unknown)[0]!r}')
     if raw.get('version') != VERSION:
@@ -251,9 +335,9 @@ def load_config(path):
     try:
         auth = _auth(raw.get('auth'))
         default_grace = grace(raw, 'config', GRACE_MINUTES)
-        entries = raw.get('entries')
-        if not isinstance(entries, list) or not entries or len(entries) > MAX_ENTRIES:
-            raise ConfigError(f'entries must be a list of 1 to {MAX_ENTRIES} entries')
+        entries = raw.get('entries', [])
+        if not isinstance(entries, list) or len(entries) > MAX_ENTRIES:
+            raise ConfigError(f'entries must be a list of at most {MAX_ENTRIES} entries')
         out, seen = [], set()
         for n, item in enumerate(entries):
             entry = _entry(item, n, default_grace)
@@ -262,9 +346,13 @@ def load_config(path):
                                   'workflow: the run list cannot tell two entries apart)')
             seen.add(entry.key)
             out.append(entry)
+        heads = _list(raw, 'heads', MAX_HEADS, _heads_entry, lambda h: h.key)
+        keep_on = _list(raw, 'keepOn', MAX_KEEP_ON, _keep_on_entry, lambda k: k.repo.lower())
+        if not (out or heads or keep_on):
+            raise ConfigError('nothing to do: give entries, heads or keepOn (at least one entry)')
     except ConfigError as e:
         raise ConfigError(f'{path}: {e}') from None
-    return Config(path, auth, out)
+    return Config(path, auth, out, heads, keep_on)
 
 
 def make_api(cfg):
@@ -328,6 +416,9 @@ def load_state(path, warn):
         warn(f'state file {path} is not version {VERSION} state; starting from empty state (the run list guards)')
         return {'version': VERSION, 'entries': {}}
     raw['entries'] = {k: v for k, v in raw['entries'].items() if isinstance(v, dict)}
+    if not isinstance(raw.get('heads', {}), dict):
+        warn(f'state file {path}: its heads part is broken; read as empty (the check suites guard)')
+        raw['heads'] = {}
     return raw
 
 
@@ -396,13 +487,18 @@ def kick_one(entry, api, state, now):
 
 
 def pause(state, now, until=None):
-    """Every entry waits until GitHub's reset: PAUSE without one (or one already past), at most MAX_WAIT."""
+    """Every entry waits until GitHub's reset: PAUSE without one (or one already past), at most MAX_WAIT. A pause
+    already running that ends later stays (a retry-after, then the same answer's low budget with a nearer reset)."""
     if until is None or until <= now:
         until = now + PAUSE
-    state['pauseUntil'] = iso(min(until, now + MAX_WAIT))
+    until = min(until, now + MAX_WAIT)
+    current = waiting_until(state.get('pauseUntil'), now)
+    if current is not None and current > until:
+        return
+    state['pauseUntil'] = iso(until)
 
 
-def tick(cfg, state_dir, api, now=None, out=sys.stdout, err=sys.stderr):
+def tick(cfg, state_dir, api, now=None, out=sys.stdout, err=sys.stderr, alert=None):
     """One tick over every entry. Returns the exit code."""
     now = now or _now()
     folder = state_folder(state_dir)
@@ -413,34 +509,57 @@ def tick(cfg, state_dir, api, now=None, out=sys.stdout, err=sys.stderr):
         except BlockingIOError:
             print('schedule-kick: another tick is running; this one does nothing', file=out)
             return 0
-        return _tick(cfg, folder, api, now, out, err)
+        return _tick(cfg, folder, api, now, out, err, alert)
     finally:
         lock.close()
 
 
-def _tick(cfg, folder, api, now, out, err):
+def _tick(cfg, folder, api, now, out, err, alert=None):
     state_path = os.path.join(folder, 'state.json')
     state = load_state(state_path, lambda m: print(f'schedule-kick: {m}', file=err))
     keys = {e.key for e in cfg.entries}
     state['entries'] = {k: v for k, v in state['entries'].items() if k in keys}
+    state['heads'] = {k: v for k, v in state.get('heads', {}).items() if k in {h.key for h in cfg.heads}}
     status, failed = {}, False
     paused = waiting_until(state.get('pauseUntil'), now)
-    for entry in cfg.entries:
+
+    def heads_alert(text):
+        from .keepon import channel_alert
+        sent, why = (alert or channel_alert)(text)
+        if not sent:
+            print(f'schedule-kick: alert not sent ({why}): {text}', file=err)
+
+    def limited(e):
+        pause(state, now, now + datetime.timedelta(seconds=e.retry_after) if e.retry_after else epoch(e.reset))
+
+    jobs = [(e.key, f'{e.repo} {e.workflow}', lambda e=e: kick_one(e, api, state, now),
+             lambda e, m: fail(state, e.key, now, m), e) for e in cfg.entries]
+    jobs += [(h.key, f'{h.repo} {h.workflow} heads',
+              lambda h=h: headsmod.reconcile(h, api, state, now, parse_time, waiting_until, BACKOFF, MAX_WAIT,
+                                             lambda: write_json(state_path, state), limited, heads_alert,
+                                             lambda: getattr(api, 'remaining', None) is not None
+                                             and api.remaining < MIN_REMAINING),
+              lambda h, m: headsmod.fail(state, h.key, now, m, BACKOFF, MAX_WAIT), h) for h in cfg.heads]
+    for key, label, work, on_fault, item in jobs:
         if paused is not None:
-            status[entry.key] = {'result': 'paused', 'message': f'GitHub API budget: paused until {iso(paused)}'}
+            status[key] = {'result': 'paused', 'message': f'GitHub API budget: paused until {iso(paused)}'}
             continue
         before = json.dumps(state, sort_keys=True)
         try:
-            result, message = kick_one(entry, api, state, now)
+            result, message = work()
         except Exception as e:      # noqa: BLE001 - one entry's fault never stops the entries after it
             result, message = 'error', f'internal error: {type(e).__name__}: {e}'
-            fail(state, entry.key, now, message)
-        remaining = getattr(api, 'remaining', None)
-        if result != 'done' and remaining is not None and remaining < MIN_REMAINING:
-            pause(state, now, epoch(getattr(api, 'reset', None)))
-            message += f' (only {remaining} API calls left: pausing)'
-        status[entry.key] = {'result': result, 'message': message}
-        line = f'schedule-kick: {entry.repo} {entry.workflow}: {result}: {message}'
+            on_fault(item, message)
+        low = [(n, getattr(api, f, None), getattr(api, r, None)) for n, f, r in
+               (('REST', 'remaining', 'reset'), ('GraphQL', 'graphql_remaining', 'graphql_reset'))]
+        low = [(n, left, reset) for n, left, reset in low if left is not None and left < MIN_REMAINING]
+        if result != 'done' and low:
+            resets = [t for t in (epoch(reset) for _, _, reset in low) if t is not None]
+            pause(state, now, max(resets) if resets else None)
+            message += ''.join(f' (only {left} {"GraphQL " if n == "GraphQL" else ""}API calls left: pausing)'
+                               for n, left, _ in low)
+        status[key] = {'result': result, 'message': message}
+        line = f'schedule-kick: {label}: {result}: {message}'
         print(line, file=err if result == 'error' else out)
         failed |= result == 'error'
         if json.dumps(state, sort_keys=True) != before:
@@ -481,13 +600,13 @@ def broken(e, state_dir, err):
     return 1
 
 
-def refuse(message, state_dir, out_err):
+def refuse(message, state_dir, out_err, status='status.json'):
     """Config refused: say so on stderr (the journal) and in the status file; nothing is sent."""
     print(f'schedule-kick: refused, nothing sent: {message}', file=out_err)
     if state_dir:
         try:
             folder = state_folder(state_dir)
-            write_json(os.path.join(folder, 'status.json'),
+            write_json(os.path.join(folder, status),
                        {'version': VERSION, 'at': iso(_now()), 'ok': False, 'error': message, 'entries': {}})
         except (ConfigError, OSError) as e:
             print(f'schedule-kick: cannot write the status file either: {e}', file=out_err)
@@ -499,9 +618,10 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
         print(USAGE, file=out)
         return 0
     parser = argparse.ArgumentParser(prog='schedule-kick', add_help=False)
-    parser.add_argument('command', choices=('tick', 'check', 'status', 'late-check'))
+    parser.add_argument('command', choices=('tick', 'keep-on', 'check', 'status', 'late-check'))
     parser.add_argument('--config')
     parser.add_argument('--state-dir')
+    parser.add_argument('--keep-on', dest='keep_on_status', action='store_true')
     try:
         a = parser.parse_args(argv)
     except SystemExit:
@@ -511,9 +631,13 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
         from . import late
         return late.main(os.environ, out, err)
     state_dir = a.state_dir or default_state_dir()
+    if a.keep_on_status and a.command != 'status':
+        print(USAGE, file=err)
+        return 2
     if a.command == 'status':
+        name = 'keep-on-status.json' if a.keep_on_status else 'status.json'
         try:
-            with open(os.path.join(state_dir, 'status.json'), encoding='utf-8') as f:
+            with open(os.path.join(state_dir, name), encoding='utf-8') as f:
                 status = json.load(f)
         except (OSError, ValueError) as e:
             print(f'schedule-kick: no readable status in {state_dir} ({e})', file=err)
@@ -523,18 +647,47 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
     try:
         cfg = load_config(a.config or default_config())
     except ConfigError as e:
-        return refuse(str(e), state_dir if a.command == 'tick' else None, err)
+        return refuse(str(e), state_dir if a.command in ('tick', 'keep-on') else None, err,
+                      'keep-on-status.json' if a.command == 'keep-on' else 'status.json')
+    if a.command == 'keep-on':
+        if not cfg.keep_on:
+            print(f'schedule-kick keep-on: no keepOn in {cfg.path}: nothing to do', file=out)
+            return 0
+        try:
+            from . import keepon
+            folder = state_folder(state_dir)
+            return keepon.run(cfg, folder, api_factory(cfg), _now(), out, err, write_json, waiting_until, pause,
+                              epoch, MIN_REMAINING)
+        except ConfigError as e:
+            return refuse(str(e), state_dir, err, 'keep-on-status.json')
+        except Exception as e:      # noqa: BLE001 - a broken pass must not leave an old `ok: true` behind
+            print(f'schedule-kick keep-on: the pass broke: {type(e).__name__}: {e}', file=err)
+            try:
+                write_json(os.path.join(state_folder(state_dir), 'keep-on-status.json'),
+                           {'version': VERSION, 'at': iso(_now()), 'ok': False,
+                            'error': f'{type(e).__name__}: {e}', 'targets': {}})
+            except Exception:       # noqa: BLE001
+                pass
+            return 1
     if a.command == 'check':
         now = _now()
         for e in cfg.entries:
             print(f'{e.repo} {e.workflow} ({e.cron.line}, ref {e.ref}, grace {e.grace.seconds // 60} min): '
                   f'slot to handle now {iso(e.slot(now))}', file=out)
-        print(f'config fine: {len(cfg.entries)} entries, auth {cfg.auth[0]}', file=out)
+        for h in cfg.heads:
+            print(f'{h.repo} {h.workflow}: heads without a run get one dispatch after {h.grace.seconds // 60} min, '
+                  f'at most {h.per_pass} a pass', file=out)
+        for k in cfg.keep_on:
+            print(f'{k.repo}: keep-on turns back on {", ".join(k.workflows)}', file=out)
+        print(f'config fine: {len(cfg.entries)} entries, {len(cfg.heads)} heads, {len(cfg.keep_on)} keepOn, '
+              f'auth {cfg.auth[0]}', file=out)
         return 0
     try:
         api = api_factory(cfg)
         return tick(cfg, state_dir, api, out=out, err=err)
     except ConfigError as e:
-        return refuse(str(e), None, err)
+        # after the config loaded (the login, the state folder): an old `ok: true` must not stay behind. A state
+        # folder that is itself refused cannot take the status either; refuse() says so and goes on.
+        return refuse(str(e), state_dir, err)
     except Exception as e:          # noqa: BLE001 - a broken tick must not leave an old `ok: true` behind
         return broken(e, state_dir, err)

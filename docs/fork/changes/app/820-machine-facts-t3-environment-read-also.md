@@ -1,0 +1,5 @@
+- Change: Machine facts: `t3_environment_read` also returns `hostResources` (CPU, cores, memory; the field of upstream PR #34293, closed there unmerged) and `placement` (labels, available and reason, running agents, slots free, memory floor, facts time), for this machine and a linked one. Labels come from the machine's Settings and its facts command, which can also say it is busy (example scripts per OS in fork-kit/placement-facts).
+- Why: An agent choosing where to run work can see which machine has room without asking the person.
+- Setting: none
+- Default: always
+- PR: [#820](https://github.com/scuttletoby/t3code/pull/820), [#1083](https://github.com/scuttletoby/t3code/pull/1083)

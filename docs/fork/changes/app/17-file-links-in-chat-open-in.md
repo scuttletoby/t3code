@@ -1,0 +1,5 @@
+- Change: File links in chat open in the files viewer, full size, or in an editor on a remote machine, and can be downloaded, from their menu.
+- Why: File links were only copyable on remote machines and had no menu on touch screens.
+- Setting: none
+- Default: always
+- PR: [#17](https://github.com/scuttletoby/t3code/pull/17)

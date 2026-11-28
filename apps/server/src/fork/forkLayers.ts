@@ -11,6 +11,7 @@ import * as HoldWorkConnect from "../cloud/holdWorkConnect.ts";
 import type * as ServerConfig from "../config.ts";
 import type * as AgentAwarenessRelay from "../relay/AgentAwarenessRelay.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
+import * as PlaytestRoutes from "../playtest/playtestRoutes.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as HeadlessUsageRefresher from "../usage/HeadlessUsageRefresher.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
@@ -32,6 +33,7 @@ import * as RunRecorder from "./runRecords/RunRecorder.ts";
 import * as StopFinishedChildren from "./stopFinishedChildren.ts";
 import * as ThreadRoleTargets from "./threadRoleTargetsLayer.ts";
 import * as WorkerWakeSlots from "./workerWakeSlots.ts";
+import * as WorkPanel from "./workPanel/workPanel.ts";
 
 /**
  * Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. A
@@ -52,13 +54,15 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
 
 /**
  * In server.ts's `layerRuntimeCoreDependenciesBase`: usage pacer and history, slot gate, usage
- * refresher, handoff service (built beside upstream's idle compaction worker), run records, result
- * reminder, the stop of finished children's sessions, the `threadRoles` save check's thread
- * lookup, which every settings write reaches, and the facts read's `factsCommand` runs.
+ * refresher, handoff service (beside upstream's idle compaction worker), run records, result
+ * reminder, finished children's session stop, the `threadRoles` save check's thread lookup, the
+ * facts read's `factsCommand` runs, and the work panel's shared runs read.
  */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
-  SlotGate.layer,
+  // fork.workPanel: the thread side panel's shared GitHub runs read and this machine's capacity,
+  // which reads this one slot gate (fork issue 1136).
+  WorkPanel.layer.pipe(Layer.provideMerge(SlotGate.layer)),
   HeadlessUsageRefresher.layer,
   HandoffService.layer,
   RunRecorder.layer,
@@ -103,6 +107,9 @@ export const layerRoutes = Layer.mergeAll(
   ActivityProbe.layer,
   // GET /api/fork/features: what this version does for a linked machine; its token only.
   ForkFeatures.layer,
+  // GET /api/fork/playtest/state and POST /api/fork/playtest/end: the thread's playtest chip and
+  // its End button (playtest F5); a signed-in session only.
+  PlaytestRoutes.layer,
   // Linked threads a parent here launched but whose task the last stop lost: one reminder each.
   DelegatedOrphanScan.layer,
   // GET /api/fork/task-prompts: a task's open prompts here, for its parent's machine; its token only.

@@ -1,0 +1,5 @@
+- Change: `pc-agents` kit: opt-in automatic T3 updates that take only releases `fork-release.yml` built from `main` (build attestation), at a quiet point, with a rollback; stable releases are published from `main` only.
+- Why: A PC follows the fork unwatched and installs nothing an agent built.
+- Setting: `autoUpdate` (kit machine file)
+- Default: off
+- PR: [#545](https://github.com/scuttletoby/t3code/pull/545)
