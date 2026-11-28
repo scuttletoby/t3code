@@ -253,15 +253,10 @@
       "added": [
         "import * as BackgroundWait from \"../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
         "const ended = yield* BackgroundWait.read(providerThread, input.taskIds, matched); // Fork: background wait (F7)",
-        "if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)"
-      ],
-      "announced": {
-        "since": "2026-11-28",
-        "added": [
-          "import * as ModelPolicyBackstop from \"../fork/modelPolicyBackstop.ts\"; // Fork: model policy backstop",
-          "Effect.andThen(ModelPolicyBackstop.check(command, orchestrator, receipts, serverSettings)), // Fork: model policy backstop"
-        ]
-      }
+        "if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)",
+        "import * as ModelPolicyBackstop from \"../fork/modelPolicyBackstop.ts\"; // Fork: model policy backstop",
+        "Effect.andThen(ModelPolicyBackstop.check(command, orchestrator, receipts, serverSettings)), // Fork: model policy backstop"
+      ]
     },
     "apps/server/src/orchestration-v2/ProviderTurnStartService.ts": {
       "why": "MCP profiles part 2: a Claude turn its MCP profile refuses never reached Claude, like the other refusals in this list.",
@@ -341,7 +336,7 @@
       ]
     },
     "apps/server/src/scheduledTasks/ScheduledTaskService.ts": {
-      "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot (a direct one is stored for the stored-delivery worker on its first refusal, so a restart keeps it; one whose task is saved while it waits is not started on its old copy, and the stored-delivery worker keeps its row and runs it again on the task as saved, #719); a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706). A save records the MCP profile of the thread that made it, and refuses a narrower thread's change that would let the task's runs get more than its own profile; a run that starts a new thread is refused when that thread would get more than the recorded profile (fork/scheduledTaskMcpProfile.ts, #699). The stored-delivery worker names its own delivery to keepStored, and a delivery it removes before its run (payload not prepared, prompt too long) leaves its place in line at once rather than at the sweep (fork/agentSlotRoutes.ts, #941).",
+      "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot (a direct one is stored for the stored-delivery worker on its first refusal, so a restart keeps it; one whose task is saved while it waits is not started on its old copy, and the stored-delivery worker keeps its row and runs it again on the task as saved, #719); a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706). A save records the MCP profile of the thread that made it, and refuses a narrower thread's change that would let the task's runs get more than its own profile; a run that starts a new thread is refused when that thread would get more than the recorded profile (fork/scheduledTaskMcpProfile.ts, #699). The stored-delivery worker names its own delivery to keepStored, and a delivery it removes before its run (payload not prepared, prompt too long) leaves its place in line at once rather than at the sweep (fork/agentSlotRoutes.ts, #941). A run refused by the model policy backstop records the refusal's text, not the launch error that wraps it (fork/modelPolicyBackstop.ts, #876 M4).",
       "added": [
         "import { makeScheduledRunSlots } from \"../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
         "const runSlots = yield* makeScheduledRunSlots(WebhookDeliverySkipped); // Fork: agent slots",
@@ -353,16 +348,11 @@
         "yield* runSlots.saving(task, existingTask); // Fork: the saving thread's MCP profile",
         "if (yield* runSlots.keepStored(taskId, entry.delivery_id)) continue; // Fork: a delivery saved while it waited runs again on the task as saved",
         "yield* runSlots.leaveStored(entry.delivery_id); // Fork: a delivery removed before its run leaves its place in line",
-        "yield* runSlots.leaveStored(entry.delivery_id); // Fork: a delivery removed before its run leaves its place in line"
-      ],
-      "announced": {
-        "since": "2026-11-28",
-        "added": [
-          "import * as ModelPolicyBackstop from \"../fork/modelPolicyBackstop.ts\"; // Fork: model policy backstop",
-          "const refused = ModelPolicyBackstop.refusalText(failure); // Fork: a policy refusal keeps its text",
-          "if (refused !== undefined) return refused; // Fork: a policy refusal keeps its text"
-        ]
-      }
+        "yield* runSlots.leaveStored(entry.delivery_id); // Fork: a delivery removed before its run leaves its place in line",
+        "import * as ModelPolicyBackstop from \"../fork/modelPolicyBackstop.ts\"; // Fork: model policy backstop",
+        "const refused = ModelPolicyBackstop.refusalText(failure); // Fork: a policy refusal keeps its text",
+        "if (refused !== undefined) return refused; // Fork: a policy refusal keeps its text"
+      ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
       "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693). A change from such a thread to the prompt or thread of a task bound to a wider thread is refused there too, before the service uses up a webhook secretRef (#699). An agent's t3_thread_send that would start a run in an idle thread takes a slot from the agent slot gate, or is refused slots_full and nothing is sent; into a running thread it only queues and takes no slot (fork/agentSlotRoutes.ts, #711).",

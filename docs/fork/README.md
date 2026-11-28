@@ -465,7 +465,10 @@ policy too (the link names the agent's thread; a call the owner's client sends t
 so each machine refuses an agent's pick outside its own rows, whatever the sending machine's policy
 says. An agent is
 a caller whose session is bound to a thread; the owner's client has none, and anything that reaches
-the server without such a session counts as a person, so the model guard hook is the backstop.
+the server without such a session counts as a person. Every other thread command an agent's call
+dispatches with a model, and a thread fork (on its source thread's model), is checked by the
+server's backstop (#876 M4; which part checks each route, and the way back:
+[model-policy.md](model-policy.md)).
 Claude's own Agent tool (Task in older Claude Code) is checked too, as each call is made (#128): T3
 gives every Claude session it opens one PreToolUse hook that reads the policy on each call. The call
 must name a model and, for a row with `efforts`, its `effort`. The Agent tool names only aliases
@@ -1762,6 +1765,8 @@ switch.
   summary.
 - [delegate-prepare.md](delegate-prepare.md): set up a checkout (merge, install, baseline tests)
   by script before a delegated agent starts.
+- [model-policy.md](model-policy.md): which part checks each route an agent picks a model on, a
+  check an agent cannot turn off, and the way back.
 - [`.github/fork-fleet.md`](../../.github/fork-fleet.md): the fleet runners and `CI_RUNNERS`.
 - [`fork-ci/README.md`](../../fork-ci/README.md) and [`fork-kit/README.md`](../../fork-kit/README.md):
   CI actions and host kits.
