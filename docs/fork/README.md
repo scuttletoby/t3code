@@ -310,9 +310,9 @@ T3 runs the project's adapter, four kinds of step only the person sets: `claim` 
 `renew` keeps the claim alive, `push` (one or more named steps) sends a round to the target, and
 `release` puts the target back. Each step is a program given by its absolute path with fixed
 arguments, run without a shell; T3 passes the session's facts as environment variables. An agent
-starts, pushes, checks and ends its thread's session with the `playtest` tool (its own tool group, `playtest`); the
-thread controls come in a later pull request. The steps' contract and the tool are in
-[playtest.md](playtest.md).
+starts, pushes, checks and ends its thread's session with the `playtest` tool (its own tool group, `playtest`). While
+a session is on, its thread shows a **Playtest** chip above the composer with an **End** button, so the person can
+end it without asking the agent. The steps' contract, the tool and the chip are in [playtest.md](playtest.md).
 
 In the app: **Settings → Fork**, section Playtest sessions: the switch (it stays off until all four steps are
 set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
