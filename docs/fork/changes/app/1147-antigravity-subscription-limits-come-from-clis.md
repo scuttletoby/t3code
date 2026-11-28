@@ -2,4 +2,4 @@
 - Why: Upstream stopped reading Google's internal quota API, which can get an account flagged; the CLI's own command calls no Google API from T3 and handles no token.
 - Setting: none
 - Default: always, for Google account instances
-- PR: [#1147](https://github.com/scuttletoby/t3code/pull/1147)
+- PR: [#1147](https://github.com/scuttletoby/t3code/pull/1147), [#1149](https://github.com/scuttletoby/t3code/pull/1149)
