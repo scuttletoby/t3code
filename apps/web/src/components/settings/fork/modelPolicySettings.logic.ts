@@ -172,16 +172,14 @@ export function aliasModelPolicyRows(
 
 /** A machine's lists of a driver hold the model by id or alias (or the driver resolves the name). */
 const machineHoldsModel = (
-  own: ReadonlyArray<ModelPolicyAliasProvider>,
   lists: ReadonlyArray<ReadonlyArray<ModelPolicyListedModel>>,
   row: ModelPolicyRow,
 ) =>
   lists.some((list) => list.some((candidate) => candidate.slug === row.model)) ||
   modelPolicyAliasTargets(lists, row.model).length > 0 ||
-  (own.some((provider) => provider.models !== undefined) &&
-    (MODEL_POLICY_DRIVER_ALIASES[row.driver] ?? []).some(
-      (alias) => alias.toLowerCase() === row.model.toLowerCase(),
-    ));
+  (MODEL_POLICY_DRIVER_ALIASES[row.driver] ?? []).some(
+    (alias) => alias.toLowerCase() === row.model.toLowerCase(),
+  );
 
 /**
  * Rows whose model no list of their driver holds on some selected machine, by id or alias: a
@@ -199,7 +197,7 @@ export function staleModelPolicyRows(
       const own = machineProviders.filter((provider) => provider.driver === row.driver);
       const lists = own.flatMap(providerLists);
       if (!lists.some((list) => list.length > 0)) return false;
-      return !machineHoldsModel(own, lists, row);
+      return !machineHoldsModel(lists, row);
     }),
   );
 }

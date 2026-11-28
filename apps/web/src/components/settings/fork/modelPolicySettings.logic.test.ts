@@ -1,4 +1,9 @@
-import { MODEL_POLICY_START_ROWS, ProviderDriverKind, ServerSettings } from "@t3tools/contracts";
+import {
+  checkModelPolicyPick,
+  MODEL_POLICY_START_ROWS,
+  ProviderDriverKind,
+  ServerSettings,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -367,6 +372,9 @@ describe("staleModelPolicyRows (#876 M6)", () => {
     };
     // `opus` is Claude Code's own alias: not stale even where no list names it.
     expect(staleModelPolicyRows(rows.slice(1, 3), [folder])).toEqual([]);
+    // A provider with only a folder's list still resolves its own alias.
+    const folderOnly = { driver: "claudeAgent", workspaceSnapshots: folder.workspaceSnapshots };
+    expect(staleModelPolicyRows([rows[2]!], [folderOnly])).toEqual([]);
   });
 
   it("flags nothing for a driver whose model list is not known here", () => {
@@ -479,6 +487,103 @@ describe("modelPolicyListedRows: rows picked from the live model list (#876 M6)"
       { driver: "codex", model: "gpt-mini", efforts: ["low"] },
       { driver: "opencode", model: "big", efforts: ["high"] },
     ]);
+  });
+
+  it("never offers a choice that sends no effort: Claude's default for a gateway model (lens major)", () => {
+    // As the Claude driver lists a model outside its catalog: `default` sends none, Claude Code picks.
+    const gateway = {
+      driver: "claudeAgent",
+      models: [
+        {
+          slug: "my-gateway-model",
+          name: "Gateway",
+          ...effort([{ id: "default", isDefault: true }, { id: "low" }, { id: "high" }]),
+        },
+      ],
+    };
+    const [row] = modelPolicyListedRows([], [gateway]).map((entry) => entry.row);
+    expect(row).toEqual({
+      driver: "claudeAgent",
+      model: "my-gateway-model",
+      efforts: ["low", "high"],
+    });
+    // The server check refuses the pick of `default` under that row: it names no effort.
+    const pick = (value: string) => ({
+      driver: "claudeAgent",
+      model: "my-gateway-model",
+      options: [{ id: "effort", value }],
+    });
+    expect(checkModelPolicyPick([row!], pick("default"))).toMatchObject({ inside: false });
+    expect(checkModelPolicyPick([row!], pick("high"))).toMatchObject({ inside: true });
+    // Another driver's `default` is a choice like any other.
+    const other = {
+      driver: "fx",
+      models: [{ slug: "m", name: "M", ...effort([{ id: "default" }]) }],
+    };
+    expect(modelPolicyListedRows([], [other])[0]!.row.efforts).toEqual(["default"]);
+  });
+
+  it("never offers ultracode as an effort choice (a machine on an older build lists it so)", () => {
+    const old = {
+      driver: "claudeAgent",
+      models: [
+        {
+          slug: "claude-opus-5-5",
+          name: "Opus 5.5",
+          ...effort([{ id: "high", isDefault: true }, { id: "xhigh" }, { id: "ultracode" }]),
+        },
+      ],
+    };
+    expect(modelPolicyListedRows([], [old])[0]!.row).toEqual({
+      driver: "claudeAgent",
+      model: "claude-opus-5-5",
+      efforts: ["high", "xhigh"],
+      defaultEffort: "high",
+    });
+  });
+
+  it("a model that turns ultracode on by default gets a row that allows the pick leaving it out", () => {
+    const model = effort([{ id: "high" }, { id: "xhigh", isDefault: true }]);
+    const ultracodeOn = {
+      driver: "claudeAgent",
+      models: [
+        {
+          slug: "claude-opus-5-5",
+          name: "Opus 5.5",
+          capabilities: {
+            optionDescriptors: [
+              ...model.capabilities.optionDescriptors,
+              { id: "ultracode", label: "Ultracode", type: "boolean", currentValue: true },
+            ],
+          },
+        },
+      ],
+    };
+    const [row] = modelPolicyListedRows([], [ultracodeOn]).map((entry) => entry.row);
+    expect(row).toEqual({
+      driver: "claudeAgent",
+      model: "claude-opus-5-5",
+      efforts: ["high", "xhigh", "ultracode"],
+      defaultEffort: "ultracode",
+    });
+    // As the server reads a pick that leaves the toggle out here (the default on), and for a
+    // linked machine (read both ways): both inside, so a Save of this row refuses neither.
+    const here = {
+      driver: "claudeAgent",
+      model: "claude-opus-5-5",
+      options: [
+        { id: "effort", value: "high" },
+        { id: "ultracode", value: true },
+      ],
+    };
+    expect(checkModelPolicyPick([row!], here)).toMatchObject({ inside: true });
+    const remote = {
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "xhigh" }],
+      ultracodeMaybeDefault: true,
+      ultracodeDefaultUnknown: true,
+    };
+    expect(checkModelPolicyPick([row!], remote)).toMatchObject({ inside: true });
   });
 
   it("leaves out models a row already names, and lists a model once across machines", () => {
