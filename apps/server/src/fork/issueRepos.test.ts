@@ -204,7 +204,7 @@ describe("IssueService with .t3code/issues.json", () => {
           Layer.provide(
             Layer.mergeAll(
               Layer.mock(IssueTrackerBindings.IssueTrackerBindingsRepository)({
-                list: Effect.succeed(new Map()),
+                list: () => Effect.succeed(new Map()),
               }),
               Layer.succeed(
                 IssueTrackerRegistry.IssueTrackerRegistry,
