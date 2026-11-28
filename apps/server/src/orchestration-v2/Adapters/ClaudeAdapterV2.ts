@@ -263,6 +263,7 @@ import {
   makeSubagentConversationArtifacts,
   subagentThreadTitle,
 } from "@t3tools/provider-core/server/subagentProjection";
+import * as BackgroundWait from "../../fork/backgroundWait.ts"; // Fork: background wait (F7)
 
 export const CLAUDE_PROVIDER = ProviderDriverKind.make("claudeAgent");
 /** The query exited before the turn attached, so the prompt was never offered. */
@@ -11408,6 +11409,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             });
             rosterChanged = true;
           } else if (message.type === "system" && message.subtype === "task_notification") {
+            yield* BackgroundWait.remember(input.nativeThreadId, message); // Fork: background wait (F7)
             yield* endClaudeMonitorTasks((taskId) => taskId === message.task_id);
             yield* Ref.update(toolUseIdsByTaskId, (current) => {
               if (!current.has(message.task_id)) return current;

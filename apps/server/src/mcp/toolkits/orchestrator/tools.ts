@@ -50,6 +50,7 @@ import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
+import * as BackgroundWait from "../../../fork/backgroundWait.ts"; // Fork: background wait (F7)
 
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
@@ -165,6 +166,8 @@ const BackgroundWaitTool = Tool.make("t3_background_wait", {
   // Only marks which tasks keep the thread Working; Claude Plan mode blocks tools without this.
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
+  .setParameters(BackgroundWait.Parameters) // Fork: background wait (F7)
+  .setSuccess(BackgroundWait.Success) // Fork: background wait (F7)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenWithoutBackgroundWait);
 
 const ScheduleTaskTool = Tool.make("schedule_task", {
