@@ -13,7 +13,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import weakened_tests as wt   # noqa: E402
 
-for _k in [k for k in os.environ if k.startswith('GIT_')]:
+# The runner's GIT_CONFIG_COUNT/KEY/VALUE stay: git's auto maintenance off (.github/scripts/fork-ci-tests.cjs).
+for _k in [k for k in os.environ if k.startswith('GIT_')
+           and not k.startswith(('GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))]:
     del os.environ[_k]
 ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
        'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}

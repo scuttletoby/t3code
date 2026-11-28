@@ -17,7 +17,9 @@ sys.path.insert(0, HERE)
 import job_changed   # noqa: E402
 
 # A caller's GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE ... would point every git call here (and the step's) at another repo.
-for _k in [k for k in os.environ if k.startswith('GIT_')]:
+# The runner's GIT_CONFIG_COUNT/KEY/VALUE stay: git's auto maintenance off (.github/scripts/fork-ci-tests.cjs).
+for _k in [k for k in os.environ if k.startswith('GIT_')
+           and not k.startswith(('GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))]:
     del os.environ[_k]
 
 ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',

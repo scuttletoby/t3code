@@ -395,6 +395,27 @@ const THIS_WORKFLOW = ".github/workflows/fork-tests.yml";
 const UNITTEST_SHIM = ".github/scripts/fork-ci-unittest.py";
 // The node --test reporter each node test also reports to, which counts its tests (countTests()).
 const NODE_COUNTS = ".github/scripts/fork-ci-node-counts.cjs";
+// Git settings every test's git gets: no auto maintenance and no auto gc. A newer git (the runners' 2.56; not 2.43)
+// runs `git maintenance run --auto` detached after a commit, merge or fetch, so it takes and drops
+// .git/objects/maintenance.lock in a test's scratch repository while the test's cleanup removes that folder
+// (FileNotFoundError: 'maintenance.lock'). Through GIT_CONFIG_COUNT, after any the caller set, so a test's own HOME,
+// GIT_CONFIG_GLOBAL or GIT_CONFIG_NOSYSTEM keeps them, and a test that drops the caller's GIT_* keeps GIT_CONFIG_*.
+const QUIET_GIT = [
+  ["maintenance.auto", "false"],
+  ["gc.auto", "0"],
+];
+
+// `env` with QUIET_GIT added as GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n after the entries it has.
+function quietGit(env) {
+  const have = Number(env.GIT_CONFIG_COUNT ?? "0");
+  const start = Number.isInteger(have) && have > 0 ? have : 0;
+  const out = { ...env, GIT_CONFIG_COUNT: String(start + QUIET_GIT.length) };
+  QUIET_GIT.forEach(([key, value], i) => {
+    out[`GIT_CONFIG_KEY_${start + i}`] = key;
+    out[`GIT_CONFIG_VALUE_${start + i}`] = value;
+  });
+  return out;
+}
 // The listed tests another workflow or script runs (`run by` it in the list). Any other `run by` names fork-tests.yml:
 // a fork test's own runs (recorded) or upstream's tests in its `test` job. This table, not a test's name, decides where
 // a test may run, so a fork test named like upstream's cannot leave the records either. fork-contracts.test.py pins it.
@@ -838,7 +859,7 @@ function jobCount(env = process.env) {
 // the counts file go on its line). The caller's records folder and counts file never reach the test: a test of this
 // runner must not write into them.
 function command(file, run = null, env = process.env, counts = null) {
-  const childEnv = { ...env };
+  const childEnv = quietGit(env);
   delete childEnv.FORK_CI_TEST_RECORDS;
   delete childEnv.FORK_CI_TEST_COUNTS;
   // A runner run by node --test (its own tests) must not hand that on: node would report to it, not to the reporters.
@@ -864,7 +885,11 @@ function command(file, run = null, env = process.env, counts = null) {
   const argv = [...base, ...shim, file, ...(run.only ? ["-v", run.only] : [])];
   if (run.root) {
     const pass = env.GITHUB_ACTIONS === undefined ? [] : [`GITHUB_ACTIONS=${env.GITHUB_ACTIONS}`];
-    return { argv: ["sudo", "-n", "env", ...run.vars, ...pass, ...count, ...argv], env: childEnv };
+    const git = Object.entries(quietGit({})).map(([k, v]) => `${k}=${v}`);
+    return {
+      argv: ["sudo", "-n", "env", ...run.vars, ...pass, ...git, ...count, ...argv],
+      env: childEnv,
+    };
   }
   for (const word of run.vars) {
     const at = word.indexOf("=");
@@ -1274,6 +1299,8 @@ module.exports = {
   RUN_ELSEWHERE,
   UNITTEST_SHIM,
   NODE_COUNTS,
+  QUIET_GIT,
+  quietGit,
   ownRuns,
   runKey,
   expectedKeys,
