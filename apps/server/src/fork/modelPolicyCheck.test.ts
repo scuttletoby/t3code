@@ -44,7 +44,11 @@ import { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
-import { withUltracodeToggle } from "../provider/ClaudeModelCatalog.ts";
+import {
+  BUNDLED_CLAUDE_MODEL_CATALOG,
+  claudeReportedModels,
+  withUltracodeToggle,
+} from "../provider/ClaudeModelCatalog.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -549,6 +553,56 @@ describe("a selection as the policy reads it", () => {
       options: [{ id: "variant", value: DEFAULT_VARIANT_CHOICE_ID }],
     };
     assert.deepStrictEqual(modelPolicyPickEfforts(pick), []);
+  });
+
+  it("Claude's default effort choice for a gateway model, which sends no effort, is no effort", () => {
+    // The model as the Claude driver lists one outside its catalog: its effort select's default.
+    const { models } = claudeReportedModels(
+      BUNDLED_CLAUDE_MODEL_CATALOG,
+      [],
+      [
+        {
+          value: "my-gateway-model",
+          displayName: "Gateway",
+          description: "",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "high"],
+        },
+      ],
+    );
+    const descriptor = models[0]?.capabilities?.optionDescriptors?.find(
+      (candidate) => candidate.id === "effort",
+    );
+    const choice =
+      descriptor?.type === "select"
+        ? descriptor.options.find((option) => option.isDefault === true)?.id
+        : undefined;
+    assert.isDefined(choice);
+    const INSTANCE = ProviderInstanceId.make("claudeAgent");
+    const gateway = {
+      instanceId: INSTANCE,
+      driver: ProviderDriverKind.make("claudeAgent"),
+      models,
+    } as unknown as ServerProvider;
+    const rows: ReadonlyArray<ModelPolicyRow> = [
+      {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        model: "my-gateway-model",
+        efforts: ["low", "high"],
+      },
+    ];
+    const read = (value: string) =>
+      ModelPolicyCheck.pickOfSelection(
+        [gateway],
+        { instanceId: INSTANCE, model: "my-gateway-model", options: [{ id: "effort", value }] },
+        true,
+      );
+    assert.deepStrictEqual(modelPolicyPickEfforts(read(choice!)), []);
+    assert.include(
+      refusal(policy("enforce", rows), read(choice!)),
+      "needs an effort from its row, and the pick names none",
+    );
+    assert.isUndefined(refusal(policy("enforce", rows), read("high")));
   });
 });
 
