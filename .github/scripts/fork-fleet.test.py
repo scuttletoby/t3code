@@ -3459,13 +3459,14 @@ class Launcher(unittest.TestCase):
         """check-net's probe `name` (OWN_PROBE or PROBE, the launcher's own text) with a fake timeout whose connect
         to this host's own address gets `outcome`: open (it answers), refused (the nft table's reject), drop (no
         answer: the unit's IPAddressDeny drops the packet in the kernel, or a router), eperm (a filter's local
-        refusal) or reset (a RST: the packet got through to a closed port); curl answers 200. Its exit and lines."""
+        refusal), reset (a RST: the packet got through to a closed port) or killed (the connect killed, SIGKILL or
+        the OOM killer: rc 137 and nothing said); curl answers 200. Its exit and lines."""
         with open(LAUNCH) as f:
             code = f.read().split(f"read -r -d '' {name} <<'EOF' || true\n", 1)[1].split('\nEOF\n', 1)[0]
         bin_ = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, bin_, True)
         errors = {'refused': 'No route to host', 'eperm': 'Operation not permitted', 'reset': 'Connection refused'}
-        fake = {'open': 'exit 0', 'drop': 'exit 124'}.get(outcome) or (
+        fake = {'open': 'exit 0', 'drop': 'exit 124', 'killed': 'exit 137'}.get(outcome) or (
             f'echo "bash: connect: {errors[outcome]}" >&2; '
             f'echo "bash: line 1: /dev/tcp/$5/443: {errors[outcome]}" >&2; exit 1')
         for tool, body in (('timeout', fake), ('curl', 'printf 200')):
@@ -3494,8 +3495,10 @@ class Launcher(unittest.TestCase):
                 rc, out = self.own_probe('OWN_PROBE', outcome, own)
                 self.assertEqual(rc, 1, out)
                 self.assertIn(f"FAIL  this host's own public address {own} {why}", out)
-        rc, out = self.own_probe('OWN_PROBE', 'refused', '')
-        self.assertEqual((rc, out), (1, 'FAIL  no own public address to try\n'))
+        for nothing in ('', ' \n\t'):
+            with self.subTest(own=nothing):
+                rc, out = self.own_probe('OWN_PROBE', 'refused', nothing)
+                self.assertEqual((rc, out), (1, 'FAIL  no own public address to try\n'))
         # The job's own sandbox (PROBE), after the table alone refused it: dropped by IPAddressDeny passes, as does a
         # refusal; reached, or a reset, fails.
         url = 'https://example.com/'
@@ -3507,8 +3510,10 @@ class Launcher(unittest.TestCase):
                 self.assertEqual(self.own_probe('PROBE', outcome, url, own, 'refused'),
                                  (0, f"ok    this host's own public address {own} {line}\n"
                                      f'ok    {url} answers (HTTP 200)\n'))
+        # Only a timeout (rc 124) with nothing said is the drop: a connect killed silently (rc 137) proves nothing.
         for outcome, why in (('open', 'is reachable from inside'),
-                             ('reset', 'is not refused by the walls (bash: connect: Connection refused')):
+                             ('reset', 'is not refused by the walls (bash: connect: Connection refused'),
+                             ('killed', 'is not refused by the walls (exit 137, nothing said)')):
             with self.subTest(job=outcome):
                 rc, out = self.own_probe('PROBE', outcome, url, own, 'refused')
                 self.assertEqual(rc, 1, out)

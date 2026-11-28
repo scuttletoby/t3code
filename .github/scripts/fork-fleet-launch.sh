@@ -1601,7 +1601,7 @@ kill_unit() {
 # no refusal): PROBE takes that silence as closed only once this probe saw the table refuse each of them.
 read -r -d '' OWN_PROBE <<'EOF' || true
 bad=0
-[[ -n $1 ]] || { echo "FAIL  no own public address to try"; bad=1; }
+[[ $1 =~ [^[:space:]] ]] || { echo "FAIL  no own public address to try"; bad=1; }
 for own in $1; do
   if err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1); then
     echo "FAIL  this host's own public address $own is reachable from inside with the table alone"
@@ -1620,11 +1620,14 @@ EOF
 # walls must refuse, $3 `refused` when OWN_PROBE saw the table alone refuse each of them (else `unproven`), then HOST
 # PORT pairs that must be closed. An own address must get a refusal, or no answer at all only after OWN_PROBE passed
 # (the unit's IPAddressDeny drops it before the table: the one difference between the two units); an answer, any
-# other error (a reset: the packet got through) or no answer without that proof fails.
+# other error (a reset: the packet got through) or no answer without that proof fails. No answer is timeout's own
+# exit (124) with nothing said: a connect that ended silently any other way (killed: SIGKILL, the OOM killer) fails.
 read -r -d '' PROBE <<'EOF' || true
 url=$1 table=$3 bad=0
 for own in $2; do
-  if err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1); then
+  ec=0
+  err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1) || ec=$?
+  if ((ec == 0)); then
     echo "FAIL  this host's own public address $own is reachable from inside"
     bad=1
   elif [[ $table != refused ]]; then
@@ -1632,10 +1635,10 @@ for own in $2; do
     bad=1
   elif [[ $err =~ (Operation\ not\ permitted|No\ route\ to\ host|Permission\ denied|Network\ is\ unreachable) ]]; then
     echo "ok    this host's own public address $own is refused (${BASH_REMATCH[1]})"
-  elif [[ -z $err ]]; then
+  elif ((ec == 124)) && [[ -z $err ]]; then
     echo "ok    this host's own public address $own gets no answer (the unit's IPAddressDeny drops it; the table alone refuses it, above)"
   else
-    echo "FAIL  this host's own public address $own is not refused by the walls ($err)"
+    echo "FAIL  this host's own public address $own is not refused by the walls (${err:-exit $ec, nothing said})"
     bad=1
   fi
 done
