@@ -1,0 +1,5 @@
+- Change: fork-ci: CI actions any repository can pin (docs-scope, gradle-cache, job-changed, fleet-route, ci-demand, pinned, test-select, doc-check), with their own releases.
+- Why: Shared CI building blocks, kept general.
+- Setting: none
+- Default: only where pinned
+- PR: [#15](https://github.com/scuttletoby/t3code/pull/15), [#16](https://github.com/scuttletoby/t3code/pull/16), [#27](https://github.com/scuttletoby/t3code/pull/27), [#35](https://github.com/scuttletoby/t3code/pull/35), [#55](https://github.com/scuttletoby/t3code/pull/55), [#94](https://github.com/scuttletoby/t3code/pull/94), [#113](https://github.com/scuttletoby/t3code/pull/113), [#141](https://github.com/scuttletoby/t3code/pull/141), [#256](https://github.com/scuttletoby/t3code/pull/256)

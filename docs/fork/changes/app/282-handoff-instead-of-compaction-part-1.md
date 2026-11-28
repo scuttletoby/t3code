@@ -1,0 +1,5 @@
+- Change: Handoff instead of compaction, part 1: the setting and the pure "should this thread hand off now?" decision. Nothing acts on it yet.
+- Why: Long threads keep their children, PRs and waits instead of compacting.
+- Setting: `server.handoff`, `projectOverride.handoff`
+- Default: off
+- PR: [#282](https://github.com/scuttletoby/t3code/pull/282)

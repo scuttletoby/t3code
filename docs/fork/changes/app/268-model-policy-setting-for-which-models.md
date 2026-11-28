@@ -1,0 +1,5 @@
+- Change: Model policy: the setting for which models (and efforts) agents may pick, per provider driver: off, advise or enforce, and the allowed rows. The server checks an agent's pick (`delegate_task`, `create_threads`, `t3_thread_launch`, `t3_thread_configure`, here, before and after it goes to linked machines, Claude's Agent tool, and a Claude skill that starts a sub-agent or names a model): a model in no row, a call that names no model, or an effort off its row is refused in enforce, only noted in advise. A person's own pick is never refused; Settings marks one outside the rows. A bad hand edit or a settings file that does not parse, refuses every agent pick (a warning in advise). Settings offers the fork's start rows (Opus 5.5 and Fable 5.2) while none are saved. While it is on, a child whose call names its model keeps only the options it names.
+- Why: Agents should use the models the person chose for each kind of work.
+- Setting: `server.modelPolicy`
+- Default: off
+- PR: [#268](https://github.com/scuttletoby/t3code/pull/268), [#731](https://github.com/scuttletoby/t3code/issues/731), [#128](https://github.com/scuttletoby/t3code/issues/128)

@@ -1,0 +1,5 @@
+- Change: Checks that refuse database schema and migration changes, fork changes to some upstream files, and fork lines outside the pinned seams.
+- Why: Keep the fork thin, so upstream syncs stay easy and a database never needs a fork step.
+- Setting: none
+- Default: always
+- PR: [#3](https://github.com/scuttletoby/t3code/pull/3), [#97](https://github.com/scuttletoby/t3code/pull/97), [#185](https://github.com/scuttletoby/t3code/pull/185)

@@ -1,0 +1,5 @@
+- Change: Playtest mode, part 2: the session store and service: start (claim), rounds of push steps, end (release), kept across restarts. A session keeps the steps it started with. No tool calls it yet.
+- Why: A person tries an agent's unfinished work on a test target, round after round, no PR per round.
+- Setting: `server.playtest`, `projectOverride.playtest`
+- Default: off
+- PR: [#261](https://github.com/scuttletoby/t3code/pull/261)

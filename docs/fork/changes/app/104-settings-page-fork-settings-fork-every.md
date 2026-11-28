@@ -1,0 +1,5 @@
+- Change: The Settings page **Fork** (`/settings/fork`): every fork setting in one place, grouped by what a person wants to do, each with one line of help saying what on and off do and its default, rare options under Advanced, and one line per feature at the top saying whether it is on: waits, wait checks, agent slots, usage pacing (per account by name), model policy, review rules, automatic updates, handoff, playtest and MCP profiles.
+- Why: Change every fork setting without editing a file.
+- Setting: `server.waitFor`, `server.waitChecks`, `server.agentSlots`, `server.usagePacing`, `server.usagePacingGate`, `server.usagePacingLowerEffort`, `server.reviewRules`, `server.modelPolicy`, `server.automaticUpdates`, `server.automaticUpdatesQuietCommand`, `server.handoff`, `server.playtest`, `server.mcpProfiles`, `server.mcpProfile`, `server.mcpSubagentProfile`, `server.mcpThreadProfiles`
+- Default: off
+- PR: [#104](https://github.com/scuttletoby/t3code/pull/104), [#543](https://github.com/scuttletoby/t3code/pull/543), [#544](https://github.com/scuttletoby/t3code/pull/544)

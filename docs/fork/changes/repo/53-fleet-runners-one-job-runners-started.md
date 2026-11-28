@@ -1,0 +1,5 @@
+- Change: Fleet runners: one-job runners started on demand on the repository's own machines, each behind walls, plus a link from a desktop machine.
+- Why: Use spare machines for CI without letting a job reach the host.
+- Setting: repository variable `CI_RUNNERS`
+- Default: `auto`
+- PR: [#53](https://github.com/scuttletoby/t3code/pull/53), [#74](https://github.com/scuttletoby/t3code/pull/74), [#191](https://github.com/scuttletoby/t3code/pull/191), [#192](https://github.com/scuttletoby/t3code/pull/192), [#194](https://github.com/scuttletoby/t3code/pull/194), [#195](https://github.com/scuttletoby/t3code/pull/195), [#196](https://github.com/scuttletoby/t3code/pull/196), [#197](https://github.com/scuttletoby/t3code/pull/197), [#198](https://github.com/scuttletoby/t3code/pull/198), [#205](https://github.com/scuttletoby/t3code/pull/205), [#208](https://github.com/scuttletoby/t3code/pull/208)

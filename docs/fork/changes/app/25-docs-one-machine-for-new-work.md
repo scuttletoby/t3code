@@ -1,0 +1,5 @@
+- Change: Docs: one machine for new work through upstream's load-balancing weights; settings saved with an early draft's client setting for it still load.
+- Why: Upstream already has the feature, so the fork's own setting was removed.
+- Setting: none
+- Default: -
+- PR: [#25](https://github.com/scuttletoby/t3code/pull/25)

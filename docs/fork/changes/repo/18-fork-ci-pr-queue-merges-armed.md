@@ -1,0 +1,5 @@
+- Change: fork-ci PR queue: merges armed pull requests in order once their reviews and checks pass.
+- Why: Merges without someone watching each pull request.
+- Setting: none
+- Default: only where used
+- PR: [#18](https://github.com/scuttletoby/t3code/pull/18), [#19](https://github.com/scuttletoby/t3code/pull/19), [#20](https://github.com/scuttletoby/t3code/pull/20), [#21](https://github.com/scuttletoby/t3code/pull/21), [#32](https://github.com/scuttletoby/t3code/pull/32), [#61](https://github.com/scuttletoby/t3code/pull/61), [#70](https://github.com/scuttletoby/t3code/pull/70), [#71](https://github.com/scuttletoby/t3code/pull/71)

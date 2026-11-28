@@ -1,7 +1,7 @@
 # About this fork
 
 Fork only. This page says what the fork is, how to install and update it, what it adds today and
-what is planned. Every change, one line each, is in [FORK_CHANGES.md](../../FORK_CHANGES.md); every
+what is planned. Every change, one file each, is listed from [FORK_CHANGES.md](../../FORK_CHANGES.md); every
 setting with its default is in [README.md](README.md).
 
 ## What it is

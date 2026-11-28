@@ -339,10 +339,10 @@ are announced.
    that decision as `decidedIn`.
 4. An agent tool may not write it: `FORK_AGENT_WRITABLE_KEYS` stays empty unless a pull request gives
    the reason.
-5. Add its row and section to [README.md](README.md) and name it in
-   [FORK_CHANGES.md](../../FORK_CHANGES.md); `packages/shared/src/forkDocs.test.ts` (the README) and
-   `.github/scripts/fork-changes-list.test.cjs` (FORK_CHANGES.md) fail until both match the row in
-   `forkDefaults.ts`.
+5. Add its row and section to [README.md](README.md) and name it in its change's file under
+   [changes/](changes/) ([FORK_CHANGES.md](../../FORK_CHANGES.md) says how);
+   `packages/shared/src/forkDocs.test.ts` (the README) and `.github/scripts/fork-changes-list.test.cjs`
+   (the change files) fail until both match the row in `forkDefaults.ts`.
 
 A key written straight into `settings.ts` is refused by the seam check, whatever its comment says.
 

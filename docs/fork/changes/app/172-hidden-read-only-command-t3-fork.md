@@ -1,0 +1,5 @@
+- Change: A hidden read-only command, `t3 __fork-report --base-dir <home>`, prints what a T3 home holds and which fork features are on, and where.
+- Why: The go-live kit checks a build and a home before switching, without writing anything.
+- Setting: none
+- Default: only when run
+- PR: [#172](https://github.com/scuttletoby/t3code/pull/172), [#184](https://github.com/scuttletoby/t3code/pull/184)

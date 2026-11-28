@@ -1,0 +1,5 @@
+- Change: Assistant setup: the switch `assistant.enabled` (off) offers **Make assistant** in Settings, which makes a thread in the Scratch project, names it `threadRoles.assistant` and picks for it the new built-in MCP profile `assistant` (no outside servers, no shell, file or web tools; T3 tool groups `orchestration`, `threads` and `projects`). Claude only.
+- Why: One thread you talk to across projects, with only T3's tools.
+- Setting: `server.assistant`, `server.mcpProfiles`
+- Default: off
+- PR: [#953](https://github.com/scuttletoby/t3code/pull/953)

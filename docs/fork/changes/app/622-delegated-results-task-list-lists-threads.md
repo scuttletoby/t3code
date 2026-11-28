@@ -1,0 +1,5 @@
+- Change: Delegated results: `task_list` lists a thread's delegated tasks whose result it has not read, and its running children per place from live status; a parent whose finished child's result never arrived gets one reminder.
+- Why: A finished child's result can no longer sit unseen.
+- Setting: `server.waitFor` (the reminder)
+- Default: off; `task_list` always (read only)
+- PR: [#622](https://github.com/scuttletoby/t3code/pull/622), [#641](https://github.com/scuttletoby/t3code/pull/641)
