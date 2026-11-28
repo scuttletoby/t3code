@@ -45,6 +45,7 @@ import { textDirection } from "~/textDirection";
 import { useClientSettings } from "../../hooks/useSettings";
 import { GuestShareIndicator } from "./GuestShareControls";
 import { SharedTooltipTrigger } from "../ui/shared-tooltip";
+import { ForkThreadRoleBadge } from "../fork/calmSidebar/ForkThreadRoleBadge"; // Fork (calm sidebar)
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -407,6 +408,7 @@ export const ChatHeader = memo(function ChatHeader({
               </T>
             </SharedTooltipTrigger>
           ) : null}
+          {renamingTitle === null ? <ForkThreadRoleBadge threadRef={activeThreadRef} /> : null}
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>
       {isServerThread ? <GuestShareIndicator threadRef={activeThreadRef} /> : null}
