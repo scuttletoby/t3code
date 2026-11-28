@@ -1,7 +1,6 @@
 // Fork only: cuts Test Server's file list as upstream's sequencer does, but by .github/fork-server-test-seconds.json
 // (upstream's shardWeights.json lacks most fork files), and prints one shard's files for `vp run test:cached`.
-// Usage and the table: .github/fork-server-test-seconds.md (`--shard i/n`, `--plan n`, `--refresh`).
-const childProcess = require("node:child_process");
+// Usage and the table: .github/fork-server-test-seconds.md (`--shard i/n`, `--plan n`, `--refresh --logs <dir>`).
 const fs = require("node:fs");
 const path = require("node:path");
 const url = require("node:url");
@@ -135,42 +134,6 @@ function buildTable(logs, runs) {
   };
 }
 
-const gh = (...args) =>
-  childProcess.execFileSync("gh", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-
-function fetchLogs(runCount) {
-  const repo = gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").trim();
-  const runs = JSON.parse(
-    gh(
-      "run",
-      "list",
-      "-R",
-      repo,
-      "-w",
-      "fork-tests.yml",
-      "-b",
-      "main",
-      "-e",
-      "push",
-      "-s",
-      "success",
-      "-L",
-      String(runCount),
-      "--json",
-      "databaseId",
-    ),
-  ).map((run) => run.databaseId);
-  const logs = [];
-  for (const run of runs) {
-    const jobs = JSON.parse(gh("api", `repos/${repo}/actions/runs/${run}/jobs?per_page=100`)).jobs;
-    for (const job of jobs.filter(
-      (j) => j.name.startsWith("Test Server") && j.conclusion === "success",
-    ))
-      logs.push(gh("api", `repos/${repo}/actions/jobs/${job.id}/logs`, "--allow-escape-sequences"));
-  }
-  return { runs, logs };
-}
-
 function savedLogs(dir) {
   const names = fs
     .readdirSync(dir)
@@ -182,6 +145,13 @@ function savedLogs(dir) {
   };
 }
 
+// As `vp fmt` writes it (runs on one line while it fits in 100 columns), so a refresh leaves no format diff.
+function tableText(table) {
+  const text = JSON.stringify(table, null, 2);
+  const inline = `  "runs": [${table.runs.map((run) => JSON.stringify(run)).join(", ")}],`;
+  return `${inline.length <= 100 ? text.replace(/ {2}"runs": \[[^\]]*\],/, inline) : text}\n`;
+}
+
 const stripColour = (text) => text.replace(/\x1b\[[0-9;]*m/g, "");
 
 async function main(argv) {
@@ -190,12 +160,12 @@ async function main(argv) {
     return at === -1 ? undefined : argv[at + 1];
   };
   if (argv.includes("--refresh")) {
-    const { runs, logs } = arg("--logs")
-      ? savedLogs(arg("--logs"))
-      : fetchLogs(Number(arg("--runs") ?? 5));
+    // Saved first (.github/fork-server-test-seconds.md): fork scripts reach gh only through fork-gh-guard.sh.
+    if (!arg("--logs")) throw new Error("--refresh needs --logs <dir> of saved Test Server logs");
+    const { runs, logs } = savedLogs(arg("--logs"));
     const table = buildTable(logs.map(stripColour), runs);
     if (Object.keys(table.files).length === 0) throw new Error("no file times in the logs");
-    fs.writeFileSync(path.join(root, TABLE), `${JSON.stringify(table, null, 2)}\n`);
+    fs.writeFileSync(path.join(root, TABLE), tableText(table));
     console.log(
       `${TABLE}: ${Object.keys(table.files).length} files from runs ${table.runs.join(", ")}`,
     );
@@ -232,4 +202,13 @@ if (require.main === module)
     process.exit(1);
   });
 
-module.exports = { readTable, weigh, split, parseLog, buildTable, median, UPSTREAM_UNRECORDED };
+module.exports = {
+  readTable,
+  weigh,
+  split,
+  parseLog,
+  buildTable,
+  tableText,
+  median,
+  UPSTREAM_UNRECORDED,
+};

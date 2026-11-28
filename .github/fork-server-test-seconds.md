@@ -27,13 +27,19 @@ To see the split without running anything:
 
 ## Refresh
 
-When the shards' Test step times drift apart, refresh the table. This needs `gh` with read access
-to the repository's Actions logs:
+When the shards' Test step times drift apart, refresh the table from the Test Server logs of the
+last green pushes to main. Save them first (`gh` with read access to the Actions logs):
 
-    node .github/scripts/fork-server-shards.cjs --refresh            # the last 5 green pushes to main
-    node .github/scripts/fork-server-shards.cjs --refresh --runs 10
-    node .github/scripts/fork-server-shards.cjs --refresh --logs <dir>  # saved logs: <runId>-<jobId>.log
+    dir=$(mktemp -d)
+    for run in $(gh run list -w fork-tests.yml -b main -e push -s success -L 5 --json databaseId -q '.[].databaseId'); do
+      for job in $(gh api "repos/{owner}/{repo}/actions/runs/$run/jobs?per_page=100" \
+          -q '.jobs[] | select(.name | startswith("Test Server")) | .id'); do
+        gh api "repos/{owner}/{repo}/actions/jobs/$job/logs" --allow-escape-sequences > "$dir/$run-$job.log"
+      done
+    done
+    node .github/scripts/fork-server-shards.cjs --refresh --logs "$dir"
 
+The script itself never calls `gh`: fork scripts reach it only through `fork-gh-guard.sh`.
 The same logs always give the same file. Commit it in a PR of its own. The table and the script are
 never fork-owned (`!` in `.github/fork-owned-paths.txt`), so that PR runs Test Server with the new
 split.

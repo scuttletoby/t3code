@@ -9,6 +9,7 @@ const {
   split,
   parseLog,
   buildTable,
+  tableText,
   UPSTREAM_UNRECORDED,
 } = require("./fork-server-shards.cjs");
 
@@ -143,10 +144,10 @@ test("the table is each file's median over the logs, rounded, sorted, and the sa
   assert.ok(readTable(JSON.stringify(built)).files);
 });
 
-test("the committed table is usable", () => {
-  const got = readTable(
-    fs.readFileSync(path.join(root, ".github/fork-server-test-seconds.json"), "utf8"),
-  );
+test("the committed table is usable, and a refresh writes it as vp fmt does (no format diff)", () => {
+  const text = fs.readFileSync(path.join(root, ".github/fork-server-test-seconds.json"), "utf8");
+  assert.equal(tableText(JSON.parse(text)), text);
+  const got = readTable(text);
   assert.equal(got.why, undefined);
   assert.ok(Object.keys(got.files).length > 100);
 });
