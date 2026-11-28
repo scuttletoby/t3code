@@ -197,7 +197,8 @@ sh fork-kit-bootstrap.sh --kit agent-guards --repo OWNER/FORK --sha RELEASE_SHA 
 
 The installer ([sbin/agent-guards-install](sbin/agent-guards-install), on the shared
 [kit_install.py](../common/kit_install.py)) copies the release to `/usr/local/libexec/agent-guards/versions/<sha>/`,
-self-tests the copy, and links `/usr/local/bin/<hook>`, `/usr/local/bin/agent-guards` and `/usr/local/bin/facts` to it. It is safe to run
+self-tests the copy, and links `/usr/local/bin/<hook>`, `/usr/local/bin/agent-guards`, `/usr/local/bin/facts` and the
+ready-made commands (`/usr/local/bin/fork-ci-why`, `fork-clone`, `fork-precheck`) to it. It is safe to run
 again and to stop at any step. `facts` is a common name: when `/usr/local/bin/facts` is something other than the kit's
 link, the installer leaves it alone and says so (a warning; the install goes on, and uninstall does not remove it or
 wait for it to stop running). Installing a release from before `facts` was added leaves `/usr/local/bin/facts` as a
@@ -252,6 +253,42 @@ big a Read, how many one-read turns) are machine settings with general defaults;
 beside them. The tables themselves live with the machine or the
 project they describe, never in the kit. Nothing in the hooks names a project, a person or a path of one machine.
 
+## Ready-made commands
+
+Pipelines agents used to rebuild each time, several turns each, as one command ([COMMANDS.md](COMMANDS.md), code in
+[lib/agent_guards/kitcmds.py](lib/agent_guards/kitcmds.py); `<command> --help` for the usage):
+
+- `fork-ci-why <pr>`: each failing required check on the pull request's head, its job link and only its log's error
+  lines (ANSI colours and timestamps stripped). The PR is read from the fork (`-R` for another repository), never
+  from the repository `gh` would pick, and its URL is the first line printed. Needs `gh` signed in.
+- `fork-clone <name> [branch]`: a blob-less clone into the work folder (`$FORK_WORK_DIR`, else `~/work`); the install
+  is offline from the package store when another clone there has the same `pnpm-lock.yaml` and its own installed
+  `node_modules` (never a link to that clone's `node_modules`: a workspace's links would point into the other
+  clone), else one install. Run again, it fast-forwards the checked-out branch when it is clean and has no commits of
+  its own (else a note says it is left as it was) and installs again when `pnpm-lock.yaml` is not the one installed.
+- `fork-precheck`: `vp fmt` and `vp lint` on the files changed against the base (the default base is fetched first,
+  and the base's commit and age are printed); then the fork checks behind most
+  "Fork checks" reds (the schema, upstream-files and seam checks), run as `.github/workflows/fork-checks.yml` runs
+  them, with the base branch's scripts and the same arguments (base: the merge-base, head: `HEAD`'s commits), printing
+  only a failing check's lines (a check it cannot run fails; `--no-fork-checks` skips them); then the test files the
+  change touches (a source file's own `NAME.test.*` beside it, else in the nearest `tests/` folder: its own folder's, then each one above), once
+  `t3-capacity` says OK where it is installed. Only its exit 1 (NOT OK) gives exit 3, "run it again later", and only
+  when no step had failed (then it is exit 1); any other exit of `t3-capacity` (2: a wrong call, as `--kind` to one
+  that takes only MB) gives exit 2 and says so, or exit 1 when a step had already failed.
+
+COMMANDS.md is a state table that `facts` reads on every machine with the kit, after the configured ones, so
+`facts --index` and the session-start context list the commands with no setting ([FACTS.md](FACTS.md)).
+
+**Run again, stopped half-way, old state.** The commands keep no state of their own. `fork-clone` reuses a folder
+only when it is a clone of the same repository (another folder is left alone and named); it clones into
+`.<name>.partial` and renames that to `<name>` only when the clone is complete, so a clone stopped half-way is removed
+and made again on the next run (a lock, `.<name>.lock`, keeps two runs for one name apart), and a marker in the
+clone's `.git` (`fork-clone-pending`) until its install has finished makes the next run install again; another
+(`fork-clone-installed`) holds the sha256 of the `pnpm-lock.yaml` installed, so a branch with another lockfile is
+installed again (a clone from before that record installs once more). A
+`fork-precheck` stopped half-way has only formatted files in the working tree, as `vp fmt` would. With no
+`t3-capacity` the tests run, with a note saying no capacity check was made.
+
 ## Tests
 
 `tests/*.test.py`, run by the fork's CI (`.github/fork-ci-tests.txt`), with no root, no network and no installed
@@ -261,3 +298,5 @@ writable; two hooks at once; very long commands; and commands that only mention 
 into a file, a commit message). The settings entries are run as `/bin/sh -c` with the hook missing and with the
 hook failing. `tests/fast.test.py` runs the hooks' cases through the fast path and through the hook, and expects the
 same answer.
+[tests/kitcmds.test.py](tests/kitcmds.test.py) runs the ready-made commands with stand-ins for `gh`, `vp`, `pnpm` and
+`t3-capacity` on PATH and real git repositories in a temporary folder (no network).

@@ -1,0 +1,14 @@
+#!/usr/bin/python3 -IB
+"""fork-clone: a blob-less clone into the work folder, its dependencies installed (offline from the store when another clone has the same lockfile).
+`fork-clone --help` for the usage (lib/agent_guards/kitcmds.py; COMMANDS.md). Tests: fork-kit/agent-guards/tests/kitcmds.test.py
+"""
+import os, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+
+if __name__ == '__main__':
+    from agent_guards import kitcmds
+    try:
+        sys.exit(kitcmds.clone(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

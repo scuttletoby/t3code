@@ -4,4 +4,5 @@
   wiring   the hooks' settings entries (Claude Code managed settings drop-in, or any settings file)
   check    run the wired hooks with one case each hook must refuse and one it must pass
   facts    the state tables: read, search, index, the gardener's check (bin/facts, bin/facts-hook; FACTS.md)
+  kitcmds  the ready-made commands fork-ci-why, fork-clone, fork-precheck (bin/fork-*; COMMANDS.md)
 """

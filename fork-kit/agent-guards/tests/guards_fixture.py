@@ -21,10 +21,17 @@ sys.path.insert(0, LIB)
 from agent_guards import config, wiring  # noqa: E402
 
 NO_MACHINE = '/nonexistent-agent-guards-test/machine.json'   # not there: every hook uses its defaults
-RUNNER = '''import runpy, sys
+# The kit's own state table (facts.KIT_TABLE, COMMANDS.md): a test that is not about it points it at a file that is not
+# there through this variable, which only RUNNER reads (the kit never does), so its tables are the test's alone.
+KIT_TABLE_VAR = 'AGENT_GUARDS_TEST_KIT_TABLE'
+NO_KIT_TABLE = '/nonexistent-agent-guards-test/COMMANDS.md'
+RUNNER = '''import os, runpy, sys
 lib, machine, uid, hook = sys.argv[1:5]
 sys.path.insert(0, lib)
 from agent_guards import config
+if os.environ.get('AGENT_GUARDS_TEST_KIT_TABLE'):
+    from agent_guards import facts
+    facts.KIT_TABLE = os.environ['AGENT_GUARDS_TEST_KIT_TABLE']
 config.MACHINE_PATH, config.OWNER_UID = machine, int(uid)
 sys.argv = [hook] + sys.argv[5:]
 runpy.run_path(hook, run_name='__main__')
