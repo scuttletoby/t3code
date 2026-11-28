@@ -1102,8 +1102,8 @@ function useChatMarkdownState(
             ? () => openMarkdownFileInPreview(fileLinkMeta.filePath)
             : undefined
         }
-        // Fork: a link naming an environment downloads from it; over SSH, this device's editor.
         {...forkRemoteEditor.linkProps({
+          chat: { threadRef, expandMedia }, // Fork: environment links open there; SSH, this editor
           canOpenApp,
           canUseShellActions,
           fileLinkMeta,

@@ -12,6 +12,7 @@ import type {
 } from "@t3tools/contracts";
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { lazy, Suspense } from "react";
+import { ForkEnvironmentFilePanel, isForkEnvironmentFile } from "./forkEnvironmentFilePanel"; // Fork
 import { LinkedThreadPane } from "./LinkedThreadPane";
 import SideThreadPane from "./SideThreadPane";
 import type { ComposerImageAttachment, DraftId } from "../../composerDraftStore";
@@ -270,6 +271,7 @@ export function RightPanelSurfaceContent(props: {
       );
     case "files":
     case "file": {
+      if (isForkEnvironmentFile(surface)) return <ForkEnvironmentFilePanel surface={surface} />; // Fork
       const files = props.files;
       const attachment = surface.kind === "file" ? surface.attachment : undefined;
       if (!attachment && (files.projectName === null || !files.workspaceRoot)) return null;

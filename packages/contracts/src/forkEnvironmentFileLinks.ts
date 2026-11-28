@@ -9,7 +9,7 @@ import { EnvironmentId, ThreadId } from "./baseSchemas.ts";
 const ENVIRONMENT_FILE_LINK_PREFIX = "/t3-environment/";
 
 /** What `t3_environment_read` tells an agent, so it can link a file on that environment. */
-export const ENVIRONMENT_FILE_LINK_AGENT_HINT = `To link a file on this environment in a reply on another environment, write \`[name](${ENVIRONMENT_FILE_LINK_PREFIX}<environmentId>/<absolute path>)\` with this result's environmentId; the user can then download it from here. The path must be absolute (\`/home/me/a.txt\`, \`C:/Users/me/a.txt\`), never \`~\` or relative. Files on the reply's own environment keep plain absolute paths.`;
+export const ENVIRONMENT_FILE_LINK_AGENT_HINT = `To link a file on this environment in a reply on another environment, write \`[name](${ENVIRONMENT_FILE_LINK_PREFIX}<environmentId>/<absolute path>)\` with this result's environmentId; the user can then open, preview or download it from here. The path must be absolute (\`/home/me/a.txt\`, \`C:/Users/me/a.txt\`), never \`~\` or relative. Files on the reply's own environment keep plain absolute paths.`;
 
 /**
  * `assets.createUrl` needs a thread id, but for an absolute path the server serves the file

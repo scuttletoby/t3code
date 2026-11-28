@@ -1,11 +1,13 @@
 // Fork: what a chat file link does beyond upstream's (#17): a long press opens its menu on touch
 // devices, a file on another machine opens in the viewing device's editor over SSH, and a link
-// naming an environment downloads from it.
+// naming an environment previews, opens and downloads there.
+/* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own messages are English only; upstream's translation catalogs hold no fork keys. */
 import { useAtomValue } from "@effect/atom-react";
 import {
   AuthFilesystemReadScope,
   type ContextMenuSource,
   type EnvironmentId,
+  type ScopedThreadRef,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
@@ -25,6 +27,7 @@ import {
   useRemoteCapableEditors,
   type RemoteOpenState,
 } from "../../remoteOpen";
+import { useRightPanelStore } from "../../rightPanelStore";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { assetEnvironment } from "../../state/assets";
 import { readEnvironment } from "../../state/environments";
@@ -36,9 +39,12 @@ import {
 } from "../../state/session";
 import { useAtomQueryRunner } from "../../state/use-atom-query-runner";
 import { downloadFile } from "../media/mediaContent";
+import { stackedThreadToast, toastManager } from "../ui/toast";
+import type { ExpandedImagePreview } from "./ExpandedImagePreview";
 import {
   environmentFileLinkProps,
   type EnvironmentFileAccessReaders,
+  type EnvironmentFileLinkChat,
 } from "./forkEnvironmentFileLink";
 import { markdownFileRemoteEditorUrl } from "./forkMarkdownFileLinkMenu";
 
@@ -158,9 +164,38 @@ function environmentNamesKey(
   return JSON.stringify([...presentations].map(([id, { entry }]) => [id, entry.target.label]));
 }
 
+/** How this device reaches a linked environment's files, with its saved names (re-rendered on rename). */
+export function useEnvironmentFileAccessReaders(): EnvironmentFileAccessReaders {
+  const namesKey = useAtomValue(environmentPresentations.presentationsAtom, environmentNamesKey);
+  const names = new Map<string, string>(JSON.parse(namesKey) as Array<[string, string]>);
+  return { ...environmentFileReaders, label: (id) => names.get(id) ?? null };
+}
+
+/** The chat's media viewer and files viewer for a link naming an environment. */
+function environmentFileLinkChat(
+  threadRef: ScopedThreadRef,
+  expandMedia: (preview: ExpandedImagePreview) => void,
+): EnvironmentFileLinkChat {
+  return {
+    expandMedia,
+    openInPanel: (linkPath, line, maximize) => {
+      useRightPanelStore.getState().openFile(threadRef, linkPath, line);
+      if (maximize) useRightPanelStore.getState().setMaximized(threadRef, true);
+    },
+    reportMediaError: (error) =>
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Media unavailable",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        }),
+      ),
+  };
+}
+
 /**
- * The props a file link takes after upstream's own: a link naming an environment downloads from
- * it, and over SSH the viewing device's editor opens the file.
+ * The props a file link takes after upstream's own: a link naming an environment previews, opens
+ * and downloads there, and over SSH the viewing device's editor opens the file.
  */
 export function useForkMarkdownFileRemoteEditor(
   remoteOpenState: RemoteOpenState,
@@ -173,12 +208,7 @@ export function useForkMarkdownFileRemoteEditor(
     reportFailure: false,
     refresh: true,
   });
-  const namesKey = useAtomValue(environmentPresentations.presentationsAtom, environmentNamesKey);
-  const names = new Map<string, string>(JSON.parse(namesKey) as Array<[string, string]>);
-  const readers: EnvironmentFileAccessReaders = {
-    ...environmentFileReaders,
-    label: (id) => names.get(id) ?? null,
-  };
+  const readers = useEnvironmentFileAccessReaders();
   const remoteEditor =
     remoteOpenState.mode === "remote-links" && editor !== null
       ? { editor, host: remoteOpenState.host }
@@ -205,9 +235,14 @@ export function useForkMarkdownFileRemoteEditor(
     /**
      * Upstream's link opens an app bundle, or a file through the environment's own shell, itself;
      * otherwise over SSH the link opens the file in this editor, and the menu names this editor
-     * unless the link is an app bundle. A link naming an environment replaces all of that.
+     * unless the link is an app bundle. A link naming an environment replaces all of that, and
+     * previews in `chat`'s media viewer and opens in its thread's files viewer.
      */
     linkProps: (input: {
+      chat: {
+        threadRef: ScopedThreadRef | undefined;
+        expandMedia: (preview: ExpandedImagePreview) => void;
+      };
       canOpenApp: boolean;
       canUseShellActions: boolean;
       fileLinkMeta: MarkdownFileLinkMeta;
@@ -217,6 +252,9 @@ export function useForkMarkdownFileRemoteEditor(
         readers,
         createAssetUrl,
         downloadFile,
+        chat: input.chat.threadRef
+          ? environmentFileLinkChat(input.chat.threadRef, input.chat.expandMedia)
+          : undefined,
       }) ??
       (remoteEditor === null
         ? {}

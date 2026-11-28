@@ -16,6 +16,7 @@ import {
   environmentFileDownloadUrl,
   environmentFileLinkProps,
   type CreateAssetUrl,
+  type EnvironmentFileLinkChat,
   type EnvironmentFileAccessReaders,
 } from "./forkEnvironmentFileLink";
 
@@ -206,5 +207,138 @@ describe("environmentFileLinkProps", () => {
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain("does not know");
     expect((error as Error).message).not.toContain("env-gone");
+  });
+});
+
+// Fork: inside a chat, a click previews media or opens the files viewer, both on
+// the link's environment, and asks that environment nothing before the click.
+describe("environmentFileLinkProps in a chat", () => {
+  const chat = () => ({
+    expandMedia: vi.fn<EnvironmentFileLinkChat["expandMedia"]>(),
+    openInPanel: vi.fn<EnvironmentFileLinkChat["openInPanel"]>(),
+    reportMediaError: vi.fn<EnvironmentFileLinkChat["reportMediaError"]>(),
+  });
+  const message = (reported: { mock: { calls: Array<Array<unknown>> } }) =>
+    (reported.mock.calls[0]![0] as Error).message;
+  const setup = (link: string, overrides: Partial<EnvironmentFileAccessReaders> = {}) => {
+    const createAssetUrl = signed();
+    const linkChat = chat();
+    const props = environmentFileLinkProps(resolveMarkdownFileLinkMeta(link)!, {
+      readers: readers(overrides),
+      createAssetUrl,
+      downloadFile: vi.fn(async () => undefined),
+      chat: linkChat,
+    })!;
+    return { props, createAssetUrl, chat: linkChat };
+  };
+
+  it("previews an image from the link's environment, signed inline there, only on click", async () => {
+    const { props, createAssetUrl, chat } = setup("/t3-environment/env-there/srv/shot.png");
+    expect(props.panelPath).toBe(null);
+    expect(createAssetUrl).not.toHaveBeenCalled();
+    props.onOpenMedia!();
+    await vi.waitFor(() => expect(chat.expandMedia).toHaveBeenCalledOnce());
+    const resource = {
+      _tag: "media-file",
+      threadId: ENVIRONMENT_FILE_LINK_THREAD_ID,
+      path: "/srv/shot.png",
+    };
+    expect(createAssetUrl).toHaveBeenCalledWith({ environmentId: THERE, input: { resource } });
+    const src = "https://there.example:3773/api/assets/token123/app.log";
+    expect(chat.expandMedia).toHaveBeenCalledWith({
+      images: [
+        {
+          src,
+          name: "shot.png",
+          actionsSource: {
+            kind: "image",
+            name: "shot.png",
+            src,
+            asset: { environmentId: THERE, resource },
+          },
+        },
+      ],
+      index: 0,
+    });
+    expect(chat.reportMediaError).not.toHaveBeenCalled();
+  });
+
+  it("previews a video as a video", async () => {
+    const { props, chat } = setup("/t3-environment/env-there/srv/run.mp4");
+    props.onOpenMedia!();
+    await vi.waitFor(() => expect(chat.expandMedia).toHaveBeenCalledOnce());
+    expect(chat.expandMedia.mock.calls[0]?.[0].images[0]).toMatchObject({
+      type: "video",
+      autoPlay: false,
+      actionsSource: { kind: "video" },
+    });
+  });
+
+  it("previews nothing and asks nothing without file read there", async () => {
+    const { props, createAssetUrl, chat } = setup("/t3-environment/env-there/srv/shot.png", {
+      canReadFiles: () => false,
+    });
+    props.onOpenMedia!();
+    await vi.waitFor(() => expect(chat.reportMediaError).toHaveBeenCalledOnce());
+    expect(createAssetUrl).not.toHaveBeenCalled();
+    expect(chat.expandMedia).not.toHaveBeenCalled();
+    expect(message(chat.reportMediaError)).toBe("This device may not read files on Build box.");
+  });
+
+  it("previews nothing and asks nothing when the environment is not connected", async () => {
+    const { props, createAssetUrl, chat } = setup("/t3-environment/env-there/srv/shot.png", {
+      httpBaseUrl: () => null,
+    });
+    props.onOpenMedia!();
+    await vi.waitFor(() => expect(chat.reportMediaError).toHaveBeenCalledOnce());
+    expect(createAssetUrl).not.toHaveBeenCalled();
+    expect(chat.expandMedia).not.toHaveBeenCalled();
+    expect(message(chat.reportMediaError)).toContain(
+      "Build box, which this device is not connected to",
+    );
+  });
+
+  it("says where it looked when the media file is missing there", async () => {
+    const { props, createAssetUrl, chat } = setup("/t3-environment/env-there/srv/shot.png");
+    createAssetUrl.mockResolvedValueOnce(
+      AsyncResult.failure(
+        Cause.fail(
+          new AssetWorkspaceAssetNotFoundError({
+            resource: {
+              _tag: "media-file",
+              threadId: ThreadId.make("environment-file-link"),
+              path: "/srv/shot.png",
+            },
+            checkedPath: "/srv/shot.png",
+          }),
+        ),
+      ),
+    );
+    props.onOpenMedia!();
+    await vi.waitFor(() => expect(chat.reportMediaError).toHaveBeenCalledOnce());
+    expect(message(chat.reportMediaError)).toBe(
+      "The file was not found on Build box at /srv/shot.png.",
+    );
+  });
+
+  it("opens any other file in the files viewer under its link path, asking nothing itself", () => {
+    const { props, createAssetUrl, chat } = setup("/t3-environment/env-there/srv/app.log:12");
+    expect(props.onOpenMedia).toBe(undefined);
+    expect(props.panelPath).toBe("/t3-environment/env-there/srv/app.log");
+    props.onOpenInPanel(props.panelPath!, 12);
+    expect(chat.openInPanel).toHaveBeenLastCalledWith(
+      "/t3-environment/env-there/srv/app.log",
+      12,
+      false,
+    );
+    props.onOpenFullSize!();
+    expect(chat.openInPanel).toHaveBeenLastCalledWith(
+      "/t3-environment/env-there/srv/app.log",
+      12,
+      true,
+    );
+    expect(createAssetUrl).not.toHaveBeenCalled();
+    // The menu still downloads it.
+    expect(props.openInEditorMenuLabel).toBe(DOWNLOAD_LABEL);
   });
 });
