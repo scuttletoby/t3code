@@ -416,6 +416,11 @@ describe("a skill that starts a sub-agent under the model policy (#128)", () => 
         assert.strictEqual(decision(output), "deny", String(name));
         assert.include(reason(output), `Model policy refused this call (fail closed): ${why}`);
       }
+      // The way out names a copy under another name: Claude Code runs some bundled skills
+      // (cannotBeShadowed) over a project copy of the same name, which T3 would read.
+      const wayOut = reason(yield* skill(ENFORCE, "simplify", session)) ?? "";
+      assert.include(wayOut, "under another name");
+      assert.include(wayOut, "cannot be replaced by a copy of the same name");
       // Advise runs it with a note; off reads nothing.
       const advised = yield* skill(ADVISE, "simplify", session);
       assert.isUndefined(decision(advised));
