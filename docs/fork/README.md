@@ -78,6 +78,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                                 | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                                 | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 | [`client.calmSidebarEnabled`](#clientcalmsidebarenabled)                     | `false`                                 | yes | [#139](https://github.com/scuttletoby/t3code/issues/139) |
+| [`client.ownerQuestionsPage`](#clientownerquestionspage)                     | `true`                                  | no  | [#828](https://github.com/scuttletoby/t3code/issues/828) |
 
 For `waitFor`, `agentSlots`, `playtest` and `stopFinishedChildren` only the `enabled` switch is pinned, and for `handoff`
 and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
@@ -388,6 +389,19 @@ is part of the stored wait, so a restart before its delivery was written runs it
 idempotent. It runs at most 90 s per delivery (the delivery is tried again after that), so a slow
 GitHub or thread does not stall other waits. Like the gate, lens_start skips a review or inline
 comment that is not submitted yet, and dates an inline comment by when it was published.
+
+**`lens_report {pr, body}`** (T3 tool, in the same group, hidden and refused while review rules are
+off) is how a lens child posts its report. Only a thread lens_start started as a child (its newest
+record in `lens-children.json`) may call it, and only for a pull request that child reads. T3
+writes the first line, `lens: <lens> · reviewer: <model> · read at: <head>`, from that record and
+the model the child runs on, so a child never types a lens name or a sha. T3 posts the report as a
+new comment only while the pull request is open and still at that head, and only if the gate would
+read it as one valid read with a findings section; otherwise it refuses and says why. The report
+may not hold its own `lens:` or `read at` line, and it must fit `reportMaxChars` with T3's line.
+The same shared vectors (`written` in `review.vectors.json`) test this writer and the gate. A repeat
+finds the earlier comment and posts nothing new, including after a post whose answer was lost (the
+tool then says `failed`: call it again). One report posts at a time, so two calls at once post
+once. Nothing is stored.
 
 ### Slot filler route (`/api/fork/delegate`)
 
@@ -1503,6 +1517,15 @@ other top-level threads fold into one closed group with a count of those waiting
 ([#139](https://github.com/scuttletoby/t3code/issues/139)). Off (the default): upstream's sidebar.
 It is a client setting, so each device chooses: calm on a phone, the full list on a desktop. A
 client settings file without it reads as off.
+
+### `client.ownerQuestionsPage`
+
+On (the default, the owner's decision in [#828](https://github.com/scuttletoby/t3code/issues/828)):
+the Issues entry opens **Waiting on you**, the open owner questions of every project on every
+connected server, instead of upstream's Issues page. Off: upstream's page. It changes which page the
+Issues entry opens, nothing else; upstream's page files stay as they are (one seam in
+`apps/web/src/routes/_chat.issues.tsx`). A client setting, so each device chooses; a client settings
+file without it reads as on. Settings → Fork → Issues page.
 
 ### A setting the fork removed
 

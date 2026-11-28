@@ -15,7 +15,7 @@ never free). Expected numbers come from capacity-rule.json, never copied
 here. RedCheck takes fix lines out of a copy of lib/heavy_facts.py and shows their tests fail.
 """
 import contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess
-import pwd, sys, tempfile, time, types, unittest
+import pwd, re, sys, tempfile, time, types, unittest
 from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1042,7 +1042,7 @@ class Holds(Case):
                            ({'version': 1, 'heavy': {'capacity': {'slots': 2}}}, 0o644)):
             self.machine_file(data, mode)
             self.assertEqual(self.facts('--fresh'), (1, None), data)    # never free on a broken machine file
-        code, out, err = self.cli([T3CAP, '64'])
+        code, out, err = self.cli([T3CAP, '--long', '64'])
         self.assertEqual(code, 1)
         self.assertRegex(out.splitlines()[-1], r'^NOT OK: heavy facts: .*heavy\.capacity')
 
@@ -1055,7 +1055,7 @@ class Holds(Case):
     def test_t3_capacity_shows_the_hold(self):
         self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'})
         self.runners(2000)
-        code, out, _ = self.cli([T3CAP, '64'])
+        code, out, _ = self.cli([T3CAP, '--long', '64'])
         self.assertEqual(code, 0, out)
         self.assertIn('available=10192MB', out.splitlines()[0])
         self.assertEqual(out.splitlines()[1], 'reservations: ci-slice:4096MB(using 2000,holding 2096)')
@@ -1591,20 +1591,20 @@ class T3Capacity(Case):
             r'reserved=\d+MB need=\d+MB free=-?\d+MB level=\w+ tier=\w+ disk=\d+GB(<\d+GB)?$'
 
     def test_the_mb_argument_first_line_and_exit_codes(self):
-        code, out, err = self.cli([T3CAP, '1536'])
+        code, out, err = self.cli([T3CAP, '--long', '1536'])
         self.assertEqual(code, 0, out + err)
         lines = out.splitlines()
         self.assertRegex(lines[0], self.FIRST)
         self.assertIn('need=1536MB', lines[0])
         self.assertEqual(lines[-1], 'OK')
         self.assertTrue(any(line.startswith('fits: ') for line in lines))
-        code, out, err = self.cli([T3CAP, '99999'])
+        code, out, err = self.cli([T3CAP, '--long', '99999'])
         self.assertEqual(code, 1)
         self.assertTrue(out.splitlines()[-1].startswith('NOT OK: 99999 MB'))
         self.assertIn('never pipe it', err)
         out_file = os.path.join(self.tmp, 'cap.txt')
         with open(out_file, 'w') as f:   # #931: output to a file keeps the status; the line says so, not "a pipe hides"
-            p = subprocess.run([T3CAP, '99999'], stdout=f, stderr=subprocess.PIPE, text=True, timeout=30,
+            p = subprocess.run([T3CAP, '--long', '99999'], stdout=f, stderr=subprocess.PIPE, text=True, timeout=30,
                                cwd=self.work, env=self.m.env(PWD=self.work))
         self.assertEqual(p.returncode, 1)
         self.assertNotIn('pipe', p.stderr)
@@ -1612,26 +1612,72 @@ class T3Capacity(Case):
         with open(out_file) as f:
             self.assertTrue(f.read().splitlines()[-1].startswith('NOT OK'))
         with open(os.devnull, 'w') as f:   # the usual gate, `t3-capacity N >/dev/null && cmd`: no "file" there
-            p = subprocess.run([T3CAP, '99999'], stdout=f, stderr=subprocess.PIPE, text=True, timeout=30,
+            p = subprocess.run([T3CAP, '--long', '99999'], stdout=f, stderr=subprocess.PIPE, text=True, timeout=30,
                                cwd=self.work, env=self.m.env(PWD=self.work))
         self.assertEqual(p.returncode, 1)
         self.assertNotIn('pipe', p.stderr)
         self.assertNotIn('to a file', p.stderr)
         self.assertIn('/dev/null', p.stderr)
         self.assertIn('exit status is kept', p.stderr)
-        self.assertIn('need=3072MB', self.cli([T3CAP])[1].splitlines()[0])
-        code, out, _ = self.cli([T3CAP, '--kind', WRITER])
+        self.assertIn('need=3072MB', self.cli([T3CAP, '--long'])[1].splitlines()[0])
+        code, out, _ = self.cli([T3CAP, '--long', '--kind', WRITER])
         self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'))
         for bad in (['x'], ['1', '2'], ['--kind']):
-            self.assertEqual(self.cli([T3CAP] + bad)[0], 2, bad)
+            self.assertEqual(self.cli([T3CAP, '--long'] + bad)[0], 2, bad)
+
+    SHORT_OK = (r'^OK: free=-?\d+MB need=\d+MB available=\d+MB( held=\d+MB)? swapfree=\d+MB '
+                r'disk=(\d+GB(<\d+GB)?|off|\?)( notes=\d+)?$')
+
+    def test_the_default_output_is_one_line_with_the_long_outputs_numbers(self):
+        """#1150: one line, the answer first, so nobody pipes it to see the answer; --long is the older output."""
+        code, out, err = self.cli([T3CAP, '1536'])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertRegex(out.strip(), self.SHORT_OK)
+        long_first = self.cli([T3CAP, '--long', '1536'])[1].splitlines()[0]
+        for key in ('available', 'swapfree', 'need'):
+            # the slot filler reads available= and swapfree= from the first line that has available= in it
+            pattern = key + r'=(\d+)MB'
+            self.assertEqual(re.search(pattern, out).group(1), re.search(pattern, long_first).group(1))
+        code, out, err = self.cli([T3CAP, '99999'])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertRegex(out.strip(),
+                         r'^NOT OK: 99999 MB.* \(free=-?\d+MB need=99999MB available=\d+MB swapfree=\d+MB ')
+        self.assertIn('never pipe it', err)
+        code, out, _ = self.cli([T3CAP, '--kind', WRITER])
+        self.assertEqual((code, len(out.splitlines())), (0, 1))
+        self.assertTrue(out.startswith('OK: '), out)
+        code, out, _ = self.cli([T3CAP, '-l', '64'])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[-1], 'OK')
+        self.assertRegex(out.splitlines()[0], self.FIRST)
+
+    def test_the_one_line_says_not_ok_when_the_kit_cannot_answer(self):
+        code, out, _ = self.cli([T3CAP, '64'], T3_CAPACITY_HEAVY=os.path.join(self.tmp, 'no-such-heavy'))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertTrue(out.startswith('NOT OK: '), out)
+        self.assertIn('available=0MB swapfree=0MB', out)
+
+    def test_help_is_exit_0_and_a_wrong_call_exit_2(self):
+        for flag in ('-h', '--help'):
+            code, out, err = self.cli([T3CAP, flag])
+            self.assertEqual((code, err), (0, ''))
+            self.assertTrue(out.startswith('t3-capacity: '), out)
+            self.assertIn('--long', out)
+        for bad in (['x'], ['1', '2'], ['--kind'], ['--longer']):
+            code, out, err = self.cli([T3CAP] + bad)
+            self.assertEqual((code, out), (2, ''), bad)
+            self.assertIn('usage: t3-capacity', err)
 
     def test_free_disk_under_the_floor_is_not_ok_with_the_reason_in_the_first_line(self):
         # #982: a disk at 97% failed a CI job with "disk full" while t3-capacity said OK. The floor is 25 GB unless
         # the machine file's heavy.disk.floorGb says otherwise; free disk is read on the home folder's filesystem
-        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB=str(26 * 1024))
+        code, out, _ = self.cli([T3CAP, '--long', '64'], HEAVY_FACTS_DISK_FREE_MB=str(26 * 1024))
         self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'), out)
         self.assertTrue(out.splitlines()[0].endswith(' disk=26GB'), out)
-        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB=str(24 * 1024))
+        code, out, _ = self.cli([T3CAP, '--long', '64'], HEAVY_FACTS_DISK_FREE_MB=str(24 * 1024))
         self.assertEqual(code, 1, out)
         first, last = out.splitlines()[0], out.splitlines()[-1]
         self.assertTrue(first.endswith(' disk=24GB<25GB'), first)
@@ -1639,24 +1685,24 @@ class T3Capacity(Case):
                                '(heavy.disk.floorGb)')
         # the same with the machine file's floor and folder; a floor of 0 is off
         self.machine_file({'version': 1, 'heavy': {'disk': {'floorGb': 40, 'path': self.work}}})
-        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB=str(30 * 1024))
+        code, out, _ = self.cli([T3CAP, '--long', '64'], HEAVY_FACTS_DISK_FREE_MB=str(30 * 1024))
         self.assertEqual(code, 1, out)
         self.assertTrue(out.splitlines()[0].endswith(' disk=30GB<40GB'), out)
         self.assertIn(f'30 GB free on {self.work}, under the floor of 40 GB', out.splitlines()[-1])
         self.machine_file({'version': 1, 'heavy': {'disk': {'floorGb': 0}}})
-        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB='1')
+        code, out, _ = self.cli([T3CAP, '--long', '64'], HEAVY_FACTS_DISK_FREE_MB='1')
         self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'), out)
 
     def test_a_disk_it_cannot_read_or_a_broken_disk_setting_is_never_ok(self):
         self.machine_file({'version': 1, 'heavy': {'disk': {'path': os.path.join(self.tmp, 'not-there')}}})
-        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB='')
+        code, out, _ = self.cli([T3CAP, '--long', '64'], HEAVY_FACTS_DISK_FREE_MB='')
         self.assertEqual(code, 1, out)
         self.assertTrue(out.splitlines()[0].endswith(' disk=?'), out)
         self.assertRegex(out.splitlines()[-1], r'^NOT OK: disk: cannot read the free space of .*not-there')
         for bad in ({'floorGb': -1}, {'floorGb': '25'}, {'path': 'relative/folder'}, {'floor': 25}):
             with self.subTest(bad=bad):
                 self.machine_file({'version': 1, 'heavy': {'disk': bad}})
-                code, out, _ = self.cli([T3CAP, '64'])
+                code, out, _ = self.cli([T3CAP, '--long', '64'])
                 self.assertEqual(code, 1, out)
                 self.assertIn('heavy.disk', out.splitlines()[-1])
 
@@ -1664,7 +1710,7 @@ class T3Capacity(Case):
         # floorGb 0 turns the floor off: the disk is not read, so a path it cannot read is no NOT OK either
         missing = os.path.join(self.tmp, 'not-there')
         self.machine_file({'version': 1, 'heavy': {'disk': {'floorGb': 0, 'path': missing}}})
-        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB='')
+        code, out, _ = self.cli([T3CAP, '--long', '64'], HEAVY_FACTS_DISK_FREE_MB='')
         self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'), out)
         self.assertTrue(out.splitlines()[0].endswith(' disk=off'), out)
 
@@ -1677,22 +1723,22 @@ class T3Capacity(Case):
         # #861: the check flipped OK / NOT OK within seconds, so "check, then start" could start work just before it
         # turned NOT OK; the orchestrator checked twice, 20 s apart. Now a NOT OK holds that long by itself.
         self.m.write('/proc/meminfo', self.m.meminfo(16384, 2048))      # busy for 1536 MB
-        code, out, _ = self.cli([T3CAP, '1536'])
+        code, out, _ = self.cli([T3CAP, '--long', '1536'])
         self.assertEqual(code, 1)
         self.m.write('/proc/meminfo', self.m.meminfo(16384, 12288))     # free again a second later
         os.unlink(self.m.cache)
-        code, out, _ = self.cli([T3CAP, '1536'])
+        code, out, _ = self.cli([T3CAP, '--long', '1536'])
         self.assertEqual(code, 1, 'held')
         self.assertRegex(out.splitlines()[0], self.FIRST, 'the first line callers parse is unchanged')
         self.assertTrue(out.splitlines()[-1].startswith('NOT OK: held: NOT OK '), out)
-        self.assertEqual(self.cli([T3CAP, '1024'])[0], 0, 'another question is not held')
+        self.assertEqual(self.cli([T3CAP, '--long', '1024'])[0], 0, 'another question is not held')
         hold_file = os.path.join(os.path.dirname(self.m.cache), hf.HOLD_FILE)
         with open(hold_file) as f:
             state = json.load(f)
         state['busy'] = {k: v - 21_000 for k, v in state['busy'].items()}     # 21 s later
         with open(hold_file, 'w') as f:
             json.dump(state, f)
-        self.assertEqual(self.cli([T3CAP, '1536'])[0], 0, 'the hold has ended')
+        self.assertEqual(self.cli([T3CAP, '--long', '1536'])[0], 0, 'the hold has ended')
 
     def test_heavy_s_own_checks_share_t3_capacity_s_hold(self):
         """#866 with #861: heavy's capacity check (a queued job's and a plain job's) is hf.checked too, so a NOT OK
@@ -1708,7 +1754,7 @@ class T3Capacity(Case):
             self.assertEqual(code, 0, err)
             return eval(out)            # (free?, why) from our own print
         self.m.write('/proc/meminfo', self.m.meminfo(16384, 2048))      # busy for a build of 2048 MB and a job
-        self.assertEqual(self.cli([T3CAP, '--kind', 'job-build', '2048'])[0], 1)
+        self.assertEqual(self.cli([T3CAP, '--long', '--kind', 'job-build', '2048'])[0], 1)
         self.assertFalse(heavy_check()[0])                               # heavy's plain ask: busy, held from now
         self.m.write('/proc/meminfo', self.m.meminfo(16384, 12288))     # free again a second later
         os.unlink(self.m.cache)
@@ -1861,13 +1907,17 @@ print(hf.hold('a:1', 'busy', None, {folder!r}))
         other = os.path.join(self.tmp, 'other')
         with open(os.path.join(self.m.reserve, 'game.conf'), 'w') as f:
             f.write(f'2000 {other}/\n')
-        code, out, _ = self.cli([T3CAP, '64'])
+        code, out, _ = self.cli([T3CAP, '--long', '64'])
         self.assertIn('available=10288MB', out.splitlines()[0])
         self.assertEqual(out.splitlines()[1], 'reservations: game:2000MB(using 0,holding 2000)')
+        code, out, _ = self.cli([T3CAP, '64'])      # #1151: the one line says what they hold, still one line
+        self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertIn(' available=10288MB held=2000MB swapfree=', out)
         os.makedirs(other)
-        code, out, _ = self.cli([T3CAP, '64'], cwd=other)
+        code, out, _ = self.cli([T3CAP, '--long', '64'], cwd=other)
         self.assertEqual(out.splitlines()[1], 'reservations: game:own')
         self.assertIn('available=12288MB', out.splitlines()[0])
+        self.assertNotIn('held=', self.cli([T3CAP, '64'], cwd=other)[1])
 
     def test_reserved_and_available_count_each_once(self):
         # #923: available= already has the reservations' hold taken off; reserved= is only what agents and jobs may
@@ -1879,7 +1929,7 @@ print(hf.hold('a:1', 'busy', None, {folder!r}))
         self.m.process(4001, other, 300)
         self.m.agent('a', 300, pids=(4001,))
         owed = self.cost(WRITER) - 300
-        code, out, _ = self.cli([T3CAP, '64'])
+        code, out, _ = self.cli([T3CAP, '--long', '64'])
         first, second = out.splitlines()[:2]
         self.assertRegex(first, self.FIRST)
         self.assertIn(f' reserved={owed}MB ', first)
@@ -1890,7 +1940,7 @@ print(hf.hold('a:1', 'busy', None, {folder!r}))
         with open(os.path.join(self.m.reserve, 'many.conf'), 'w') as f:
             for i in range(80):
                 f.write(f'10 {self.tmp}/{"long-folder-name-" * 4}{i}\n')
-        code, out, _ = self.cli([T3CAP, '64'])
+        code, out, _ = self.cli([T3CAP, '--long', '64'])
         self.assertIn('available=11488MB', out.splitlines()[0])
 
     def test_slow_failing_or_garbled_facts_are_never_ok(self):
@@ -1898,7 +1948,7 @@ print(hf.hold('a:1', 'busy', None, {folder!r}))
                      'exit 75'):
             with self.subTest(body=body):
                 t = time.monotonic()
-                code, out, err = self.cli([T3CAP, '64'], T3_CAPACITY_HEAVY=fake_heavy(self.tmp, body))
+                code, out, err = self.cli([T3CAP, '--long', '64'], T3_CAPACITY_HEAVY=fake_heavy(self.tmp, body))
                 self.assertLess(time.monotonic() - t, hf.ANSWER_SECONDS + 3)
                 self.assertEqual(code, 1, out)
                 self.assertTrue(out.splitlines()[0].startswith('available=0MB swapfree=0MB'), out)
@@ -1909,7 +1959,7 @@ print(hf.hold('a:1', 'busy', None, {folder!r}))
     def test_the_slow_facts_are_ended(self):
         mark = os.path.join(self.tmp, 'still-running')
         body = f'(sleep 8; touch {mark}) & exec sleep 60'
-        self.assertEqual(self.cli([T3CAP, '64'], T3_CAPACITY_HEAVY=fake_heavy(self.tmp, body))[0], 1)
+        self.assertEqual(self.cli([T3CAP, '--long', '64'], T3_CAPACITY_HEAVY=fake_heavy(self.tmp, body))[0], 1)
         time.sleep(4)
         self.assertFalse(os.path.exists(mark), 'a child of the slow heavy facts kept running')
 
@@ -1956,10 +2006,10 @@ class CpuBrake(Case):
 
     def test_t3_capacity_says_not_ok(self):
         self.cpu(100)
-        code, out, _ = self.cli([T3CAP, '64'])
+        code, out, _ = self.cli([T3CAP, '--long', '64'])
         self.assertEqual(code, 1, out)
         self.assertRegex(out.splitlines()[-1], r'^NOT OK: cpu pressure 100% ')
-        self.assertEqual(self.cli([T3CAP, '--kind', WRITER])[0], 0, 'an agent is not braked')
+        self.assertEqual(self.cli([T3CAP, '--long', '--kind', WRITER])[0], 0, 'an agent is not braked')
 
     def test_a_rule_without_cpu_brakes_nothing(self):
         rule = {k: v for k, v in RULE.items() if k != 'cpu'}
@@ -2076,7 +2126,7 @@ class TestOnlySettings(Case):
             f.write('ORCH\n')
         with open(conf, 'w') as f:
             json.dump({'sessions_file': sessions, 'queue': os.path.join(self.tmp, 'none.md')}, f)
-        p = subprocess.run([T3CAP, '64'], capture_output=True, text=True, timeout=30, env=env, cwd=self.work)
+        p = subprocess.run([T3CAP, '--long', '64'], capture_output=True, text=True, timeout=30, env=env, cwd=self.work)
         self.assertNotIn('garbled', p.stdout + p.stderr)
         p = subprocess.run([SLOTS], input=json.dumps({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ORCH'}),
                            capture_output=True, text=True, timeout=30, env=dict(env, AGENT_SLOTS_CONFIG=conf),

@@ -1,5 +1,5 @@
 {
-  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a lens report, one with the lens marker, that is not one valid read is a `comment without a first-line lens header` entry that reads nothing, and so is a post without the marker that looks like a report and holds an open finding (a blocker or major, or NOT SAFE, as review_judge.read_findings reads it); `not_lens`, when there is one: [where, why] of each post that looks like a report but has no lens marker, so is no lens report, as lens.Review.not_lens_reports names them). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). `reads`: posts as in `scans` (each by its `author`, else `someone`; an override comment is `<override_prefix> <sha>: ...`), the `head`, the reads that are its change merged with the base (`same`) and `override_authors`, under the `basic` rules in enforce with findings judged: lens.Review.lens_reads (each lens key's sha), the keys head_check.review_rounds fails until that lens posts again (`again`: UNREAD, or a report with no findings section) and whether head_check.verdict with the `required` lenses and the rounds pass (`passes`); T3's lens_start reads the same (lensStart.ts), and its vectors hold no finding in a report that counts and stay under the round cap. `unicode`: `refused` is what T3 refuses on a runtime that assigns those code points (a letter, number, mark, format character or space there), as written or as an HTML number reference writes it (`&#x1C89;`; only the findings rules, which fold the text, read a reference): a new symbol reads alike on both sides. Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
+  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a lens report, one with the lens marker, that is not one valid read is a `comment without a first-line lens header` entry that reads nothing, and so is a post without the marker that looks like a report and holds an open finding (a blocker or major, or NOT SAFE, as review_judge.read_findings reads it); `not_lens`, when there is one: [where, why] of each post that looks like a report but has no lens marker, so is no lens report, as lens.Review.not_lens_reports names them). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). `reads`: posts as in `scans` (each by its `author`, else `someone`; an override comment is `<override_prefix> <sha>: ...`), the `head`, the reads that are its change merged with the base (`same`) and `override_authors`, under the `basic` rules in enforce with findings judged: lens.Review.lens_reads (each lens key's sha), the keys head_check.review_rounds fails until that lens posts again (`again`: UNREAD, or a report with no findings section) and whether head_check.verdict with the `required` lenses and the rounds pass (`passes`); T3's lens_start reads the same (lensStart.ts), and its vectors hold no finding in a report that counts and stay under the round cap. `unicode`: `refused` is what T3 refuses on a runtime that assigns those code points (a letter, number, mark, format character or space there), as written or as an HTML number reference writes it (`&#x1C89;`; only the findings rules, which fold the text, read a reference): a new symbol reads alike on both sides. `written`: a report a lens child hands T3's lens_report (`body`, by `reviewer`, for lens `lens` at `head`), the `comment` T3 posts (its header line, a blank line, the report without leading blank lines or trailing space) and `refused` (null: posted; else part of why T3 refuses it), and `expect`: what the gate reads of that comment as the only post, as in `reads` with `required` the lens; a report T3 posts reads the head. Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
   "config_path": ".github/pr-queue.json",
   "override_prefix": "override for head",
   "globs": [
@@ -4562,6 +4562,216 @@
       "section": true,
       "unassigned": ["U+0897"],
       "refused": ["U+0897"]
+    }
+  ],
+  "written": [
+    {
+      "name": "a clean report is posted and reads the head",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "state: fine\nblocker: none\nmajor: none",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nstate: fine\nblocker: none\nmajor: none",
+      "refused": null,
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "blank lines before the report and space after it are dropped",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "\n  \n\nstate: fine\nblocker: none\nmajor: none\n\n  ",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nstate: fine\nblocker: none\nmajor: none",
+      "refused": null,
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "a report with one blocker and no section is posted: the gate reads it and fails the head",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "blocker: the lock is gone, so two writers race on the row",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nblocker: the lock is gone, so two writers race on the row",
+      "refused": null,
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "a heading that names the lens is fine below the header T3 writes",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "## lens notes\n\nblocker: none\nmajor: none",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n## lens notes\n\nblocker: none\nmajor: none",
+      "refused": null,
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "the reviewer is one line",
+      "lens": "code",
+      "reviewer": "model\n  x\t2",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "blocker: none\nmajor: none",
+      "comment": "lens: code · reviewer: model x 2 · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nblocker: none\nmajor: none",
+      "refused": null,
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "a report that writes its own header is refused",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nlens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none",
+      "refused": "lens marker",
+      "expect": {
+        "reads": {
+          "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaa')": null
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "a report that names another head `read at` is refused",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "checked the fix, read at: bbbbbbb\nblocker: none\nmajor: none",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nchecked the fix, read at: bbbbbbb\nblocker: none\nmajor: none",
+      "refused": "lens marker",
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "a header line in a code block is refused",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "```\nlens: code · reviewer: y · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n```\nblocker: none\nmajor: none",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n```\nlens: code · reviewer: y · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n```\nblocker: none\nmajor: none",
+      "refused": "lens marker",
+      "expect": {
+        "reads": {
+          "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaa')": null
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "a header in look-alike letters is refused",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "ｌｅｎｓ: code · reviewer: y · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nｌｅｎｓ: code · reviewer: y · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none",
+      "refused": "lens marker",
+      "expect": {
+        "reads": {
+          "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaa')": null
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "a report with no findings section is refused",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "state: fine\nlooks good to me",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nstate: fine\nlooks good to me",
+      "refused": "no findings section",
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": ["code"],
+        "passes": false
+      }
+    },
+    {
+      "name": "a report with only one of the two section lines is refused",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "major: none",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nmajor: none",
+      "refused": "no findings section",
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": ["code"],
+        "passes": false
+      }
+    },
+    {
+      "name": "an empty report is refused",
+      "lens": "code",
+      "reviewer": "model-x",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "\n   \n",
+      "comment": "lens: code · reviewer: model-x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n",
+      "refused": "empty",
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": ["code"],
+        "passes": false
+      }
+    },
+    {
+      "name": "a reviewer name that reads as another head is refused",
+      "lens": "code",
+      "reviewer": "x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "body": "blocker: none\nmajor: none",
+      "comment": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\nblocker: none\nmajor: none",
+      "refused": "does not read as lens code",
+      "expect": {
+        "reads": {
+          "code": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "again": [],
+        "passes": false
+      }
     }
   ]
 }

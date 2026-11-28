@@ -664,7 +664,11 @@ after another, up to the group's ceiling), the memory budget, the queue and note
 
 Two thin callers come with it:
 
-- `bin/t3-capacity [--kind KIND] [MB]`: the older host check's output (first line `available=..MB swapfree=..MB
+- `bin/t3-capacity [--kind KIND] [--long] [MB]`: **one line** by default (#1150), the answer first, so nobody pipes
+  it to see the answer: `OK: free=..MB need=..MB available=..MB swapfree=..MB disk=..GB` or `NOT OK: <why> (free=..MB
+  need=..MB available=..MB swapfree=..MB disk=..GB)`, ` held=..MB` after available= when reservations hold memory back (#1151; the kit reads reserve.d itself, so
+  no wrapper is needed, and a wrapper that prints its own line makes it two), ` notes=<n>` at the end when there
+  are notes; the numbers are the long output's. `-h`/`--help` prints its use (exit 0). `--long` gives the older host check's output (first line `available=..MB swapfree=..MB
   load=..`, available less the rule's whole reservation hold, `reserved=` what admitted jobs and agents may still
   grow into (so `available - reserved` counts each once), last line `OK` or `NOT OK: why`, exit 0 or 1), now
   from `heavy facts`. MB defaults to 3072. **Disk floor (#982):** the first line ends with `disk=<GB>GB`, the free
