@@ -37,6 +37,7 @@ const {
   recordsTo,
   writeRecords,
   command,
+  QUIET_GIT,
   NODE_COUNTS,
   fileLimit,
 } = require("./fork-ci-tests.cjs");
@@ -1641,6 +1642,11 @@ test("command: Python through the counting shim; an own run as root through sudo
     "env",
     "A_TESTS=1",
     "GITHUB_ACTIONS=true",
+    "GIT_CONFIG_COUNT=2",
+    "GIT_CONFIG_KEY_0=maintenance.auto",
+    "GIT_CONFIG_VALUE_0=false",
+    "GIT_CONFIG_KEY_1=gc.auto",
+    "GIT_CONFIG_VALUE_1=0",
     "FORK_CI_TEST_COUNTS=/c/n.jsonl",
     "python3",
     "-I",
@@ -1676,6 +1682,69 @@ test("command: Python through the counting shim; an own run as root through sudo
   ]);
   assert.equal(node.env.NODE_TEST_CONTEXT, undefined);
   assert.equal(node.env.FORK_CI_TEST_COUNTS, undefined);
+});
+
+// Git's auto maintenance (detached in a newer git) wrote .git/objects/maintenance.lock in a test's scratch repository
+// while its cleanup removed the folder. Every test's git, as root too, has it off, and auto gc, after the caller's own
+// GIT_CONFIG_* entries and whatever HOME or global config the test picks.
+test("command: every test's git runs with auto maintenance and auto gc off", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-tests-git-"));
+  try {
+    const repo = path.join(dir, "repo");
+    const outer = {
+      PATH: process.env.PATH,
+      HOME: dir,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "user.name",
+      GIT_CONFIG_VALUE_0: "caller",
+    };
+    const git = (env, ...args) =>
+      childProcess
+        .execFileSync("git", ["-C", repo, ...args], {
+          env,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        })
+        .trim();
+    childProcess.execFileSync("git", ["init", "-q", repo], { env: outer, stdio: "ignore" });
+    // Git's default would be on: the setting comes from the runner, not from the test's config.
+    assert.equal(
+      childProcess.spawnSync("git", ["-C", repo, "config", "--get", "maintenance.auto"], {
+        env: outer,
+      }).status,
+      1,
+    );
+    for (const env of [
+      command("fork-kit/a.test.py", null, outer, null).env,
+      command("fork-ci/a.test.cjs", { root: false, vars: [], only: null }, outer, null).env,
+      { ...command("fork-kit/a.test.py", null, outer, null).env, GIT_CONFIG_GLOBAL: "/dev/null" },
+    ]) {
+      assert.equal(git(env, "config", "--get", "maintenance.auto"), "false");
+      assert.equal(git(env, "config", "--get", "gc.auto"), "0");
+      assert.equal(git(env, "config", "--get", "user.name"), "caller"); // the caller's entry is kept
+    }
+    // As root the environment is sudo's, so the settings go on the `env` line: run that line's variables here.
+    const { argv } = command(
+      "fork-kit/a.test.py",
+      { root: true, vars: [], only: null },
+      outer,
+      null,
+    );
+    const vars = argv.slice(3, argv.indexOf("python3"));
+    const line = Object.fromEntries(
+      vars.map((v) => [v.slice(0, v.indexOf("=")), v.slice(v.indexOf("=") + 1)]),
+    );
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: "1", ...line };
+    assert.equal(git(env, "config", "--get", "maintenance.auto"), "false");
+    assert.equal(git(env, "config", "--get", "gc.auto"), "0");
+    // An odd count from the caller is not added to: git would refuse it.
+    const odd = command("fork-kit/a.test.py", null, { ...outer, GIT_CONFIG_COUNT: "x" }, null).env;
+    assert.equal(odd.GIT_CONFIG_COUNT, String(QUIET_GIT.length));
+    assert.equal(git(odd, "config", "--get", "maintenance.auto"), "false");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // An ok-lines test's end line: its own count of its ok lines (countTests()).

@@ -187,7 +187,9 @@ class Case(unittest.TestCase):
                                            'HOME': self.home})
         env.start()
         self.addCleanup(env.stop)
-        for name in [n for n in os.environ if n.startswith('GIT_') and n not in ('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM')]:
+        # The runner's GIT_CONFIG_COUNT/KEY/VALUE stay: git's auto maintenance off (.github/scripts/fork-ci-tests.cjs).
+        for name in [n for n in os.environ if n.startswith('GIT_') and n not in ('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM')
+                     and not n.startswith(('GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))]:
             del os.environ[name]
         self.section = {'logFile': self.path('state', 'cleaner.log'), 'daily': {'outDir': self.path('state', 'daily')}}
         self.merged, self.closed, self.open = [], [], []
