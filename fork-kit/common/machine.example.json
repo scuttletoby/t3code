@@ -255,6 +255,20 @@
       ]
     }
   },
+  "homelab": {
+    "leaseDir": "/var/lib/fork-homelab/leases",
+    "machines": [
+      {
+        "name": "test-box",
+        "host": "test-box.example",
+        "port": 22,
+        "roles": ["test"],
+        "note": "shared test machine",
+        "lease": { "defaultMinutes": 60, "maxMinutes": 480 }
+      },
+      { "name": "build-box", "host": "192.0.2.20", "roles": ["build"] }
+    ]
+  },
   "desk": {
     "pool": "pc",
     "host": "fleet-host.example",

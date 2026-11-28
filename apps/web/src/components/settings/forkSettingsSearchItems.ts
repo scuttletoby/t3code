@@ -198,10 +198,27 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     scope: "project-defaults",
   },
   {
+    id: "calm-sidebar",
+    title: "Calm sidebar",
+    to: FORK_PAGE,
+    searchTerms: [
+      "calm sidebar calmSidebarEnabled roles assistant orchestrator fold other threads",
+    ],
+    environmentOnly: true,
+  },
+  {
+    id: "thread-roles",
+    title: "Thread roles",
+    to: FORK_PAGE,
+    searchTerms: ["threadRoles role assistant orchestrator project missing remove"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
     id: "playtest",
     title: "Let agents run playtests",
     to: FORK_PAGE,
-    searchTerms: ["playtest test target staging round adapter"],
+    searchTerms: ["playtest test target staging round adapter chip end session"],
     environmentOnly: true,
     scope: "project-defaults",
   },

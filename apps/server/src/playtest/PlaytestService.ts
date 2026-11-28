@@ -42,7 +42,8 @@ import * as PlaytestStore from "./PlaytestStore.ts";
 
 /** A step's output kept, on each of stdout and stderr: the last this many bytes. */
 const STEP_MAX_OUTPUT_BYTES = 64 * 1024;
-const RELEASE_PROBLEM = "release: ";
+/** A failed release's problem starts with this (a renew or claim problem never does). */
+export const RELEASE_PROBLEM = "release: ";
 const RENEW_PROBLEM = "renew: ";
 /** A renew, or a message about an end, that failed is tried again this soon (at most `renewMinutes`). */
 const RETRY_MS = 60_000;

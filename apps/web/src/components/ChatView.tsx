@@ -363,6 +363,7 @@ import { useProactivePanels } from "../hooks/useProactivePanels";
 import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEntries";
 import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+import { useForkPlaytestItems } from "./fork/playtest/usePlaytestChipItems"; // Fork (playtest)
 import { useForkHandoffWaitingItems } from "./fork/handoff/useForkHandoffWaitingItems"; // Fork (HO5)
 import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
 import { ComposerSurface } from "./chat/ComposerSurface";
@@ -2756,6 +2757,7 @@ export default function ChatView(props: ChatViewProps) {
     );
     return item ? [item] : [];
   });
+  const forkPlaytestItems = useForkPlaytestItems(routeThreadRef); // Fork (playtest)
   const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)
   const limitRecoveryBanner = useUsageLimitRecoveryBannerItem(
     limitRecoveryRun !== null && activeThreadShell !== null
@@ -2859,6 +2861,7 @@ export default function ChatView(props: ChatViewProps) {
         ...projectCloneItems,
         ...freshSessionItems,
         ...heldSendItems,
+        ...forkPlaytestItems, // Fork (playtest)
         ...forkHandoffWaitingItems, // Fork (HO5)
         ...systemComposerBannerItems,
       ];
@@ -2872,6 +2875,7 @@ export default function ChatView(props: ChatViewProps) {
       ...projectCloneItems,
       ...freshSessionItems,
       ...heldSendItems,
+      ...forkPlaytestItems, // Fork (playtest)
       ...forkHandoffWaitingItems, // Fork (HO5)
       ...systemComposerBannerItems,
       branchMismatchBannerItem(

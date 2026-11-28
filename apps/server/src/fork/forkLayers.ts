@@ -11,6 +11,7 @@ import * as HoldWorkConnect from "../cloud/holdWorkConnect.ts";
 import type * as ServerConfig from "../config.ts";
 import type * as AgentAwarenessRelay from "../relay/AgentAwarenessRelay.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
+import * as PlaytestRoutes from "../playtest/playtestRoutes.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as HeadlessUsageRefresher from "../usage/HeadlessUsageRefresher.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
@@ -107,6 +108,9 @@ export const layerRoutes = Layer.mergeAll(
   ActivityProbe.layer,
   // GET /api/fork/features: what this version does for a linked machine; its token only.
   ForkFeatures.layer,
+  // GET /api/fork/playtest/state and POST /api/fork/playtest/end: the thread's playtest chip and
+  // its End button (playtest F5); a signed-in session only.
+  PlaytestRoutes.layer,
   // GET /api/fork/handoff/state and POST /api/fork/handoff/now: the thread menu's "Hand off now"
   // and the "handoff waiting on" chip; a signed-in session only.
   HandoffRoutes.layer,

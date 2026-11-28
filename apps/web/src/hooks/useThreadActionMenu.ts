@@ -52,6 +52,7 @@ import {
 import { buildPhysicalToLogicalProjectKeyMap } from "../sidebarProjectGrouping";
 import { threadRuntimeCanArchive } from "@t3tools/client-runtime/state/models";
 import { useCopyToClipboard } from "./useCopyToClipboard";
+import * as ForkRoles from "../components/fork/calmSidebar/threadRoleMenu"; // Fork (calm sidebar)
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { useClientSettings } from "./useSettings";
 import { canTurnThreadIntoProject, useThreadActions } from "./useThreadActions";
@@ -155,6 +156,7 @@ export function useThreadActionMenu(input: {
       snoozePresets,
       canShareWithGuest,
       canTurnIntoProject: canTurnThreadIntoProject(threadRef),
+      forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)
       forkHandoff: forkHandoff.state, // Fork (HO5)
     });
     const run = async (action: ThreadActionMenuId) => {
@@ -172,6 +174,7 @@ export function useThreadActionMenu(input: {
         );
         return;
       }
+      if (ForkRoles.runIfThreadRoleMenuAction(threadRef, action)) return; // Fork (calm sidebar)
       if (action.startsWith("snooze:")) {
         const preset =
           action === "snooze:custom"
