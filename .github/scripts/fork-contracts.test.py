@@ -594,6 +594,12 @@ SHELL_CHANGE = re.compile(r"GITHUB_ENV|GITHUB_PATH|BASH_ENV|BASH_FUNC_|^\s*(?:fu
                           re.M)
 
 
+# The shared checkout's copy of git_retry (fork-git-retry.sh's function, word for word): a
+# function that lives and dies inside its own step, not a change to the shell of later steps.
+GIT_RETRY_FUNCTION = re.search(r"^git_retry\(\) \{\n.*?^\}\n",
+                               (root / ".github" / "scripts" / "fork-git-retry.sh").read_text(), re.M | re.S).group(0)
+
+
 def shell_env_keys(env):
     return {k for k in env or {} if k in SHELL_ENV or str(k).startswith("BASH_FUNC_")}
 
@@ -602,7 +608,7 @@ def earlier_step_problem(step, shared_run):
     run = str(step.get("run", ""))
     if "uses" in step:
         return f"an action ({step['uses']}) can write GITHUB_ENV"
-    if SHELL_CHANGE.search(run):
+    if SHELL_CHANGE.search(run.replace(GIT_RETRY_FUNCTION, "")):
         return "writes GITHUB_ENV/GITHUB_PATH/BASH_ENV or defines a shell function"
     if run == shared_run or is_refusal(step):
         return None
@@ -1368,7 +1374,7 @@ esac
 # the list itself: a misread tip is only looked up, or counted unscanned.
 declare -A reviewed=()
 if [[ ${#missing[@]} -gt 0 ]]; then
-git fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$CONFIG_BRANCH:refs/scan-script/head"
+git_retry fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$CONFIG_BRANCH:refs/scan-script/head"
 while read -r tip; do reviewed[$tip]=1; done < <(git show "refs/scan-script/head:.github/fork-secret-sweep-gone-tips.txt" 2> /dev/null \
 | sed -nE 's/^([0-9a-f]{40})[[:space:]].*/\1/p')
 fi
@@ -1528,7 +1534,7 @@ export UPSTREAM OLD_HEADS_FILE="${RUNNER_TEMP:?}/old-heads" SCANNED_GONE_FILE="$
 DELETED_TIPS_FILE="${RUNNER_TEMP:?}/deleted-tips"
 if [[ ${#OLD_HEADS} -le 100000 ]]; then export OLD_HEADS; fi
 if [[ ${#SCANNED_GONE} -le 100000 ]]; then export SCANNED_GONE; fi
-git fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$CONFIG_BRANCH:refs/scan-script/head"
+git_retry fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$CONFIG_BRANCH:refs/scan-script/head"
 git show "refs/scan-script/head:.github/scripts/fork-secret-scan.sh" > "${RUNNER_TEMP:?}/scan-from-default-branch.sh"
 # A default branch's script from before the files reads only the variables: a list too
 # long to export would reach it as an empty list, so a tip it names would go unscanned.
@@ -1795,7 +1801,7 @@ def secret_scan_problems(wfs):
         problems.append(f"{SCAN_FILE}: no step runs the scan script")
     for j, step in runs:
         run = str(step.get("run", ""))
-        fetched = re.search(r'git fetch [^\n]*"\+refs/heads/\$CONFIG_BRANCH:([^"\s]+)"', run)
+        fetched = re.search(r'git(?:_retry)? fetch [^\n]*"\+refs/heads/\$CONFIG_BRANCH:([^"\s]+)"', run)
         if re.search(r"(?<!:\.github/scripts/)fork-secret-scan\.sh", run):
             problems.append(f"{SCAN_FILE}/{j}: names the checkout's scan script (run the default branch's copy)")
         if not fetched or f'git show "{fetched.group(1)}:.github/scripts/fork-secret-scan.sh"' not in run:
@@ -2149,9 +2155,16 @@ check("secret-scan: the sweep's activity lookup (#239) in its exact form passes"
 # Also: run again (same clone, or a new runner with the record), stopped half-way (before or while
 # writing the record), the first run (no record), a record that cannot be read, a tip that comes
 # back, no tips at all, and no clone.
+def step_git_retry(run):
+    """The step's own git_retry (defined at its top, before the part a harness runs alone): that part
+    calls it, so the harness puts it in front."""
+    fn = re.search(r"^ *git_retry\(\) \{\n.*?^ *\}\n", run, re.M | re.S)
+    return fn.group(0) if fn else ""
+
+
 def sweep_lookup_code(run):
     start, end = run.find('SCANNED_GONE=""\n'), run.find("unset LOOKUP_TOKEN\n")
-    return run[start:end] if 0 <= start < end else "exit 99\n"
+    return step_git_retry(run) + run[start:end] if 0 <= start < end else "exit 99\n"
 
 
 sweep_work = pathlib.Path(tempfile.mkdtemp(prefix="fork-contracts-sweep-"))
@@ -3358,7 +3371,7 @@ for what, old, new in (
 # (#691) a default branch whose script predates the files: a list too long to export fails the job.
 def handoff_code(run):
     start = run.find("unset LOOKUP_TOKEN\n")
-    return run[start:] if start >= 0 else "exit 99\n"
+    return step_git_retry(run) + run[start:] if start >= 0 else "exit 99\n"
 
 
 handoff_origin = sweep_work / "handoff-origin"

@@ -95,14 +95,18 @@ head="$(git rev-parse HEAD)"
 run_sha="${RUN_SHA:-$head}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/fork-channel.sh"
+# git_retry (fork-git-retry.sh): each fetch below is tried again after a connection error, never after another error.
+# Upstream's tags come with their files (that remote is no promisor), so a try may take minutes.
+. "$here/fork-git-retry.sh"
+GIT_RETRY_TRY=300 GIT_RETRY_TOTAL=360
 fork_channel_init || fail "FORK_FOLLOW_CHANNEL is '$FORK_FOLLOW_CHANNEL'; it must be nightly or stable. Nothing was planned."
 
 # Read-only fetches into refs this run alone uses: upstream's tags and default branch, and this
 # fork's tags (its releases). Pruned, so a tag deleted since an earlier fetch here is gone too.
-git fetch --quiet --prune --no-tags "$upstream_url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head" \
+git_retry fetch --quiet --prune --no-tags "$upstream_url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head" \
   > "$logs/fetch.log" 2>&1 \
   || fail "Could not fetch the tags and default branch of $UPSTREAM ($upstream_url):" "$(quoted "$(tail -n 20 "$logs/fetch.log")")"
-git fetch --quiet --prune --no-tags "$ORIGIN" "+refs/tags/v*:refs/fork-tags/v*" > "$logs/fetch.log" 2>&1 \
+git_retry fetch --quiet --prune --no-tags "$ORIGIN" "+refs/tags/v*:refs/fork-tags/v*" > "$logs/fetch.log" 2>&1 \
   || fail "Could not fetch the tags of this fork ($ORIGIN):" "$(quoted "$(tail -n 20 "$logs/fetch.log")")"
 
 # Newest first by version (fork-channel.sh), not by name or by when a tag was made.
@@ -375,7 +379,7 @@ new_workflows() { # new_workflows FROM TO: sets new_list, the upstream workflow 
 # They differ after upstream changed them, and on a re-run (or a queued run) of a run whose commit
 # is older than the series. Building then would mix two versions of the release steps.
 if ! git cat-file -e "$run_sha^{commit}" 2> /dev/null; then
-  git fetch --quiet --no-tags "$ORIGIN" "$run_sha" > "$logs/fetch.log" 2>&1 \
+  git_retry fetch --quiet --no-tags "$ORIGIN" "$run_sha" > "$logs/fetch.log" 2>&1 \
     || fail "This run's commit $run_sha is not in the fork, so the plan cannot compare its release workflows with the candidate's." \
       "Start a new run (\`gh workflow run fork-follow.yml --repo $REPOSITORY\`) instead of re-running this one."
 fi
@@ -511,8 +515,8 @@ prefetch_rebase_blobs() { # prefetch_rebase_blobs BASE TARGET
   git cat-file --batch-all-objects --batch-check='%(objectname)' | sort -u > "$logs/prefetch.here"
   comm -23 "$logs/prefetch.wanted" "$logs/prefetch.here" > "$logs/prefetch.ids"
   [[ -s "$logs/prefetch.ids" ]] || return 0
-  git -c fetch.negotiationAlgorithm=noop fetch --quiet "$promisor" --no-tags --no-write-fetch-head \
-    --recurse-submodules=no --filter=blob:none --stdin < "$logs/prefetch.ids" > "$logs/prefetch.log" 2>&1 \
+  GIT_RETRY_STDIN="$logs/prefetch.ids" git_retry -c fetch.negotiationAlgorithm=noop fetch --quiet "$promisor" --no-tags \
+    --no-write-fetch-head --recurse-submodules=no --filter=blob:none --stdin > "$logs/prefetch.log" 2>&1 \
     || fail "Could not fetch the $(wc -l < "$logs/prefetch.ids") files the rebase from $base_tag onto $target_tag reads from $promisor (this checkout has no file contents of its own):" \
       "$(quoted "$(tail -n 20 "$logs/prefetch.log")")" "" "Nothing was rebased; the series was left as it is."
 }

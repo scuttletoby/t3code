@@ -223,6 +223,43 @@
 # fetches there and a content still missing is a fatal git error, which fails the scan.
 set -euo pipefail
 
+# git_retry: a copy of fork-git-retry.sh (the workflow runs this script alone, from the default branch, outside the
+# checkout); fork-git-retry.test.py holds it to that file. A fetch whose failure fails the scan goes through it: tried
+# again after a connection error only, within the same time limit the fetch had.
+git_retry() {
+  local net real waits err code=0 limit try=1 end=$((SECONDS + ${GIT_RETRY_TOTAL:-150}))
+  net='Failed to connect|Could(n.t| not) resolve|Connection (refused|reset|timed out)|Operation timed out|Network is unreachable'
+  net+='|Temporary failure in name resolution|Recv failure|Send failure|SSL_ERROR_SYSCALL|SSL_(connect|read)|gnutls_handshake'
+  net+='|TLS connect error|returned error: (429|5[0-9][0-9])|RPC failed|early EOF|unexpected disconnect|hung up unexpectedly'
+  net+='|was not closed cleanly|transfer closed with|Empty reply from server'
+  real='not our ref|find remote ref|no such remote ref|unadvertised object|Authentication failed|could not read (Username|Password)'
+  real+='|Repository not found|returned error: 4([01][0-9]|2[0-8]|[3-9][0-9])|not appear to be a git repository|invalid refspec'
+  read -r -a waits <<< "${GIT_RETRY_WAITS:-5 10 20}"
+  while :; do
+    limit=$((end - SECONDS))
+    ((limit < ${GIT_RETRY_TRY:-90})) || limit=${GIT_RETRY_TRY:-90}
+    ((limit > 0)) || limit=1
+    code=0
+    if [[ -n "${GIT_RETRY_STDIN:-}" ]]; then
+      { err="$(LC_ALL=C timeout -k 5 "$limit" git "$@" 2>&1 >&3 3>&- < "$GIT_RETRY_STDIN")" || code=$?; } 3>&1
+    else
+      { err="$(LC_ALL=C timeout -k 5 "$limit" git "$@" 2>&1 >&3 3>&-)" || code=$?; } 3>&1
+    fi
+    [[ -z "$err" ]] || printf '%s\n' "$err" >&2
+    ((code)) || return 0
+    if ((code != 124 && code != 137)) && { ! grep -qE "$net" <<< "$err" || grep -qE "$real" <<< "$err"; }; then
+      return "$code"
+    fi
+    if ((try > ${#waits[@]})) || ((SECONDS + ${waits[try - 1]} + 5 > end)); then
+      echo "::error::git $1: a connection error on try $try, the last one (git_retry: no tries or time left)" >&2
+      return "$code"
+    fi
+    echo "::warning::git $1: a connection error on try $try (exit $code); trying again in ${waits[try - 1]} s" >&2
+    sleep "${waits[try - 1]}"
+    try=$((try + 1))
+  done
+}
+
 # OLD_HEADS_FILE / SCANNED_GONE_FILE / DELETED_TIPS_FILE, when set, are read instead of the variable (#637), which is
 # then no longer exported; a file that cannot be read fails the job rather than leaving the list empty.
 for list in OLD_HEADS SCANNED_GONE DELETED_TIPS; do
@@ -242,7 +279,7 @@ done
 have() { GIT_NO_LAZY_FETCH=1 git cat-file -e "$1^{commit}" 2>/dev/null; }
 # Commits only, file contents on demand: the checkout is a blob-less clone.
 fetch() {
-  have "$1" || git fetch --no-tags --quiet --filter=blob:none origin "$1" 2>/dev/null || true
+  have "$1" || git_retry fetch --no-tags --quiet --filter=blob:none origin "$1" 2>/dev/null || true
   have "$1"
 }
 # An earlier head of a pull request (see "replaced heads"): 0 when it is here; 1 when origin answers
@@ -308,7 +345,7 @@ fetch_upstream() {
   git for-each-ref --format='delete %(refname)' refs/scan-upstream/ | git update-ref --stdin || return 1
   [[ -n "${UPSTREAM:-}" ]] || return 1
   local url="${UPSTREAM_URL:-https://github.com/$UPSTREAM.git}"
-  timeout 600 git fetch --quiet --no-tags --filter=blob:none "$url" \
+  GIT_RETRY_TRY=600 GIT_RETRY_TOTAL=600 git_retry fetch --quiet --no-tags --filter=blob:none "$url" \
     "+HEAD:refs/scan-upstream/head" "+refs/tags/v*:refs/scan-upstream/tags/v*" >&2 || return 1
   git rev-parse --quiet --verify refs/scan-upstream/head > /dev/null
 }
@@ -345,7 +382,7 @@ summary() { if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then printf '%s\n' "$@" >> "
 fetch_config_branch() {
   [[ -n "${CONFIG_BRANCH:-}" ]] || return 1
   git check-ref-format "refs/heads/$CONFIG_BRANCH" || return 1
-  timeout 600 git fetch --quiet --no-tags --filter=blob:none origin \
+  GIT_RETRY_TRY=600 GIT_RETRY_TOTAL=600 git_retry fetch --quiet --no-tags --filter=blob:none origin \
     "+refs/heads/$CONFIG_BRANCH:refs/scan-config/head" >&2 || return 1
   git rev-parse --quiet --verify 'refs/scan-config/head^{commit}'
 }
@@ -500,7 +537,7 @@ case "$EVENT_NAME" in
     # pushed; when it is gone already (deleted, or moved by a later push), that push's run reads it.
     if [[ "${PUSH_REF:-}" == refs/tags/* ]]; then
       if git check-ref-format "$PUSH_REF" &&
-        timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "+$PUSH_REF:refs/scan-tag/pushed" >&2 &&
+        GIT_RETRY_TRY=300 GIT_RETRY_TOTAL=300 git_retry fetch --quiet --no-tags --filter=blob:none origin "+$PUSH_REF:refs/scan-tag/pushed" >&2 &&
         [[ "$(git rev-parse --quiet --verify 'refs/scan-tag/pushed^{commit}')" == "$(git rev-parse --quiet --verify "$AFTER^{commit}")" ]]; then
         mapfile -t tag_objects < <(tag_chain refs/scan-tag/pushed)
       else
@@ -519,7 +556,7 @@ case "$EVENT_NAME" in
     read_gone_list "$settings"
     changes=()
     if ! git for-each-ref --format='delete %(refname)' refs/scan-sweep/ | git update-ref --stdin ||
-      ! timeout 900 git fetch --quiet --no-tags --filter=blob:none origin \
+      ! GIT_RETRY_TRY=900 GIT_RETRY_TOTAL=900 git_retry fetch --quiet --no-tags --filter=blob:none origin \
         "+refs/*:refs/scan-sweep/*" "^refs/pull/*" >&2; then
       echo "::error::Secret scan: cannot fetch the refs of origin. Re-run the job." >&2
       exit 2
@@ -703,8 +740,9 @@ if ! git -c core.quotepath=false diff-tree --stdin -m -r --no-commit-id --raw --
     sort -u > "$work/wanted" ||
   ! git cat-file --batch-check='%(objectname)' --batch-all-objects 2> /dev/null | sort -u > "$work/have" ||
   ! comm -23 "$work/wanted" "$work/have" > "$work/missing" ||
-  { [[ -s "$work/missing" ]] && ! timeout 600 git -c fetch.negotiationAlgorithm=noop fetch --quiet --no-tags \
-    --no-write-fetch-head --recurse-submodules=no --filter=blob:none origin --stdin < "$work/missing"; }; then
+  { [[ -s "$work/missing" ]] && ! GIT_RETRY_TRY=600 GIT_RETRY_TOTAL=600 GIT_RETRY_STDIN="$work/missing" git_retry \
+    -c fetch.negotiationAlgorithm=noop fetch --quiet --no-tags --no-write-fetch-head --recurse-submodules=no \
+    --filter=blob:none origin --stdin; }; then
   cannot_read
 fi
 

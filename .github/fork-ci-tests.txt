@@ -57,6 +57,7 @@
 .github/scripts/fork-fleet-walls-contract.test.py ~96s unittest
 .github/scripts/fork-fleet-walls-wsl2.test.py ~40s unittest
 .github/scripts/fork-gate-trust-docs.test.py ok lines
+.github/scripts/fork-git-retry.test.py ~23s unittest
 .github/scripts/fork-head-gate-workflow.test.py ok lines
 .github/scripts/fork-follow.test.sh ~41s
 .github/scripts/fork-interaction-limit.test.sh
