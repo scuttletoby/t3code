@@ -4,24 +4,34 @@
 General: the project's config names its servers and ports; nothing here knows a project.
 
   {
-    "claims_dir": ".lanes",                       folder of claims and measurements (relative: to the config's folder)
     "servers": {"api": {"port": 4100}, "db": {"port": 4101}},
     "lane_mb": 800,                               a lane's memory before one is measured
     "reserve_mb": 1024,                           memory left free for everything else
     "max_lanes": 4                                never more lanes than this at once
   }
 
+The host's part comes from the runner's environment, never from the project's config (a pull request edits that):
+FORK_CI_LANES_DIR, the one folder of claims and measurements every lane on the host shares (absolute; default
+$XDG_STATE_HOME/fork-ci-lanes, else ~/.local/state/fork-ci-lanes), and FORK_CI_LANES_MAX_LANES,
+FORK_CI_LANES_RESERVE_MB and FORK_CI_LANES_LANE_MB, the host's limits (defaults 4, 1024, 800). A project's config can
+only tighten them: the lower max_lanes, the higher reserve_mb and lane_mb.
+
 Admission (admit): a new lane starts only when fewer than max_lanes run and the memory the machine has free now
-(MemAvailable, measured) minus reserve_mb holds one more lane's cost. A lane's cost is the largest peak of the last
-lanes measured (each run records its children's peak memory), lane_mb until one is. When the free memory cannot be
-measured, a lane starts only when none runs (one at a time: the safe old way).
+(MemAvailable, measured) minus reserve_mb, minus what the admitted lanes have not used yet (each lane's cost less its
+process group's memory now: a lane started a moment ago is not in MemAvailable yet), holds one more lane's cost. A
+lane's cost is the largest peak of the last lanes measured (each run records its peak memory: its largest process,
+or its process group's sampled total when larger), lane_mb until one is. When the free memory or the measurements
+cannot be read, a lane starts only when none runs (one at a time: the safe old way).
 
   python3 pool.py run --config lanes.json --lane ID --server NAME [--server NAME]... [--alone [--restart]]
       [--wait-s 3600] -- command...
 Waits (polling) until every named server is claimed (shared, or alone with --alone; --restart: a waiting restart goes
-first) and the pool admits the lane, then runs the command with LANE_ID and LANE_PORT_<NAME> set, releases on exit
-(also on SIGTERM/SIGINT: the command is stopped first) and records the lane's peak memory. Exit: the command's; 75
-when it waited --wait-s without a start; 2 for a config it cannot use.
+first, on every named server) and the pool admits the lane, then runs the command with LANE_ID and LANE_PORT_<NAME>
+set, releases on exit (also on SIGTERM/SIGINT/SIGHUP: the command is stopped first) and records the lane's peak
+memory. The lane runs in its own process group (pool.py makes one when it does not lead one and no terminal is its
+input); its claims stay alive while a process of that group runs, so a pool.py killed outright (SIGKILL) holds its
+servers until the command it left ends. Exit: the command's; 128 + the signal when stopped; 75 when it waited
+--wait-s without a start; 2 for a config it cannot use.
 """
 import argparse, json, os, re, resource, signal, subprocess, sys, time
 
@@ -39,16 +49,42 @@ class ConfigError(Exception):
     pass
 
 
-def load_config(path):
-    """The project's lane config, checked; claims_dir made absolute."""
+HOST_LIMITS = (('max_lanes', 'FORK_CI_LANES_MAX_LANES', 4, min), ('reserve_mb', 'FORK_CI_LANES_RESERVE_MB', 1024, max),
+               ('lane_mb', 'FORK_CI_LANES_LANE_MB', 800, max))
+
+
+def host_dir(env):
+    """The host's one claims folder (from the runner's environment, absolute)."""
+    got = env.get('FORK_CI_LANES_DIR')
+    if got is not None:
+        if not os.path.isabs(got):
+            raise ConfigError(f'FORK_CI_LANES_DIR must be an absolute folder (not {got!r}): every lane on the host '
+                              'shares it, a relative one would be one per working folder')
+        return os.path.normpath(got)
+    state = env.get('XDG_STATE_HOME')
+    if not state or not os.path.isabs(state):
+        home = env.get('HOME') or os.path.expanduser('~')
+        if not os.path.isabs(home):
+            raise ConfigError('set FORK_CI_LANES_DIR: no absolute home folder to keep the claims in')
+        state = os.path.join(home, '.local', 'state')
+    return os.path.join(state, 'fork-ci-lanes')
+
+
+def load_config(path, env=None):
+    """The project's lane config, checked, with the host's folder and limits (from env, the runner's environment:
+    the project can only tighten the limits)."""
+    env = os.environ if env is None else env
     try:
         with open(path, encoding='utf-8') as f:
             c = json.load(f)
     except (OSError, ValueError) as e:
         raise ConfigError(f'cannot read the lane config {path} ({type(e).__name__}: {e})')
-    keys = {'claims_dir', 'servers', 'lane_mb', 'reserve_mb', 'max_lanes'}
-    if not isinstance(c, dict) or set(c) - keys or not {'claims_dir', 'servers'} <= set(c):
-        raise ConfigError(f'{path}: needs "claims_dir" and "servers", and only the keys {sorted(keys)}')
+    keys = {'servers', 'lane_mb', 'reserve_mb', 'max_lanes'}
+    if isinstance(c, dict) and 'claims_dir' in c:
+        raise ConfigError(f'{path}: "claims_dir" is the host\'s, not the project\'s: '
+                          'set FORK_CI_LANES_DIR on the runner')
+    if not isinstance(c, dict) or set(c) - keys or 'servers' not in c:
+        raise ConfigError(f'{path}: needs "servers", and only the keys {sorted(keys)}')
     servers = c['servers']
     if not isinstance(servers, dict) or not servers:
         raise ConfigError(f'{path}: "servers" must name at least one server')
@@ -60,14 +96,19 @@ def load_config(path):
         if s['port'] in ports:
             raise ConfigError(f'{path}: servers {ports[s["port"]]!r} and {name!r} share port {s["port"]}')
         ports[s['port']] = name
-    for key, default in (('lane_mb', 800), ('reserve_mb', 1024), ('max_lanes', 4)):
-        v = c.get(key, default)
-        if not isinstance(v, int) or isinstance(v, bool) or v < (1 if key != 'reserve_mb' else 0):
+    for key, var, default, pick in HOST_LIMITS:
+        least = 1 if key != 'reserve_mb' else 0
+        try:
+            host = int(env.get(var, default))
+        except ValueError:
+            host = None
+        if host is None or host < least:
+            raise ConfigError(f'{var} must be a whole number of at least {least}')
+        v = c.get(key, host)
+        if not isinstance(v, int) or isinstance(v, bool) or v < least:
             raise ConfigError(f'{path}: "{key}" must be a whole number')
-        c[key] = v
-    if not isinstance(c['claims_dir'], str) or not c['claims_dir']:
-        raise ConfigError(f'{path}: "claims_dir" must be a folder')
-    c['claims_dir'] = os.path.join(os.path.dirname(os.path.abspath(path)), c['claims_dir'])
+        c[key] = pick(v, host)
+    c['claims_dir'] = host_dir(env)
     return c
 
 
@@ -84,39 +125,87 @@ def available_mb(meminfo='/proc/meminfo'):
 
 
 def cost_mb(measured, default):
-    """A lane's cost: the largest of the last measured peaks; default before any."""
-    peaks = [m for m in measured[-KEEP:] if isinstance(m, int) and m > 0]
+    """A lane's cost: the largest of the last measured peaks; default before any; None when the measurements
+    cannot be read (never the default on a guess: it may be far below what lanes take)."""
+    if measured is None:
+        return None
+    peaks = [m for m in measured[-KEEP:] if isinstance(m, int) and not isinstance(m, bool) and m > 0]
     return max(peaks) if peaks else default
 
 
-def admit(lanes, free_mb, cost, reserve_mb, max_lanes):
-    """(ok, why) for one more lane beside `lanes` running ones."""
+def admit(lanes, free_mb, cost, reserve_mb, max_lanes, pending_mb=0):
+    """(ok, why) for one more lane beside `lanes` running ones, which have not used pending_mb of their cost yet."""
     if lanes >= max_lanes:
         return False, f'{lanes} lanes run (max_lanes {max_lanes})'
-    if free_mb is None:
-        return (True, 'free memory unknown: the only lane') if lanes == 0 else \
-            (False, f'free memory unknown: one lane at a time ({lanes} running)')
-    if free_mb - reserve_mb < cost:
-        return False, f'{free_mb} MB free, {reserve_mb} MB kept free, a lane takes {cost} MB'
+    if free_mb is None or cost is None:
+        unknown = 'free memory unknown' if free_mb is None else 'the measurements cannot be read'
+        return (True, f'{unknown}: the only lane') if lanes == 0 else \
+            (False, f'{unknown}: one lane at a time ({lanes} running)')
+    if free_mb - reserve_mb - pending_mb < cost:
+        return False, (f'{free_mb} MB free, {reserve_mb} MB kept free, {pending_mb} MB not used yet by running '
+                       f'lanes, a lane takes {cost} MB')
     return True, f'{free_mb} MB free holds a lane of {cost} MB'
 
 
+PAGE_MB = os.sysconf('SC_PAGE_SIZE') / (1 << 20)
+
+
+def group_rss_mb(pgid, proc='/proc'):
+    """The memory (resident) a process group uses now, in MB; 0 when it cannot be read."""
+    total = 0
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return 0
+    for n in names:
+        if not n.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, n, 'stat'), 'rb') as f:
+                stat = f.read().decode('ascii', 'replace')
+            fields = stat[stat.rindex(')') + 2:].split()
+            if int(fields[2]) == pgid:
+                total += int(fields[21])
+        except (OSError, ValueError, IndexError):
+            continue
+    return int(total * PAGE_MB)
+
+
+def pending_mb(lanes, rss=group_rss_mb):
+    """What admitted lanes have not used of their cost yet: each lane's cost less its group's memory now (a lane
+    with no group to measure counts its whole cost)."""
+    total = 0
+    for c in lanes:
+        cost = (c.get('note') or {}).get('cost')
+        if not isinstance(cost, int) or isinstance(cost, bool) or cost <= 0:
+            continue
+        group = (c.get('note') or {}).get('group')
+        used = rss(group) if isinstance(group, int) and group > 1 else 0
+        total += max(0, cost - used)
+    return total
+
+
 def read_measured(folder):
+    """The measured peaks: [] before any; None when the file cannot be read (one lane at a time until a lane
+    measures again)."""
     try:
         with open(os.path.join(folder, MEASURED), encoding='utf-8') as f:
             got = json.load(f)
-        return got if isinstance(got, list) else []
+    except FileNotFoundError:
+        return []
     except (OSError, ValueError):
-        return []   # (no measurement yet, or one it cannot read: the config's lane_mb)
+        return None
+    return got if isinstance(got, list) else None
 
 
 def record(folder, peak_mb):
-    """Add one lane's measured peak (under the claims lock; the file is written whole)."""
+    """Add one lane's measured peak (under the claims lock; the file is written whole; one it cannot read is
+    started afresh)."""
     c = claims_mod.Claims(folder)
     fd = c._locked()
     try:
-        got = (read_measured(folder) + [int(peak_mb)])[-KEEP:]
-        tmp = os.path.join(folder, f'.tmp-measured-{os.getpid()}')
+        got = ((read_measured(folder) or []) + [int(peak_mb)])[-KEEP:]
+        tmp = os.path.join(folder, f'{claims_mod.TMP}measured-{os.getpid()}')
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(got, f)
         os.replace(tmp, os.path.join(folder, MEASURED))
@@ -128,20 +217,76 @@ def env_name(server):
     return 'LANE_PORT_' + re.sub(r'[^A-Za-z0-9]', '_', server).upper()
 
 
-def take(c, cfg, servers, mode, holder, lane, restart, free=available_mb):
+def take(c, cfg, servers, mode, holder, lane, restart, free=available_mb, rss=group_rss_mb, since=None, group=None):
     """Claim every server or none: (tokens or None, why). A refusal gives back what it got (no lane holds one server
-    while waiting for another: no deadlock)."""
+    while waiting for another: no deadlock); a refused restart waits first in line on every one of its servers, all
+    with one `since` (the time the lane began waiting), so the oldest waiting lane is first on all it needs. Each
+    claim notes the lane's cost and its process group (group: measured for what the lane has not used yet)."""
     cost = cost_mb(read_measured(cfg['claims_dir']), cfg['lane_mb'])
+    note = {'cost': cost if cost is not None else cfg['lane_mb'], **({'group': group} if group else {})}
+    servers = sorted(servers)
     got = []
-    for i, s in enumerate(sorted(servers)):
-        gate = (lambda n: admit(n, free(), cost, cfg['reserve_mb'], cfg['max_lanes'])) if i == 0 else None
-        token, why = c.claim(s, mode, holder, lane, restart=restart, admit=gate)
+
+    def gate(lanes):
+        return admit(len(lanes), free(), cost, cfg['reserve_mb'], cfg['max_lanes'], pending_mb(lanes, rss))
+    for i, s in enumerate(servers):
+        token, why = c.claim(s, mode, holder, lane, restart=restart, admit=gate if i == 0 else None,
+                             keep_wait=restart, since=since, note=note)
         if token is None:
             for t in got:
                 c.release(t)
+            if restart:
+                for other in servers:
+                    c.queue(other, holder, lane, since=since)
             return None, why
         got.append(token)
-    return got, 'claimed ' + ', '.join(f'{s} {mode}' for s in sorted(servers))
+    if restart:
+        for s in servers:
+            c.withdraw(s, holder, lane)
+    return got, 'claimed ' + ', '.join(f'{s} {mode}' for s in servers)
+
+
+class Stopper:
+    """SIGTERM/SIGINT/SIGHUP while a lane runs: stop its command, also when the signal came before the command
+    started (it is stopped the moment it starts: never a command run on with no claim or no one to stop it)."""
+    SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+    def __init__(self, clock=time.monotonic):
+        self.signum, self.at, self.proc, self.clock = None, None, None, clock
+
+    def on_signal(self, signum, frame):
+        if self.signum is None:
+            self.signum, self.at = signum, self.clock()
+        self._stop()
+
+    def started(self, proc):
+        self.proc = proc
+        if self.signum is not None:
+            self._stop()
+
+    def _stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def overdue(self, grace_s=10):
+        return self.signum is not None and self.clock() - self.at >= grace_s
+
+    def code(self, rc):
+        return 128 + self.signum if self.signum is not None else rc
+
+    def install(self):
+        return {s: signal.signal(s, self.on_signal) for s in self.SIGNALS}
+
+
+def own_group():
+    """Lead a process group (the lane's command runs in it, so the claims outlive a pool.py killed outright).
+    Not when a terminal is the input: the terminal's Ctrl-C must still reach the lane."""
+    if os.getpgrp() != os.getpid() and not os.isatty(0):
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            pass   # (a session leader cannot; its group is the holder's then)
+    return os.getpgrp() if os.getpgrp() == os.getpid() else None
 
 
 def run(argv=None, sleep=time.sleep, clock=time.monotonic):
@@ -164,13 +309,28 @@ def run(argv=None, sleep=time.sleep, clock=time.monotonic):
     except ConfigError as e:
         print(f'pool: {e}', file=sys.stderr)
         return 2
-    c, holder, mode = claims_mod.Claims(cfg['claims_dir']), claims_mod.me(), 'alone' if a.alone else 'shared'
-    start, pause, said = clock(), 0.2, None
+    stopper = Stopper()
+    old = stopper.install()
     try:
+        return lane(a, cmd, cfg, stopper, sleep, clock)
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+
+
+def lane(a, cmd, cfg, stopper, sleep, clock):
+    group = own_group()
+    mode = 'alone' if a.alone else 'shared'
+    c = claims_mod.Claims(cfg['claims_dir'])
+    start, pause, said, since, holder = clock(), 0.2, None, time.time(), None
+    try:
+        holder = claims_mod.me()
         while True:
-            tokens, why = take(c, cfg, a.server, mode, holder, a.lane, a.restart)
+            tokens, why = take(c, cfg, a.server, mode, holder, a.lane, a.restart, since=since, group=group)
             if tokens:
                 break
+            if stopper.signum is not None:
+                return stopper.code(0)
             if why != said:
                 print(f'pool: lane {a.lane} waits: {why}', file=sys.stderr, flush=True)
                 said = why
@@ -183,38 +343,36 @@ def run(argv=None, sleep=time.sleep, clock=time.monotonic):
         print(f'pool: {e}', file=sys.stderr)
         return 2
     finally:
-        if a.restart:   # (a granted claim already ended its wait; this ends one a refusal left)
+        if a.restart and holder is not None:   # (a grant already ended its waits; this ends those a refusal left)
             try:
                 for s in a.server:
                     c.withdraw(s, holder, a.lane)
             except claims_mod.ClaimsError:
                 pass
-    print(f'pool: lane {a.lane}: {why}', file=sys.stderr, flush=True)
     env = {**os.environ, 'LANE_ID': a.lane, **{env_name(s): str(cfg['servers'][s]['port']) for s in a.server}}
-    child = None
-
-    def stop(signum, frame):
-        if child is not None and child.poll() is None:
-            child.terminate()
-        raise SystemExit(128 + signum)
-    old = {s: signal.signal(s, stop) for s in (signal.SIGTERM, signal.SIGINT)}
+    sampled = 0
     try:
+        if stopper.signum is not None:
+            return stopper.code(0)
+        print(f'pool: lane {a.lane}: {why}', file=sys.stderr, flush=True)
         child = subprocess.Popen(cmd, env=env)
-        rc = child.wait()
-    except SystemExit as e:
-        if child is not None:
+        stopper.started(child)
+        while True:
             try:
-                child.wait(timeout=10)
+                rc = child.wait(timeout=1)
+                break
             except subprocess.TimeoutExpired:
+                pass
+            if group:
+                sampled = max(sampled, group_rss_mb(group))
+            if stopper.overdue():
                 child.kill()
-                child.wait()
-        rc = e.code
+        rc = stopper.code(rc)
     finally:
-        for s, h in old.items():
-            signal.signal(s, h)
         for t in tokens:
             c.release(t)
-    peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024   # its largest process, kB on Linux
+    # Its peak: its largest process (kB on Linux), or the group's sampled total when larger.
+    peak = max(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024, sampled)
     if peak > 0:
         try:
             record(cfg['claims_dir'], peak)

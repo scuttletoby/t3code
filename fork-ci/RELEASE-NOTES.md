@@ -16,9 +16,11 @@ nothing.
 ### lanes: a general test-lane pool and claims rule (#890)
 
 New: [`lanes/`](lanes/README.md). `pool.py run` runs one lane's command once its servers are claimed and the pool
-admits it from measured free memory; `claims.py` is the rule (shared or alone, a waiting restart first, dead holders
-swept by pid and start time or by unit, one lock); `contract.py` holds the contract tests a project runs against its
-own adapter.
+admits it from measured free memory, less what lanes admitted a moment ago have not used yet; `claims.py` is the
+rule (shared or alone, a waiting restart first on every server it needs, dead holders swept by pid, start time and
+process group or by unit, garbage claim files swept, one lock); `contract.py` holds the contract tests a project runs
+against its own adapter. The claims folder and the limits a pull request must not loosen come from the runner's
+environment (`FORK_CI_LANES_*`), never from the project's config.
 
 **Upgrade:** none (nothing used it before).
 

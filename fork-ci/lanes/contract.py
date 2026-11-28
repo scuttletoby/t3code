@@ -131,12 +131,82 @@ class LaneContract:
         with self.assertRaises(claims_mod.ClaimsError):
             self.take(2)
 
-    def test_a_claim_it_cannot_parse_grants_nothing(self):
-        self.granted(1)
-        with open(os.path.join(self.folder, 'x' + claims_mod.SUFFIX), 'w') as f:
-            f.write('{"kind": "claim", "ser')
+    def plant(self, name, body):
+        os.makedirs(self.folder, exist_ok=True)
+        path = os.path.join(self.folder, name)
+        with open(path, 'w') as f:
+            f.write(body)
+        return path
+
+    def test_a_planted_or_garbage_claim_is_swept(self):
+        # Does a claim file this version never writes (junk, an empty holder, a pid with no start time, which would
+        # read as alive for ever) block the server? No: it is removed at the next call, which is granted.
+        bodies = ('{"kind": "claim", "ser', '{}', '[]',
+                  '{"kind": "claim", "mode": "alone", "server": "%s", "holder": {}}',
+                  '{"kind": "claim", "mode": "alone", "server": "%s", "holder": {"pid": 1}}',
+                  '{"kind": "claim", "mode": "alone", "server": "%s", "holder": {"pid": "x", "start": "s"}}')
+        for i, body in enumerate(bodies):
+            with self.subTest(body=body):
+                path = self.plant(f'x{i}' + claims_mod.SUFFIX, body.replace('%s', self.servers[0]))
+                t = self.granted(1, 'alone')
+                self.assertFalse(os.path.exists(path))
+                self.c.release(t)
+
+    def test_a_claim_of_a_newer_version_grants_nothing(self):
+        # A claim a newer release wrote (its shape may be one this version cannot judge): fail closed, never swept.
+        path = self.plant('x' + claims_mod.SUFFIX, '{"v": 999, "kind": "claim"}')
         with self.assertRaises(claims_mod.ClaimsError):
             self.take(2)
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_temporary_file_a_crash_left_is_removed(self):
+        # A writer that died between writing its temporary file and the rename leaves `.tmp-*`: the next call (under
+        # the lock, so no writer is half-way) removes it.
+        path = self.plant('.tmp-00000000000000000001-1-abcdef', '{"kind": "cl')
+        self.granted(1)
+        self.assertFalse(os.path.exists(path))
+
+    def test_lanes_are_counted_by_holder(self):
+        # Two runners that pass the same lane name are two lanes against admission, not one; one lane's two servers
+        # are one.
+        self.c.claim(self.servers[0], 'shared', holder(1), 'same')
+        self.c.claim(self.servers[1], 'shared', holder(1), 'same')
+        self.c.claim(self.servers[0], 'shared', holder(2), 'same')
+        seen = []
+        self.c.claim(self.servers[1], 'shared', holder(3), 'x',
+                     admit=lambda lanes: (seen.append(len(lanes)), (True, ''))[1])
+        self.assertEqual(seen, [2])
+
+    def test_a_restart_keeps_its_place_on_every_server(self):
+        # A restart that needs two servers, refused on one: does a younger claim get in on the other meanwhile? No:
+        # queue() holds its place there too, and keep_wait keeps the wait while it holds a server.
+        a, b = self.servers
+        s1 = self.c.claim(b, 'shared', holder(1), 'lane1')[0]
+        r = self.c.claim(a, 'alone', holder(9), 'lane9', restart=True, keep_wait=True)[0]
+        self.assertIsNotNone(r)
+        self.assertIsNone(self.c.claim(b, 'alone', holder(9), 'lane9', restart=True, keep_wait=True)[0])
+        self.c.release(r)
+        self.c.queue(a, holder(9), 'lane9')
+        token, why = self.c.claim(a, 'shared', holder(2), 'lane2')
+        self.assertIsNone(token, why)
+        self.assertIn('waiting restart goes first', why)
+        self.c.release(s1)
+        self.assertIsNotNone(self.c.claim(a, 'alone', holder(9), 'lane9', restart=True, keep_wait=True)[0])
+        self.assertIsNotNone(self.c.claim(b, 'alone', holder(9), 'lane9', restart=True, keep_wait=True)[0])
+
+    def test_waits_of_one_lane_share_one_place(self):
+        # Two restarts that each need a and b never deadlock: a lane's waits carry the time it began waiting, so the
+        # same lane is first on every server they share.
+        a, b = self.servers
+        s1 = self.c.claim(b, 'shared', holder(1), 'lane1')[0]
+        self.c.queue(a, holder(8), 'lane8', since=10.0)
+        self.c.queue(b, holder(9), 'lane9', since=20.0)
+        self.c.queue(a, holder(9), 'lane9', since=20.0)
+        self.c.queue(b, holder(8), 'lane8', since=10.0)
+        self.c.release(s1)
+        self.assertIsNone(self.c.claim(a, 'alone', holder(9), 'lane9', restart=True, keep_wait=True)[0])
+        self.assertIsNotNone(self.c.claim(a, 'alone', holder(8), 'lane8', restart=True, keep_wait=True)[0])
+        self.assertIsNotNone(self.c.claim(b, 'alone', holder(8), 'lane8', restart=True, keep_wait=True)[0])
 
     def test_a_refused_admission_claims_nothing(self):
         # The pool says no: nothing is held (and a restart still waits first in line).
@@ -146,7 +216,7 @@ class LaneContract:
         self.assertEqual([c['kind'] for c in self.c.holders()], ['wait'])
         seen = []
         self.granted(9, 'alone', restart=True, admit=lambda lanes: (seen.append(lanes), (True, ''))[1])
-        self.assertEqual(seen, [0])
+        self.assertEqual(seen, [[]])
 
     def test_two_users_of_one_folder_see_each_other(self):
         # Two processes' views of one folder: a claim made through one holds against the other.
