@@ -84,7 +84,9 @@ has no row yet (usage history, busy check, placement, thread roles): set it in `
   set them (**Make assistant** sets the assistant); the app does not show them yet. Settings file
   only (`threadRoles`).
 - Waiting on you: the Issues entry lists the open owner questions of every project on every
-  connected server, read only. Settings → Fork → Issues page turns it off for upstream's Issues page
+  connected server, each with its recommendation and an answer box. **Post answer** posts the
+  comment "Owner decision: ..." as the account the server signs in with and takes the label
+  `status:needs-owner-decision` off. Settings → Fork → Issues page turns it off for upstream's Issues page
   (on by default).
 
 **Playtesting**
@@ -171,7 +173,7 @@ From the fork's open issues, grouped. Each is one line; the issue has the detail
 - Playtest: a thread chip with an End button
   ([#889](https://github.com/scuttletoby/t3code/issues/889)) and what blocks turning it on
   ([#901](https://github.com/scuttletoby/t3code/issues/901)).
-- Waiting on you: the Issues page opens it
+- Waiting on you on the phone, and a fork-ci action that lists and labels owner questions
   ([#887](https://github.com/scuttletoby/t3code/issues/887)).
 - Every question, approval or sign-in from any machine shows up in the thread you read
   ([#808](https://github.com/scuttletoby/t3code/issues/808)).

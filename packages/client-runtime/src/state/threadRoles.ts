@@ -145,7 +145,8 @@ export interface CalmRoleRow<T> {
 /**
  * `off`: the list as given (calm off, or no threads). `no-roles`: no row holds a role; the list as
  * given plus a hint, never all folded. `calm`: role rows on top (assistants, then orchestrators, in list order), every
- * other thread in `otherThreads` in list order, and how many of those wait on the person.
+ * other thread in `otherThreads` in list order. A view counts its own waiting threads with
+ * `isWaitingOnPerson`, over the rows it folds.
  */
 export type CalmPartition<T> =
   | { readonly kind: "off"; readonly threads: ReadonlyArray<T> }
@@ -154,7 +155,6 @@ export type CalmPartition<T> =
       readonly kind: "calm";
       readonly roleRows: ReadonlyArray<CalmRoleRow<T>>;
       readonly otherThreads: ReadonlyArray<T>;
-      readonly waitingCount: number;
     };
 
 /**
@@ -173,18 +173,14 @@ export function calmPartition<
   const assistants: Array<CalmRoleRow<T>> = [];
   const orchestrators: Array<CalmRoleRow<T>> = [];
   const otherThreads: Array<T> = [];
-  let waitingCount = 0;
   for (const thread of threads) {
     const role = threadRole(thread, rolesByEnvironment.get(thread.environmentId));
     if (role === "assistant") assistants.push({ thread, role });
     else if (role === "orchestrator") orchestrators.push({ thread, role });
-    else {
-      otherThreads.push(thread);
-      if (isWaitingOnPerson(thread)) waitingCount += 1;
-    }
+    else otherThreads.push(thread);
   }
   if (assistants.length === 0 && orchestrators.length === 0) return { kind: "no-roles", threads };
-  return { kind: "calm", roleRows: [...assistants, ...orchestrators], otherThreads, waitingCount };
+  return { kind: "calm", roleRows: [...assistants, ...orchestrators], otherThreads };
 }
 
 function sameRoles(a: ResolvedThreadRoles, b: ResolvedThreadRoles): boolean {
