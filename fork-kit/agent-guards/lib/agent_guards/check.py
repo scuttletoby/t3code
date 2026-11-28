@@ -150,6 +150,10 @@ def speed_cases(tmp, sid, bash):
         out.append(('poll-loop-guard', 'PreToolUse', 'a sleep loop on CI', bash(loop), 'refused', None))
     out.append(('poll-loop-guard', 'PreToolUse', 'the same in the background',
                 dict(bash(loop), tool_input={'command': loop, 'run_in_background': True}), 'passed', None))
+    kill = 'pkill -f agent-guards-self-check'
+    if poll['enabled'] and not problem:
+        out.append(('poll-loop-guard', 'PreToolUse', 'a pkill -f that kills its own shell',
+                    dict(bash(kill), tool_input={'command': kill, 'run_in_background': True}), 'refused', None))
     size, problem = config.load('readSize')
     big = os.path.join(tmp, 'big.txt')
     with open(big, 'w') as f:
