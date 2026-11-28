@@ -493,7 +493,7 @@ def pause(state, now, until=None):
     state['pauseUntil'] = iso(min(until, now + MAX_WAIT))
 
 
-def tick(cfg, state_dir, api, now=None, out=sys.stdout, err=sys.stderr):
+def tick(cfg, state_dir, api, now=None, out=sys.stdout, err=sys.stderr, alert=None):
     """One tick over every entry. Returns the exit code."""
     now = now or _now()
     folder = state_folder(state_dir)
@@ -504,12 +504,12 @@ def tick(cfg, state_dir, api, now=None, out=sys.stdout, err=sys.stderr):
         except BlockingIOError:
             print('schedule-kick: another tick is running; this one does nothing', file=out)
             return 0
-        return _tick(cfg, folder, api, now, out, err)
+        return _tick(cfg, folder, api, now, out, err, alert)
     finally:
         lock.close()
 
 
-def _tick(cfg, folder, api, now, out, err):
+def _tick(cfg, folder, api, now, out, err, alert=None):
     state_path = os.path.join(folder, 'state.json')
     state = load_state(state_path, lambda m: print(f'schedule-kick: {m}', file=err))
     keys = {e.key for e in cfg.entries}
@@ -518,6 +518,12 @@ def _tick(cfg, folder, api, now, out, err):
     status, failed = {}, False
     paused = waiting_until(state.get('pauseUntil'), now)
 
+    def heads_alert(text):
+        from .keepon import channel_alert
+        sent, why = (alert or channel_alert)(text)
+        if not sent:
+            print(f'schedule-kick: alert not sent ({why}): {text}', file=err)
+
     def limited(e):
         pause(state, now, now + datetime.timedelta(seconds=e.retry_after) if e.retry_after else epoch(e.reset))
 
@@ -525,7 +531,7 @@ def _tick(cfg, folder, api, now, out, err):
              lambda e, m: fail(state, e.key, now, m), e) for e in cfg.entries]
     jobs += [(h.key, f'{h.repo} {h.workflow} heads',
               lambda h=h: headsmod.reconcile(h, api, state, now, parse_time, waiting_until, BACKOFF, MAX_WAIT,
-                                             lambda: write_json(state_path, state), limited),
+                                             lambda: write_json(state_path, state), limited, heads_alert),
               lambda h, m: headsmod.fail(state, h.key, now, m, BACKOFF, MAX_WAIT), h) for h in cfg.heads]
     for key, label, work, on_fault, item in jobs:
         if paused is not None:
@@ -537,10 +543,14 @@ def _tick(cfg, folder, api, now, out, err):
         except Exception as e:      # noqa: BLE001 - one entry's fault never stops the entries after it
             result, message = 'error', f'internal error: {type(e).__name__}: {e}'
             on_fault(item, message)
-        remaining = getattr(api, 'remaining', None)
-        if result != 'done' and remaining is not None and remaining < MIN_REMAINING:
-            pause(state, now, epoch(getattr(api, 'reset', None)))
-            message += f' (only {remaining} API calls left: pausing)'
+        low = [(n, getattr(api, f, None), getattr(api, r, None)) for n, f, r in
+               (('REST', 'remaining', 'reset'), ('GraphQL', 'graphql_remaining', 'graphql_reset'))]
+        low = [(n, left, reset) for n, left, reset in low if left is not None and left < MIN_REMAINING]
+        if result != 'done' and low:
+            resets = [t for t in (epoch(reset) for _, _, reset in low) if t is not None]
+            pause(state, now, max(resets) if resets else None)
+            message += ''.join(f' (only {left} {"GraphQL " if n == "GraphQL" else ""}API calls left: pausing)'
+                               for n, left, _ in low)
         status[key] = {'result': result, 'message': message}
         line = f'schedule-kick: {label}: {result}: {message}'
         print(line, file=err if result == 'error' else out)
@@ -583,13 +593,13 @@ def broken(e, state_dir, err):
     return 1
 
 
-def refuse(message, state_dir, out_err):
+def refuse(message, state_dir, out_err, status='status.json'):
     """Config refused: say so on stderr (the journal) and in the status file; nothing is sent."""
     print(f'schedule-kick: refused, nothing sent: {message}', file=out_err)
     if state_dir:
         try:
             folder = state_folder(state_dir)
-            write_json(os.path.join(folder, 'status.json'),
+            write_json(os.path.join(folder, status),
                        {'version': VERSION, 'at': iso(_now()), 'ok': False, 'error': message, 'entries': {}})
         except (ConfigError, OSError) as e:
             print(f'schedule-kick: cannot write the status file either: {e}', file=out_err)
@@ -630,7 +640,8 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
     try:
         cfg = load_config(a.config or default_config())
     except ConfigError as e:
-        return refuse(str(e), state_dir if a.command == 'tick' else None, err)
+        return refuse(str(e), state_dir if a.command in ('tick', 'keep-on') else None, err,
+                      'keep-on-status.json' if a.command == 'keep-on' else 'status.json')
     if a.command == 'keep-on':
         if not cfg.keep_on:
             print(f'schedule-kick keep-on: no keepOn in {cfg.path}: nothing to do', file=out)
@@ -641,7 +652,7 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
             return keepon.run(cfg, folder, api_factory(cfg), _now(), out, err, write_json, waiting_until, pause,
                               epoch, MIN_REMAINING)
         except ConfigError as e:
-            return refuse(str(e), None, err)
+            return refuse(str(e), state_dir, err, 'keep-on-status.json')
         except Exception as e:      # noqa: BLE001 - a broken pass must not leave an old `ok: true` behind
             print(f'schedule-kick keep-on: the pass broke: {type(e).__name__}: {e}', file=err)
             try:

@@ -231,6 +231,18 @@ class Check(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(fake.paths, [])
 
+    def test_head_run_from_another_workflow_takes_the_direct_run_path(self):
+        # HEAD_RUN=true only counts in fork-tests.yml's own run: another workflow's dispatch fails as before (#430)
+        fake = Fake([[]], pulls=[self.open_pr()])
+        code, out, _ = check(fake, **{**self.HEAD_ENV,
+                                      'GITHUB_WORKFLOW_REF': 'o/r/.github/workflows/other.yml@refs/heads/feature'})
+        self.assertEqual(code, 0, out)                      # a called or other workflow's run: nothing to check
+        self.assertEqual(fake.paths, [])
+        code, out, _ = check(fake, **{**self.HEAD_ENV,
+                                      'GITHUB_WORKFLOW_REF': 'x/r/.github/workflows/fork-tests.yml@refs/heads/feature'})
+        self.assertEqual(code, 1, out)
+        self.assertEqual(fake.paths, [])
+
     def test_a_dispatch_on_a_branch_that_is_no_head_run_still_fails(self):
         fake = Fake([[]], pulls=[self.open_pr()])
         code, out, _ = check(fake, **{**self.HEAD_ENV, 'HEAD_RUN': 'false'})

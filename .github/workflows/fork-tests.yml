@@ -41,11 +41,14 @@ name: Fork tests
 #   and test_server (ci.yml checks a superset of them).
 #   A dispatch with `head` true is a head run, sent by the head-runs part of
 #   fork-kit/schedule-kick for a trusted head that has no run (a pull request
-#   branch of this repository, or main; #1157): dispatched on that branch, it
-#   runs as a release run but tests the run's own commit (github.sha, where its
-#   checks land), so a branch that moved after the dispatch gets the result on
-#   the commit really tested. On a pull request's branch fork_checks_ran judges
-#   it as that pull request's run (fork-checks-ran.py).
+#   branch of this repository, or main; #1157). Dispatched on that branch, it
+#   runs every job a pull request run can (the macOS lint too) on the run's own
+#   commit (github.sha, where its checks land). On a pull request's branch it is
+#   never weaker than that pull request's own run: it tests the pull request's
+#   merge commit (whose head parent must be github.sha), scans for secrets as
+#   that pull request's run does (fork-secret-scan.yml's head_ref), and
+#   fork_checks_ran judges it as that pull request's run (fork-checks-ran.py).
+#   Test: fork-contracts.test.py (head-run).
 on:
   pull_request:
   push:
@@ -116,6 +119,10 @@ jobs:
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # pull-requests: read for a head run's pull request lookup (the resolve step)
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       # Release runs: the commit every job checks out. Empty on pull_request and
       # push, where each checkout already takes the run's own commit.
@@ -209,26 +216,54 @@ jobs:
         env:
           REF: ${{ inputs.ref }}
           HEAD_RUN: ${{ inputs.head == true }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           sha=$(git rev-parse HEAD)
           if [[ "$HEAD_RUN" == true ]]; then
-            echo "Head run: every job tests \`$sha\`, this run's own commit (the dispatch saw \`$REF\`)." >> "$GITHUB_STEP_SUMMARY"
             [[ "$sha" == "$REF" ]] || echo "::notice::the branch moved after the dispatch: testing its newer head $sha, where this run's checks land"
+            # A pull request's head: its merge commit, as the pull request's own run tests it.
+            if [[ -z "$DEFAULT_BRANCH" || "$BRANCH" != "$DEFAULT_BRANCH" ]]; then
+              numbers=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f "head=$GITHUB_REPOSITORY_OWNER:$BRANCH" -f per_page=100 \
+                --jq '[.[] | select(.head.repo.full_name == env.GITHUB_REPOSITORY and .head.ref == env.BRANCH) | .number | tostring] | join(" ")')
+              read -r -a prs <<< "$numbers"
+              if (( ${#prs[@]} != 1 )); then
+                echo "::error::head run on $BRANCH: ${#prs[@]} open pull requests from this repository have it as their head; a head run tests one pull request's merge commit, so it fails"
+                exit 1
+              fi
+              if ! git fetch -q --no-tags --depth=2 origin "+refs/pull/${prs[0]}/merge:refs/remotes/head-run/merge"; then
+                echo "::error::head run: pull request #${prs[0]} has no merge commit (a conflict?), so nothing a pull request run would test exists; fix the branch and push"
+                exit 1
+              fi
+              merge=$(git rev-parse refs/remotes/head-run/merge)
+              if [[ "$(git rev-parse "$merge^2")" != "$RUN_SHA" ]]; then
+                echo "::error::head run: pull request #${prs[0]}'s merge commit $merge is not for $RUN_SHA (the branch moved, or GitHub has not updated it yet); the newer head gets its own run"
+                exit 1
+              fi
+              sha=$merge
+              echo "Head run of pull request #${prs[0]}: every job tests its merge commit \`$sha\` (head \`$RUN_SHA\`)." >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
           echo "Testing $sha (from \`$REF\`) in every job."
           echo "Release run: every job tests \`$sha\` (from \`$REF\`)." >> "$GITHUB_STEP_SUMMARY"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       # Release runs test the whole commit. upstream's release.yml has no macOS lint.
+      # A head run also runs the macOS lint, as a pull request run may.
       - name: Release run checks everything
         id: release
         if: inputs.ref != ''
+        env:
+          HEAD_RUN: ${{ inputs.head == true }}
         run: |
           for gate in typecheck build desktop_launch test test_web test_server rust release_smoke; do
             echo "$gate=true" >> "$GITHUB_OUTPUT"
           done
           echo "test_packages=" >> "$GITHUB_OUTPUT"
-          echo "mobile_native=false" >> "$GITHUB_OUTPUT"
+          echo "mobile_native=$HEAD_RUN" >> "$GITHUB_OUTPUT"
 
       # Where each Linux job below runs (.github/scripts/fork-fleet.py route). It
       # calls no API and never fails for the fleet: a pool counts only with a
@@ -298,6 +333,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      pull-requests: read
     steps:
       - name: Checkout
         shell: bash
@@ -783,16 +819,18 @@ jobs:
 
   # Every commit a pull request or a push to main adds, history included: a
   # secret committed and then deleted is still public. Release runs test a
-  # commit that already passed this on its way to main, so they skip it.
+  # commit that already passed this on its way to main, so they skip it; a head
+  # run on a pull request's branch scans as that pull request's run (head_ref).
   # The job, the ranges and why: fork-secret-scan.yml, which a pull request
   # also runs on its own, so a newer push cancelling this run cannot leave a
   # head unscanned.
   secrets:
     name: Secret scan
-    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (inputs.ref == '') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (inputs.ref == '' || (inputs.head && github.ref_name != github.event.repository.default_branch)) }}
     uses: ./.github/workflows/fork-secret-scan.yml
     with:
       test: true
+      head_ref: ${{ inputs.head && github.ref_name || '' }}
 
   lint:
     name: Lint

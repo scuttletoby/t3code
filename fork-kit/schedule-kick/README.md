@@ -129,25 +129,34 @@ suites. Only trusted heads count: the default branch's tip and heads of pull req
 repository; a pull request from another fork is never dispatched. A head with any run of the entry's workflow
 (any event, any state) needs nothing. A head without one is recorded the first time it is seen, and once it has been
 seen for `graceMinutes` (0 to 60, default 10) it gets **one** `workflow_dispatch` on its branch with the inputs
-`ref` (the head's commit) and `head` (`true`); at most `maxPerPass` (1 to 20, default 3) a tick, the default branch
-first, then the pull requests updated last.
+`ref` (the head's commit) and `head` (`true`); at most `maxPerPass` (1 to 20, default 3) attempts a tick (refused
+ones count too), the default branch first, then the pull requests updated last.
+
+Every head gets a **run**, not a **result**: a head with a run in any state counts as done, so a run cancelled by
+hand, lost with its runner or stuck queued is never dispatched again here (the fleet's watch and sweep and
+`fork-ci-rerun` deal with those), and a head run whose pull request also has no fork-checks run (both events dropped
+in one switch-off) fails in `fork_checks_ran` and is not dispatched again either.
 
 The workflow needs a `workflow_dispatch` with a `ref` input and a boolean `head` input that makes the run test its
 own commit (`github.sha`, where its checks land), not the commit `ref` names: if the branch moved between the
-GraphQL call and the dispatch, the new head is the one that is tested and gets the result. A branch whose workflow
-file is older than the `head` input refuses the dispatch (HTTP 422): that commit is recorded as refused and not
-sent again (its next push brings the new file). With `ghAs` the App needs Actions write and read access to pull
+GraphQL call and the dispatch, the new head is the one that is tested and gets the result. Its result stands in for
+the pull request's own run, so it must never be weaker: fork-tests.yml's head run tests the pull request's merge
+commit, scans for secrets as that pull request's run and runs every job. A branch whose workflow file is older than
+the `head` input (HTTP 422 "Unexpected inputs") or has no `workflow_dispatch` refuses the dispatch for good: that
+commit is recorded as refused, alerted once and not sent again (its next push brings the new file). Any other 422,
+such as "Cannot trigger a 'workflow_dispatch' on a disabled workflow" while the workflow is switched off (#517),
+waits and tries again. With `ghAs` the App needs Actions write and read access to pull
 requests and contents.
 
-| Case                                                     | What happens                                                                                             |
-| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Runs again                                               | a head is recorded as sent before the call and never sent twice, also when its run is slow to show       |
-| Stops half-way                                           | sent, state not written: the run's check suite shows next tick, nothing is sent again                    |
-| Sent, but no run shows within 30 minutes                 | one ALERT line and an error exit (`lost`), not sent again                                                |
-| No runs at all, empty or broken state                    | first tick records the heads; the check suites are what stop a second dispatch, not the state file       |
-| A head force-pushed mid-pass                             | a pull request whose head moved while GitHub answered waits a tick; old heads are dropped from the state |
-| More check suites on a commit than read (50), none a run | not sent (cannot tell), with a note                                                                      |
-| API error                                                | that entry waits (5 minutes, doubling, at most an hour); a rate limit or a low GraphQL budget pauses     |
+| Case                                                     | What happens                                                                                                                        |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Runs again                                               | a head is recorded as sent before the call and never sent twice, also when its run is slow to show                                  |
+| Stops half-way                                           | sent, state not written: the run's check suite shows next tick, nothing is sent again                                               |
+| Sent, but no run shows within 30 minutes                 | one ALERT line, an error exit and one alert-channel message (`lost`), not sent again                                                |
+| No runs at all, empty or broken state                    | first tick records the heads; the check suites are what stop a second dispatch, not the state file                                  |
+| A head force-pushed mid-pass                             | a pull request whose head moved while GitHub answered waits a tick; marks of heads gone stay 7 days                                 |
+| More check suites on a commit than read (50), none a run | not sent (cannot tell), with a note                                                                                                 |
+| API error                                                | that entry waits (5 minutes, doubling, at most an hour); a rate limit, or a low REST or GraphQL budget (each counted apart), pauses |
 
 Budget: one GraphQL call a tick per entry (a few points of the 5,000 an hour) plus at most `maxPerPass` dispatches.
 

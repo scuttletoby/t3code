@@ -972,7 +972,7 @@ MUTATIONS = {
                         '    delay = BACKOFF * 2 ** min(failures - 1, 10)', 'Faults.test_the_backoff_stops_at_one_hour'),
     'the pause cap': ('kick', "    state['pauseUntil'] = iso(min(until, now + MAX_WAIT))", "    state['pauseUntil'] = iso(until)",
                       'Faults.test_a_reset_far_ahead_pauses_one_hour_not_never'),
-    'few calls left: until the reset': ('kick', "            pause(state, now, epoch(getattr(api, 'reset', None)))",
+    'few calls left: until the reset': ('kick', "            pause(state, now, max(resets) if resets else None)",
                                         '            pause(state, now)',
                                         'Faults.test_few_calls_left_pauses_until_githubs_reset'),
     'secondary limit: retry-after': ('kick', '            pause(state, now, now + datetime.timedelta(seconds=e.retry_after) if e.retry_after',
@@ -990,7 +990,7 @@ MUTATIONS = {
         'kick', "keeps what is done\n        paused = waiting_until(state.get('pauseUntil'), now)\n",
         "keeps what is done\n", 'Tick.test_a_rate_limit_pauses_every_entry_until_the_reset'),
     'few calls left pauses': (
-        'kick', "        if result != 'done' and remaining is not None and remaining < MIN_REMAINING:",
+        'kick', "        if result != 'done' and low:",
         '        if False:', 'Tick.test_few_calls_left_pauses_the_rest'),
     'one tick at a time': ('kick', '            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)', '            int(0)',
                            'Tick.test_two_ticks_at_once_the_second_does_nothing'),

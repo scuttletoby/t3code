@@ -149,6 +149,27 @@ class KeepOn(unittest.TestCase):
         self.assertEqual(len([c for c in self.api.calls if c[0] == 'workflows']), 1)
         self.assertEqual(self.keep_on(NOW + datetime.timedelta(minutes=3))[0], 0)    # the pause is over
 
+    def test_a_rate_limit_on_turning_on_pauses_and_stops_the_pass(self):
+        self.api.workflow_rows = {REPO: rows(**{'fork-tests': 'disabled_manually', 'fork-follow': 'disabled_manually'})}
+        self.api.fail['enable'] = github.ApiError('HTTP 403 rate limit', rate_limited=True, retry_after=300, status=403)
+        self.assertEqual(self.keep_on()[0], 1)
+        self.assertEqual(len(self.enables()), 1)                # no second call after the limit
+        with open(os.path.join(self.folder, 'keep-on.json')) as f:
+            self.assertIn('pauseUntil', json.load(f))
+        self.keep_on(NOW + datetime.timedelta(seconds=15))
+        self.assertEqual([c[0] for c in self.api.calls], ['workflows', 'enable'])   # paused: no call
+
+    def test_a_refused_config_leaves_no_old_ok_status(self):
+        self.api.workflow_rows = {REPO: rows(**{'fork-tests': 'active', 'fork-follow': 'active'})}
+        self.assertEqual(self.keep_on()[0], 0)
+        path = os.path.join(self.tmp, 'config.json')
+        with open(path, 'w') as f:
+            f.write('{broken')
+        self.assertEqual(kick.main(['keep-on', '--config', path, '--state-dir', self.folder], out=io.StringIO(),
+                                   err=io.StringIO()), 2)
+        self.assertEqual(kick.main(['status', '--keep-on', '--state-dir', self.folder], out=io.StringIO(),
+                                   err=io.StringIO()), 1)
+
     def test_the_alert_channel_without_a_section_is_journal_only_and_never_raises(self):
         self.assertEqual(keepon.channel_alert('x', read_channel=lambda: (None, {})),
                          (False, 'no alert channel in the machine file (journal only)'))
@@ -282,6 +303,9 @@ class RedCheck(unittest.TestCase):
                          'KeepOn.test_two_passes_at_once_the_second_does_nothing'),
             'the pause': ('keepon', '        if paused is not None:\n            for key', '        if False:\n            for key',
                           'KeepOn.test_a_list_error_is_an_error_and_a_rate_limit_pauses'),
+            'pause stops the pass': ('keepon', "                    paused = waiting_until(state.get('pauseUntil'), now)\n                continue",
+                                     '                    pass\n                continue',
+                                     'KeepOn.test_a_rate_limit_on_turning_on_pauses_and_stops_the_pass'),
             'the alert line': ('keepon', 'ALERT {label}', '{label}',
                                'KeepOn.test_a_switched_off_target_is_turned_back_on_with_an_alert_line'),
             'status code kept': ('github', 'retry_after, e.code) from None', 'retry_after) from None',

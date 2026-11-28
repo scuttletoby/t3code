@@ -114,6 +114,9 @@ def _pass(cfg, folder, api, now, out, err, write_json, waiting_until, pause, epo
             if r['path'].startswith('.github/workflows/'):
                 by_file.setdefault(r['path'][len('.github/workflows/'):], r)
         for key, label, workflow in targets:
+            if paused is not None:          # a rate limit earlier in this pass: no more calls
+                status[key] = {'result': 'paused', 'message': f'GitHub API budget: paused until {iso(paused)}'}
+                continue
             r = by_file.get(workflow)
             if r is None:
                 problem(key, label, 'no such workflow in the repository (renamed or deleted? fix the config)')
@@ -134,7 +137,9 @@ def _pass(cfg, folder, api, now, out, err, write_json, waiting_until, pause, epo
                 problem(key, label, f'was {r["state"]}, and turning it back on failed: {e}')
                 failed = True
                 if e.rate_limited:
-                    pause(state, now, epoch(e.reset))
+                    pause(state, now, now + datetime.timedelta(seconds=e.retry_after) if e.retry_after
+                          else epoch(e.reset))
+                    paused = waiting_until(state.get('pauseUntil'), now)
                 continue
             t = state['targets'].setdefault(key, {})
             t.pop('error', None)

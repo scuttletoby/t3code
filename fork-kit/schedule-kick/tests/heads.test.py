@@ -55,10 +55,15 @@ class Heads(unittest.TestCase):
         self.state_dir = os.path.join(self.tmp, 'state')
         self.api = FakeApi(NOW)
         self.cfg = kick.Config('cfg.json', ('tokenFile', '/x'), [], [kick.HeadsEntry(REPO, WF, 10, 3)])
+        self.alerts = []
+
+    def alert(self, text):
+        self.alerts.append(text)
+        return True, ''
 
     def tick(self, now, cfg=None):
         out, err = io.StringIO(), io.StringIO()
-        code = kick.tick(cfg or self.cfg, self.state_dir, self.api, now=now, out=out, err=err)
+        code = kick.tick(cfg or self.cfg, self.state_dir, self.api, now=now, out=out, err=err, alert=self.alert)
         return code, out.getvalue() + err.getvalue()
 
     def sent(self):
@@ -186,6 +191,8 @@ class Heads(unittest.TestCase):
         code, out = self.tick(NOW + datetime.timedelta(minutes=45))
         self.assertEqual(code, 0, out)                                      # said once; not sent again
         self.assertEqual(self.sent(), [('feature-7', A)])
+        self.assertEqual(len(self.alerts), 1)                               # and through the alert channel, once
+        self.assertIn(f'#7 {A} (feature-7) was dispatched', self.alerts[0])
 
     # --- force push mid-pass, old heads --------------------------------------------------------------------------------
     def test_a_head_that_moved_while_github_answered_waits_for_the_next_pass(self):
@@ -202,7 +209,23 @@ class Heads(unittest.TestCase):
         self.api.answer = answer(prs=[pr(7, B, runs=(PATH,))])              # force-pushed; its own run came
         self.tick(NOW + datetime.timedelta(minutes=15))
         bucket = self.state()['heads'][f'heads {REPO.lower()} {WF}']
+        self.assertEqual(bucket['seen'], {})
+        self.assertIn(A, bucket['sent'])                                    # kept a while: it may come back
+        self.tick(NOW + datetime.timedelta(days=heads.MARK_DAYS, minutes=11))
+        bucket = self.state()['heads'][f'heads {REPO.lower()} {WF}']
         self.assertEqual((bucket['seen'], bucket['sent']), ({}, {}))
+
+    def test_a_head_missing_from_one_snapshot_keeps_its_lost_mark(self):
+        self.api.answer = answer(prs=[pr(7, A)])
+        self.tick(NOW)
+        self.tick(NOW + datetime.timedelta(minutes=10))
+        self.tick(NOW + datetime.timedelta(minutes=45))                     # lost
+        self.api.answer = answer(prs=[pr(7, A, last=B)])                    # one pass: moved while GitHub answered
+        self.tick(NOW + datetime.timedelta(minutes=50))
+        self.api.answer = answer(prs=[pr(7, A)])
+        for minutes in (55, 70, 90):
+            self.tick(NOW + datetime.timedelta(minutes=minutes))
+        self.assertEqual(self.sent(), [('feature-7', A)])
 
     def test_more_check_suites_than_read_and_none_a_run_sends_nothing(self):
         prs = [pr(7, A)]
@@ -256,6 +279,16 @@ class Heads(unittest.TestCase):
         self.tick(NOW)
         self.assertIn('pauseUntil', self.state())
 
+    def test_a_rest_answer_after_the_graphql_call_does_not_hide_a_low_graphql_budget(self):
+        self.api.answer = answer(main_runs=())
+        self.tick(NOW)
+        self.api.answer = answer(main_runs=(), remaining=50)
+        self.api.after_dispatch = lambda: setattr(self.api, 'remaining', 4999)    # the dispatch's REST headers
+        self.tick(NOW + datetime.timedelta(minutes=10))
+        self.assertEqual(self.sent(), [('main', MAIN)])
+        self.assertIn('pauseUntil', self.state())
+        self.assertIn('GraphQL API calls left', self.status()['message'])
+
     def test_a_refusal_of_the_inputs_is_recorded_and_not_sent_again(self):
         # a branch whose workflow file is older than the head input: HTTP 422 "Unexpected inputs provided"
         self.api.answer = answer(prs=[pr(7, A), pr(8, B)])
@@ -267,6 +300,27 @@ class Heads(unittest.TestCase):
         del self.api.fail['dispatch']
         self.tick(NOW + datetime.timedelta(minutes=15))
         self.assertEqual(len(self.api.dispatches()), 2)                     # #7 and #8, each tried once
+        self.assertEqual(len(self.alerts), 2)                               # each refusal said once
+
+    def test_a_422_for_a_switched_off_workflow_waits_and_tries_again(self):
+        # #517: the workflow is off for a few seconds; keep-on turns it back on
+        self.api.answer = answer(prs=[pr(7, A)])
+        self.tick(NOW)
+        self.api.fail['dispatch'] = github.ApiError(
+            "POST ...: HTTP 422 Cannot trigger a 'workflow_dispatch' on a disabled workflow", status=422)
+        self.assertEqual(self.tick(NOW + datetime.timedelta(minutes=10))[0], 1)
+        del self.api.fail['dispatch']
+        for minutes in (16, 30):
+            self.tick(NOW + datetime.timedelta(minutes=minutes))
+        self.assertEqual(self.sent(), [('feature-7', A), ('feature-7', A)])
+        self.assertEqual(self.alerts, [])
+
+    def test_refusals_count_toward_max_per_pass(self):
+        self.api.answer = answer(prs=[pr(n, f'{n:040x}') for n in range(1, 11)])
+        self.tick(NOW)
+        self.api.fail['dispatch'] = github.ApiError('HTTP 422 Unexpected inputs provided: ["head"]', status=422)
+        self.tick(NOW + datetime.timedelta(minutes=10))
+        self.assertEqual(len(self.api.dispatches()), 3)
 
     def test_a_dispatch_that_fails_otherwise_is_tried_again_after_the_wait(self):
         self.api.answer = answer(prs=[pr(7, A)])
@@ -330,18 +384,27 @@ class RedCheck(unittest.TestCase):
                                          'Heads.test_the_head_is_recorded_as_sent_before_the_call'),
             'a run counts': ('heads', 'return True\n    total', 'return False\n    total',
                              'Heads.test_a_head_with_a_run_of_the_workflow_needs_nothing'),
-            'max per pass': ('heads', ' or len(sent) >= entry.per_pass', '',
+            'max per pass': ('heads', ' or tried >= entry.per_pass', '',
                              'Heads.test_at_most_max_per_pass_then_the_rest_on_later_passes'),
             'moved head skipped': ('heads', "commit.get('oid') != pr.get('headRefOid')", 'False',
                                    'Heads.test_a_head_that_moved_while_github_answered_waits_for_the_next_pass'),
             'unknown suites': ('heads', "type(total) is int and total <= len(suites['nodes'])", 'True',
                                'Heads.test_more_check_suites_than_read_and_none_a_run_sends_nothing'),
-            'refused once': ('heads', 'if e.status in REFUSED_STATUSES:', 'if False:',
+            'refused once': ('heads', 'if permanent(e):', 'if False:',
                              'Heads.test_a_refusal_of_the_inputs_is_recorded_and_not_sent_again'),
             'lost said': ("heads", "mark['result'] = 'lost'", "pass",
                           'Heads.test_a_sent_head_whose_run_never_shows_is_reported_lost_once'),
-            'graphql budget read': ('heads', "api.remaining = limit['remaining']", 'pass',
+            'graphql budget read': ('heads', "api.graphql_remaining = limit['remaining']", 'pass',
                                     'Heads.test_a_low_graphql_budget_pauses'),
+            'a disabled-workflow 422 retries': ('heads', "e.status == 422 and any(", "e.status == 422 or any(",
+                                                'Heads.test_a_422_for_a_switched_off_workflow_waits_and_tries_again'),
+            'refusals count': ('heads', '        tried += 1\n', '',
+                               'Heads.test_refusals_count_toward_max_per_pass'),
+            'marks kept a while': ('heads', "if k in current or (parse_time(v.get('at')) or keep_after) > keep_after}",
+                                   'if k in current}',
+                                   'Heads.test_a_head_missing_from_one_snapshot_keeps_its_lost_mark'),
+            'budgets apart': ('kick', "('GraphQL', 'graphql_remaining', 'graphql_reset')", "('GraphQL', 'remaining', 'reset')",
+                              'Heads.test_a_rest_answer_after_the_graphql_call_does_not_hide_a_low_graphql_budget'),
             'graphql errors': ('github', '    if errors:\n        text', '    if False:\n        text',
                                'Heads.test_a_graphql_error_answer_is_an_error_not_an_empty_list'),
         })
