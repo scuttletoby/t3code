@@ -39,6 +39,13 @@ name: Fork tests
 # - workflow_call / workflow_dispatch with `ref`: release. Every Linux job runs
 #   on that commit, no path filter. Covers release.yml's quality, test, test_web
 #   and test_server (ci.yml checks a superset of them).
+#   A dispatch with `head` true is a head run, sent by the head-runs part of
+#   fork-kit/schedule-kick for a trusted head that has no run (a pull request
+#   branch of this repository, or main; #1157): dispatched on that branch, it
+#   runs as a release run but tests the run's own commit (github.sha, where its
+#   checks land), so a branch that moved after the dispatch gets the result on
+#   the commit really tested. On a pull request's branch fork_checks_ran judges
+#   it as that pull request's run (fork-checks-ran.py).
 on:
   pull_request:
   push:
@@ -56,6 +63,11 @@ on:
         description: Commit or branch to test (resolved to one commit for every job)
         required: true
         type: string
+      head:
+        description: Head run (the head-runs reconciler) - test this run's own commit on its branch; ref only names the commit it saw
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -186,7 +198,7 @@ jobs:
         if: inputs.ref != ''
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.head && github.sha || inputs.ref }}
           sparse-checkout: |
             /package.json
           sparse-checkout-cone-mode: false
@@ -196,8 +208,13 @@ jobs:
         if: inputs.ref != ''
         env:
           REF: ${{ inputs.ref }}
+          HEAD_RUN: ${{ inputs.head == true }}
         run: |
           sha=$(git rev-parse HEAD)
+          if [[ "$HEAD_RUN" == true ]]; then
+            echo "Head run: every job tests \`$sha\`, this run's own commit (the dispatch saw \`$REF\`)." >> "$GITHUB_STEP_SUMMARY"
+            [[ "$sha" == "$REF" ]] || echo "::notice::the branch moved after the dispatch: testing its newer head $sha, where this run's checks land"
+          fi
           echo "Testing $sha (from \`$REF\`) in every job."
           echo "Release run: every job tests \`$sha\` (from \`$REF\`)." >> "$GITHUB_STEP_SUMMARY"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
@@ -315,6 +332,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           OUTSIDE_PR: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HEAD_RUN: ${{ inputs.head == true }}
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 -I .github/scripts/fork-checks-ran.py
 

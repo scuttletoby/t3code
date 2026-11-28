@@ -5001,6 +5001,7 @@ POLICY_ENV = {
     "PR_NUMBER": "${{ github.event.pull_request.number }}",
     "OUTSIDE_PR": "${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}",
     "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+    "HEAD_RUN": "${{ inputs.head == true }}",
     "GITHUB_TOKEN": "${{ github.token }}",
 }
 POLICY_CHECKOUT_ENV = {"REF": "${{ github.sha }}", "HISTORY": "tip", "SPARSE": "/.github/scripts/"}
