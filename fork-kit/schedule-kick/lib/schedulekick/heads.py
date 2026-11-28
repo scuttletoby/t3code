@@ -1,0 +1,215 @@
+"""heads: every trusted head gets a run (fork-kit/schedule-kick/README.md, Heads).
+
+GitHub drops the event of a workflow that is switched off at the time, so a pull request head (or the default
+branch's tip) can end up with no run at all, and nothing ever tests it. Each tick, for each `heads` entry of the
+config, this makes one GraphQL call: the default branch's tip and the open pull requests (the 100 most recently
+updated), each head commit with the GitHub Actions check suites on it. A head counts only when it is trusted: the
+default branch's tip, or the head of a pull request from a branch of this same repository (a pull request from
+another fork is never dispatched). A head that has a run of the entry's workflow (any event, any state: one that
+ran is enough here) needs nothing. One without:
+
+1. first seen now: recorded, nothing sent (GitHub's own run may still be on its way);
+2. seen less than graceMinutes ago: wait;
+3. else one workflow_dispatch on its branch with inputs ref=<the head's commit> and head=true (the workflow's head
+   run: it tests the run's own commit, where its checks land), at most maxPerPass a pass, the default branch first,
+   then the pull requests updated last first. The head is recorded as sent before the call, so it is sent once.
+
+A sent head whose run does not show within LOST_MINUTES is reported once ("lost") and not sent again: something
+else is wrong (a dispatch GitHub took and dropped), and a loop would only hide it. A branch whose workflow file
+refuses the inputs (an older copy without `head`: HTTP 422) is recorded as refused for that commit and not sent
+again; its next push brings the new file. Any other error waits (5 minutes, doubling, at most an hour) and tries
+again; a rate limit pauses the tick (kick.py).
+"""
+import datetime
+
+from .github import ApiError, iso
+
+ACTIONS_APP_ID = 15368          # GitHub Actions' App id on github.com: its check suites are workflow runs
+PR_LIMIT = 100                  # the most one GraphQL page holds
+SUITE_LIMIT = 50                # check suites read per head commit (a commit has a few: one per workflow run)
+LOST_MINUTES = 30
+GRACE_MINUTES = 10
+MAX_GRACE_MINUTES = 60
+PER_PASS = 3
+MAX_PER_PASS = 20
+REFUSED_STATUSES = (422,)       # GitHub refuses the dispatch itself (unknown input, no workflow_dispatch trigger)
+
+QUERY = '''query($owner: String!, $name: String!) {
+  rateLimit { remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    defaultBranchRef { name target { ... on Commit { oid %(suites)s } } }
+    pullRequests(states: OPEN, first: %(prs)d, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      totalCount
+      nodes {
+        number isCrossRepository headRefName headRefOid
+        headRepository { nameWithOwner }
+        commits(last: 1) { nodes { commit { oid %(suites)s } } }
+      }
+    }
+  }
+}''' % {'prs': PR_LIMIT, 'suites': f'checkSuites(first: {SUITE_LIMIT}, filterBy: {{appId: {ACTIONS_APP_ID}}}) '
+                                    '{ totalCount nodes { workflowRun { workflow { resourcePath } } } }'}
+
+
+class Head:
+    def __init__(self, branch, sha, what, has_run):
+        self.branch, self.sha, self.what, self.has_run = branch, sha, what, has_run
+
+
+def _run_of(commit, workflow_path):
+    """True when one of the commit's Actions check suites is a run of the workflow; None when the commit has more
+    suites than were read and none of them is (cannot tell: nothing is sent)."""
+    suites = commit.get('checkSuites') if isinstance(commit, dict) else None
+    if not isinstance(suites, dict) or not isinstance(suites.get('nodes'), list):
+        raise ApiError('a head commit without its check suites')
+    for node in suites['nodes']:
+        run = node.get('workflowRun') if isinstance(node, dict) else None
+        workflow = run.get('workflow') if isinstance(run, dict) else None
+        path = workflow.get('resourcePath') if isinstance(workflow, dict) else None
+        if isinstance(path, str) and path.lower().endswith(workflow_path):
+            return True
+    total = suites.get('totalCount')
+    return False if type(total) is int and total <= len(suites['nodes']) else None
+
+
+def snapshot(data, repo, workflow):
+    """(heads, notes) from one GraphQL answer: the trusted heads, the default branch first, one per commit."""
+    r = data.get('repository') if isinstance(data, dict) else None
+    if not isinstance(r, dict) or str(r.get('nameWithOwner', '')).lower() != repo.lower():
+        raise ApiError(f'GraphQL for {repo}: no such repository in the answer')
+    path = f'/{repo}/actions/workflows/{workflow}'.lower()
+    heads, notes, seen = [], [], set()
+
+    def add(branch, sha, what, commit):
+        if not isinstance(sha, str) or len(sha) != 40 or sha in seen:
+            return
+        has = _run_of(commit, path)
+        if has is None:
+            notes.append(f'{what} {sha[:12]}: more check suites than read, none of them a run: not sent')
+            return
+        seen.add(sha)
+        heads.append(Head(branch, sha, what, has))
+
+    default = r.get('defaultBranchRef')
+    target = default.get('target') if isinstance(default, dict) else None
+    if isinstance(target, dict) and isinstance(default.get('name'), str):
+        add(default['name'], target.get('oid'), default['name'], target)
+    prs = r.get('pullRequests')
+    if not isinstance(prs, dict) or not isinstance(prs.get('nodes'), list):
+        raise ApiError(f'GraphQL for {repo}: no pull request list in the answer')
+    if type(prs.get('totalCount')) is int and prs['totalCount'] > len(prs['nodes']):
+        notes.append(f'{prs["totalCount"]} open pull requests: only the {len(prs["nodes"])} updated last are read')
+    for pr in prs['nodes']:
+        if not isinstance(pr, dict):
+            continue
+        head_repo = pr.get('headRepository')
+        if pr.get('isCrossRepository') is not False or not isinstance(head_repo, dict) \
+                or str(head_repo.get('nameWithOwner', '')).lower() != repo.lower():
+            continue                            # another fork's pull request (or one GitHub no longer knows)
+        commits = (pr.get('commits') or {}).get('nodes') if isinstance(pr.get('commits'), dict) else None
+        commit = (commits[0] or {}).get('commit') if isinstance(commits, list) and len(commits) == 1 else None
+        if not isinstance(commit, dict) or commit.get('oid') != pr.get('headRefOid'):
+            notes.append(f'#{pr.get("number")}: its head moved while GitHub answered: next pass')
+            continue
+        if isinstance(pr.get('headRefName'), str) and pr['headRefName']:
+            add(pr['headRefName'], pr.get('headRefOid'), f'#{pr.get("number")}', commit)
+    return heads, notes
+
+
+def _bucket(state, key):
+    heads = state.setdefault('heads', {})
+    old = heads.get(key)
+    if not isinstance(old, dict):
+        old = {}
+    old['seen'] = {k: v for k, v in (old.get('seen') or {}).items() if isinstance(v, str)} \
+        if isinstance(old.get('seen'), dict) else {}
+    old['sent'] = {k: v for k, v in (old.get('sent') or {}).items() if isinstance(v, dict)} \
+        if isinstance(old.get('sent'), dict) else {}
+    heads[key] = old
+    return old
+
+
+def fail(state, key, now, message, backoff, most):
+    b = _bucket(state, key)
+    failures = int(b.get('failures', 0)) + 1 if type(b.get('failures', 0)) is int else 1
+    b.update(failures=failures, retryAfter=iso(now + min(backoff * 2 ** min(failures - 1, 10), most)), error=message)
+
+
+def reconcile(entry, api, state, now, parse_time, waiting_until, backoff, most, save=lambda: None,
+              limited=lambda e: None):
+    """(result, message) for one heads entry; state['heads'][key] updated in place. save() writes the state (called
+    before each dispatch, so a head is recorded as sent before it is sent); limited(e) on a rate limit (kick.py
+    pauses the tick)."""
+    b = _bucket(state, entry.key)
+    wait = waiting_until(b.get('retryAfter'), now)
+    if wait is not None:
+        return 'waiting', f'after {b.get("failures", 1)} error(s), next try after {iso(wait)}'
+    owner, name = entry.repo.split('/')
+    try:
+        data = api.graphql(entry.repo, QUERY, {'owner': owner, 'name': name})
+        heads, notes = snapshot(data, entry.repo, entry.workflow)
+    except ApiError as e:
+        fail(state, entry.key, now, str(e), backoff, most)
+        if e.rate_limited:
+            limited(e)
+        return 'error', str(e)
+    limit = data.get('rateLimit') if isinstance(data, dict) else None
+    if isinstance(limit, dict) and type(limit.get('remaining')) is int:
+        api.remaining = limit['remaining']      # the GraphQL budget: kick.py pauses when it runs low
+        reset = parse_time(limit.get('resetAt'))
+        api.reset = reset.timestamp() if reset else None
+    current = {h.sha for h in heads}
+    b['seen'] = {k: v for k, v in b['seen'].items() if k in current}     # an old head (force push, merge): gone
+    b['sent'] = {k: v for k, v in b['sent'].items() if k in current}
+    for k in ('failures', 'retryAfter', 'error'):
+        b.pop(k, None)
+    sent, lost, waiting, errors = [], [], 0, []
+    for h in heads:
+        if h.has_run:
+            b['seen'].pop(h.sha, None)
+            continue
+        mark = b['sent'].get(h.sha)
+        if mark is not None:
+            at = parse_time(mark.get('at'))
+            if mark.get('result') == 'dispatched' and at is not None \
+                    and now - at >= datetime.timedelta(minutes=LOST_MINUTES):
+                mark['result'] = 'lost'
+                lost.append(f'{h.what} {h.sha[:12]}')
+            continue
+        first = parse_time(b['seen'].get(h.sha))
+        if first is None or first > now:
+            b['seen'][h.sha] = iso(now)
+            waiting += 1
+            continue
+        if now - first < entry.grace or len(sent) >= entry.per_pass:
+            waiting += 1
+            continue
+        b['sent'][h.sha] = {'at': iso(now), 'branch': h.branch, 'result': 'dispatched'}
+        save()
+        try:
+            api.dispatch(entry.repo, entry.workflow, h.branch, {'ref': h.sha, 'head': 'true'})
+        except ApiError as e:
+            if e.status in REFUSED_STATUSES:
+                b['sent'][h.sha] = {'at': iso(now), 'branch': h.branch, 'result': 'refused', 'error': str(e)[:300]}
+                errors.append(f'{h.what} {h.sha[:12]} refused (not sent again): {e}')
+                continue
+            del b['sent'][h.sha]
+            fail(state, entry.key, now, str(e), backoff, most)
+            errors.append(f'{h.what} {h.sha[:12]}: {e}')
+            if e.rate_limited:
+                limited(e)
+            break
+        sent.append(f'{h.what} {h.sha[:12]} ({h.branch})')
+        b['seen'].pop(h.sha, None)
+    parts = [f'{len(heads)} heads']
+    if sent:
+        parts.append('workflow_dispatch sent for ' + ', '.join(sent))
+    if waiting:
+        parts.append(f'{waiting} without a run waiting (grace or {entry.per_pass} a pass)')
+    if lost:
+        parts.append('ALERT: dispatched but no run after '
+                     f'{LOST_MINUTES} minutes (not sent again): ' + ', '.join(lost))
+    parts += errors + notes
+    result = 'error' if errors or lost else ('dispatched' if sent else 'ran')
+    return result, '; '.join(parts)

@@ -564,8 +564,9 @@ NOT_GATE = ('.github/fork-ci-tests.txt',)
 # other kits run machines and agents (placement-facts: example scripts a machine runs for its facts; slot-filler:
 # starts queued agent tasks into free slots), and the merge gate reads none of them.
 GATE_KITS = ('gh-apps', 'review')
-OTHER_KITS = ('.gitignore', 'README.md', 'agent-guards', 'cleaner', 'common', 'desk', 'gardener', 'golive', 'heavy',
-              'model-guard', 'pc-agents', 'placement-facts', 'schedule-kick', 'slot-filler', 'update-policy')
+OTHER_KITS = ('.gitignore', 'README.md', 'agent-guards', 'ci-lane', 'cleaner', 'common', 'desk', 'gardener',
+              'golive', 'heavy', 'model-guard', 'pc-agents', 'placement-facts', 'schedule-kick', 'slot-filler',
+              'update-policy')
 
 
 class ForkConfig(unittest.TestCase):

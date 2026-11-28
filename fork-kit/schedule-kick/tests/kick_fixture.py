@@ -9,7 +9,7 @@ LIB_ENV = 'SCHEDULE_KICK_TEST_LIB'
 LIB = os.environ.get(LIB_ENV) or os.path.join(KIT, 'lib')
 sys.path.insert(0, LIB)
 
-from schedulekick import cron, github, kick  # noqa: E402,F401
+from schedulekick import cron, github, heads, keepon, kick  # noqa: E402,F401
 
 UTC = datetime.timezone.utc
 
@@ -51,6 +51,30 @@ class FakeApi:
         self.add_run(repo, workflow, github.iso(self.github_now), 'workflow_dispatch', ref)
         if self.after_dispatch:
             self.after_dispatch()
+
+    # heads.py: one GraphQL answer a pass (set `answer`, or a function of the call), and keepon.py's two calls
+    answer = None
+    workflow_rows = None            # repo -> [{'id', 'path', 'state'}]
+
+    def graphql(self, repo, query, variables):
+        self.calls.append(('graphql', repo, dict(variables)))
+        if 'graphql' in self.fail:
+            raise self.fail['graphql']
+        return self.answer(self) if callable(self.answer) else self.answer
+
+    def workflows(self, repo):
+        self.calls.append(('workflows', repo))
+        if 'workflows' in self.fail:
+            raise self.fail['workflows']
+        return [dict(r) for r in (self.workflow_rows or {}).get(repo, [])]
+
+    def enable(self, repo, workflow_id):
+        self.calls.append(('enable', repo, workflow_id))
+        if 'enable' in self.fail:
+            raise self.fail['enable']
+        for r in (self.workflow_rows or {}).get(repo, []):
+            if r['id'] == workflow_id:
+                r['state'] = 'active'
 
     def dispatches(self):
         return [c for c in self.calls if c[0] == 'dispatch']

@@ -1,0 +1,13 @@
+# schedule-kick kit: written by schedule-kick-install. Do not edit: run the installer again.
+[Unit]
+Description=schedule-kick keep-on: turn the named workflows back on (fork-kit/schedule-kick)
+# runs the release in use; without one (an uninstall half-way) it does nothing
+ConditionPathExists=/usr/local/libexec/schedule-kick/current/bin/schedule-kick
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/schedule-kick/current/bin/schedule-kick keep-on
+Nice=5
+TimeoutStartSec=2min
+# as schedule-kick.service: files it makes are this user's only, no other sandboxing (README, Install)
+UMask=0077

@@ -6,12 +6,12 @@
   schedule-kick-install self-check
 
 install copies bin/schedule-kick, sbin/schedule-kick-install, lib/schedulekick/, systemd/, README.md and
-fork-kit/common/kit_install.py of one release into /usr/local/libexec/schedule-kick/versions/<sha>/ (with
+fork-kit/common/{kit_install,machine_file,alert}.py of one release into /usr/local/libexec/schedule-kick/versions/<sha>/ (with
 MANIFEST.sha256), checks the copy, switches the link `current` to it and links /usr/local/bin/schedule-kick and
-/usr/local/sbin/schedule-kick-install to it. With --timer it also writes the kit's one timer: the user units
-schedule-kick.service and schedule-kick.timer in /etc/systemd/user/, which run `schedule-kick tick` every 5 minutes
-for each user who enables the timer (that user's own config file names the workflows and the token); --no-timer
-removes them. The choice is kept in /etc/schedule-kick/config.json, so a run without either option keeps it. Safe
+/usr/local/sbin/schedule-kick-install to it. With --timer it also writes the kit's timers: the user units
+schedule-kick.service and schedule-kick.timer in /etc/systemd/user/, which run `schedule-kick tick` every 5 minutes,
+and schedule-kick-keep-on.service and .timer, which run `schedule-kick keep-on` every 15 seconds, for each user who
+enables them (that user's own config file names the workflows and the token); --no-timer removes them. The choice is kept in /etc/schedule-kick/config.json, so a run without either option keeps it. Safe
 to run again, and to stop at any step; one installer at a time. The steps every kit shares are in
 fork-kit/common/kit_install.py.
 """
@@ -26,10 +26,12 @@ except ImportError as e:     # a copy without common/kit_install.py (changed or 
              'root (fork-kit/schedule-kick/README.md, Install)')
 
 UNIT_DIR = '/etc/systemd/user'
-TIMER_UNITS = ('schedule-kick.service', 'schedule-kick.timer')
+TIMER_UNITS = ('schedule-kick.service', 'schedule-kick.timer', 'schedule-kick-keep-on.service',
+               'schedule-kick-keep-on.timer')
 UNIT_HEADER = '# schedule-kick kit: written by schedule-kick-install.'
-ENABLE = 'systemctl --user daemon-reload && systemctl --user enable --now schedule-kick.timer'
-DISABLE = 'systemctl --user disable --now schedule-kick.timer'
+ENABLE = ('systemctl --user daemon-reload && systemctl --user enable --now schedule-kick.timer (and, with keepOn, '
+          'schedule-kick-keep-on.timer)')
+DISABLE = 'systemctl --user disable --now schedule-kick.timer schedule-kick-keep-on.timer'
 
 
 class ScheduleKickInstaller(kit_install.Installer):
@@ -41,10 +43,10 @@ class ScheduleKickInstaller(kit_install.Installer):
     LINKS = {'/usr/local/bin/schedule-kick': 'bin/schedule-kick',
              '/usr/local/sbin/schedule-kick-install': 'sbin/schedule-kick-install'}
     SOURCE_FILES = ('bin/schedule-kick', 'sbin/schedule-kick-install', 'README.md', 'common/kit_install.py',
-                    'systemd/schedule-kick.service', 'systemd/schedule-kick.timer')
+                    'common/machine_file.py', 'common/alert.py') + tuple(f'systemd/{u}' for u in TIMER_UNITS)
     EXECUTABLE = frozenset({'bin/schedule-kick', 'sbin/schedule-kick-install'})
     PACKAGE = 'schedulekick'
-    MODULES = ('__init__', 'cron', 'github', 'kick', 'late')
+    MODULES = ('__init__', 'cron', 'github', 'heads', 'keepon', 'kick', 'late')
     HELP = ('bin/schedule-kick', 'schedule-kick tick')
     HAS_CONFIG = True
     KIT_STEPS = ('timer-units',)
@@ -105,7 +107,7 @@ class ScheduleKickInstaller(kit_install.Installer):
                 self.say(f'removed {path} (users run `{DISABLE}`)')
 
     def installed_summary(self, plan):
-        return ', timer units written (every 5 minutes)' if plan['timer'] else ', no timer'
+        return ', timer units written (tick every 5 minutes, keep-on every 15 seconds)' if plan['timer'] else ', no timer'
 
 
 INSTALLER = ScheduleKickInstaller()

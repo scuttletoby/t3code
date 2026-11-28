@@ -44,6 +44,7 @@
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs ~24s
 .github/scripts/fork-checks-ran.test.py unittest
+.github/scripts/fork-ci-plan.test.py unittest
 .github/scripts/fork-ci-pressure.test.py unittest
 .github/scripts/fork-ci-rerun.test.py unittest
 .github/scripts/fork-contracts.test.py ~91s ok lines
@@ -119,6 +120,9 @@ fork-kit/agent-guards/tests/memory-index.test.py unittest
 fork-kit/agent-guards/tests/poll-loop.test.py unittest
 fork-kit/agent-guards/tests/read-size.test.py unittest
 fork-kit/agent-guards/tests/wiring.test.py unittest
+fork-kit/ci-lane/tests/lane.test.py unittest
+fork-kit/ci-lane/tests/parity.test.py unittest
+fork-kit/ci-lane/tests/parts.test.py unittest
 fork-kit/cleaner/tests/compress.test.py ~15s unittest
 fork-kit/cleaner/tests/daily.test.py ~19s unittest
 fork-kit/cleaner/tests/dedupe.test.py ~22s unittest
@@ -174,7 +178,9 @@ fork-kit/review/tests/comments.test.py unittest
 fork-kit/review/tests/eval.test.py unittest
 fork-kit/review/tests/plan.test.py unittest
 fork-kit/schedule-kick/tests/cron.test.py unittest
+fork-kit/schedule-kick/tests/heads.test.py unittest
 fork-kit/schedule-kick/tests/install.test.py unittest
+fork-kit/schedule-kick/tests/keepon.test.py unittest
 fork-kit/schedule-kick/tests/kick.test.py unittest
 fork-kit/schedule-kick/tests/late.test.py unittest
 fork-kit/slot-filler/tests/filler.test.py unittest
