@@ -13,13 +13,13 @@ Each route gets one check. The T3 server checks everything that reaches it. The 
 which runs inside Claude Code, is for what the server cannot see. Until its copies of the server's
 routes are removed (#876, M7), the hook checks the first two rows too, against its own policy file.
 
-| Route                                                                                                            | Checked by                                                                                                                                   |
-| ---------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `delegate_task`, `create_threads`, `t3_thread_launch`, `t3_thread_configure` (here and on linked machines)       | the server, by the route's own check                                                                                                         |
-| every other thread command an agent's MCP call dispatches with a model, and a thread fork (`t3_thread_transfer`) | the server's backstop (below)                                                                                                                |
-| Claude's `Agent` tool and a skill that starts a sub-agent or names a model, in a session T3 opened               | T3's own PreToolUse hook, which reads the server's policy (the model-guard hook reads `Agent` too: it cannot tell T3's sessions from others) |
-| Claude's `Agent` tool in a Claude Code session T3 did not open, `Workflow` scripts, `RemoteTrigger`              | the model-guard hook                                                                                                                         |
-| a project's default model (`t3_project_create`, `t3_project_update`) and `schedule_task`                         | the model-guard hook (the owner left these to the hook, [#769](https://github.com/scuttletoby/t3code/issues/769))                            |
+| Route                                                                                                                                                                         | Checked by                                                                                                                                   |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `delegate_task`, `create_threads`, `t3_thread_launch`, `t3_thread_configure` (here and on linked machines)                                                                    | the server, by the route's own check                                                                                                         |
+| every other thread command an agent's MCP call dispatches with a model, a thread fork (`t3_thread_transfer`), and `run_scheduled_task_now` on a task that starts a new thread | the server's backstop (below)                                                                                                                |
+| Claude's `Agent` tool and a skill that starts a sub-agent or names a model, in a session T3 opened                                                                            | T3's own PreToolUse hook, which reads the server's policy (the model-guard hook reads `Agent` too: it cannot tell T3's sessions from others) |
+| Claude's `Agent` tool in a Claude Code session T3 did not open, `Workflow` scripts, `RemoteTrigger`                                                                           | the model-guard hook                                                                                                                         |
+| a project's default model (`t3_project_create`, `t3_project_update`) and `schedule_task`                                                                                      | the model-guard hook (the owner left these to the hook, [#769](https://github.com/scuttletoby/t3code/issues/769))                            |
 
 ### The backstop
 
@@ -30,15 +30,41 @@ against the policy when all of these hold:
 - it comes from an agent's MCP call: a thread bound to the session here, or a linked machine's call
   that names its agent's thread;
 - that call's route did not check its picks itself (the four routes in the table's first row do);
-- the command names a model (a new thread, a model change, a message or a delegated task with its
-  own model) or forks a thread, which runs on its source thread's model.
+- the command names a model (a new thread, a model change, a message, a queued run's edit or a
+  delegated task with its own model, a task sent to a linked machine) or forks a thread, which runs
+  on its source thread's model;
+- it is not a replay: a command that already has a receipt (a retry of an accepted `delegate_task`,
+  `create_threads` or `t3_thread_launch` call, say) starts nothing new, so it is answered from its
+  receipt as the first time, whoever checked it then, and is not checked or logged again after a
+  policy change.
+
+The backstop reads the dispatching service's own settings, not the call's context, so a call path
+without the settings service is still checked. With the policy `off` it reads nothing, not even a
+fork's source thread.
 
 So a new tool that starts a thread is checked without its own check, and a fork of a thread whose
 model is outside the rows is refused in `enforce` (start the thread with `t3_thread_launch` or
 `delegate_task` and a model from the rows instead). `advise` only logs the pick, as a dispatch has
 no reply to carry a note. Each pick is logged once as "model policy pick", with route
-`agent command`. Not read: the owner's client, and work the server starts by itself outside an
-agent's call (a scheduled run, an automatic handoff, a provider's own sub-agents).
+`agent command`. A refusal reaches the agent as upstream's `orchestration_error` (not the routes'
+`model_unavailable`), cut at 1000 characters, so past that the rows are shortened to the first
+ones and how many more there are, never the fix at the end. Not read: the owner's client, and work
+the server starts by itself outside an agent's call (a scheduled run on its schedule or webhook, an
+automatic handoff, a provider's own sub-agents).
+
+- **`run_scheduled_task_now`:** a task that starts a new thread runs on the task's own model, which
+  the owner may have picked, as the calling agent's pick: outside the rows, the run fails with route
+  `scheduled task`, and the task's last run error is the refusal, which says to change the task's
+  model with `schedule_task` (or that the owner runs it). A task bound to a thread sends a message
+  without a model and runs on that thread's model, as `t3_thread_send` does, so it is not read.
+- **A route's mark:** a route that checked its picks marks its `/mcp` request, and the backstop
+  leaves every command of that request alone. A JSON-RPC batch is one request, so one call in it
+  that checked its picks leaves the batch's other calls unread. An agent able to send raw batches
+  with its session's token has easier ways out of the policy; the mark is per request, not per call.
+- **Linked machines:** each machine checks a pick against its own rows. The sending machine's
+  routes check `t3_thread_launch` and `t3_thread_configure` before they go; a `t3_thread_send` with
+  a model or a `t3_thread_transfer` fork sent to a linked machine is checked only there, and not at
+  all while that machine's policy is `off`.
 
 ## A check an agent cannot turn off
 

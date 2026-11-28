@@ -44,7 +44,9 @@ export type PolicyRoute =
    * Any other thread command an agent's MCP call dispatches with a model, or a fork onto its
    * source's model (the backstop, modelPolicyBackstop.ts).
    */
-  | "agent command";
+  | "agent command"
+  /** A scheduled task's own model, run by an agent's run_scheduled_task_now (the backstop too). */
+  | "scheduled task";
 
 /** Where the call names its model, for the refusal's hint. */
 const FIELDS: Record<PolicyRoute, string> = {
@@ -57,6 +59,8 @@ const FIELDS: Record<PolicyRoute, string> = {
     "the skill's frontmatter: model, with one of its efforts in effort (or use a skill that runs inline and names neither)",
   "agent command":
     "the call's model (a thread fork runs on its source thread's model: start the thread with t3_thread_launch or delegate_task and a model from the rows instead)",
+  "scheduled task":
+    "the scheduled task's own model: run_scheduled_task_now runs the task on it as this agent's pick (change the task's model with schedule_task, or the owner runs it)",
 };
 
 /** Where the call names its model alone, and its options. */
@@ -68,6 +72,7 @@ const MODEL_FIELD: Record<PolicyRoute, string> = {
   Agent: "model",
   Skill: "the skill's frontmatter model",
   "agent command": "the call's model",
+  "scheduled task": "the scheduled task's model",
 };
 const OPTIONS_FIELD: Record<PolicyRoute, string> = {
   delegate_task: "target.options",
@@ -77,6 +82,7 @@ const OPTIONS_FIELD: Record<PolicyRoute, string> = {
   Agent: "the call",
   Skill: "the skill's frontmatter",
   "agent command": "the call's options",
+  "scheduled task": "the scheduled task's model options",
 };
 
 /** What the agent does to fix a refused pick, per the verdict's `fix`. */
@@ -97,7 +103,29 @@ const fixText = (fix: ModelPolicyFix | undefined, route: PolicyRoute): string =>
   }
 };
 
-const SETTINGS_PLACE = "Settings → Fork → Model policy";
+const SETTINGS_PLACE = "Settings → Fork → Models agents may use";
+
+const textLength = (text: string) => Array.from(text).length;
+
+/**
+ * `build` with the rows, or, past `limit` characters, with as many of the first rows as fit and how
+ * many more there are, so the text's end (the fix) survives a reply cut at `limit`.
+ */
+const withRowsWithin = (
+  allow: ReadonlyArray<ModelPolicyRow>,
+  limit: number | undefined,
+  build: (rows: string) => string,
+): string => {
+  const full = build(modelPolicyRowsText(allow));
+  if (limit === undefined || textLength(full) <= limit) return full;
+  for (let shown = allow.length - 1; shown >= 0; shown--) {
+    const more = `${allow.length - shown} more (all in ${SETTINGS_PLACE})`;
+    const rows = shown === 0 ? more : `${modelPolicyRowsText(allow.slice(0, shown))}; and ${more}`;
+    const text = build(rows);
+    if (textLength(text) <= limit) return text;
+  }
+  return full;
+};
 
 /**
  * A pick as the server reads it: `aliasOf` is the model an alias names here. An alias is not read
@@ -131,6 +159,8 @@ export function answerPick(
   policy: ModelPolicy | undefined,
   route: PolicyRoute,
   pick: ServerPick,
+  /** The most characters a refusal may have: past it, the rows are shortened, never the fix. */
+  limit?: number,
 ): PolicyAnswer {
   if (policy === undefined) {
     return {
@@ -153,7 +183,12 @@ export function answerPick(
   if (pick.unreadable !== undefined) {
     return stance.mode === "enforce"
       ? {
-          refuse: `Model policy refused this call (fail closed): ${pick.unreadable}. Allowed: ${modelPolicyRowsText(stance.allow)}.`,
+          refuse: withRowsWithin(
+            stance.allow,
+            limit,
+            (rows) =>
+              `Model policy refused this call (fail closed): ${pick.unreadable}. Allowed: ${rows}.`,
+          ),
         }
       : {
           note: `Model policy (advise): ${pick.unreadable}, so this call was not checked; it runs, and enforce would refuse it.`,
@@ -167,17 +202,22 @@ export function answerPick(
       ? {}
       : { note: `Model policy: ${verdict.row.model} is for ${useFor}.` };
   }
-  const allowed =
-    pick.allowedText?.(stance.allow) ?? `Allowed: ${modelPolicyRowsText(stance.allow)}.`;
   const why =
     pick.aliasOf === undefined || pick.model === undefined
       ? verdict.why
       : `${verdict.why} (${pick.model} is an alias of ${pick.aliasOf}; an alias is not read as its model, so name the full id)`;
   if (stance.mode === "enforce") {
+    const refuse = (allowed: string) =>
+      `Model policy refused this pick: ${why}. ${allowed} ${fixText(verdict.fix, route)}`;
     return {
-      refuse: `Model policy refused this pick: ${why}. ${allowed} ${fixText(verdict.fix, route)}`,
+      refuse:
+        pick.allowedText === undefined
+          ? withRowsWithin(stance.allow, limit, (rows) => refuse(`Allowed: ${rows}.`))
+          : refuse(pick.allowedText(stance.allow)),
     };
   }
+  const allowed =
+    pick.allowedText?.(stance.allow) ?? `Allowed: ${modelPolicyRowsText(stance.allow)}.`;
   return {
     note: `Model policy (advise): this pick is outside the policy (${why}); it runs, and enforce would refuse it. ${allowed}`,
     warn: true,
@@ -295,7 +335,7 @@ export function pickOfSelection(
  * this machine's catalog. Every catalog control here counts as a decoy; an ultracode default here
  * counts both ways; an alias gets the full-id hint.
  */
-const pickOfRemote = (
+export const pickOfRemote = (
   providers: ReadonlyArray<ServerProvider>,
   selection:
     | { readonly model?: string | undefined; readonly options?: ModelPolicyPick["options"] }
@@ -354,6 +394,8 @@ export interface PickCheckOptions {
    * call as checked by its route (the call's next command is read too).
    */
   readonly marksCall?: boolean;
+  /** The most characters the refusal may have (the reply that carries it is cut there). */
+  readonly refusalLimit?: number;
 }
 
 /**
@@ -372,17 +414,28 @@ export const routeCheckedCall = (scope: McpInvocationContext.McpInvocationScope)
  * settings on every call (a changed policy counts from the next call), logs the pick while a policy
  * is on, and fails with the refusal or returns the note for the agent.
  */
-export const makePickCheck = Effect.gen(function* () {
+export const makePickCheck = Effect.map(
   // A host built without settings (upstream's handler tests) has no policy: nothing is checked.
   // The server always wires them; there a settings read that fails refuses.
-  const settings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
-  return Effect.fn("ModelPolicyCheck.checkPick")(function* (
+  Effect.serviceOption(ServerSettings.ServerSettingsService),
+  (settings) => pickCheckOn(settings),
+);
+
+/**
+ * {@link makePickCheck} on the settings given: the backstop passes its own service's, so a call
+ * whose context lacks them is still checked.
+ */
+export const pickCheckOn = (
+  settings: Option.Option<ServerSettings.ServerSettingsService["Service"]>,
+) =>
+  Effect.fn("ModelPolicyCheck.checkPick")(function* <E = never>(
     route: PolicyRoute,
     /**
-     * The pick, read only while a policy is on (it may read the providers); `undefined`: the call
-     * picks no model (a skill that runs inline and names none), so nothing is checked or logged.
+     * The pick, read only while a policy is on (it may read the providers or the store, and fail
+     * with that read's error); `undefined`: the call picks no model (a skill that runs inline and
+     * names none, a command replayed from its receipt), so nothing is checked or logged.
      */
-    readPick: Effect.Effect<ServerPick | undefined>,
+    readPick: Effect.Effect<ServerPick | undefined, E>,
     options: PickCheckOptions = {},
   ) {
     if (options.marksCall !== false) {
@@ -399,7 +452,7 @@ export const makePickCheck = Effect.gen(function* () {
     if (policy !== undefined && modelPolicyStance(policy).mode === "off") return undefined;
     const pick = yield* readPick;
     if (pick === undefined) return undefined;
-    const answer = answerPick(policy, route, pick);
+    const answer = answerPick(policy, route, pick, options.refusalLimit);
     const annotations = {
       route,
       ...describePick(pick),
@@ -424,7 +477,6 @@ export const makePickCheck = Effect.gen(function* () {
     );
     return answer.note;
   });
-});
 
 /**
  * The registry's providers, or none in a host built without it (a pick then has no driver, so

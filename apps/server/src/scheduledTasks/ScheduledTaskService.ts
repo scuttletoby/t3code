@@ -55,6 +55,7 @@ import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import { makeScheduledRunSlots } from "../fork/agentSlotRoutes.ts"; // Fork: agent slots
+import * as ModelPolicyBackstop from "../fork/modelPolicyBackstop.ts"; // Fork: model policy backstop
 import { OrchestratorDispatchError } from "../orchestration-v2/Orchestrator.ts";
 import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -386,6 +387,8 @@ function errorMessage(error: unknown): string {
 
 function dispatchErrorMessage(cause: Cause.Cause<unknown>): string {
   const failure = Cause.squash(cause);
+  const refused = ModelPolicyBackstop.refusalText(failure); // Fork: a policy refusal keeps its text
+  if (refused !== undefined) return refused; // Fork: a policy refusal keeps its text
   // Direct orchestration refusals are user-facing; nested defects can contain private data.
   return isOrchestratorDispatchError(failure) && typeof failure.cause === "string"
     ? (userFacingDispatchErrorMessage(failure.cause) ?? errorMessage(failure))

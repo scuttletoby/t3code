@@ -60,6 +60,14 @@ import {
   type OptionCase,
 } from "./modelPolicyOptions.testkit.ts";
 
+/** The Settings section's heading as the web app shows it, which the refusals name. */
+const SETTINGS_HEADING = /id="model-policy-section" title="([^"]+)"/.exec(
+  NodeFS.readFileSync(
+    new URL("../../../web/src/components/settings/fork/ModelPolicySettings.tsx", import.meta.url),
+    "utf8",
+  ),
+)?.[1];
+
 const OPUS = "claude-opus-5-5";
 const FABLE = "claude-fable-5-2";
 const ROWS = MODEL_POLICY_START_ROWS;
@@ -221,7 +229,7 @@ describe("the answer for a pick, per policy state", () => {
         JSON.stringify(raw),
       );
       assert.include(text, "so every agent pick is refused", JSON.stringify(raw));
-      assert.include(text, "Settings → Fork → Model policy");
+      assert.include(text, `Settings → Fork → ${SETTINGS_HEADING}`);
     }
     const advise = answer(unreadable({ mode: "advise", allow: [{ model: OPUS }] }), claude("x"));
     assert.isFalse("refuse" in advise);

@@ -851,7 +851,7 @@ const make = Effect.gen(function* () {
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
-      Effect.andThen(ModelPolicyBackstop.checkAgentCommand(command, orchestrator)), // Fork: model policy backstop
+      Effect.andThen(ModelPolicyBackstop.check(command, orchestrator, receipts, serverSettings)), // Fork: model policy backstop
       Effect.andThen(orchestrator.dispatch(command)),
     );
 
