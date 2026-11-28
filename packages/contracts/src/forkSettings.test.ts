@@ -81,6 +81,12 @@ describe("ownerQuestionsPage", () => {
 });
 
 describe("fork settings seam", () => {
+  it("every client fork setting has its patch field, so a device can save it", () => {
+    expect(Object.keys(ForkClientSettingsPatchFields).toSorted()).toEqual(
+      Object.keys(ForkClientSettingsFields).toSorted(),
+    );
+  });
+
   it("puts every fork field into upstream's structs unchanged", () => {
     sameFields(ServerSettings.fields, ForkServerSettingsFields);
     sameFields(ServerSettingsPatch.fields, ForkServerSettingsPatchFields);

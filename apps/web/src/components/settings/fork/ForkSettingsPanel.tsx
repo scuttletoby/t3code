@@ -22,6 +22,7 @@ import { StopFinishedChildrenSettings } from "./StopFinishedChildrenSettings";
 import { UpdatesSettings } from "./UpdatesSettings";
 import { ModelPolicySettings } from "./ModelPolicySettings";
 import { UsagePacingSettings } from "./UsagePacingSettings";
+import { WorkPanelSettings } from "./WorkPanelSettings";
 
 export function ForkSettingsPanel() {
   const { connectedEnvironments, scope } = useSettingsScope();
@@ -67,6 +68,7 @@ export function ForkSettingsPanel() {
       <HandoffSettings isProjectScope={isProjectScope} />
       <ReviewRulesSettings isProjectScope={isProjectScope} />
       {server(<AssistantSettings />)}
+      {server(<WorkPanelSettings />)}
       <PlaytestSettings isProjectScope={isProjectScope} />
       {server(<UpdatesSettings />)}
       {server(<OwnerQuestionsSettings />)}

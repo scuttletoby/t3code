@@ -488,6 +488,7 @@ import {
   SourceControlSignInResult,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import { WsForkWorkPanelRpc } from "./forkWorkPanel.ts"; // Fork (work panel)
 import { Project, ProjectMutation, ProjectMutationError } from "./project.ts";
 
 export const WS_METHODS = {
@@ -2758,4 +2759,5 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeThreadRpc,
   WsOrchestrationV2SubscribeCommandOutputRpc,
   WsOrchestrationV2SubscribePromptSuggestionRpc,
+  WsForkWorkPanelRpc, // Fork (work panel)
 ).middleware(RpcScopeAuthorization);
