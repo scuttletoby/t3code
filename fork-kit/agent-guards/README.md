@@ -43,8 +43,11 @@ g=/usr/local/bin/capacity-pipe-guard; [ -r "$g" ] || { echo "capacity-pipe-guard
 A hook that runs past its timeout is ended by Claude Code. For the open hooks the call then goes on. The
 `actions-disable-guard` entry sets `"onFailure": "block"`, so a timeout or a hook that cannot start refuses the
 call. Claude Code honours `onFailure` from version 2.1.295 on; an older one ignores it, and there a hook that fails
-or times out lets the call run, so run 2.1.295 or later. The guard also answers by itself within 5 s of its start (it
-refuses when it runs out of time with a guarded word unread), well inside its 10 s.
+or times out lets the call run, so run 2.1.295 or later. The guard also answers by itself well inside its 10 s: at 5 s
+from its start it stops reading and skims the command and the files it names for a guard word (gh, an HTTP client,
+a guarded path, `workflow`, `disable`, an agent session): one found, or no time left for the skim either, refuses;
+none found passes, so a loaded machine no longer refuses unrelated calls. Shell text over 10,000 commands in one call
+(a big script) is skimmed the same way instead of parsed.
 
 **The fast path** (#1094). Every Bash call runs actions-disable-guard, capacity-pipe-guard and memory-index-guard.
 A Python script is compiled on every start, and actions-disable-guard is 5,000 lines: ~55 ms a call on an idle

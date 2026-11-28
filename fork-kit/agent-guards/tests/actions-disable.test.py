@@ -1081,9 +1081,11 @@ class AttackTest(Case):
         # A hook that is not done at its time limit does not stop the command. So the guard stops itself first
         # and refuses: what it could not read to the end (a script the command runs, a word put together from
         # variables) may be the disabling call.
-        for cmd in ('A=dis; B=able; gh workflow $A$B 1', 'bash sub/dis.sh', 'bash sub/ok.sh', 'ls -la $X'):
+        for cmd in ('A=dis; B=able; gh workflow $A$B 1', 'bash sub/dis.sh', 'bash sub/ok.sh'):
             with self.subTest(cmd=cmd):
                 self.assertIn('could not finish', self.g.decide(cmd, self.dir, self.env, budget=-1) or '', cmd)
+        # out of time, the skim decides: a command with no guard word in it or in a file it names passes
+        self.assertIsNone(self.g.decide('ls -la $X', self.dir, self.env, budget=-1))
         # #1752: a command the fast exit passes needs no time at all (it reads nothing), so it passes out of time too
         self.assertIsNone(self.g.decide('ls -la', self.dir, self.env, budget=-1))
         self.assertIsNone(self.g.decide('gh pr list', self.dir, self.env, budget=60))
@@ -1474,6 +1476,7 @@ class GuardTest(Case):
         # the whole hook, with no time at all: it answers "deny" itself instead of running into the hook limit
         import contextlib, io
         from unittest import mock
+        self.write('x.sh', 'gh workflow dis' + 'able 1\n')   # out of time, the skim still finds it
         for cmd, verdict in (('bash x.sh', 'deny'), ('ls', None)):   # #1752: the fast exit needs no time
             out = io.StringIO()
             with mock.patch.object(self.g, 'BUDGET', -1), \
@@ -1492,6 +1495,7 @@ class GuardTest(Case):
         import contextlib, io
         from unittest import mock
         out = io.StringIO()
+        self.write('x.sh', 'gh workflow dis' + 'able 1\n')   # out of time, the skim still finds it
         with mock.patch.object(self.g, 'process_age', lambda: self.g.BUDGET + 1), \
                 mock.patch.object(sys, 'stdin', io.StringIO(self.event('bash x.sh'))), \
                 mock.patch.dict(os.environ, {'HOME': self.dir}), contextlib.redirect_stdout(out):
@@ -1518,6 +1522,7 @@ class GuardTest(Case):
         self.assertIn(last, text)
         body, _, tail = text.replace('\nBUDGET = 5.0\n', '\nBUDGET = 1.0\n', 1).rpartition(last)
         self.write('slow-hook', body + '\ntime.sleep(1.3)' + last + tail)
+        self.write('x.sh', 'gh workflow dis' + 'able 1\n')   # out of time, the skim still finds it
         for cmd in ('bash x.sh', 'ls -la'):
             r = subprocess.run([sys.executable, '-I', os.path.join(self.dir, 'slow-hook')], input=self.event(cmd),
                                capture_output=True, text=True, env={'PATH': '/usr/bin:/bin', 'HOME': self.dir},
@@ -2169,8 +2174,9 @@ class FastExitTest(Case):
         # the clock is looked at after the fast exit: a hook that starts late answers a plain command with a pass
         import contextlib, io
         self.write('evil.py', 'x = "actions/permissions"\n', 0o644)
+        # python3 ok.py: no ok.py, so no guard word in the command or a file it names (the skim passes it)
         for cmd, refused in (('ls -la', False), ('git status', False), ('python3 evil.py', True),
-                             ('python3 ok.py', True)):
+                             ('python3 ok.py', False)):
             with self.subTest(cmd=cmd):
                 out = io.StringIO()
                 ev = json.dumps({'tool_name': 'Bash', 'cwd': self.dir, 'tool_input': {'command': cmd}})
@@ -2618,6 +2624,12 @@ class CacheTest(CacheCase):
             return real(p)
         with mock.patch.object(self.g, 'read_text', alarm):
             why = self.g.decide('python3 ok.py; python3 ok0.py; python3 ok1.py; python3 ok2.py', self.dir, self.env)
+        self.assertIsNone(why)   # out of time, the skim finds no guard word in the files: passed, and nothing kept
+        self.assertFalse(os.path.exists(self.cache_path()))
+        self.write('ok2.py', 'x = "actions/permissions"\n', 0o644)
+        del done[:]
+        with mock.patch.object(self.g, 'read_text', alarm):
+            why = self.g.decide('python3 ok.py; python3 ok0.py; python3 ok1.py; python3 ok2.py', self.dir, self.env)
         self.assertIn('could not finish', why)
         self.assertFalse(os.path.exists(self.cache_path()))
 
@@ -2766,8 +2778,9 @@ class SlowBackendTest(CacheCase):
         self.assertEqual(out['permissionDecision'], 'deny')
         self.assertIn('could not finish', out['permissionDecisionReason'])
         # The budget is 5 s from the start of the process (the limit is 10 s) and every read takes 2 s or more, so a
-        # hook that keeps its budget starts at most 3 of the 6 reads; a loaded machine only makes that fewer.
-        self.assertLessEqual(slow_calls(self).count('read'), 3, slow_calls(self))
+        # hook that keeps its budget starts at most 3 of the 6 reads, and the skim after it (2 s) one more; a loaded
+        # machine only makes that fewer.
+        self.assertLessEqual(slow_calls(self).count('read'), 4, slow_calls(self))
 
     def test_a_slow_log_never_holds_or_doubles_the_answer(self):
         # the refusal is written out before the log line, and the log gets 2 s past the budget at most
@@ -3915,6 +3928,129 @@ class Pr1108Round1Test(Case):
         self.write('t.js', tpl)
         self.refused('python3 u7.py', './u7.py', 'node x.py', 'python3 y.js', 'node b.js', 'node t.js',
                      f"node -e '{blk}'", f"node -e '{tpl}'")
+
+
+class OutOfTimeSkimTest(Case):
+    """Agent-speed study (67 hook errors or timeouts, 21 refusals at the 5 s budget): the guard parses at most
+    MAX_COMMANDS commands of shell text per call and skims past that, a command it runs out of time on is skimmed
+    instead of refused outright, and a refusal says what it refused and what to do instead. Red on main where the
+    behaviour is new (the out-of-time passes, the parse limit, the message)."""
+    pipe = GuardTest.pipe
+    event = GuardTest.event
+    DIS = 'gh workflow dis' + 'able 1'   # split: this file is read by the guard it tests
+    SHAPES = (DIS, 'gh api -X PUT repos/a/b/actions/workflows/1/dis' + 'able',
+              'gh api --method=PUT repos/a/b/actions/workflows/ci.yml/dis' + 'able',
+              'gh api -XPUT repos/a/b/actions/workflows/1/dis' + 'able',
+              'gh api -X PUT repos/a/b/actions/perm' + 'issions -F enabled=false',
+              'curl -q -X PUT -H "Authorization: token x" https://api.github.com/repos/a/b/actions/workflows/1/dis'
+              + 'able',
+              'A=dis; gh "work""flow" ${A}able 1', 'bash off.sh', './off.sh', 'python3 off.py', 'bash outer.sh',
+              'D=.; bash "$D/off.sh"', 'cat off.sh | bash', 'bash < off.sh', 'cd sub && bash off2.sh')
+
+    def files(self):
+        self.write('off.sh', f'#!/bin/sh\n{self.DIS}\n')
+        self.write('off.py', "import subprocess\nsubprocess.run(['gh', 'api', '-X', 'PUT', "
+                             f"'repos/a/b/actions/workflows/1/{'dis' + 'able'}'])\n", 0o644)
+        self.write('outer.sh', '#!/bin/sh\nset -e\nbash ./off.sh\n')   # two files deep
+        self.write('sub/off2.sh', f'{self.DIS}\n')   # in a folder the command moves to
+        self.write('plain.sh', '#!/bin/sh\necho hello | grep h\nls -la\n')
+        self.write('ok.py', 'print(1)\n', 0o644)
+        self.write('x.txt', 'a\nb\n', 0o644)
+
+    def test_every_switch_off_shape_is_refused_out_of_time(self):
+        # Question: out of time, does any known switch-off shape (the gh subcommand, the REST PUT to the disable
+        # endpoint in its gh api and curl forms, Actions permissions, scripts that call them) get through?
+        self.files()
+        for cmd in self.SHAPES:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.decide(cmd), cmd)   # the full reading refuses it
+                self.assertIn('could not finish', self.g.decide(cmd, self.dir, self.env, budget=-1) or '', cmd)
+
+    def test_unrelated_commands_pass_out_of_time(self):
+        # Question: out of time, does an unrelated Bash call still run? (main refused every one of them)
+        self.files()
+        for cmd in ('ls -la $X', 'git status && grep -rn foo . | head', 'pnpm test', 'bash plain.sh',
+                    'python3 ok.py', 'for f in *.txt; do wc -l "$f"; done',
+                    "cat > brief.md <<'EOF'\nThe guard reads text. Run the tests, then push.\nEOF\nawk 'NR<3' x.txt"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.g.decide(cmd, self.dir, self.env, budget=-1), cmd)
+
+    def test_heredoc_text_and_plain_commands_pass(self):
+        # Question: does text in a heredoc (also naming gh commands) and an ordinary command still pass in full?
+        self.files()
+        brief = 'Use `gh pr view 12` and `gh run list`; never switch a workflow off.\n' * 2000
+        for cmd in (f"cat > brief.md <<'EOF'\n{brief}EOF", "awk 'NR<3' x.txt",
+                    f'gh pr create --title t --body "$(cat <<\'EOF\'\n{brief}EOF\n)"', 'bash plain.sh'):
+            with self.subTest(cmd=cmd[:40]):
+                self.assertIsNone(self.decide(cmd))
+
+    def test_large_input_is_parsed_only_up_to_the_limit(self):
+        # Question: does a big shell text (a 15,000-line script, the same as a heredoc into bash) stay under the
+        # budget? Counted as commands parsed, not as time (#1150): main parsed all of them (4 s for 2 MB, idle).
+        self.files()
+        limit = getattr(self.g, 'MAX_COMMANDS', 10_000)
+        lines = 'echo "line $X" | grep line\n' * 15_000
+        self.write('big.sh', lines)
+        self.write('bigoff.sh', lines + 'bash ./off.sh\n')
+        self.write('bigvar.sh', 'D=.\n' + lines + 'bash "$D/off.sh"\n')
+        self.write('biggh.sh', lines + self.DIS + '\n')
+        real, seen = self.g.segment_reason, []
+        def count(*a, **k):
+            seen.append(1)
+            return real(*a, **k)
+        for cmd, refused in (('bash big.sh', False), (f"bash <<'EOF'\n{lines}EOF", False), ('bash bigoff.sh', True),
+                             ('bash bigvar.sh', True), ('bash biggh.sh', True)):
+            with self.subTest(cmd=cmd[:30]):
+                del seen[:]
+                with mock.patch.object(self.g, 'segment_reason', count):
+                    why = self.decide(cmd)
+                self.assertLessEqual(len(seen), limit + 10, cmd[:30])
+                self.assertEqual(why is not None, refused, why)
+                if refused:
+                    self.assertIn('off.sh' if 'off' in cmd or 'var' in cmd else 'workflow', why)
+
+    def test_an_internal_error_on_a_real_shape_denies(self):
+        # Question: when the guard itself fails, is a real switch-off still refused (through the real hook)?
+        self.files()
+        for cmd in self.SHAPES:
+            with self.subTest(cmd=cmd):
+                r = self.pipe(self.event(cmd), {'ACTIONS_DISABLE_GUARD_TEST_CRASH': '1'})
+                self.assertEqual(json.loads(r.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_the_hook_out_of_time_skims(self):
+        # Question: the whole hook, started too late to read anything: does it refuse the switch-off and pass the
+        # unrelated call, inside its 10 s?
+        import contextlib, io
+        self.files()
+        for cmd, verdict in (('bash off.sh', 'deny'), ('git status && ls -la $X', None), ('bash plain.sh', None)):
+            out = io.StringIO()
+            with mock.patch.object(self.g, 'process_age', lambda: self.g.BUDGET + 1), \
+                    mock.patch.object(sys, 'stdin', io.StringIO(self.event(cmd))), \
+                    mock.patch.dict(os.environ, {'HOME': self.dir}), contextlib.redirect_stdout(out):
+                self.assertEqual(self.g.main(), 0)
+            if verdict is None:   # passed: no decision (a machine file problem may still be reported)
+                self.assertNotIn('permissionDecision', out.getvalue(), cmd)
+                continue
+            got = json.loads(out.getvalue())['hookSpecificOutput']
+            self.assertEqual(got['permissionDecision'], 'deny')
+            self.assertIn('found `workflow disable` in the file off.sh', got['permissionDecisionReason'])
+
+    def test_a_refusal_says_what_and_what_to_do(self):
+        # Question: does the refusal of a text-only command next to a tool the guard cannot read say what text went
+        # where, which tool, and what to do instead, and does doing that pass?
+        self.files()
+        brief = f"cat > brief.md <<'EOF'\nNever run {self.DIS}.\nEOF\n"
+        why = self.decide(brief + "awk 'NR<3' x.txt")
+        for part in ('writes to the file `brief.md`', '`awk`', 'What to do instead:', 'separate Bash calls'):
+            self.assertIn(part, why)
+        self.assertIsNone(self.decide(brief))                 # the advice works: each part alone passes
+        self.assertIsNone(self.decide("awk 'NR<3' x.txt"))
+        why = self.decide(f"echo '{self.DIS}' | sometool")
+        for part in ('pipes on from `echo`', '`sometool`', 'give `sometool` that file as an argument'):
+            self.assertIn(part, why)
+        self.write('msg.md', f'Never run {self.DIS}.\n', 0o644)
+        self.assertIsNone(self.decide('sometool -F msg.md'))   # the advice works
+        self.assertIsNone(self.decide('cat msg.md'))
 
 
 if __name__ == '__main__':
