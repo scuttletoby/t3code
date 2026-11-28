@@ -318,6 +318,30 @@ describe("makeClaudeMcpProfiles", () => {
       ),
   );
 
+  // Does every Claude query that carries T3's MCP server (so T3's orchestration text) get the
+  // fork's background-Agent guidance, and one without T3's server none?
+  it.effect(
+    "a query with T3's MCP server gets the background-Agent guidance with each prompt",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        ClaudeMcpProfileTesting.clearOpenedPlanKeys();
+        const plan = yield* makeClaudeMcpProfiles;
+        const withT3 = (yield* plan(thread("t3"), { mcpServers: { "t3-code": {} } })).options;
+        assert.lengthOf(withT3.hooks?.UserPromptSubmit ?? [], 1);
+        const withoutT3 = (yield* plan(thread("bare"), {})).options;
+        assert.isUndefined(withoutT3.hooks?.UserPromptSubmit);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettingsService.ServerSettingsService.layerTest(),
+            ManagedPolicy.layerTest(),
+            Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
+          ).pipe(Layer.provideMerge(NodeServices.layer)),
+        ),
+      ),
+  );
+
   /** A planner over settings the test changes between turns, from no opened process. */
   const planner = Effect.gen(function* () {
     T3ToolSets.__testing.clear();

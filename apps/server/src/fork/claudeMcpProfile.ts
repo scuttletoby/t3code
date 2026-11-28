@@ -44,6 +44,7 @@ import {
   resolveMcpProfile,
 } from "./mcpProfile.ts";
 import { makeClaudeAgentModelPolicyHook } from "./claudeAgentModelPolicy.ts";
+import { withBackgroundAgentGuidance } from "./claudeBackgroundAgents.ts";
 import { decodeSettingsFileSilently } from "./settingsFileRead.ts";
 import {
   MAX_T3_TOOL_SETS,
@@ -812,8 +813,12 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
       keepOpenedPlanKey(thread.id, key);
       fixT3ToolSet(thread.id, set, turn);
     }
-    // The policy hook goes in before the options are made lazy, so adding it reads nothing early.
-    return fixedWhenOpened(withAgentModelPolicy(plan, yield* agentPolicy), thread.id, set, turn);
+    // The hooks go in before the options are made lazy, so adding them reads nothing early.
+    const hooked = withBackgroundAgentGuidance(
+      withAgentModelPolicy(plan, yield* agentPolicy),
+      overrides,
+    );
+    return fixedWhenOpened(hooked, thread.id, set, turn);
   });
 
   return Effect.fn("ClaudeMcpProfile.plan")(function* (
