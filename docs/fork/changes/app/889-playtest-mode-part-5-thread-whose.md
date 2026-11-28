@@ -1,0 +1,5 @@
+- Change: Playtest mode, part 5: a thread whose playtest session is on shows a Playtest chip above the composer with an End button, which ends the session as the tool's `end` does. The chip goes when the session ends any other way.
+- Why: The person sees that a session runs and ends it without asking the agent.
+- Setting: `server.playtest`, `projectOverride.playtest`
+- Default: off
+- PR: [#889](https://github.com/scuttletoby/t3code/issues/889)

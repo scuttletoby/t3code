@@ -5396,14 +5396,18 @@ for label, conc in {
 # --- head-run (#1157) -----------------------------------------------------------------------------
 # A head run (workflow_dispatch with head=true, fork-kit/schedule-kick's heads) on a pull request's branch must never be
 # weaker than that pull request's own run, since its fork-ci-result lands on the same head: it tests the pull request's
-# merge commit (whose head parent is the run's commit), scans for secrets as that pull request's run (head_ref), and
-# runs the macOS lint. On main it is a release run of main's tip.
+# merge commit (whose head parent is the run's commit), scans for secrets as that pull request's run (head_ref), runs
+# the macOS lint, and checks the fork lines in upstream files on that merge commit (`workflows`, depth 2: its first
+# parent is the base). On main it is a release run of main's tip.
 HEAD_RUN_EXPR = "${{ inputs.head == true }}"
 SECRETS_IF = ("${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && "
               "(inputs.ref == '' || (inputs.head && github.ref_name != github.event.repository.default_branch)) }}")
 # fork_ci_result lets `secrets` skip only in a release run: never in a head run on a pull request's branch, where
 # SECRETS_IF runs it (so a skip there is no reason to pass).
 RESULT_RELEASE = "${{ inputs.ref != '' && !(inputs.head && github.ref_name != github.event.repository.default_branch) }}"
+SEAM_STEP = "Fork lines in upstream files"
+SEAM_IF = "${{ github.event_name == 'pull_request' || (inputs.head && github.ref_name != github.event.repository.default_branch) }}"
+SEAM_RUN = "node .github/scripts/fork-seam-check.cjs --no-upstream HEAD^1 HEAD"
 
 
 def head_run_problems(tests, scan):
@@ -5439,6 +5443,14 @@ def head_run_problems(tests, scan):
                    if st.get("name") == "Require every job to pass"), {})
     if (result.get("env") or {}).get("RELEASE_RUN") != RESULT_RELEASE:
         problems.append("fork-tests.yml: fork_ci_result: a head run on a pull request's branch may skip the secret scan")
+    wf_steps = (jobs.get("workflows") or {}).get("steps") or []
+    seam = next((st for st in wf_steps if st.get("name") == SEAM_STEP), {})
+    checkout = next((st for st in wf_steps if st.get("name") == "Checkout"), {})
+    if seam.get("if") != SEAM_IF or seam.get("run") != SEAM_RUN \
+            or (checkout.get("with") or {}).get("ref") != "${{ needs.changes.outputs.sha }}" \
+            or (checkout.get("with") or {}).get("fetch-depth") != 2:
+        problems.append("fork-tests.yml: workflows: a head run on a pull request's branch does not check the fork lines "
+                        "in upstream files on its merge commit")
     scan_inputs = ((scan.get(True) or scan.get("on") or {}).get("workflow_call") or {}).get("inputs") or {}
     if (scan_inputs.get("head_ref") or {}).get("default") != "":
         problems.append("fork-secret-scan.yml: no workflow_call input head_ref (default empty)")
@@ -5475,6 +5487,11 @@ for label, edit in {
     "a fork_ci_result that lets a head run skip the scan": lambda t, s, st: [
         x.get("env", {}).__setitem__("RELEASE_RUN", "${{ inputs.ref != '' }}")
         for x in t["jobs"]["fork_ci_result"]["steps"] if x.get("name") == "Require every job to pass"],
+    "a head run that skips the fork lines in upstream files": lambda t, s, st: [
+        x.__setitem__("if", "${{ github.event_name == 'pull_request' }}")
+        for x in t["jobs"]["workflows"]["steps"] if x.get("name") == SEAM_STEP],
+    "a head run's fork lines checked on a shallower checkout": lambda t, s, st: [
+        x["with"].__setitem__("fetch-depth", 1) for x in t["jobs"]["workflows"]["steps"] if x.get("name") == "Checkout"],
     "a head run's scan as a sweep": lambda t, s, st: [
         x.get("env", {}).__setitem__("EVENT_NAME", "${{ github.event_name }}")
         for j in s["jobs"].values() for x in j.get("steps") or [] if x.get("id") == "scan"],

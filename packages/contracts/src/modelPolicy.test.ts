@@ -12,6 +12,7 @@ import {
   MODEL_POLICY_START_ROWS,
   modelPolicyAliasTargets,
   modelPolicyPickEfforts,
+  modelPolicyRowsText,
   modelPolicyStance,
   ModelPolicyPatch,
   ModelPolicyFromSettingsFile,
@@ -285,6 +286,58 @@ describe("one pick against the rows", () => {
         ],
       }),
     ).toMatchObject({ inside: true });
+  });
+
+  it("reads Claude's default effort choice (sends no effort, Claude Code picks) as no effort", () => {
+    const rows = [
+      { driver: "claudeAgent", model: "gw", efforts: ["low", "high"] },
+      { driver: "claudeAgent", model: "gw-plain" },
+    ] as never;
+    const claudePick = (model: string, value: string, driver?: string) => ({
+      ...(driver === undefined ? {} : { driver }),
+      model,
+      options: [{ id: "effort", value }],
+    });
+    expect(modelPolicyPickEfforts(claudePick("gw", "default", "claudeAgent"))).toEqual([]);
+    // A row with efforts refuses it; a row without (no effort control) allows it as left out.
+    expect(checkModelPolicyPick(rows, claudePick("gw", "default", "claudeAgent"))).toMatchObject({
+      inside: false,
+      why: "gw needs an effort from its row, and the pick names none",
+    });
+    expect(
+      checkModelPolicyPick(rows, claudePick("gw-plain", "default", "claudeAgent")),
+    ).toMatchObject({ inside: true });
+    // Not Claude's no-effort choice under another driver, or with the driver not known.
+    expect(modelPolicyPickEfforts(claudePick("gw", "default", "fx"))).toEqual(["default"]);
+    expect(checkModelPolicyPick(rows, claudePick("gw", "default"))).toMatchObject({
+      inside: false,
+    });
+  });
+
+  it("leaves a row's no-effort choice out of the allowed list, as a pick naming it is refused", () => {
+    // A hand-written Claude row holding `default` (no merged build offered it) still saves.
+    const rows = [
+      { driver: "claudeAgent", model: "gw", efforts: ["default", "low"], defaultEffort: "default" },
+      { driver: "claudeAgent", model: "gw-only", efforts: ["default"] },
+      { driver: "opencode", model: "oc-x", efforts: ["t3:default", "high"], defaultEffort: "high" },
+      { driver: "fx", model: "fx-x", efforts: ["default", "low"], defaultEffort: "default" },
+    ] as never;
+    expect(
+      checkModelPolicyPick(rows, {
+        driver: "claudeAgent",
+        model: "gw",
+        options: [{ id: "effort", value: "default" }],
+      }),
+    ).toMatchObject({ inside: false });
+    expect(modelPolicyRowsText(rows)).toBe(
+      [
+        "claudeAgent gw (efforts low; default left out: on claudeAgent it sends no effort, so a pick naming it is refused)",
+        "claudeAgent gw-only (efforts none usable; default left out: on claudeAgent it sends no effort, so a pick naming it is refused)",
+        "opencode oc-x (efforts high; default high; t3:default left out: on opencode it sends no effort, so a pick naming it is refused)",
+        // Another driver's `default` is a level like any other.
+        "fx fx-x (efforts default, low; default default)",
+      ].join("; "),
+    );
   });
 
   it("reads OpenCode's Default variant (t3:default, sends no variant) as no effort, as if left out", () => {

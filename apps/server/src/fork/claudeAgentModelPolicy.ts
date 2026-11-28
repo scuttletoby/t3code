@@ -149,7 +149,7 @@ function skillFrontmatter(text: string): Record<string, unknown> | undefined {
 const unreadableSkill = (why: string): ServerPick => ({
   driver: CLAUDE_DRIVER,
   model: undefined,
-  unreadable: `${why}, so T3 cannot tell whether it starts a sub-agent (context: fork) on a model outside the policy. Do the work without it, or a person puts a copy in the project's .claude/skills that names a model from the rows in its frontmatter model and effort`,
+  unreadable: `${why}, so T3 cannot tell whether it starts a sub-agent (context: fork) on a model outside the policy. Do the work without it, or a person puts a copy under another name in the project's .claude/skills that names a model from the rows in its frontmatter model and effort (some skills bundled with Claude Code cannot be replaced by a copy of the same name: Claude Code runs its own)`,
 });
 
 /**

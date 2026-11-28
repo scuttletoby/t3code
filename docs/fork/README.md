@@ -310,9 +310,9 @@ T3 runs the project's adapter, four kinds of step only the person sets: `claim` 
 `renew` keeps the claim alive, `push` (one or more named steps) sends a round to the target, and
 `release` puts the target back. Each step is a program given by its absolute path with fixed
 arguments, run without a shell; T3 passes the session's facts as environment variables. An agent
-starts, pushes, checks and ends its thread's session with the `playtest` tool (its own tool group, `playtest`); the
-thread controls come in a later pull request. The steps' contract and the tool are in
-[playtest.md](playtest.md).
+starts, pushes, checks and ends its thread's session with the `playtest` tool (its own tool group, `playtest`). While
+a session is on, its thread shows a **Playtest** chip above the composer with an **End** button, so the person can
+end it without asking the agent. The steps' contract, the tool and the chip are in [playtest.md](playtest.md).
 
 In the app: **Settings → Fork**, section Playtest sessions: the switch (it stays off until all four steps are
 set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
@@ -465,7 +465,10 @@ policy too (the link names the agent's thread; a call the owner's client sends t
 so each machine refuses an agent's pick outside its own rows, whatever the sending machine's policy
 says. An agent is
 a caller whose session is bound to a thread; the owner's client has none, and anything that reaches
-the server without such a session counts as a person, so the model guard hook is the backstop.
+the server without such a session counts as a person. Every other thread command an agent's call
+dispatches with a model, and a thread fork (on its source thread's model), is checked by the
+server's backstop (#876 M4; which part checks each route, and the way back:
+[model-policy.md](model-policy.md)).
 Claude's own Agent tool (Task in older Claude Code) is checked too, as each call is made (#128): T3
 gives every Claude session it opens one PreToolUse hook that reads the policy on each call. The call
 must name a model and, for a row with `efforts`, its `effort`. The Agent tool names only aliases
@@ -1418,8 +1421,18 @@ Which threads hold a role, for the calm sidebar: the `assistant` thread (or `nul
 `orchestrators` one thread per project (project id to thread id). A role is a pointer in the
 settings, not a tag on the thread, so a project has at most one orchestrator and the roles are a
 setting the person changes ([#138](https://github.com/scuttletoby/t3code/issues/138)). The default,
-no roles, changes nothing. This setting alone shows nothing: the calm sidebar
-(`client.calmSidebarEnabled`) reads it.
+no roles, changes nothing. The thread header shows a badge, Assistant or Orchestrator, on a thread
+that holds a role now; the calm sidebar (`client.calmSidebarEnabled`) puts those threads on top.
+
+**Setting a role.** A thread's menu (the sidebar's and the thread title's) has **Role**: Make
+project orchestrator or Make assistant, Replace (naming the thread that holds it now) when another
+thread does, and Remove role, which clears every pointer to that thread. A pick saves one pointer;
+the menu has no Role for a sub-agent, side chat, delegated task or deleted thread, nor on a
+connection without the right to change settings. A role the thread holds shows checked (and cannot
+be picked again). An archived thread can be given a role from its menu, but the role is paused (no
+role row, no badge) until the thread is unarchived. **Settings → Fork → Calm sidebar** lists the roles
+of the selected environment, each marked when it gives no role now (missing, deleted, archived, a
+sub-agent, or in another project), with Remove for each.
 
 Only the person can change it; agents cannot (the settings tool refuses it as person-only). A save
 that sets a pointer anew is refused unless the thread exists and is not deleted, is a top-level
@@ -1558,7 +1571,22 @@ Turns on the calm sidebar on this device: the threads in `server.threadRoles` go
 other top-level threads fold into one closed group with a count of those waiting for you
 ([#139](https://github.com/scuttletoby/t3code/issues/139)). Off (the default): upstream's sidebar.
 It is a client setting, so each device chooses: calm on a phone, the full list on a desktop. A
-client settings file without it reads as off.
+client settings file without it reads as off. Switch it in **Settings → Fork → Calm sidebar**.
+
+On the web, with it on:
+
+- The role threads come first, under the heading Assistant, then Orchestrator(s), drawn as ordinary
+  rows (their menu, settle and pin work as anywhere). A settled or snoozed role thread stays on top.
+  An archived or deleted one, a sub-agent or a thread moved to another project holds no role.
+- **Other threads (N)** folds every other thread the list would show open (pinned, active,
+  working). Its heading counts them and, when any waits for you (an approval, a question, a
+  sub-agent's request or a guest message), shows "W waiting". A usage-limit stop is not counted: it
+  clears without you. Whether the group is open is kept per device; it starts closed. The open
+  thread is never folded away. Snoozed and settled threads stay in their own sections, which are
+  already folded.
+- No thread holds a role: the list stays as it is, with a hint at the top on how to make one.
+- While a search runs, the calm view steps aside, so the search finds every thread.
+- The project filter applies first: role rows outside it are not shown.
 
 ### `client.ownerQuestionsPage`
 
@@ -1737,6 +1765,8 @@ switch.
   summary.
 - [delegate-prepare.md](delegate-prepare.md): set up a checkout (merge, install, baseline tests)
   by script before a delegated agent starts.
+- [model-policy.md](model-policy.md): which part checks each route an agent picks a model on, a
+  check an agent cannot turn off, and the way back.
 - [`.github/fork-fleet.md`](../../.github/fork-fleet.md): the fleet runners and `CI_RUNNERS`.
 - [`fork-ci/README.md`](../../fork-ci/README.md) and [`fork-kit/README.md`](../../fork-kit/README.md):
   CI actions and host kits.
