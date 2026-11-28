@@ -11,30 +11,37 @@ lens's prompt file; and the pull request's earlier reads of this lens, so round 
 context share one total cap (--max-total-lines): what does not fit is listed under "Not in this packet" at the top.
 It does not replace reading every changed file in full.
 
+Run it from a checkout of the pull request's BASE (a worktree of the base tip), with --repo naming the clone at the
+head: its code comes from the folder it runs from, the pull request from --repo. A lens never runs the head's copy:
+that is the code under review, and it could write its own reviewer's instructions. A run whose own copy of the code
+that builds the packet (this script, the kit's lib, the gate's pr-queue and head-check code) differs from the base's
+for a file the pull request changes refuses (exit 2) with the command for the base's copy; that check only catches
+an honest run, so the base's copy is the rule, not the check.
+
 The lens list, the prompt paths and the kit settings are read as the gate reads them: from the pull request's base
 tip with git (review_kit's loaders with `base`), never from the working tree or the head, so a pull request cannot
-pick or write its own reviewer's instructions. When it changes them, the packet says so at the top.
+pick or write its own reviewer's instructions. When it changes them (against the merge base), the packet says so.
 
-Every text taken from GitHub (the pull request body, issue bodies and comments, earlier lens comments) sits inside a
-fence longer than any backtick run in it, under a line saying it is data, not instructions: no body can open a
-section of the packet. Earlier rounds are the comments the gate counts (lens.Review's own lens_posts and counts: the
-configured author associations, no bots), never edited and not hidden, picked with the gate's lens_header and
-lens_key. Other lenses' reports and `not a lens:` notes between rounds (those often sum up every lens's findings) are
-only counted, since a lens does not read another lens's report (SKILL.md, "Order", step 4); --all-lenses (for the
-author or the orchestrator, never a lens) adds them.
+Every text taken from GitHub (the pull request's title and body, issue titles, bodies and comments, earlier lens
+comments) sits inside a fence longer than any backtick run in it, under a line saying it is data, not instructions:
+no body can open a section of the packet. Earlier rounds are the posts the gate counts: conversation comments,
+reviews and inline review comments, read as the gate reads them (pr_queue.review_flags) and filtered with
+lens.Review's own lens_posts and counts (the configured author associations, no bots), never edited and not hidden,
+picked with the gate's lens_header and lens_key. A post with the lens marker whose header the parser cannot read but
+that names this lens is shown as "unparsed, maybe this lens". Other lenses' reports and `not a lens:` notes between
+rounds (those often sum up every lens's findings) are only counted, since a lens does not read another lens's report
+(SKILL.md, "Order", step 4); --all-lenses (for the author or the orchestrator, never a lens) adds them.
 
 It needs a clone checked out at the pull request's head (--repo, default the current folder) that has the base commit:
 the diff and the files are read with git from that clone's HEAD, never from the working tree, and the run refuses a
 clone whose HEAD is not the pull request's head. The first line of the packet, and of what it prints, is
-`head: <sha>`, so a stale packet is easy to spot. When the pull request changes the code that builds the packet
-(this script, the kit's lib, the gate's pr-queue or head-check code) and this copy is not the base's, line 2 is a
-WARNING with the command that builds it from the base's copy. The same head and the same comments give the same
+`head: <sha>`, so a stale packet is easy to spot. The same head and the same comments give the same
 bytes: nothing in it comes from the clock or the machine.
 
-Exit 0: packet written. Exit 1: packet written with gaps (a linked issue or the comments gh could not read); each gap
-is listed under "Gaps" at the top of the packet and as a WARN line on stderr. Exit 2: no packet (wrong head, unknown
-lens, no base commit, gh failed on the pull request itself), and an older packet at --out is removed; the message says
-what to do.
+Exit 0: packet written. Exit 1: packet written with gaps (a linked issue, the comments or the reviews gh could not
+read); each gap is listed under "Gaps" at the top of the packet and as a WARN line on stderr. Exit 2: no packet (wrong
+head, unknown lens, no base commit, not the base's copy, gh failed on the pull request itself). Exit 3: the packet
+could not be written to --out. On exit 2 and 3 an older packet at --out is removed (emptied when it cannot be).
 """
 import argparse
 import json
@@ -50,6 +57,7 @@ KIT = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(KIT))   # the checkout this copy of the script runs from
 sys.path.insert(0, os.path.join(KIT, 'lib'))
 import review_kit  # noqa: E402
+import pr_queue  # noqa: E402  (on the path review_kit set: the gate's own review reader)
 
 lens = review_kit.lens
 CONTEXT = 30           # lines before and after each changed place
@@ -64,6 +72,7 @@ BUILDER_FILES = ('fork-kit/review/lens-packet',)
 BUILDER_DIRS = ('fork-kit/review/lib/', 'fork-ci/actions/pr-queue/', 'fork-ci/actions/head-check/')
 REF_RE = re.compile(r'(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|part\s+of|refs?|see)\s*:?\s+#(\d+)')
 TITLE_REF_RE = re.compile(r'#(\d+)\b')
+LENS_FIELD_RE = re.compile(r'\W*lens\s*[:=\u2014\u2013]\s*(.*?)\s*(?:[\u00b7|]|\breviewer\b|\bread\b|$)', re.I)
 HUNK_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$')
 
 
@@ -125,10 +134,11 @@ def base_blob(repo, commit, rel):
         raise Stop(str(e)) from None
 
 
-def lens_config(repo, base_tip, head, name, settings_path):
+def lens_config(repo, base_tip, merge_base, head, name, settings_path):
     """(gate Config, prompt path, prompt text, [config files the pull request changes]). The kit settings, the queue
     config and the prompt are read from the base tip, as the gate reads them; Stop when the lens is not in its review
-    block."""
+    block. What the pull request changes is judged against the merge base, as its diff is: a prompt main changed
+    after the branch point is no change of this pull request."""
     try:
         if settings_path is None and review_kit.base_file(repo, base_tip, review_kit.SETTINGS) is None:
             others = review_kit.other_settings(repo, base_tip)
@@ -151,7 +161,7 @@ def lens_config(repo, base_tip, head, name, settings_path):
     for rel in (settings_path or review_kit.SETTINGS, settings['queue_config'], path):
         if rel not in rels:
             rels.append(rel)
-    changed = [rel for rel in rels if base_blob(repo, base_tip, rel) != base_blob(repo, head, rel)]
+    changed = [rel for rel in rels if base_blob(repo, merge_base, rel) != base_blob(repo, head, rel)]
     return cfg, path, blob.decode('utf-8', 'replace'), changed
 
 
@@ -178,14 +188,14 @@ def builder_problem(repo, base_tip, files):
 
 def linked_issues(pr):
     """The issues the body references with a closing or linking word (`Fixes #N`, `Part of #N`), then any `#N` in the
-    title; never the pull request itself; at most MAX_ISSUES."""
+    title; never the pull request itself. The packet shows the first MAX_ISSUES and names the rest."""
     nums = [int(n) for n in REF_RE.findall(pr.get('body') or '')]
     nums += [int(n) for n in TITLE_REF_RE.findall(pr.get('title') or '')]
     out = []
     for n in nums:
         if n != pr['number'] and n not in out:
             out.append(n)
-    return out[:MAX_ISSUES]
+    return out
 
 
 def changed_files(repo, base, head):
@@ -270,30 +280,40 @@ def context_block(repo, head, path, spans, max_lines):
 
 
 def round_kind(body, name):
-    """'own' for a read of this lens (the gate's lens_key, so `code r2` is `code`), 'note' for a `not a lens:` note
-    between rounds, 'other' for another lens's report (anything carrying the gate's lens marker), None for the rest.
+    """'own' for a read of this lens (the gate's lens_key, so `code r2` is `code`), 'maybe' for a post with the lens
+    marker whose header the gate cannot read but whose first lens field names this lens, 'note' for a `not a lens:`
+    note between rounds, 'other' for another lens's report (anything else carrying the gate's lens marker), None for
+    the rest.
     Only for comments the gate counts: a stranger's text is never parsed here."""
     body = body or ''
     if body.lstrip().lower().startswith('not a lens:'):
         return 'note'
     try:
         header = lens.lens_header(body)
-        if header and lens.lens_key(header[0]) == lens.lens_key(name):
-            return 'own'
-        return 'other' if lens.has_marker(body) else None
+        if header:
+            return 'own' if lens.lens_key(header[0]) == lens.lens_key(name) else 'other'
+        if not lens.has_marker(body):
+            return None
+        for line in body.splitlines():   # a header the gate cannot read (not on the first line, say): whose is it?
+            m = LENS_FIELD_RE.match(lens.norm_line(line))
+            if m and m.group(1).strip():
+                return 'maybe' if lens.lens_key(m.group(1)) == lens.lens_key(name) else 'other'
+        return 'other'
     except lens.UnicodeDrift:
         return 'other'   # the gate blocks on it; --all-lenses shows it
 
 
-def earlier_rounds(cfg, comments, name, all_lenses):
-    """(lines, shown comments): the comments the gate counts (lens.Review.lens_posts drops bots, counts keeps the
-    configured author associations), never edited and not hidden; this lens's reads, with --all-lenses the rest too.
-    The lines say how many were left out and why."""
+def earlier_rounds(cfg, pr_view, name, all_lenses):
+    """(lines, shown [(kind, post)]): the posts the gate counts (lens.Review.lens_posts reads comments, reviews and
+    inline review comments and drops bots; counts keeps the configured author associations), never edited and not
+    hidden; this lens's reads (and its unparsed maybes), with --all-lenses the rest too. The lines say how many were
+    left out and why."""
     review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association, cfg.lens_author_associations,
                          log=lambda *a: None)
-    posts = review.lens_posts({'comments': comments})
-    not_counted = len(comments) - len(posts)
-    unread, kinds = 0, {'own': [], 'note': [], 'other': []}
+    posts = review.lens_posts(pr_view)
+    total = sum(len(pr_view.get(k) or []) for k in ('comments', 'reviews', lens.REVIEW_COMMENTS))
+    not_counted = total - len(posts)
+    unread, kinds = 0, {'own': [], 'maybe': [], 'note': [], 'other': []}
     for when, i, post in posts:
         if not review.counts(post):
             not_counted += 1
@@ -305,11 +325,11 @@ def earlier_rounds(cfg, comments, name, all_lenses):
             unread += 1          # the gate reads nothing from an edited or hidden lens comment (lens.scan_posts)
             continue
         kinds[kind].append((when, i, post))
-    keep = ('own', 'note', 'other') if all_lenses else ('own',)
-    shown = sorted((x for k in keep for x in kinds[k]), key=lambda x: x[:2])
+    keep = ('own', 'maybe', 'note', 'other') if all_lenses else ('own', 'maybe')
+    shown = sorted(((when, i, k, post) for k in keep for when, i, post in kinds[k]), key=lambda x: x[:2])
     lines = []
     if not_counted:
-        lines += ['', f'{not_counted} comment(s) the gate does not count left out (a bot, or an author association '
+        lines += ['', f'{not_counted} post(s) the gate does not count left out (a bot, or an author association '
                   f'not one of {", ".join(cfg.lens_author_associations)}).']
     if unread:
         lines += ['', f'{unread} edited or hidden lens comment(s) left out: the gate reads nothing from them.']
@@ -317,7 +337,18 @@ def earlier_rounds(cfg, comments, name, all_lenses):
         lines += ['', f'{len(kinds["other"])} report(s) of other lenses and {len(kinds["note"])} `not a lens:` note(s) '
                   f'left out: a lens does not read another lens\'s report (SKILL.md, "Order", step 4); --all-lenses '
                   f'(the author or the orchestrator, never a lens) adds them.']
-    return lines, [post for _, _, post in shown]
+    return lines, [(k, post) for _, _, k, post in shown]
+
+
+def gh_run(cwd):
+    """A gh caller shaped as pr_queue.review_flags wants it: gh(*args) -> CompletedProcess with text output."""
+    def call(*args):
+        try:
+            return subprocess.run(['gh', *args], cwd=cwd, capture_output=True, text=True,
+                                  env={**os.environ, 'GH_PAGER': '', 'NO_COLOR': '1', 'GH_PROMPT_DISABLED': '1'})
+        except FileNotFoundError:
+            return subprocess.CompletedProcess(['gh', *args], 127, '', 'gh is not installed')
+    return call
 
 
 def build(args):
@@ -343,21 +374,24 @@ def build(args):
     if subprocess.run(['git', '-C', repo, 'cat-file', '-e', f'{base_tip}^{{commit}}'], capture_output=True).returncode:
         raise Stop(f'the clone has no base commit {base_tip!r}: git -C {repo} fetch origin {base_ref}')
     base = git(repo, 'merge-base', base_tip, head).decode().strip()
-    cfg, prompt_path, prompt_text, config_changed = lens_config(repo, base_tip, head, args.lens, args.settings)
+    cfg, prompt_path, prompt_text, config_changed = lens_config(repo, base_tip, base, head, args.lens, args.settings)
     files = changed_files(repo, base, head)
     builder = builder_problem(repo, base_tip, files)
+    if builder:
+        has_base_copy = base_blob(repo, base_tip, BUILDER_FILES[0]) is not None
+        raise Stop(f'this pull request changes the code that builds the packet ({", ".join(builder)}) and this copy '
+                   f'of it is not the base\'s: a lens never reads a packet the code under review built. '
+                   + (f'Build it with the base\'s copy: git -C {repo} worktree add --detach <dir> {base_tip} && '
+                      f'python3 -I <dir>/fork-kit/review/lens-packet {args.pr} --lens {args.lens} --repo {repo} '
+                      f'--out <file>' if has_base_copy else
+                      f'The base {base_tip[:12]} has no lens-packet: review this pull request without a packet.'))
 
     gaps, top, out = [], [], []
     out.append(f'head: {head}')
-    if builder:
-        out.append(f'WARNING: this pull request changes the code that builds this packet ({", ".join(builder)}) and '
-                   f'this packet was built by a copy that is not the base\'s. Build it with the base\'s copy: '
-                   f'git -C {repo} worktree add --detach <dir> {base_tip} && python3 -I <dir>/fork-kit/review/'
-                   f'lens-packet {args.pr} --lens {args.lens} --repo {repo} --out <file>')
     out.append(f'base: {base} (merge base with {base_ref}; lens config read at its tip {base_tip})')
     out.append(f'pr: #{pr["number"]} {pr.get("url", "")} · lens: {args.lens}')
     out.append('')
-    out.append(f'# Lens packet: #{pr["number"]} {pr.get("title", "")}')
+    out.append(f'# Lens packet: #{pr["number"]}')
     out.append('')
     out.append('Made by fork-kit/review/lens-packet. Read this first. It does not replace reading every changed file '
                'in full: it holds the diff and the lines around each change, not whole files. The diff and the files '
@@ -368,14 +402,19 @@ def build(args):
                 f'base version. See the diff for the change.']
     gap_at = len(out)
 
-    out += ['', Heading('## Pull request'), '', f'**{pr.get("title", "")}**', '',
-            untrusted((pr.get('body') or '(no body)').strip())]
+    out += ['', Heading('## Pull request'), '',
+            untrusted(f'title: {pr.get("title", "")}\n\n' + ((pr.get('body') or '').strip() or '(no body)'))]
 
     out += ['', Heading('## Linked issues')]
     issues = linked_issues(pr)
+    left_out = []
     if not issues:
         out += ['', '(none referenced)']
-    for n in issues:
+    if len(issues) > MAX_ISSUES:
+        more = ', '.join(f'#{n}' for n in issues[MAX_ISSUES:])
+        left_out.append(f'{len(issues) - MAX_ISSUES} more linked issue(s), not shown (at most {MAX_ISSUES}): {more}')
+        out += ['', f'{len(issues) - MAX_ISSUES} more referenced, not shown (at most {MAX_ISSUES}): {more}']
+    for n in issues[:MAX_ISSUES]:
         text, err = gh(['issue', 'view', str(n), '-R', slug, '--json', 'number,title,state,body,comments'], repo)
         if err:
             gaps.append(f'issue #{n}: gh could not read it: {err}')
@@ -383,8 +422,9 @@ def build(args):
             continue
         issue = json.loads(text)
         comments = issue.get('comments') or []
-        out += ['', f'### #{n} {issue.get("title", "")} ({issue.get("state", "").lower()})', '',
-                untrusted(shorten(issue.get('body') or '(no body)', ISSUE_BODY_CHARS))]
+        out += ['', f'### #{n} ({issue.get("state", "").lower()})', '',
+                untrusted(f'title: {issue.get("title", "")}\n\n'
+                          + shorten(issue.get('body') or '(no body)', ISSUE_BODY_CHARS))]
         if comments:
             shown = comments[-ISSUE_COMMENTS:]
             out += ['', f'Last {len(shown)} of {len(comments)} comments:']
@@ -398,7 +438,7 @@ def build(args):
         name = f'{old} -> {new}' if old != new else new
         out.append(f'- {st} {name} ' + ('(binary)' if a is None else f'+{a} -{d}'))
 
-    used, left_out, diff_note = 0, [], {}
+    used, diff_note = 0, {}
     out += ['', Heading('## Diff')]
     for st, old, new, a, d in files:
         text, note = file_diff(repo, base, head, old, new, args.max_diff_lines)
@@ -444,18 +484,31 @@ def build(args):
     out += ['', Heading('## Earlier lens comments on this pull request'),
             '', 'Rounds before this one: check whether their findings are fixed at this head; form your own view of '
             'the rest.']
-    text, err = gh(['pr', 'view', str(pr['number']), '-R', slug, '--json', 'comments'], repo)
+    text, err = gh(['pr', 'view', str(pr['number']), '-R', slug, '--json', 'comments,reviews'], repo)
+    view = None
     if err:
-        gaps.append(f'pull request comments: gh could not read them: {err}')
+        gaps.append(f'pull request comments and reviews: gh could not read them: {err}')
         out += ['', f'(not read: {err})']
     else:
-        lines, rounds = earlier_rounds(cfg, json.loads(text).get('comments') or [], args.lens, args.all_lenses)
+        view = json.loads(text)
+        flags, inline, why = pr_queue.review_flags(gh_run(repo), slug, pr['number'])
+        if flags is None:
+            gaps.append(f'pull request reviews and inline comments: {why}')
+            out += ['', f'Reviews and inline review comments not read ({why}): only conversation comments below.']
+            view = {'comments': view.get('comments') or []}
+        else:
+            view[lens.REVIEW_FLAGS], view[lens.REVIEW_COMMENTS] = flags, inline
+    if view is not None:
+        lines, rounds = earlier_rounds(cfg, view, args.lens, args.all_lenses)
         out += lines
         if not rounds:
             out += ['', '(none)']
-        for c in rounds:
+        for kind, c in rounds:
             who = (c.get('author') or {}).get('login', '?')
-            out += ['', f'### {who}, {c.get("createdAt", "")} ({c.get("url", "")})', '',
+            when = c.get('createdAt') or c.get('submittedAt') or ''
+            label = (' · unparsed, maybe this lens: the gate cannot read its header and blocks on it'
+                     if kind == 'maybe' else '')
+            out += ['', f'### {who}, {when} ({c.get("url", "")}){label}', '',
                     untrusted(shorten(c.get('body'), LENS_COMMENT_CHARS))]
 
     if gaps:
@@ -470,7 +523,7 @@ def build(args):
         if isinstance(part, Heading):
             toc.append(f'{line}: {part}')
         line += part.count('\n') + 1
-    return head, '\n'.join(out) + '\n', gaps, out[1] if builder else None, toc
+    return head, '\n'.join(out) + '\n', gaps, toc
 
 
 def remove(path):
@@ -479,6 +532,22 @@ def remove(path):
         return True
     except FileNotFoundError:
         return False
+
+
+def discard(path):
+    """No older packet at `path` stays readable: removed, or emptied when its folder does not let it go; a message."""
+    try:
+        if remove(path):
+            return f'removed the older packet {path}'
+        return None
+    except OSError:
+        pass
+    try:
+        with open(path, 'w'):
+            pass
+        return f'emptied the older packet {path} (it could not be removed)'
+    except OSError as e:
+        return f'the older packet {path} could be neither removed nor emptied ({e.strerror}): do not read it'
 
 
 def write(path, text):
@@ -510,17 +579,23 @@ def main(argv):
                    help='diff and context lines of all files together (default 4000)')
     args = p.parse_args(argv)
     try:
-        head, text, gaps, warning, toc = build(args)
+        head, text, gaps, toc = build(args)
     except (Stop, ValueError) as e:
         why = e if isinstance(e, Stop) else f'gh printed something that is not JSON: {e}'
         print(f'lens-packet: {why}', file=sys.stderr)
-        if remove(args.out):
-            print(f'lens-packet: removed the older packet {args.out}', file=sys.stderr)
+        said = discard(args.out)
+        if said:
+            print(f'lens-packet: {said}', file=sys.stderr)
         return 2
-    write(args.out, text)
+    try:
+        write(args.out, text)
+    except OSError as e:
+        print(f'lens-packet: cannot write {args.out}: {e}', file=sys.stderr)
+        said = discard(args.out)
+        if said:
+            print(f'lens-packet: {said}', file=sys.stderr)
+        return 3
     print(f'head: {head}')
-    if warning:
-        print(warning)
     print(f'wrote {args.out}: {len(text)} characters; sections (line: heading):')
     for t in toc:
         print(f'  {t}')
