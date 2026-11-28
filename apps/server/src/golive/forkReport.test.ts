@@ -1145,6 +1145,7 @@ describe("__fork-report settings", () => {
       "placement: settings only so far; nothing reads them yet (later placement rows)",
     threadRoles: "calm sidebar: settings only so far; nothing reads them yet",
     assistant: "only offers Make assistant; the assistant is the threadRoles.assistant thread",
+    lanes: "lanes: settings only so far; nothing reads them yet (later lane phases)",
   };
 
   it("counts every fork setting as a feature or names why it is not a switch", () => {

@@ -48,6 +48,7 @@ import {
   StopFinishedChildrenSettingsFromSettingsFile,
   StopFinishedChildrenSettingsPatch,
 } from "./stopFinishedChildren.ts";
+import { LanesSettingsFromSettingsFile, LanesSettingsPatch } from "./forkLanes.ts";
 import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   UsagePacingFromSettingsFile,
@@ -77,6 +78,7 @@ export * from "./placement.ts";
 export * from "./playtest.ts";
 export * from "./reviewRules.ts";
 export * from "./stopFinishedChildren.ts";
+export * from "./forkLanes.ts";
 export * from "./threadRoles.ts";
 export * from "./usagePacing.ts";
 
@@ -150,6 +152,8 @@ export const ForkServerSettingsFields = {
   assistant: AssistantSettingsFromSettingsFile,
   /** Stops a finished delegated child's provider session after a grace time; off. A bad value reads as off. */
   stopFinishedChildren: StopFinishedChildrenSettingsFromSettingsFile,
+  /** Lanes under a project's orchestrator (issue 1156); off. A bad value reads as off, a bad lane drops alone. */
+  lanes: LanesSettingsFromSettingsFile,
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -199,6 +203,8 @@ export const ForkServerSettingsPatchFields = {
   assistant: Schema.optionalKey(AssistantSettingsPatch),
   /** Strict: a save refuses a bad value or an unknown field. */
   stopFinishedChildren: Schema.optionalKey(StopFinishedChildrenSettingsPatch),
+  /** Strict: a save refuses a bad lane name or definition; `null` removes one lane. */
+  lanes: Schema.optionalKey(LanesSettingsPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -252,6 +258,8 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   threadRoles: { fields: { assistant: "replace", orchestrators: { replaceEntries: {} } } },
   assistant: "merge-fields",
   stopFinishedChildren: "merge-fields",
+  // One lane per entry, so two saves for different lanes keep both.
+  lanes: { fields: { enabled: "replace", definitions: { replaceEntries: {} } } },
 };
 
 /**

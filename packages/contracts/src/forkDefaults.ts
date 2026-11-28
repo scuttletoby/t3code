@@ -239,6 +239,15 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     decidedIn: "#925",
   },
   {
+    scope: "server",
+    key: "lanes",
+    default: { enabled: false },
+    fields: true,
+    off: true,
+    reason: "No lane can be switched on; the project's orchestrator works alone, as today.",
+    decidedIn: "#1156",
+  },
+  {
     scope: "projectOverride",
     key: "mcpProfile",
     default: undefined,
