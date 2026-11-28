@@ -1,7 +1,8 @@
 """trace_check.py: every tracked file a test touches under strace must pick that test when it alone changes.
 Run: python3 -B fork-ci/actions/test-select/trace-check.test.py (the end-to-end tests skip without strace).
 """
-import contextlib, importlib.util, io, json, os, re, shutil, subprocess, sys, tempfile, textwrap, unittest
+import contextlib, importlib.util, io, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, textwrap, time
+import unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -233,6 +234,75 @@ class EndToEnd(Repo):
         self.assertIn('1 not traced', out)
 
 
+FAKE_STRACE = '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n'
+
+
+class CutOff(Repo):
+    """A cancelled or timed-out job: the traced tests stop at once and the report keeps what finished. A stand-in
+    strace (it only runs the command) so this runs on any machine; nothing here reads a trace."""
+
+    def setUp(self):
+        super().setUp()
+        self.token = f'cut-off-{os.getpid()}-{id(self)}'
+        self.write({'tests/test_fast.py': '', 'tests/test_slow.py': '',
+                    '.github/test-select.json': json.dumps({'tests': ['tests/test_*.py']}),
+                    '.bin/strace': FAKE_STRACE})
+        os.chmod(os.path.join(self.d, '.bin/strace'), 0o755)
+        self.commit()
+        self.report = os.path.join(self.d, 'report.txt')
+        self.env = {**os.environ, 'PATH': os.path.join(self.d, '.bin') + os.pathsep + os.environ['PATH']}
+        self.env.pop('GITHUB_OUTPUT', None)
+
+    def start(self, run):
+        return subprocess.Popen([sys.executable, '-I', os.path.join(HERE, 'trace_check.py'), '--root', self.d,
+                                 '--jobs', '1', '--run', run, '--report', self.report], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    def alive(self):
+        out = []
+        for pid in filter(str.isdigit, os.listdir('/proc')):
+            try:
+                with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                    line = f.read()
+                if self.token.encode() in line and b'time.sleep' in line and b'case ' not in line:   # the slow test
+                    out.append(pid)
+            except OSError:
+                pass
+        return out
+
+    def test_the_report_holds_every_line(self):
+        p = self.start('true {test}')
+        out = p.communicate(timeout=60)[0].decode()
+        self.assertEqual(p.returncode, 1, out)   # the stand-in leaves no trace: not checked
+        with open(self.report) as f:
+            self.assertEqual(f.read(), out)
+        self.assertIn('trace-check: 2 tests, 0 misses, 2 not traced', out)
+
+    def test_sigterm_stops_every_traced_test_and_keeps_what_finished(self):
+        # Does a cancel return within seconds, leave no test running, and keep the finished test's line?
+        sleep = f'{shlex.quote(sys.executable)} -c "import time; time.sleep(300)" {self.token}'
+        slow = f'case {{test}} in *slow*) exec {sleep};; esac'
+        p = self.start(slow)
+        self.addCleanup(lambda: [os.kill(int(pid), 9) for pid in self.alive()])
+        for _ in range(200):   # the fast test is reported, the slow one is running
+            if self.alive() and os.path.exists(self.report):
+                with open(self.report) as f:
+                    if 'tests/test_fast.py' in f.read():
+                        break
+            time.sleep(0.05)
+        self.assertTrue(self.alive(), 'the slow test never started')
+        started = time.monotonic()
+        p.send_signal(signal.SIGTERM)
+        out = p.communicate(timeout=60)[0].decode()
+        self.assertLess(time.monotonic() - started, 10, out)
+        self.assertEqual(p.returncode, 1, out)
+        self.assertEqual(self.alive(), [], out)
+        with open(self.report) as f:
+            report = f.read()
+        self.assertIn('tests/test_fast.py: no trace', report)
+        self.assertIn('trace-check: cut off by SIGTERM after 1 of 2 tests', report)
+
+
 class NoStrace(Repo):
     def test_fails_without_strace(self):
         self.write({'tests/test_a.py': ''})
@@ -248,7 +318,7 @@ class Action(unittest.TestCase):
     def test_runs_only_the_releases_script(self):
         runs = re.findall(r'^\s*run: (.*)$', self.text, re.M)
         self.assertEqual(runs, ['python3 -I "$GITHUB_ACTION_PATH/../trace_check.py" --config "$CONFIG" --run "$RUN" '
-                                '--jobs "$JOBS"'])
+                                '--jobs "$JOBS" --report "${REPORT:-$RUNNER_TEMP/trace-check.txt}"'])
         self.assertNotIn('uses:', self.text)
 
     def test_inputs_reach_the_script_by_env_only(self):

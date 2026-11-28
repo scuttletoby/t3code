@@ -60,6 +60,9 @@ nor add an output.
   ],
   "always_run": [{ "glob": "tests/test_inventory.py", "why": "reads file names from a data file" }],
   "inputs": [{ "test": "tests/test_backup.py", "reads": [], "why": "lists only its temp folders" }],
+  "follow_calls": [
+    { "glob": "tools/build.py", "why": "most tool tests import it, each for a few functions" }
+  ],
   "import_roots": ["lib"]
 }
 ```
@@ -79,10 +82,42 @@ nor add an output.
   reaches still runs it always. Use it for a test that lists folders the action cannot work out but that are not the
   repository (its temporary folders, passed to helpers as parameters). A wrong declaration is a miss the
   [trace check](#trace-check) reports. A `test` glob that matches no test file fails the step.
+- `follow_calls`: large shared Python modules (globs over the repository's `.py` files) whose top-level functions
+  count only for the tests that can reach them. Without it, a test that imports the module takes in every path the
+  module names; with it, a path named inside a top-level function counts only when the function is reached:
+  - module-level code, classes (their bodies run on import), decorated functions (a decorator may register them) and
+    dunder functions (`__getattr__`) always count, and so does every import the module makes;
+  - a function is reached when that code, a reached function, or any other file among the test's inputs says its
+    name: in code, an import, an attribute (`build.make_x`), a keyword, or a word in a string or a script
+    (`mock.patch('tools.build.make_x')`, `python3 -c '...'` in a shell file). Names, not a call graph: a name in
+    common use picks more tests, never fewer;
+  - a name it cannot work out counts the whole module: `getattr`/`setattr`/`hasattr`/`delattr` with a name that is
+    not a written string, `globals()`, `locals()`, `vars()`, `dir()`, `eval`, `exec`, `inspect.getmembers`,
+    `.__dict__` or `sys.modules`, anywhere in the module or in the test's other inputs;
+  - a change to the module itself still picks every test that imports it.
+
+  The [trace check](#trace-check) measures it as it measures the rest. A glob that matches no tracked `.py` file
+  fails the step.
+
 - `import_roots`: folders searched for imports after the importing file's folder and the `sys.path` entries it can
   work out (code that loads from an install path that mirrors a repository folder).
 
 A change to the config itself, or to a workflow file (`.github/workflows/`), always runs every test.
+
+### Checking the config against the full run
+
+A project's own test that the config names exactly the files its full run runs can match more widely than the
+selector does (Python's `fnmatch` lets `*` cross a `/`), and `git ls-files` lists an unmerged file once per stage
+during a conflict. Use the selector's check instead, with its own matching and each tracked file once:
+
+```sh
+python3 -I fork-ci/actions/test-select/test_select.py --check-config --runs 'tests/test_*.py' --runs tools/check/test_install.py
+```
+
+`--runs` (repeat it) is what the full run runs: globs as above or paths. Exit 0 when the config's tests are exactly
+those files; 1, naming each file, when the full run runs one the config misses (no pull request would pick it) or
+the config names one the full run does not run. It also checks the rest of the config as a run would (an
+`always_run`, `inputs` or `follow_calls` glob that names nothing).
 
 ## What counts as an input
 
@@ -172,12 +207,35 @@ never as a pull request's gate:
 ```yaml
 trace-check:
   runs-on: ubuntu-latest # needs strace (sudo apt-get install -y strace) and ptrace of its own children
+  timeout-minutes: 120
   steps:
     - uses: actions/checkout@<sha>
-    - uses: scuttletoby/t3code/fork-ci/actions/test-select/trace@<release sha> # ci/vN
+    # Optional: skip when the last finished trace ran on this same commit. A read that fails runs the check and
+    # says why (the exit status and the start of gh's message, on one line: never a workflow command).
+    - id: last
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        if got=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/trace.yml/runs?status=success&per_page=1" \
+                   --jq '.workflow_runs[0].head_sha // ""' 2>&1); then
+          if [ "$got" = "$GITHUB_SHA" ]; then echo skip=true >> "$GITHUB_OUTPUT"; fi
+        else
+          rc=$?
+          echo "trace skip: cannot read the last run (exit $rc: $(printf '%s' "$got" | tr -s '\r\n' '  ' | cut -c1-200)); running the check"
+        fi
+    - id: trace
+      if: steps.last.outputs.skip != 'true'
+      uses: scuttletoby/t3code/fork-ci/actions/test-select/trace@<release sha> # ci/vN
       with:
         run: python3 -I -B {test} # how one test runs; {test} is its path, shell-quoted
         jobs: "2"
+    # Keep what finished when the run fails, times out or is cancelled.
+    - if: always() && steps.trace.outputs.report != ''
+      uses: actions/upload-artifact@<sha>
+      with:
+        name: trace-check
+        path: ${{ steps.trace.outputs.report }}
+        if-no-files-found: ignore
 ```
 
 It fails, never passes unchecked, when strace is missing, `--only` matches no test, a test's trace does not show its
@@ -185,7 +243,10 @@ own file read, or a test fails, errs or skips tests under the trace: what a test
 is reported `not checked` (and still judged by what it touched). Run it as the test job runs the tests: the same
 runner, environment variables and working directory, or tests that skip there skip here and fail the check. A test
 whose inputs run every test is reported and checked on. The last line gives the number of tests, misses and tests
-not checked. Not seen: folder listings (the files read after them
+not checked. Each test's lines print, and go to the `report` file (the action's output of that name), as soon as its
+trace ends. A cancelled or timed-out job (SIGTERM, SIGINT) kills every traced test's process group at once, so the
+step stops within seconds, and the run ends with `trace-check: cut off by ...` and fails: what finished stays in the
+report. Not seen: folder listings (the files read after them
 are), files read by a process the test did not start, and files git reads.
 
 ## What it saves

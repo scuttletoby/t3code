@@ -17,13 +17,26 @@ inputs:
     description: How many tests are traced at once.
     required: false
     default: "2"
+  report:
+    description: >-
+      A file each result line is also written to as soon as it is known, so a run that times out or is cancelled
+      keeps what finished (upload it with if: always()). Empty: trace-check.txt in the runner's temp folder.
+    required: false
+    default: ""
+outputs:
+  report:
+    description: The report file (written even when the run is cut off).
+    value: ${{ steps.trace.outputs.report }}
 runs:
   using: composite
   steps:
     # Runs only this release's script; the tests it traces are the caller's, run by the caller's own command.
-    - shell: bash
+    # A cancel or timeout stops every traced test at once (their process groups) and keeps the report so far.
+    - id: trace
+      shell: bash
       env:
         CONFIG: ${{ inputs.config }}
         RUN: ${{ inputs.run }}
         JOBS: ${{ inputs.jobs }}
-      run: python3 -I "$GITHUB_ACTION_PATH/../trace_check.py" --config "$CONFIG" --run "$RUN" --jobs "$JOBS"
+        REPORT: ${{ inputs.report }}
+      run: python3 -I "$GITHUB_ACTION_PATH/../trace_check.py" --config "$CONFIG" --run "$RUN" --jobs "$JOBS" --report "${REPORT:-$RUNNER_TEMP/trace-check.txt}"

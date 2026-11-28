@@ -850,6 +850,150 @@ class Declared(Repo):
                 self.select(rc=1)
 
 
+BIG = textwrap.dedent('''\
+    import os, subprocess, sys
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    def build_a():
+        return open(os.path.join(ROOT, 'build', 'a.gradle')).read()
+    def build_b():
+        return _b()
+    def _b():
+        return open(os.path.join(ROOT, 'build', 'b.gradle')).read()
+    def unused():
+        return open(os.path.join(ROOT, 'build', 'c.gradle')).read()
+    class Tool:
+        def run(self):
+            return open(os.path.join(ROOT, 'build', 'k.gradle')).read()
+    def register(f):
+        return f
+    @register
+    def hook():
+        return open(os.path.join(ROOT, 'build', 'd.gradle')).read()
+    def late():
+        return open(os.path.join(ROOT, 'build', 'late.gradle')).read()
+    def stage():
+        subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'stage.py')])
+''')
+USES_BIG = "sys.path.insert(0, os.path.join(ROOT, 'tools'))\n"
+GRADLE = {f'build/{n}.gradle': '' for n in ('a', 'b', 'c', 'd', 'k', 'late')}
+
+
+class FollowCalls(Repo):
+    """follow_calls: what a big shared module's top-level functions name counts only for the tests that can reach
+    them; anything it cannot work out counts the whole module."""
+    config = {**CONFIG, 'follow_calls': [{'glob': 'tools/big.py', 'why': 'most tool tests import it'}]}
+    tests = {'tests/test_a.py': py(USES_BIG + 'from big import build_a\nbuild_a()\n'),
+             'tests/test_b.py': py(USES_BIG + 'import big\nbig.build_b()\n')}
+
+    def setUp(self):
+        super().setUp()
+        self.write({CONFIG_PATH: json.dumps(self.config)})
+
+    def cases(self, base, cases):
+        for change, chosen in cases:
+            with self.subTest(change):
+                self.setUp()
+                self.assertEqual(self.picks({'tools/big.py': BIG, **GRADLE, **self.tests, **base}, {change: '# y\n'}),
+                                 chosen)
+
+    def test_a_file_only_reached_functions_name(self):
+        # Which tests does a change to a file one function of the module names pick? Those that reach the function.
+        self.cases({}, [('build/a.gradle', ['tests/test_a.py']), ('build/b.gradle', ['tests/test_b.py']),
+                        ('build/c.gradle', [])])
+
+    def test_the_module_itself_and_code_that_runs_on_import_pick_every_importer(self):
+        # Does a change to the module itself, or to what a class or a decorated def names, still pick every test?
+        both = ['tests/test_a.py', 'tests/test_b.py']
+        self.cases({}, [('tools/big.py', both), ('build/d.gradle', both), ('build/k.gradle', both)])
+
+    def test_without_follow_calls_every_importer_takes_in_everything(self):
+        self.write({CONFIG_PATH: json.dumps(CONFIG)})
+        self.assertEqual(self.picks({'tools/big.py': BIG, **GRADLE, **self.tests}, {'build/c.gradle': '# y\n'}),
+                         ['tests/test_a.py', 'tests/test_b.py'])
+
+    def test_a_name_in_a_string_or_a_script_reaches(self):   # mock.patch('big.unused'); python -c in a shell script
+        patch = "import big\nfrom unittest import mock\nmock.patch('big.unused')\n"
+        self.cases({'tests/test_m.py': py(USES_BIG + patch),
+                    'tests/test_s.py': py(USES_BIG + "import big\nimport subprocess\n"
+                                          "subprocess.run(['sh', os.path.join(ROOT, 'tools', 'run.sh')])\n"),
+                    'tools/run.sh': "python3 -c 'import big; big.unused()'\n"},
+                   [('build/c.gradle', ['tests/test_m.py', 'tests/test_s.py'])])
+
+    def test_what_a_reached_function_runs_can_reach_more(self):   # stage() runs tools/stage.py, which calls late()
+        stage = ('import os, sys\nsys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n'
+                 'import big\nbig.late()\n')
+        self.cases({'tests/test_c.py': py(USES_BIG + 'from big import stage\n'), 'tools/stage.py': stage},
+                   [('build/late.gradle', ['tests/test_c.py']), ('tools/stage.py', ['tests/test_c.py'])])
+
+    def test_a_name_it_cannot_work_out_counts_the_whole_module(self):
+        # getattr(big, name) in a test, or globals() in the module: any function can run, so all of them count.
+        self.cases({'tests/test_r.py': py(USES_BIG + "import big\ngetattr(big, os.environ['F'])()\n")},
+                   [('build/c.gradle', ['tests/test_r.py'])])
+        self.cases({'tools/big.py': BIG + 'def run(name):\n    return globals()[name]()\n'},
+                   [('build/c.gradle', ['tests/test_a.py', 'tests/test_b.py'])])
+
+    def test_a_followed_module_that_does_not_parse_runs_every_test(self):
+        self.runs_all({'tools/big.py': BIG, **GRADLE, **self.tests}, {'tools/big.py': 'def (\n'}, why='cannot parse')
+
+    def test_a_glob_that_names_no_python_file_fails_the_step(self):   # a renamed module must be renamed there too
+        for glob in ('tools/gone.py', 'README.md'):
+            with self.subTest(glob):
+                self.write({CONFIG_PATH: json.dumps({**CONFIG, 'follow_calls': [{'glob': glob, 'why': 'x'}]})})
+                self.base({})
+                self.select(rc=1)
+
+
+class CheckConfig(Repo):
+    """--check-config: do the config's tests name exactly what the full run runs, matched as the selector matches?"""
+    runs = ['tests/test_*.py', 'tools/sub/test_*.py', 'tests/test_*.sh']
+
+    def check(self, runs, config=None):
+        if config:
+            self.write({CONFIG_PATH: json.dumps(config)})
+        r = subprocess.run([sys.executable, '-I', SCRIPT, '--check-config', *[x for g in runs for x in ('--runs', g)]],
+                           cwd=self.d, capture_output=True, env={**os.environ, **ENV})
+        return r.returncode, r.stdout.decode() + r.stderr.decode()
+
+    def test_a_config_that_matches(self):
+        self.base({})
+        rc, out = self.check(self.runs)
+        self.assertEqual(rc, 0, out)
+        self.assertIn('config ok: its tests name the 3 files the full run runs', out)
+
+    def test_a_file_the_selector_would_miss(self):
+        # A pattern a wider matcher passes: fnmatch's 'tests/*.py' matches tests/sub/test_deep.py; the selector's
+        # (and so this check's) '*' stays inside one folder, so no pull request would ever pick that test.
+        self.base({'tests/sub/test_deep.py': ''})
+        rc, out = self.check(['tests/*.py', 'tests/sub/test_deep.py'], {'tests': ['tests/*.py']})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('tests/sub/test_deep.py: the full run runs it, but the config\'s tests do not name it', out)
+
+    def test_a_test_the_full_run_does_not_run(self):
+        self.base({})
+        rc, out = self.check(['tests/test_*.py'])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("tools/sub/test_sub.py: the config's tests name it, but the full run does not run it", out)
+
+    def test_an_unmerged_index(self):
+        # git ls-files lists a conflicted file once per stage (three times); the check sees each file once.
+        self.base({})
+        self.git('checkout', '-q', '-b', 'other')
+        self.commit('other', {'tests/test_plain.py': 'import os\n'})
+        self.git('checkout', '-q', 'main')
+        self.commit('main', {'tests/test_plain.py': 'import sys\n'})
+        subprocess.run(['git', 'merge', '-q', 'other'], cwd=self.d, capture_output=True, env={**os.environ, **ENV})
+        self.assertEqual(self.git('ls-files').splitlines().count('tests/test_plain.py'), 3)
+        rc, out = self.check(self.runs)
+        self.assertEqual(rc, 0, out)
+        self.assertIn('the 3 files the full run runs', out)
+
+    def test_it_needs_what_the_full_run_runs(self):
+        self.base({})
+        rc, out = self.check([])
+        self.assertEqual(rc, 1, out)
+        self.assertIn('--check-config needs --runs', out)
+
+
 class Config(Repo):
     def test_a_config_it_cannot_read_fails_the_step(self):   # no test list: red, never zero tests
         for text in ('{', '{"tests": []}', '{"tests": ["t"], "always": []}', '{"tests": ["t"], "always_all": ["x"]}',
