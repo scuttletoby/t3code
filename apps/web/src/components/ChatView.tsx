@@ -364,6 +364,7 @@ import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEn
 import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { useForkPlaytestItems } from "./fork/playtest/usePlaytestChipItems"; // Fork (playtest)
+import { useForkNoEffortItems } from "./fork/modelPolicy/useForkNoEffortItems"; // Fork (model policy)
 import { useForkHandoffWaitingItems } from "./fork/handoff/useForkHandoffWaitingItems"; // Fork (HO5)
 import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
 import { ComposerSurface } from "./chat/ComposerSurface";
@@ -2782,6 +2783,7 @@ export default function ChatView(props: ChatViewProps) {
       : null,
     messages,
   );
+  const forkNoEffortItems = useForkNoEffortItems(routeThreadRef); // Fork (model policy)
   const composerBannerItems = (() => {
     const fallbackSelection = draftFallback?.selection;
     const defaultSelection =
@@ -2864,6 +2866,7 @@ export default function ChatView(props: ChatViewProps) {
         ...forkPlaytestItems, // Fork (playtest)
         ...forkHandoffWaitingItems, // Fork (HO5)
         ...systemComposerBannerItems,
+        ...forkNoEffortItems, // Fork (model policy)
       ];
     }
     return [
@@ -2878,6 +2881,7 @@ export default function ChatView(props: ChatViewProps) {
       ...forkPlaytestItems, // Fork (playtest)
       ...forkHandoffWaitingItems, // Fork (HO5)
       ...systemComposerBannerItems,
+      ...forkNoEffortItems, // Fork (model policy)
       branchMismatchBannerItem(
         {
           mismatchKey: activeBranchMismatchKey,
