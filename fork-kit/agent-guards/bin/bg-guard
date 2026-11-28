@@ -4,7 +4,9 @@ Part of fork-kit/agent-guards (README.md there: install, settings entry, the mac
 
 Why: in some hosts (child threads, headless runs) the end of a background command never wakes the agent, so it
 stalls for hours (several agents did). This hook blocks such a stop once per try and tells the agent to wait in the
-foreground. At most maxBlocks blocks per session, so a deliberate leftover (a test server) never loops.
+foreground: t3_background_wait, or a loop on that command's PID (it names each PID), which poll-loop-guard lets
+through because the PID is in the agent's own process tree (tests/poll-loop.test.py, BgGuardAgrees, holds the two
+to that). At most maxBlocks blocks per session, so a deliberate leftover (a test server) never loops.
 
 General (any project, any Claude config dir). Settings, all optional (machine file, bgGuard):
   skipSessionsFiles  files with one session id per line (# comments): sessions never blocked (e.g. orchestrators
@@ -60,7 +62,8 @@ def claude_pid(start):
 
 
 def background_commands(root, mine):
-    """Bash tool commands still running under this claude process (children of it, not this hook's own chain)."""
+    """(pid, text) of the Bash tool commands still running under this claude process (children of it, not this
+    hook's own chain)."""
     out = []
     for d in os.listdir('/proc'):
         if not d.isdigit() or int(d) in mine or ppid(int(d)) != root:
@@ -68,7 +71,7 @@ def background_commands(root, mine):
         c = cmdline(int(d))
         if SNAPSHOT in c:
             i = c.rfind(" eval '")
-            out.append((c[i + 7:].split("' < /dev/null", 1)[0] if i >= 0 else c[-140:])[:140])
+            out.append((int(d), (c[i + 7:].split("' < /dev/null", 1)[0] if i >= 0 else c[-140:])[:140]))
     return out
 
 
@@ -121,11 +124,15 @@ def decide(data, c, start_pid):
         return None
     if not count_block(c, sid):
         return None
+    running.sort()
+    alive = ' || '.join(f'kill -0 {p} 2>/dev/null' for p, _ in running[:3])
     return {'decision': 'block', 'reason':
             'You are ending your turn while a command you started in the background is still running: '
-            + ' | '.join(running[:3])
-            + '. Its completion will NOT wake you, so you would stall. Wait for it in the foreground now '
-              '(a loop that checks its output file every 60 s, with a long timeout), then continue your task. '
+            + ' | '.join(f'PID {p}: {text}' for p, text in running[:3])
+            + '. Its completion will NOT wake you, so you would stall. Wait for it in the foreground now: '
+              't3_background_wait with its task id if you have that tool, else a Bash call with a long timeout '
+              f'(600000 ms): `while {alive}; do sleep 30; done` (again if it is still running '
+              'then). A wait on your own background job is not refused by poll-loop-guard. Then continue your task. '
               'If you really mean to leave it running (e.g. a test server) and something else will wake you, say so '
               'and stop again.'}
 

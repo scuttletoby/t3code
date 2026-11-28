@@ -22,12 +22,24 @@ condition counts), when it waits long; or a check after long top-level sleeps:
 Lets through: a retry loop (a command tried again after a sleep, with no check inside that loop, even when the same
 call reads a file before or after it), short waits (a loop of 1 s sleeps for a local server, a few rounds that stay
 under the limit), a sleep with no check after it, a counter test (`[ $n -lt 3 ]` is a bound, not a check), any
-command run in the background (`run_in_background`: the host wakes the agent when it ends), the Monitor tool (an
-until-condition there is the right way to wait for a file), and text that only names these (echo, a commit message,
-a heredoc into a file, a comment; a quoted "#1150" is no comment). Shell text handed on (`bash -c '..'`, `sh -c`,
+command run in the background (`run_in_background`: the host wakes the agent when it ends), and text that only names
+these (echo, a commit message, a heredoc into a file, a comment; a quoted "#1150" is no comment).
+Also lets through a wait on the agent's OWN background job, in the foreground too (bg-guard refuses to let the turn
+end while that job runs, and tells the agent to wait for it: the two must agree): a loop whose every check reads only
+that job, i.e. its output file (`<...>/<session id>/tasks/<task>.output`, Claude Code's file of a run_in_background
+command, found also through a variable: `f=<that file>; until [ -s "$f" ]; do sleep 20; done`) or a process in the
+agent's own process tree (`while kill -0 <pid>; do sleep 30; done`, `ps -p <pid>`, `[ -d /proc/<pid> ]`, or `$!` of
+a job the same command started). A wait on a process outside that tree, another session's file or anything else
+stays refused. And a Monitor: Claude Code runs a Monitor call's command through the Bash hooks with tool_name "Bash",
+so the guard looks the call's tool_use_id up in the transcript (its tail, for up to MONITOR_LOOK seconds, only when it
+found a wait: the line may be written just after the hook starts). A Monitor with an until-condition on a file or a
+process is the right way to wait (it streams, it is no model turn per check), so it passes; a Monitor that polls CI
+or a pull request is refused like a Bash loop. A call it cannot find there counts as Bash (refused as before). Shell text handed on (`bash -c '..'`, `sh -c`,
 `sudo -u x bash -c`, `eval`, `bash <<EOF`, `cat <<EOF | bash`) is read the same way.
 Known gaps (misses, on purpose: a false refusal costs more): a count it cannot read (`$(seq 1 $N)`, `[ $n -lt $MAX
-]`, C-style `for ((..))`) is one round; a script file it does not open; a loop built with a function.
+]`, C-style `for ((..))`) is one round; a script file it does not open; a loop built with a function. Its own-job
+test is narrow the other way (it refuses what it cannot tell is the agent's own): a PID from `$(cat x.pid)` or
+pgrep, a relative path, an option value it does not know (`stat -c %s`), a PID whose process already ended.
 Also refuses (foreground or background: F7, 107 calls in two weeks) a `pkill -f P`, `kill $(pgrep -f P)` or `pgrep -f
 P | xargs kill` whose pattern also matches this command's text: the host runs the command as `bash -c '<text>'`, so
 that shell's command line matches too, pkill spares only itself, and the shell dies (exit 143/144, nothing after it
@@ -36,7 +48,7 @@ Settings (machine file, pollLoop): enabled (default true), maxSleepSeconds (120)
 Fail open: a broken settings part, a lib that cannot load, broken input or its own error lets the command run, with
 one line saying so. Exit 2 (refuse) only answers a wait it found. Tests: fork-kit/agent-guards/tests/poll-loop.test.py
 """
-import json, math, os, re, shlex, sys
+import json, math, os, re, shlex, sys, time
 
 NAME = 'poll-loop-guard'
 DEFAULTS = {'enabled': True, 'maxSleepSeconds': 120, 'loopSleepSeconds': 5}
@@ -79,6 +91,15 @@ HEREDOC = re.compile(r'<<(-?)\s*(["\']?)([A-Za-z_][A-Za-z0-9_]*)\2')
 INTO_SHELL = re.compile(r'\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\b')
 COUNTER = re.compile(r'\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|[A-Za-z_][A-Za-z0-9_]*|-?\d+')
 DEPTH = 8
+OWN_BG = '\x00bg'            # `$!` after a `&` in the same command: a job this command starts itself
+NEUTRAL = {'/dev/null', '/dev/stdin', '-'}
+OWN_LIST = {'export', 'local', 'declare', 'readonly', 'typeset'}   # assignments as arguments
+VAR = re.compile(r'\$\{(!|[A-Za-z_][A-Za-z0-9_]*)\}|\$(!|[A-Za-z_][A-Za-z0-9_]*)')
+SESSION = re.compile(r'[A-Za-z0-9-]{8,128}')
+TOOL_USE_ID = re.compile(r'[A-Za-z0-9_-]{1,128}')
+MONITOR_LOOK = 1.5           # seconds to look for the tool_use line in the transcript (only when a wait was found)
+TRANSCRIPT_TAIL = 1 << 20    # bytes of the transcript's end that are read
+CLAUDE = 'claude'            # Claude Code's process name (as bg-guard)
 # pkill/pgrep (procps): the options that take a value (short, then long without "=")
 KILL_SHORT_VALUE = set('gGPstuUFrqOd')
 KILL_LONG_VALUE = {'--signal', '--group', '--parent', '--pgroup', '--session', '--terminal', '--euid', '--uid',
@@ -268,14 +289,88 @@ def substitutions(word):
     return out
 
 
+def _ppid(pid):
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            return int(f.read().rsplit(')', 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def _argv0(pid):
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            return os.path.basename(f.read().split(b'\0', 1)[0].decode(errors='replace'))
+    except OSError:
+        return ''
+
+
+def claude_pid(start):
+    """The Claude Code process above `start` (as bg-guard finds it), or 0."""
+    pid, n = start, 0
+    while pid > 1 and n < 64:
+        if _argv0(pid) == CLAUDE:
+            return pid
+        pid, n = _ppid(pid), n + 1
+    return 0
+
+
+class Own:
+    """What is the agent's own background job: a file in its session's tasks folder (Claude Code writes a
+    run_in_background command's output there), or a running process under its Claude Code process (not that process
+    itself). `pid` is a test of a PID (the hook's: the process tree in /proc); a session id that is empty or odd
+    makes no file its own."""
+
+    def __init__(self, session, pid=None):
+        self.session = session if isinstance(session, str) and SESSION.fullmatch(session) else ''
+        self._pid = pid if pid is not None else self._tree
+        self._root = None
+
+    def _tree(self, pid):
+        if self._root is None:
+            self._root = claude_pid(os.getppid())
+        if not self._root or pid <= 1 or pid == self._root:
+            return False
+        p, n = pid, 0
+        while p > 1 and n < 64:
+            p, n = _ppid(p), n + 1
+            if p == self._root:
+                return True
+        return False
+
+    def pid(self, n):
+        try:
+            return bool(self._pid(n))
+        except Exception:   # noqa: BLE001 - cannot tell: not its own
+            return False
+
+    def path(self, p):
+        if not p.startswith('/') or '$' in p or '`' in p:
+            return False
+        p = os.path.normpath(p)
+        m = re.fullmatch(r'/proc/(\d+)(?:/.*)?', p)
+        if m:
+            return self.pid(int(m.group(1)))
+        parts = p.split('/')
+        if not self.session:
+            return False
+        for i in range(len(parts) - 1):
+            if parts[i] == self.session and parts[i + 1] == 'tasks' and len(parts) <= i + 3:
+                return True
+        return False
+
+
 class Reading:
     """What one command does. A wait is a loop that both sleeps and checks inside the same loop (its condition
     counts), or a check after top-level sleeps. A check elsewhere in the command (an `ls` before a retry loop, a
     `cat` of its log after it) does not make a retry loop a wait."""
 
-    def __init__(self, settings, text=''):
+    def __init__(self, settings, text='', own=None):
         self.s = settings
         self.text = text       # the whole command: the shell that runs it has this on its command line
+        self.own = own         # an Own, or None: nothing is the agent's own job
+        self.vars = {}         # NAME -> its value as far as it is known (None: not known)
+        self.bg = False        # a `&` was seen: `$!` is a job of this command
         self.found = []        # (what it checks, why it is a wait, 'ci' or 'local')
         self.watch = []
         self.kills = []        # the pkill/pgrep calls that also kill the shell running them
@@ -301,6 +396,7 @@ class Reading:
                 i, at_cmd, piped = j + 2, False, False
                 continue
             if t in SEPARATORS:
+                self.bg = self.bg or (t == '&' and not (i and ts[i - 1] in ('>', '<')))   # not 2>&1
                 at_cmd, piped = True, t in ('|', '|&')
                 i += 1
                 continue
@@ -320,6 +416,8 @@ class Reading:
             if word in KEYWORDS or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', t, re.S):
                 for inner in substitutions(t):         # p="$(gh pr checks 5)"
                     self.read(inner, depth + 1)
+                if word not in KEYWORDS:
+                    self._assign(t)
                 i += 1
                 continue
             if word == '$' and i + 1 < len(ts) and ts[i + 1] == '(':
@@ -355,6 +453,90 @@ class Reading:
         while len(self.stack) > max(base, 1):
             self._close()
 
+    def _expand(self, word):
+        """The word with the variables it knows put in (`$!` after a `&`: OWN_BG); the others stay as written."""
+        def put(m):
+            name = m.group(1) or m.group(2)
+            if name == '!':
+                return OWN_BG if self.bg else m.group(0)
+            value = self.vars.get(name)
+            return m.group(0) if value is None else value
+        return VAR.sub(put, word)
+
+    def _assign(self, word):
+        name, _, value = word.partition('=')
+        self.vars[name] = None if '$(' in value or '`' in value else self._expand(value)
+
+    def _own_pid(self, word):
+        return word == OWN_BG or (word.isdigit() and self.own.pid(int(word)))
+
+    def _own_call(self, word, args):
+        """True when this check reads only the agent's own background job (Own): its output file, or a process
+        in its own tree. Anything it cannot tell (a PID from pgrep, a relative path, an option value it does not
+        know) is not its own, so the wait is judged as before."""
+        if self.own is None:
+            return False
+        ex, k = [], 0
+        while k < len(args):                     # without its redirections (`2>/dev/null`, `>out`)
+            a = args[k]
+            if a in ('<', '>', '>>', '<<'):
+                k += 2
+                continue
+            if len(a) == 1 and a.isdigit() and k + 1 < len(args) and args[k + 1] in ('<', '>', '>>'):   # 2>x
+                k += 1
+                continue
+            ex.append(self._expand(a))
+            k += 1
+        if word == 'kill':
+            pids = [a for a in ex if not a.startswith('-') and a != '0']
+            return bool(pids) and all(self._own_pid(a) for a in pids)
+        if word == 'ps':
+            pids, k = [], 0
+            while k < len(ex):
+                a = ex[k]
+                if a in ('-p', '--pid', '-q', '--quick-pid') and k + 1 < len(ex):
+                    pids += ex[k + 1].split(',')
+                    k += 1
+                elif re.fullmatch(r'--(?:quick-)?pid=.+', a):
+                    pids += a.partition('=')[2].split(',')
+                elif re.fullmatch(r'-[pq].+', a):
+                    pids += a[2:].split(',')
+                elif '/' in a:
+                    return False
+                k += 1
+            return bool(pids) and all(self._own_pid(p) for p in pids)
+        if word in ('pgrep', 'pidof', 'curl', 'wget'):
+            return False
+        if word in TESTS:
+            ops = [a for a in ex if not a.startswith('-') and a not in ('[', ']', ']]', '!', '=', '==', '!=')]
+            return bool(ops) and all(self.own.path(a) for a in ops)
+        if word == 'find':
+            roots = []
+            for a in ex:
+                if a.startswith(('-', '(', '!')):
+                    break
+                roots.append(a)
+            rest = ex[len(roots):]
+            return bool(roots) and all(self.own.path(a) for a in roots) and \
+                all(self.own.path(a) for a in rest if '/' in a)
+        # ls, stat and the readers: every word is an option, a number (`-n 1`), the pattern or filter (grep, rg,
+        # jq: the first other word), a file of its own, or /dev/null; at least one file of its own
+        own, first = False, word in ('grep', 'egrep', 'fgrep', 'rg', 'jq')
+        for a in ex:
+            if a.startswith('--pid='):           # tail --pid=<pid>
+                if not self._own_pid(a.partition('=')[2]):
+                    return False
+                own = True
+            elif a.startswith('-') or a.isdigit() or a in NEUTRAL:
+                continue
+            elif self.own.path(a):
+                own = True
+            elif first and '/' not in a and '$' not in a:
+                first = False
+            else:
+                return False
+        return own
+
     def _in_loop(self):
         return len(self.stack) > 1
 
@@ -365,6 +547,8 @@ class Reading:
             self.top_slept += amount
 
     def _check(self, kind, name):
+        if kind == 'own':      # a look at the agent's own background job: waiting for it is the way bg-guard asks
+            return
         if self._in_loop():
             self.stack[-1][kind].append(name)
         if self.top_slept > self.s['maxSleepSeconds']:
@@ -424,6 +608,10 @@ class Reading:
             if not args:
                 return
             word, args = os.path.basename(args[0]), args[1:]
+        if word in OWN_LIST:
+            for a in args:
+                if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', a, re.S):
+                    self._assign(a)
         prev, kills = self.prev, word == 'kill' and not {'-0', '-s0', '--signal=0'} & set(args)
         if word not in SHELLS and word not in ('eval', 'watch'):
             self.into_kill += kills                # kill $(pgrep -f x): that pgrep feeds a kill
@@ -476,23 +664,24 @@ class Reading:
             self._check('ci' if any('github.com' in a for a in args) else 'local', word)
         elif word == 'kill':
             if '-0' in args:
-                self._check('local', 'kill -0')
+                self._check('own' if self._own_call(word, args) else 'local', 'kill -0')
         elif word in TESTS:
             if any(a in FILE_TESTS for a in args):
-                self._check('local', word)
+                self._check('own' if self._own_call(word, args) else 'local', word)
             elif any(a in COUNTER_TESTS for a in args):
                 k = next(k for k, a in enumerate(args) if a in COUNTER_TESTS)
                 if k and k + 1 < len(args) and COUNTER.fullmatch(args[k - 1]) and COUNTER.fullmatch(args[k + 1]):
                     self._bound([args[k - 1], args[k + 1]])
         elif word in LOOKS or (word in READERS and not piped):
-            self._check('local', word)
+            self._check('own' if self._own_call(word, args) else 'local', word)
 
 
-def verdict(command, settings, background=False):
+def verdict(command, settings, background=False, own=None, monitor=False):
     """None, or (what it checks, why it counts as a wait, 'ci' or 'local'), or (the call, its pattern, 'kill') for a
     pkill/pgrep that kills its own shell. A background command is only checked for that (the host wakes the agent
-    when it ends, so a wait there is fine; a self-kill is not)."""
-    r = Reading(settings, command)
+    when it ends, so a wait there is fine; a self-kill is not). `own` (an Own): checks of the agent's own background
+    job are no wait. `monitor`: the command is a Monitor's, where only a wait on CI counts."""
+    r = Reading(settings, command, own)
     r.read(command)
     if r.kills:
         return r.kills[0][0], r.kills[0][1], 'kill'
@@ -500,9 +689,34 @@ def verdict(command, settings, background=False):
         return None
     if r.watch:
         return ', '.join(sorted(set(r.watch))), 'it waits for CI to finish', 'ci'
-    if not r.found:
+    found = [f for f in r.found if f[2] == 'ci'] if monitor else r.found
+    if not found:
         return None
-    return next((f for f in r.found if f[2] == 'ci'), r.found[0])
+    return next((f for f in found if f[2] == 'ci'), found[0])
+
+
+def tool_of(event, wait=MONITOR_LOOK):
+    """The name of the tool that made this call, from its tool_use line in the transcript (Claude Code runs a
+    Monitor's command through the Bash hooks as tool_name "Bash"), or None: no id, no transcript, or no line in its
+    last TRANSCRIPT_TAIL bytes within `wait` seconds (the line may be written just after the hook starts)."""
+    tid, path = event.get('tool_use_id'), event.get('transcript_path')
+    if not (isinstance(tid, str) and TOOL_USE_ID.fullmatch(tid) and isinstance(path, str) and path):
+        return None
+    rx = re.compile(rb'"id"\s*:\s*"' + re.escape(tid.encode()) + rb'"\s*,\s*"name"\s*:\s*"([A-Za-z0-9_.:-]{1,128})"')
+    end = time.monotonic() + wait
+    while True:
+        try:
+            with open(path, 'rb') as f:
+                size = os.fstat(f.fileno()).st_size
+                f.seek(max(0, size - TRANSCRIPT_TAIL))
+                m = rx.search(f.read(TRANSCRIPT_TAIL))
+            if m:
+                return m.group(1).decode()
+        except OSError:
+            pass
+        if time.monotonic() >= end:
+            return None
+        time.sleep(0.1)
 
 
 def reason(what, why, kind, settings):
@@ -515,7 +729,9 @@ def reason(what, why, kind, settings):
     way = ('To wait for CI or a pull request: push and stop (or watch_pull_request); you are told when it ends.'
            if kind == 'ci' else
            'To wait for a job, a file or a process: run the job with run_in_background and wait with '
-           't3_background_wait, or use Monitor with an until-condition; you are woken when it ends.')
+           't3_background_wait, or use Monitor with an until-condition; you are woken when it ends. A wait on your '
+           'own background job (its PID, `while kill -0 <pid>; do sleep 30; done`, or its tasks/<id>.output file) '
+           'is not refused.')
     return (f'Refused by {NAME}: this command waits by sleeping and checking again ({what}; {why}). Each new check '
             f'is a model turn that sends the whole context again, and the loop overshoots the end. {way} Not '
             'refused: a retry loop (a command tried again after a sleep, with no status check inside the loop), '
@@ -567,8 +783,11 @@ def main(argv=None):
         command = ti.get('command')
         if not isinstance(command, str):
             return 0
+        own = Own(event.get('session_id'))
         try:
-            found = verdict(command, settings, ti.get('run_in_background') is True)
+            found = verdict(command, settings, ti.get('run_in_background') is True, own)
+            if found and found[2] == 'local' and tool_of(event) == 'Monitor':
+                found = verdict(command, settings, False, own, monitor=True)
         except ValueError:   # text a shell reader cannot split (an open quote): not ours to judge
             return 0
     except BaseException as e:   # noqa: BLE001 - fail open: this guards a habit, not an attack

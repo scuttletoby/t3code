@@ -333,6 +333,224 @@ class Hook(unittest.TestCase):
         self.assertLess((time.perf_counter() - start) / (5 * len(cmds)), 0.5)
 
 
+SID = 'aaaaaaaa-1111-2222-3333-444444444444'      # this session
+OTHER = 'bbbbbbbb-1111-2222-3333-444444444444'    # another one
+TASKS = f'/tmp/claude-1000/-work-p/{SID}/tasks'
+MINE = 4242                                       # a PID in the agent's own process tree (a stand-in test)
+OWN = G.Own(SID, pid=lambda n: n == MINE)
+# the clash: bg-guard refuses to end the turn while these jobs run, so a wait on them must pass (the first two are
+# the shapes agents were refused on, 11-28)
+OWN_WAITS = [
+    f'f={TASKS}/b1bj9nwnj.output; for i in $(seq 1 19); do [ -s "$f" ] && break; sleep 30; done; cat "$f"',
+    f'D={TASKS}; timeout 290 bash -c "until [ -s $D/bkyuc0ftk.output ]; do sleep 5; done"; cat $D/bkyuc0ftk.output',
+    f'until [ -s {TASKS}/x.output ]; do sleep 20; done',
+    f'export F={TASKS}/x.output; until grep -q DONE "$F"; do sleep 20; done',
+    f'until tail -1 {TASKS}/x.output | grep -q ok; do sleep 20; done',
+    f'while ! jq -e .done {TASKS}/x.output >/dev/null; do sleep 30; done',
+    f'until test -s ${{T}}/x.output; do sleep 30; done'.replace('${T}', TASKS),
+    f'sleep 300; tail -5 {TASKS}/x.output',
+    f'while kill -0 {MINE} 2>/dev/null; do sleep 30; done',
+    f'while kill -0 {MINE} 2>&1 >/dev/null; do sleep 30; done',
+    f'P={MINE}; while kill -0 $P; do sleep 30; done',
+    f'while ps -p {MINE} >/dev/null; do sleep 30; done',
+    f'while [ -d /proc/{MINE} ]; do sleep 30; done',
+    'make & p=$!; while kill -0 $p; do sleep 10; done',
+    f'while kill -0 {MINE} 2>/dev/null || [ ! -s {TASKS}/x.output ]; do sleep 30; done',
+]
+# still refused with the agent's own jobs known: not its own, or CI beside its own
+NOT_OWN = [
+    f'until [ -s /tmp/claude-1000/-work-p/{OTHER}/tasks/x.output ]; do sleep 20; done',   # another session's
+    f'until [ -s {TASKS}/../../../../etc/x ]; do sleep 20; done',                         # out of the folder
+    f'until [ -s {TASKS}/sub/dir/x ]; do sleep 20; done',                                 # not a task file
+    f'until [ -s /work/{SID}/x.output ]; do sleep 20; done',                              # no tasks folder
+    f'while kill -0 {MINE + 1}; do sleep 30; done',                                       # not in its tree
+    'p=$!; while kill -0 $p; do sleep 10; done',                                          # no & in this command
+    'make 2>&1; p=$!; while kill -0 $p; do sleep 10; done',                               # 2>&1 is no &
+    f'until grep -q DONE {TASKS}/x.output /var/log/syslog; do sleep 20; done',            # and another file
+    f'until grep -q DONE {TASKS}/x.output || gh pr checks 1; do sleep 20; done',          # and CI
+    f'until [ -s {TASKS}/x.output ] && [ -f /work/done ]; do sleep 20; done',
+    'while pgrep -f vitest >/dev/null; do sleep 20; done',                                # pgrep: anyone's
+    f'until [ -s x.output ]; do sleep 20; done',                                          # relative
+    f'f=$(ls {TASKS}/*.output); until [ -s "$f" ]; do sleep 20; done',                    # a value not known
+    f'until [ -s "{TASKS}/$ID.output" ]; do sleep 20; done',
+    f'while kill -0 $(cat {TASKS}/x.pid); do sleep 30; done',
+]
+
+
+class OwnJob(unittest.TestCase):
+    """The clash (11-28): bg-guard refuses to end a turn while a background job of the agent runs, and this guard
+    refused every wait on that job but `timeout 590 tail --pid=..`. A wait whose every check reads only the agent's
+    own background job passes; anything else is judged as before."""
+
+    def test_a_wait_on_its_own_background_job_passes(self):
+        for cmd in OWN_WAITS:
+            with self.subTest(cmd):
+                self.assertIsNotNone(G.verdict(cmd, DEFAULTS), 'a wait at all')   # without knowing what is its own
+                self.assertIsNone(G.verdict(cmd, DEFAULTS, own=OWN))
+
+    def test_a_wait_on_anything_else_stays_refused(self):
+        for cmd in NOT_OWN + REFUSED:
+            with self.subTest(cmd):
+                self.assertIsNotNone(G.verdict(cmd, DEFAULTS, own=OWN))
+
+    def test_no_session_id_makes_no_file_its_own(self):
+        for sid in ('', 'x', None, 'a/b/c/d/e/f', '../../../tmp'):
+            with self.subTest(sid):
+                own = G.Own(sid, pid=lambda n: False)
+                self.assertFalse(own.path('/tmp/claude-1000/p//tasks/x.output'))
+                self.assertIsNotNone(G.verdict('until [ -s /tmp/c//tasks/x.output ]; do sleep 20; done', DEFAULTS,
+                                               own=own))
+
+    def test_a_pid_test_that_fails_is_not_its_own(self):
+        def boom(n):
+            raise OSError('gone')
+        self.assertIsNotNone(G.verdict(f'while kill -0 {MINE}; do sleep 30; done', DEFAULTS,
+                                       own=G.Own(SID, pid=boom)))
+
+    def test_the_refusal_names_the_own_job_way(self):
+        text = G.reason(*G.verdict('until test -f x; do sleep 10; done', DEFAULTS), DEFAULTS)
+        self.assertIn('own background job', text)
+        self.assertIn('kill -0 <pid>', text)
+
+    def test_its_process_tree_is_the_claude_one(self):
+        """The hook's own PID test, for real: a process under the stand-in Claude Code is its own; the test's own
+        process (above that Claude Code) and PID 1 are not."""
+        driver = ('import json, os, sys\nsys.path.insert(0, sys.argv[1])\nimport guards_fixture as fx\n'
+                  'g = fx.load_hook("poll-loop-guard")\no = g.Own("x" * 8)\n'
+                  'print(json.dumps([o.pid(int(a)) for a in sys.argv[2:]]))\n')
+        script = 'sleep 30 & "$@" $!; r=$?; kill $! 2>/dev/null; exit $r'
+        r = subprocess.run(['claude', '-c', script, 'claude', sys.executable, '-I', '-B', '-c', driver,
+                            os.path.dirname(os.path.abspath(__file__)), str(os.getpid()), '1'],
+                           executable='/bin/sh', capture_output=True, text=True, timeout=60, start_new_session=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), [False, False, True])
+
+
+def transcript(folder, tool_use_id, name, compact=True, junk=0):
+    """A transcript file whose last line is the assistant's tool_use of `name` with that id (after `junk` bytes)."""
+    path = os.path.join(folder, 'session.jsonl')
+    line = {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
+        {'type': 'tool_use', 'id': tool_use_id, 'name': name, 'input': {'command': 'x', 'description': 'd'}}]}}
+    with open(path, 'w') as f:
+        if junk:
+            f.write(json.dumps({'type': 'user', 'message': {'content': 'j' * junk}}) + '\n')
+        f.write(json.dumps(line, separators=(',', ':') if compact else None) + '\n')
+    return path
+
+
+class MonitorCalls(unittest.TestCase):
+    """Claude Code runs a Monitor's command through the Bash hooks as tool_name "Bash" (seen 11-28, 2.1.325: a
+    PreToolUse "Bash" hook got {"tool_name": "Bash", "tool_input": {"command", "description"}} for a Monitor call), so
+    a Monitor until-loop was refused as a Bash loop although the kit wires this guard for Bash only to let it pass.
+    The guard looks the call up in the transcript."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='poll-loop-monitor-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def event(self, cmd, path, tid='toolu_01Mon'):
+        return dict(bash(cmd), tool_use_id=tid, transcript_path=path)
+
+    def hook(self, event):
+        return subprocess.run([sys.executable, '-I', HOOK], input=json.dumps(event), capture_output=True, text=True,
+                              timeout=60)
+
+    def test_a_monitor_until_loop_on_a_file_passes_and_one_on_ci_is_refused(self):
+        for compact in (True, False):
+            with self.subTest(compact=compact):
+                path = transcript(self.tmp, 'toolu_01Mon', 'Monitor', compact)
+                for cmd in ('until [ -s /work/out ]; do sleep 20; done; cat /work/out',
+                            'until grep -q "idle alarm" /var/log/filler.log; do sleep 5; done'):
+                    r = self.hook(self.event(cmd, path))
+                    self.assertEqual((r.returncode, r.stdout, r.stderr), (0, '', ''), cmd)
+                for cmd in ('until gh pr checks 1; do sleep 60; done', 'gh run watch 9',
+                            'until [ -s /work/out ] && gh pr checks 1; do sleep 60; done'):
+                    r = self.hook(self.event(cmd, path))
+                    self.assertEqual(r.returncode, 2, cmd)
+                    self.assertIn('push and stop', r.stderr)
+
+    def test_a_bash_call_or_one_it_cannot_find_is_judged_as_bash(self):
+        cmd = 'until [ -s /work/out ]; do sleep 20; done'
+        bash_line = transcript(self.tmp, 'toolu_01Mon', 'Bash')
+        for name, ev in (('a Bash call', self.event(cmd, bash_line)),
+                         ('another id', self.event(cmd, bash_line, tid='toolu_other')),
+                         ('no transcript', self.event(cmd, os.path.join(self.tmp, 'none.jsonl'))),
+                         ('no id', dict(bash(cmd), transcript_path=bash_line)),
+                         ('an odd id', self.event(cmd, bash_line, tid='"x" .*')),
+                         ('a folder', self.event(cmd, self.tmp))):
+            with self.subTest(name):
+                start = time.monotonic()
+                r = self.hook(ev)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertLess(time.monotonic() - start, G.MONITOR_LOOK + 10)   # bounded (a slow runner: + 10 s)
+
+    def test_a_line_written_just_after_the_hook_starts_is_found(self):
+        path = os.path.join(self.tmp, 'late.jsonl')
+        open(path, 'w').close()
+        import threading
+        t = threading.Timer(0.3, lambda: transcript(self.tmp, 'toolu_late', 'Monitor') and
+                            os.replace(os.path.join(self.tmp, 'session.jsonl'), path))
+        t.start()
+        self.addCleanup(t.cancel)
+        self.assertEqual(G.tool_of({'tool_use_id': 'toolu_late', 'transcript_path': path}), 'Monitor')
+
+    def test_it_reads_only_the_end_of_a_big_transcript(self):
+        near = transcript(self.tmp, 'toolu_near', 'Monitor', junk=3 * G.TRANSCRIPT_TAIL)
+        self.assertEqual(G.tool_of({'tool_use_id': 'toolu_near', 'transcript_path': near}, wait=0), 'Monitor')
+        with open(near, 'a') as f:      # the line is now further from the end than the tail it reads
+            f.write(json.dumps({'type': 'user', 'message': {'content': 'k' * G.TRANSCRIPT_TAIL}}) + '\n')
+        with fx.bytes_read(G) as reads:
+            self.assertIsNone(G.tool_of({'tool_use_id': 'toolu_near', 'transcript_path': near}, wait=0))
+        self.assertLessEqual(sum(reads), G.TRANSCRIPT_TAIL)
+
+    def test_a_wait_tool_of_the_host_is_never_read(self):
+        for name in ('mcp__t3-code__t3_background_wait', 'Monitor', 'mcp__t3-code__watch_pull_request'):
+            with self.subTest(name):
+                r = self.hook({'hook_event_name': 'PreToolUse', 'tool_name': name,
+                               'tool_input': {'command': 'until test -f x; do sleep 10; done', 'taskId': 'b1'}})
+                self.assertEqual((r.returncode, r.stdout, r.stderr), (0, '', ''))
+
+
+class BgGuardAgrees(unittest.TestCase):
+    """The contract of the two guards, run for real under a stand-in Claude Code with a background Bash tool
+    command: bg-guard blocks the stop and names a wait; this guard lets exactly that wait through (and still refuses
+    the same loop on a process outside the agent's tree)."""
+
+    DRIVER = r"""import json, os, re, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+import guards_fixture as fx
+def hook(name, ev):
+    return subprocess.run([sys.executable, '-I', '-B', '-c', fx.RUNNER, fx.LIB, fx.NO_MACHINE, str(os.geteuid()),
+                           os.path.join(fx.BIN, name)], input=json.dumps(ev), capture_output=True, text=True,
+                          timeout=60)
+stop = hook('bg-guard', {'hook_event_name': 'Stop', 'session_id': 'agrees-1'})
+reason = json.loads(stop.stdout)['reason']
+wait = re.search(r'`(while [^`]+)`', reason).group(1)
+bash = lambda c: {'hook_event_name': 'PreToolUse', 'tool_name': 'Bash', 'session_id': 'agrees-1',
+                  'tool_input': {'command': c, 'timeout': 600000}}
+mine = hook('poll-loop-guard', bash(wait))
+other = hook('poll-loop-guard', bash(re.sub(r'kill -0 \d+', 'kill -0 %d' % int(sys.argv[2]), wait)))
+print(json.dumps({'reason': reason, 'wait': wait, 'mine': [mine.returncode, mine.stderr],
+                  'other': [other.returncode, other.stderr]}))
+"""
+
+    def test_the_wait_bg_guard_names_passes_this_guard(self):
+        tmp = tempfile.mkdtemp(prefix='poll-loop-agrees-')
+        self.addCleanup(shutil.rmtree, tmp, True)
+        script = ("sh -c 'sleep 30; true' shell-snapshots/snapshot-agrees >/dev/null 2>&1 & B=$!; "
+                  '"$@"; r=$?; kill $B 2>/dev/null; exit $r')
+        r = subprocess.run(['claude', '-c', script, 'claude', sys.executable, '-I', '-B', '-c', self.DRIVER,
+                            os.path.dirname(os.path.abspath(__file__)), str(os.getpid())],
+                           executable='/bin/sh', capture_output=True, text=True, timeout=120, start_new_session=True,
+                           env=dict(os.environ, HOME=tmp))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertIn('t3_background_wait', out['reason'])
+        self.assertRegex(out['wait'], r'^while kill -0 \d+ 2>/dev/null; do sleep 30; done$')
+        self.assertEqual(out['mine'], [0, ''], out['wait'])
+        self.assertEqual(out['other'][0], 2, out['other'])          # the test process is above that Claude Code
+
+
 class Configured(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='poll-loop-config-')
