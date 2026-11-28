@@ -1,6 +1,6 @@
 # agent-guards: Claude Code hooks that guard every agent on a machine
 
-Six Claude Code hooks and a lookup command. Each hook stops one mistake that agents made on a shared machine, at
+Nine Claude Code hooks and a lookup command. Each hook stops one mistake that agents made on a shared machine, at
 the moment they make it. A line in the agents' instructions did not stop any of them. The hooks are general: a project gives only its facts
 (file paths, a command name, a budget) in the machine file's `"agent-guards"` section.
 
@@ -17,6 +17,9 @@ Linux, Python 3 standard library only. One file per hook in [bin/](bin/), the sh
 | `bg-guard`              | Stop, 5 s                                                                                            | Ending a turn while a Bash command the agent started in the background still runs (the end of it may never wake the agent). At most `maxBlocks` times per session                                                                                                                                                                                                                                                                                                                            | Passes (exit 1, with a line)                                                                            |
 | `agent-slots`           | UserPromptSubmit and Stop, 5 s                                                                       | Only for the orchestrator sessions listed in `sessionsFile`: adds "agents alive, slots free, ready queue" as context; blocks a stop once while slots are free and the ready queue has items                                                                                                                                                                                                                                                                                                  | Passes (exit 1, with a line)                                                                            |
 | `facts-hook`            | SessionStart and PreCompact, 5 s                                                                     | Nothing; it adds context: at session start the things in the state tables for the session and "check the state table before diagnosing or redoing something" (`facts <words>`); before compaction, keep the things' names, not their rows. See [FACTS.md](FACTS.md)                                                                                                                                                                                                                          | Passes (exit 1, "the state tables are NOT shown")                                                       |
+| `poll-loop-guard`       | PreToolUse (`Bash`), 5 s                                                                             | A foreground loop that checks CI, a pull request, a file or a job and sleeps inside that same loop, too long (`while ! gh pr checks 12; do sleep 60; done`, `sleep 300; gh run view`, `gh run watch`, `watch -n 60 gh ...`); a retry loop with no check inside it passes; the reason names the wait tool that fits (CI: push and stop or `watch_pull_request`; a job or a file: `run_in_background` + `t3_background_wait`, or Monitor with an until-condition)                              | Passes (exit 1, "wait loops are NOT checked")                                                           |
+| `read-size-guard`       | PreToolUse (`Read`), 5 s                                                                             | A Read with no offset and no limit whose text (its first 2000 lines) is over `readSize.maxChars` characters; the reason says `grep -n`, then Read that range, or `allow_large: true` for a whole file that is really needed                                                                                                                                                                                                                                                                  | Passes (exit 1, "Read sizes are NOT checked")                                                           |
+| `batch-nudge`           | PostToolUse (`Read\|Grep\|Glob\|LS\|NotebookRead\|Bash`), 5 s                                        | Nothing; it adds one line of context after every `batchNudge.afterTurns` turns in a row that each made one read-only call: put the next independent reads in one call                                                                                                                                                                                                                                                                                                                        | Passes (exit 1, "no batching hint")                                                                     |
 
 How each hook answers is what Claude Code reads: PreToolUse refuses with exit 2 and the reason on stderr. PostToolUse
 and Stop block with `{"decision": "block", "reason": ...}` on stdout. UserPromptSubmit and SessionStart add `additionalContext`; PreCompact
@@ -27,7 +30,7 @@ its tests are.
 
 **Why one fails closed and the others open.** `actions-disable-guard` guards against a step that cannot be undone
 by an agent (Actions turned off on a repo). If it is gone or broken, refusing every Bash command is the safe answer,
-and the message says so. The other five guard mistakes or only add context. Refusing every call because a helper is gone would stop all
+and the message says so. The other eight guard mistakes or only add context. Refusing every call because a helper is gone would stop all
 work on the machine. The settings entry does both (`agent-guards hooks` prints it):
 
 ```sh
@@ -135,30 +138,45 @@ once, once from each hook that has a problem in its part (`actionsDisable` and `
 `memoryIndex` after it). A broken or unknown part of another hook changes nothing for it. `agent-guards self-check`
 checks the whole section strictly and names every problem.
 
-| Key                            | Default                                | What it is                                                                                                                                            |
-| ------------------------------ | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `actionsDisable.stateDir`      | `~/.local/state/actions-disable-guard` | The refusal log (`log`) and a parse cache                                                                                                             |
-| `actionsDisable.refuseScripts` | `[]`                                   | `{"name": "garden.py", "flag": "--fix", "why": "..."}`: also refuse running that script with that flag (a project's own tool that disables workflows) |
-| `capacityPipe.commands`        | `["t3-capacity"]`                      | The capacity checks: commands that answer OK (exit 0) or NOT OK (exit 1)                                                                              |
-| `memoryIndex.maxChars`         | `6000`                                 | Characters in the whole index at most                                                                                                                 |
-| `memoryIndex.maxLine`          | `160`                                  | Characters in one line at most                                                                                                                        |
-| `memoryIndex.stateDir`         | `~/.cache/memory-index-guard`          | One file per session: the index as last seen                                                                                                          |
-| `bgGuard.skipSessionsFiles`    | `[]`                                   | Files of session ids (one per line, `#` comments) that are never blocked, such as orchestrators that are woken another way                            |
-| `bgGuard.maxBlocks`            | `3`                                    | Blocks per session at most, so a background job left on purpose never loops                                                                           |
-| `bgGuard.stateDir`             | `~/.local/state/bg-guard`              | One block count per session (raised under a lock)                                                                                                     |
-| `agentSlots.sessionsFile`      | `""` (the hook does nothing)           | The orchestrator session ids it acts for                                                                                                              |
-| `agentSlots.queue`             | `""`                                   | A markdown file; the ready list is the `- ` lines under `readyHeading`                                                                                |
-| `agentSlots.readyHeading`      | `"## Ready"`                           |                                                                                                                                                       |
-| `agentSlots.maxAlive`          | `10`                                   | Agent processes at most                                                                                                                               |
-| `agentSlots.processName`       | `"claude"`                             | The process name that is counted                                                                                                                      |
-| `agentSlots.note`              | `""`                                   | Extra text for the context line (a build-agent limit, say)                                                                                            |
-| `facts.dirs`                   | `[]`                                   | State tables for every session: a table file, or a folder whose `STATE.md` is the table ([FACTS.md](FACTS.md))                                        |
-| `facts.projects`               | `[]`                                   | `{"match", "dirs", "text", "name"}`: more tables for one project (`match`: its remote as `host/owner/repo`, or a folder; `name`: its record folder)   |
-| `facts.staleDays`              | `30`                                   | `facts --check` reports a row whose `Updated` is older                                                                                                |
-| `facts.maxRows`                | `60`                                   | `facts --check` reports a table with more rows                                                                                                        |
-| `facts.indexLines`             | `40`                                   | Things the session-start context shows at most                                                                                                        |
-| `facts.indexChars`             | `4000`                                 | Characters of the whole session-start context at most                                                                                                 |
-| `facts.records`                | `[]`                                   | `{"path", "projectsDir", "shared"}`: record repos that `facts <words>` searches after the tables ([FACTS.md](FACTS.md))                               |
+The three speed hooks (`poll-loop-guard`, `read-size-guard`, `batch-nudge`, #1150) are stricter: they guard speed,
+not safety, so a part of theirs that cannot be used as written turns that hook off (it lets every call through, and
+says so the same loud way, once a session for each hook, #1151), and so does a lib that cannot load. A machine file from before them (no `pollLoop`,
+`readSize` or `batchNudge` part) gives their defaults, with the hooks on.
+
+| Key                            | Default                                          | What it is                                                                                                                                            |
+| ------------------------------ | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `actionsDisable.stateDir`      | `~/.local/state/actions-disable-guard`           | The refusal log (`log`) and a parse cache                                                                                                             |
+| `actionsDisable.refuseScripts` | `[]`                                             | `{"name": "garden.py", "flag": "--fix", "why": "..."}`: also refuse running that script with that flag (a project's own tool that disables workflows) |
+| `capacityPipe.commands`        | `["t3-capacity"]`                                | The capacity checks: commands that answer OK (exit 0) or NOT OK (exit 1)                                                                              |
+| `memoryIndex.maxChars`         | `6000`                                           | Characters in the whole index at most                                                                                                                 |
+| `memoryIndex.maxLine`          | `160`                                            | Characters in one line at most                                                                                                                        |
+| `memoryIndex.stateDir`         | `~/.cache/memory-index-guard`                    | One file per session: the index as last seen                                                                                                          |
+| `bgGuard.skipSessionsFiles`    | `[]`                                             | Files of session ids (one per line, `#` comments) that are never blocked, such as orchestrators that are woken another way                            |
+| `bgGuard.maxBlocks`            | `3`                                              | Blocks per session at most, so a background job left on purpose never loops                                                                           |
+| `bgGuard.stateDir`             | `~/.local/state/bg-guard`                        | One block count per session (raised under a lock)                                                                                                     |
+| `agentSlots.sessionsFile`      | `""` (the hook does nothing)                     | The orchestrator session ids it acts for                                                                                                              |
+| `agentSlots.queue`             | `""`                                             | A markdown file; the ready list is the `- ` lines under `readyHeading`                                                                                |
+| `agentSlots.readyHeading`      | `"## Ready"`                                     |                                                                                                                                                       |
+| `agentSlots.maxAlive`          | `10`                                             | Agent processes at most                                                                                                                               |
+| `agentSlots.processName`       | `"claude"`                                       | The process name that is counted                                                                                                                      |
+| `agentSlots.note`              | `""`                                             | Extra text for the context line (a build-agent limit, say)                                                                                            |
+| `facts.dirs`                   | `[]`                                             | State tables for every session: a table file, or a folder whose `STATE.md` is the table ([FACTS.md](FACTS.md))                                        |
+| `facts.projects`               | `[]`                                             | `{"match", "dirs", "text", "name"}`: more tables for one project (`match`: its remote as `host/owner/repo`, or a folder; `name`: its record folder)   |
+| `facts.staleDays`              | `30`                                             | `facts --check` reports a row whose `Updated` is older                                                                                                |
+| `facts.maxRows`                | `60`                                             | `facts --check` reports a table with more rows                                                                                                        |
+| `facts.indexLines`             | `40`                                             | Things the session-start context shows at most                                                                                                        |
+| `facts.indexChars`             | `4000`                                           | Characters of the whole session-start context at most                                                                                                 |
+| `facts.records`                | `[]`                                             | `{"path", "projectsDir", "shared"}`: record repos that `facts <words>` searches after the tables ([FACTS.md](FACTS.md))                               |
+| `pollLoop.enabled`             | `true`                                           | `false` turns `poll-loop-guard` off                                                                                                                   |
+| `pollLoop.maxSleepSeconds`     | `120`                                            | A command with a check whose sleeps add up to more is refused                                                                                         |
+| `pollLoop.loopSleepSeconds`    | `5`                                              | A `while`/`until` loop with a check that sleeps this long a round, or longer, is refused (a CI check: any sleep)                                      |
+| `readSize.enabled`             | `true`                                           | `false` turns `read-size-guard` off                                                                                                                   |
+| `readSize.maxChars`            | `20000`                                          | Characters a whole-file Read may return at most                                                                                                       |
+| `batchNudge.enabled`           | `true`                                           | `false` turns `batch-nudge` off                                                                                                                       |
+| `batchNudge.afterTurns`        | `3`                                              | The hint comes after this many one-read turns in a row, and again after every this many more                                                          |
+| `batchNudge.tailBytes`         | `1048576`                                        | Bytes at the end of the session's transcript it reads                                                                                                 |
+| `batchNudge.readOnlyTools`     | `["Read", "Grep", "Glob", "LS", "NotebookRead"]` | Tools whose call counts as a quick read                                                                                                               |
+| `batchNudge.readOnlyCommands`  | `cat`, `grep`, `sed`, `git`, ... (config.py)     | Bash commands that only read (no redirection to a file, no `sed -i`, no `find -delete`; git only with a read subcommand)                              |
 
 Paths are absolute or start with `~/` (the home of the user the hook runs as). An example is in
 [machine.example.json](../common/machine.example.json).
@@ -166,7 +184,7 @@ Paths are absolute or start with `~/` (the home of the user the hook runs as). A
 **State and logs.** Each hook keeps going when its state folder or log cannot be written (a full disk, a folder
 that is not writable): the answer never depends on it. `memory-index-guard` writes its state whole (a temporary
 file, then a rename). `bg-guard` counts under a lock, so two Stop hooks at once count two blocks.
-`actions-disable-guard` appends one line per refusal. `agent-slots` and `facts-hook` write nothing.
+`actions-disable-guard` appends one line per refusal. `agent-slots` and `facts-hook` write nothing; the three speed hooks write only an empty marker file per session in `~/.cache/agent-guards/notices` when the machine file is broken (so they say it once; kept 7 days).
 
 ## Install
 
@@ -228,7 +246,10 @@ what it names: root-owned, not writable by group or others, no link on the way.
 
 Everything in this kit is general. What a project or a machine adds is only its facts in the machine file: the
 capacity command's name, the memory budget, the orchestrator's session file and queue, a script of its own that
-must not run with a given flag, and where its state tables are. The tables themselves live with the machine or the
+must not run with a given flag, and where its state tables are. The speed hooks' limits (how long a wait, how
+big a Read, how many one-read turns) are machine settings with general defaults; the wait tools their messages name
+(`t3_background_wait`, `watch_pull_request`) are the host's, with Claude Code's own Monitor and `run_in_background`
+beside them. The tables themselves live with the machine or the
 project they describe, never in the kit. Nothing in the hooks names a project, a person or a path of one machine.
 
 ## Tests
