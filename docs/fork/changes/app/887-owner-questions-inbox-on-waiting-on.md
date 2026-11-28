@@ -1,0 +1,5 @@
+- Change: Owner questions, the Inbox: on Waiting on you, each question shows its recommendation (the body's `Recommendation:` line) and an answer box. **Post answer** posts the comment `Owner decision: ...` through upstream's issue comment call, as the account the server signs in with, then takes the rule's label off (only after the comment is posted). Only a person's click posts; agents get no new tool.
+- Why: The owner answers every owner question in one place inside T3.
+- Setting: `client.ownerQuestionsPage`
+- Default: on (owner decision)
+- PR: [#887](https://github.com/scuttletoby/t3code/issues/887), [#829](https://github.com/scuttletoby/t3code/issues/829)
