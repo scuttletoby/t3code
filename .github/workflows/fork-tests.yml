@@ -117,8 +117,10 @@ jobs:
       test_server: ${{ steps.release.outputs.test_server || steps.fork_only.outputs.test_server || steps.detect.outputs.test_server }}
       rust: ${{ steps.release.outputs.rust || steps.fork_only.outputs.rust || steps.detect.outputs.rust }}
       release_smoke: ${{ steps.release.outputs.release_smoke || steps.fork_only.outputs.release_smoke || steps.detect.outputs.release_smoke }}
-      mobile_native: ${{ steps.release.outputs.mobile_native || steps.fork_only.outputs.mobile_native || steps.fork.outputs.mobile_native }}
-      # 'true' only on a pull request whose every changed path is fork-owned (the `fork_only` step).
+      # The `fork` step takes the fork_only step's answer (else the detector's) and adds the fork's own rule.
+      mobile_native: ${{ steps.release.outputs.mobile_native || steps.fork.outputs.mobile_native }}
+      # 'true' only on a pull request whose every changed path is fork-owned (the `fork_only` step); its
+      # gates also come first on a pull request with only some paths fork-owned (those are left out).
       fork_only: ${{ steps.fork_only.outputs.fork_only || 'false' }}
       # Where each Linux job runs (the `route` step; empty in a release run, which is GitHub-hosted).
       runners: ${{ steps.route.outputs.runners }}
@@ -153,28 +155,30 @@ jobs:
         if: inputs.ref == ''
         uses: ./.github/actions/ci-changes
 
+      # A pull request that changes only fork-owned paths (.github/fork-owned-paths.txt: fork-ci/, fork-kit/, the
+      # fork's own .github scripts) skips the app jobs: its gates are upstream's detector's answer for a change with
+      # no path left, all false. One that changes some fork-owned paths gets the detector's answer for the other
+      # paths alone (no app job reads a fork-owned path, and the detector runs every job for a path it does not
+      # know). Anything unclear keeps the detector's answer (.github/scripts/fork-owned-paths.cjs).
+      # Pull requests into main only (a stacked one compares with its parent; a retarget starts no new run).
+      - name: Fork-only pull request
+        id: fork_only
+        if: inputs.ref == '' && github.event_name == 'pull_request' && github.base_ref == github.event.repository.default_branch
+        run: node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT"
+
       # ci-changes.cjs runs the macOS lint when upstream's ci.yml changes; the
-      # fork's copy of it counts the same.
+      # fork's copy of it counts the same. Starts from the fork_only step's answer when it gave one.
       - name: Fork workflow changes run the macOS lint
         id: fork
         if: inputs.ref == ''
         env:
-          DETECTED: ${{ steps.detect.outputs.mobile_native }}
+          DETECTED: ${{ steps.fork_only.outputs.mobile_native || steps.detect.outputs.mobile_native }}
         run: |
           value="$DETECTED"
           if grep -qxE '\.github/workflows/fork-tests\.yml' "$RUNNER_TEMP/changed-paths" 2>/dev/null; then
             value=true
           fi
           echo "mobile_native=$value" >> "$GITHUB_OUTPUT"
-
-      # A pull request that changes only fork-owned paths (.github/fork-owned-paths.txt: fork-ci/, fork-kit/, the
-      # fork's own .github scripts) skips the app jobs: its gates are upstream's detector's answer for a change with
-      # no path left, all false. Anything unclear keeps the detector's answer (.github/scripts/fork-owned-paths.cjs).
-      # Pull requests into main only (a stacked one compares with its parent; a retarget starts no new run).
-      - name: Fork-only pull request
-        id: fork_only
-        if: inputs.ref == '' && github.event_name == 'pull_request' && github.base_ref == github.event.repository.default_branch
-        run: node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT"
 
       # A branch name is resolved once, here: jobs start minutes apart, and a
       # branch that moves in between would otherwise test two commits in one run.
@@ -223,7 +227,7 @@ jobs:
           FLEET_MODE: ${{ vars.CI_RUNNERS }}
           FLEET_BEACON_PC: ${{ vars.FLEET_BEACON_PC }}
           FLEET_BEACON_VM: ${{ vars.FLEET_BEACON_VM }}
-          GATES: ${{ steps.fork_only.outputs.fork_only == 'true' && toJSON(steps.fork_only.outputs) || toJSON(steps.detect.outputs) }}
+          GATES: ${{ steps.fork_only.outputs.typecheck && toJSON(steps.fork_only.outputs) || toJSON(steps.detect.outputs) }}
         run: python3 -I .github/scripts/fork-fleet.py route
 
   # A fleet job that waits too long for its runner cancels the run with an
@@ -336,6 +340,8 @@ jobs:
       # policy reads the same effort ids, same test); packages/shared/src/capacity/: the capacity rule's one
       # source, which the heavy kit's evaluator and its tests read and heavy-install copies
       # (fork-kit/heavy/tests/capacity_rule.test.py, facts.test.py, install.test.py); keep the lists in step.
+      # The workspace files (pnpm-workspace.yaml, the package.json files) are what fork-owned-paths.cjs narrows a
+      # partly fork-owned change with, as in `changes`; fork-owned-paths.test.py runs it here.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -399,6 +405,10 @@ jobs:
             /packages/shared/src/cliRelease.ts
             /packages/shared/src/model.ts
             /packages/ssh/src/tunnel.ts
+            /pnpm-workspace.yaml
+            /*/package.json
+            /*/*/package.json
+            !/.repos/
           sparse-checkout-cone-mode: false
 
       # Pinned release, verified by checksum. Upstream's own workflows use runner
@@ -608,6 +618,9 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.changes.outputs.sha }}
+          # Two commits: on a pull request, the merge commit and its base, so fork-ci-tests.cjs can see which files
+          # the pull request changes (a weight note on a test it did not touch only warns).
+          fetch-depth: 2
           sparse-checkout: |
             /.github/
             /docs/fork/
@@ -1291,7 +1304,7 @@ jobs:
   test_server:
     name: Test Server ${{ matrix.shard }}
     needs: changes
-    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (needs.changes.outputs.fork_only != 'true') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test_server != 'false') }}
     # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
     runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][0], fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 20
@@ -1319,20 +1332,7 @@ jobs:
         timeout-minutes: 1
         run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
-      - name: Detect affected jobs
-        id: changes
-        if: inputs.ref == ''
-        uses: ./.github/actions/ci-changes
-
-      - name: Report skip
-        if: steps.changes.outputs.test_server == 'false'
-        run: |
-          msg="Skipped: upstream's change detector found no change that affects t3 (apps/server)."
-          echo "::notice title=Test Server ${{ matrix.shard }} skipped::$msg"
-          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Setup Vite+
-        if: steps.changes.outputs.test_server != 'false'
         uses: ./.github/actions/setup-ci-deps
         with:
           # Lint saves the pnpm store; the others only restore it.
@@ -1343,7 +1343,6 @@ jobs:
       # fingerprints each task's inputs, so a restored entry only replays a
       # task whose inputs are unchanged. A new lockfile starts a fresh cache.
       - name: Cache vp tasks
-        if: steps.changes.outputs.test_server != 'false'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: node_modules/.vite/task-cache
@@ -1352,23 +1351,20 @@ jobs:
 
       - name: Resolve Playwright version
         id: playwright_version
-        if: steps.changes.outputs.test_server != 'false'
         run: echo "version=$(node -p "require('./apps/server/node_modules/playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: Cache Chromium
         id: chromium_cache
-        if: steps.changes.outputs.test_server != 'false'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-shell-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright_version.outputs.version }}
 
       - name: Install Chromium for server browser integration tests
-        if: steps.changes.outputs.test_server != 'false' && steps.chromium_cache.outputs.cache-hit != 'true'
+        if: steps.chromium_cache.outputs.cache-hit != 'true'
         run: node apps/server/node_modules/playwright-core/cli.js install --only-shell chromium
 
       - name: Install missing Chromium system dependencies
-        if: steps.changes.outputs.test_server != 'false'
         run: |
           browser=$(find "$HOME/.cache/ms-playwright" -name chrome-headless-shell -type f -print -quit)
           test -n "$browser"
@@ -1379,7 +1375,6 @@ jobs:
       # As upstream: Vitest's module cache, saved only by pushes to main so
       # pull requests never evict each other's entries.
       - name: Restore Vitest module cache
-        if: steps.changes.outputs.test_server != 'false'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: node_modules/.vitest-cache
@@ -1387,7 +1382,6 @@ jobs:
           restore-keys: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
 
       - name: Test
-        if: steps.changes.outputs.test_server != 'false'
         env:
           T3CODE_TRANSFER_BUDGET_REPORT_PATH: ${{ runner.temp }}/t3code-transfer-budget.md
           T3CODE_TRANSFER_BUDGET_RESULT_PATH: ${{ runner.temp }}/thread-transfer-result.json
@@ -1400,7 +1394,7 @@ jobs:
           --verify-hits 1 apps/server
 
       - name: Save Vitest module cache
-        if: github.event_name == 'push' && steps.changes.outputs.test_server != 'false'
+        if: github.event_name == 'push'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: node_modules/.vitest-cache
@@ -1623,7 +1617,7 @@ jobs:
             build: "the change affects neither desktop, server nor web, and no package needs a typecheck",
             test: "the change affects no package this job tests",
             test_web: "the change affects nothing @t3tools/web depends on",
-            test_server: "fork-only pull request: every changed path is fork-owned",
+            test_server: "the change affects nothing t3 (apps/server) depends on",
             rust: "the change touches none of the native Rust crates",
             mobile_native_static_analysis: (if $release == "true"
               then "release run: upstream release.yml has no macOS lint"
@@ -1645,9 +1639,6 @@ jobs:
             if [[ "$(echo "$RESULTS" | jq -r '.changes.outputs.fork_only')" == true ]]; then
               echo
               echo "Fork-only pull request: every changed path is fork-owned (.github/fork-owned-paths.txt), so the app jobs were skipped."
-            elif [[ "$(echo "$RESULTS" | jq -r '.changes.outputs.test_server')" == false ]]; then
-              echo
-              echo "Server shards passed without running tests: the change affects nothing t3 (apps/server) depends on."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           # An outside pull request fails here whatever the other jobs did.

@@ -305,6 +305,38 @@ function weightNote(file, weight, seconds, speed = 1) {
     : null;
 }
 
+// The paths a pull request changes, from GitHub's merge commit (its first parent is the base, so HEAD^1..HEAD is the
+// change), or null: not a pull_request run, or the change cannot be read (a checkout without the parents). Null keeps
+// every weight note an error.
+function prChanges(env = process.env, git = gitHere) {
+  if (env.GITHUB_EVENT_NAME !== "pull_request") return null;
+  try {
+    git(["rev-parse", "--verify", "--quiet", "HEAD^2^{commit}"]);
+    return git(["diff", "--name-only", "--no-renames", "-z", "HEAD^1", "HEAD"])
+      .split("\0")
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+function gitHere(args) {
+  return childProcess.execFileSync("git", ["-c", "core.quotePath=false", ...args], {
+    cwd: ROOT,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+// Whether a test's weight note only warns: on a pull request (`changes`, prChanges()) that changes neither the test
+// nor the list. A slow runner can push a test the pull request never touched over its weight; that is no reason to
+// hold the pull request. Pushes to main and release runs (changes null) still fail on it, and so does a pull request
+// that changes the test or the weights, which is where the weight gets fixed.
+function weightOnlyWarns(file, changes) {
+  return Array.isArray(changes) && !changes.includes(file) && !changes.includes(LIST);
+}
+
 // One shard's results: its failed tests, the passed ones whose weight must change (weightNote(), at the runner's
 // speed) and that speed. A failed test's time says nothing about its usual one: it gets no weight note.
 function judge(runs, weights) {
@@ -1077,10 +1109,11 @@ async function runOwn(args, { runTest: run = runTest } = {}) {
   if (failed) process.exitCode = 1;
 }
 
-// `runTest` and `now` are the real ones unless a test hands in fakes (a shard's time, its slow warning).
+// `runTest`, `now` and `changes` are the real ones unless a test hands in fakes (a shard's time, its slow warning, the
+// paths a pull request changes).
 async function main(
   parts = process.argv.slice(2),
-  { runTest: run = runTest, now = Date.now } = {},
+  { runTest: run = runTest, now = Date.now, changes: readChanges = prChanges } = {},
 ) {
   if (parts[0] === "--run") return runOwn(parts.slice(1), { runTest: run });
   const to = recordsTo();
@@ -1116,7 +1149,9 @@ async function main(
   const judged = judge(runs, weight);
   const { speed } = judged;
   const stale = judged.stale.map(({ note }) => note);
-  failed += judged.failed.length + stale.length;
+  const changes = judged.stale.length ? readChanges() : null;
+  const warned = judged.stale.filter(({ file }) => weightOnlyWarns(file, changes));
+  failed += judged.failed.length + stale.length - warned.length;
   if (to) {
     const format = new Map(entries.map((entry) => [entry.file, entry.format]));
     const records = runs.map((r) =>
@@ -1144,7 +1179,12 @@ async function main(
     });
   }
   for (const { file, note } of judged.stale)
-    console.log(`::error file=${file}::${note} in ${LIST}`);
+    console.log(
+      warned.some((each) => each.file === file)
+        ? `::warning file=${file}::${note} in ${LIST} (a warning only: this pull request changes neither ` +
+            `the test nor ${LIST}; a push to main still fails on it)`
+        : `::error file=${file}::${note} in ${LIST}`,
+    );
   const slow = slowNote(mine, weight, jobs, seconds);
   if (slow) console.log(`::warning::${slow}`);
   for (const run of runs) {
@@ -1221,6 +1261,8 @@ module.exports = {
   runSpeed,
   weightNote,
   judge,
+  prChanges,
+  weightOnlyWarns,
   expectedSeconds,
   slowNote,
   findTests,
