@@ -5,7 +5,7 @@ No root, no systemd, no network.
 """
 # CI's checkout is shallow without tags, so the test that runs an older release's installer skips there (it runs locally):
 # fork-ci: may skip Install.test_older_installers_install_and_uninstall_keep_the_hosts_t3_capacity
-import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, unittest
+import contextlib, importlib.machinery, importlib.util, io, json, os, re, shutil, subprocess, sys, tempfile, unittest
 
 OLDER_RELEASE = 'ci/v22'   # a released installer from before the t3-capacity link (its uninstall is run below)
 
@@ -619,6 +619,38 @@ class Install(unittest.TestCase):
         self.m.ROOT_UID = os.geteuid() + 1
         self.assertEqual(self.install()[0], 1)
         self.assertEqual(self.run_main('uninstall')[0], 1)
+
+
+class Bootstrap(unittest.TestCase):
+    """bootstrap.sh hands each installer option to heavy-install. Run as a normal user it stops at "run this as root",
+    after reading its options, so these runs need no root and no network."""
+    BOOTSTRAP = os.path.join(KIT, 'bootstrap.sh')
+
+    def run_bootstrap(self, *args):
+        return subprocess.run(['sh', self.BOOTSTRAP, '--repo', 'o/fork', '--sha', SHA1, *args], capture_output=True,
+                              text=True, timeout=60)
+
+    @unittest.skipIf(os.geteuid() == 0, 'as root the bootstrap goes on to the network')
+    def test_every_installer_option_reaches_the_installer(self):
+        usage = subprocess.run([sys.executable, '-I', '-B', os.path.join(KIT, 'sbin', 'heavy-install'), 'install',
+                                '-h'], capture_output=True, text=True, timeout=60).stdout
+        opts = sorted(set(re.findall(r'\[(--[a-z][a-z0-9-]*)( [A-Z_]+)?\]', usage)))
+        self.assertIn(('--replace-t3-capacity', ''), opts)
+        for opt, value in opts:
+            with self.subTest(opt):
+                r = self.run_bootstrap(opt, *(['1'] if value else []))
+                self.assertEqual(r.returncode, 1)
+                self.assertIn('run this as root', r.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, 'as root the bootstrap goes on to the network')
+    def test_a_second_sha_or_source_is_refused(self):
+        for extra in (['--sha', SHA2], ['--sha=' + SHA2], ['--source', '/tmp/x'], ['--source=/tmp/x']):
+            with self.subTest(extra):
+                r = self.run_bootstrap('--replace-t3-capacity', *extra)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn('after the installer options', r.stderr)
+        r = self.run_bootstrap('--bogus')
+        self.assertIn('unknown option --bogus', r.stderr)
 
 
 if __name__ == '__main__':
