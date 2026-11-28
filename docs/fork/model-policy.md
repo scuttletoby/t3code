@@ -40,7 +40,7 @@ against the policy when all of these hold:
 
 - it comes from an agent's MCP call: a thread bound to the session here, or a linked machine's call
   that names its agent's thread;
-- that call's route did not check its picks itself (the four routes in the table's first row do);
+- that call's route did not check its picks itself (the four routes in the table's first two rows do);
 - the command names a model (a new thread, a model change, a message, a queued run's edit or a
   delegated task with its own model, a task sent to a linked machine) or forks a thread, which runs
   on its source thread's model;
@@ -90,10 +90,18 @@ The hook leaves `delegate_task` and `create_threads` to T3 only while all of the
 - the file is root-owned, not writable by group or others, and not a link;
 - it locks `modelPolicy` at the hook's mode or a stricter one, with no row or effort the hook's own
   rows do not cover (a locked row without `efforts` is covered only by a hook row without them);
+- T3 reads the locked value as written: only `mode` and `allow`, both given, and rows with only
+  T3's keys (`driver`, `model`, `efforts`, `defaultEffort`, `useFor`; not the hook's `aliases` or
+  option ids), at least one effort in a row's `efforts`, a `defaultEffort` among them, and no
+  spaces around a text. T3 still starts on a value it cannot read, but reads it as enforce with
+  nothing allowed (and refuses every agent pick on its routes); the hook's self-check reports it;
 - every T3 server named in the hook's machine file (`t3ServerStates`, each T3 home's
   `userdata/server-runtime.json`) is running, says it loaded this file, and started after the file
   last changed. T3 reads its managed policy only when it starts, so a T3 started before the lock
-  was written or changed still runs the old policy until it restarts.
+  was written or changed still runs the old policy until it restarts;
+- each of those servers wrote `fork-capabilities.json` beside its `server-runtime.json` when it
+  started (`apps/server/src/fork/modelPolicyRoutesMarker.ts`), naming its own process and both
+  routes: a T3 older than that loads the lock too, but does not check both routes itself.
 
 In any other state it keeps checking them. So give both the same rows, and switch both to
 `enforce` together. Name every T3 home on the machine: the hook cannot see a server that is not
@@ -104,7 +112,9 @@ restarted. That opens only the window until T3's next start, when it loads the l
 
 Linux. The rows are the fork's start rows (#126), in `advise`, as in the hook's paste-ready
 install. T3 reads the managed policy only when it starts. It refuses to start while the file is not
-valid (a key it does not know counts), so write it with this command, not by hand. A policy file that is
+valid (a top-level key or setting it does not know counts), so write it with this command, not by
+hand. Inside `modelPolicy`'s value it does not refuse: a key or value it cannot read there makes it
+start with every agent pick refused (see the list above). A policy file that is
 already there is kept (`set -C`): merge the `modelPolicy` entry into its `settings` instead.
 
 ```sh
@@ -128,12 +138,20 @@ umask 022 && mkdir -p /etc/t3code
 }
 JSON
 python3 -c 'import json; json.load(open("/etc/t3code/policy.json"))' && echo "policy.json is JSON"
-# Name each T3 home's runtime state in the hook's machine file (T3_HOME as in the hook's paste-ready install).
+# Name this T3 home's runtime state in the hook's machine file, beside any home named already.
+# Run it again for each T3 home on the machine. Fill in the folder T3 keeps its state in first.
+T3_HOME=/path/to/t3-home
 T3_HOME="$T3_HOME" python3 - <<'PY'
-import json, os
+import json, os, sys
+home = os.environ.get('T3_HOME', '')
+if not os.path.isabs(home) or not os.path.isdir(os.path.join(home, 'userdata')):
+    sys.exit(f'T3_HOME ({home!r}) is not a T3 home: set it to the folder T3 keeps its state in')
 path = '/etc/fork-kit/machine.json'
 data = json.load(open(path))
-data.setdefault('model-guard', {})['t3ServerStates'] = [os.environ['T3_HOME'] + '/userdata/server-runtime.json']
+state = os.path.join(home, 'userdata', 'server-runtime.json')
+states = data.setdefault('model-guard', {}).setdefault('t3ServerStates', [])
+if state not in states:
+    states.append(state)
 with open(path + '.tmp', 'w') as out:
     json.dump(data, out, indent=2)
     out.write('\n')
@@ -166,8 +184,14 @@ say `enforce` and T3 has restarted.
   file makes the hook check the server's routes again from its next call, until T3 has restarted.
 - **Undo the lock step:** as root, remove the `modelPolicy` entry (or the whole file, if it holds
   nothing else) and restart T3. The hook checks the server's routes again from its next call.
+- **An older hook kit:** first remove `t3ServerStates` from the `model-guard` section of
+  `/etc/fork-kit/machine.json`. A kit from before it reads the key as unknown, and refuses every
+  checked call (fail closed) until it is gone. Install a newer kit before adding the key again.
+- **An older T3:** a T3 without `fork-capabilities.json` leaves the hook checking both routes, so a
+  lock only stops counting. A T3 from before the `modelPolicy` setting refuses to start with it
+  locked: undo the lock step before going back that far.
 - **The hook:** `/usr/local/sbin/model-guard-install uninstall`, as root (see its README). Or set
   its own policy file's `mode` to `off`.
 - **The backstop alone:** revert the pull request that adds it. Its two lines in
   `ThreadManagementService.ts` are listed in `.github/fork-seams.json`; with them gone, the
-  routes in the table's second row are not checked by the server.
+  routes in the table's third row are not checked by the server.
