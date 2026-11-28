@@ -6,16 +6,20 @@ the same time. The short step passes `first: true` and goes before every step th
 
 - **Who goes first.** A `first` caller waits in the kernel and holds a "waiting" mark meanwhile; a caller without
   `first` takes the lock only when it is free and no `first` caller waits (it looks every 30 s and says at its first
-  look why it waits). So a `first` caller waits at most for the one step that holds the lock now.
+  look why it waits). So a `first` caller waits at most for the one step that holds the lock now. Two callers
+  without `first` that look at the same moment are not taken for a waiting `first` caller: the second waits up to
+  1 s in the kernel for the first one's look to end.
 - **A bounded wait.** Set `wait` (seconds) or `until` (an epoch second, for example the end of a nightly window). When
   it runs out the command does not run, the step exits 75, and the output `gave_up` says why and who held the lock. A
-  shared `concurrency` group would instead cancel a waiting run silently.
+  shared `concurrency` group would instead cancel a waiting run silently. A limit must be a finite number, at least
+  0 and at most 31 days away: `nan` (which never runs out), `inf` or a negative one is exit 2 and runs nothing.
 - **Held until everything ended.** The command runs in its own process group with the lock tool as its child
   subreaper. A cancel's signal goes to that group; what the command leaves running gets SIGTERM, 30 s later SIGKILL,
   and only then is the lock let go. Exit code: the command's (128+N when signal N ended it).
 - **No stale lock.** The locks are flocks, so the kernel frees them when the holder ends (a cancelled job, a killed
   runner, a reboot). Missing lock files or folder are made again; files an older version left are used as they are.
-  `NAME.holder` only names the last holder in the log and decides nothing.
+  `NAME.holder` only names the last holder in the log and decides nothing: a note that is not text is shown as best
+  it can be, in one line, never a crash.
 
 It needs Linux and Python 3 (standard library only). The lock is per machine: only steps on the same machine (one
 self-hosted runner host, its `dir`) share it.

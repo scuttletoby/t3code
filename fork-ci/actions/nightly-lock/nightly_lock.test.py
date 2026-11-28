@@ -390,6 +390,29 @@ class Lock(Base):
         self.go('soak')
         self.assertEqual((hold.wait(60), soak.wait(60)), (0, 0))
 
+    def test_another_plain_caller_s_look_is_not_taken_for_a_waiting_first_caller(self):
+        """Two callers without --first look at the same moment: the one that finds the waiting mark taken (held
+        exclusive, for the moment of the other's look) must not say a --first caller is waiting, and takes the free
+        lock once that look is over. The test holds the mark exclusive as such a look does, and lets go only once the
+        tool has met it (it waits in the kernel, or it has already said why it waits)."""
+        os.makedirs(self.locks, exist_ok=True)
+        fd = os.open(os.path.join(self.locks, WANT), os.O_RDONLY | os.O_CREAT, 0o666)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            p = self.start('step', '--wait', '30')
+            err = self.stderr_lines(p)
+
+            def met():
+                lines = lock_lines(os.path.join(self.locks, WANT)) or []
+                return any(w[:1] == ('->',) and str(p.pid) in w for w in lines) or err
+            self.assertTrue(wait_for(met, 60), 'the tool never looked at the waiting mark')
+        finally:
+            os.close(fd)   # the other caller's look is over
+        self.assertTrue(self.started('step'), ''.join(err))
+        self.go('step')
+        self.assertEqual(p.wait(60), 0)
+        self.assertFalse([line for line in err if 'a --first caller is waiting' in line], ''.join(err))
+
     def test_a_command_killed_by_a_signal_exits_128_plus_n(self):
         self.assertEqual(self.start('k', '--wait', '1', cmd=['sh', '-c', 'kill -TERM $$']).wait(60), 143)
 
@@ -518,6 +541,15 @@ class Lock(Base):
             p = subprocess.run([sys.executable, '-I', TOOL, *args, '--wait', '0', '--', 'true'], env=self.env(),
                                capture_output=True, text=True)
             self.assertEqual(p.returncode, 2, args)
+        for flag in ('--wait', '--until'):   # a limit that never runs out (nan, inf) or makes no sense: exit 2, nothing run
+            for value in ('nan', 'inf', '-inf', '-1', '1e12'):
+                with self.subTest(flag=flag, value=value):
+                    p = subprocess.run([sys.executable, '-I', TOOL, '--dir', self.locks, flag, value, '--', 'sh', '-c',
+                                        f'echo ran >> {self.log}'], env=self.env(), capture_output=True, text=True,
+                                       timeout=60)
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertNotIn('Traceback', p.stderr)
+        self.assertEqual(self.lines(), [])
 
 
 class Action(Base):
@@ -572,7 +604,8 @@ class Action(Base):
         self.assertTrue(free(self.locks))
 
     def test_bad_inputs_run_nothing(self):
-        for kw in ({'first': 'yes'}, {'wait': '', 'until': ''}, {'wait': '1', 'until': '2'}, {'name': '../x'}):
+        for kw in ({'first': 'yes'}, {'wait': '', 'until': ''}, {'wait': '1', 'until': '2'}, {'name': '../x'},
+                   {'wait': 'nan'}, {'wait': '', 'until': 'inf'}):
             with self.subTest(kw):
                 p, _ = self.run_step(f'echo ran >> {self.log}', **kw)
                 self.assertEqual(p.wait(60), 2, kw)
@@ -596,6 +629,27 @@ class State(Base):
         q = self.start('two', '--wait', '0.2')
         self.assertEqual(q.wait(60), 75)
         self.assertIn('lock held by', q.stderr.read())
+        self.go('hold')
+        self.assertEqual(hold.wait(60), 0)
+
+    def test_a_note_that_is_not_text_while_the_lock_is_held_is_shown_never_a_crash(self):
+        """The lock is held and its holder note is not text (an older version's, a broken write): does a caller that
+        waits, with or without --first, give up with 75 naming the holder as best it can, never a traceback?"""
+        hold = self.start('hold', '--wait', '30')
+        self.assertTrue(self.started('hold'))
+        with open(os.path.join(self.locks, HOLDER), 'wb') as f:
+            f.write(b'\xff\xfe\x00 not text\nsecond=line')
+        note = os.path.join(self.d, 'note')
+        for args in (('--wait', '0.2'), ('--first', '--wait', '0.2')):
+            with self.subTest(args):
+                p = self.start('never', *args, '--gave-up-note', note)
+                self.assertEqual(p.wait(60), 75)
+                err = p.stderr.read()
+                self.assertNotIn('Traceback', err)
+                self.assertIn('lock held by', err)
+                self.assertIn('not text', err)
+                self.assertRegex(read(note), r'^lock held by [^\n\x00]*not text[^\n\x00]*\n$')   # one line
+        self.assertNotIn('start never', self.lines())
         self.go('hold')
         self.assertEqual(hold.wait(60), 0)
 

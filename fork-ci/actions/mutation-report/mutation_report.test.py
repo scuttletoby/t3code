@@ -98,7 +98,7 @@ class Report(unittest.TestCase):
                 if cmd[1:3] != ['issue', 'list']:
                     return ''
                 red = f'"{R.RED_TITLE}" in:title' in cmd
-                return json.dumps([{'number': n, 'title': R.RED_TITLE} for n in open_red] if red else [])
+                return json.dumps([{'number': n, 'title': R.RED_TITLE, 'author': BOT} for n in open_red] if red else [])
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = R.main(['--results', p('r.json'), '--baseline', p('base.json'), '--expect', p('targets.json'),
                              '--issue', '--repo', 'o/r', '--commit', 'f' * 40], run=run)
@@ -239,7 +239,8 @@ class Report(unittest.TestCase):
 
         def run(cmd, stdin=None):
             calls.append((cmd, stdin))
-            return json.dumps([{'number': 4, 'title': R.TITLE, 'state': 'OPEN', 'body': old}]) if cmd[1:3] == ['issue', 'list'] else ''
+            return (json.dumps([{'number': 4, 'title': R.TITLE, 'state': 'OPEN', 'body': old, 'author': BOT}])
+                    if cmd[1:3] == ['issue', 'list'] else '')
         with contextlib.redirect_stdout(io.StringIO()):
             rc = R.main(['--results', p('r.json'), '--baseline', p('base.json'), '--expect', p('targets.json'),
                          '--issue', '--repo', 'o/r', '--run-url', 'u/new', '--summary', p('summary.md'),
@@ -272,8 +273,8 @@ class Report(unittest.TestCase):
                            ('base.json', {'modules': {'a': {'kill_rate': 50.0}}})):
             with open(p(name), 'w') as f:
                 json.dump(data, f)
-        for issues, verbs in (([{'number': 9, 'title': R.TITLE, 'state': 'OPEN', 'body': ''},
-                                {'number': 4, 'title': R.TITLE, 'state': 'OPEN', 'body': ''}],
+        for issues, verbs in (([{'number': 9, 'title': R.TITLE, 'state': 'OPEN', 'body': '', 'author': BOT},
+                                {'number': 4, 'title': R.TITLE, 'state': 'OPEN', 'body': '', 'author': BOT}],
                                [['issue', 'edit', '4'], ['issue', 'close', '9']]), ([], [['issue', 'create']])):
             calls = []
 
@@ -324,12 +325,19 @@ class Report(unittest.TestCase):
 
 
 
+BOT_LOGIN = 'app/github-actions'   # how gh names the workflow token's account (GITHUB_TOKEN)
+BOT = {'login': BOT_LOGIN, 'is_bot': True}
+
+
 class FakeGitHub:
-    """gh with state: issues {number: {title, state, body}}; list, create, edit, reopen, close and comment act on it.
-    `fail_on` names one verb that fails once (HTTP 502), as a run stopped between two writes would leave it."""
-    def __init__(self, issues=(), fail_on=None):
-        self.issues = {n: {'title': t, 'state': st, 'body': b} for n, t, st, b in issues}
-        self.calls, self.fail_on = [], fail_on
+    """gh with state: issues {number: {title, state, body, author}}; list, create, edit, reopen, close and comment act
+    on it. An issue is the bot's (BOT_LOGIN, what the workflow token writes as) unless a fifth item names another
+    author; list honours --author and --limit as GitHub's search does (newest first). `fail_on` names one verb that
+    fails once (HTTP 502), as a run stopped between two writes would leave it."""
+    def __init__(self, issues=(), fail_on=None, me=BOT_LOGIN):
+        self.issues = {n: {'title': t, 'state': st, 'body': b, 'author': (rest or [BOT_LOGIN])[0]}
+                       for n, t, st, b, *rest in issues}
+        self.calls, self.fail_on, self.me = [], fail_on, me
 
     def __call__(self, cmd, stdin=None):
         self.calls.append(cmd)
@@ -340,12 +348,15 @@ class FakeGitHub:
         arg = lambda flag: cmd[cmd.index(flag) + 1]
         if verb == 'list':
             state, title = arg('--state'), arg('--search').split('"')[1]
-            return json.dumps([{'number': n, 'title': i['title'], 'state': i['state'], 'body': i['body']}
+            author = arg('--author') if '--author' in cmd else None
+            return json.dumps([{'number': n, 'title': i['title'], 'state': i['state'], 'body': i['body'],
+                                'author': {'login': i['author'], 'is_bot': i['author'].startswith('app/')}}
                                for n, i in sorted(self.issues.items(), reverse=True)   # search: newest first
-                               if title in i['title'] and state in ('all', i['state'].lower())])
+                               if title in i['title'] and state in ('all', i['state'].lower())
+                               and author in (None, i['author'])][:int(arg('--limit'))])
         if verb == 'create':
             n = max(self.issues, default=0) + 1
-            self.issues[n] = {'title': arg('--title'), 'state': 'OPEN', 'body': stdin}
+            self.issues[n] = {'title': arg('--title'), 'state': 'OPEN', 'body': stdin, 'author': self.me}
             return f'https://github.com/o/r/issues/{n}\n'
         issue = self.issues[int(cmd[3])]
         if verb == 'edit':
@@ -360,7 +371,7 @@ class FakeGitHub:
         return [r['run'] for r in R.old_trend(self.issues[n]['body'])[0]]
 
     def reports(self, title=R.TITLE):
-        return {n: i['state'] for n, i in self.issues.items() if i['title'] == title}
+        return {n: i['state'] for n, i in self.issues.items() if i['title'] == title and i['author'] == self.me}
 
 
 def trend_body(runs):
@@ -455,12 +466,83 @@ class RollingIssue(unittest.TestCase):
         self.assertIn('the trend kept in #3 could not be read: its runs are left out', gh.issues[5]['body'])
         self.assertEqual(gh.issues[6]['state'], 'OPEN')
 
+    def test_a_foreign_issue_with_the_report_s_title_is_never_read_or_written(self):
+        """In a public repository anyone can open an issue with the report's title. While the real report is open, the
+        outsider's trend (runs dated 9999) must not push the real runs out, and the outsider's issue is not closed as
+        a copy; while the real one is closed and the outsider's is open, the real one is reopened, the outsider's never
+        edited."""
+        fake = trend_body([(f'u/fake{i}', 1) for i in range(30)]).replace('2026-10-01', '9999-12-31')
+        for real_state in ('OPEN', 'CLOSED'):
+            with self.subTest(real_state):
+                gh = FakeGitHub([(5, R.TITLE, real_state, trend_body([(f'u/{i}', i) for i in range(1, 11)])),
+                                 (7, R.TITLE, 'OPEN', fake, 'someone'), (8, R.TITLE, 'OPEN', fake, 'app/other-bot')])
+                rc, out = self.report(gh, 'u/new')
+                self.assertEqual(rc, 0, out)
+                self.assertEqual(gh.reports(), {5: 'OPEN'})
+                self.assertEqual(gh.report_runs(5), [f'u/{i}' for i in range(1, 11)] + ['u/new'])
+                self.assertNotIn('9999', gh.issues[5]['body'])
+                for n in (7, 8):
+                    self.assertEqual((gh.issues[n]['state'], gh.issues[n]['body']), ('OPEN', fake))
+                self.assertFalse([c for c in gh.calls if c[2] != 'list' and c[3:4] in (['7'], ['8'])], gh.calls)
+
+    def test_the_report_is_found_among_more_than_a_hundred_issues_with_its_words(self):
+        """A search for the title's words that finds more than 100 issues (one page) must still find the report."""
+        gh = FakeGitHub([(1, R.TITLE, 'OPEN', trend_body([('u/1', 1)]))]
+                        + [(n, f'{R.TITLE} for module {n}', 'CLOSED', '') for n in range(2, 160)])
+        self.assertEqual(self.report(gh, 'u/new')[0], 0)
+        self.assertEqual(gh.reports(), {1: 'OPEN'}, 'no second report issue')
+        self.assertEqual(gh.report_runs(1), ['u/1', 'u/new'])
+
+    def test_find_issues_keeps_only_the_writer_s_own_even_when_the_search_returns_others(self):
+        """The search asks for the author; the issues it returns are checked again, so a search that ignored it (or an
+        issue without an author) cannot bring a foreign trend in."""
+        found = [{'number': 3, 'title': R.TITLE, 'state': 'OPEN', 'body': 'x', 'author': {'login': 'someone'}},
+                 {'number': 4, 'title': R.TITLE, 'state': 'OPEN', 'body': 'y'},
+                 {'number': 5, 'title': R.TITLE, 'state': 'open', 'body': 'z', 'author': {'login': 'github-actions'}},
+                 {'number': 6, 'title': R.TITLE, 'state': 'OPEN', 'body': 'w', 'author': BOT}]
+        cmds = []
+        run = lambda cmd, stdin=None: cmds.append(cmd) or json.dumps(found)
+        self.assertEqual([i['number'] for i in R.find_issues(run, 'o/r', R.TITLE, BOT_LOGIN)], [5, 6])
+        self.assertEqual(cmds[0][cmds[0].index('--author') + 1], BOT_LOGIN)
+        run = lambda cmd, stdin=None: json.dumps([dict(found[3], number=n) for n in range(1000)])
+        with self.assertRaisesRegex(ValueError, 'more than'):   # a full page: the report may be past it
+            R.find_issues(run, 'o/r', R.TITLE, BOT_LOGIN)
+
+    def test_trend_cells_from_a_broken_body_are_shown_as_plain_text(self):
+        """A trend entry whose date or commit is not one (Markdown, a mention, a table bar, a comment end): the table
+        shows '?' and the kept trend cannot end its own HTML comment."""
+        bad = ('an earlier report\n<!-- mutation-trend ' + json.dumps(   # '>' escaped, as the marker keeps it
+            [{'run': 'u/1 --> <b>', 'date': '[x](https://example.invalid) @someone |', 'commit': '`|@ab <b>',
+              'rates': {'a': 50.0}}]).replace('>', '\\u003e') + ' -->')
+        gh = FakeGitHub([(5, R.TITLE, 'OPEN', bad)])
+        self.assertEqual(self.report(gh, 'u/new')[0], 0)
+        body = gh.issues[5]['body']
+        self.assertIn('| ? | `?` | 50.0% |', body)
+        for text in ('@someone', 'example.invalid', '`|@ab', '<b>'):
+            self.assertNotIn(text, body)
+        self.assertEqual(gh.report_runs(5), ['u/1 --> <b>', 'u/new'])   # the marker still reads back whole
+
     def test_no_report_issue_yet_creates_one_and_the_next_run_finds_it(self):
         gh = FakeGitHub()
         self.assertEqual(self.report(gh, 'u/1')[0], 0)
         self.assertEqual(self.report(gh, 'u/2')[0], 0)
         self.assertEqual(gh.reports(), {1: 'OPEN'})
         self.assertEqual(gh.report_runs(1), ['u/1', 'u/2'])
+
+
+class RedIssueAuthor(unittest.TestCase):
+    def test_a_foreign_open_red_issue_is_never_commented_on_or_closed(self):
+        t = RollingIssue('test_no_report_issue_yet_creates_one_and_the_next_run_finds_it')
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        gh = FakeGitHub([(3, R.RED_TITLE, 'OPEN', 'not ours', 'someone')])
+        self.assertEqual(t.report(gh, 'u/1')[0], 0)   # green: closes only its own red issue
+        self.assertEqual(gh.issues[3]['state'], 'OPEN')
+        with open(t.p('r.json'), 'w') as f:
+            json.dump({'modules': [{'module': 'a', 'error': 'stopped'}]}, f)
+        self.assertEqual(t.report(gh, 'u/2')[0], 1)   # red: opens its own, never comments on the foreign one
+        self.assertEqual(gh.reports(R.RED_TITLE), {5: 'OPEN'})   # #4 is the report
+        self.assertFalse([c for c in gh.calls if c[2] in ('comment', 'close') and c[3] == '3'], gh.calls)
 
 
 class ConfigTitles(unittest.TestCase):
@@ -480,16 +562,19 @@ class ConfigTitles(unittest.TestCase):
         with open(self.t.p('r.json'), 'w') as f:
             json.dump({'modules': [{'module': 'a', 'error': 'stopped'}]}, f)   # red: the red issue too
         cfg = self.config({'about': 'x', 'title': 'Mutants: weekly', 'red_title': 'mutants red',
-                           'labels': ['type:test'], 'red_labels': ['prio:high']})
+                           'labels': ['type:test'], 'red_labels': ['prio:high'], 'author': 'app/my-bot'})
+        gh.me = 'app/my-bot'   # the token is that app's
         self.assertEqual(self.t.report(gh, 'u/1', *cfg)[0], 1)
         creates = [c for c in gh.calls if c[2] == 'create']
         self.assertEqual([(c[c.index('--title') + 1], [c[i + 1] for i, x in enumerate(c) if x == '--label'])
                           for c in creates], [('Mutants: weekly', ['type:test']), ('mutants red', ['prio:high'])])
         self.assertIn('the issue "Mutants: weekly"', gh.issues[2]['body'])
+        self.assertEqual({c[c.index('--author') + 1] for c in gh.calls if c[2] == 'list'}, {'app/my-bot'})
 
     def test_a_config_this_release_cannot_read_writes_no_issue_but_the_report(self):
         for data in ({'title': 'x', 'runners': 1}, {'title': ''}, {'title': 'a "b"'}, {'labels': 'x'},
-                     {'title': 't', 'red_title': 't'}, '{', '[]'):
+                     {'title': 't', 'red_title': 't'}, '{', '[]',
+                     {'author': ''}, {'author': 'a b'}, {'author': 'x"'}, {'author': 5}, {'author': '-x'}):
             with self.subTest(data):
                 gh = FakeGitHub()
                 out = self.t.p('rep.md')
@@ -515,8 +600,10 @@ open(state + '.calls', 'a').write(' '.join(cmd[:3]) + '\n')
 verb = cmd[1]
 if verb == 'list':
     title, st = arg('--search').split('"')[1], arg('--state')
-    print(json.dumps([dict(i, number=int(n)) for n, i in issues.items() if title in i['title']
-                      and st in ('all', i['state'].lower())]))
+    author = arg('--author') if '--author' in cmd else None
+    print(json.dumps([dict(i, number=int(n), author={'login': i.get('author', 'app/github-actions')})
+                      for n, i in issues.items() if title in i['title'] and st in ('all', i['state'].lower())
+                      and author in (None, i.get('author', 'app/github-actions'))]))
 elif verb == 'create':
     issues[str(len(issues) + 1)] = {'title': arg('--title'), 'state': 'OPEN', 'body': sys.stdin.read()}
 elif verb == 'edit':
@@ -562,11 +649,13 @@ class Action(unittest.TestCase):
         self.assertNotIn('${{', step['run'])
 
     def test_a_closed_report_issue_is_reopened_by_the_step(self):
-        r, issues = self.run_step({'4': {'title': R.TITLE, 'state': 'CLOSED', 'body': trend_body([('u/1', 1)])}},
+        r, issues = self.run_step({'4': {'title': R.TITLE, 'state': 'CLOSED', 'body': trend_body([('u/1', 1)])},
+                                   '5': {'title': R.TITLE, 'state': 'OPEN', 'body': 'x', 'author': 'someone'}},
                                   TREND=self.t.p('trend.json'))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(issues['4']['state'], 'OPEN')
-        self.assertEqual(len([i for i in issues.values() if i['title'] == R.TITLE]), 1)
+        self.assertEqual((issues['5']['state'], issues['5']['body']), ('OPEN', 'x'))
+        self.assertEqual(len([i for i in issues.values() if i['title'] == R.TITLE and 'author' not in i]), 1)
         with open(self.t.p('trend.json')) as f:
             self.assertEqual([x['run'] for x in json.load(f)['runs']], ['u/1', 'https://github.com/o/r/actions/runs/7'])
         with open(self.t.p('summary.md')) as f:

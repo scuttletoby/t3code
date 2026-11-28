@@ -13,9 +13,13 @@ Who waits for whom:
   DIR/NAME-first.lock shared, and a caller without --first never takes the lock while that is held. So a --first caller
   waits at most for the one step that holds the lock now, and is never overtaken.
 - A caller without --first takes the lock only when it is free and no --first caller waits; it looks again every POLL_S
-  seconds, and says at its first look (and every SAY_EVERY_S) why it waits.
+  seconds, and says at its first look (and every SAY_EVERY_S) why it waits. Its look holds NAME-first.lock exclusive
+  for a moment, so a second caller that looks at that moment waits for it in the kernel (BUSY_S at most) before it
+  takes the mark for a waiting --first caller.
 - --wait S or --until EPOCH bounds the wait. When it runs out: exit 75, the command does not run, and the line names
-  who held the lock. A shared `concurrency` group would instead cancel a waiting run silently.
+  who held the lock (a give-up can come up to BUSY_S after the limit). Each must be finite, at least 0 and at most
+  MAX_WAIT_S away (nan never runs out): exit 2 otherwise. A shared `concurrency` group would instead cancel a waiting
+  run silently.
 
 State: the locks are flocks, so the kernel frees them when the holder ends: a cancelled job, a killed runner, a reboot.
 No stale lock, nothing to clean up, and a missing file (or folder) is made again; a lock file replaced between open and
@@ -35,12 +39,15 @@ cannot be opened) runs nothing (exit 71). `--gave-up-note FILE`: on exit 75 one 
 is removed at the start, so an old note never stays. `--github-output`: on exit 75 that line is also the step output
 `gave_up` ($GITHUB_OUTPUT).
 """
-import argparse, contextlib, ctypes, errno, fcntl, os, re, signal, subprocess, sys, threading, time
+import argparse, contextlib, ctypes, errno, fcntl, math, os, re, signal, subprocess, sys, threading, time
 
 LOCK_DIR = '/tmp'   # --dir
 NAME = 'nightly'   # --name: NAME.lock, NAME-first.lock (held shared by every --first caller while it waits), NAME.holder
 POLL_S = float(os.environ.get('NIGHTLY_LOCK_POLL_S', '') or 30)   # env: tests only
 SAY_EVERY_S = 600
+BUSY_S = 1.0   # a caller without --first holds the waiting mark exclusive only for its look (microseconds): a mark held
+               # exclusive longer than this is taken for a waiting --first caller
+MAX_WAIT_S = 31 * 86400   # --wait / --until further than this: a typo, refused (a CI job never lasts that long)
 GRACE_S = float(os.environ.get('NIGHTLY_LOCK_GRACE_S', '') or 30)   # leftovers: SIGTERM, then SIGKILL; env: tests only
 PR_SET_CHILD_SUBREAPER = 36
 EXIT_WAIT = 75
@@ -162,11 +169,13 @@ def me():
 
 
 def holder():
+    """The holder note as one line of printable text (it can be anything: an older version's, a broken write)."""
     try:
-        with open(path(HOLDER)) as f:
-            return f.read().strip()[:200] or 'unknown'
-    except OSError:
+        with open(path(HOLDER), encoding='utf-8', errors='replace') as f:
+            text = f.read(4096)
+    except (OSError, ValueError):
         return 'unknown'
+    return ' '.join(''.join(c if c.isprintable() else ' ' for c in text).split())[:200] or 'unknown'
 
 
 def note_holder():
@@ -201,6 +210,8 @@ def take_after_first(deadline):
     said = 0.0
     while True:
         want = try_lock(path(WANT), fcntl.LOCK_EX)   # fails while any --first caller holds it shared
+        if want is None:   # or while another caller without --first looks: that is over in a moment, a wait is not
+            want = wait_lock(path(WANT), fcntl.LOCK_EX, BUSY_S)
         if want is not None:
             try:
                 fd = try_lock(path(LOCK), fcntl.LOCK_EX)
@@ -387,6 +398,11 @@ def main(argv=None):
         ap.error(f'--name {args.name!r}: letters, digits, . _ - (64 at most, not starting with . _ -)')
     if not args.dir:
         ap.error('--dir is empty')
+    for flag, value in (('--wait', args.wait), ('--until', args.until)):   # nan never runs out: `left <= 0` is never true
+        if value is not None and not (math.isfinite(value) and value >= 0):
+            ap.error(f'{flag} {value}: a number of seconds, at least 0 and finite')
+    if (args.wait if args.wait is not None else args.until - time.time()) > MAX_WAIT_S:
+        ap.error(f'{"--wait" if args.wait is not None else "--until"}: more than {MAX_WAIT_S // 86400} days away')
     LOCK_DIR = args.dir
     LOCK, WANT, HOLDER = lock_names(args.name)
     if args.gave_up_note:

@@ -15,6 +15,10 @@ issue open while a module has no score.
   carried over. Each write is one call, so a run stopped between two of them leaves state the next run finishes.
 - **The red issue.** A red run opens, or comments on, one issue titled `red_title` (a comment notifies; an edited
   rolling issue notifies nobody); the first green run closes it.
+- **Only its own issues.** In a public repository anyone can open an issue with the report's title. Only issues opened
+  by `author` (the account the token writes as; default `app/github-actions`, the workflow token) are read, merged,
+  written or closed. A stranger's issue with the same title is left alone, and its trend never comes in. A date or
+  commit in a kept trend that is not one shows as `?`, so nothing in an issue body reaches the table as Markdown.
 - **The baseline changes only by a pull request.** `suggest` writes this run's numbers in the baseline's format.
 - A module without a result this run keeps its last section, marked as not refreshed.
 
@@ -27,6 +31,11 @@ Pin a release commit by its full SHA, never a commit of main ([why](../../README
 ```yaml
 permissions:
   issues: write
+# One report run at a time (a dispatch beside the schedule): two at once both read the trend, and the last write
+# drops the other's run. GitHub keeps one waiting run per group; a third one replaces it.
+concurrency:
+  group: mutation-report
+  cancel-in-progress: false
 steps:
   # ... the mutation steps write their results into results/
   - if: always()
@@ -70,15 +79,19 @@ No outputs.
   "title": "Mutation testing: report",
   "red_title": "mutation run red",
   "labels": [],
-  "red_labels": []
+  "red_labels": [],
+  "author": "app/github-actions"
 }
 ```
+
+`author` is the login the `token` writes as, as `gh` names it: `app/NAME` for an app (the workflow token is
+`app/github-actions`), the user's login for a personal token. Issues by any other account are ignored.
 
 A key this release does not know (a newer release's) is a bad config: the report and files are still written, no
 issue is read or written, and the step fails. Labels must exist in the repository.
 
-**Moving from a project's own copy:** set `title` and `red_title` to the copy's titles, so the action finds and
-continues the copy's issue and trend; then delete the copy.
+**Moving from a project's own copy:** set `title` and `red_title` to the copy's titles (and `author`, when the copy
+wrote with another token), so the action finds and continues the copy's issue and trend; then delete the copy.
 
 ## Tests
 

@@ -21,12 +21,15 @@ notifies nobody), and a green run closes it.
 import argparse, datetime, glob, json, os, re, subprocess, sys
 
 CONFIG_DEFAULTS = {'title': 'Mutation testing: report', 'red_title': 'mutation run red', 'labels': [],
-                   'red_labels': []}
+                   'red_labels': [], 'author': 'app/github-actions'}   # author: the account the token writes as
 TITLE, RED_TITLE = CONFIG_DEFAULTS['title'], CONFIG_DEFAULTS['red_title']
 MAX_BODY = 60000   # GitHub's limit is 65536
 TOP = 8
 TREND_KEEP = 26   # runs in the trend table: half a year of weekly runs
 TREND_RE = re.compile(r'<!-- mutation-trend (.*?) -->', re.S)
+AUTHOR_RE = re.compile(r'(app/)?[A-Za-z0-9][A-Za-z0-9-]{0,38}')   # a login as gh names it; an app's is app/NAME
+DATE_RE, COMMIT_RE = re.compile(r'\d{4}-\d{2}-\d{2}'), re.compile(r'[0-9A-Za-z]{1,40}')
+SEARCH_LIMIT = 1000   # gh pages through the search; a full last page: the report may lie past it (an error)
 
 
 def load_results(paths, skipped=None):
@@ -158,10 +161,19 @@ def old_trend(body):
     try:
         runs = json.loads(m.group(1))
         if isinstance(runs, list) and all(isinstance(r, dict) and isinstance(r.get('rates'), dict) for r in runs):
-            return runs, None
+            return [clean_run(r) for r in runs], None
     except ValueError:
         pass
     return [], 'the trend kept in the last report could not be read: it starts again with this run'
+
+
+def clean_run(r):
+    """A kept run as it may be shown: a date or a commit that is not one (letters and digits) becomes '?', and a rate
+    that is not a number is left out. The body is read back from an issue: nothing in it reaches the table as Markdown."""
+    date, commit = str(r.get('date', '')), str(r.get('commit', ''))
+    rates = {str(n): v for n, v in r['rates'].items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    return {'run': str(r.get('run', '')), 'date': date if DATE_RE.fullmatch(date) else '?',
+            'commit': commit if COMMIT_RE.fullmatch(commit) else '?', 'rates': rates}
 
 
 def trend(old_runs, results, run_url, commit, now, base=None):
@@ -169,7 +181,7 @@ def trend(old_runs, results, run_url, commit, now, base=None):
     keep a rate: one judge calls no score (a shrunken module included) is '-', never next week's comparison."""
     rates = {n: r['kill_rate'] for n, r in sorted(results.items())
              if 'error' not in r and scored(r) and not shrunken(r, (base or {}).get(n))}
-    this = {'run': run_url, 'date': f'{now:%Y-%m-%d}', 'commit': commit[:10], 'rates': rates}
+    this = clean_run({'run': run_url, 'date': f'{now:%Y-%m-%d}', 'commit': commit[:10], 'rates': rates})
     return ([r for r in old_runs if r.get('run') != run_url] + [this])[-TREND_KEEP:]
 
 
@@ -220,7 +232,8 @@ def render(rows, problems, results, base, old_body, run_url, commit, now, max_de
     out += ['', f'### Kill rate per run (newest first, the last {TREND_KEEP} runs)']
     if trend_note:
         out.append(f'⚠️ {trend_note}')
-    out += trend_table(runs, [name for name, _, _ in rows]) + [f'<!-- mutation-trend {json.dumps(runs)} -->']
+    kept = json.dumps(runs).replace('>', '\\u003e')   # '>' is only ever inside a string: no '-->' ends the marker
+    out += trend_table(runs, [name for name, _, _ in rows]) + [f'<!-- mutation-trend {kept} -->']
     if skipped:   # left out of this run's scores: said here, never only in the artifact
         out += ['', f'⚠️ {len(skipped)} test file(s) left out this run (red without any mutation, run no target): '
                 + '; '.join(f'`{f}`: {why[:80]}' for f, why in sorted(skipped.items()))[:2000]]
@@ -276,18 +289,33 @@ def load_config(path):
             raise ValueError(f'{path}: "{k}" must be a non-empty title without a double quote')
     if config['title'] == config['red_title']:
         raise ValueError(f'{path}: "title" and "red_title" must differ')
+    if not isinstance(config['author'], str) or not AUTHOR_RE.fullmatch(config['author']):
+        raise ValueError(f'{path}: "author" must be the login the token writes as (an app\'s: app/NAME)')
     for k in ('labels', 'red_labels'):
         if not isinstance(config[k], list) or not all(isinstance(x, str) and x.strip() for x in config[k]):
             raise ValueError(f'{path}: "{k}" must be a list of label names')
     return config
 
 
-def find_issues(run, repo, title):
-    """Every issue titled exactly `title`, open or closed: [{number, state, body}], oldest first."""
-    found = json.loads(run(['gh', 'issue', 'list', '--repo', repo, '--state', 'all', '--search', f'"{title}" in:title',
-                            '--json', 'number,title,state,body', '--limit', '100']) or '[]')
+def login(name):
+    """A login as one string to compare: gh names an app app/NAME, the API NAME[bot]."""
+    name = str(name or '').casefold()
+    return name.removeprefix('app/').removesuffix('[bot]')
+
+
+def find_issues(run, repo, title, author, state='all'):
+    """Every issue titled exactly `title` that `author` opened, in `state` (all: open or closed): [{number, state,
+    body}], oldest first. In a public repository anyone can open an issue with the same title: only the writer's own
+    count, so a stranger's is never read, merged, written or closed. ValueError when the search returned a full last
+    page (the report may lie past it): no write then, never a second report."""
+    found = json.loads(run(['gh', 'issue', 'list', '--repo', repo, '--state', state, '--author', author, '--search',
+                            f'"{title}" in:title', '--json', 'number,title,state,body,author',
+                            '--limit', str(SEARCH_LIMIT)]) or '[]')
+    if len(found) >= SEARCH_LIMIT:
+        raise ValueError(f'the search for "{title}" by {author} found more than {SEARCH_LIMIT - 1} issues')
     return sorted(({'number': i['number'], 'state': str(i.get('state', '')).upper(), 'body': i.get('body') or ''}
-                   for i in found if i['title'] == title), key=lambda i: i['number'])
+                   for i in found if i['title'] == title and isinstance(i.get('author'), dict)
+                   and login(i['author'].get('login')) == login(author)), key=lambda i: i['number'])
 
 
 def pick_issue(issues):
@@ -320,9 +348,7 @@ def alert(run, repo, problems, run_url, commit, config=None):
     notifies and bumps it), and closed by the first green run. Raises what gh raises."""
     config = config or CONFIG_DEFAULTS
     red_title = config['red_title']
-    found = json.loads(run(['gh', 'issue', 'list', '--repo', repo, '--state', 'open', '--search',
-                            f'"{red_title}" in:title', '--json', 'number,title', '--limit', '20']) or '[]')
-    number = min((i['number'] for i in found if i['title'] == red_title), default=None)
+    number = min((i['number'] for i in find_issues(run, repo, red_title, config['author'], 'open')), default=None)
     if not problems:
         if number:
             run(['gh', 'issue', 'close', str(number), '--repo', repo, '--comment',
@@ -401,7 +427,7 @@ def main(argv=None, run=default_run, now=None):
     target, extra, issues, issue_error = None, [], [], config_error
     if a.issue and not config_error:
         try:
-            issues = find_issues(run, a.repo, config['title'])
+            issues = find_issues(run, a.repo, config['title'], config['author'])
             target, extra = pick_issue(issues)
         except (subprocess.CalledProcessError, OSError, ValueError, TypeError, KeyError) as e:   # gh down or missing
             issue_error = f'could not read the rolling issue: {gh_error(e)}'
