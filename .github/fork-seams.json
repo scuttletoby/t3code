@@ -256,10 +256,10 @@
         "if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)"
       ],
       "announced": {
-        "since": "2026-11-27",
+        "since": "2026-11-28",
         "added": [
           "import * as ModelPolicyBackstop from \"../fork/modelPolicyBackstop.ts\"; // Fork: model policy backstop",
-          "Effect.andThen(ModelPolicyBackstop.checkAgentCommand(command, orchestrator)), // Fork: model policy backstop"
+          "Effect.andThen(ModelPolicyBackstop.check(command, orchestrator, receipts, serverSettings)), // Fork: model policy backstop"
         ]
       }
     },
@@ -354,7 +354,15 @@
         "if (yield* runSlots.keepStored(taskId, entry.delivery_id)) continue; // Fork: a delivery saved while it waited runs again on the task as saved",
         "yield* runSlots.leaveStored(entry.delivery_id); // Fork: a delivery removed before its run leaves its place in line",
         "yield* runSlots.leaveStored(entry.delivery_id); // Fork: a delivery removed before its run leaves its place in line"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-28",
+        "added": [
+          "import * as ModelPolicyBackstop from \"../fork/modelPolicyBackstop.ts\"; // Fork: model policy backstop",
+          "const refused = ModelPolicyBackstop.refusalText(failure); // Fork: a policy refusal keeps its text",
+          "if (refused !== undefined) return refused; // Fork: a policy refusal keeps its text"
+        ]
+      }
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
       "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693). A change from such a thread to the prompt or thread of a task bound to a wider thread is refused there too, before the service uses up a webhook secretRef (#699). An agent's t3_thread_send that would start a run in an idle thread takes a slot from the agent slot gate, or is refused slots_full and nothing is sent; into a running thread it only queues and takes no slot (fork/agentSlotRoutes.ts, #711).",
