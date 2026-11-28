@@ -9,6 +9,7 @@ import {
   parseRunRecordLines,
   parseTaskLabels,
   readEstimateTag,
+  runRecordLane,
   type RunRecordInput,
   sumRunUsage,
 } from "./runRecord.ts";
@@ -578,6 +579,37 @@ describe("parseRunRecordLines", () => {
         (record) => record.runId,
       ),
       ["run-2"],
+    );
+  });
+
+  it("reads a record without the lane field (written before it) as no lane", () => {
+    const record = buildRunRecord(input())!;
+    // Nothing writes the field yet: a new record has none, as an old one.
+    assert.isFalse("lane" in record);
+    const [read] = parseRunRecordLines(JSON.stringify(record));
+    assert.strictEqual(read?.runId, "run-1");
+    assert.strictEqual(runRecordLane(read!), null);
+  });
+
+  it("reads a record's lane, keeps a name no longer defined, and reads a bad one as none", () => {
+    const record = buildRunRecord(input())!;
+    const lines = [
+      { ...record, runId: "a", lane: "pr-queue" },
+      { ...record, runId: "b", lane: "a-lane-since-removed" },
+      { ...record, runId: "c", lane: null },
+      { ...record, runId: "d", lane: 7 },
+      { ...record, runId: "e", lane: "  " },
+    ].map((line) => JSON.stringify(line));
+    const records = parseRunRecordLines(lines.join("\n"));
+    assert.deepStrictEqual(
+      records.map((read) => [read.runId, runRecordLane(read)]),
+      [
+        ["a", "pr-queue"],
+        ["b", "a-lane-since-removed"],
+        ["c", null],
+        ["d", null],
+        ["e", null],
+      ],
     );
   });
 });

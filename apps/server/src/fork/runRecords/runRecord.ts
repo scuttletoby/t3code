@@ -75,6 +75,11 @@ export interface RunRecord {
   readonly kindRefused?: string | null;
   /** The run this one continues after a restart, a Continue, or a usage-limit reset. */
   readonly continuationOf: string | null;
+  /**
+   * The lane the run worked for (issue 1156): a lane thread's run, or one of its workers'. Absent in
+   * records written before this field, and not written yet; read it with {@link runRecordLane}.
+   */
+  readonly lane?: string | null;
   readonly providerInstanceId: string;
   readonly model: string;
   readonly effort: string | null;
@@ -492,6 +497,15 @@ export function parseRunRecordLines(
     records.push(value);
   }
   return records;
+}
+
+/**
+ * A record's lane, or null: for a record written before the field, a run outside any lane, or a
+ * value that is not a name. A lane no longer in the settings is kept as written.
+ */
+export function runRecordLane(record: RunRecord): string | null {
+  const lane: unknown = record.lane;
+  return typeof lane === "string" && lane.trim() !== "" ? lane : null;
 }
 
 function isRunRecord(value: unknown): value is RunRecord {

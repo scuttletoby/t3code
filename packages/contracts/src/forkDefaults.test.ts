@@ -93,6 +93,7 @@ describe("settings saved by an older build", () => {
         "server.mcpThreadProfiles",
         "server.assistant",
         "server.stopFinishedChildren",
+        "server.lanes",
         "projectOverride.waitChecks",
         "projectOverride.mcpProfile",
         "projectOverride.mcpSubagentProfile",

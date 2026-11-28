@@ -70,6 +70,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.threadRoles`](#serverthreadroles)                                   | `{"assistant":null,"orchestrators":{}}` | yes | [#138](https://github.com/scuttletoby/t3code/issues/138)   |
 | [`server.assistant`](#serverassistant)                                       | `{"enabled":false}`                     | yes | [#879](https://github.com/scuttletoby/t3code/issues/879)   |
 | [`server.stopFinishedChildren`](#serverstopfinishedchildren)                 | `{"enabled":false}`                     | yes | [#925](https://github.com/scuttletoby/t3code/issues/925)   |
+| [`server.lanes`](#serverlanes)                                               | `{"enabled":false}`                     | yes | [#1156](https://github.com/scuttletoby/t3code/issues/1156) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                                 | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)     |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                                 | yes | [#260](https://github.com/scuttletoby/t3code/issues/260)   |
 | [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                                 | yes | [#291](https://github.com/scuttletoby/t3code/issues/291)   |
@@ -81,7 +82,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`client.ownerQuestionsPage`](#clientownerquestionspage)                     | `true`                                  | no  | [#828](https://github.com/scuttletoby/t3code/issues/828)   |
 | [`client.workPanelEnabled`](#clientworkpanelenabled)                         | `false`                                 | yes | [#1136](https://github.com/scuttletoby/t3code/issues/1136) |
 
-For `waitFor`, `agentSlots`, `playtest` and `stopFinishedChildren` only the `enabled` switch is pinned, and for `handoff`
+For `waitFor`, `agentSlots`, `playtest`, `stopFinishedChildren` and `lanes` only the `enabled` switch is pinned, and for `handoff`
 and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
 
 ## Each setting
@@ -1442,6 +1443,39 @@ process as any resumed thread does.
 Switch on: **Settings → Fork**, section Stop finished sub-agents, or in `settings.json`:
 `"stopFinishedChildren": { "enabled": true, "graceSeconds": 60 }`. Anything but `"enabled": true`
 reads as off, and a bad `graceSeconds` as 60; a save with a bad value is refused.
+
+### `server.lanes`
+
+Lanes under a project's orchestrator
+([#1156](https://github.com/scuttletoby/t3code/issues/1156)): the orchestrator stays the one thread
+the person talks to, and each lane (a long-lived child thread) owns one kind of work, such as the
+pull request queue, with its own workers. Settings only so far: nothing reads them yet, and no lane
+runs.
+
+- `enabled` (off): no lane can be switched on, whatever is defined.
+- `definitions`: the lanes that exist, by name. The orchestrator only switches a defined lane on and
+  off; it cannot make one. A name is lower-case words joined by `-` (`pr-queue`), at most 40
+  characters. Each lane has a `description` (what it does, the start of its thread's brief), `owns`
+  (the kinds of item it may claim: `pr`, `issue`) and `driver` (`agent`, the default and for now the
+  only one). Left out, the built-in lanes `pr-queue` and `issues` are defined.
+
+Only the person can change it. A save changes `enabled` and each definition on its own (`null`
+removes a lane), so two saves for different lanes keep both; a save with a bad name or definition is
+refused. The file is read leniently: a value that is not an object reads as off with the built-in
+lanes, anything but `"enabled": true` as off, a `definitions` that is not an object as no lanes, and
+a bad name or definition (another driver included) drops alone. A record that names a lane no
+longer defined keeps the name; whatever acts on it treats the lane as unknown.
+
+```json
+{
+  "lanes": {
+    "enabled": true,
+    "definitions": {
+      "pr-queue": { "description": "Moves open pull requests to a decision.", "owns": ["pr"] }
+    }
+  }
+}
+```
 
 ### `projectOverride.waitChecks`
 
