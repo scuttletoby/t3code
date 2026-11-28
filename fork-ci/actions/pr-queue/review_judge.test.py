@@ -565,7 +565,7 @@ NOT_GATE = ('.github/fork-ci-tests.txt',)
 # starts queued agent tasks into free slots), and the merge gate reads none of them.
 GATE_KITS = ('gh-apps', 'review')
 OTHER_KITS = ('.gitignore', 'README.md', 'agent-guards', 'cleaner', 'common', 'desk', 'gardener', 'golive', 'heavy',
-              'model-guard', 'pc-agents', 'placement-facts', 'schedule-kick', 'slot-filler', 'update-policy')
+              'homelab', 'model-guard', 'pc-agents', 'placement-facts', 'schedule-kick', 'slot-filler', 'update-policy')
 
 
 class ForkConfig(unittest.TestCase):

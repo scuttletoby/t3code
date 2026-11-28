@@ -78,6 +78,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import { ThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
 import { checkOutput, outputRequestProblem } from "./runOutput.ts";
 import { routineSpan } from "@t3tools/shared/observability";
+import * as BackgroundWait from "../fork/backgroundWait.ts"; // Fork: background wait (F7)
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
 
@@ -1750,6 +1751,8 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
+    const ended = yield* BackgroundWait.read(providerThread, input.taskIds, matched); // Fork: background wait (F7)
+    if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)
     if (input.awaited && matched.length === 0) {
       return yield* new ThreadManagementBackgroundWaitError({
         threadId: input.threadId,

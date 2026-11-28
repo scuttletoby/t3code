@@ -1,7 +1,8 @@
 /**
  * Fork: "Waiting on you", the open owner questions of every project on every connected
- * server, read-only. Upstream's Issues page files are not changed: this page reads the same issue
- * listing and rows, and the rule in contracts (forkOwnerQuestions.ts) picks the questions.
+ * server, each with its recommendation and an answer box (OwnerQuestionAnswer). Upstream's Issues
+ * page files are not changed: this page reads the same issue listing and rows, and the rule in
+ * contracts (forkOwnerQuestions.ts) picks the questions.
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: this page is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
 import { useAtomValue } from "@effect/atom-react";
@@ -32,6 +33,8 @@ import { isElectron } from "~/env";
 import { useLiveRefresh } from "~/hooks/useLiveRefresh";
 import { useEnvironments, useIssuesSupported } from "~/state/environments";
 import { issueEnvironment, useIssueList } from "~/state/issues";
+
+import { OwnerQuestionAnswer } from "./OwnerQuestionAnswer";
 
 import {
   commentsOfDetail,
@@ -207,17 +210,19 @@ export function WaitingOnYouPage() {
   ) : (
     <div className="flex flex-col gap-1">
       {view.waiting.map((entry) => (
-        <IssueRow
-          key={`${entry.environmentId}\u0000${entry.url}`}
-          entry={entry}
-          selected={false}
-          showScope
-          showTracker={false}
-          environmentLabel={
-            showEnvironment ? environmentLabels.get(entry.environmentId) : undefined
-          }
-          onSelect={open}
-        />
+        <div key={`${entry.environmentId}\u0000${entry.url}`} className="flex flex-col">
+          <IssueRow
+            entry={entry}
+            selected={false}
+            showScope
+            showTracker={false}
+            environmentLabel={
+              showEnvironment ? environmentLabels.get(entry.environmentId) : undefined
+            }
+            onSelect={open}
+          />
+          <OwnerQuestionAnswer entry={entry} rule={RULE} />
+        </div>
       ))}
       {view.checking > 0 ? (
         <p className="px-3 py-2 text-xs text-muted-foreground">
