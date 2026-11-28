@@ -1,4 +1,4 @@
-import { MODEL_POLICY_START_ROWS, ServerSettings } from "@t3tools/contracts";
+import { MODEL_POLICY_START_ROWS, ProviderDriverKind, ServerSettings } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -6,11 +6,15 @@ import {
   aliasModelPolicyRows,
   modelPolicyAllowText,
   modelPolicyEditorText,
+  modelPolicyListedRows,
   modelPolicyStartsFromStartRows,
+  modelPolicyTextRows,
   personModelPickMarks,
+  staleModelPolicyRows,
   unknownModelPolicyDrivers,
   unreadableModelPolicyMode,
   unreadableModelPolicyText,
+  withAddedModelPolicyRow,
   withModelPolicyAllow,
 } from "./modelPolicySettings.logic";
 
@@ -328,5 +332,187 @@ describe("personModelPickMarks: the outside policy mark (#125)", () => {
         (mark) => mark.outside !== null,
       ),
     ).toBe(true);
+  });
+});
+
+describe("staleModelPolicyRows (#876 M6)", () => {
+  const rows = fromFile({
+    modelPolicy: {
+      mode: "enforce",
+      allow: [
+        { driver: "claudeAgent", model: "claude-opus-5-5", efforts: ["high"] },
+        { driver: "claudeAgent", model: "claude-opus-4-1" },
+        { driver: "claudeAgent", model: "opus" },
+        { driver: "codex", model: "gpt-mini" },
+      ],
+    },
+  }).modelPolicy.allow;
+  const claude = {
+    driver: "claudeAgent",
+    models: [{ slug: "claude-opus-5-5", aliases: ["opus"] }],
+  };
+
+  it("names each row whose model no list of its driver holds, by id or alias", () => {
+    // A retired id is stale; the full id and the alias (marked as an alias instead) are not.
+    expect(staleModelPolicyRows(rows, [claude])).toEqual([rows[1]]);
+    // Runs again: the same answer.
+    expect(staleModelPolicyRows(rows, [claude])).toEqual(staleModelPolicyRows(rows, [claude]));
+  });
+
+  it("counts a folder's own list, and a name the driver resolves by itself", () => {
+    const folder = {
+      driver: "claudeAgent",
+      models: [{ slug: "claude-fable-5-2" }],
+      workspaceSnapshots: [{ models: [{ slug: "claude-opus-4-1" }] }],
+    };
+    // `opus` is Claude Code's own alias: not stale even where no list names it.
+    expect(staleModelPolicyRows(rows.slice(1, 3), [folder])).toEqual([]);
+  });
+
+  it("flags nothing for a driver whose model list is not known here", () => {
+    // No codex provider (the unknown driver note covers it), no list yet, or an empty list.
+    expect(staleModelPolicyRows([rows[3]!], [claude])).toEqual([]);
+    expect(staleModelPolicyRows([rows[1]!], [{ driver: "claudeAgent" }])).toEqual([]);
+    expect(staleModelPolicyRows([rows[1]!], [{ driver: "claudeAgent", models: [] }])).toEqual([]);
+  });
+
+  it("reads each machine on its own lists: listed here but not there is stale there", () => {
+    const here = { ...claude, environmentId: "here" };
+    const there = {
+      driver: "claudeAgent",
+      environmentId: "there",
+      models: [{ slug: "claude-opus-4-1" }],
+    };
+    expect(staleModelPolicyRows([rows[0]!, rows[1]!], [here, there])).toEqual([rows[0], rows[1]]);
+    // A machine without the driver's list says nothing.
+    expect(
+      staleModelPolicyRows([rows[1]!], [there, { driver: "claudeAgent", environmentId: "x" }]),
+    ).toEqual([]);
+  });
+});
+
+describe("modelPolicyListedRows: rows picked from the live model list (#876 M6)", () => {
+  const effort = (choices: ReadonlyArray<{ id: string; isDefault?: boolean }>, id = "effort") => ({
+    capabilities: {
+      optionDescriptors: [
+        {
+          id,
+          label: "Effort",
+          type: "select",
+          options: choices.map((c) => ({ ...c, label: c.id })),
+        },
+      ],
+    },
+  });
+  const claude = {
+    driver: "claudeAgent",
+    environmentId: "here",
+    models: [
+      {
+        slug: "claude-opus-5-5",
+        name: "Opus 5.5",
+        ...effort([{ id: "medium" }, { id: "high", isDefault: true }, { id: "xhigh" }]),
+      },
+      { slug: "claude-haiku-5-5", name: "Haiku 5.5" },
+    ],
+  };
+
+  it("offers each listed model as a row the server's save accepts, efforts from its own control", () => {
+    const listed = modelPolicyListedRows([], [claude]);
+    expect(listed.map((entry) => entry.row)).toEqual([
+      {
+        driver: "claudeAgent",
+        model: "claude-opus-5-5",
+        efforts: ["medium", "high", "xhigh"],
+        defaultEffort: "high",
+      },
+      // No effort control: the row checks only the model.
+      { driver: "claudeAgent", model: "claude-haiku-5-5" },
+    ]);
+    expect(listed.map((entry) => entry.label)).toEqual([
+      "claudeAgent: Opus 5.5 (claude-opus-5-5)",
+      "claudeAgent: Haiku 5.5 (claude-haiku-5-5)",
+    ]);
+    const rows = listed.map((entry) => entry.row);
+    expect(withModelPolicyAllow("enforce", JSON.stringify(rows))).toEqual({
+      value: { mode: "enforce", allow: rows },
+    });
+  });
+
+  it("reads the effort under the id the driver reads, not a decoy, and never OpenCode's no-variant", () => {
+    const codex = {
+      driver: "codex",
+      models: [
+        {
+          slug: "gpt-mini",
+          name: "GPT mini",
+          capabilities: {
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Decoy",
+                type: "select",
+                options: [{ id: "max", label: "x" }],
+              },
+              {
+                id: "reasoningEffort",
+                label: "Effort",
+                type: "select",
+                options: [{ id: "low", label: "Low" }],
+              },
+            ],
+          },
+        },
+      ],
+    };
+    const opencode = {
+      driver: "opencode",
+      models: [
+        {
+          slug: "big",
+          name: "Big",
+          ...effort([{ id: "t3:default", isDefault: true }, { id: "high" }], "variant"),
+        },
+      ],
+    };
+    expect(modelPolicyListedRows([], [codex, opencode]).map((entry) => entry.row)).toEqual([
+      { driver: "codex", model: "gpt-mini", efforts: ["low"] },
+      { driver: "opencode", model: "big", efforts: ["high"] },
+    ]);
+  });
+
+  it("leaves out models a row already names, and lists a model once across machines", () => {
+    const there = { ...claude, environmentId: "there" };
+    const listed = modelPolicyListedRows(
+      [{ driver: "claudeAgent", model: "claude-haiku-5-5" }],
+      [claude, there],
+    );
+    expect(listed.map((entry) => entry.row.model)).toEqual(["claude-opus-5-5"]);
+    expect(new Set(listed.map((entry) => entry.key)).size).toBe(listed.length);
+  });
+});
+
+describe("modelPolicyTextRows and withAddedModelPolicyRow (#876 M6)", () => {
+  const row = { driver: ProviderDriverKind.make("codex"), model: "gpt-mini" };
+
+  it("reads the editor's rows loosely, none for text that is not a list", () => {
+    expect(modelPolicyTextRows(JSON.stringify([ROW, 3, null]))).toEqual([ROW]);
+    expect(modelPolicyTextRows("[ {")).toEqual([]);
+    expect(modelPolicyTextRows(JSON.stringify(ROW))).toEqual([]);
+  });
+
+  it("adds the row at the end of the editor's list, empty text as no rows", () => {
+    const added = withAddedModelPolicyRow(JSON.stringify([ROW]), row);
+    expect(added).toEqual({ text: JSON.stringify([ROW, row], null, 2) });
+    expect(withAddedModelPolicyRow("  ", row)).toEqual({ text: JSON.stringify([row], null, 2) });
+  });
+
+  it("keeps text it cannot read and says why, so nothing the person typed is lost", () => {
+    expect(withAddedModelPolicyRow("[ {", row)).toEqual({
+      error: "Fix the rows' JSON first; a listed model is added to a valid list.",
+    });
+    expect(withAddedModelPolicyRow(JSON.stringify(ROW), row)).toEqual({
+      error: "Fix the rows' JSON first; a listed model is added to a valid list.",
+    });
   });
 });

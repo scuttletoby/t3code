@@ -8,12 +8,14 @@ import {
   modelPolicyAliasTargets,
   modelPolicyCatalogEffortIds,
   type ModelPolicyListedModel,
+  modelPolicyListedEfforts,
   type ModelPolicyMode,
   ModelPolicyPatch,
   type ModelPolicyRow,
   modelPolicyPickEfforts,
   modelPolicyStance,
   type ModelSelection,
+  isProviderDriverKind,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -123,6 +125,18 @@ const providerLists = (provider: ModelPolicyAliasProvider) => [
   ),
 ];
 
+/** The providers per machine (`environmentId`; providers without one read as one machine). */
+const byMachine = (providers: ReadonlyArray<ModelPolicyAliasProvider>) => {
+  const machines = new Map<string | undefined, Array<ModelPolicyAliasProvider>>();
+  for (const provider of providers) {
+    machines.set(provider.environmentId, [
+      ...(machines.get(provider.environmentId) ?? []),
+      provider,
+    ]);
+  }
+  return machines;
+};
+
 /**
  * Rows naming an alias on some selected machine, with its models there (none for a name the driver
  * resolves by itself): such a row follows the alias to a new model and misses the full id. Each
@@ -132,13 +146,7 @@ export function aliasModelPolicyRows(
   rows: ReadonlyArray<ModelPolicyRow>,
   providers: ReadonlyArray<ModelPolicyAliasProvider>,
 ): ReadonlyArray<{ readonly row: ModelPolicyRow; readonly aliasOf: ReadonlyArray<string> }> {
-  const machines = new Map<string | undefined, Array<ModelPolicyAliasProvider>>();
-  for (const provider of providers) {
-    machines.set(provider.environmentId, [
-      ...(machines.get(provider.environmentId) ?? []),
-      provider,
-    ]);
-  }
+  const machines = byMachine(providers);
   return rows.flatMap((row) => {
     let flagged = false;
     const aliasOf = new Set<string>();
@@ -160,6 +168,137 @@ export function aliasModelPolicyRows(
     }
     return flagged ? [{ row, aliasOf: [...aliasOf] }] : [];
   });
+}
+
+/** A machine's lists of a driver hold the model by id or alias (or the driver resolves the name). */
+const machineHoldsModel = (
+  own: ReadonlyArray<ModelPolicyAliasProvider>,
+  lists: ReadonlyArray<ReadonlyArray<ModelPolicyListedModel>>,
+  row: ModelPolicyRow,
+) =>
+  lists.some((list) => list.some((candidate) => candidate.slug === row.model)) ||
+  modelPolicyAliasTargets(lists, row.model).length > 0 ||
+  (own.some((provider) => provider.models !== undefined) &&
+    (MODEL_POLICY_DRIVER_ALIASES[row.driver] ?? []).some(
+      (alias) => alias.toLowerCase() === row.model.toLowerCase(),
+    ));
+
+/**
+ * Rows whose model no list of their driver holds on some selected machine, by id or alias: a
+ * retired or misspelled model, so the row may allow nothing there. Each machine is read on its own
+ * lists; a machine with no model of the driver listed yet (or none at all) says nothing, and an
+ * alias row is left to {@link aliasModelPolicyRows}.
+ */
+export function staleModelPolicyRows(
+  rows: ReadonlyArray<ModelPolicyRow>,
+  providers: ReadonlyArray<ModelPolicyAliasProvider>,
+): ReadonlyArray<ModelPolicyRow> {
+  const machines = byMachine(providers);
+  return rows.filter((row) =>
+    [...machines.values()].some((machineProviders) => {
+      const own = machineProviders.filter((provider) => provider.driver === row.driver);
+      const lists = own.flatMap(providerLists);
+      if (!lists.some((list) => list.length > 0)) return false;
+      return !machineHoldsModel(own, lists, row);
+    }),
+  );
+}
+
+/** A provider as the add-a-model list reads it: its lists' models may carry a display name. */
+export interface ModelPolicyListProvider extends ModelPolicyAliasProvider {
+  readonly models?: ReadonlyArray<ModelPolicyListedModel & { readonly name?: string }> | undefined;
+  readonly workspaceSnapshots?:
+    | ReadonlyArray<{
+        readonly models?:
+          | ReadonlyArray<ModelPolicyListedModel & { readonly name?: string }>
+          | undefined;
+      }>
+    | undefined;
+}
+
+/** A model the selected machines list, as the row Settings adds for it. */
+export interface ModelPolicyListedRow {
+  readonly key: string;
+  readonly label: string;
+  readonly row: ModelPolicyRow;
+}
+
+/**
+ * The models the selected machines list that no row names yet, each as the row Settings adds for
+ * it: its driver and id, and the efforts its own control offers ({@link modelPolicyListedEfforts}).
+ * A model listed on several machines or folders is offered once, as its first list holds it.
+ */
+export function modelPolicyListedRows(
+  existing: ReadonlyArray<{ readonly driver?: unknown; readonly model?: unknown }>,
+  providers: ReadonlyArray<ModelPolicyListProvider>,
+): ReadonlyArray<ModelPolicyListedRow> {
+  const keyOf = (driver: unknown, model: unknown) => JSON.stringify([driver, model]);
+  const seen = new Set(existing.map((row) => keyOf(row.driver, row.model)));
+  const listed: Array<ModelPolicyListedRow> = [];
+  for (const provider of providers) {
+    const driver = provider.driver;
+    // A driver that is no valid id could not be saved in a row.
+    if (!isProviderDriverKind(driver)) continue;
+    const models = [
+      ...(provider.models ?? []),
+      ...(provider.workspaceSnapshots ?? []).flatMap((snapshot) => snapshot.models ?? []),
+    ];
+    for (const model of models) {
+      const key = keyOf(driver, model.slug);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const { efforts, defaultEffort } = modelPolicyListedEfforts(driver, model);
+      const [first, ...rest] = efforts;
+      const row: ModelPolicyRow =
+        first === undefined
+          ? { driver, model: model.slug }
+          : {
+              driver,
+              model: model.slug,
+              efforts: [first, ...rest],
+              ...(defaultEffort === undefined ? {} : { defaultEffort }),
+            };
+      const name = model.name !== undefined && model.name !== model.slug ? model.name : undefined;
+      listed.push({
+        key,
+        label: `${driver}: ${name === undefined ? model.slug : `${name} (${model.slug})`}`,
+        row,
+      });
+    }
+  }
+  return listed;
+}
+
+/** The editor's text as a list, or `undefined` when it is not one (empty text is no rows). */
+const editorList = (text: string): ReadonlyArray<unknown> | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(text.trim() === "" ? "[]" : text);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/** The editor's rows read loosely (the objects in its list), none for text that is not a list. */
+export function modelPolicyTextRows(
+  text: string,
+): ReadonlyArray<{ readonly driver?: unknown; readonly model?: unknown }> {
+  return (editorList(text) ?? []).filter(
+    (row): row is { readonly driver?: unknown; readonly model?: unknown } =>
+      typeof row === "object" && row !== null && !Array.isArray(row),
+  );
+}
+
+/** The editor's text with the row added at the end, or why it cannot be added (the text is kept). */
+export function withAddedModelPolicyRow(
+  text: string,
+  row: ModelPolicyRow,
+): { readonly text: string } | { readonly error: string } {
+  const list = editorList(text);
+  if (list === undefined) {
+    return { error: "Fix the rows' JSON first; a listed model is added to a valid list." };
+  }
+  return { text: JSON.stringify([...list, row], null, 2) };
 }
 
 /** One allowed row as one line. */

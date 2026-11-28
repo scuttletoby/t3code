@@ -316,6 +316,10 @@ export interface ModelPolicyListedModel {
               readonly id: string;
               readonly type: string;
               readonly role?: string | undefined;
+              /** A select's choices, as Settings offers them for a new row. */
+              readonly options?:
+                | ReadonlyArray<{ readonly id: string; readonly isDefault?: boolean | undefined }>
+                | undefined;
             }>
           | undefined;
       }
@@ -346,6 +350,27 @@ export function modelPolicyCatalogEffortIds(
         .map((descriptor) => descriptor.id),
     ),
   ];
+}
+
+/**
+ * The efforts a new row for a listed model names: the choices of the select under the id its driver
+ * reads (else the control the list marks), without OpenCode's no-variant, and the list's default.
+ * None without such a control (the row checks only the model); ultracode is never offered here.
+ */
+export function modelPolicyListedEfforts(
+  driver: string,
+  model: ModelPolicyListedModel,
+): { readonly efforts: ReadonlyArray<string>; readonly defaultEffort: string | undefined } {
+  const ids = Object.hasOwn(MODEL_POLICY_DRIVER_EFFORT_IDS, driver)
+    ? [MODEL_POLICY_DRIVER_EFFORT_IDS[driver]!]
+    : modelPolicyCatalogEffortIds([[model]], model.slug);
+  const choices = (model.capabilities?.optionDescriptors ?? [])
+    .filter((descriptor) => descriptor.type === "select" && ids.includes(descriptor.id))
+    .flatMap((descriptor) => descriptor.options ?? [])
+    .filter((choice) => choice.id !== MODEL_POLICY_OPENCODE_NO_VARIANT);
+  const efforts = [...new Set(choices.map((choice) => choice.id))];
+  const defaultEffort = choices.find((choice) => choice.isDefault === true)?.id;
+  return { efforts, defaultEffort };
 }
 
 /**
