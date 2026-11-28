@@ -44,28 +44,30 @@ Merge its base (`origin/main`, or the base branch of a stacked pull request); `F
 conflicts. Then, in the pull request's checkout:
 
 ```sh
-node .github/scripts/fork-changes-list.cjs adopt   # a stacked pull request: adopt <its base branch>
+node .github/scripts/fork-changes-list.cjs adopt
 git add FORK_CHANGES.md docs/fork/changes
 git commit --no-edit
 ```
 
+During a merge `adopt` reads the merge's own two sides. Its argument (`adopt <base branch>`,
+default `origin/main`) is used only when no merge, cherry-pick or rebase is in progress.
+
 `adopt` writes each row the pull request added or edited (against its merge base) as a change file,
-and removes the file of a row it removed. Then, and only when every table row left in
-`FORK_CHANGES.md` is held by a file or was on the base already, it puts the base's entry page in
-`FORK_CHANGES.md`. A row whose file changed on `main` since is left alone and named, to edit by
-hand; `adopt` then exits 1 and leaves the page as it is. It can run again: a row a file already holds
-is skipped, and a `.md.tmp` file left by a run that stopped is removed.
+and removes the file of a row it removed. Then it puts the base's entry page in `FORK_CHANGES.md`.
+When anything is left to do by hand, it exits 1 and changes nothing: a row whose file changed on
+`main` since, rows it cannot pair, conflict markers in the entry page's own text, a base with no
+table, or a side with the old table still. It can run again: a row a file already holds is skipped,
+and a `.md.tmp` file left by a run that stopped is removed.
 
-A replay works too: during a `git cherry-pick` or `git rebase` that stops on `FORK_CHANGES.md`,
-`adopt` reads the commit being replayed against its parent, then `git cherry-pick --continue` (or
+A replay works too: during a `git cherry-pick` or `git rebase` stopped on `FORK_CHANGES.md`, `adopt`
+reads the commit being replayed against its parent, then `git cherry-pick --continue` (or
 `git rebase --continue`). A branch whose merge base has no table (a branch from before the list's
-history was rewritten) is refused with exit 1: replay its commits instead. A branch that already has
-this page, against a base with the old table (a stale `origin/main`), is refused too, and nothing is
-removed.
+history was rewritten) is refused: replay its commits instead. A merge already committed with the
+pull request's own table is undone with `git reset --merge HEAD^`, then merged again.
 
-An abort does not undo `adopt`, and refuses while its edits are in tracked files. To undo, before
-the abort: `git checkout -- docs/fork/changes`, then `git merge --abort` (or `cherry-pick` /
-`rebase --abort`), then `git clean -fd -- docs/fork/changes` (this also deletes any other untracked
-file there).
+An abort may keep `adopt`'s edits: `git merge --abort` refuses while they are in tracked files, and
+`git cherry-pick --abort` keeps them. To undo, before the abort: `git checkout -- docs/fork/changes`,
+then the abort, then `git clean -fd -- docs/fork/changes` (this also deletes any other untracked file
+there).
 
 `print` lists the changes by first pull request number, not in the old table's order.

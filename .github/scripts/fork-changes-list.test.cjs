@@ -718,7 +718,7 @@ test("the adopt command removes nothing on a branch with the new page when its b
   const before = files();
   const stale = status("adopt", "old");
   assert.equal(stale.code, 1);
-  assert.match(stale.out, /old table still: nothing adopted/u);
+  assert.match(stale.out, /old table still: nothing to adopt onto.*\nnothing changed/su);
   assert.doesNotMatch(stale.out, /removed/u);
   assert.deepEqual(files(), before);
   // The pure check under it: the pull request's side has no table row, its base has.
@@ -748,4 +748,199 @@ test("the adopt command removes a leftover .md.tmp, and an abort is undone by ch
   git("clean", "-fdq", "--", CHANGES_DIR);
   assert.equal(git("status", "--porcelain"), "");
   assert.equal(fs.existsSync(path.join(root, CHANGES_DIR)), false);
+});
+
+/** The working tree's state: `git status` and every file's text under the list, to show a refusal changed nothing. */
+function snapshot(root, git) {
+  const files = {};
+  const walk = (dir) => {
+    if (!fs.existsSync(dir)) return;
+    for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, item.name);
+      if (item.isDirectory()) walk(full);
+      else files[path.relative(root, full)] = fs.readFileSync(full, "utf8");
+    }
+  };
+  walk(path.join(root, CHANGES_DIR));
+  files[CHANGES] = fs.readFileSync(path.join(root, CHANGES), "utf8");
+  return { status: git("status", "--porcelain"), files };
+}
+
+test("a REBASE_HEAD left by a finished rebase is not a rebase in progress: later merges read their own sides", (t) => {
+  const { root, git, write, commit, merge, status, why, adopted } = adoptRepo(
+    t,
+    "fork-changes-stale-rebase-",
+  );
+  // P adds row Z to the old table; Y, stacked on P, adds row W. Y is replayed onto main (a conflicted rebase,
+  // adopted and finished), and git leaves .git/REBASE_HEAD behind.
+  const [r1, r2] = [ENTRY(10, "Ten."), ENTRY(11, "Eleven.")];
+  const [z, w] = [ENTRY(50, "Fifty, from P."), ENTRY(60, "Sixty, from Y.")];
+  git("checkout", "-qb", "P", "old");
+  write(CHANGES, oldPage([[APP, [r1, r2, z]]]));
+  commit("P adds Z");
+  git("checkout", "-qb", "Y");
+  write(CHANGES, oldPage([[APP, [r1, r2, z, w]]]));
+  commit("Y adds W");
+  assert.throws(() => git("rebase", "-q", "--onto", "main", "P"));
+  const replayed = git("rev-parse", "REBASE_HEAD").trim();
+  assert.match(
+    status("adopt", "main").out,
+    /wrote {3}docs\/fork\/changes\/app\/60-sixty-from-y\.md/u,
+  );
+  git("add", CHANGES, CHANGES_DIR);
+  execFileSync(
+    "git",
+    ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "rebase", "--continue"],
+    {
+      cwd: root,
+      stdio: "pipe",
+      env: { ...process.env, GIT_EDITOR: "true" },
+    },
+  );
+  const rebaseHead = path.join(root, ".git", "REBASE_HEAD");
+  if (!fs.existsSync(rebaseHead)) fs.writeFileSync(rebaseHead, `${replayed}\n`); // as git 2.43 leaves it
+
+  // The stacked step: Y merges P, which still has the old table. Refused, nothing changed (before: read as the
+  // finished rebase, the page restored with exit 0, and Z in no file).
+  assert.deepEqual(merge("P"), [CHANGES]);
+  const before = snapshot(root, git);
+  const stacked = status("adopt");
+  assert.equal(stacked.code, 1, stacked.out);
+  assert.match(stacked.out, /\(merge\)/u);
+  assert.match(stacked.out, /old table still: nothing to adopt onto/u);
+  assert.deepEqual(snapshot(root, git), before);
+  git("merge", "--abort");
+
+  // An old pull request merging main in the same clone adopts its own rows (before: refused, "git fetch").
+  git("checkout", "-q", "pr");
+  assert.deepEqual(merge("main"), [CHANGES]);
+  const plain = status("adopt", "main");
+  assert.equal(plain.code, 0, plain.out);
+  assert.match(plain.out, /\(merge\)/u);
+  assert.equal(fs.readFileSync(path.join(root, CHANGES), "utf8"), NEW_PAGE);
+  git("add", CHANGES, CHANGES_DIR);
+  git("commit", "-q", "--no-edit");
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(why()).filter(([name]) => name in adopted)),
+    adopted,
+  );
+});
+
+test("conflict markers in the entry page's own text: adopt refuses and checkEntryPage rejects them", (t) => {
+  const { root, git, write, commit, merge, status } = adoptRepo(t, "fork-changes-markers-");
+  git("checkout", "-qb", "a", "main");
+  write(CHANGES, NEW_PAGE.replace("Every change", "Each change"));
+  commit("a edits the page");
+  git("checkout", "-qb", "b", "main");
+  write(CHANGES, NEW_PAGE.replace("Every change", "All changes"));
+  commit("b edits the page");
+  assert.deepEqual(merge("a"), [CHANGES]);
+  const before = snapshot(root, git);
+  const out = status("adopt", "main");
+  assert.equal(out.code, 1, out.out);
+  assert.match(out.out, /conflict markers in its own text/u);
+  assert.deepEqual(snapshot(root, git), before);
+  assert.throws(
+    () => checkEntryPage(fs.readFileSync(path.join(root, CHANGES), "utf8")),
+    /FORK_CHANGES\.md line \d+: a conflict marker/u,
+  );
+});
+
+test("adopt pairs an edited row by its Change line before its number: a new row above it with the same number", () => {
+  const waits = ENTRY(84, "Waits: agents can wait.");
+  const slots = ENTRY(84, "Agent slots: refused when full.");
+  const basePage = oldPage([[APP, [ENTRY(10, "Ten."), waits, slots]]]);
+  const main = converted(basePage);
+  const fileOf = (entry) => main.find((c) => c.entry.Change === entry.Change).path;
+  const added = ENTRY(84, "Waits, part 2: a new change.", { PR: `${PR(84)}, ${PR(99)}` });
+  // The edit keeps the Change line: it goes to its own file, the new row to a new one.
+  const kept = adopt(
+    basePage,
+    oldPage([[APP, [ENTRY(10, "Ten."), added, { ...waits, Why: "Edited." }, slots]]]),
+    main,
+  );
+  assert.deepEqual(kept.conflicts, []);
+  assert.deepEqual(kept.remove, []);
+  assert.deepEqual(
+    kept.write.map((w) => [w.path, /^- Change: (.*)$/mu.exec(w.text)[1]]),
+    [
+      [`${CHANGES_DIR}/app/84-waits-part-2-new-change.md`, added.Change],
+      [fileOf(waits), waits.Change],
+    ],
+  );
+  // The edit changes the Change line too: two added rows and one removed share #84, so a person pairs them.
+  const reworded = adopt(
+    basePage,
+    oldPage([[APP, [ENTRY(10, "Ten."), added, { ...waits, Change: "Waits: reworded." }, slots]]]),
+    main,
+  );
+  assert.deepEqual([reworded.write, reworded.remove], [[], []]);
+  assert.equal(reworded.conflicts.length, 2);
+  assert.match(reworded.conflicts[0], /more than one row with its first pull request \(#84\)/u);
+});
+
+test("every adopt refusal leaves the tree as it was: a row main changed since, next to an added one", (t) => {
+  const { root, git, commit, merge, status } = adoptRepo(t, "fork-changes-refuse-");
+  git("checkout", "-q", "main");
+  const file = path.join(root, CHANGES_DIR, "app/11-eleven.md");
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("Reason 11.", "Changed on main."));
+  commit("main edits eleven");
+  git("checkout", "-q", "pr");
+  assert.deepEqual(merge("main"), [CHANGES]);
+  const before = snapshot(root, git);
+  const out = status("adopt", "main");
+  assert.equal(out.code, 1, out.out);
+  assert.match(out.out, /the row this pull request edits changed on the base since/u);
+  assert.match(out.out, /nothing changed/u);
+  assert.doesNotMatch(out.out, /wrote/u); // before: the added row's file was written
+  assert.deepEqual(snapshot(root, git), before);
+});
+
+test("a merge committed with the pull request's own table: adopt says to undo it, and that advice works", (t) => {
+  const { root, git, merge, status, why, adopted } = adoptRepo(t, "fork-changes-kept-");
+  git("checkout", "-q", "pr");
+  assert.deepEqual(merge("main"), [CHANGES]);
+  git("checkout", "--ours", CHANGES);
+  git("add", CHANGES);
+  git("commit", "-q", "--no-edit");
+  const before = snapshot(root, git);
+  const out = status("adopt", "main");
+  assert.equal(out.code, 1, out.out);
+  assert.match(out.out, /undo that merge \(git reset --merge HEAD\^\), merge again/u);
+  assert.doesNotMatch(out.out, /git show .*> FORK_CHANGES\.md/u); // that would drop the pull request's row
+  assert.deepEqual(snapshot(root, git), before);
+  git("reset", "-q", "--merge", "HEAD^");
+  assert.deepEqual(merge("main"), [CHANGES]);
+  assert.equal(status("adopt", "main").code, 0);
+  assert.deepEqual(why(), adopted);
+});
+
+test("during a merge whose base has no table, the advice is to replay, not a base argument adopt ignores", (t) => {
+  const { root, git, write, commit, merge } = tempRepo(t, "fork-changes-ancient-");
+  write("README.md", "readme\n");
+  commit("before the list");
+  git("tag", "pre");
+  const basePage = oldPage([[APP, [ENTRY(10, "Ten."), ENTRY(11, "Eleven.")]]]);
+  write(CHANGES, basePage);
+  commit("old table");
+  apply(root, adopt("", basePage, []));
+  write(CHANGES, NEW_PAGE);
+  commit("one file per change");
+  git("checkout", "-qb", "ancient", "pre");
+  write(CHANGES, oldPage([[APP, [ENTRY(10, "Ten."), ENTRY(11, "Eleven, old words.")]]]));
+  commit("a branch from before the list's history");
+  assert.deepEqual(merge("main"), [CHANGES]);
+  const before = snapshot(root, git);
+  const script = path.join(__dirname, "fork-changes-list.cjs");
+  let out = "";
+  assert.throws(
+    () => execFileSync("node", [script, "adopt", "main"], { cwd: root, stdio: "pipe" }),
+    (error) => {
+      out = `${error.stdout}${error.stderr}`;
+      return error.status === 1;
+    },
+  );
+  assert.match(out, /abort this merge and replay the pull request's commits/u);
+  assert.doesNotMatch(out, /adopt <base branch>/u);
+  assert.deepEqual(snapshot(root, git), before);
 });

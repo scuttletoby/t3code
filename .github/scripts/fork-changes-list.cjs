@@ -310,6 +310,10 @@ const changesNamedIds = (changes) => namedIds(changes.map((change) => change.tex
  * in a merge), which this check no longer reads: refused, with the command that moves the rows to files.
  */
 function checkEntryPage(text) {
+  const marker = text.split("\n").findIndex((line) => CONFLICT_MARKER.test(line));
+  if (marker !== -1) {
+    throw new Error(`${CHANGES} line ${marker + 1}: a conflict marker; resolve the conflict`);
+  }
   const row = text.split("\n").findIndex((line) => line.trimStart().startsWith("|"));
   if (row !== -1) {
     throw new Error(
@@ -389,10 +393,9 @@ function adopt(baseText, headText, changes) {
   if (head.length === 0) {
     // A page with no table row is the new entry page, not "the pull request removed every row".
     if (base.length > 0) {
+      result.page = "no table on the pull request's side";
       result.conflicts.push(
-        `the pull request's ${CHANGES} has no table row but its base has ${base.length}: nothing removed. ` +
-          "If the branch has the new entry page already, there is nothing to adopt; otherwise the base is wrong " +
-          "(a stale origin/main: git fetch; a stacked pull request: adopt <its base branch>)",
+        `the pull request's ${CHANGES} has no table row but its base has ${base.length}: nothing removed`,
       );
     }
     return result;
@@ -402,10 +405,10 @@ function adopt(baseText, headText, changes) {
   if (base.length === 0 && head.some(held)) {
     // The pull request's page holds the whole old list, but its base has none (a merge base from before the list,
     // or after it moved): every row would look added, and an edited one would become a second file.
+    result.page = "no table on the base";
     result.conflicts.push(
       `the base's ${CHANGES} has no table row, but the pull request's side has the old list (${head.length} rows): ` +
-        "nothing written. Pass the pull request's base branch (adopt <base branch>), or replay its commits with " +
-        "git cherry-pick and run adopt at each conflict",
+        "nothing written",
     );
     return result;
   }
@@ -422,14 +425,48 @@ function adopt(baseText, headText, changes) {
   const holding = (row) =>
     files.find((file) => file.section === row.section && sameEntry(file.entry, row.entry));
   const taken = new Set(files.map((file) => file.path));
-  const paired = new Set();
   const label = (row) => `${row.section}: "${row.entry.Change.slice(0, 60)}..."`;
+  // Which removed row each added row edits: the same Change line first, over all added rows; then the same first
+  // pull request, only where one added and one removed row share it (a new row with an edited row's number,
+  // above it, must not take that row's file). More than one is for a person to pair.
+  const paired = new Set();
+  const pairOf = new Map();
+  const ambiguous = new Set();
   for (const row of added) {
-    const open = removed.filter((was) => !paired.has(was) && was.section === row.section);
-    const was =
-      open.find((candidate) => candidate.entry.Change === row.entry.Change) ??
-      open.find((candidate) => sameChange(candidate.entry, row.entry));
-    if (was !== undefined) paired.add(was);
+    const was = removed.find(
+      (other) =>
+        !paired.has(other) &&
+        other.section === row.section &&
+        other.entry.Change === row.entry.Change,
+    );
+    if (was !== undefined) {
+      pairOf.set(row, was);
+      paired.add(was);
+    }
+  }
+  for (const row of added) {
+    const ref = firstRef(row.entry);
+    if (pairOf.has(row) || ref === null) continue;
+    const sameRef = (other) => other.section === row.section && firstRef(other.entry) === ref;
+    const was = removed.filter((other) => !paired.has(other) && sameRef(other));
+    const rivals = added.filter((other) => !pairOf.has(other) && sameRef(other));
+    if (was.length === 1 && rivals.length === 1) {
+      pairOf.set(row, was[0]);
+      paired.add(was[0]);
+    } else if (was.length > 0) {
+      for (const other of was) paired.add(other); // not removed: its edit is among the rivals
+      for (const other of rivals) ambiguous.add(other);
+    }
+  }
+  for (const row of added) {
+    if (ambiguous.has(row)) {
+      result.conflicts.push(
+        `${label(row)}: this pull request adds or edits more than one row with its first pull request ` +
+          `(#${firstRef(row.entry)}); which row edits which is for a person: make the edits by hand`,
+      );
+      continue;
+    }
+    const was = pairOf.get(row);
     if (holding(row) !== undefined) continue;
     let file = was === undefined ? undefined : holding(was);
     if (was !== undefined && file === undefined) {
@@ -510,28 +547,34 @@ function printList(changes) {
   return out.join("\n");
 }
 
+/** A line git writes into a file it could not merge. */
+const CONFLICT_MARKER = /^(?:<{7}|>{7}|\|{7})(?: |$)|^={7}$/mu;
+
 /**
  * The two pages `adopt` compares and the side it lands on, from the operation in progress: a cherry-pick or rebase
- * replays CHERRY_PICK_HEAD / REBASE_HEAD (compared with its parent) onto HEAD; a merge brings MERGE_HEAD into HEAD
- * (the pull request); with none, HEAD against its merge base with `baseRef`.
+ * stopped on a conflict replays CHERRY_PICK_HEAD / REBASE_HEAD (compared with its parent) onto HEAD; a merge brings
+ * MERGE_HEAD into HEAD (the pull request); with none, HEAD against its merge base with `baseRef`. A rebase is in
+ * progress only while its rebase-merge/ or rebase-apply/ folder is: git leaves REBASE_HEAD behind after one.
  */
 function adoptSides(root, baseRef) {
   const rev = (ref) => git(["rev-parse", "--verify", "-q", `${ref}^{commit}`], root).trim();
   const pending = (name) =>
     fs.existsSync(path.resolve(root, git(["rev-parse", "--git-path", name], root).trim()));
-  for (const [name, how] of [
-    ["CHERRY_PICK_HEAD", "cherry-pick"],
-    ["REBASE_HEAD", "rebase"],
-  ]) {
-    if (pending(name)) {
-      return {
-        how,
-        pr: rev(name),
-        base: rev(`${name}^`),
-        onto: rev("HEAD"),
-        next: `git ${how} --continue`,
-      };
+  const replay = (name, how) => ({
+    how,
+    pr: rev(name),
+    base: rev(`${name}^`),
+    onto: rev("HEAD"),
+    next: `git ${how} --continue`,
+  });
+  if (pending("CHERRY_PICK_HEAD")) return replay("CHERRY_PICK_HEAD", "cherry-pick");
+  if (pending("rebase-merge") || pending("rebase-apply")) {
+    if (!pending("REBASE_HEAD")) {
+      throw new Error(
+        "a rebase is in progress but stopped on no commit: finish it (git rebase --continue) or abort it, then run this again",
+      );
     }
+    return replay("REBASE_HEAD", "rebase");
   }
   if (pending("MERGE_HEAD")) {
     const onto = rev("MERGE_HEAD");
@@ -552,10 +595,25 @@ function adoptSides(root, baseRef) {
   };
 }
 
+/** What to do about a whole-page refusal, for the operation `adopt` read. */
+function pageAdvice(result, sides, baseRef) {
+  if (result.page === "no table on the pull request's side") {
+    return sides.how === "no merge in progress"
+      ? `if the branch has the new entry page already, there is nothing to adopt; otherwise ${baseRef} is not its base: git fetch, or name the base branch (adopt <base branch>)`
+      : "if the branch has the new entry page already, there is nothing to adopt; otherwise the side merged in is not this pull request's base";
+  }
+  if (sides.how === "no merge in progress" && sides.base === sides.onto) {
+    return `${baseRef} is merged already with the old table kept: undo that merge (git reset --merge HEAD^), merge again, and run adopt during it`;
+  }
+  return sides.how === "merge"
+    ? "the merge base is from before the list: abort this merge and replay the pull request's commits (git cherry-pick), running adopt at each conflict"
+    : "replay the pull request's commits (git cherry-pick), running adopt at each conflict, or name its base branch (adopt <base branch>)";
+}
+
 /**
- * `adopt [<base>]` in the checkout of the current folder: writes and removes change files, then (when every row of
- * the page in the working tree is held by a file or was on the base already) puts the landing side's entry page in
- * FORK_CHANGES.md. Exits 1 with the reason whenever it leaves something to do by hand.
+ * `adopt [<base>]` in the checkout of the current folder: writes and removes change files, then puts the landing
+ * side's entry page in FORK_CHANGES.md (when every table row of the working page is held by a file or was on the
+ * base). Any refusal (exit 1) changes nothing but a leftover temp file it removes.
  */
 function adoptCommand(baseRef = "origin/main") {
   const root = git(["rev-parse", "--show-toplevel"], process.cwd()).trim();
@@ -584,17 +642,53 @@ function adoptCommand(baseRef = "origin/main") {
   console.log(
     `reading ${CHANGES} of ${short(sides.pr)} against ${short(sides.base)} (${sides.how}), onto ${short(sides.onto)}`,
   );
+  const refuse = (...why) => {
+    for (const line of why) console.error(`by hand: ${line}`);
+    console.error("nothing changed");
+    return 1;
+  };
   const ontoPage = show(sides.onto);
   if (tableRows(ontoPage).length > 0) {
-    console.error(
-      `by hand: ${short(sides.onto)}'s ${CHANGES} is the old table still: nothing adopted (git fetch, or name the right base)`,
+    return refuse(
+      `${short(sides.onto)}'s ${CHANGES} is the old table still: nothing to adopt onto (git fetch, or name the right base)`,
     );
-    return 1;
   }
   const basePage = show(sides.base);
   const prPage = show(sides.pr);
-  const changes = readChanges(root);
-  const result = adopt(basePage, prPage, changes);
+  const result = adopt(basePage, prPage, readChanges(root));
+  if (result.page !== undefined) {
+    return refuse(...result.conflicts, pageAdvice(result, sides, baseRef));
+  }
+  const pagePath = path.join(root, CHANGES);
+  const working = fs.existsSync(pagePath) ? fs.readFileSync(pagePath, "utf8") : "";
+  const rowLines = (text) =>
+    text
+      .split("\n")
+      .filter((line) => line.startsWith("|"))
+      .map((line) => line.trim());
+  const replacePage = rowLines(working).length > 0;
+  if (!replacePage && CONFLICT_MARKER.test(working)) {
+    return refuse(
+      `${CHANGES} has conflict markers in its own text (not the old table): resolve them by hand`,
+    );
+  }
+  if (replacePage) {
+    // Only rows that came from the two commits may go: the pull request's (adopted here) and the base's.
+    const known = new Set([...rowLines(prPage), ...rowLines(basePage)]);
+    const unknown = rowLines(working).filter((line) => !known.has(line));
+    if (unknown.length > 0) {
+      result.conflicts.push(
+        `${CHANGES} has ${unknown.length} table row(s) from neither side, e.g. "${unknown[0].slice(0, 60)}...": ` +
+          "move them to change files by hand",
+      );
+    }
+  }
+  if (result.conflicts.length > 0) {
+    return refuse(
+      ...result.conflicts,
+      `then run adopt again; or, once every row of ${CHANGES} is a file: git show ${short(sides.onto)}:${CHANGES} > ${CHANGES}`,
+    );
+  }
   for (const file of result.write) {
     const full = path.join(root, file.path);
     fs.mkdirSync(path.dirname(full), { recursive: true });
@@ -606,43 +700,18 @@ function adoptCommand(baseRef = "origin/main") {
     fs.rmSync(path.join(root, file), { force: true });
     console.log(`removed ${file}`);
   }
-  const conflicts = [...result.conflicts];
-  const pagePath = path.join(root, CHANGES);
-  const working = fs.existsSync(pagePath) ? fs.readFileSync(pagePath, "utf8") : "";
-  const rowLines = (text) =>
-    text
-      .split("\n")
-      .filter((line) => line.startsWith("|"))
-      .map((line) => line.trim());
-  if (rowLines(working).length > 0) {
-    // Only rows that came from the two commits may go: the pull request's (adopted above) and the base's.
-    const known = new Set([...rowLines(prPage), ...rowLines(basePage)]);
-    const unknown = rowLines(working).filter((line) => !known.has(line));
-    if (unknown.length > 0) {
-      conflicts.push(
-        `${CHANGES} has ${unknown.length} table row(s) from neither side, e.g. "${unknown[0].slice(0, 60)}...": ` +
-          `move them to change files by hand, then take ${short(sides.onto)}'s page`,
-      );
-    }
-    if (conflicts.length === 0) {
-      fs.writeFileSync(`${pagePath}.tmp`, ontoPage);
-      fs.renameSync(`${pagePath}.tmp`, pagePath);
-      console.log(`wrote   ${CHANGES} (the entry page of ${short(sides.onto)})`);
-    }
+  if (replacePage) {
+    fs.writeFileSync(`${pagePath}.tmp`, ontoPage);
+    fs.renameSync(`${pagePath}.tmp`, pagePath);
+    console.log(`wrote   ${CHANGES} (the entry page of ${short(sides.onto)})`);
   }
-  for (const conflict of conflicts) console.error(`by hand: ${conflict}`);
-  if (result.write.length + result.remove.length + conflicts.length === 0) {
+  if (result.write.length + result.remove.length === 0 && !replacePage) {
     console.log(
       `nothing to adopt: ${short(sides.pr)}'s ${CHANGES} edits no table row, or every row is a file already`,
     );
   }
-  if (conflicts.length > 0) {
-    console.log(
-      `then: git show ${short(sides.onto)}:${CHANGES} > ${CHANGES} once no row there is left unmoved`,
-    );
-  }
   console.log(`next: git add ${CHANGES} ${CHANGES_DIR} && ${sides.next}`);
-  return conflicts.length === 0 ? 0 : 1;
+  return 0;
 }
 
 module.exports = {
