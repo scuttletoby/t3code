@@ -153,3 +153,43 @@ export type UsagePacingGateMode = typeof UsagePacingGateMode.Type;
  */
 export const UsagePacingLowerEffort = Schema.Record(TrimmedNonEmptyString, TrimmedNonEmptyString);
 export type UsagePacingLowerEffort = typeof UsagePacingLowerEffort.Type;
+
+/**
+ * Fork: the accounts new delegated work moves through, in order, when the account it would
+ * run on is spent. Empty (the default) moves nothing. A save is strict: an id that is not an
+ * instance id, or one listed twice, is refused.
+ */
+export const AccountOrder = Schema.Array(ProviderInstanceId).check(
+  Schema.makeFilter((ids) => new Set(ids).size === ids.length, {
+    expected: "each account listed once",
+  }),
+);
+export type AccountOrder = typeof AccountOrder.Type;
+
+const isProviderInstanceId = Schema.is(ProviderInstanceId);
+
+/**
+ * `accountOrder` as the settings file holds it, read leniently with a warning: an entry that is not
+ * an instance id, or a repeat, is dropped (no work moves to it), and a value that is not a list
+ * reads as empty (nothing moves), so a typo never moves work and the rest of the file still loads.
+ */
+export const AccountOrderFromSettingsFile = Schema.Unknown.pipe(
+  Schema.decodeTo(
+    Schema.toType(AccountOrder),
+    SchemaTransformation.transformEffect({
+      decode: Effect.fn("AccountOrder.decode")(function* (raw: unknown) {
+        const listed = Array.isArray(raw) ? raw : [];
+        const ids = [...new Set(listed.filter(isProviderInstanceId))];
+        const dropped = Array.isArray(raw) ? listed.length - ids.length : 1;
+        if (dropped > 0) {
+          yield* Effect.logWarning(
+            "settings: accountOrder entries that are not provider instance ids, or repeats, are ignored; no work moves to them, and the next settings save writes the cleaned list back to the file",
+            { value: raw },
+          );
+        }
+        return ids as AccountOrder;
+      }),
+      encode: (ids) => Effect.succeed(ids as unknown),
+    }),
+  ),
+);

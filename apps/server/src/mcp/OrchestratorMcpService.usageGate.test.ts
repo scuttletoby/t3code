@@ -188,7 +188,10 @@ interface Dispatched {
  */
 const delegate = (input: {
   readonly settings?: Partial<
-    Pick<ServerSettingsValue, "usagePacingGate" | "usagePacingLowerEffort" | "modelPolicy">
+    Pick<
+      ServerSettingsValue,
+      "usagePacingGate" | "usagePacingLowerEffort" | "modelPolicy" | "accountOrder"
+    >
   >;
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly pacer?: "real" | "untouched" | "absent" | "failing";
@@ -1449,6 +1452,148 @@ describe("OrchestratorMcpService usage pacing gate", () => {
       });
       assert.isTrue(result._tag === "Success");
       assert.strictEqual(dispatched.length, 1);
+    }),
+  );
+});
+
+describe("OrchestratorMcpService account order", () => {
+  /** Read two hours ago: past the 30-minute stale bound the pacer runs with here. */
+  const stale = (usedPercent: number) => ({
+    ...third(usedPercent),
+    usageLimits: { checkedAt: at(-120 * MINUTE), windows: [weekly(usedPercent)] },
+  });
+  /** A full window whose reset time is a minute ago: the value belongs to the window before. */
+  const resetPassed = (base: ServerProvider): ServerProvider => ({
+    ...base,
+    usageLimits: {
+      checkedAt: at(-MINUTE),
+      windows: [{ ...weekly(100), resetsAt: at(-MINUTE) }],
+    },
+  });
+  const order = (...ids: ReadonlyArray<ProviderInstanceId>) => ({ accountOrder: ids });
+
+  it.effect("account full: the task runs on the first account in the order with room", () =>
+    Effect.gen(function* () {
+      // The order wins over room: codex-second has more, but codex-third comes first.
+      const { result, dispatched } = yield* delegate({
+        settings: order(MAIN, THIRD, SECOND),
+        providers: [main(100), second(10), third(50)],
+      });
+      assert.strictEqual(
+        textOf(result),
+        "Account order: codex is at its limit (Weekly 100% used), so this task runs on codex-third, the first account in the order with room.",
+      );
+      assert.strictEqual(dispatched.length, 1);
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: THIRD, model: MODEL });
+    }),
+  );
+
+  it.effect("account with room: nothing moves and the reply has no note", () =>
+    Effect.gen(function* () {
+      const { result, dispatched } = yield* delegate({
+        settings: order(MAIN, SECOND),
+        providers: [main(90), second(10)],
+      });
+      assert.strictEqual(textOf(result), "");
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: MAIN, model: MODEL });
+    }),
+  );
+
+  it.effect("account data stale: that account takes no work and the next one does", () =>
+    Effect.gen(function* () {
+      const { result, dispatched } = yield* delegate({
+        settings: order(THIRD, SECOND),
+        providers: [main(100), second(40), stale(10)],
+      });
+      assert.include(textOf(result), "runs on codex-second");
+      assert.include(
+        textOf(result),
+        "passed over: codex-third has no current usage reading (stale)",
+      );
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: SECOND, model: MODEL });
+    }),
+  );
+
+  it.effect("all accounts full: the task runs as asked, with one note saying why", () =>
+    Effect.gen(function* () {
+      const { result, dispatched } = yield* delegate({
+        settings: order(MAIN, SECOND, THIRD),
+        providers: [main(100), second(100), stale(10)],
+      });
+      assert.strictEqual(
+        textOf(result),
+        "Account order: codex is at its limit (Weekly 100% used) and no account in the order can take this task (codex-second is at its limit (Weekly 100% used); codex-third has no current usage reading (stale)), so it runs on codex as asked.",
+      );
+      assert.strictEqual(dispatched.length, 1);
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: MAIN, model: MODEL });
+    }),
+  );
+
+  it.effect(
+    "account reset in the past: its old full value neither moves work off it nor to it",
+    () =>
+      Effect.gen(function* () {
+        // On it: the old 100% is not current, so the task stays (unknown is never a stop).
+        const kept = yield* delegate({
+          settings: order(MAIN, SECOND),
+          providers: [resetPassed(main(0)), second(10)],
+        });
+        assert.strictEqual(textOf(kept.result), "");
+        assert.deepStrictEqual(kept.dispatched[0]?.modelSelection, {
+          instanceId: MAIN,
+          model: MODEL,
+        });
+        // As a target: not known until read again, so the next account takes the task.
+        const moved = yield* delegate({
+          settings: order(SECOND, THIRD),
+          providers: [main(100), resetPassed(second(0)), third(10)],
+        });
+        assert.include(
+          textOf(moved.result),
+          "codex-second has no current usage reading (resetPassed)",
+        );
+        assert.deepStrictEqual(moved.dispatched[0]?.modelSelection, {
+          instanceId: THIRD,
+          model: MODEL,
+        });
+      }),
+  );
+
+  it.effect("an instance the caller named is never moved by the order", () =>
+    Effect.gen(function* () {
+      const { result, dispatched } = yield* delegate({
+        settings: order(MAIN, SECOND),
+        providers: [main(100), second(10)],
+        target: { providerInstanceId: MAIN },
+      });
+      assert.strictEqual(textOf(result), "");
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: MAIN, model: MODEL });
+    }),
+  );
+
+  it.effect("never moves to an account the project turned off", () =>
+    Effect.gen(function* () {
+      const { result, dispatched } = yield* delegate({
+        settings: order(SECOND, THIRD),
+        providers: [main(100), second(10), third(10)],
+        disabledForProject: [SECOND],
+      });
+      assert.include(textOf(result), "runs on codex-third");
+      assert.include(textOf(result), "codex-second has room, but this project turned it off");
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: THIRD, model: MODEL });
+    }),
+  );
+
+  it.effect("with the pacing gate on too, both notes are in the reply", () =>
+    Effect.gen(function* () {
+      // The order moves the task to codex-second; the gate then finds it ahead and moves it on.
+      const { result, dispatched } = yield* delegate({
+        settings: { ...order(SECOND), usagePacingGate: "enforce" },
+        providers: [main(100), second(70), third(10)],
+      });
+      assert.include(textOf(result), "Account order: codex is at its limit");
+      assert.include(textOf(result), "Usage pacing: codex-second is ahead of its usage pace");
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: THIRD, model: MODEL });
     }),
   );
 });

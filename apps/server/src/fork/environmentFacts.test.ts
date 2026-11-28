@@ -167,6 +167,20 @@ it.effect("this machine's read carries hostResources and placement, with the fac
   }),
 );
 
+it.effect("this machine's placement labels are its facts' labels, as the settings hold them", () =>
+  Effect.gen(function* () {
+    const labelled = fromFile({
+      agentSlots: { enabled: true, maxPerMachine: 3, minFreeMemoryMb: 512 },
+      placement: { mode: "advise", labels: ["GPU", "gpu", "ci-runner"] },
+    });
+    const { placement } = yield* readFacts({ settings: labelled });
+    expect(placement?.labels).toEqual(["gpu", "ci-runner"]);
+    // A placement value the file holds as unreadable reads as off: no labels are claimed.
+    const broken = fromFile({ placement: { mode: "advise", labels: "gpu" } });
+    expect((yield* readFacts({ settings: broken })).placement?.labels).toEqual([]);
+  }),
+);
+
 it.effect("a slot gate that cannot count says unavailable with a reason, never slots free", () =>
   Effect.gen(function* () {
     for (const usage of [

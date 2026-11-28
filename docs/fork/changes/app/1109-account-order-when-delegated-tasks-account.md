@@ -1,0 +1,5 @@
+- Change: Account order: when a delegated task's account is spent, the pacing gate moves it to the next account in the person's order that has room.
+- Why: Delegated work leaves a spent account without the agent picking one.
+- Setting: `server.accountOrder`
+- Default: off (empty order)
+- PR: [#1109](https://github.com/scuttletoby/t3code/pull/1109)

@@ -84,6 +84,8 @@ const NOT_ADVERTISED: Readonly<Record<string, string>> = {
   "fork/remoteReplyRead.ts": "a client of another environment's tool",
   // Asks the linked environment's `orchestrator_capabilities` which driver a task's instance runs.
   "fork/remoteMcpProfile.ts": "a client of another environment's tool",
+  // Reads a linked environment's `t3_environment_read` and `orchestrator_capabilities` to advise.
+  "fork/placementAdvice.ts": "a client of another environment's tool",
 };
 
 // A toolkit: an object whose `tools` are all `Tool`s (Toolkit exports no type guard).

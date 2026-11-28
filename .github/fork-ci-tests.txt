@@ -68,6 +68,7 @@
 .github/scripts/fork-changes-list.test.cjs
 .github/scripts/fork-release-workflow.test.py ok lines
 .github/scripts/fork-release.test.sh ~5s
+.github/scripts/fork-release-downloads.test.py ~8s unittest
 .github/scripts/fork-run-alert.test.sh
 .github/scripts/fork-reusable-permissions.test.py ok lines
 .github/scripts/fork-schema-check.test.cjs ~6s
@@ -174,9 +175,12 @@ fork-kit/pc-agents/tests/update.test.py ~66s unittest
 fork-kit/placement-facts/tests/scripts.test.py unittest
 fork-kit/review/tests/comments.test.py unittest
 fork-kit/review/tests/eval.test.py unittest
+fork-kit/review/tests/packet.test.py unittest
 fork-kit/review/tests/plan.test.py unittest
 fork-kit/schedule-kick/tests/cron.test.py unittest
+fork-kit/schedule-kick/tests/heads.test.py unittest
 fork-kit/schedule-kick/tests/install.test.py unittest
+fork-kit/schedule-kick/tests/keepon.test.py unittest
 fork-kit/schedule-kick/tests/kick.test.py unittest
 fork-kit/schedule-kick/tests/late.test.py unittest
 fork-kit/slot-filler/tests/filler.test.py unittest
