@@ -83,7 +83,7 @@ class Install(fx.FakeHost):
         self.assertEqual(self.config(), {'version': 1, 'settings': False})
         self.assertIsNone(self.drop_in())
         self.assertIn('hooks not in managed settings', out)
-        for hook in wiring.HOOKS + ('agent-guards',):
+        for hook in wiring.HOOKS + ('agent-guards', 'facts', 'fork-lens-packet'):
             self.assertTrue(self.is_file(f'/usr/local/bin/{hook}'), hook)
         self.assertEqual(self.run_main('self-check')[0], 0)
 
