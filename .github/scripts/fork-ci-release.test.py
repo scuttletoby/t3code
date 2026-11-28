@@ -463,7 +463,7 @@ def load(rel, name):
     loader.exec_module(mod)
     return mod
 failed = []
-if how == 'kit_install':        # agent-guards, cleaner, gardener, golive, schedule-kick, update-policy: check_options' file part
+if how == 'kit_install':        # agent-guards, ci-lane, cleaner, gardener, golive, schedule-kick, update-policy: check_options' file part
     m = load(installer, 'kit_installer')
     inst, missing = m.INSTALLER, []
     for rel in inst.source_files():
@@ -526,6 +526,7 @@ KITS = {"agent-guards": ("kit_install", "sbin/agent-guards-install", "kit"),
         "gardener": ("kit_install", "sbin/gardener-install", "kit"),
         "golive": ("kit_install", "sbin/t3-golive-install", "kit"),
         "schedule-kick": ("kit_install", "sbin/schedule-kick-install", "kit"),
+        "ci-lane": ("kit_install", "sbin/ci-lane-install", "kit"),
         "update-policy": ("kit_install", "sbin/update-policy-install", "kit"),
         "heavy": ("heavy", "sbin/heavy-install", "kit"),
         "model-guard": ("own", "sbin/model-guard-install", "kit"),
@@ -535,9 +536,7 @@ KITS = {"agent-guards": ("kit_install", "sbin/agent-guards-install", "kit"),
 # fork-kit folders that install nothing on a host
 NO_INSTALLER = {"common": "the code and the bootstrap the kits share", "review": "a skill an agent reads",
                 "placement-facts": "example scripts a person copies",
-                "slot-filler": "one script and a timer a person sets up from its README",
-                # #1157 phase 2b adds ci-lane's installer (with the launcher's lane verbs) and moves this row to KITS
-                "ci-lane": "no installer yet: phase 2b of #1157 adds it and must move this row to KITS"}
+                "slot-filler": "one script and a timer a person sets up from its README"}
 # What each kind of failure asks for
 CAUSES = {"path": "add the path(s) to .github/fork-ci-release.json paths",
           "self-test": "the installer's own self-test failed on the release: a file a copied script loads is not in "
