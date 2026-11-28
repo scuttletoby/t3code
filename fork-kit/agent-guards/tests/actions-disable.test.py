@@ -3796,5 +3796,126 @@ class Pr1041Round2Test(Case):
                     'b{a,}sh d.txt', env=env)
 
 
+class Issue1057Test(Case):
+    """#1057: a guarded word inside a shell comment of a file read for CLAUDE_CODE_SIMPLE (a sourced file,
+    ~/.bashrc) is no command. Everything else keeps its comments: the command's own text (it can read them back from
+    $BASH_EXECUTION_STRING), and Python and JS code, inline, in a script file or a heredoc (#1108: each guess at
+    another language's comments was a way past). Each passing case has its twin, which is still refused."""
+
+    def refused(self, *cmds):
+        for cmd in cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.decide(cmd), cmd)
+
+    def passes(self, *cmds):
+        for cmd in cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.decide(cmd), cmd)
+
+    def test_inline_code_is_read_whole(self):
+        self.refused("python3 -c '# never: gh workflow disable 1\nprint(1)'",
+                     "python3 -c 'print(1)  # not codex exec'",
+                     "python3 -Bc '# claude --bare'",
+                     "node -e '// never codex exec\nconsole.log(1)'",
+                     "node --eval='// codex exec'",
+                     "python3 -c 'import os; os.system(\"gh workflow disable 1\")'",
+                     "perl -e '# codex exec'")
+
+    def test_script_files_are_read_whole(self):
+        self.write('notes.py', '# never run gh workflow disable 1 by hand\nprint(1)\n')
+        self.write('ok.js', '#!/usr/bin/env node\n// do not run `claude --bare` here\nconsole.log(1)\n')
+        self.write('run.py', 'import subprocess\nsubprocess.run(["gh", "workflow", "disable", "1"])\n')
+        self.refused('python3 notes.py', 'node ok.js', './ok.js', 'python3 run.py')
+
+    def test_heredoc_into_an_interpreter_is_read_whole(self):
+        self.refused("python3 - <<'E'\n# gh workflow disable 1\nprint(1)\nE",
+                     "node <<'E'\n// codex exec\nconsole.log(1)\nE",
+                     "python3 - <<'E'\nimport os; os.system('gh workflow disable 1')\nE")
+
+    def test_start_files_and_sourced_files(self):
+        self.write('.bashrc', '# export CLAUDE_CODE_SIMPLE=1   (never: it turns the hooks off)\nalias ll="ls -l"\n')
+        self.write('vars.sh', 'X=1  # not CLAUDE_CODE_SIMPLE\n')
+        self.passes('claude -p hi', '. ./vars.sh; claude -p hi')
+        self.write('vars.sh', 'echo "# not a comment"; export CLAUDE_CODE_SIMPLE=1\n')
+        self.refused('. ./vars.sh; claude -p hi', 'CLAUDE_CODE_SIMPLE=1 claude -p hi',
+                     'export CLAUDE_CODE_SIMPLE=1 # set\nclaude -p hi')
+        self.write('vars.sh', 'export $(tail -n1 vars.sh | cut -c3-)\n# CLAUDE_CODE_SIMPLE=1\n')   # reads itself
+        self.refused('. ./vars.sh; claude -p hi')
+        self.write('.bashrc', 'cat > x <<E\n# CLAUDE_CODE_SIMPLE=1\nE\n')   # a heredoc body is no comment
+        self.refused('claude -p hi')
+        self.write('.bashrc', 'export CLAUDE_CODE_SIMPLE=1\n')
+        self.refused('claude -p hi')
+
+    def test_the_command_keeps_its_own_comments(self):
+        """#1108: the command can read its own text back, comments too ($BASH_EXECUTION_STRING), so its
+        CLAUDE_CODE_SIMPLE / BASH_ENV / `disable` checks read it whole."""
+        self.refused('ls # CLAUDE_CODE_SIMPLE=1\nclaude -p hi',
+                     'export $(printf %s "$BASH_EXECUTION_STRING" | tail -c 20); claude -p hi # CLAUDE_CODE_SIMPLE=1',
+                     'gh $(printf %s "$BASH_EXECUTION_STRING" | tail -c 16) 1 # workflow disable')
+
+    def test_data_keeps_its_comments(self):
+        """Text a command turns into code keeps its comments."""
+        self.write('notes.py', '# gh workflow disable 1\n')
+        self.write('later.js', '// codex exec\n')
+        self.refused("sed 's/^# //' notes.py | bash", "sed 's,^// ,,' later.js | sh")
+
+    def test_shell_comments_still_pass(self):
+        """The shell text itself: already right before #1057, kept so."""
+        self.passes('# never run gh workflow disable 1', 'ls  # claude --bare', '# codex exec\nls')
+        self.refused('ls\ngh workflow disable 1 # off', 'echo "#"; codex exec hi')
+
+
+class Pr1108Round1Test(Case):
+    """#1108 fix round 1: the lens commands that got past the Python/JS comment dropping. Each one is refused on
+    main and must stay refused: Python and JS code (inline, a script file, a heredoc) is read whole, comments too.
+    The guarded call is only text handed to decide(); nothing here runs."""
+
+    GH = 'gh workflow disable 1'
+
+    def refused(self, *cmds):
+        for cmd in cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.decide(cmd), cmd)
+
+    def test_code_lens_commands_are_refused(self):
+        gh = self.GH
+        a = f's = "\x1c"\nimport os; os.system("{gh}")\n#\n'   # a raw \x1c in a string: a row for splitlines()
+        a2 = f's = " "\nimport os; os.system("{gh}")\n#\n'
+        self.write('a.py', a)
+        self.write('a2.py', a2)
+        self.write('b.py', f'# coding: utf-7\n#+AAo-import os; os.system("{gh}")\n')
+        self.write('c.py', f'class A{{ #x = require("child_process").execSync("{gh}")\n}}; new A\n')
+        self.write('c.js', f'x = 4 \\\n//2; import os; os.system("{gh}")\n')
+        d = f'`\n// ${{require("child_process").execSync("{gh}")}}\n`\n'
+        self.write('d.js', d)
+        self.refused(
+            f"python3 -c '{a}'",                                                     # A1
+            f"python3 -c '{a2}'",
+            'python3 a.py', 'python3 a2.py',                                         # A2
+            f"python3 - <<'E'\n{a}E",                                                # A3
+            'python3 b.py',                                                          # B1
+            f"python3 - <<'E'\n# coding: utf-7\n#+AAo-import os; os.system(\"{gh}\")\nE",   # B2
+            'node c.py',                                                             # C1
+            'python3 c.js',                                                          # C2
+            f"node -e '{d}'",                                                        # D1
+            'node d.js',                                                             # D2
+            f"node -e 's = \"true \\\n// ; {gh}\"; require(\"child_process\").execSync(s)'",   # E1
+            f"python3 -c 'import sys,os; os.system(sys.argv[1][3:])' '-c#{gh}'",      # F1
+            f"node -e 'require(\"child_process\").execSync(process.argv[2].slice(9))' -- '--eval=//{gh}'",  # F2
+            f"python3 '-cimport os,sys; os.system(sys.stdin.read()[1:])' <<'E'\n#{gh}\nE")  # G1
+
+    def test_state_lens_commands_are_refused(self):
+        gh = self.GH
+        self.write('u7.py', f'#!/usr/bin/env python3\n# coding: utf-7\n# +AAo-print("{gh}")\n')
+        self.write('x.py', f'class A{{#x;static{{console.log("{gh}")}}}}\n//}}\n')
+        self.write('y.js', f'x = (4\n// 2, print("{gh}"))\n')
+        blk = f'/*\n// */ console.log("{gh}")\n'
+        tpl = f's = `\n// x`; console.log("{gh}") //`\n'
+        self.write('b.js', blk)
+        self.write('t.js', tpl)
+        self.refused('python3 u7.py', './u7.py', 'node x.py', 'python3 y.js', 'node b.js', 'node t.js',
+                     f"node -e '{blk}'", f"node -e '{tpl}'")
+
+
 if __name__ == '__main__':
     unittest.main()
