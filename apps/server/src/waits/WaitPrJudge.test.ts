@@ -149,6 +149,7 @@ const fakeHost = () => {
     }),
     Layer.mock(ProjectService.ProjectService)({
       getShell: (projectId) => Effect.succeed(Option.fromNullishOr(projects.get(projectId))),
+      listShells: () => Effect.sync(() => [...projects.values()]),
     }),
   );
   const layer = Layer.merge(
@@ -473,21 +474,27 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
         const filePath = yield* storePath;
         const service = yield* makeService(filePath, yield* makePrJudge());
 
-        // Naming the repository does not help: the host comes from the project's remote. The
-        // refusal never says "pass url" or "pass host" (fields link_pull_request has, wait_for not).
-        for (const input of [
-          prWait({ number: 7 }),
-          prWait({ number: 7, repository: "acme/widgets" }),
-        ]) {
+        // Without a repository, or naming one no project of T3 has as its remote, the host is
+        // unknown. The refusal never says "pass url" or "pass host" (fields link_pull_request
+        // has, wait_for not), and says what to do instead.
+        for (const [input, words] of [
+          [prWait({ number: 7 }), "Name its repository (owner/repo)"],
+          [
+            prWait({ number: 7, repository: "other/gadgets" }),
+            "no project in T3 has other/gadgets as its remote",
+          ],
+        ] as const) {
           const refused = yield* refusal(service, input, BARE_PROJECT);
           assert.strictEqual(refused.code, "invalid");
           assert.include(refused.message, "has no remote on a pull request host T3 knows");
+          assert.include(refused.message, words);
           assert.notMatch(refused.message, /\bpass\b/iu);
         }
         assert.deepStrictEqual(host.reads, []);
-        // Each new wait looked again past the cached "none" before it was refused.
+        // Each new wait looked again past the cached "none" before it was refused; the named
+        // repository was then looked for among the projects (the bare one looked up once more).
         const bare = `/work/${BARE_PROJECT}`;
-        assert.deepStrictEqual(host.lookups, [bare, bare, bare, bare]);
+        assert.deepStrictEqual(host.lookups, [bare, bare, bare, bare, bare]);
         assert.deepStrictEqual(host.refreshes, [bare, bare]);
 
         yield* register(service, prWait({ number: 7, until: "merged" }));
@@ -497,6 +504,38 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
         const [ended] = yield* storedWaits(filePath);
         assert.strictEqual(ended?.result?.outcome, "check_error");
         assert.strictEqual(ended?.result?.detail, "The project of this wait is gone.");
+      }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+    },
+  );
+
+  it.effect(
+    "a project without a remote waits on a repository another project of T3 has as its remote",
+    () => {
+      const host = fakeHost();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+        const filePath = yield* storePath;
+        const service = yield* makeService(filePath, yield* makePrJudge());
+        const made = yield* register(
+          service,
+          prWait({ number: 7, repository: "Acme/Widgets", until: "merged" }),
+          BARE_PROJECT,
+        );
+        assert.strictEqual(made.state, "waiting");
+        assert.deepStrictEqual(host.reads, ["detail github.com acme/widgets#7 stale:false"]);
+        const [stored] = yield* storedWaits(filePath);
+        assert.deepStrictEqual(stored?.spec, {
+          number: 7,
+          repository: "acme/widgets",
+          host: "github.com",
+          until: "merged",
+        });
+
+        host.prs.set("acme/widgets#7", { state: "merged", headSha: HEAD_A });
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 1 });
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.result?.outcome, "merged");
       }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
     },
   );
@@ -557,7 +596,7 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
   });
 
   it.effect(
-    "a stored wait whose project's remote is gone is a failed read: check_error only after the grace",
+    "a stored wait whose project's remote is gone reads its pinned host without the remote",
     () => {
       const host = fakeHost();
       return Effect.gen(function* () {
@@ -566,14 +605,44 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
         const filePath = yield* storePath;
         const service = yield* makeService(filePath, yield* makePrJudge());
         yield* register(service, prWait({ number: 8, until: "merged" }));
+
+        // The lookup finds no remote now, here or in any project: the pin holds host and repository.
+        host.projects.set(PROJECT, shell(PROJECT, null));
+        host.remotes.set(`/work/${PROJECT}`, null);
+        host.prs.set("acme/widgets#8", { state: "merged", headSha: HEAD_A });
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 1 });
+        const [ended] = yield* storedWaits(filePath);
+        assert.strictEqual(ended?.result?.outcome, "merged");
+        assert.strictEqual(host.reads.at(-1), "detail github.com acme/widgets#8 stale:false");
+      }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+    },
+  );
+
+  it.effect(
+    "an unpinned stored wait whose project's remote is gone is a failed read: check_error only after the grace",
+    () => {
+      const host = fakeHost();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const fs = yield* FileSystem.FileSystem;
+        host.prs.set("acme/widgets#8", { state: "open", headSha: HEAD_A });
+        const filePath = yield* storePath;
+        const service = yield* makeService(filePath, yield* makePrJudge());
+        yield* register(service, prWait({ number: 8, until: "merged" }));
         const readsAtRegistration = host.reads.length;
+        // As an older build stored it: no pinned host or repository.
+        const file = JSON.parse(yield* fs.readFileString(filePath));
+        file.waits[0].spec = { number: 8, until: "merged" };
+        yield* fs.writeFileString(filePath, JSON.stringify(file));
+        const after = yield* makeService(filePath, yield* makePrJudge());
 
         // The lookup finds no remote now (removed, or `git remote` timed out on a busy host).
         host.projects.set(PROJECT, shell(PROJECT, null));
         host.remotes.set(`/work/${PROJECT}`, null);
         host.prs.set("acme/widgets#8", { state: "merged", headSha: HEAD_A });
         yield* TestClock.adjust(SWEEP);
-        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 0 });
+        assert.deepStrictEqual(yield* after.judgeDue(), { judged: 1, ended: 0 });
         const [failed] = yield* storedWaits(filePath);
         assert.strictEqual(failed?.state, "waiting");
         assert.include(failed?.lastError ?? "", "has no remote on a pull request host T3 knows");
@@ -581,7 +650,7 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
 
         for (let minute = 0; minute < 16; minute += 2) {
           yield* TestClock.adjust(SWEEP);
-          yield* service.judgeDue();
+          yield* after.judgeDue();
         }
         const [ended] = yield* storedWaits(filePath);
         assert.strictEqual(ended?.result?.outcome, "check_error");
