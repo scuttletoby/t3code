@@ -1913,8 +1913,8 @@ make_canaries() {
 }
 
 check_net() {
-  local url=$1 target host port user resolv own blocked seen from linked canaries rc=0 i n=0 table=refused
-  local -a pairs=() props table_props
+  local url=$1 target host port user resolv own blocked seen from linked canaries rc=0 prop n=0 table=refused
+  local -a pairs=() props table_props=()
   shift
   [[ $url =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] || die "check-net: not a plain http(s) URL: $url"
   (($# > 0)) || die "check-net: name at least one HOST:PORT that must be closed"
@@ -1939,12 +1939,12 @@ check_net() {
   sandbox "$user" "$resolv" "$blocked" "$RUN_DIR/check-net.root" ''
   # The same sandbox with this host's own addresses left out of IPAddressDeny: the nft table alone stands between
   # the job and them (OWN_PROBE).
-  table_props=("${props[@]}")
-  for i in "${!table_props[@]}"; do
-    if [[ ${table_props[i]} == IPAddressDeny=* ]]; then
-      table_props[i]="IPAddressDeny=${PRIVATE4[*]} ::/0"
+  for prop in "${props[@]}"; do
+    if [[ $prop == IPAddressDeny=* ]]; then
+      prop="IPAddressDeny=${PRIVATE4[*]} ::/0"
       n=$((n + 1))
     fi
+    table_props+=("$prop")
   done
   ((n == 1)) || die "check-net: the sandbox has $n IPAddressDeny settings, not one"
   canaries="$CANARY_DIR/fork-fleet-canary $CANARY_DIR/fork-fleet-canary-group"
