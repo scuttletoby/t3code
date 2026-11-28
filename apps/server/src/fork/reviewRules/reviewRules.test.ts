@@ -59,6 +59,8 @@ const FIELDS: Record<string, ReadonlyArray<string> | null> = {
   unicode: ["name", "body", "findings", "section", "unassigned", "refused"],
   // Run by lensStart.test.ts: lens_start's copy of lens_reads, review_rounds and verdict.
   reads: ["name", "posts", "head", "same", "override_authors", "required", "expect"],
+  // Run by lensReport.test.ts: the comment lens_report writes, and what the gate reads of it.
+  written: ["name", "lens", "reviewer", "head", "body", "comment", "refused", "expect"],
   rounds: [
     "name",
     "config",
