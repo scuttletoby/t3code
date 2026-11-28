@@ -27,6 +27,7 @@
           ".github/*.yml",
           ".github/*.yaml",
           ".github/fork-actions-policies.json",
+          ".github/fork-ci-plan.json",
           ".github/fork-ci-release*.json",
           ".github/fork-ci-rerun.json",
           ".github/fork-fleet.json",

@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "workflow": ".github/workflows/fork-tests.yml",
+  "parts": [
+    {
+      "name": "workflows",
+      "job": "workflows",
+      "check": "Workflow lint and upstream drift",
+      "step": "Fork script tests",
+      "args": ["!fork-kit/", "!fork-ci/", "!.github/scripts/fork-fleet-walls"],
+      "lane": true
+    },
+    {
+      "name": "fleet-launcher",
+      "job": "workflows",
+      "check": "Workflow lint and upstream drift",
+      "step": "Fleet launcher as root",
+      "args": ["--run", ".github/scripts/fork-fleet.test.py"],
+      "lane": false,
+      "why": "runs as root"
+    },
+    {
+      "name": "action",
+      "job": "action_tests",
+      "check": "Fork action and fleet walls tests",
+      "step": "Fork action and fleet walls tests",
+      "args": ["fork-ci/", ".github/scripts/fork-fleet-walls"],
+      "lane": true
+    },
+    {
+      "name": "kit",
+      "job": "kit_tests",
+      "check": "Fork kit tests {shard}",
+      "step": "Fork kit tests",
+      "args": ["fork-kit/"],
+      "shards": 3,
+      "lane": true
+    },
+    {
+      "name": "gh-apps-root",
+      "job": "kit_root_tests",
+      "check": "Fork kit tests as root",
+      "step": "gh-apps kit as root",
+      "args": ["--run", "fork-kit/gh-apps/tests/root.test.py"],
+      "lane": false,
+      "why": "runs as root"
+    },
+    {
+      "name": "heavy",
+      "job": "kit_root_tests",
+      "check": "Fork kit tests as root",
+      "step": "heavy kit with a real systemd user manager",
+      "args": ["--run", "fork-kit/heavy/tests/heavy.test.py"],
+      "lane": false,
+      "why": "needs a systemd user manager it starts as root"
+    },
+    {
+      "name": "owned-reads",
+      "job": "lint",
+      "check": "Lint",
+      "step": "Check that app code reads no fork-owned path",
+      "args": ["--run", ".github/scripts/fork-owned-reads.test.py"],
+      "lane": false,
+      "why": "needs the app's dependencies"
+    }
+  ]
+}

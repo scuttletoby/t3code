@@ -1,0 +1,10 @@
+#!/usr/bin/python3 -IB
+"""ci-lane: the own CI lane kit (lib/cilane, fork-kit/ci-lane/README.md). Runs the fork's own tests of trusted heads
+on fleet machines, in shadow beside Actions, and posts one non-required check per head.
+-I: no environment variable, user site folder or current folder changes what Python loads. The code is loaded
+only from this file's real folder."""
+import os, sys
+kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path[:0] = [os.path.join(kit, 'lib')]
+from cilane import cli  # noqa: E402
+sys.exit(cli.main(sys.argv[1:]))
