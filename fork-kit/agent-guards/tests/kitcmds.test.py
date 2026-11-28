@@ -586,6 +586,67 @@ class Precheck(Base):
         self.assertIn('OK: fmt, lint', r.stdout)
         self.assertNotIn('fork checks', r.stdout)
 
+    # --push: the step before every push (docs/fork/agent-rules.md) -------------------------------------------
+
+    def test_push_checks_only_the_pushed_commits_and_never_writes_or_tests(self):
+        self.capacity()
+        self.fake('vp', 'sys.exit(1 if os.environ.get("FAKE_FMT_FAIL") and "--check" in sys.argv else 0)')
+        r = self.precheck('--push')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.words('vp'), [['fmt', '--check', '--no-error-on-unmatched-pattern', 'src/a.ts'],
+                                            ['lint', '--no-error-on-unmatched-pattern', 'src/a.ts']],
+                         'only the committed change (unstaged and new files are not pushed); fmt only checks')
+        self.assertEqual(self.calls('t3-capacity'), [], 'no test, so no capacity check')
+        self.assertNotIn('x ok', r.stdout)
+        self.assertIn('OK: fmt check, lint, fork checks', r.stdout)
+        self.assertIn('note: uncommitted changes are not in the push', r.stdout)
+        r = self.precheck('--push', env={'FAKE_FMT_FAIL': '1'})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('FAILED: fmt check (exit 1)', r.stdout)
+
+    def test_push_fetches_the_base_first_so_a_stale_main_is_not_the_base(self):
+        def stand_ins():
+            for f in FORK_CHECK_FILES[1:]:
+                write(os.path.join(self.repo, f), NODE_LOGGER)
+            git('commit', '-q', '-am', 'stand-in checks', cwd=self.repo)
+            git('push', '-q', 'origin', 'main', cwd=self.repo)
+        git('checkout', '-q', 'main', cwd=self.repo)
+        stand_ins()
+        git('checkout', '-q', 'change', cwd=self.repo)
+        main = git('rev-parse', 'main', cwd=self.repo)
+        git('update-ref', 'refs/remotes/origin/main', 'main~1', cwd=self.repo)   # last fetched before main moved
+        r = self.precheck('--push')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(git('rev-parse', 'origin/main', cwd=self.repo), main)
+        self.assertIn(['--config-ref', main], [c[2:4] for c in self.calls('fork-seam-check.cjs')],
+                      'the seam check reads the remote main\'s config, as CI does')
+
+    def test_every_node_check_step_of_the_workflow_runs_with_no_second_list(self):
+        def extra_step():
+            wf = os.path.join(self.repo, FORK_CHECK_FILES[0])
+            with open(wf) as f:
+                text = f.read()
+            step = ('\n      - name: One more check\n'
+                    '        env:\n          HEAD_SHA: ${{ github.event.pull_request.head.sha }}\n'
+                    '        run: node .github/scripts/fork-extra-check.cjs "$HEAD_SHA"\n')
+            self.assertIn('\n\n  outside_pr:', text)
+            write(wf, text.replace('\n\n  outside_pr:', step + '\n  outside_pr:', 1))
+            write(os.path.join(self.repo, '.github/scripts/fork-extra-check.cjs'),
+                  'console.error("extra says no to " + process.argv[2]); process.exit(1);\n')
+            git('add', '-A', cwd=self.repo)
+            git('commit', '-q', '-m', 'one more check', cwd=self.repo)
+        self.on_main(extra_step)
+        r = self.precheck('--no-tests')
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('fork-precheck: extra check FAILED (exit 1):', r.stderr)
+        self.assertIn('extra says no to ' + git('rev-parse', 'HEAD', cwd=self.repo), r.stderr)
+        self.assertIn('FAILED: extra check (exit 1)', r.stdout)
+
+    def test_the_agent_rules_name_the_push_check(self):
+        with open(os.path.join(REPO_TOP, 'docs/fork/agent-rules.md')) as f:
+            rules = f.read()
+        self.assertTrue('fork-kit/agent-guards/bin/fork-precheck --push' in rules, 'the push step is not named')
+
     def test_no_change_runs_nothing_and_outside_a_checkout_is_exit_2(self):
         git('reset', '-q', '--hard', 'origin/main', cwd=self.repo)
         git('clean', '-q', '-fd', cwd=self.repo)

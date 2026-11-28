@@ -267,14 +267,20 @@ Pipelines agents used to rebuild each time, several turns each, as one command (
   clone), else one install. Run again, it fast-forwards the checked-out branch when it is clean and has no commits of
   its own (else a note says it is left as it was) and installs again when `pnpm-lock.yaml` is not the one installed.
 - `fork-precheck`: `vp fmt` and `vp lint` on the files changed against the base (the default base is fetched first,
-  and the base's commit and age are printed); then the fork checks behind most
-  "Fork checks" reds (the schema, upstream-files and seam checks), run as `.github/workflows/fork-checks.yml` runs
-  them, with the base branch's scripts and the same arguments (base: the merge-base, head: `HEAD`'s commits), printing
-  only a failing check's lines (a check it cannot run fails; `--no-fork-checks` skips them); then the test files the
-  change touches (a source file's own `NAME.test.*` beside it, else in the nearest `tests/` folder: its own folder's, then each one above), once
-  `t3-capacity` says OK where it is installed. Only its exit 1 (NOT OK) gives exit 3, "run it again later", and only
-  when no step had failed (then it is exit 1); any other exit of `t3-capacity` (2: a wrong call, as `--kind` to one
-  that takes only MB) gives exit 2 and says so, or exit 1 when a step had already failed.
+  and the base's commit and age are printed); then the fork checks behind most "Fork checks" reds (every
+  `run: node .github/scripts/fork-*.cjs` step of `.github/workflows/fork-checks.yml`, today the schema,
+  upstream-files and seam checks; the workflow is the one list), run as that workflow runs them, with the base
+  branch's scripts and the same arguments (base: the merge-base, head: `HEAD`'s commits), printing only a failing
+  check's lines (a check it cannot run fails; `--no-fork-checks` skips them); then the test files the change touches
+  (a source file's own `NAME.test.*` beside it, else in the nearest `tests/` folder: its own folder's, then each one
+  above), once `t3-capacity` says OK where it is installed. Only its exit 1 (NOT OK) gives exit 3, "run it again
+  later", and only when no step had failed (then it is exit 1); any other exit of `t3-capacity` (2: a wrong call, as
+  `--kind` to one that takes only MB) gives exit 2 and says so, or exit 1 when a step had already failed.
+  `fork-precheck --push` is the step before every push ([agent rules](../../docs/fork/agent-rules.md)), runnable
+  from a checkout without the kit installed (`fork-kit/agent-guards/bin/fork-precheck --push`): it fetches the base
+  when it is a remote branch, then checks only the committed files (what the push sends) with `vp fmt --check` (it
+  writes nothing) and `vp lint`, and runs the fork checks; no tests, so no capacity check. Exit 1 means CI would be
+  red on one of these.
 
 COMMANDS.md is a state table that `facts` reads on every machine with the kit, after the configured ones, so
 `facts --index` and the session-start context list the commands with no setting ([FACTS.md](FACTS.md)).
