@@ -1449,8 +1449,8 @@ reads as off, and a bad `graceSeconds` as 60; a save with a bad value is refused
 Lanes under a project's orchestrator
 ([#1156](https://github.com/scuttletoby/t3code/issues/1156)): the orchestrator stays the one thread
 the person talks to, and each lane (a long-lived child thread) owns one kind of work, such as the
-pull request queue, with its own workers. So far: the settings, and the lane store below. No tool
-starts a lane yet (part 3), so no lane runs.
+pull request queue, with its own workers. So far: the settings, the lane store and the lane tools
+below.
 
 - `enabled` (off): no lane can be switched on, whatever is defined.
 - `definitions`: changes to the lanes that exist. The built-in lanes `pr-queue` (owns `pr`) and
@@ -1502,6 +1502,20 @@ that is not one) is refused, and every new state is checked before it is written
 names are looked up as the file's own keys only, so a name like `constructor` finds nothing. Run
 records name the lane a run worked for (a lane's thread, or one of its workers) in `lane`; for a
 stopped lane, only runs that ended by its stop.
+
+**The lane tools** (part 3), in the T3 tool group `lanes`, are listed and callable only while
+`enabled` is on (off: hidden from `tools/list` and `tool_search`, refused when called). Each acts on
+the calling thread's project, and each repeats safely:
+
+- `lane_start`: switches a defined lane on with a thread of the project acting for it (usually a
+  child the orchestrator started with `delegate_task`; a thread acts for at most one running lane),
+  and returns its generation. That thread passes the lane and generation to `lane_claim` and
+  `lane_release`; a thread that is not the lane's current one is refused.
+- `lane_stop`: switches a lane off and releases its claims.
+- `lane_board`: every defined lane (`off` when it never ran, `undefined` when settings no longer
+  define it) with its thread and generation, the claims (stale ones marked), the escalations
+  waiting and each lane's last 3 notes.
+- `lane_claim`, `lane_release`: from the lane's thread, one owner per item, as the store above.
 
 ```json
 {

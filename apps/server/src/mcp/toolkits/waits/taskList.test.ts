@@ -24,6 +24,7 @@ import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementSer
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import { Playtest } from "../../../playtest/PlaytestLayer.ts";
+import { LaneStore } from "../../../fork/lanes/LaneStore.ts";
 import { ServerSettingsService } from "../../../serverSettings.ts";
 import { Waits } from "../../../waits/WaitWorker.ts";
 import * as McpHttpServer from "../../McpHttpServer.ts";
@@ -138,6 +139,7 @@ const toolsLayer = (world: World) => {
         ),
     }),
     Layer.mock(Waits)({}),
+    Layer.mock(LaneStore)({}),
     Layer.mock(Playtest)({ filePath: "unused" }),
     Layer.mock(RemoteDelegation.RemoteDelegation)({
       // The environment that went away never answers; the other one says the run is going.

@@ -14,6 +14,8 @@ import { ThreadManagementService } from "../orchestration-v2/ThreadManagementSer
 import { PeerForwarding } from "../peer/PeerForwarding.ts";
 import { RemoteDelegation } from "../peer/RemoteDelegation.ts";
 import { Playtest } from "../playtest/PlaytestLayer.ts";
+import { LaneStore } from "../fork/lanes/LaneStore.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 import { Waits } from "../waits/WaitWorker.ts";
 import budget from "./forkAgentContextBudget.json" with { type: "json" };
 
@@ -21,6 +23,8 @@ import budget from "./forkAgentContextBudget.json" with { type: "json" };
 const toolHandlerServices = Layer.mergeAll(
   Layer.mock(ThreadManagementService)({}),
   Layer.mock(Waits)({}),
+  Layer.mock(LaneStore)({}),
+  Layer.mock(ServerSettingsService)({}),
   Layer.mock(RemoteDelegation)({}),
   Layer.mock(PeerForwarding)({}),
   Layer.mock(Playtest)({ filePath: "unused" }),

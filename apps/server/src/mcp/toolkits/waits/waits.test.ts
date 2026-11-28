@@ -20,6 +20,7 @@ import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementSer
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import { Playtest } from "../../../playtest/PlaytestLayer.ts";
+import { LaneStore } from "../../../fork/lanes/LaneStore.ts";
 import { ServerSettingsService } from "../../../serverSettings.ts";
 import type { WaitDelivery } from "../../../waits/WaitDelivery.ts";
 import * as WaitService from "../../../waits/WaitService.ts";
@@ -105,6 +106,7 @@ const toolsLayer = (input: {
     Layer.mock(RemoteDelegation.RemoteDelegation)({}),
     Layer.mock(PeerForwarding.PeerForwarding)({}),
     Layer.mock(Playtest)({ filePath: "unused" }),
+    Layer.mock(LaneStore)({}),
   );
   const made = WaitService.make({
     filePath: input.filePath,
@@ -713,9 +715,14 @@ it.layer(NodeServices.layer)("wait tools", (it) => {
               "playtest",
               "lens_start",
               "lens_report",
+              "lane_start",
+              "lane_stop",
+              "lane_board",
+              "lane_claim",
+              "lane_release",
             ],
           );
-          // task_list, playtest, lens_start and lens_report share the toolkit; their budget is ForkAgentContextBudget's.
+          // task_list, playtest, the lens and the lane tools share the toolkit; their budget is ForkAgentContextBudget's.
           const listed = all.filter((tool) => tool.name.startsWith("wait_"));
           const total = listed.reduce((sum, tool) => sum + tool.description.length, 0);
           assert.isAtMost(total, 900);

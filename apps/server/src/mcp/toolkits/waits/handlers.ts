@@ -6,6 +6,13 @@ import { Waits } from "../../../waits/WaitWorker.ts";
 import { assertSameLink } from "../../linkOrigin.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { assertTargetWithinLimits, type Caller, unavailable } from "../../threadAccess.ts";
+import {
+  laneBoardCall,
+  laneClaimCall,
+  laneReleaseCall,
+  laneStartCall,
+  laneStopCall,
+} from "../../../fork/lanes/laneTools.ts";
 import { lensReportCall } from "../../../fork/reviewRules/lensReportTool.ts";
 import { lensStartCall } from "../../../fork/reviewRules/lensStartTool.ts";
 import { callingThread as threadOfCaller } from "./callingThread.ts";
@@ -94,6 +101,15 @@ const handlers = {
   playtest: McpToolAccess.actsAsCaller((input) => playtestCall(input)),
   lens_start: McpToolAccess.actsAsCaller((input) => lensStartCall(input)),
   lens_report: McpToolAccess.actsAsCaller((input) => lensReportCall(input)),
+  // Fork (lanes): the lane thread is checked as the thread tools check a thread they change.
+  lane_start: McpToolAccess.writesThreads(
+    (input) => [input.threadId],
+    (input) => laneStartCall(input),
+  ),
+  lane_stop: McpToolAccess.actsAsCaller((input) => laneStopCall(input)),
+  lane_board: McpToolAccess.readsAsCaller(() => laneBoardCall()),
+  lane_claim: McpToolAccess.actsAsCaller((input) => laneClaimCall(input)),
+  lane_release: McpToolAccess.actsAsCaller((input) => laneReleaseCall(input)),
 } satisfies McpToolAccess.Handlers<typeof WaitsToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(WaitsToolkit, handlers);

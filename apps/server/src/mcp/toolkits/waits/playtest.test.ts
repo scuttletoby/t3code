@@ -39,6 +39,7 @@ import {
   live,
   writeStore,
 } from "../../../playtest/PlaytestService.testkit.ts";
+import { LaneStore } from "../../../fork/lanes/LaneStore.ts";
 import { ServerSettingsService } from "../../../serverSettings.ts";
 import { Waits } from "../../../waits/WaitWorker.ts";
 import * as McpHttpServer from "../../McpHttpServer.ts";
@@ -96,6 +97,7 @@ const toolsLayer = (
         }),
         // The other fork tools' services; these tests never call them.
         Layer.mock(Waits)({}),
+        Layer.mock(LaneStore)({}),
         Layer.mock(RemoteDelegation.RemoteDelegation)({}),
         Layer.mock(PeerForwarding.PeerForwarding)({}),
         Layer.succeed(Playtest, service),

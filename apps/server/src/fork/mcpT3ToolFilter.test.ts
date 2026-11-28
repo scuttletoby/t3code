@@ -48,6 +48,8 @@ import { Waits } from "../waits/WaitWorker.ts";
 import { makeClaudeMcpProfiles } from "./claudeMcpProfile.ts";
 import * as McpT3ToolFilter from "./mcpT3ToolFilter.ts";
 import * as McpT3ToolRule from "./mcpT3ToolRule.ts";
+import { LaneStore } from "./lanes/LaneStore.ts";
+import * as LaneToolsVisibility from "./lanes/laneToolsVisibility.ts";
 import * as LensReport from "./reviewRules/lensReport.ts";
 import * as LensStartVisibility from "./reviewRules/lensStartVisibility.ts";
 import * as T3ToolSets from "./mcpT3ToolSets.ts";
@@ -173,6 +175,9 @@ const serverLayer = <S>(shared: Layer.Layer<S>) => {
             }),
         }),
         Layer.mock(Playtest)({ filePath: "unused" }),
+        Layer.mock(LaneStore)({
+          board: () => Effect.succeed({ lanes: {}, claims: [], outbox: [], notes: [] }),
+        }),
         Layer.mock(RemoteDelegation.RemoteDelegation)({}),
         Layer.mock(PeerForwarding.PeerForwarding)({}),
         Layer.mock(ProjectService.ProjectService)({}),
@@ -530,6 +535,52 @@ describe("lens_start and lens_report: off means off (review rules, fork issue #8
         reviewRules: { preset: "recommended" },
         projectSettingsOverrides: { [PROJECT]: { reviewRules: { preset: "off" } } },
       },
+    ),
+  );
+});
+
+describe("the lane tools: off means off (lanes, fork issue #1156)", () => {
+  const LANES = ["lane_start", "lane_stop", "lane_board", "lane_claim", "lane_release"];
+  const found = (reply: RpcReply) =>
+    (
+      (reply.result?.structuredContent as { tools?: ReadonlyArray<{ name: string }> })?.tools ?? []
+    ).map((tool) => tool.name);
+
+  it.effect("lanes off (the default): not listed, refused, not found by tool_search", () =>
+    withServer(({ list, call }) =>
+      Effect.gen(function* () {
+        LaneToolsVisibility.__testing.clear();
+        const listedNow = yield* list("all");
+        for (const name of LANES) {
+          expect(listedNow).not.toContain(name);
+          const refused = yield* call("all", name, { lane: "pr-queue" });
+          expect(refused.error?.message).toBe(LaneToolsVisibility.LANE_TOOLS_OFF(name));
+          expect(found(yield* call("all", "tool_search", { query: `${name} lane` }))).not.toContain(
+            name,
+          );
+        }
+      }),
+    ),
+  );
+
+  it.effect("lanes on: listed and found in the lanes group only", () =>
+    withServer(
+      ({ list, call }) =>
+        Effect.gen(function* () {
+          LaneToolsVisibility.__testing.clear();
+          const all = yield* list("all");
+          for (const name of LANES) expect(all).toContain(name);
+          expect(found(yield* call("all", "tool_search", { query: "lane_board lanes" }))).toContain(
+            "lane_board",
+          );
+          // A profile with `waits` but not `lanes` keeps none of them.
+          const waits = yield* list("waits");
+          for (const name of LANES) expect(waits).not.toContain(name);
+          const board = yield* call("all", "lane_board", {});
+          expect(board.result?.isError).not.toBe(true);
+          expect(board.result?.structuredContent).toMatchObject({ claims: [], notes: [] });
+        }),
+      { ...SETTINGS, lanes: { enabled: true } },
     ),
   );
 });

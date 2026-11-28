@@ -59,7 +59,8 @@ const McpProfileChoice = McpProfileName.check(
 
 /**
  * Groups of T3's own tools: one per toolkit (`preview` has two), and `playtest`, a waits tool that
- * runs build and deploy steps, so keeping `waits` does not give it. {@link MCP_T3_UNGROUPED_TOOLS}
+ * runs build and deploy steps, so keeping `waits` does not give it, and `lanes`, the waits toolkit's
+ * lane tools (fork issue 1156). {@link MCP_T3_UNGROUPED_TOOLS}
  * are in no group; apps/server/src/fork/mcpProfile.ts maps each tool, and a test checks them all.
  */
 export const MCP_T3_TOOL_GROUPS = [
@@ -79,6 +80,7 @@ export const MCP_T3_TOOL_GROUPS = [
   "playtest",
   "workflows",
   "feedback",
+  "lanes",
 ] as const;
 export type McpT3ToolGroup = (typeof MCP_T3_TOOL_GROUPS)[number];
 

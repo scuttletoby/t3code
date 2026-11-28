@@ -287,6 +287,17 @@ export function startLane(
           `The lane '${input.lane}' already runs in thread ${current.threadId} (generation ${current.generation}).`,
         );
   }
+  // One lane per thread: run records and claims name a thread's lane by its thread.
+  const busy = Object.entries(state.lanes).find(
+    ([lane, entry]) =>
+      lane !== input.lane && entry.status === "running" && entry.threadId === input.threadId,
+  );
+  if (busy !== undefined) {
+    return refuse(
+      "already-running",
+      `Thread ${input.threadId} already acts for the lane '${busy[0]}'; a lane needs its own thread.`,
+    );
+  }
   const generation = (current?.generation ?? 0) + 1;
   const entry: LaneEntry = {
     status: "running",

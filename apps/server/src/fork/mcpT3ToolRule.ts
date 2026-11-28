@@ -38,6 +38,12 @@ import { installFillerDelegateServer } from "./fillerDelegate.ts";
 import { LENS_REPORT_OFF, LENS_REPORT_TOOL } from "./reviewRules/lensReport.ts";
 import { installLensStartServer } from "./reviewRules/lensStartServer.ts";
 import {
+  LANE_TOOLS,
+  LANE_TOOLS_OFF,
+  laneToolsSearchable,
+  makeLaneToolsOn,
+} from "./lanes/laneToolsVisibility.ts";
+import {
   LENS_START_OFF,
   LENS_START_TOOL,
   lensStartSearchable,
@@ -166,12 +172,15 @@ const searchable = (threadId: string, name: string) =>
     name,
   ) &&
   // Fork (review rules): off means off, also for a search.
-  (!LENS_TOOLS.has(name) || lensStartSearchable(threadId));
+  (!LENS_TOOLS.has(name) || lensStartSearchable(threadId)) &&
+  // Fork (lanes): off means off, also for a search.
+  (!LANE_TOOLS.has(name) || laneToolsSearchable());
 
 /** The rule's check of one tool for one request, as {@link layer} runs it. */
 const makeVisible = Effect.gen(function* () {
   const profileById = yield* makeThreadMcpProfilesById;
   const lensStartOn = yield* makeLensStartOn;
+  const laneToolsOn = yield* makeLaneToolsOn;
   /** Worked out now from the settings: kept when it applies, reused briefly when refused. */
   const workedOut = Effect.fnUntraced(function* (threadId: ThreadId) {
     const now = yield* Clock.currentTimeMillis;
@@ -234,6 +243,11 @@ const makeVisible = Effect.gen(function* () {
     if (!t3ToolAllowed(set, target)) {
       if (method === "tools/list") return false;
       return yield* new T3ToolOutsideProfile({ message: t3ToolRefusal(set, target) });
+    }
+    // Fork (lanes): the lane tools only while lanes are on.
+    if (LANE_TOOLS.has(target) && !(yield* laneToolsOn)) {
+      if (method === "tools/list") return false;
+      return yield* new T3ToolOutsideProfile({ message: LANE_TOOLS_OFF(target) });
     }
     // Fork (review rules): lens_start and lens_report only where the thread's project has review rules on.
     if (!LENS_TOOLS.has(target) || (yield* lensStartOn(thread.threadId))) return true;
