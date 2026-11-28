@@ -104,13 +104,21 @@ class Files(unittest.TestCase):
 
     def test_it_is_fast(self):
         """A file up to maxChars bytes is judged by its size alone; a big one reads at most 4 x maxChars bytes of
-        text and, to count its lines, the file once (up to 16 MB)."""
+        text and, to count its lines, the file once (up to 16 MB; a bigger one only its start). The bytes read are
+        checked; the wall time has wide slack, since a busy CI runner made a 50 ms limit fail on main."""
         small, big = self.file('s.txt', 's' * 19000), self.file('b.txt', ('b' * 99 + '\n') * 100000)  # 10 MB
+        huge = self.file('h.txt', ('h' * 99 + '\n') * 1000)
+        with open(huge, 'r+b') as f:
+            f.truncate(G.COUNT_LINES_UP_TO + 1)                 # 16 MB + 1, sparse: too big to count its lines
+        for path, most in ((small, 0), (big, 4 * 20000 + 4 + os.path.getsize(big)), (huge, 4 * 20000 + 4)):
+            with self.subTest(os.path.basename(path)), fx.bytes_read(G) as reads:
+                G.measure(path, 20000)
+                self.assertLessEqual(sum(reads), most)
         start = time.perf_counter()
         for _ in range(20):
             G.measure(small, 20000)
             G.measure(big, 20000)
-        self.assertLess((time.perf_counter() - start) / 20, 0.05)
+        self.assertLess((time.perf_counter() - start) / 20, 0.5)   # the bytes above are the cause; this is slack
 
 
 class Configured(unittest.TestCase):
