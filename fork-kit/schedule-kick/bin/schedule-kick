@@ -1,8 +1,11 @@
 #!/usr/bin/python3 -IB
-"""schedule-kick: the schedule-kick kit (lib/schedulekick). Starts listed GitHub workflows at their cron times.
+"""schedule-kick: the schedule-kick kit (lib/schedulekick). Starts listed GitHub workflows at their cron times, gives
+trusted heads without a run one, and keeps named workflows switched on.
 -I: no environment variable, user site folder or current folder changes what Python loads. The code is loaded
-only from this file's real folder."""
+only from this file's real folder (and common/ beside it, or fork-kit/common in a checkout: the alert channel)."""
 import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+common = os.path.join(kit, 'common')
+sys.path[:0] = [os.path.join(kit, 'lib'), common if os.path.isdir(common) else os.path.join(os.path.dirname(kit), 'common')]
 from schedulekick import kick  # noqa: E402
 sys.exit(kick.main(sys.argv[1:]))

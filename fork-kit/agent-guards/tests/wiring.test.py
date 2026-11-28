@@ -65,6 +65,13 @@ class Entries(unittest.TestCase):
         self.assertFalse(wiring.ours({'hooks': wiring.hooks(), 'permissions': {}}))
         self.assertFalse(wiring.ours({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': '/x/other'}]}]}}))
         self.assertFalse(wiring.ours({'hooks': {}}))
+        env = {'API_TIMEOUT_MS': '180000'}
+        self.assertEqual(json.loads(wiring.drop_in_text(env=env)), {'hooks': wiring.hooks(), 'env': env})
+        self.assertEqual(json.loads(wiring.drop_in_text(env={})), {'hooks': wiring.hooks()})
+        self.assertTrue(wiring.ours(json.loads(wiring.drop_in_text(env=env))))
+        self.assertFalse(wiring.ours({'hooks': wiring.hooks(), 'env': {'X': 1}}))       # only text values
+        self.assertFalse(wiring.ours({'hooks': wiring.hooks(), 'env': ['X=1']}))
+        self.assertFalse(wiring.ours({'env': env}))
         # lens B nit: a command that only names a kit hook somewhere is not the kit's
         other = {'type': 'command', 'command': 'echo /usr/local/bin/bg-guard; g=/usr/local/bin/bg-guard; x'}
         self.assertFalse(wiring.ours({'hooks': {'Stop': [{'hooks': [other]}]}}))
@@ -213,7 +220,7 @@ class Check(unittest.TestCase):
     def test_the_kit_entries_pass(self):
         code, lines = self.run_check(self.settings)
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 21, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 22, '\n'.join(lines))
         self.assertEqual(lines[-1], 'check: test settings: OK')
         # lens A nit: the hooks ran with HOME in check's own temporary folder; nothing (log, cache, state) is
         # written in the caller's HOME
@@ -400,7 +407,7 @@ class Command(unittest.TestCase):
         self.assertIn('WARNING:', text)
         self.assertIn('docker group', text)
         with open(drop_in, 'w') as f:                                    # wired: the same is a problem
-            f.write(wiring.drop_in_text())
+            f.write(wiring.drop_in_text(env=fx.config.harness_env({})[0]))
         self.approval.write(self.approval.new_code(), 1, 'gh x', self.tmp)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -414,6 +421,44 @@ class Command(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(self.cli.self_check(fx.BIN, drop_in, links), 0, out.getvalue())
+
+    def test_self_check_takes_a_drop_in_with_env(self):
+        drop_in = os.path.join(self.tmp, 'agent-guards.json')
+        for hook in wiring.HOOKS:
+            os.symlink(os.path.join(fx.BIN, hook), os.path.join(self.tmp, hook))
+        import contextlib
+        self.addCleanup(fx.use_machine, fx.NO_MACHINE)
+        defaults = fx.config.harness_env({})[0]
+        mine = [{'name': 'API_TIMEOUT_MS', 'value': '240000'}]
+        sibling = os.path.join(self.tmp, 'zz-site.json')
+        for name, env, rows, other, want in (
+                ('the defaults', defaults, None, None, 0),
+                ('not text', {'API_TIMEOUT_MS': 300000}, None, None, 1),
+                ('an old drop-in without env', None, None, None, 1),
+                ('a machine file edit without a reinstall', defaults, mine, None, 1),
+                ('after the reinstall', dict(defaults, API_TIMEOUT_MS='240000'), mine, None, 0),
+                ('a variable another managed file sets', dict(defaults, BASH_MAX_OUTPUT_LENGTH=None), None,
+                 {'env': {'BASH_MAX_OUTPUT_LENGTH': '1'}}, 0)):
+            with self.subTest(name):
+                fx.use_machine(fx.machine_file(self.tmp, {'harnessEnv': rows}) if rows else fx.NO_MACHINE)
+                if other:
+                    with open(sibling, 'w') as f:
+                        json.dump(other, f)
+                elif os.path.exists(sibling):
+                    os.unlink(sibling)
+                data = {'hooks': wiring.hooks()}
+                if env is not None:
+                    data['env'] = {k: v for k, v in env.items() if v is not None}
+                with open(drop_in, 'w') as f:
+                    f.write(json.dumps(data))
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(self.cli.self_check(fx.BIN, drop_in, self.tmp), want, out.getvalue())
+                if name == 'a machine file edit without a reinstall':
+                    self.assertIn('API_TIMEOUT_MS is 300000 in the drop-in, the machine file gives 240000',
+                                  out.getvalue())
+                if not want:
+                    self.assertIn('managed settings env: ', out.getvalue())
 
     def test_self_check_names_an_unknown_key(self):
         machine = fx.machine_file(self.tmp, {'gardener': {}})
