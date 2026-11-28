@@ -77,7 +77,8 @@ export interface RunRecord {
   readonly continuationOf: string | null;
   /**
    * The lane the run worked for (issue 1156): a lane thread's run, or one of its workers'. Absent in
-   * records written before this field, and not written yet; read it with {@link runRecordLane}.
+   * records written before this field and in records of runs outside any lane (or while lanes are
+   * off); read it with {@link runRecordLane}.
    */
   readonly lane?: string | null;
   readonly providerInstanceId: string;
@@ -401,6 +402,8 @@ export interface RunRecordInput {
   readonly runMessage: string | null;
   readonly finalMessage: boolean;
   readonly providerTurns: ReadonlyArray<ProviderTurnUsageInput>;
+  /** The lane the run worked for (the lane store's answer), or null/absent: none is written. */
+  readonly lane?: string | null;
   /** Epoch millis of `run.requestedAt`, `run.startedAt` and `run.completedAt`. */
   readonly times: {
     readonly requestedMs: number;
@@ -451,6 +454,7 @@ export function buildRunRecord(input: RunRecordInput): RunRecord | null {
     ...(fromTask.estimate !== null || fromTask.estimateRefused !== null
       ? { estimate: fromTask.estimate, estimateRefused: fromTask.estimateRefused }
       : { estimate: fromRun.estimate, estimateRefused: fromRun.estimateRefused }),
+    ...(input.lane != null && input.lane !== "" ? { lane: input.lane } : {}),
     continuationOf:
       run.restartContinuationOfRunId ??
       run.manualContinuationOfRunId ??

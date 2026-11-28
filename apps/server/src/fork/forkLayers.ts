@@ -24,6 +24,7 @@ import * as FillerDelegate from "./fillerDelegate.ts";
 import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
+import * as LaneStore from "./lanes/LaneStore.ts";
 import * as McpProfileTurnCheck from "./mcpProfileTurnCheck.ts";
 import * as PullRequestWatchSlot from "./pullRequestWatchSlot.ts";
 import * as RemoteTaskPrompts from "./remoteTaskPrompts.ts";
@@ -62,7 +63,8 @@ export const layerRuntimeServices = Layer.mergeAll(
   SlotGate.layer,
   HeadlessUsageRefresher.layer,
   HandoffService.layer,
-  RunRecorder.layer,
+  // The lane store tells run records which lane a run worked for (issue 1156; off by default).
+  RunRecorder.layer.pipe(Layer.provide(LaneStore.layer)),
   DelegatedResultReminder.layer,
   StopFinishedChildren.layer,
   ThreadRoleTargets.layer,
