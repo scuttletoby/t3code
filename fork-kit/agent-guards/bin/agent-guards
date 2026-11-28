@@ -60,12 +60,16 @@ def self_check(bin_dir, drop_in, links_dir=None):
     try:
         with open(drop_in, encoding='utf-8') as f:
             text = f.read()
-        if json.loads(text) != {'hooks': wiring.hooks()}:
+        data = json.loads(text)
+        if not isinstance(data, dict) or set(data) - {'hooks', 'env'} or data.get('hooks') != wiring.hooks() \
+                or ('env' in data and not wiring.env_ok(data['env'])):
             problems.append(f'{drop_in} is not the kit\'s drop-in of this release: run the installer again '
                             '(agent-guards-install install ... --settings)')
         else:
             wired = True
             notes.append(f'{drop_in}: every hook is wired in managed settings')
+            notes.append('managed settings env: ' + (' '.join(f'{k}={v}' for k, v in data.get('env', {}).items())
+                                                     or 'none'))
     except FileNotFoundError:
         notes.append(f'{drop_in} is not there: the hooks are not in managed settings (installer --settings, or '
                      'by hand from `agent-guards hooks`)')

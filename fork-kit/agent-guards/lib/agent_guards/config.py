@@ -21,6 +21,7 @@ problem in its answer (systemMessage, and additionalContext where the event take
                                      "name": "repo"}],
                        "records": [{"path": "/srv/records", "projectsDir": "projects",
                                     "shared": ["machines", "orch", "shared"]}]},
+    "harnessEnv":     [{"name": "API_TIMEOUT_MS", "value": "240000"}, {"name": "DISABLE_AUTOUPDATER", "value": null}],
     "pollLoop":       {"enabled": true, "maxSleepSeconds": 120, "loopSleepSeconds": 5},
     "readSize":       {"enabled": true, "maxChars": 20000},
     "batchNudge":     {"enabled": true, "afterTurns": 3, "tailBytes": 1048576,
@@ -31,6 +32,8 @@ problem in its answer (systemMessage, and additionalContext where the event take
 The three speed hooks (pollLoop, readSize, batchNudge) differ in one way: a problem in their own part, or in the
 file, turns that hook off (it lets every call through and says so) instead of using the defaults, because they guard
 speed, not safety, and must never block work on a broken config. "enabled": false turns one off on purpose.
+
+"harnessEnv" is not a hook's part: the installer reads it (harness_env, HARNESS_ENV) for the managed settings' env.
 
 Paths are absolute or start with "~/" (each user's own home). Plain Python 3 standard library.
 """
@@ -176,6 +179,60 @@ SPEC = {
 }
 HOOKS = tuple(SPEC)
 
+# "harnessEnv": the Claude Code environment variables `agent-guards-install --settings` writes in the "env" of the
+# managed settings drop-in, for every session on the machine (speed: smaller tool outputs, fewer compactions, no
+# 10-minute wait on a stuck request, no update in the middle of a run). Each is in the Claude Code docs
+# (code.claude.com/docs/en/env-vars). None: off (not written) unless the machine file gives a value.
+HARNESS_ENV = {
+    'BASH_MAX_OUTPUT_LENGTH': '12000',     # Claude Code's default 30000 characters
+    'MAX_MCP_OUTPUT_TOKENS': '8000',       # default 25000
+    'API_TIMEOUT_MS': '180000',            # time to the response headers, not the stream; default 600000
+    'DISABLE_AUTOUPDATER': '1',            # updates come with the kit, not in the middle of a run
+    'CLAUDE_CODE_AUTO_COMPACT_WINDOW': None,          # orchestrator only, and managed env is for every session
+    'CLAUDE_CODE_PROMPT_CACHE_TTL': None,             # "5m" or "1h": on after measuring cache reads vs writes
+    'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL': None,
+}
+ENV_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$')
+
+
+def harness_env(section):
+    """({name: value} for the drop-in's "env", [problems]) from a section's "harnessEnv": a list of rows
+    {"name": "<VARIABLE>", "value": "<text>" | <whole number> | null}. A row's value replaces the default; null takes
+    the variable out. Rows, not an object keyed by the name: the machine file refuses keys that look like a secret,
+    and MAX_MCP_OUTPUT_TOKENS is one. A name that looks like a secret is still refused here (the drop-in is world
+    readable), unless it is one of HARNESS_ENV. A bad row, or a name given again, is left out and named; a
+    "harnessEnv" that is not a list keeps the defaults. Never raises."""
+    env = {k: v for k, v in HARNESS_ENV.items()}
+    where, problems = f'{KIT}.harnessEnv', []
+    rows = section.get('harnessEnv', []) if isinstance(section, dict) else []
+    if not isinstance(rows, list):
+        return {k: v for k, v in env.items() if v is not None}, [f'{where}: must be a list of {{"name": "<VARIABLE>", '
+                                                                 '"value": "<text>"}} rows (built-in defaults used)']
+    seen = set()
+    for k, row in enumerate(rows):
+        name = row.get('name') if isinstance(row, dict) else None
+        value = row.get('value') if isinstance(row, dict) else None
+        if not isinstance(row, dict) or set(row) - {'name', 'value'} or 'value' not in row \
+                or not isinstance(name, str) or isinstance(value, bool) \
+                or not (value is None or isinstance(value, (str, int))):
+            problems.append(f'{where}: entry {k} must be {{"name": "<VARIABLE>", "value": "<text>" or null}} (that '
+                            'entry is left out)')
+        elif not ENV_NAME_RE.match(name):
+            problems.append(f'{where}: entry {k}: "name" must be a variable name (letters, digits, _), not {name!r} '
+                            '(that entry is left out)')
+        elif name in seen:
+            problems.append(f'{where}: entry {k}: {name!r} is given twice (that entry is left out)')
+        elif machine_file.SECRET_KEY.search(name) and name not in HARNESS_ENV:
+            problems.append(f'{where}: entry {k}: {name!r} looks like a secret, and the managed settings are readable '
+                            'by every user (that entry is left out)')
+        elif isinstance(value, str) and ('\0' in value or len(value) > 4096):
+            problems.append(f'{where}: entry {k}: the value of {name!r} must be at most 4096 characters, without NUL '
+                            '(that entry is left out)')
+        else:
+            seen.add(name)
+            env[name] = None if value is None else str(value)
+    return {k: v for k, v in env.items() if v is not None}, problems
+
 
 def defaults(hook):
     return {k: copy.deepcopy(d) for k, (_t, d, _c) in SPEC[hook].items()}
@@ -295,11 +352,12 @@ def load_all():
         return {h: defaults(h) for h in HOOKS}, [problem] if problem else []
     out, problems = {}, []
     for key in section:
-        if key not in SPEC:
+        if key not in SPEC and key != 'harnessEnv':
             problems.append(f'{KIT}: unknown key {key!r} (ignored by every hook; known: {", ".join(HOOKS)})')
     for hook in HOOKS:
         out[hook], p = _own(section, hook)
         problems += p
+    problems += harness_env(section)[1]
     return out, problems
 
 

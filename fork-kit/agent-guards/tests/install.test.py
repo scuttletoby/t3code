@@ -14,12 +14,16 @@ KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(KIT), 'common', 'tests'))
 sys.path.insert(0, os.path.join(KIT, 'lib'))
 import install_fixture as fx  # noqa: E402
-from agent_guards import wiring  # noqa: E402
+from agent_guards import config, wiring  # noqa: E402
 
 SHA1, SHA2 = fx.SHA1, fx.SHA2
 DROP_IN = wiring.DROP_IN
 CONFIG = '/etc/agent-guards/config.json'
 FOREIGN = {'permissions': {'deny': ['Bash(rm -rf /)']}}
+MACHINE = '/etc/fork-kit/machine.json'
+MANAGED = f'{wiring.MANAGED_DIR}/managed-settings.json'
+DEFAULT_ENV = {'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '8000', 'API_TIMEOUT_MS': '180000',
+               'DISABLE_AUTOUPDATER': '1'}
 
 
 class Install(fx.FakeHost):
@@ -68,6 +72,19 @@ class Install(fx.FakeHost):
         os.makedirs(os.path.dirname(self.path(DROP_IN)), exist_ok=True)
         with open(self.path(DROP_IN), 'w') as f:
             f.write(data if isinstance(data, str) else json.dumps(data))
+
+    def put_json(self, path, data, mode=0o644):
+        os.makedirs(os.path.dirname(self.path(path)), exist_ok=True)
+        with open(self.path(path), 'w') as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+        os.chmod(self.path(path), mode)
+
+    def machine(self, env=None, text=None):
+        """The machine file with that "harnessEnv" (None: an "agent-guards" section without it)."""
+        section = {'readSize': {'maxChars': 20000}}
+        if env is not None:
+            section['harnessEnv'] = env
+        self.put_json(MACHINE, text if text is not None else {'version': 1, 'agent-guards': section})
 
     def assert_named_hooks_there(self):
         """The rule: a drop-in names only hooks that are installed (links that end in a file)."""
@@ -120,7 +137,7 @@ class Install(fx.FakeHost):
         code, out, err = self.install('--settings')
         self.assertEqual(code, 0, err)
         with open(self.path(DROP_IN)) as f:
-            self.assertEqual(f.read(), wiring.drop_in_text())
+            self.assertEqual(f.read(), wiring.drop_in_text(env=DEFAULT_ENV))
         self.assertEqual(self.config(), {'version': 1, 'settings': True})
         self.assertIn('hooks in managed settings', out)
         self.assert_named_hooks_there()
@@ -171,6 +188,82 @@ class Install(fx.FakeHost):
         code, _, err = self.run_main('uninstall')
         self.assertEqual(code, 1)
         self.assertIn('code of this kit is in use', err)
+
+    def test_harness_env_defaults_go_in_the_drop_in(self):
+        for name, setup in (('no machine file', lambda: None), ('no section', lambda: self.put_json(MACHINE, {
+                'version': 1})), ('a section without harnessEnv', lambda: self.machine()),
+                            ('an empty harnessEnv', lambda: self.machine([]))):
+            with self.subTest(name):
+                self.fresh()
+                setup()
+                code, out, err = self.install('--settings')
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.drop_in()['env'], DEFAULT_ENV)
+                self.assertTrue(wiring.ours(self.drop_in()))
+                self.assertIn('managed settings env: BASH_MAX_OUTPUT_LENGTH=12000', out)
+                self.assertNotIn('CLAUDE_CODE_PROMPT_CACHE_TTL', self.drop_in()['env'])   # off until measured
+                self.assertEqual(self.run_main('self-check')[0], 0)
+
+    def test_harness_env_a_machine_value_wins_and_off_removes_the_key(self):
+        self.machine([{'name': 'API_TIMEOUT_MS', 'value': '300000'}, {'name': 'MAX_MCP_OUTPUT_TOKENS', 'value': 6000},
+                      {'name': 'DISABLE_AUTOUPDATER', 'value': None},
+                      {'name': 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL', 'value': '1h'}])
+        code, _, err = self.install('--settings')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.drop_in()['env'], {'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '6000',
+                                                 'API_TIMEOUT_MS': '300000',
+                                                 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL': '1h'})
+        self.machine([{'name': n, 'value': None} for n in DEFAULT_ENV])          # every key off: no "env" at all
+        code, _, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.drop_in(), {'hooks': wiring.hooks()})
+        self.assertEqual(self.run_main('self-check')[0], 0)
+
+    def test_harness_env_never_clobbers_env_other_managed_files_set(self):
+        self.put_json(MANAGED, {'env': {'API_TIMEOUT_MS': '900000'}, 'model': 'x'})
+        self.put_json(f'{os.path.dirname(DROP_IN)}/zz-site.json', {'env': {'DISABLE_AUTOUPDATER': '0'}})
+        self.put_json(f'{os.path.dirname(DROP_IN)}/broken.json', '{"env": ')
+        code, out, err = self.install('--settings')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.drop_in()['env'], {'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '8000'})
+        self.assertIn(f'left to {MANAGED}: API_TIMEOUT_MS', out)
+        self.assertIn('zz-site.json: DISABLE_AUTOUPDATER', out)
+        with open(self.path(MANAGED)) as f:
+            self.assertEqual(json.load(f), {'env': {'API_TIMEOUT_MS': '900000'}, 'model': 'x'})   # not touched
+
+    def test_harness_env_a_broken_machine_file_or_bad_rows_keep_the_defaults_and_say_so(self):
+        self.machine(text='{')
+        code, out, err = self.install('--settings')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.drop_in()['env'], DEFAULT_ENV)
+        self.assertIn('warning: harnessEnv', out)
+        self.machine([{'name': 'ANTHROPIC_API_KEY', 'value': 'sk-x'}, {'name': 'bad name', 'value': '1'},
+                      {'name': 'BASH_MAX_OUTPUT_LENGTH', 'value': True}])
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.drop_in()['env'], DEFAULT_ENV)
+        self.assertIn('looks like a secret', out)
+        self.assertNotIn('sk-x', json.dumps(self.drop_in()))
+
+    def test_harness_env_an_old_drop_in_without_env_upgrades(self):
+        self.assertEqual(self.install('--settings')[0], 0)
+        self.write_drop_in(json.dumps({'hooks': wiring.hooks()}, indent=2) + '\n')   # what the release before wrote
+        code, _, err = self.install(sha=SHA2)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.drop_in(), {'hooks': wiring.hooks(), 'env': DEFAULT_ENV})
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        code, _, err = self.install('--no-settings', sha=SHA2)        # rollback removes the env with the hooks
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self.drop_in())
+
+    def test_harness_env_runs_again_and_changes_nothing(self):
+        self.machine([{'name': 'API_TIMEOUT_MS', 'value': '240000'}])
+        self.put_json(MANAGED, {'env': {'DISABLE_AUTOUPDATER': '0'}})
+        self.assertEqual(self.install('--settings')[0], 0)
+        before = self.snapshot()
+        code, _, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.snapshot(), before)
 
     def test_runs_again_and_changes_nothing(self):
         self.assertEqual(self.install('--settings')[0], 0)

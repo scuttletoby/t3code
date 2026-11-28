@@ -96,6 +96,10 @@
       ]
     },
     "capacityPipe": { "commands": ["t3-capacity"] },
+    "harnessEnv": [
+      { "name": "API_TIMEOUT_MS", "value": "180000" },
+      { "name": "CLAUDE_CODE_PROMPT_CACHE_TTL", "value": null }
+    ],
     "memoryIndex": { "maxChars": 6000, "maxLine": 160, "stateDir": "~/.cache/memory-index-guard" },
     "bgGuard": {
       "skipSessionsFiles": ["~/.local/state/example-orch/slot-sessions.txt"],

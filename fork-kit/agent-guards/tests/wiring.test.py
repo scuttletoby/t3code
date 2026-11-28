@@ -65,6 +65,13 @@ class Entries(unittest.TestCase):
         self.assertFalse(wiring.ours({'hooks': wiring.hooks(), 'permissions': {}}))
         self.assertFalse(wiring.ours({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': '/x/other'}]}]}}))
         self.assertFalse(wiring.ours({'hooks': {}}))
+        env = {'API_TIMEOUT_MS': '180000'}
+        self.assertEqual(json.loads(wiring.drop_in_text(env=env)), {'hooks': wiring.hooks(), 'env': env})
+        self.assertEqual(json.loads(wiring.drop_in_text(env={})), {'hooks': wiring.hooks()})
+        self.assertTrue(wiring.ours(json.loads(wiring.drop_in_text(env=env))))
+        self.assertFalse(wiring.ours({'hooks': wiring.hooks(), 'env': {'X': 1}}))       # only text values
+        self.assertFalse(wiring.ours({'hooks': wiring.hooks(), 'env': ['X=1']}))
+        self.assertFalse(wiring.ours({'env': env}))
         # lens B nit: a command that only names a kit hook somewhere is not the kit's
         other = {'type': 'command', 'command': 'echo /usr/local/bin/bg-guard; g=/usr/local/bin/bg-guard; x'}
         self.assertFalse(wiring.ours({'hooks': {'Stop': [{'hooks': [other]}]}}))
@@ -414,6 +421,20 @@ class Command(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(self.cli.self_check(fx.BIN, drop_in, links), 0, out.getvalue())
+
+    def test_self_check_takes_a_drop_in_with_env(self):
+        drop_in = os.path.join(self.tmp, 'agent-guards.json')
+        for hook in wiring.HOOKS:
+            os.symlink(os.path.join(fx.BIN, hook), os.path.join(self.tmp, hook))
+        import contextlib
+        for env, want in (({'API_TIMEOUT_MS': '180000'}, 0), ({'API_TIMEOUT_MS': 180000}, 1)):
+            with open(drop_in, 'w') as f:
+                f.write(json.dumps({'hooks': wiring.hooks(), 'env': env}))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(self.cli.self_check(fx.BIN, drop_in, self.tmp), want, out.getvalue())
+            if not want:
+                self.assertIn('managed settings env: API_TIMEOUT_MS=180000', out.getvalue())
 
     def test_self_check_names_an_unknown_key(self):
         machine = fx.machine_file(self.tmp, {'gardener': {}})

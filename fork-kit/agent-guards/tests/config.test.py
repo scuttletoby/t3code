@@ -49,7 +49,10 @@ class Load(unittest.TestCase):
             self.assertIsNone(problem, hook)
             for key, value in section.get(hook, {}).items():
                 self.assertEqual(got[key], value)
-        self.assertEqual(set(section), set(config.HOOKS))      # the example shows every hook's keys
+        self.assertEqual(set(section), set(config.HOOKS) | {'harnessEnv'})   # the example shows every hook's keys
+        self.assertEqual(config.harness_env(section), (
+            {'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '8000', 'API_TIMEOUT_MS': '180000',
+             'DISABLE_AUTOUPDATER': '1'}, []))
         for hook in config.HOOKS:
             self.assertEqual(set(section[hook]), set(config.SPEC[hook]), hook)
 
@@ -128,6 +131,33 @@ class Load(unittest.TestCase):
                     got, problem = self.load(hook, {hook: s})
                     self.assertEqual(got, config.defaults(hook))
                     self.assertTrue(problem)
+
+    def test_harness_env(self):
+        self.assertEqual(config.harness_env({}), ({'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '8000',
+                                                    'API_TIMEOUT_MS': '180000', 'DISABLE_AUTOUPDATER': '1'}, []))
+        self.assertEqual(set(config.HARNESS_ENV), {
+            'BASH_MAX_OUTPUT_LENGTH', 'MAX_MCP_OUTPUT_TOKENS', 'API_TIMEOUT_MS', 'DISABLE_AUTOUPDATER',
+            'CLAUDE_CODE_AUTO_COMPACT_WINDOW', 'CLAUDE_CODE_PROMPT_CACHE_TTL', 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL'})
+        env, problems = config.harness_env({'harnessEnv': [
+            {'name': 'API_TIMEOUT_MS', 'value': 240000}, {'name': 'DISABLE_AUTOUPDATER', 'value': None},
+            {'name': 'MY_FLAG', 'value': ''}, {'name': 'API_TIMEOUT_MS', 'value': '1'},
+            {'name': 'CLAUDE_CODE_OAUTH_TOKEN', 'value': 'x'}, {'name': '1BAD', 'value': '1'},
+            {'name': 'X', 'value': False}, {'name': 'X', 'value': '1', 'why': 'y'}, 'X=1']})
+        self.assertEqual(env, {'BASH_MAX_OUTPUT_LENGTH': '12000', 'MAX_MCP_OUTPUT_TOKENS': '8000',
+                               'API_TIMEOUT_MS': '240000', 'MY_FLAG': ''})
+        self.assertEqual(len(problems), 6, problems)
+        self.assertIn("'API_TIMEOUT_MS' is given twice", problems[0])
+        self.assertIn('looks like a secret', problems[1])
+        self.assertEqual(config.harness_env({'harnessEnv': {'API_TIMEOUT_MS': '1'}})[0], config.harness_env({})[0])
+        self.assertIn('must be a list', config.harness_env({'harnessEnv': {}})[1][0])
+
+    def test_load_all_takes_harness_env_and_names_its_problems(self):
+        fx.use_machine(fx.machine_file(self.tmp, {'harnessEnv': [{'name': 'API_TIMEOUT_MS', 'value': '1'}]}))
+        self.assertEqual(config.load_all()[1], [])
+        fx.use_machine(fx.machine_file(self.tmp, {'harnessEnv': [{'name': 'ANTHROPIC_API_KEY', 'value': '1'}]}))
+        problems = config.load_all()[1]
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('agent-guards.harnessEnv', problems[0])
 
     def test_load_all_names_each_problem_once(self):
         fx.use_machine(fx.machine_file(self.tmp, text='{'))

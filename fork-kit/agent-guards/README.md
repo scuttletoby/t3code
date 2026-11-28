@@ -181,6 +181,43 @@ says so the same loud way, once a session for each hook, #1151), and so does a l
 Paths are absolute or start with `~/` (the home of the user the hook runs as). An example is in
 [machine.example.json](../common/machine.example.json).
 
+### Harness speed settings (`harnessEnv`)
+
+With `--settings` the drop-in also carries an `"env"`: Claude Code environment variables for every session on the
+machine, so tool outputs stay small (fewer compactions), a stuck request does not hold an agent for 10 minutes, and
+Claude Code does not update itself in the middle of a run (updates come with the kit). Each variable is in the Claude
+Code docs ([env-vars](https://code.claude.com/docs/en/env-vars)). Defaults (`agent_guards.config.HARNESS_ENV`):
+
+| Variable                                | Default  | Claude Code's own default, and why                                                              |
+| --------------------------------------- | -------- | ----------------------------------------------------------------------------------------------- |
+| `BASH_MAX_OUTPUT_LENGTH`                | `12000`  | 30000 characters of Bash output read back                                                       |
+| `MAX_MCP_OUTPUT_TOKENS`                 | `8000`   | 25000 tokens of an MCP tool's answer                                                            |
+| `API_TIMEOUT_MS`                        | `180000` | 600000: the time a request has to get its response headers (a long streamed answer is not cut)  |
+| `DISABLE_AUTOUPDATER`                   | `1`      | updates in the background; `claude update` still works                                          |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW`       | off      | for an orchestrator only, and the drop-in is for every session: set it for that session instead |
+| `CLAUDE_CODE_PROMPT_CACHE_TTL`          | off      | `5m` or `1h`: turned on after measuring cache reads against cache writes                        |
+| `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL` | off      | the same for sub-agents, workflows and helper requests                                          |
+
+A machine changes them in its machine file, as rows (not an object keyed by the name: the machine file refuses keys
+that look like a secret, and `MAX_MCP_OUTPUT_TOKENS` is one):
+
+```json
+"agent-guards": { "harnessEnv": [{ "name": "API_TIMEOUT_MS", "value": "240000" },
+                                 { "name": "DISABLE_AUTOUPDATER", "value": null },
+                                 { "name": "CLAUDE_CODE_PROMPT_CACHE_TTL", "value": "1h" }] }
+```
+
+A row's value (text or a whole number) replaces the default, `null` takes the variable out, and any other variable
+name can be added. A name that looks like a secret is refused (the drop-in is readable by every user), and so is a
+bad row or a name given twice: left out and named by the installer and `agent-guards self-check`. With no machine
+file, no section or no `harnessEnv`, the defaults apply; a machine file that cannot be read gives the defaults too,
+with a warning (speed, not safety: the install goes on). The installer never replaces a value the machine already
+sets in managed settings: a variable that `managed-settings.json` or another `managed-settings.d/*.json` file sets is
+left out of the drop-in, and the installer says which. Managed `env` wins over a user's or a project's `env` and
+over the variable in the shell, so a machine that wants another value sets it here. A change takes effect on the
+next install (with no option, the last `--settings` choice is kept) and in sessions started after it.
+`--no-settings` removes the env with the hooks.
+
 **State and logs.** Each hook keeps going when its state folder or log cannot be written (a full disk, a folder
 that is not writable): the answer never depends on it. `memory-index-guard` writes its state whole (a temporary
 file, then a rename). `bg-guard` counts under a lock, so two Stop hooks at once count two blocks.
