@@ -117,6 +117,7 @@ fork-kit/agent-guards/tests/memory-index.test.py unittest
 fork-kit/agent-guards/tests/poll-loop.test.py unittest
 fork-kit/agent-guards/tests/read-size.test.py unittest
 fork-kit/agent-guards/tests/wiring.test.py unittest
+fork-kit/claude-settings/tests/settings.test.py unittest
 fork-kit/cleaner/tests/compress.test.py ~15s unittest
 fork-kit/cleaner/tests/daily.test.py ~19s unittest
 fork-kit/cleaner/tests/dedupe.test.py ~22s unittest

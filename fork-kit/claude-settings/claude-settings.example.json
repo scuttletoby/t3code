@@ -1,0 +1,16 @@
+{
+  "_comment": "Keys claude-settings keeps in each user's Claude Code settings.json (README.md). Objects merge key by key; other values are set as given. Copy this file, list your own keys, keep it outside the fork.",
+  "version": 1,
+  "settings": {
+    "disableClaudeAiConnectors": true,
+    "skillOverrides": {
+      "claude-approvals": "user-invocable-only",
+      "keybindings-help": "user-invocable-only",
+      "loop": "user-invocable-only",
+      "schedule": "user-invocable-only",
+      "init": "user-invocable-only",
+      "simplify": "user-invocable-only",
+      "code-review": "name-only"
+    }
+  }
+}

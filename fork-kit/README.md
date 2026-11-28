@@ -16,6 +16,7 @@ Every kit follows the same pattern:
 | Kit                                          | What                                                                                                                                                                                                                       |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [agent-guards](agent-guards/README.md)       | Claude Code hooks that guard every agent on a machine: no disabling Actions, no piped capacity check, a memory index in budget, no stop with a background command, agent slots (Linux)                                     |
+| [claude-settings](claude-settings/README.md) | `claude-settings`: merge one config's keys (skill list, connectors, ...) into each user's Claude Code `settings.json` and check they stay; no installer (Linux, macOS, Windows)                                            |
 | [cleaner](cleaner/README.md)                 | `fork-cleaner`: free disk space by rules (`worktrees` with merged branches, `tmp`, `agent-scratch`, `docker`; `compress-cold` and `dedupe` delete no content) and never what could be needed; daily timer (Linux, systemd) |
 | [desk](desk/README.md)                       | A desktop's side of a fork fleet desk pool: runner users, walls, desk agent; one folder (Linux, WSL2)                                                                                                                      |
 | [gardener](gardener/README.md)               | `gardener`: each project's checks once a day (small scripts, JSON-line findings; general ones shipped, project ones by path), one report issue per project updated in place; report only (Linux, systemd)                  |
@@ -34,6 +35,7 @@ Every kit follows the same pattern:
 private machine file (`/etc/fork-kit/machine.json`) where the facts of one machine live, and the installer and
 bootstrap of the agent-guards, cleaner, gardener, golive, schedule-kick and update-policy kits.
 
-[review](review/README.md) and [placement-facts](placement-facts/README.md) have no installer: review is a skill,
-docs and tools an agent uses from a checkout of the fork, beside the merge gate whose parser it imports;
-placement-facts holds example scripts a person copies and edits.
+[review](review/README.md), [placement-facts](placement-facts/README.md) and [claude-settings](claude-settings/README.md) have no
+installer: review is a skill, docs and tools an agent uses from a checkout of the fork, beside the merge gate whose
+parser it imports; placement-facts holds example scripts a person copies and edits; claude-settings is one command
+run from a checkout.
