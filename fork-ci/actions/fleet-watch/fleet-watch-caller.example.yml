@@ -25,6 +25,8 @@ jobs:
       actions: write # read runs, jobs and job logs; cancel and re-run runs
       contents: read # the checkout of the config
     steps:
+      # On a self-hosted label, drop sparse-checkout (or run fork-ci git-clean first): a sparse checkout leaves
+      # core.sparseCheckout=true in the reused work folder's .git, and later jobs there build from a partial tree.
       - uses: actions/checkout@<sha> # pin by full SHA
         with:
           sparse-checkout: .github/fleet.json

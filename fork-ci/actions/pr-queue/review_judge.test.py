@@ -5,7 +5,7 @@ The shared vectors (review.vectors.json: `cases`, `findings`, `scans`, `rounds`)
 rest here: reading git's name-status output, and that a rule set the parser
 would refuse, or a diff line nobody knows, never judges.
 """
-import dataclasses, json, os, re, sys, time, types, unittest, unittest.mock
+import dataclasses, html, json, os, re, sys, time, types, unittest, unittest.mock
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 
@@ -358,8 +358,9 @@ class Rounds(unittest.TestCase):
 # Every section of review.vectors.json, replayed whole: the TypeScript side (apps/server/src/reviewRules) runs the same
 # sections, and each side fails on a section or a vector field it does not run, so neither can skip one quietly.
 SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds',
-            'reads', 'linear', 'py_unicode', 'unicode'}
-FIELDS = {'linear': {'name', 'fn', 'parts', 'expect', 'ms'},
+            'reads', 'linear', 'py_unicode', 'unicode', 'written'}
+FIELDS = {'written': {'name', 'lens', 'reviewer', 'head', 'body', 'comment', 'refused', 'expect'},
+          'linear': {'name', 'fn', 'parts', 'expect', 'ms'},
           'unicode': {'name', 'body', 'findings', 'section', 'unassigned', 'refused'},
           'reads': {'name', 'posts', 'head', 'same', 'override_authors', 'required', 'expect'},
           'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
@@ -491,8 +492,10 @@ class SharedVectors(unittest.TestCase):
             with self.subTest(v['name']):
                 said, section = rj.read_findings(v['body'])
                 self.assertEqual(([list(f) for f in said], section), (v['findings'], v['section']))
+                # As written or as its HTML references write it (`&#x1C89;`): the rules read both.
                 self.assertEqual(v['unassigned'],
-                                 sorted({f'U+{ord(c):04X}' for c in v['body'] if unicodedata.category(c) == 'Cn'}))
+                                 sorted({f'U+{ord(c):04X}' for c in v['body'] + html.unescape(v['body'])
+                                         if unicodedata.category(c) == 'Cn'}))
                 # What T3 refuses on a runtime that assigns them (a letter, number, mark, format or space there): a
                 # subset; the rest (a new symbol) reads alike here and there.
                 self.assertLessEqual(set(v['refused']), set(v['unassigned']))
@@ -508,6 +511,17 @@ class SharedVectors(unittest.TestCase):
         for v in VECTORS['reads']:
             with self.subTest(v['name']):
                 self.assertEqual(replay_reads(v), v['expect'])
+
+    def test_every_written_vector(self):   # T3's lens_report writes the header: the gate reads what it posts
+        self.assertGreaterEqual(len(VECTORS['written']), 10)
+        for v in VECTORS['written']:
+            with self.subTest(v['name']):
+                got = replay_reads({'posts': [{'body': v['comment']}], 'head': v['head'], 'same': [],
+                                    'override_authors': [], 'required': [v['lens']]})
+                self.assertEqual(got, v['expect'])
+                self.assertTrue(v['comment'].startswith(f"lens: {v['lens']} · reviewer: "), v['comment'])
+                if v['refused'] is None:   # a report T3 posts is one valid read of its lens at the head
+                    self.assertEqual((got['reads'], got['again']), ({v['lens']: v['head']}, []))
 
     def test_every_round(self):
         self.assertGreaterEqual(len(VECTORS['rounds']), 28)
@@ -547,10 +561,11 @@ FORK_CONFIG = '.github/fork-pr-queue.json'
 NOT_GATE = ('.github/fork-ci-tests.txt',)
 # fork-kit folders that are gate settings (#82): review is the lens-format checker and the lens skill (what a lens
 # report must say to count), gh-apps keeps the gate App's key and mints its tokens (the gate-trust design). The
-# other kits run machines and agents, and the merge gate reads none of them.
+# other kits run machines and agents (placement-facts: example scripts a machine runs for its facts; slot-filler:
+# starts queued agent tasks into free slots), and the merge gate reads none of them.
 GATE_KITS = ('gh-apps', 'review')
 OTHER_KITS = ('.gitignore', 'README.md', 'agent-guards', 'cleaner', 'common', 'desk', 'gardener', 'golive', 'heavy',
-              'model-guard', 'pc-agents', 'schedule-kick', 'update-policy')
+              'model-guard', 'pc-agents', 'placement-facts', 'schedule-kick', 'slot-filler', 'update-policy')
 
 
 class ForkConfig(unittest.TestCase):

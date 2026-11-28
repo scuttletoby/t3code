@@ -244,7 +244,9 @@ def _fold(text, _=False):
     text = lens.nfkc(text)
     # html.unescape raises on a number reference past int's 4,300-digit limit: its value, or one past Unicode (U+FFFD)
     text = re.sub(r'&#0*([0-9]+)', lambda m: '&#' + (m[1] if len(m[1]) <= 7 else '1114112'), text)
-    text = re.sub(r'\\([!-/:-@\[-`{-~])', r'\1', html.unescape(text))
+    text = html.unescape(text)
+    lens.unicode_check(text)   # `&#x1C89;` is read as U+1C89, so it drifts as the letter itself does
+    text = re.sub(r'\\([!-/:-@\[-`{-~])', r'\1', text)
     cf = ''.join(re.escape(ch) for ch in set(text) if unicodedata.category(ch) == 'Cf')
     return (re.sub(f'[{cf}]', '', text) if cf else text).translate(CONFUSABLES)
 

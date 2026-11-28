@@ -245,7 +245,8 @@ class MachineFile(unittest.TestCase):
 MUTATIONS = {
     'optional: a missing file is None': ('        if optional:        # the file or a folder', '        if False:  #',
                                          'test_optional_section_is_none_only_when_missing'),
-    'optional: a missing section is None': ('    if kit not in data:\n        if optional:', '    if kit not in data:\n        if False:',
+    'optional: a missing section is None': ('            if optional:\n                return None\n'
+                                            '            if self.data is None', '            if self.data is None',
                                             'test_optional_section_is_none_only_when_missing'),
     'folders above are safe': ('            _check_folder_on_the_way(path, where, os.fstat(fd), owner_uid)\n', '',
                                'test_every_folder_above_is_safe'),

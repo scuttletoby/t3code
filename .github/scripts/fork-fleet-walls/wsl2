@@ -64,7 +64,10 @@ RUN_PROPS = {'Type', 'KillMode', 'EnvironmentFile', 'ReadWritePaths', 'RuntimeMa
              'MountAPIVFS', 'MountFlags', 'BindReadOnlyPaths', 'BindPaths', 'TemporaryFileSystem', 'NoNewPrivileges',
              'RemoveIPC', 'PrivateDevices', 'PrivateIPC', 'PrivateTmp', 'PrivateNetwork', 'PrivateUsers',
              'PrivateMounts', 'SystemCallFilter', 'SystemCallArchitectures', 'SystemCallErrorNumber', 'LockPersonality',
-             'CapabilityBoundingSet', 'UMask'}
+             'CapabilityBoundingSet', 'UMask',
+             # Only how the kernel kills a job: the launcher refuses an OOMScoreAdjust under 1 (a job never outlives
+             # the host's own processes), OOMPolicy=kill ends the job's whole unit.
+             'OOMScoreAdjust', 'OOMPolicy'}
 RESTRICTS = re.compile(r'(Protect|Restrict|Memory|CPU|Tasks|IO|Limit)[A-Za-z]*')
 READ_LITERAL = {'TemporaryFileSystem', 'RestrictAddressFamilies', 'SystemCallFilter', 'SystemCallArchitectures',
                 'RestrictNamespaces', 'PrivateDevices'}   # read by the walls: must be written out, no $

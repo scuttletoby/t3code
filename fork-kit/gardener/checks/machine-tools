@@ -1,0 +1,197 @@
+#!/usr/bin/python3 -IB
+"""machine-tools: the tools a machine needs, and the ones it runs that have no source. Report only.
+
+A tool listed in "tools" that is not there is an error naming where it comes from, so a machine set up again (or
+moved) is told what it still lacks. Every entry of the "scan" folders (programs, and systemd units) needs a source:
+a fork kit's install record (/etc/<kit>/installed.tsv: the 3- and 6-column rows install-drift reads, and the
+pc-agents kit's "sha256<TAB>path" rows), a link to a file committed in a git checkout, a link into the system's own
+folders (/usr, /lib, but not /usr/local), or a "tools" entry. Anything else was put there by hand and has no review,
+tests or history: one warning per entry, so it can be moved into a kit or a project's repository, declared, or
+removed. A checkout git cannot read (a worktree whose main checkout is gone, an empty .git folder, another user's
+checkout) is no source: each entry in it is a warning, never passed. A systemd mask (a unit linked to /dev/null) is
+the system's own and needs no source.
+
+Options:
+  tools    [{"path": "/usr/local/bin/x" or "~/...", "source": "where it comes from (a kit, OWNER/REPO: path, ...)"}]
+           (default []; a path must be absolute or start with "~/")
+  scan     folders to look through (default below; [] looks at none; absolute or "~/..."); "~/" is the home folder
+           of the gardener's user
+  ignore   [glob] entry names that need no source (default: snapd's generated units and __pycache__)
+  etc      "/etc": the folder of the kits' etc folders
+"""
+import fnmatch, glob, os, subprocess, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from gardener.contract import emit, read_context  # noqa: E402
+
+SCAN = ['~/.local/bin', '~/.config/systemd/user', '/usr/local/bin', '/usr/local/sbin', '/usr/local/libexec',
+        '/etc/systemd/system']
+IGNORE = ['snap-*', 'snap.*', '__pycache__']
+UNIT_DIRS = ('.wants', '.requires', '.upholds', '.d')     # a unit folder's links and drop-ins, not units
+SYSTEM = ('/usr/', '/lib/', '/lib64/', '/bin/', '/sbin/')     # the distribution's own (packages)
+
+ctx = read_context()
+opt = ctx['options']
+prefix = os.environ.get('GARDENER_TEST_PREFIX', '')   # tests only: every path is read under this folder
+etc = '/etc' if opt.get('etc') is None else opt['etc']
+tools = [] if opt.get('tools') is None else opt['tools']     # the type is checked before any default: {} is no list
+scan = SCAN if opt.get('scan') is None else opt['scan']
+ignore = IGNORE if opt.get('ignore') is None else opt['ignore']
+
+
+def a_path(p):
+    """A machine path: absolute, or in the home folder. A relative one would be read from the check's own folder."""
+    return isinstance(p, str) and (p.startswith('/') or p.startswith('~/'))
+
+
+if not isinstance(tools, list) or not all(isinstance(t, dict) and a_path(t.get('path'))
+                                          and isinstance(t.get('source'), str) and t['source'].strip()
+                                          and set(t) <= {'path', 'source'} for t in tools):
+    raise SystemExit('machine-tools: "tools" must be a list of {"path": "/..." or "~/...", "source": ...}')
+if not isinstance(scan, list) or not all(a_path(x) for x in scan):
+    raise SystemExit('machine-tools: "scan" must be a list of folders, each "/..." or "~/..."')
+if not isinstance(ignore, list) or not all(isinstance(x, str) and x for x in ignore):
+    raise SystemExit('machine-tools: "ignore" must be a list of strings')
+if not isinstance(etc, str) or not etc.startswith('/'):
+    raise SystemExit('machine-tools: "etc" must be an absolute folder')
+
+
+def logical(path):
+    """An option's path as the machine names it: ~/ expanded, absolute, normalised."""
+    return os.path.normpath(os.path.expanduser(path))
+
+
+def real(path):
+    """The machine path `path` (logical) resolves to, links followed, still without the test prefix."""
+    r = os.path.realpath(prefix + path)
+    return r[len(prefix):] if prefix and (r == prefix or r.startswith(prefix + '/')) else r
+
+
+def inside(path, folder):
+    return path == folder or path.startswith(folder.rstrip('/') + '/')
+
+
+# what the kits installed: each recorded path, and the folder a recorded link points to (a kit's versions/<sha>)
+recorded = set()
+for record in glob.glob(os.path.join(prefix + etc, '*', 'installed.tsv')):
+    try:
+        with open(record, encoding='utf-8') as f:
+            rows = [ln.rstrip('\n').split('\t') for ln in f if ln.strip() and not ln.startswith('#')]
+    except OSError:
+        continue    # install-drift reports a record it cannot read
+    for row in rows:
+        if len(row) == 2:           # pc-agents: sha256, path
+            path, kind, want = row[1], 'file', ''
+        elif len(row) == 3:         # path, kind, link target or sha256
+            path, kind, want = row
+        elif len(row) == 6:         # gh-apps: path, kind, owner, group, mode, link target or sha256
+            path, kind, want = row[0], row[1], row[5]
+        else:
+            continue                # install-drift reports a bad row
+        if path.startswith('/'):
+            recorded.add(os.path.normpath(path))
+            if kind == 'link' and want.startswith('/'):
+                recorded.add(os.path.normpath(want))
+declared = {logical(t['path']) for t in tools}
+
+for t in tools:
+    path = logical(t['path'])
+    if not os.path.exists(prefix + path):
+        emit('machine-tools.missing', 'error', f'{path} is missing (it comes from: {t["source"].strip()})', path,
+             f'install it from {t["source"].strip()}, or drop it from this check\'s "tools" if the machine no longer '
+             'needs it')
+
+
+def from_a_kit(path, target):
+    return any(inside(r, path) or inside(path, r) or inside(target, r) for r in recorded)
+
+
+checkouts = {}     # checkout folder -> (committed files and their folders, None) or (None, why git cannot read it)
+
+
+def committed(root):
+    """One `git ls-files` per checkout. Fails closed: only exit 0 is a list; anything else is git's reason."""
+    if root not in checkouts:
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_OPTIONAL_LOCKS='0',
+                   GIT_CEILING_DIRECTORIES=os.path.dirname(prefix + root))   # never a checkout above this one
+        try:
+            r = subprocess.run(['git', '-C', prefix + root, 'ls-files', '-z'], capture_output=True, timeout=60,
+                               stdin=subprocess.DEVNULL, env=env)
+        except (OSError, subprocess.SubprocessError) as e:
+            checkouts[root] = None, str(e)
+        else:
+            if r.returncode != 0:
+                lines = os.fsdecode(r.stderr).strip().splitlines()
+                checkouts[root] = None, (lines[0] if lines else f'git exit {r.returncode}')[:200]
+            else:
+                files = set()
+                for rel in filter(None, os.fsdecode(r.stdout).split('\0')):
+                    while rel and rel not in files:
+                        files.add(rel)
+                        rel = os.path.dirname(rel)
+                checkouts[root] = files, None
+    return checkouts[root]
+
+
+def in_git(target):
+    """(None, None) when not in a git checkout, else (checkout, 'tracked' or 'untracked' or why git cannot read it).
+    A checkout git will not read is never 'tracked'."""
+    folder = os.path.dirname(target)
+    while not os.path.lexists(os.path.join(prefix + folder, '.git')):
+        if folder in ('/', ''):
+            return None, None
+        folder = os.path.dirname(folder)
+    files, why = committed(folder)
+    if files is None:
+        return folder, why
+    return folder, 'tracked' if os.path.relpath(target, folder) in files else 'untracked'
+
+
+for folder in dict.fromkeys(logical(x) for x in scan):
+    try:
+        names = sorted(os.listdir(prefix + folder))
+    except FileNotFoundError:
+        continue
+    except OSError as e:
+        emit('machine-tools.unreadable', 'info', f'{folder} cannot be read as this user ({e.strerror}): not checked',
+             folder)
+        continue
+    units = '/systemd/' in folder + '/'
+    here = real(folder)
+    for name in names:
+        path = os.path.join(folder, name)
+        if any(fnmatch.fnmatchcase(name, g) for g in ignore) or path in declared or name == '.git':
+            continue                # .git: the checkout's own data; its entries are checked against it
+        is_link = os.path.islink(prefix + path)
+        if units and name.endswith(UNIT_DIRS) and not is_link and os.path.isdir(prefix + path):
+            continue                # a unit's .wants/.requires/.upholds links and .d drop-ins
+        target = real(path) if is_link else path
+        if units and is_link and target == '/dev/null':
+            continue                # a mask (systemctl mask): the system's own
+        if from_a_kit(path, target):
+            continue
+        if is_link and target.startswith(SYSTEM) and not target.startswith('/usr/local/'):
+            continue                # the distribution's own unit or program, linked
+        if is_link and units and os.path.dirname(target) == here:
+            continue                # an alias of another unit in this same folder: that one is checked
+        if not os.path.exists(prefix + target):
+            emit('machine-tools.broken-link', 'warn', f'{path} is a link to {target}, which is not there', path,
+                 'remove the link, or install what it points to')
+            continue
+        checkout, git = in_git(target)
+        if git == 'tracked':
+            continue
+        what = f'{path} links to {target}, which' if is_link else path
+        if git == 'untracked':
+            emit('machine-tools.untracked', 'warn', what + ' is in a git checkout but not committed: it has no '
+                 'history or review', path, 'commit it in its repository, or move it into a kit')
+            continue
+        if git is not None:
+            emit('machine-tools.unknown-source', 'warn', f'{what} is in {checkout}, which git cannot read ({git}): '
+                 'whether it is committed is not known, so it counts as no source', path,
+                 'repair the checkout (a worktree whose main checkout is gone, an empty .git folder, another user\'s '
+                 'checkout) or remove it; or move the entry into a kit or a project\'s repository')
+            continue
+        kind = 'folder' if os.path.isdir(prefix + path) else 'link' if is_link else 'file'
+        emit('machine-tools.no-source', 'warn', f'{path} ({kind}) has no source: no kit installed it and it is not '
+             'from a git checkout', path, 'move it into a fork kit (general) or the project\'s repository '
+             '(project-only) and install it from there; or list it in "tools" with its source; or remove it')

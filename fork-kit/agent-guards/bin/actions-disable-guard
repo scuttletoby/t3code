@@ -32,6 +32,9 @@ How it reads a command (by parsing, not by pattern):
      Every other use is refused: a command word the guard does not know (taskset, chrt, unshare, sg, screen, tmux,
      at, expect, make, a project tool, a word from a variable), inline code or a script in any other language
      (python -c, node -e, a .py file), an HTTP client without a flag table, gh under an alias or an extension.
+     A shell comment in a file read for CLAUDE_CODE_SIMPLE (~/.bashrc, a sourced file) is no command (#1057), as
+     the shell reads it. The command's own text and Python, JS and other code are read whole, comments too: a
+     command can read its own comments ($BASH_EXECUTION_STRING), and a guess at another language's is a way past.
   4. Known command words only widen what passes; an unknown word never hides what follows it. The words behind it
      are read as a command of their own (`taskset 1 bash -c ..`), its quoted arguments as shell text
      (`sg users -c '..'`), and gh is still gh under a name the command gives it (`ln -s /usr/bin/gh g; ./g ..`).
@@ -381,7 +384,7 @@ class Lex:
 
     def __init__(self, text, run=True):
         self.t, self.n = text, len(text)
-        self.cmds, self.subs, self.taint, self.spans = [], [], set(), []
+        self.cmds, self.subs, self.taint, self.spans, self.notes = [], [], set(), [], []
         self.cur, self.word, self.redir, self.pending, self.depth = self.new(), None, None, [], 0
         self.groups = []   # the ( .. ) and { ..; } groups around the current command, by id
         if run:
@@ -411,6 +414,15 @@ class Lex:
         """The text without its heredoc bodies."""
         out, at = [], 0
         for a, b in self.spans:
+            out.append(self.t[at:a])
+            at = b
+        return ''.join(out) + self.t[at:]
+
+    def uncommented(self):
+        """The text without its comments (#1057). Heredoc bodies and quoted text stay: only what this shell
+        itself skips as a comment goes."""
+        out, at = [], 0
+        for a, b in self.notes:
             out.append(self.t[at:a])
             at = b
         return ''.join(out) + self.t[at:]
@@ -487,7 +499,9 @@ class Lex:
             elif c == '#':
                 if self.word is None:   # a comment, to the end of the line
                     j = t.find('\n', i)
-                    i = n if j < 0 else j
+                    j = n if j < 0 else j
+                    self.notes.append((i, j))
+                    i = j
                 else:
                     self.lit(c)
                     i += 1
@@ -2803,6 +2817,14 @@ def named(text):
     return None
 
 
+def shell_uncomment(text):
+    """Shell text without its comments, as the shell itself reads them (#1057): a guarded word in a `#` comment
+    of a file the shell reads for CLAUDE_CODE_SIMPLE (~/.bashrc, a sourced file) is no command. Not for the command
+    itself (it can read its own comments from $BASH_EXECUTION_STRING), nor for Python, JS or other code: a guess at
+    another language's comments is a way past the guard (#1108)."""
+    return Lex(text).uncommented()
+
+
 REFUSE_TAG = "this machine's refuseScripts"   # in the label refuse_script_named() gives
 MENTION_HINT = ('If the file only mentions the script (a message, notes), give it to the program as a redirect, '
                 '`python3 tools/check.py < msg.md`, which is read as data, or do not pipe or substitute a file that '
@@ -3695,14 +3717,14 @@ def start_files(ctx):
         text = read_named(f, ctx)
         if text is None:
             return f'the command reads {f}, which the guard cannot read, and it may set {NO_HOOKS_ENV}'
-        if NO_HOOKS_ENV.lower() in text.lower():
+        if NO_HOOKS_ENV.lower() in shell_uncomment(text).lower():
             return f'the command reads {f}, which names {NO_HOOKS_ENV}'
     if re.search(r'(?<![\w$])(?:BASH_ENV|ENV)=', ctx.get('all') or ''):
         return f'the command sets BASH_ENV or ENV: a file the shell reads first may set {NO_HOOKS_ENV}'
     home = ctx['env'].get('HOME') or ''
     for name in START_FILES if os.path.isabs(home) else ():
         text = read_text(os.path.join(home, name))
-        if text and NO_HOOKS_ENV.lower() in text.lower():
+        if text and NO_HOOKS_ENV.lower() in shell_uncomment(text).lower():
             return f'~/{name} names {NO_HOOKS_ENV}'
     return None
 

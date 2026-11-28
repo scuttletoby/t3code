@@ -1,5 +1,9 @@
 {
   "version": 1,
+  "alert": {
+    "command": ["/srv/example/bin/notify-owner", "--topic", "machine"],
+    "timeoutSeconds": 60
+  },
   "heavy": {
     "sweep": {
       "stop": false,
@@ -127,6 +131,55 @@
           "shared": ["machines", "orch", "shared"]
         }
       ]
+    },
+    "pollLoop": { "enabled": true, "maxSleepSeconds": 120, "loopSleepSeconds": 5 },
+    "readSize": { "enabled": true, "maxChars": 20000 },
+    "batchNudge": {
+      "enabled": true,
+      "afterTurns": 3,
+      "tailBytes": 1048576,
+      "readOnlyTools": ["Read", "Grep", "Glob", "LS", "NotebookRead"],
+      "readOnlyCommands": [
+        "cat",
+        "head",
+        "tail",
+        "sed",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ls",
+        "find",
+        "wc",
+        "stat",
+        "file",
+        "tree",
+        "du",
+        "df",
+        "pwd",
+        "echo",
+        "printf",
+        "jq",
+        "awk",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "nl",
+        "diff",
+        "cmp",
+        "readlink",
+        "realpath",
+        "basename",
+        "dirname",
+        "which",
+        "type",
+        "column",
+        "less",
+        "git",
+        "facts",
+        "true"
+      ]
     }
   },
   "cleaner": {
@@ -167,7 +220,6 @@
     "timeZone": "Europe/London",
     "windowMinutes": 120,
     "retryMinutes": 15,
-    "alertCommand": ["/srv/example/bin/notify-owner", "--topic", "updates"],
     "alertOnBoot": false,
     "containerUsers": ["example-agent"],
     "systemDocker": true,

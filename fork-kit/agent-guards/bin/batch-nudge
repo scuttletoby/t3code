@@ -1,0 +1,212 @@
+#!/usr/bin/python3 -IB
+"""Claude Code PostToolUse hook (Read, Grep, Glob, LS, NotebookRead, Bash): a hint to batch reads. It never refuses.
+Part of fork-kit/agent-guards (README.md there: install, settings entry, the machine file's "agent-guards" section).
+
+Why: 93% of the turns that used a tool made exactly one call, and each turn costs about 10 s and sends the whole
+context again. 29,000 turns were one quick read right after a turn that was one quick read: each pair could have
+been one turn (up to 89 h and 3.4 G tokens). A line in the briefs did not change the number.
+
+What it does: after the afterTurns-th turn in a row (default 3) whose only tool call was a read-only one, it adds one
+line of context: put the next independent reads in one call. Then again after every afterTurns more such turns, so
+an agent that keeps going one read a turn sees it a few times, not every turn. A turn is one assistant message of the
+session's transcript (its tool calls share the message id); it reads only the last tailBytes (default 1 MB) of the
+transcript, so a long session costs no more than a short one. Read-only: a tool in readOnlyTools, or a Bash command
+whose every command word is in readOnlyCommands (no `sed -i`, no `find -delete/-exec`; git only with log, show,
+diff, status, grep, blame, ls-files, rev-parse, also after -C dir or -c k=v; a redirection only to /dev/null).
+A user's prompt, a text-only answer or a turn with two or more calls starts the count again.
+
+Settings (machine file, batchNudge): enabled (default true), afterTurns (3), tailBytes (1048576), readOnlyTools,
+readOnlyCommands. Fail open: a broken settings part, a lib that cannot load, a transcript it cannot read, broken input
+or its own error adds nothing (exit 0, or 1 with a line on its own error). Tests:
+fork-kit/agent-guards/tests/batch-nudge.test.py
+"""
+import json, os, re, shlex, sys
+
+NAME = 'batch-nudge'
+DEFAULTS = {'enabled': True, 'afterTurns': 3, 'tailBytes': 1048576,
+            'readOnlyTools': ['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'],
+            'readOnlyCommands': ['cat', 'head', 'tail', 'sed', 'grep', 'ls', 'find', 'wc', 'git']}
+GIT_READS = {'log', 'show', 'diff', 'status', 'grep', 'blame', 'ls-files', 'rev-parse'}
+PUNCT = set('();<>|&')
+
+
+def _settings():
+    """(batchNudge settings, problem or None). A problem means the hook adds nothing."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        return config.load('batchNudge')
+    except BaseException as e:   # noqa: BLE001 - fail open
+        return dict(DEFAULTS), f'cannot load the kit\'s config code ({type(e).__name__}: {e})'
+
+
+def _first(text, event):
+    """True when this session has not had this notice yet (the kit's lib; a lib that cannot load: always)."""
+    try:
+        from agent_guards import config
+        return config.first_notice(text, event)
+    except BaseException:   # noqa: BLE001
+        return True
+
+
+def read_only_bash(command, words):
+    """True when every simple command of `command` only reads (a short list, on purpose: unsure is False)."""
+    if not isinstance(command, str) or not command.strip() or '$(' in command or '`' in command:
+        return False
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        ts = list(lex)
+    except ValueError:
+        return False
+    parts, cur, i = [], [], 0
+    while i < len(ts):
+        t = ts[i]
+        if t and set(t) <= PUNCT:
+            if '<' in t or '>' in t:       # only 2>/dev/null, >/dev/null, 2>&1: anything else may write
+                nxt = ts[i + 1] if i + 1 < len(ts) else ''
+                if t in ('>', '>>', '&>', '2>') and nxt == '/dev/null' or t == '>&' and nxt in ('1', '2'):
+                    if cur and cur[-1] in ('1', '2'):
+                        cur.pop()
+                    i += 2
+                    continue
+                return False
+            parts.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+        i += 1
+    parts.append(cur)
+    for ws in parts:
+        while ws and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', ws[0], re.S):
+            ws = ws[1:]
+        if not ws:
+            continue
+        cmd = os.path.basename(ws[0])
+        if cmd not in words:
+            return False
+        if cmd == 'sed' and any(w.startswith('-i') or w.startswith('--in-place') for w in ws[1:]):
+            return False
+        if cmd == 'find' and any(w in ('-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fls')
+                                 for w in ws[1:]):
+            return False
+        if cmd == 'git' and git_verb(ws[1:]) not in GIT_READS:
+            return False
+    return True
+
+
+def git_verb(args):
+    """git's subcommand after its own options (`git -C dir log`, `git -c k=v show`, `git --no-pager diff`)."""
+    i = 0
+    while i < len(args) and args[i].startswith('-'):
+        i += 2 if args[i] in ('-C', '-c', '--git-dir', '--work-tree', '--namespace') else 1
+    return args[i] if i < len(args) else ''
+
+
+def read_only(name, tool_input, settings):
+    if name in settings['readOnlyTools']:
+        return True
+    return name == 'Bash' and isinstance(tool_input, dict) and \
+        read_only_bash(tool_input.get('command'), set(settings['readOnlyCommands']))
+
+
+def tail_lines(path, size):
+    """The whole lines in the last `size` bytes of the transcript (the first, cut one is dropped)."""
+    with open(path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        start = max(0, end - size)
+        f.seek(start)
+        data = f.read(end - start)
+    lines = data.split(b'\n')
+    return lines[1:] if start > 0 else lines
+
+
+def streak(path, settings):
+    """How many turns in a row, the latest last, made exactly one tool call and that one read-only."""
+    turns = []          # oldest first: [message id, [(tool, input)]], or None for a user's prompt
+    for raw in tail_lines(path, settings['tailBytes']):
+        if not raw.strip():
+            continue
+        if b'"type":"user"' in raw[:4096] or b'"type": "user"' in raw[:4096]:
+            if b'"tool_result"' in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if d.get('type') == 'user' and not d.get('isMeta') and not d.get('isSidechain'):
+                turns.append(None)          # a prompt: the count starts again after it
+            continue
+        if b'"assistant"' not in raw:
+            continue
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if d.get('type') != 'assistant' or d.get('isSidechain'):
+            continue
+        msg = d.get('message') or {}
+        mid = msg.get('id') or d.get('uuid')
+        if not turns or turns[-1] is None or turns[-1][0] != mid:
+            turns.append([mid, []])
+        for block in msg.get('content') or []:
+            if isinstance(block, dict) and block.get('type') == 'tool_use':
+                turns[-1][1].append((block.get('name'), block.get('input')))
+    n = 0
+    for t in reversed(turns):
+        if t is None or len(t[1]) != 1 or not read_only(t[1][0][0], t[1][0][1], settings):
+            break
+        n += 1
+    return n
+
+
+def hint(n):
+    return (f'{NAME}: {n} turns in a row each made one read-only call. Each turn takes about 10 s and sends the whole '
+            'context again: put the next independent reads in ONE call (one Bash command, e.g. `sed -n 1,80p a; '
+            'grep -n x b`, or several tool calls in one message).')
+
+
+def main(argv=None):
+    """Exit 0 always for its answer (context or nothing); 1 only on its own failure (the call has run anyway)."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv:
+        sys.stderr.write(f'usage: {NAME} (hook: PostToolUse JSON on stdin; its settings entry: `agent-guards hooks`)\n')
+        return 1
+    try:
+        settings, problem = _settings()
+        event = json.loads(sys.stdin.read())
+        if problem:
+            text = (f'{NAME}: the machine file\'s "agent-guards" section cannot be used as written ({problem}); '
+                    f'built-in defaults used for that part, and {NAME} adds nothing until it is fixed. Tell the '
+                    'owner; `agent-guards self-check` names every problem.')
+            sys.stderr.write(text + '\n')
+            if not _first(text, event):
+                return 0
+            out = {'systemMessage': text}
+            if isinstance(event, dict) and event.get('hook_event_name') in ('PreToolUse', 'PostToolUse'):
+                out['hookSpecificOutput'] = {'hookEventName': event['hook_event_name'], 'additionalContext': text}
+            print(json.dumps(out))
+            return 0
+        if not settings['enabled'] or not isinstance(event, dict) or event.get('hook_event_name') != 'PostToolUse':
+            return 0
+        if not read_only(event.get('tool_name'), event.get('tool_input'), settings):
+            return 0
+        path = event.get('transcript_path')
+        if not isinstance(path, str) or not path:
+            return 0
+        try:
+            n = streak(path, settings)
+        except (OSError, ValueError):
+            return 0
+        if n < settings['afterTurns'] or n % settings['afterTurns']:
+            return 0
+    except BaseException as e:   # noqa: BLE001 - it only adds a hint
+        sys.stderr.write(f'{NAME}: failed ({type(e).__name__}: {e}); no hint added.\n')
+        return 1
+    print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': hint(n)}}))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

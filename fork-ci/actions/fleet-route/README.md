@@ -47,7 +47,7 @@ jobs:
         with:
           # the config as the base branch has it: a pull request cannot change where it runs
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
-          sparse-checkout: .github/fleet.json
+          sparse-checkout: .github/fleet.json # only on a GitHub-hosted runner: see below
           sparse-checkout-cone-mode: false
       - id: route
         uses: scuttletoby/t3code/fork-ci/actions/fleet-route@<release sha> # ci/vN
@@ -71,6 +71,12 @@ jobs:
           && fromJSON('["self-hosted", "example-build"]')
           || 'ubuntu-latest' }}
 ```
+
+The route job's sparse checkout is for a GitHub-hosted runner, which starts each job on a fresh disk. On a
+self-hosted label, run [git-clean](../git-clean/README.md) first (it empties the workspace), or drop `sparse-checkout`
+and read the one file with `git show <ref>:.github/fleet.json`: a sparse checkout leaves `core.sparseCheckout=true` in
+the reused work folder's `.git`, which outlives the next job's `sparse-checkout disable`, so later jobs there build
+from a partial tree. [checkout-state](../checkout-state/README.md) refuses such a workflow.
 
 The `runs-on` reads, in order:
 

@@ -6,7 +6,7 @@
   update-policy-install self-check
 
 install copies bin/update-policy, sbin/update-policy-install, lib/updatepolicy/, systemd/, apt/, README.md and
-fork-kit/common/{machine_file,free_contract,kit_install}.py of one release into
+fork-kit/common/{machine_file,free_contract,kit_install,alert}.py of one release into
 /usr/local/libexec/update-policy/versions/<sha>/ (with MANIFEST.sha256), checks the copy, switches the link `current`
 to it and links /usr/local/bin/update-policy and /usr/local/sbin/update-policy-install to it. With --timer the kit
 takes over restarts, in this order, so there is never a time with neither restart policy: it writes the system
@@ -55,7 +55,7 @@ class UpdatePolicyInstaller(kit_install.Installer):
     LINKS = {'/usr/local/bin/update-policy': 'bin/update-policy',
              '/usr/local/sbin/update-policy-install': 'sbin/update-policy-install'}
     SOURCE_FILES = ('bin/update-policy', 'sbin/update-policy-install', 'README.md', 'common/machine_file.py',
-                    'common/free_contract.py', 'common/kit_install.py', 'apt/zz-update-policy') \
+                    'common/free_contract.py', 'common/kit_install.py', 'common/alert.py', 'apt/zz-update-policy') \
         + tuple(f'systemd/{name}' for name in UNITS)
     EXECUTABLE = frozenset({'bin/update-policy', 'sbin/update-policy-install'})
     PACKAGE = 'updatepolicy'

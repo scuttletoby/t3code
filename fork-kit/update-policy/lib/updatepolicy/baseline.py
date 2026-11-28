@@ -253,6 +253,14 @@ def disk_drift(host, s):
     return out
 
 
+def alert_drift(s):
+    """A machine with no alert channel: every alert goes only to the journal, which nobody reads in time."""
+    if s['alertCommand']:
+        return []
+    return ['no alert channel: alerts go only to the journal (add the machine file\'s "alert" section, then run '
+            '`update-policy test-alert` as root)']
+
+
 def _guarded(name, fn):
     """One check; one that breaks is a drift line, and the others still run."""
     try:
@@ -269,7 +277,8 @@ def check(host, m, s, state, now):
                      ('the pending restart', lambda: pending_drift(m.pending(), s, now, state, m.boot_id())),
                      ('the listening ports', lambda: ports_drift(host, s)),
                      ('sshd\'s settings', lambda: ssh_drift(host, s)),
-                     ('the disks', lambda: disk_drift(host, s))):
+                     ('the disks', lambda: disk_drift(host, s)),
+                     ('the alert channel', lambda: alert_drift(s))):
         lines += _guarded(name, fn)
     return [settings_mod.one_line(x, 400) for x in lines]
 

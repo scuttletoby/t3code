@@ -10,7 +10,8 @@ A hook's answer never depends on who runs the test: run_hook starts it under a s
 to the real Claude Code of an agent running the tests and blocked whenever that agent had another command running in
 the background (config.test.py failed 4 of 15 that way while several suites ran at once).
 """
-import importlib.machinery, importlib.util, json, os, signal, subprocess, sys
+import builtins, contextlib, importlib.machinery, importlib.util, json, os, signal, subprocess, sys
+from unittest import mock
 
 sys.dont_write_bytecode = True   # the CI runner has no -B: no __pycache__ beside the hooks
 
@@ -28,6 +29,16 @@ config.MACHINE_PATH, config.OWNER_UID = machine, int(uid)
 sys.argv = [hook] + sys.argv[5:]
 runpy.run_path(hook, run_name='__main__')
 '''
+# the same through the fast path (bin/agent-guards-fast, lib/agent_guards/fast.py), with the config set the same way
+FAST_RUNNER = '''import sys
+lib, machine, uid, hook = sys.argv[1:5]
+sys.path.insert(0, lib)
+from agent_guards import config
+config.MACHINE_PATH, config.OWNER_UID = machine, int(uid)
+from agent_guards import fast
+sys.exit(fast.main([hook] + sys.argv[5:]))
+'''
+VIA = None   # 'fast': run_hook starts every hook through the fast path (tests/fast.test.py runs suites both ways)
 # argv: a stand-in Claude Code that runs "$@" as a child (not exec: `; exit $?` after it) and nothing else
 STAND_IN = '"$@"; exit $?'
 # argv: run argv[1:] with no `claude` above it: the middle process ends at once, so the one below it is re-parented
@@ -85,13 +96,42 @@ def load_hook(name, machine=NO_MACHINE):
     return mod
 
 
+@contextlib.contextmanager
+def bytes_read(mod):
+    """A list that gets the size of every read() the hook module `mod` makes on a file it opens while the block
+    runs. A speed test checks this (what the hook reads), not the wall time a busy test machine adds."""
+    reads, real_open = [], builtins.open
+
+    class Counted:
+        def __init__(self, f):
+            self._f = f
+
+        def read(self, *args):
+            data = self._f.read(*args)
+            reads.append(len(data))
+            return data
+
+        def __getattr__(self, name):
+            return getattr(self._f, name)
+
+        def __enter__(self):
+            self._f.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._f.__exit__(*exc)
+
+    with mock.patch.object(mod, 'open', lambda *a, **k: Counted(real_open(*a, **k)), create=True):
+        yield reads
+
+
 def run_hook(name, event, machine=NO_MACHINE, env=None, cwd=None, timeout=60, args=(), hook=None, parent='claude'):
     """Run bin/<name> (or the file `hook`) in a new process with `event` (a dict, or text) on stdin. Its parent is a
     stand-in Claude Code with nothing else under it (parent='claude'), or it has no `claude` above it (parent=None).
     The whole process group is killed afterwards; past `timeout` that raises subprocess.TimeoutExpired."""
     text = event if isinstance(event, str) else json.dumps(event)
-    argv = [sys.executable, '-I', '-B', '-c', RUNNER, LIB, machine, str(os.geteuid()), hook or os.path.join(BIN, name),
-            *args]
+    argv = [sys.executable, '-I', '-B', '-c', FAST_RUNNER if VIA == 'fast' else RUNNER, LIB, machine,
+            str(os.geteuid()), hook or os.path.join(BIN, name), *args]
     if parent == 'claude':
         argv, exe = ['claude', '-c', STAND_IN, 'claude', *argv], '/bin/sh'
     elif parent is None:
