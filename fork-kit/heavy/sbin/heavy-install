@@ -40,6 +40,9 @@ CAPACITY = '/usr/local/bin/t3-capacity'
 # and its uninstall deletes LIBEXEC and ETC whole (so a copy kept anywhere in them would be lost)
 KEPT_CAPACITY = '/usr/local/libexec/heavy-kept'
 UNIT_DIR = '/etc/systemd/user'
+# Every link names `current`, the form every installer from ci/v23 on knows as its own, so a rollback to any of them
+# switches t3-capacity together with heavy (#1095). ci/v20 and older have no bin/t3-capacity: before going back to one,
+# run this release's uninstall (README, Rollback past the `t3-capacity` link).
 LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-install',
          CAPACITY: CURRENT + '/bin/t3-capacity'}
 KEPT = {WRAPPER: (REPLACED, 'heavy'), CAPACITY: (KEPT_CAPACITY, 't3-capacity')}   # where a plain old file goes
@@ -130,21 +133,23 @@ def write_file(path, text, mode=0o644):
 
 
 def switch_link(path, target):
-    """Point path at target in one step (a new link renamed over the old one)."""
+    """Point path at target in one step (a new link renamed over the old one). A temporary link a stopped run left
+    is removed, also when the link is right already (#933)."""
     real = p(path)
+    tmp = f'{real}.new-link'
+    if os.path.islink(tmp):
+        os.unlink(tmp)
     if os.path.islink(real) and os.readlink(real) == target:
         return
     os.makedirs(os.path.dirname(real), mode=0o755, exist_ok=True)
-    tmp = f'{real}.new-link'
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(tmp)
     os.symlink(target, tmp)
     os.replace(tmp, real)
 
 
-def ours(path, target):
+def kit_link(path):
+    """PATH is the link this kit makes (its target may be gone, e.g. after a rollback to ci/v20 or older)."""
     real = p(path)
-    return os.path.islink(real) and os.readlink(real) == target
+    return os.path.islink(real) and os.readlink(real) == LINKS[path]
 
 
 def read_manifest(folder):
@@ -280,9 +285,9 @@ def check_options(a):
 
 def check_old_state(replace_capacity=False):
     """Refuse, before writing anything, what the installer must not overwrite."""
-    for path, target in LINKS.items():
+    for path in LINKS:
         real = p(path)
-        if not os.path.lexists(real) or ours(path, target):
+        if not os.path.lexists(real) or kit_link(path):
             continue
         if path in KEPT and os.path.isfile(real) and not os.path.islink(real):
             continue   # a plain old copy: kept in its KEPT folder, put back by uninstall
@@ -331,7 +336,7 @@ def ours_unit(path):
 
 def record_rows(sha, unit_path, sweep_timer=False):
     rows = [(path, 'link', target) for path, target in sorted(LINKS.items())
-            if path != CAPACITY or ours(path, target)]     # a host's own t3-capacity left in place is not recorded
+            if path != CAPACITY or kit_link(path)]     # a host's own t3-capacity left in place is not recorded
     rows.append((CURRENT, 'link', f'{VERSIONS}/{sha}'))
     folder = p(f'{VERSIONS}/{sha}')
     for rel, digest in sorted(read_manifest(folder).items()):
@@ -405,7 +410,7 @@ def install(a, stop_after=None):
     switch_link(CURRENT, f'{VERSIONS}/{a.sha}')
     done('switch')
     for path, target in LINKS.items():
-        if path == CAPACITY and os.path.lexists(p(path)) and not ours(path, target) and not a.replace_t3_capacity:
+        if path == CAPACITY and os.path.lexists(p(path)) and not kit_link(path) and not a.replace_t3_capacity:
             if os.path.islink(p(path)):
                 say(f'note: {path} is a link this kit did not make (to {os.readlink(p(path))}): left as it is (its '
                     f'readings can differ from the kit\'s; remove it and run again with --replace-t3-capacity to '
@@ -438,7 +443,7 @@ def install(a, stop_after=None):
     done('record')
     say(f'installed release {a.sha}: slice {cfg["slice"]}, grace {cfg["grace_seconds"]:g}s'
         + (', sweep timer units written' if sweep_timer else '')
-        + ('' if ours(CAPACITY, LINKS[CAPACITY]) else
+        + ('' if kit_link(CAPACITY) else
            f'; WARNING: {CAPACITY} is still the host\'s own, not the kit\'s (--replace-t3-capacity switches it)'))
     for path, kind, want in rows:
         say(f'  {path}  {kind}  {want}')
@@ -451,21 +456,33 @@ def uninstall():
     cfg = {}
     with contextlib.suppress(Refused):
         cfg = read_config()
-    for path, target in LINKS.items():
-        if ours(path, target):
-            os.unlink(p(path))
-    for path, (folder, name) in KEPT.items():
+    for path in LINKS:
+        folder, name = KEPT.get(path, (None, None))
         backups = []
-        if os.path.isdir(p(folder)):
+        if folder and os.path.isdir(p(folder)):
+            for n in os.listdir(p(folder)):
+                if n.startswith(name + '.') and n.endswith('.tmp'):   # a keep that stopped before its rename
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(os.path.join(p(folder), n))
             backups = sorted((os.path.join(p(folder), n) for n in os.listdir(p(folder))
-                              if n.startswith(name + '.') and not n.endswith('.tmp')), key=os.path.getmtime)
-        if backups and not os.path.lexists(p(path)):
+                              if n.startswith(name + '.')), key=os.path.getmtime)
+        mine = kit_link(path)
+        if backups and (mine or not os.path.lexists(p(path))):
+            # the kept copy is renamed over the kit's link in one step: the command is never missing (#933)
             tmp = p(path) + '.restore'
             shutil.copy2(backups[-1], tmp)
             os.replace(tmp, p(path))
             say(f'put the old {path} back')
-        if folder == KEPT_CAPACITY and backups:   # outside LIBEXEC: removed only once its copy is back in place
-            if os.path.isfile(p(path)) and not os.path.islink(p(path)) \
+        elif mine:
+            os.unlink(p(path))
+        for left in (p(path) + '.restore', p(path) + '.new-link'):   # a run that stopped half-way
+            if os.path.islink(left) or os.path.isfile(left):
+                os.unlink(left)
+        if folder == KEPT_CAPACITY and os.path.isdir(p(folder)):   # outside LIBEXEC: removed once its copy is back
+            if not backups:
+                with contextlib.suppress(OSError):
+                    os.rmdir(p(folder))   # empty (only a stopped keep's temporary file was there)
+            elif os.path.isfile(p(path)) and not os.path.islink(p(path)) \
                     and sha256_file(p(path)) == sha256_file(backups[-1]):
                 shutil.rmtree(p(folder), ignore_errors=True)
             else:

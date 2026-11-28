@@ -5,7 +5,9 @@ No root, no systemd, no network.
 """
 # CI's checkout is shallow without tags, so the test that runs an older release's installer skips there (it runs locally):
 # fork-ci: may skip Install.test_older_installers_install_and_uninstall_keep_the_hosts_t3_capacity
+# fork-ci: may skip Install.test_a_rollback_with_a_real_older_installer_rolls_t3_capacity_back_too
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, unittest
+from unittest import mock
 
 OLDER_RELEASE = 'ci/v22'   # a released installer from before the t3-capacity link (its uninstall is run below)
 
@@ -14,7 +16,7 @@ CAPACITY = os.path.join(os.path.dirname(os.path.dirname(KIT)), 'packages', 'shar
 SHA1, SHA2 = 'a' * 40, 'b' * 40
 OLD_WRAPPER = b'#!/bin/sh\nexec systemd-run --user --scope --quiet --slice=heavy.slice --collect -- "$@"\n'
 OLD_CAPACITY = b'#!/bin/sh\necho "available=9999MB swapfree=9999MB load=0/4cores"; echo OK\n'   # a host's own copy
-CAPACITY_LINK = '/usr/local/libexec/heavy/current/bin/t3-capacity'
+CAPACITY_LINK = '/usr/local/libexec/heavy/current/bin/t3-capacity'   # the form every installer from ci/v23 on knows
 
 
 def load(path=os.path.join(KIT, 'sbin', 'heavy-install')):
@@ -246,25 +248,16 @@ class Install(unittest.TestCase):
         self.run_old_capacity()
 
     def test_older_installers_install_and_uninstall_keep_the_hosts_t3_capacity(self):
-        repo = os.path.dirname(os.path.dirname(KIT))
-        r = subprocess.run(['git', '-C', repo, 'rev-parse', '--verify', '-q', OLDER_RELEASE + '^{commit}'],
-                           capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
+        m_old, source = self.older_installer(OLDER_RELEASE)
+        if m_old is None:
             self.skipTest(f'{OLDER_RELEASE} is not in this checkout (a shallow clone without tags); '
                           f'test_kept_t3_capacity_is_outside_every_folder_an_uninstall_deletes covers its deletes')
-        older = os.path.join(self.root, 'older-release')
-        os.mkdir(older)
-        tree = subprocess.run(['git', '-C', repo, 'archive', OLDER_RELEASE, 'fork-kit', 'packages/shared/src/capacity'],
-                              capture_output=True, timeout=120, check=True).stdout
-        subprocess.run(['tar', '-x', '-C', older], input=tree, check=True, timeout=120)
-        m_old = load(os.path.join(older, 'fork-kit', 'heavy', 'sbin', 'heavy-install'))
-        m_old.PREFIX, m_old.ROOT_UID = self.root, os.geteuid()
         self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
         self.assertEqual(self.install('--replace-t3-capacity')[0], 0)
         # the rollback: the older installer installs its own release over this state, then uninstalls
-        code, _, err = self.run_main('install', '--source', os.path.join(older, 'fork-kit', 'heavy'), '--sha', SHA2,
-                                     m=m_old)
+        code, _, err = self.run_main('install', '--source', source, '--sha', SHA2, m=m_old)
         self.assertEqual(code, 0, err)
+        # the link names `current`: the older release's own t3-capacity runs, as its heavy does
         self.assertEqual(self.resolve('/usr/local/bin/t3-capacity'),
                          self.path(f'/usr/local/libexec/heavy/versions/{SHA2}/bin/t3-capacity'))
         code, _, err = self.run_main('uninstall', m=m_old)
@@ -272,6 +265,203 @@ class Install(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy')))
         self.assertFalse(os.path.exists(self.path('/etc/heavy')))
         self.assert_older_uninstall_left_the_kept_copy_then_restore()
+
+    def older_installer(self, release):
+        """The heavy-install of RELEASE (a ci/vN tag), loaded on the fake root, or None without the tag (CI)."""
+        repo = os.path.dirname(os.path.dirname(KIT))
+        r = subprocess.run(['git', '-C', repo, 'rev-parse', '--verify', '-q', release + '^{commit}'],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return None, None
+        older = os.path.join(self.root, 'older-' + release.replace('/', '-'))
+        os.mkdir(older)
+        paths = ['fork-kit']   # releases before heavy facts (ci/v20 and older) have no capacity rule folder
+        if subprocess.run(['git', '-C', repo, 'cat-file', '-e', release + ':packages/shared/src/capacity'],
+                          capture_output=True, timeout=60).returncode == 0:
+            paths.append('packages/shared/src/capacity')
+        tree = subprocess.run(['git', '-C', repo, 'archive', release, *paths],
+                              capture_output=True, timeout=120, check=True).stdout
+        subprocess.run(['tar', '-x', '-C', older], input=tree, check=True, timeout=120)
+        m_old = load(os.path.join(older, 'fork-kit', 'heavy', 'sbin', 'heavy-install'))
+        m_old.PREFIX, m_old.ROOT_UID = self.root, os.geteuid()
+        return m_old, os.path.join(older, 'fork-kit', 'heavy')
+
+    def run_kit_capacity(self):
+        """/usr/local/bin/t3-capacity resolves to a kit copy that is there and starts."""
+        real = self.resolve('/usr/local/bin/t3-capacity')
+        self.assertTrue(os.path.isfile(real), real)
+        r = subprocess.run([sys.executable, '-I', '-B', real, '--help'], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('t3-capacity [--kind KIND] [MB]', r.stdout)
+
+    def test_a_rollback_to_a_release_without_t3_capacity_is_mended_by_either_line(self):
+        # ci/v20 or older switches `current` to a release without bin/t3-capacity. The README says to run this
+        # release's uninstall first; without it the link points at a missing file until one of the two lines below.
+        # Here its switch is made by hand (CI has no tags; the real ci/v20 runs in the next test).
+        for mend in ('install', 'uninstall'):
+            with self.subTest(mend=mend):
+                shutil.rmtree(self.root)
+                os.makedirs(self.path('/usr/local/bin'))
+                self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
+                self.assertEqual(self.install('--replace-t3-capacity')[0], 0)
+                old_release = self.path(f'/usr/local/libexec/heavy/versions/{SHA2}')
+                os.makedirs(old_release + '/bin')
+                shutil.copy2(os.path.join(KIT, 'bin', 'heavy'), old_release + '/bin/heavy')
+                os.unlink(self.path('/usr/local/libexec/heavy/current'))
+                os.symlink(f'/usr/local/libexec/heavy/versions/{SHA2}', self.path('/usr/local/libexec/heavy/current'))
+                self.assertFalse(os.path.exists(self.resolve('/usr/local/bin/t3-capacity')))   # the documented gap
+                code, out, err = self.install() if mend == 'install' else self.run_main('uninstall')
+                self.assertEqual(code, 0, err)
+                if mend == 'install':                                 # rolling forward again: the usual line
+                    self.assertEqual(os.readlink(self.path('/usr/local/bin/t3-capacity')), CAPACITY_LINK)
+                    self.run_kit_capacity()
+                    self.assertEqual(self.run_main('self-check')[0], 0)
+                else:                                                 # the broken kit link: the host's copy back
+                    self.run_old_capacity()
+                    self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy-kept')))
+
+    def assert_release_in_use(self, sha):
+        """heavy and t3-capacity on PATH are both release SHA's, and t3-capacity starts."""
+        for cmd in ('heavy', 't3-capacity'):
+            self.assertEqual(self.resolve(f'/usr/local/bin/{cmd}'),
+                             self.path(f'/usr/local/libexec/heavy/versions/{sha}/bin/{cmd}'), cmd)
+        self.run_kit_capacity()
+
+    def test_a_rollback_with_a_real_older_installer_rolls_t3_capacity_back_too(self):
+        # #1095: ci/v23 is the first release that links t3-capacity, ci/v33 the last before #933. Each must see this
+        # release's link as its own: switch it with heavy, print no note or WARNING, take --replace-t3-capacity.
+        for release in ('ci/v23', 'ci/v33', 'ci/v20'):
+            with self.subTest(release=release):
+                shutil.rmtree(self.root)
+                os.makedirs(self.path('/usr/local/bin'))
+                m_old, source = self.older_installer(release)
+                if m_old is None:
+                    self.skipTest(f'{release} is not in this checkout (a shallow clone without tags); '
+                                  'test_a_rollback_to_a_release_without_t3_capacity_is_mended_by_either_line '
+                                  'covers ci/v20 by hand')
+                self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
+                self.assertEqual(self.install('--replace-t3-capacity')[0], 0)
+                if release == 'ci/v20':
+                    # no bin/t3-capacity there: the README's order is this release's uninstall first, which puts
+                    # the host's copy back; ci/v20 does not know t3-capacity and leaves it running
+                    self.assertEqual(self.run_main('uninstall')[0], 0)
+                    code, out, err = self.run_main('install', '--source', source, '--sha', SHA2, m=m_old)
+                    self.assertEqual(code, 0, err)
+                    self.run_old_capacity()
+                    self.assertEqual(self.install('--replace-t3-capacity')[0], 0)   # roll forward again
+                    self.assert_release_in_use(SHA1)
+                else:
+                    code, out, err = self.run_main('install', '--source', source, '--sha', SHA2, m=m_old)
+                    self.assertEqual(code, 0, err)
+                    self.assertNotIn('note:', out)
+                    self.assertNotIn('WARNING', out)
+                    self.assert_release_in_use(SHA2)
+                    code, out, err = self.run_main('install', '--source', source, '--sha', SHA2,
+                                                   '--replace-t3-capacity', m=m_old)
+                    self.assertEqual(code, 0, err)                    # runs again with the option: not refused
+                    self.assertEqual(self.run_main('self-check', m=m_old)[0], 0)
+                    code, out, err = self.install()                   # roll forward again
+                    self.assertEqual(code, 0, err)
+                    self.assertNotIn('note:', out)
+                    self.assert_release_in_use(SHA1)
+                    self.assertEqual(self.run_main('self-check')[0], 0)
+                code, out, err = self.run_main('uninstall')           # this release's uninstall: the old copy back
+                self.assertEqual(code, 0, err)
+                self.run_old_capacity()
+                self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy-kept')))
+
+    def test_uninstall_never_leaves_the_command_missing(self):
+        # #933 1: the kept copy replaces the kit's link in one rename; there is no step without a t3-capacity
+        self.write_old('/usr/local/bin/heavy', OLD_WRAPPER)
+        self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
+        self.assertEqual(self.install('--replace-t3-capacity')[0], 0)
+        missing = []
+        real_unlink, real_replace = os.unlink, os.replace
+
+        def watch(fn):
+            def call(*args, **kw):
+                out = fn(*args, **kw)
+                for path in ('/usr/local/bin/heavy', '/usr/local/bin/t3-capacity'):
+                    if not os.path.lexists(self.path(path)):
+                        missing.append(path)
+                return out
+            return call
+
+        with mock.patch.object(os, 'unlink', watch(real_unlink)), mock.patch.object(os, 'replace', watch(real_replace)):
+            code, out, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(missing, [])
+        self.run_old_capacity()
+
+    def test_uninstall_stopped_before_its_rename_then_run_again(self):
+        # #933 1 and 2: a stop between the copy and its rename leaves the kit's link, which still runs
+        self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
+        self.assertEqual(self.install('--replace-t3-capacity')[0], 0)
+        real_replace = os.replace
+
+        def stop(src, dst, *a, **kw):
+            if dst == self.path('/usr/local/bin/t3-capacity'):
+                raise OSError('stopped before the rename (test)')
+            return real_replace(src, dst, *a, **kw)
+
+        with mock.patch.object(os, 'replace', stop), self.assertRaises(OSError):
+            self.run_main('uninstall')
+        self.assertEqual(os.readlink(self.path('/usr/local/bin/t3-capacity')), CAPACITY_LINK)
+        self.run_kit_capacity()
+        code, out, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        self.run_old_capacity()
+        self.assertEqual(sorted(os.listdir(self.path('/usr/local/bin'))), ['t3-capacity'])   # no .restore
+        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy-kept')))
+        self.assertEqual(self.run_main('uninstall')[0], 0)            # again, on an empty prefix: fine
+        self.run_old_capacity()
+
+    def test_a_keep_stopped_before_its_rename_leaves_no_kept_folder_after_uninstall(self):
+        # #933 2: the copy into heavy-kept/ stopped before its rename; then the owner uninstalls
+        self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)
+        real_replace = os.replace
+
+        def stop(src, dst, *a, **kw):
+            if src.endswith('.tmp') and '/heavy-kept/' in src:
+                raise OSError('stopped before the rename (test)')
+            return real_replace(src, dst, *a, **kw)
+
+        with mock.patch.object(os, 'replace', stop), self.assertRaises(OSError):
+            self.install('--replace-t3-capacity')
+        self.assertEqual([n.endswith('.tmp') for n in os.listdir(self.path('/usr/local/libexec/heavy-kept'))],
+                         [True])
+        self.run_old_capacity()
+        code, out, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        self.run_old_capacity()
+        self.assertFalse(os.path.exists(self.path('/usr/local/libexec/heavy-kept')))
+
+    def test_a_link_swap_stopped_half_way_leaves_no_temporary_link(self):
+        # #933 2: a stop between the new link and its rename leaves `<path>.new-link`; then the line runs again, or
+        # the owner uninstalls
+        real_replace = os.replace
+
+        def stop(src, dst, *a, **kw):
+            if src.endswith('/t3-capacity.new-link'):
+                raise OSError('stopped before the rename (test)')
+            return real_replace(src, dst, *a, **kw)
+
+        for then in ('install', 'uninstall'):
+            with self.subTest(then=then):
+                shutil.rmtree(self.root)
+                os.makedirs(self.path('/usr/local/bin'))
+                with mock.patch.object(os, 'replace', stop), self.assertRaises(OSError):
+                    self.install()
+                self.assertTrue(os.path.islink(self.path('/usr/local/bin/t3-capacity.new-link')))
+                code, out, err = self.install() if then == 'install' else self.run_main('uninstall')
+                self.assertEqual(code, 0, err)
+                left = [n for n in os.listdir(self.path('/usr/local/bin')) if '.' in n]
+                self.assertEqual(left, [])
+        # one left beside a link that is right already (another run made the link after this one stopped)
+        self.assertEqual(self.install()[0], 0)
+        os.symlink('/nowhere', self.path('/usr/local/bin/t3-capacity.new-link'))
+        self.assertEqual(self.install()[0], 0)
+        self.assertFalse(os.path.lexists(self.path('/usr/local/bin/t3-capacity.new-link')))
 
     def test_t3_capacity_swap_fails_old_command_still_works_then_run_again(self):
         self.write_old('/usr/local/bin/t3-capacity', OLD_CAPACITY)

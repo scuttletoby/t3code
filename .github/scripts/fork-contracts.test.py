@@ -4587,8 +4587,9 @@ MAY_SKIP = {
     "fork-ci/actions/head-check/review_guide.test.py": ["ReleaseTags." + t for t in (
         "test_override_authors_is_first_in_the_release_after_the_one_the_notes_name",
         "test_the_path_rules_are_first_in_the_release_the_guide_names")],
-    # Runs an older release's installer, found by its ci/vN tag; CI's checkout fetches none.
+    # Run older releases' installers, found by their ci/vN tags; CI's checkout fetches none.
     "fork-kit/heavy/tests/install.test.py": [
+        "Install.test_a_rollback_with_a_real_older_installer_rolls_t3_capacity_back_too",
         "Install.test_older_installers_install_and_uninstall_keep_the_hosts_t3_capacity"],
 }
 check("records: the tests a part run may skip are exactly the pinned ones, each by name (MAY_SKIP)",

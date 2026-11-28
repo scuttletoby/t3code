@@ -862,7 +862,10 @@ a plain copy back (`heavy --self-check` says the link differs and warns about th
   one is made again. The old `/usr/local/bin/heavy` and `/usr/local/bin/t3-capacity` keep working until the links
   step, which copies each to its kept folder before its link replaces it in one rename. The sweep's units are
   written only after that, so a timer never runs before the release it needs is in use. Running the same line again
-  finishes the job.
+  finishes the job, and removes a temporary link (`<path>.new-link`) a stopped run left. Uninstall puts each kept
+  copy back over the kit's link in one rename (never a moment without the command), then removes what a stopped run
+  left: a `.restore` copy, a `.new-link`, a half-kept `heavy-kept/*.tmp`, and `heavy-kept/` once it is empty or its
+  copy is back.
 - **Rollback:** the timer's service runs `/usr/local/libexec/heavy/current/lib/heavy_sweep.py` (the sweep of the
   release in use, never an older `heavy` without the `sweep` verb), and only when that file exists. Before going
   back to a release without the sweep, run the newer installer with `--no-sweep-timer`; if you did not, the
@@ -875,14 +878,18 @@ a plain copy back (`heavy --self-check` says the link differs and warns about th
 - **Rollback past the memory queue:** remove the `queue` key from the machine file's `heavy` section first. A
   release from before the queue does not know it: its sweep refuses the whole machine file and says which key. That
   release cannot be changed from here, so the order is the guard: key out, then the older release.
-- **Rollback past the `t3-capacity` link:** an older installer leaves `/usr/local/bin/t3-capacity` as it is, a link
-  to `current/bin/t3-capacity`; every release since `heavy facts` has that file. Before going back further, run
-  `heavy-install uninstall` (it puts the old copy back). The old copy is kept in `/usr/local/libexec/heavy-kept/`,
-  outside `/usr/local/libexec/heavy` and `/etc/heavy`, because an older installer's uninstall deletes those two
-  folders whole (and puts the newest file of `replaced/` back as `heavy`). That older uninstall does not know the
-  `t3-capacity` link, so it leaves it broken (every `t3-capacity N && …` gate then fails): run this release's
-  `sbin/heavy-install uninstall` from its source folder, as root, which removes the broken link and puts the kept
-  copy back, or install again.
+- **Rollback past the `t3-capacity` link:** the link names `current/bin/t3-capacity`, the form every installer from
+  ci/v23 on knows as its own, so a rollback to any of them switches `t3-capacity` together with `heavy`, with no note
+  (#1095). The trade-off is a rollback to ci/v20 or older, which has no `bin/t3-capacity`: its install switches
+  `current` and the link then points at a missing file (every `t3-capacity N && …` gate fails). So before installing
+  ci/v20 or older, run this release's `heavy-install uninstall` first: it puts the host's old copy back (from
+  `/usr/local/libexec/heavy-kept/`) or, where there was none, removes the link, and the older release then leaves
+  `/usr/local/bin/t3-capacity` alone. If the older install ran first, either line mends it: this release's install
+  (rolling forward) or its uninstall. The old copy is kept in `/usr/local/libexec/heavy-kept/`, outside
+  `/usr/local/libexec/heavy` and `/etc/heavy`, because an older installer's uninstall deletes those two folders whole
+  (and puts the newest file of `replaced/` back as `heavy`). An uninstall from ci/v22 or older does not know the
+  `t3-capacity` link, so it leaves it broken: run this release's `sbin/heavy-install uninstall` from its source folder, as root,
+  which removes the broken link and puts the kept copy back, or install again.
 - **Old state:** a plain-file `/usr/local/bin/heavy` (the one-line wrapper from before) is kept and put back by
   uninstall; a plain `/usr/local/bin/t3-capacity` (a host's own copy) is left alone, or with `--replace-t3-capacity`
   kept and put back by uninstall. A link at `t3-capacity` that points elsewhere is left alone (refused with
