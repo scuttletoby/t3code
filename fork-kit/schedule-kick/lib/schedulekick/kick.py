@@ -218,8 +218,7 @@ def _entry(raw, n, default_grace=GRACE_MINUTES):
     for key in ('repo', 'workflow', 'cron', 'ref'):
         if not isinstance(raw.get(key), str):
             raise ConfigError(f'{where}.{key} is missing or not a string')
-    if not REPO_RE.match(raw['repo']) or raw['repo'].split('/')[1] in ('.', '..'):
-        raise ConfigError(f'{where}.repo {raw["repo"]!r} is not OWNER/NAME')
+    _repo(raw, where)
     if not WORKFLOW_RE.match(raw['workflow']):
         raise ConfigError(f'{where}.workflow {raw["workflow"]!r} is not a workflow file name (name.yml)')
     if not REF_RE.match(raw['ref']) or '..' in raw['ref'] or raw['ref'].endswith('/'):
