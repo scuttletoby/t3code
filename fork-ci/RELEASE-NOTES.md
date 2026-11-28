@@ -20,7 +20,9 @@ admits it from measured free memory, less what lanes admitted a moment ago have 
 rule (shared or alone, a waiting restart first on every server it needs, dead holders swept by pid, start time and
 process group or by unit, garbage claim files swept, one lock); `contract.py` holds the contract tests a project runs
 against its own adapter. The claims folder and the limits a pull request must not loosen come from the runner's
-environment (`FORK_CI_LANES_*`), never from the project's config.
+environment (`FORK_CI_LANES_*`), never from the project's config. A lane's cost is the larger of `lane_mb` and its
+own measured peaks (kept by config file and lane id); a newer release's claim holds only the server it names, and a
+lane that needs it waits.
 
 **Upgrade:** none (nothing used it before).
 

@@ -19,9 +19,10 @@ only tighten them: the lower max_lanes, the higher reserve_mb and lane_mb.
 Admission (admit): a new lane starts only when fewer than max_lanes run and the memory the machine has free now
 (MemAvailable, measured) minus reserve_mb, minus what the admitted lanes have not used yet (each lane's cost less its
 process group's memory now: a lane started a moment ago is not in MemAvailable yet), holds one more lane's cost. A
-lane's cost is the largest peak of the last lanes measured (each run records its peak memory: its largest process,
-or its process group's sampled total when larger), lane_mb until one is. When the free memory or the measurements
-cannot be read, a lane starts only when none runs (one at a time: the safe old way).
+lane's cost is the largest of lane_mb and the peaks of its own last runs (each run records its peak memory, by its
+config file and lane id, so one project's light lanes never lower another's cost: its largest process, or its process
+group's sampled total when larger). When the free memory or the measurements cannot be read, a lane starts only when
+none runs (one at a time: the safe old way).
 
   python3 pool.py run --config lanes.json --lane ID --server NAME [--server NAME]... [--alone [--restart]]
       [--wait-s 3600] -- command...
@@ -29,9 +30,10 @@ Waits (polling) until every named server is claimed (shared, or alone with --alo
 first, on every named server) and the pool admits the lane, then runs the command with LANE_ID and LANE_PORT_<NAME>
 set, releases on exit (also on SIGTERM/SIGINT/SIGHUP: the command is stopped first) and records the lane's peak
 memory. The lane runs in its own process group (pool.py makes one when it does not lead one and no terminal is its
-input); its claims stay alive while a process of that group runs, so a pool.py killed outright (SIGKILL) holds its
-servers until the command it left ends. Exit: the command's; 128 + the signal when stopped; 75 when it waited
---wait-s without a start; 2 for a config it cannot use.
+input); its claims stay alive while a process of that group runs. A pool.py killed outright (SIGKILL) takes its
+command with it (the kernel kills it), and holds its servers until the processes that command started end. Exit: the
+command's; 128 + the signal when stopped; 75 when it waited --wait-s without a start (also behind a newer release's
+claim on a server it needs); 2 for a config it cannot use.
 """
 import argparse, json, os, re, resource, signal, subprocess, sys, time
 
@@ -41,7 +43,8 @@ sys.path.insert(0, HERE)
 import claims as claims_mod   # noqa: E402  (the same release)
 
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]*\Z')
-KEEP = 20   # measurements kept; the cost is the largest of the last ones
+KEEP = 20   # measurements kept per lane; the cost is the largest of the last ones
+MAX_KEYS = 200   # lanes measured: the longest unmeasured are dropped (lane ids that change every run)
 MEASURED = 'measured.json'
 
 
@@ -109,6 +112,7 @@ def load_config(path, env=None):
             raise ConfigError(f'{path}: "{key}" must be a whole number')
         c[key] = pick(v, host)
     c['claims_dir'] = host_dir(env)
+    c['config_path'] = os.path.realpath(path)   # (the lane's measurements are kept by it)
     return c
 
 
@@ -124,13 +128,22 @@ def available_mb(meminfo='/proc/meminfo'):
     return None
 
 
-def cost_mb(measured, default):
-    """A lane's cost: the largest of the last measured peaks; default before any; None when the measurements
-    cannot be read (never the default on a guess: it may be far below what lanes take)."""
-    if measured is None:
+def _peaks(got):
+    return [m for m in got if isinstance(m, int) and not isinstance(m, bool) and m > 0] if isinstance(got, list) else []
+
+
+def cost_mb(peaks, default):
+    """A lane's cost: the largest of default (lane_mb: the floor, also once it is measured) and its last measured
+    peaks; None when the measurements cannot be read (never the default on a guess: it may be far below what the
+    lane takes)."""
+    if peaks is None:
         return None
-    peaks = [m for m in measured[-KEEP:] if isinstance(m, int) and not isinstance(m, bool) and m > 0]
-    return max(peaks) if peaks else default
+    return max([default] + _peaks(peaks[-KEEP:] if isinstance(peaks, list) else []))
+
+
+def measure_key(cfg, lane):
+    """Whose peaks: the config file (one per project checkout) and the lane id."""
+    return cfg.get('config_path', '') + '\0' + lane
 
 
 def admit(lanes, free_mb, cost, reserve_mb, max_lanes, pending_mb=0):
@@ -186,25 +199,28 @@ def pending_mb(lanes, rss=group_rss_mb):
 
 
 def read_measured(folder):
-    """The measured peaks: [] before any; None when the file cannot be read (one lane at a time until a lane
-    measures again)."""
+    """The measured peaks, {measure_key: [peak MB, ...]}: {} before any (and for an earlier release's one host-wide
+    list: no lane's own peaks); None when the file cannot be read (one lane at a time until a lane measures again)."""
     try:
         with open(os.path.join(folder, MEASURED), encoding='utf-8') as f:
             got = json.load(f)
     except FileNotFoundError:
-        return []
+        return {}
     except (OSError, ValueError):
         return None
-    return got if isinstance(got, list) else None
+    return got if isinstance(got, dict) else {} if isinstance(got, list) else None
 
 
-def record(folder, peak_mb):
+def record(folder, key, peak_mb):
     """Add one lane's measured peak (under the claims lock; the file is written whole; one it cannot read is
-    started afresh)."""
+    started afresh). Keeps the last KEEP of each lane, and the MAX_KEYS lanes measured last."""
     c = claims_mod.Claims(folder)
     fd = c._locked()
     try:
-        got = ((read_measured(folder) or []) + [int(peak_mb)])[-KEEP:]
+        got = read_measured(folder) or {}
+        got[key] = (_peaks(got.pop(key, None)) + [int(peak_mb)])[-KEEP:]   # (popped: it moves to the end)
+        for old in list(got)[:-MAX_KEYS]:
+            del got[old]
         tmp = os.path.join(folder, f'{claims_mod.TMP}measured-{os.getpid()}')
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(got, f)
@@ -222,7 +238,8 @@ def take(c, cfg, servers, mode, holder, lane, restart, free=available_mb, rss=gr
     while waiting for another: no deadlock); a refused restart waits first in line on every one of its servers, all
     with one `since` (the time the lane began waiting), so the oldest waiting lane is first on all it needs. Each
     claim notes the lane's cost and its process group (group: measured for what the lane has not used yet)."""
-    cost = cost_mb(read_measured(cfg['claims_dir']), cfg['lane_mb'])
+    measured = read_measured(cfg['claims_dir'])
+    cost = None if measured is None else cost_mb(measured.get(measure_key(cfg, lane), []), cfg['lane_mb'])
     note = {'cost': cost if cost is not None else cfg['lane_mb'], **({'group': group} if group else {})}
     servers = sorted(servers)
     got = []
@@ -276,6 +293,26 @@ class Stopper:
 
     def install(self):
         return {s: signal.signal(s, self.on_signal) for s in self.SIGNALS}
+
+
+try:
+    import ctypes
+    _prctl = ctypes.CDLL(None, use_errno=True).prctl
+except (ImportError, OSError, AttributeError):
+    _prctl = None
+PR_SET_PDEATHSIG = 1
+
+
+def die_with(parent):
+    """For the command, before it starts: the kernel kills it (SIGKILL) when pool.py dies, so a pool.py killed outright
+    (an outer `timeout -k` shorter than pool.py's own 10 s kill, while a command that ignores SIGTERM hangs) does not
+    leave it holding its servers for ever. A pool.py that died before this was set: the command does not start."""
+    def preexec():
+        if _prctl is not None:
+            _prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+        if os.getppid() != parent:
+            os._exit(128 + signal.SIGKILL)
+    return preexec
 
 
 def own_group():
@@ -355,7 +392,7 @@ def lane(a, cmd, cfg, stopper, sleep, clock):
         if stopper.signum is not None:
             return stopper.code(0)
         print(f'pool: lane {a.lane}: {why}', file=sys.stderr, flush=True)
-        child = subprocess.Popen(cmd, env=env)
+        child = subprocess.Popen(cmd, env=env, preexec_fn=die_with(os.getpid()))
         stopper.started(child)
         while True:
             try:
@@ -375,7 +412,7 @@ def lane(a, cmd, cfg, stopper, sleep, clock):
     peak = max(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024, sampled)
     if peak > 0:
         try:
-            record(cfg['claims_dir'], peak)
+            record(cfg['claims_dir'], measure_key(cfg, a.lane), peak)
         except (OSError, claims_mod.ClaimsError):
             pass
     return rc

@@ -15,9 +15,11 @@ project names: a server is any name the caller gives).
   - Every call reads and writes under one lock (flock on <folder>/.lock); claim files are written whole (a temporary
     file renamed into place), so a reader never sees half a claim; a temporary file a crashed writer left is removed.
   - A claim file this version does not write (junk, a wrong shape, a holder with no start time) is swept: it would
-    otherwise hold the server for ever. Fails closed where it cannot judge: a folder it cannot read, or a claim a
-    newer version wrote (`v` above VERSION), refuses every claim, naming why. An empty or missing folder holds
-    nothing.
+    otherwise hold the server for ever. Fields it does not know are kept and ignored (judged by the ones it knows), so
+    a release that changes what a claim means must raise VERSION. Fails closed where it cannot judge: a folder it
+    cannot read refuses every claim; a claim a newer version wrote (`v` above VERSION) is never swept and refuses
+    every claim on the server it names (every server when it names none), naming why: a caller waits, and only that
+    release (or a person) removes it once its holder is gone. An empty or missing folder holds nothing.
 """
 import fcntl, json, os, subprocess, time
 
@@ -59,14 +61,14 @@ def _whole(v):
 
 
 def valid_holder(h):
-    """A holder this version writes: {"unit"[, "user"]} or {"pid", "start"[, "pgid"]}."""
+    """A holder this version can judge: {"unit"[, "user"]} or {"pid", "start"[, "pgid"]}, and any fields it does not
+    know (ignored)."""
     if not isinstance(h, dict):
         return False
     if 'unit' in h:
-        return set(h) <= {'unit', 'user'} and isinstance(h['unit'], str) and bool(h['unit']) and \
-            isinstance(h.get('user', True), bool)
-    return set(h) <= {'pid', 'start', 'pgid'} and _whole(h.get('pid')) and isinstance(h.get('start'), str) and \
-        bool(h['start']) and ('pgid' not in h or _whole(h['pgid']))
+        return isinstance(h['unit'], str) and bool(h['unit']) and isinstance(h.get('user', True), bool)
+    return _whole(h.get('pid')) and isinstance(h.get('start'), str) and bool(h['start']) and \
+        ('pgid' not in h or _whole(h['pgid']))
 
 
 def valid_entry(c):
@@ -140,8 +142,13 @@ class Claims:
         return fd
 
     def _read(self):
-        """The entries (under the lock). Removes what a crash or a planter left: temporary files (every write is
-        under this lock, so none is half-way now) and claim files this version does not write."""
+        return self._scan()[0]
+
+    def _scan(self):
+        """(entries, newer) under the lock. newer: (server or None, version, path) of each claim file a newer
+        release wrote (never swept: this version cannot judge it). Removes what a crash or a planter left:
+        temporary files (every write is under this lock, so none is half-way now) and claim files this version
+        does not write."""
         try:
             listed = os.listdir(self.folder)
         except OSError as e:
@@ -149,7 +156,7 @@ class Claims:
         for n in listed:
             if n.startswith(TMP):
                 self._unlink(n)
-        out = []
+        out, newer = [], []
         for n in sorted(n for n in listed if n.endswith(SUFFIX) and not n.startswith('.')):
             path = os.path.join(self.folder, n)
             try:
@@ -163,14 +170,15 @@ class Claims:
                 c = None
             v = c.get('v', VERSION) if isinstance(c, dict) else None
             if isinstance(v, int) and not isinstance(v, bool) and v > VERSION:
-                raise ClaimsError(f'the claim {path} is from a newer release (version {v}, this one reads '
-                                  f'{VERSION}): run that release, or remove it once no lane holds it')
+                server = c.get('server')
+                newer.append((server if isinstance(server, str) and server else None, v, path))
+                continue
             if v != VERSION or not valid_entry(c):
                 self._unlink(n)   # not a claim any release wrote: it would hold the server for ever
                 continue
             c['id'] = n[:-len(SUFFIX)]
             out.append(c)
-        return out
+        return out, newer
 
     def _unlink(self, name):
         try:
@@ -220,13 +228,18 @@ class Claims:
             raise ValueError(f'not a holder: {holder!r}')
         fd = self._locked()
         try:
-            live, _ = self._sweep(self._read())
+            entries, newer = self._scan()
+            live, _ = self._sweep(entries)
             mine = lambda c: c['holder'] == holder and c.get('lane', '') == lane   # noqa: E731
             held = [c for c in live if c['kind'] == 'claim' and c['server'] == server]
             waits = waiting(live, server)
             why = None
             clash = [c for c in held if conflicts(c['mode'], mode)]
-            if clash:
+            newest = [n for n in newer if n[0] in (None, server)]
+            if newest:
+                why = (f'{server}: a claim from a newer release holds it ({newest[0][2]}, version {newest[0][1]}; '
+                       f'this release reads {VERSION}): that release removes it once its holder is gone')
+            elif clash:
                 why = (f'{server} is held {clash[0]["mode"]} by lane {clash[0].get("lane") or "?"}'
                        f'{f" (+{len(clash) - 1} more)" if len(clash) > 1 else ""}')
             elif waits and not mine(waits[0]):

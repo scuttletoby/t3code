@@ -130,9 +130,46 @@ class Admission(unittest.TestCase):
                                    f'l{n}', False, free=lambda: 99999, rss=lambda pgid: 0)[0]
         self.assertIsNotNone(take(1))
         self.assertIsNone(take(2))
-        pool.record(d, 500)
-        self.assertEqual(pool.read_measured(d), [500])
-        self.assertEqual(pool.read_measured(self.folder()), [])   # missing: nothing measured yet
+        pool.record(d, 'k', 500)
+        self.assertEqual(pool.read_measured(d), {'k': [500]})
+        self.assertEqual(pool.read_measured(self.folder()), {})   # missing: nothing measured yet
+        with open(os.path.join(d, pool.MEASURED), 'w') as f:
+            f.write('[500]')   # an earlier release's one host-wide list: no lane's own peaks
+        self.assertEqual(pool.read_measured(d), {})
+
+    def test_another_projects_peaks_never_lower_a_lanes_cost(self):
+        # The host's measurements hold 20 small peaks of other lanes (another project's unit tests; or an earlier
+        # release's one host-wide list) or of this lane: four heavy lanes ("lane_mb": 3000) started together on room
+        # for one. Do they all get in? No: a lane's cost is its own peaks (by its config and lane), never below lane_mb.
+        heavy = os.path.join(os.sep, 'heavy', 'lanes.json')
+        bodies = ([100] * 20, {os.path.join(os.sep, 'light', 'lanes.json') + '\0unit': [100] * 20},
+                  {f'{heavy}\0l{n}': [100] * 20 for n in (1, 2, 3, 4)})
+        for i, body in enumerate(bodies):
+            with self.subTest(i):
+                d = self.folder()
+                with open(os.path.join(d, pool.MEASURED), 'w') as f:
+                    json.dump(body, f)
+                c = claims.Claims(d, alive=lambda h: True)
+                cfg = {**self.cfg(d, lane_mb=3000), 'config_path': heavy}
+                got = [pool.take(c, cfg, ['a'], 'shared', {'pid': n, 'start': 's', 'pgid': n}, f'l{n}', False,
+                                 free=lambda: 1024 + 3000 + 500, rss=lambda pgid: 0, group=n + 100)[0]
+                       for n in (1, 2, 3, 4)]
+                self.assertEqual([g is not None for g in got], [True, False, False, False])
+
+    def test_peaks_are_kept_per_project_and_lane(self):
+        d = self.folder()
+        for n in range(pool.KEEP + 5):
+            pool.record(d, 'p\0a', n + 1)
+        pool.record(d, 'p\0b', 7)
+        got = pool.read_measured(d)
+        self.assertEqual(got['p\0a'], list(range(6, pool.KEEP + 6)))   # the last KEEP
+        self.assertEqual(got['p\0b'], [7])
+        self.assertEqual(pool.measure_key({'config_path': '/x/lanes.json'}, 'one'), '/x/lanes.json\0one')
+        for n in range(pool.MAX_KEYS):   # lane names that change every run: the file stays small
+            pool.record(d, f'k{n}', 1)
+        got = pool.read_measured(d)
+        self.assertEqual(len(got), pool.MAX_KEYS)
+        self.assertNotIn('p\0a', got)   # the longest unmeasured go first
 
     def test_a_restart_on_two_servers_keeps_its_place_on_both(self):
         # A restart that needs a and b, refused on b: does a younger lane get a in the meantime? No.
@@ -154,10 +191,12 @@ class Admission(unittest.TestCase):
         self.assertIsNotNone(got, why)
         self.assertEqual([w for w in c.holders() if w['kind'] == 'wait'], [])   # its waits end with the grant
 
-    def test_the_cost_is_the_largest_recent_peak(self):
+    def test_the_cost_is_the_largest_recent_peak_never_below_lane_mb(self):
         self.assertEqual(pool.cost_mb([], 800), 800)
-        self.assertEqual(pool.cost_mb([300, 500, 'x', -1], 800), 500)
-        self.assertEqual(pool.cost_mb([9000] + [100] * pool.KEEP, 800), 100)   # an old peak ages out
+        self.assertEqual(pool.cost_mb([300, 500, 'x', -1], 800), 800)   # the floor holds once measured too
+        self.assertEqual(pool.cost_mb([300, 900, 'x', -1], 800), 900)
+        self.assertEqual(pool.cost_mb([9000] + [100] * pool.KEEP, 50), 100)   # an old peak ages out
+        self.assertIsNone(pool.cost_mb(None, 800))
 
     def test_free_memory_is_measured(self):
         d = tempfile.mkdtemp()
@@ -306,34 +345,68 @@ class Run(unittest.TestCase):
         self.assertEqual(claims.Claims(os.path.join(self.d, 'claims')).holders(), [])
         self.assertEqual(self.done(self.lane('two', '--server', 'api', '--alone'))[0], 0)
 
-    def test_a_killed_pool_keeps_its_claim_while_the_command_runs(self):
-        # pool.py killed with SIGKILL (no cleanup) while its shared command runs on: can an alone lane get the server
-        # under the orphaned command? No: the claim holds until the command's last process ends.
-        a = self.lane('one', '--server', 'api', code=self.until('one'))
+    def test_a_killed_pool_keeps_its_claim_while_what_its_command_started_runs(self):
+        # pool.py killed with SIGKILL (no cleanup) while its shared command runs: the command dies with it, but a
+        # process the command started runs on. Can an alone lane get the server under it? No: the claim holds until
+        # the lane's group's last process ends.
+        code = ('import os, subprocess, sys, time\n'
+                f'open({self.path("mid")!r}, "w").write(str(os.getpid()))\n'
+                f'subprocess.Popen([sys.executable, "-c", {self.until("one")!r}])\n'
+                'time.sleep(600)\n')
+        a = self.lane('one', '--server', 'api', code=code)
         self.wait_for(self.path('one.in'))
-        with open(self.path('one.in')) as f:
-            orphan = int(f.read())
-        self.addCleanup(lambda: subprocess.run(['kill', '-9', str(orphan)], capture_output=True))
+        orphan, mid = (int(open(self.path(n)).read()) for n in ('one.in', 'mid'))
+        for pid in (orphan, mid):
+            self.addCleanup(lambda pid=pid: subprocess.run(['kill', '-9', str(pid)], capture_output=True))
         a.kill()
         a.wait()
+        self.wait_gone(mid)
         rc, out = self.done(self.lane('two', '--server', 'api', '--alone', '--restart', wait='1'))
         self.assertEqual(rc, 75, out)
         self.assertIn('held shared', out)
         os.kill(orphan, signal.SIGKILL)
-        for _ in range(500):
-            try:
-                os.kill(orphan, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.02)
+        self.wait_gone(orphan)
         rc, out = self.done(self.lane('three', '--server', 'api', '--alone'))
         self.assertEqual(rc, 0, out)
+
+    def test_a_pool_killed_while_it_stops_takes_its_command_with_it(self):
+        # An outer `timeout -k 1`: SIGTERM, then SIGKILL before pool.py's own kill (10 s), to a command that ignores
+        # SIGTERM. Does the command run on, holding its server for ever? No: it dies with pool.py; the server is free.
+        code = 'import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n' + self.until('one')
+        a = self.lane('one', '--server', 'api', '--alone', code=code)
+        self.wait_for(self.path('one.in'))
+        with open(self.path('one.in')) as f:
+            cmd = int(f.read())
+        self.addCleanup(lambda: subprocess.run(['kill', '-9', str(cmd)], capture_output=True))
+        a.send_signal(signal.SIGTERM)
+        time.sleep(0.5)
+        a.kill()
+        a.wait()
+        self.wait_gone(cmd)
+        rc, out = self.done(self.lane('two', '--server', 'api', '--alone', wait='5'))
+        self.assertEqual(rc, 0, out)
+
+    def test_a_newer_release_claim_holds_only_its_server(self):
+        # A claim a newer release wrote (on a host whose projects pin two releases), its holder dead: does it fail
+        # every lane at once? No: a lane that needs another server runs; one that needs its server waits (exit 75).
+        folder = os.path.join(self.d, 'claims')
+        os.makedirs(folder)
+        with open(os.path.join(folder, 'x' + claims.SUFFIX), 'w') as f:
+            json.dump({'v': claims.VERSION + 1, 'kind': 'claim', 'mode': 'alone', 'server': 'db-main',
+                       'holder': {'pid': 999999999, 'start': '1'}, 'since': 1.0}, f)
+        rc, out = self.done(self.lane('one', '--server', 'api'))
+        self.assertEqual(rc, 0, out)
+        rc, out = self.done(self.lane('two', '--server', 'db-main', wait='0'))
+        self.assertEqual(rc, 75, out)
+        self.assertIn('newer release', out)
+        self.assertTrue(os.path.exists(os.path.join(folder, 'x' + claims.SUFFIX)))   # never swept by this one
 
     def test_a_lane_records_its_peak_memory(self):
         self.assertEqual(self.done(self.lane('one', '--server', 'api', code='x = bytearray(30 << 20)'))[0], 0)
         got = pool.read_measured(os.path.join(self.d, 'claims'))
-        self.assertEqual(len(got), 1)
-        self.assertGreaterEqual(got[0], 30)
+        self.assertEqual(list(got), [self.config + '\0one'])   # by its config and lane
+        self.assertEqual(len(got[self.config + '\0one']), 1)
+        self.assertGreaterEqual(got[self.config + '\0one'][0], 30)
 
     def test_an_unknown_server_or_no_command(self):
         rc, out = self.done(self.lane('one', '--server', 'cache'))
@@ -346,6 +419,17 @@ class Run(unittest.TestCase):
                 return
             time.sleep(0.02)
         self.fail(f'{path} never appeared')
+
+    def wait_gone(self, pid):
+        for _ in range(500):
+            try:
+                with open(f'/proc/{pid}/stat') as f:
+                    if f.read().rsplit(')', 1)[1].split()[0] == 'Z':
+                        return
+            except (FileNotFoundError, ProcessLookupError):
+                return
+            time.sleep(0.02)
+        self.fail(f'process {pid} still runs')
 
     def wait_for_wait(self, lane):
         c = claims.Claims(os.path.join(self.d, 'claims'))

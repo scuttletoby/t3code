@@ -15,7 +15,7 @@ unit) runs these tests against that code:
 The fork runs it against claims.Claims itself (lanes.test.py). Each test answers one question; no test sleeps or
 reads the wall clock (the clock and who is alive are the test's).
 """
-import os, stat, tempfile, shutil, sys
+import json, os, stat, tempfile, shutil, sys
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -152,12 +152,29 @@ class LaneContract:
                 self.assertFalse(os.path.exists(path))
                 self.c.release(t)
 
-    def test_a_claim_of_a_newer_version_grants_nothing(self):
-        # A claim a newer release wrote (its shape may be one this version cannot judge): fail closed, never swept.
-        path = self.plant('x' + claims_mod.SUFFIX, '{"v": 999, "kind": "claim"}')
-        with self.assertRaises(claims_mod.ClaimsError):
-            self.take(2)
+    def test_a_claim_of_a_newer_version_holds_only_its_server(self):
+        # A claim a newer release wrote (its shape may be one this version cannot judge): never swept, and it holds
+        # the server it names (all of them when it names none); another server is free.
+        a, b = self.servers
+        path = self.plant('x' + claims_mod.SUFFIX, '{"v": 999, "kind": "claim", "server": "%s"}' % b)
+        self.granted(1, 'alone', server=a)
+        self.assertIn('newer release', self.refused(2, server=b))
         self.assertTrue(os.path.exists(path))
+        os.unlink(path)
+        path = self.plant('y' + claims_mod.SUFFIX, '{"v": 999, "kind": "claim"}')
+        self.assertIn('newer release', self.refused(3, server=b))
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_claim_with_a_field_this_version_does_not_know_is_honoured(self):
+        # A claim of this version with one field more (in the entry or its holder): is it swept as garbage? No: it
+        # holds its server, judged by the fields this version knows, and is swept once its holder is gone.
+        body = {'v': claims_mod.VERSION, 'kind': 'claim', 'mode': 'alone', 'server': self.servers[0],
+                'holder': {**holder(1), 'extra': 1}, 'lane': 'lane1', 'since': 1.0, 'tag': 'x'}
+        path = self.plant('x' + claims_mod.SUFFIX, json.dumps(body))
+        self.refused(2)
+        self.assertTrue(os.path.exists(path))
+        self.dead.add(holder(1)['pid'])
+        self.granted(2)
 
     def test_a_temporary_file_a_crash_left_is_removed(self):
         # A writer that died between writing its temporary file and the rename leaves `.tmp-*`: the next call (under
