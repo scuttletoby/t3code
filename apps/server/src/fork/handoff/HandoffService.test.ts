@@ -27,6 +27,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
@@ -1135,6 +1136,41 @@ describe("HandoffService: a handoff that cannot run (#608)", () => {
       yield* TestClock.adjust(HANDOFF_SETTLE_MS / 2);
       yield* emit(null, "handOffWhenDue", 1);
       expect(sent).toEqual([]);
+    }),
+  );
+
+  it.effect("logs that it cannot run once per thread and cause, again after it could run", () =>
+    Effect.gen(function* () {
+      const warnings: Array<string> = [];
+      const state = {
+        data: big(),
+        settings: { ...on, modelSelection: chosen } as Partial<HandoffSettings>,
+        providerInstances: otherInstanceConfig(false) as ServerSettingsValue["providerInstances"],
+      };
+      const { threadState } = yield* harness(state);
+      const read = threadState().pipe(
+        Effect.provide(
+          Logger.layer(
+            [
+              Logger.make(({ message, logLevel }) => {
+                const text = JSON.stringify(message);
+                if (logLevel === "Warn" && text.includes("cannot run")) warnings.push(text);
+              }),
+            ],
+            { mergeWithExisting: false },
+          ),
+        ),
+      );
+      // The menu and the chip read it at each open and change.
+      for (let i = 0; i < 3; i++) expect((yield* read).on).toBe(false);
+      expect(warnings).toHaveLength(1);
+      state.providerInstances = otherOn as ServerSettingsValue["providerInstances"];
+      expect((yield* read).on).toBe(true);
+      state.providerInstances = otherInstanceConfig(
+        false,
+      ) as ServerSettingsValue["providerInstances"];
+      yield* read;
+      expect(warnings).toHaveLength(2);
     }),
   );
 
@@ -2296,9 +2332,10 @@ describe("HandoffService, agent source", () => {
           settings: on,
         });
         yield* TestClock.adjust(10 * MINUTE_MS);
-        // The new server sees both runs reported again.
+        // The new server sees both runs reported again. The write turn's loop is replaced before
+        // its first read (the run's own turn end carries the write turn on): both timers end.
         yield* Queue.offer(events, runUpdated(write));
-        yield* emit(runUpdated(run()), "handOffWhenDue", 2);
+        yield* emit(runUpdated(run()), "handOffTimer", 2);
         yield* TestClock.adjust(10 * MINUTE_MS);
         expect(sent).toEqual([]);
       }),
@@ -2328,6 +2365,80 @@ describe("HandoffService, agent source", () => {
         expect(messages(sent)).toMatchObject([
           { commandId: `server:handoff:${threadId}:${runId}`, messageId: handoffMessageId },
         ]);
+      }),
+    );
+
+    it.effect.each([{ prior: false }, { prior: true }])(
+      "a press sends after the settle (prior idle loop $prior)",
+      ({ prior }) =>
+        Effect.gen(function* () {
+          const idle = () => projection({ usedTokens: 100_000, cacheExpiresInMs: 30 * MINUTE_MS });
+          const state = { data: idle(), settings: pressable };
+          const { sent, emit, ask } = yield* harness(state);
+          // The turn end's loop sleeps toward the idle window (26 min).
+          if (prior) yield* emit(runUpdated(run()), "readThread", 1);
+          expect(yield* ask()).toEqual({ kind: "started" });
+          for (let i = 0; i < 30; i++) {
+            yield* TestClock.adjust(1000);
+            for (let j = 0; j < 20; j++) yield* Effect.yieldNow;
+          }
+          // 30 s after the press, long before the idle window.
+          expect(sent.length).toBeGreaterThan(0);
+        }),
+    );
+
+    // Between the idle size and the size backstop, with a warm cache: the turn end's loop sleeps
+    // toward the idle window, and a press replaces it.
+    const idleRange = () => projection({ usedTokens: 100_000, cacheExpiresInMs: 30 * MINUTE_MS });
+    /** Lets `ms` pass in one-second steps, each with time for the loops to run. */
+    const pass = (ms: number) =>
+      Effect.gen(function* () {
+        for (let left = ms; left > 0; left -= 1000) {
+          yield* TestClock.adjust(Math.min(1000, left));
+          for (let j = 0; j < 20; j++) yield* Effect.yieldNow;
+        }
+      });
+
+    it.effect("a press at 100K, the turn end's idle timer sleeping, sends once at the settle", () =>
+      Effect.gen(function* () {
+        const state = { data: idleRange(), settings: pressable };
+        const { sent, emit, ask } = yield* harness(state);
+        yield* emit(runUpdated(run()), "readThread", 1);
+        expect(yield* ask()).toEqual({ kind: "started" });
+        yield* pass(HANDOFF_SETTLE_MS - 1000);
+        expect(sent).toEqual([]);
+        yield* pass(1000);
+        expect(messages(sent)).toMatchObject([
+          { commandId: `server:handoff:${threadId}:${runId}`, messageId: handoffMessageId },
+        ]);
+        // The idle window passing later sends nothing more: the press took the timer's place.
+        yield* pass(30 * MINUTE_MS);
+        expect(messages(sent)).toHaveLength(1);
+      }),
+    );
+
+    it.effect("a press that finds the thread busy inside the settle keeps the idle handoff", () =>
+      Effect.gen(function* () {
+        const state = { data: idleRange(), settings: pressable };
+        const { sent, emit, events, ended, ask } = yield* harness(state);
+        const read = "HandoffService.readThread";
+        const next = (event: OrchestrationV2DomainEvent) =>
+          emit(event, read, (ended.get(read) ?? 0) + 1);
+        yield* emit(runUpdated(run()), read, 1);
+        expect(yield* ask()).toEqual({ kind: "started" });
+        // Busy inside the settle: the press ends unsent.
+        state.data = { ...idleRange(), runtimeRequests: pending };
+        yield* next(threadChanged(state.data));
+        yield* pass(HANDOFF_SETTLE_MS);
+        expect(sent).toEqual([]);
+        // The request answered without a new turn (no turn end): the idle handoff still comes.
+        // Before the idle window the turn end's decision sleeps whatever it waits on: no read now.
+        state.data = idleRange();
+        yield* Queue.offer(events, threadChanged(state.data));
+        yield* pass(20 * MINUTE_MS);
+        expect(sent).toEqual([]);
+        yield* pass(10 * MINUTE_MS);
+        expect(messages(sent)).toMatchObject([{ messageId: handoffMessageId }]);
       }),
     );
 
@@ -2394,10 +2505,11 @@ describe("HandoffService, agent source", () => {
         const state = { data: small(), settings: pressable };
         const { sent, emit, ask } = yield* harness(state);
         expect(yield* ask()).toEqual({ kind: "started" });
+        // The loop goes on as a turn end's: it waits on the request, then skips (under 75K).
         state.data = { ...small(), runtimeRequests: pending };
-        yield* emit(threadChanged(state.data), "handOffWhenDue", 1);
-        state.data = small();
         yield* emit(threadChanged(state.data), "readThread", 3);
+        state.data = small();
+        yield* emit(threadChanged(state.data), "handOffWhenDue", 1);
         yield* TestClock.adjust(10 * MINUTE_MS);
         expect(sent).toEqual([]);
       }),

@@ -216,6 +216,8 @@ export const make = Effect.gen(function* () {
   const logSlotWait = (threadId: ThreadId, outcome: HandoffWaitsForSlot) =>
     Effect.logInfo("handoff waits for an agent slot", { threadId, detail: outcome.detail });
 
+  // The cause last logged for a thread whose handoff cannot run; cleared when it can again.
+  const blockedLogged = new Map<ThreadId, string>();
   const readThread = Effect.fn("HandoffService.readThread")(function* (threadId: ThreadId) {
     const current = yield* serverSettings.getSettings;
     const thread = yield* projections.getThread(threadId);
@@ -226,11 +228,17 @@ export const make = Effect.gen(function* () {
     if (resolved.mode !== "handoff") return null;
     // Same rule as the compaction wrapper (handoffOwner.ts): a handoff that cannot run sends
     // nothing, and idle compaction covers the thread instead. Read again at every step.
+    if (blocked === null) blockedLogged.delete(threadId);
     if (blocked !== null) {
-      yield* Effect.logWarning("handoff cannot run; idle compaction covers this thread", {
-        threadId,
-        ...blocked,
-      });
+      // Once per thread and cause: the menu and the chip read it too, at each open and change.
+      const key = `${blocked.instanceId}\n${blocked.reason}`;
+      if (blockedLogged.get(threadId) !== key) {
+        blockedLogged.set(threadId, key);
+        yield* Effect.logWarning("handoff cannot run; idle compaction covers this thread", {
+          threadId,
+          ...blocked,
+        });
+      }
       return null;
     }
     return { ...resolved, records: yield* withStores(readHandoffRecords(threadId)) };
@@ -758,9 +766,14 @@ export const make = Effect.gen(function* () {
           continue;
         }
         if (decision.kind === "wait") {
-          // A person's press is not queued: busy again before it sent, it ends; the next turn
-          // end decides, and the person may ask again.
-          if (trigger === "asked") return;
+          // A person's press is not queued: busy again before it sent, the press ends and the
+          // loop goes on as the turn end's it replaced (its wait, then its idle handoff). The
+          // person may ask again.
+          if (trigger === "asked") {
+            trigger = "turn-end";
+            if (pressed.get(threadId)?.loop === waiting) pressed.delete(threadId);
+            continue;
+          }
           waitingOn.set(threadId, { loop: waiting, blockers: decision.blockers });
           yield* Effect.logInfo("handoff waiting", { threadId, blockers: decision.blockers });
           // Read again when the thread changes: the work ending decides, not only the next turn.
@@ -916,7 +929,13 @@ export const make = Effect.gen(function* () {
     const marked = Effect.sync(() => {
       if (trigger === "asked") pressed.set(threadId, { loop: waiting, runId: sourceRunId });
     });
-    return Effect.andThen(marked, handOffLoop(threadId, sourceRunId, waiting, trigger)).pipe(
+    // `FiberMap.run` puts a fiber in the map only at its first pause. Pause before the first read
+    // (which can resume a press's fiber): else that press finds no timer, and this late install
+    // interrupts it. The press's mark comes first: a late update of the pressed run must find it.
+    return Effect.andThen(
+      Effect.andThen(marked, Effect.yieldNow),
+      handOffLoop(threadId, sourceRunId, waiting, trigger),
+    ).pipe(
       Effect.ensuring(
         Effect.andThen(
           leavePlace(waiting),

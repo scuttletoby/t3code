@@ -1,8 +1,8 @@
 /**
- * Fork (HO5): "Hand off now" in the thread menu (threadActionMenu.logic.ts builds it; its hook
- * and the sidebar's menu read the state first and run the click). The server decides as at a turn
- * end and uses the same ids, so a press during an automatic handoff, or a second press, sends one.
- * The calls load on use, so the pure menu builder stays free of the app's network code.
+ * Fork (HO5): "Hand off now" in the thread menu; the server decides as at a turn end, same ids.
+ * The calls load on use, so the pure menu builder stays free of the app's network code. The
+ * settings check (handoffSettingsOn.ts) loads apart too: its modules need React, which a test of
+ * the menu's hook may mock away.
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own text is English only; upstream's translation catalogs hold no fork keys. */
 import {
@@ -28,6 +28,13 @@ export type HandoffMenuState = HandoffRouteState | null;
 
 /** How long the menu waits for the state before it opens without the item. */
 const HANDOFF_MENU_READ_TIMEOUT_MS = 300;
+
+/** The settings check, once loaded (at once, with this module); a failed load counts as off. */
+let maybeOn: ((threadRef: ScopedThreadRef) => boolean) | undefined;
+const settingsCheck = import("./handoffSettingsOn").then(
+  (module) => (maybeOn = module.handoffMaybeOn),
+  () => () => false,
+);
 
 function blockerText(blocker: HandoffRouteBlocker): string {
   switch (blocker.kind) {
@@ -122,9 +129,27 @@ export function handOffNowItems(
 export async function readHandoffMenuState(
   threadRef: ScopedThreadRef | null,
 ): Promise<HandoffMenuState> {
-  if (threadRef === null) return null;
-  const api = await import("./handoffApi");
-  return api.readHandoffState(threadRef, { timeoutMs: HANDOFF_MENU_READ_TIMEOUT_MS });
+  // Off (the default) waits for nothing: no load, no read.
+  if (threadRef === null || maybeOn?.(threadRef) === false) return null;
+  // The first loads count in the same limit as the read.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), HANDOFF_MENU_READ_TIMEOUT_MS);
+  });
+  const read = settingsCheck
+    .then((check) =>
+      check(threadRef)
+        ? import("./handoffApi").then((api) =>
+            api.readHandoffState(threadRef, { timeoutMs: HANDOFF_MENU_READ_TIMEOUT_MS }),
+          )
+        : null,
+    )
+    .catch(() => null);
+  try {
+    return await Promise.race([read, late]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function handOffNow(threadRef: ScopedThreadRef): Promise<void> {

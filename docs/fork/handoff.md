@@ -36,6 +36,11 @@ stays `off`, so only the long-running role threads hand off. A thread's own entr
 still wins, and a project's value replaces the server's whole, its `roles` too. A role pointer to an
 archived or deleted thread changes nothing: that thread is not handed off anyway.
 
+Rolling back to a build without `roles` after setting it turns handoff off for every thread, not only
+the role threads: an older build reads handoff settings with a field it does not know as off, and
+its next settings save writes the default in their place. Clear `roles` ("Same as above") before
+rolling back.
+
 The new session runs on `modelSelection`, else the thread's current model, as for every thread. The
 model policy (`server.modelPolicy`) checks agents' picks, not this one.
 
@@ -49,7 +54,11 @@ hidden when a press would do nothing (just handed off or compacted, a newer turn
 20,000 tokens). A press decides as a turn end would, but skips the size backstop and the idle wait.
 It settles first like any handoff and uses the same ids as the latest turn's own handoff, so a
 second press, or a press while that turn's handoff is going, sends one handoff. A press on a busy
-thread queues nothing: the toast says what it waits on, and the person may press again later.
+thread queues nothing: the toast says what it waits on, and the person may press again later. A
+press that finds the thread busy again inside its settle ends unsent too; the turn end's own
+decision goes on (its wait, then its idle handoff once the thread is quiet), as if no one had
+pressed. The menu reads the item's state only when the settings this app holds may put handoff on
+for the thread; off, the menu opens at once.
 
 When a due handoff waits on a busy thread, a chip above the composer says "Handoff waiting on …"
 and goes once it no longer waits. The handoff's first message still shows upstream's "New session"
