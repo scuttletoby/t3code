@@ -704,12 +704,9 @@
     "apps/web/src/components/usage/UsageLimitsPooled.tsx": {
       "why": "The Usage tab's limits (fork issue 1146) get the fork's fleet list first: one import and one element at the top of upstream's list, which renders nothing while the server it is connected to has no linked machine (components/fork/fleetUsage).",
       "added": [
-        "import { ForkFleetUsage } from \"../fork/fleetUsage/ForkFleetUsage\"; // Fork (fleet usage)"
-      ],
-      "announced": {
-        "since": "2026-11-27",
-        "added": ["<ForkFleetUsage now={now} />"]
-      }
+        "import { ForkFleetUsage } from \"../fork/fleetUsage/ForkFleetUsage\"; // Fork (fleet usage)",
+        "<ForkFleetUsage now={now} />"
+      ]
     },
     "apps/web/src/components/chat/ThreadDetailsPanel.tsx": {
       "why": "The work panel (fork issue 1136) sits in the thread's side panel right after its sub-agents (ThreadRelationshipsPanel): one import and one element, which renders nothing while the client fork setting workPanelEnabled is off (components/fork/workPanel).",
