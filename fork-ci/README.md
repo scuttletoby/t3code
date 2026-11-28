@@ -104,6 +104,13 @@ for this say which names callers may import in their README's "Python API" secti
 per day (CI hours, runs per workflow, queue wait per runner label, cancelled and failed share), for a before/after
 record of a CI change.
 
+### Test lanes
+
+[`lanes/`](lanes/README.md) runs several test lanes at once on shared test servers: a pool that admits a lane from
+measured free memory, and a claims rule (shared or alone per server, a waiting restart first, dead holders swept,
+one lock). The project's config names only its servers and ports; projects run the shared contract tests against
+their own adapter.
+
 ### Law tests
 
 [`laws/`](laws/README.md) is the contract for law tests (generated orders of runs, crashes, reruns and old state

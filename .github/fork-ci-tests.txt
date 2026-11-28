@@ -105,6 +105,7 @@ fork-ci/actions/pr-queue/tested-base/tested_base.test.py unittest
 fork-ci/actions/test-select/test-select.test.py ~26s unittest
 fork-ci/actions/test-select/trace-check.test.py unittest
 fork-ci/actions/weakened-tests/weakened_tests.test.py unittest
+fork-ci/lanes/lanes.test.py unittest
 fork-ci/laws/laws.test.py unittest
 fork-kit/agent-guards/tests/actions-disable.test.py ~45s unittest
 fork-kit/agent-guards/tests/agent-slots.test.py unittest
