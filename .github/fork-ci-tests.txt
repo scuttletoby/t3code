@@ -172,7 +172,9 @@ fork-kit/review/tests/comments.test.py unittest
 fork-kit/review/tests/eval.test.py unittest
 fork-kit/review/tests/plan.test.py unittest
 fork-kit/schedule-kick/tests/cron.test.py unittest
+fork-kit/schedule-kick/tests/heads.test.py unittest
 fork-kit/schedule-kick/tests/install.test.py unittest
+fork-kit/schedule-kick/tests/keepon.test.py unittest
 fork-kit/schedule-kick/tests/kick.test.py unittest
 fork-kit/schedule-kick/tests/late.test.py unittest
 fork-kit/slot-filler/tests/filler.test.py unittest
