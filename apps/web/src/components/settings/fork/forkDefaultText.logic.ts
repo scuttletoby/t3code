@@ -30,6 +30,7 @@ export const FORK_DEFAULT_TEXT = {
   usagePacingAccount: `${pacingAccount.reservePercent}% kept, ${
     pacingAccount.burnFirst ? "use this account first" : "no account first"
   }`,
+  accountOrder: textOrEmpty(D.accountOrder.join(", ")),
   waitFor: onOff(D.waitFor.enabled),
   agentSlots: onOff(D.agentSlots.enabled),
   // No account named: every account's limit is 0, no limit.

@@ -18,6 +18,7 @@ describe("forkFeatureStatuses", () => {
     ).toEqual([...FORK_FEATURES].toSorted());
     expect(lines(server({}))).toEqual([
       "Plan usage pacing: Off",
+      "Account order: Off",
       "Limit on running agents: Off",
       "Stop finished sub-agents: Off",
       "Agent waits: Off",
@@ -36,6 +37,7 @@ describe("forkFeatureStatuses", () => {
         waitFor: { enabled: true },
         agentSlots: { enabled: true },
         usagePacingGate: "advise",
+        accountOrder: ["claude_second"],
         modelPolicy: { mode: "enforce", allow: [] },
         reviewRules: { preset: "recommended" },
         automaticUpdates: true,
@@ -46,6 +48,7 @@ describe("forkFeatureStatuses", () => {
     );
     expect(statuses).toEqual([
       "Plan usage pacing: On: advise",
+      "Account order: On",
       "Limit on running agents: On",
       "Stop finished sub-agents: On",
       "Agent waits: On",

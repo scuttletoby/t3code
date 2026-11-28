@@ -1,5 +1,6 @@
 /**
- * Fork: usage pacing (`usagePacingGate`, `usagePacingLowerEffort`, `usagePacing`). Server-wide, so
+ * Fork: usage pacing (`usagePacingGate`, `usagePacingLowerEffort`, `usagePacing`) and the account
+ * order (`accountOrder`). Server-wide, so
  * a project screen does not show it. Every write is an ordinary settings patch from the person at
  * the screen; agents cannot change it.
  */
@@ -7,6 +8,7 @@
 import {
   burnFirstWindowKinds,
   DEFAULT_SERVER_SETTINGS,
+  type ProviderInstanceId,
   type ServerSettingsPatch,
   type UsagePacingGateMode,
   type UsagePacingInstanceSettingsPatch,
@@ -27,6 +29,10 @@ import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings
 import { BoundedNumberField, ForkRow, OptionLines, useSelectedProviders } from "./ForkRow";
 import {
   USAGE_PACING_GATE_OPTIONS,
+  accountOrderAddable,
+  accountOrderRows,
+  accountOrderSummary,
+  moveInAccountOrder,
   USAGE_PACING_WINDOW_KINDS,
   USAGE_PACING_WINDOW_LABELS,
   burnFirstWindowsAfterToggle,
@@ -47,6 +53,7 @@ export function UsagePacingSettings() {
   return (
     <SettingsSection id="usage-pacing-section" title="Plan usage pacing">
       <GateRow updateSettings={updateSettings} />
+      <AccountOrderRows updateSettings={updateSettings} />
       <AccountRows updateSettings={updateSettings} />
       <AdvancedSettings targetIds={["usage-pacing-lower-effort"]}>
         <LowerEffortRow updateSettings={updateSettings} />
@@ -109,6 +116,109 @@ function GateRow({ updateSettings }: { readonly updateSettings: UpdateSettings }
         </Select>
       }
     />
+  );
+}
+
+function AccountOrderRows({ updateSettings }: { readonly updateSettings: UpdateSettings }) {
+  const searchableSetting = useSearchableSetting();
+  const order = useScopedSettings((settings) => settings.accountOrder);
+  const { targets } = useSettingsScope();
+  const providers = useSelectedProviders();
+  const mixed = targetsDiffer(targets, (settings) => settings.accountOrder);
+  const rows = accountOrderRows(providers, order);
+  const addable = accountOrderAddable(providers, order);
+  const save = (next: ReadonlyArray<ProviderInstanceId>) =>
+    updateSettings({ accountOrder: [...next] });
+
+  return (
+    <ForkRow
+      serverScoped
+      {...searchableSetting("usage-pacing-account-order")}
+      settingKeys={["accountOrder"]}
+      lockPaths={["accountOrder"]}
+      mixed={mixed}
+      status={mixed ? undefined : accountOrderSummary(rows)}
+      description={
+        mixed
+          ? MIXED
+          : `When the account a sub-agent would start on is at its limit (its share kept for you included), the sub-agent starts on the first account below that has room instead. An account whose usage was not read recently takes no work; with no room anywhere the sub-agent starts as asked. Works with pacing off too. ${defaultIs("accountOrder")}`
+      }
+      resetAction={
+        !mixed && order.length > 0 ? (
+          <SettingResetButton
+            ariaLabel="Reset account order to default"
+            onClick={() => save(DEFAULT_SERVER_SETTINGS.accountOrder)}
+          />
+        ) : null
+      }
+      control={
+        mixed || addable.length === 0 ? null : (
+          <Select
+            value={null}
+            onValueChange={(value) => {
+              if (value !== null) save([...order, value as ProviderInstanceId]);
+            }}
+          >
+            <SelectTrigger
+              size="sm"
+              className="w-full sm:w-48"
+              aria-label="Add an account to the order"
+            >
+              <SelectValue>Add account</SelectValue>
+            </SelectTrigger>
+            <SelectPopup align="end" alignItemWithTrigger={false}>
+              {addable.map((candidate) => (
+                <SelectItem hideIndicator key={candidate.instanceId} value={candidate.instanceId}>
+                  {candidate.label}
+                </SelectItem>
+              ))}
+            </SelectPopup>
+          </Select>
+        )
+      }
+    >
+      {mixed || rows.length === 0 ? null : (
+        <ol aria-label="Account order" className="flex flex-col gap-1 pb-2 text-xs">
+          {rows.map((row, index) => (
+            <li key={row.instanceId} className="flex items-center gap-2">
+              <span className="w-5 text-muted-foreground">{index + 1}.</span>
+              <span className="min-w-0 flex-1 truncate">
+                {row.label}
+                {row.known ? null : (
+                  <span className="text-muted-foreground"> (not on this server any more)</span>
+                )}
+              </span>
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={index === 0}
+                aria-label={`Move ${row.label} up`}
+                onClick={() => save(moveInAccountOrder(order, index, -1))}
+              >
+                Up
+              </Button>
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={index === rows.length - 1}
+                aria-label={`Move ${row.label} down`}
+                onClick={() => save(moveInAccountOrder(order, index, 1))}
+              >
+                Down
+              </Button>
+              <Button
+                size="xs"
+                variant="destructive-outline"
+                aria-label={`Remove ${row.label} from the order`}
+                onClick={() => save(order.filter((id) => id !== row.instanceId))}
+              >
+                Remove
+              </Button>
+            </li>
+          ))}
+        </ol>
+      )}
+    </ForkRow>
   );
 }
 

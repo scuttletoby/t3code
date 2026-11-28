@@ -72,6 +72,16 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     scope: "environment-defaults",
   },
   {
+    id: "usage-pacing-account-order",
+    title: "Account order",
+    to: FORK_PAGE,
+    searchTerms: [
+      "accountOrder account failover fallback next account limit spent out of usage order provider",
+    ],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
     id: "usage-pacing",
     title: "Share of each plan kept for you",
     to: FORK_PAGE,

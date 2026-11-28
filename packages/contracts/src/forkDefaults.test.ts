@@ -80,6 +80,7 @@ describe("settings saved by an older build", () => {
         "server.usagePacing",
         "server.usagePacingGate",
         "server.usagePacingLowerEffort",
+        "server.accountOrder",
         "server.waitFor",
         "server.waitChecks",
         "server.agentSlots",
@@ -158,6 +159,7 @@ describe("settings saved by an older build", () => {
       mcpThreadProfiles: { "thread-1": "lean" },
       assistant: { enabled: true },
       stopFinishedChildren: { enabled: true },
+      accountOrder: ["claude_second", "claude_main"],
     };
     const settings = decodeServerFile(saved);
     expect(settings).toMatchObject(saved);
