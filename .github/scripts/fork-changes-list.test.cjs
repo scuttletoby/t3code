@@ -556,19 +556,92 @@ test("adopt does nothing on empty, unchanged or new-format pages, or a row main 
   assert.deepEqual(adopt("", "", main), none);
   assert.deepEqual(adopt(basePage, basePage, main), none);
   assert.deepEqual(adopt(NEW_PAGE, NEW_PAGE, main), none);
-  assert.deepEqual(adopt(basePage, NEW_PAGE, main).conflicts, []);
   const both = oldPage([[APP, [ENTRY(10, "Ten."), ENTRY(11, "Eleven.")]]]);
   assert.deepEqual(adopt(basePage, both, converted(both)), none);
 });
 
-test("the adopt command moves an open pull request's table edits to files during its merge of main", (t) => {
-  const { root, git, write, commit, merge } = tempRepo(t, "fork-changes-adopt-");
+test("adopt removes nothing when the pull request's page has no table row but its base has (adopted, or a stale base)", () => {
+  const basePage = oldPage([[APP, [ENTRY(10, "Ten."), ENTRY(11, "Eleven.")]]]);
+  const result = adopt(basePage, NEW_PAGE, converted(basePage));
+  assert.deepEqual(result.remove, []);
+  assert.deepEqual(result.write, []);
+  assert.equal(result.conflicts.length, 1);
+  assert.match(result.conflicts[0], /no table row but its base has 2: nothing removed/u);
+});
+
+test("adopt writes no second file when the base has no table but the pull request's side has the old list", () => {
+  // A branch from before the list's history: its merge base has no FORK_CHANGES.md, and its table has
+  // the old wording of a row main edited since.
+  const [r1, r2] = [ENTRY(10, "Ten."), ENTRY(11, "Eleven, edited on main.")];
+  const main = converted(oldPage([[APP, [r1, r2]]]));
+  const headPage = oldPage([
+    [APP, [r1, { ...r2, Change: "Eleven, edited on main, in old words." }]],
+  ]);
+  for (const basePage of ["", NEW_PAGE]) {
+    const result = adopt(basePage, headPage, main);
+    assert.deepEqual([result.write, result.remove], [[], []]);
+    assert.match(
+      result.conflicts.join("\n"),
+      /base's FORK_CHANGES\.md has no table row.*old list \(2 rows\)/u,
+    );
+  }
+  // One row added to the new page by hand (no old list) is adopted; one that names a held change is not.
+  const one = `${NEW_PAGE}\n## ${APP}\n\n| Change | Why | Setting | Default | PR |\n| --- | --- | --- | --- | --- |\n`;
+  const fresh = adopt(
+    NEW_PAGE,
+    `${one}| ${Object.values(ENTRY(40, "Forty.")).join(" | ")} |\n`,
+    main,
+  );
+  assert.deepEqual(
+    fresh.write.map((w) => w.path),
+    [`${CHANGES_DIR}/app/40-forty.md`],
+  );
+  const again = { ...r2, Why: "Other words." };
+  const dup = adopt(NEW_PAGE, `${one}| ${Object.values(again).join(" | ")} |\n`, main);
+  assert.deepEqual(dup.write, []);
+  assert.match(
+    dup.conflicts[0],
+    /a change file already holds this change \(docs\/fork\/changes\/app\/11-eleven-edited-on-main\.md\)/u,
+  );
+});
+
+test("readChanges refuses one change in two files, and names a leftover .md.tmp with its fix", (t) => {
+  const { root, write } = tempRepo(t, "fork-changes-dup-");
+  const text = formatChange(ENTRY(10, "Ten."));
+  write(`${CHANGES_DIR}/app/10-ten.md`, text);
+  write(`${CHANGES_DIR}/app/10-ten-2.md`, text.replace("Reason 10.", "Older words."));
+  assert.throws(() => readChanges(root), /10-ten\.md: the same change as .*10-ten-2\.md/u);
+  fs.rmSync(path.join(root, CHANGES_DIR, "app/10-ten-2.md"));
+  write(`${CHANGES_DIR}/app/other.md`, text.replace("Ten.", "Ten.").replace("[#10]", "[#11]"));
+  assert.throws(() => readChanges(root), /the same Change line/u);
+  fs.rmSync(path.join(root, CHANGES_DIR, "app/other.md"));
+  write(`${CHANGES_DIR}/app/11-eleven.md.tmp`, text);
+  assert.throws(
+    () => readChanges(root),
+    /11-eleven\.md\.tmp: left by an adopt run that stopped; run adopt again/u,
+  );
+});
+
+/** A temp repo where `pr` edits the old table (r2) and adds r5, and main since moved the list to files. */
+function adoptRepo(t, name) {
+  const repoT = tempRepo(t, name);
+  const { root, git, write, commit } = repoT;
   const script = path.join(__dirname, "fork-changes-list.cjs");
-  const run = (...args) => execFileSync("node", [script, ...args], { cwd: root, encoding: "utf8" });
+  const run = (...args) =>
+    execFileSync("node", [script, ...args], { cwd: root, encoding: "utf8", stdio: "pipe" });
+  /** The command's exit status and output, for a run that may fail. */
+  const status = (...args) => {
+    try {
+      return { code: 0, out: run(...args) };
+    } catch (error) {
+      return { code: error.status, out: `${error.stdout}${error.stderr}` };
+    }
+  };
   const [r1, r2] = [ENTRY(10, "Ten."), ENTRY(11, "Eleven.")];
   const basePage = oldPage([[APP, [r1, r2]]]);
   write(CHANGES, basePage);
   commit("old table");
+  git("tag", "old");
   git("checkout", "-qb", "pr");
   const r5 = ENTRY(30, "Thirty, from the pull request.");
   write(CHANGES, oldPage([[APP, [r1, { ...r2, Why: "Edited by the pull request." }, r5]]]));
@@ -577,6 +650,17 @@ test("the adopt command moves an open pull request's table edits to files during
   apply(root, adopt("", basePage, []));
   write(CHANGES, NEW_PAGE);
   commit("one file per change");
+  const why = () => Object.fromEntries(readChanges(root).map((c) => [c.name, c.entry.Why]));
+  const adopted = {
+    "10-ten.md": "Reason 10.",
+    "11-eleven.md": "Edited by the pull request.",
+    "30-thirty-from-pull-request.md": "Reason 30.",
+  };
+  return { ...repoT, run, status, why, adopted };
+}
+
+test("the adopt command moves an open pull request's table edits to files during its merge of main", (t) => {
+  const { root, git, merge, run, why, adopted } = adoptRepo(t, "fork-changes-adopt-");
   git("checkout", "-q", "pr");
   assert.throws(
     () => run("adopt", "main"),
@@ -586,16 +670,82 @@ test("the adopt command moves an open pull request's table edits to files during
   const out = run("adopt", "main");
   assert.match(out, /wrote {3}docs\/fork\/changes\/app\/11-eleven\.md/u);
   assert.match(out, /wrote {3}docs\/fork\/changes\/app\/30-thirty-from-pull-request\.md/u);
-  git("checkout", "main", "--", CHANGES);
+  // adopt puts main's entry page in place itself, once every row is a file: no checkout that could drop one.
+  assert.equal(fs.readFileSync(path.join(root, CHANGES), "utf8"), NEW_PAGE);
   git("add", CHANGES, CHANGES_DIR);
   git("commit", "-q", "--no-edit");
   checkEntryPage(fs.readFileSync(path.join(root, CHANGES), "utf8"));
-  const why = Object.fromEntries(readChanges(root).map((c) => [c.name, c.entry.Why]));
-  assert.deepEqual(why, {
-    "10-ten.md": "Reason 10.",
-    "11-eleven.md": "Edited by the pull request.",
-    "30-thirty-from-pull-request.md": "Reason 30.",
-  });
+  assert.deepEqual(why(), adopted);
   // Again, after the merge: HEAD's page has no table row, so nothing is left to adopt.
   assert.match(run("adopt", "main"), /nothing to adopt/u);
+});
+
+test("the adopt command reads the replayed commit during a cherry-pick or rebase, not HEAD", (t) => {
+  for (const how of ["cherry-pick", "rebase"]) {
+    const { root, git, run, why, adopted } = adoptRepo(t, `fork-changes-${how}-`);
+    if (how === "cherry-pick") {
+      git("checkout", "-qb", "replay", "main");
+      assert.throws(() => git("cherry-pick", "pr"));
+    } else {
+      git("checkout", "-q", "pr");
+      assert.throws(() => git("rebase", "-q", "main"));
+    }
+    const out = run("adopt", "main");
+    assert.match(out, new RegExp(`\\(${how}\\)`, "u"));
+    assert.match(out, /wrote {3}docs\/fork\/changes\/app\/30-thirty-from-pull-request\.md/u);
+    assert.match(out, new RegExp(`next: .*git ${how} --continue`, "u"));
+    assert.equal(fs.readFileSync(path.join(root, CHANGES), "utf8"), NEW_PAGE);
+    git("add", CHANGES, CHANGES_DIR);
+    execFileSync(
+      "git",
+      ["-c", "user.name=t", "-c", "user.email=t@example.invalid", how, "--continue"],
+      {
+        cwd: root,
+        stdio: "pipe",
+        env: { ...process.env, GIT_EDITOR: "true" },
+      },
+    );
+    assert.deepEqual(why(), adopted);
+    assert.match(run("adopt", "main"), /nothing to adopt/u);
+  }
+});
+
+test("the adopt command removes nothing on a branch with the new page when its base still has the old table", (t) => {
+  const { root, git, status } = adoptRepo(t, "fork-changes-stale-");
+  git("checkout", "-qb", "stacked", "main");
+  // `old` stands for a stale origin/main, or the base of a branch stacked on this change before it lands.
+  const files = () => readChanges(root).map((c) => c.path);
+  const before = files();
+  const stale = status("adopt", "old");
+  assert.equal(stale.code, 1);
+  assert.match(stale.out, /old table still: nothing adopted/u);
+  assert.doesNotMatch(stale.out, /removed/u);
+  assert.deepEqual(files(), before);
+  // The pure check under it: the pull request's side has no table row, its base has.
+  const sideNoTable = adopt(git("show", `old:${CHANGES}`), NEW_PAGE, readChanges(root));
+  assert.deepEqual([sideNoTable.remove, sideNoTable.conflicts.length], [[], 1]);
+});
+
+test("the adopt command removes a leftover .md.tmp, and an abort is undone by checkout and clean", (t) => {
+  const { root, git, merge, run, write } = adoptRepo(t, "fork-changes-abort-");
+  git("checkout", "-q", "pr");
+  assert.deepEqual(merge("main"), [CHANGES]);
+  write(`${CHANGES_DIR}/app/30-thirty-from-pull-request.md.tmp`, "half");
+  const out = run("adopt", "main");
+  assert.match(
+    out,
+    /removed docs\/fork\/changes\/app\/30-thirty-from-pull-request\.md\.tmp \(left by a run that stopped\)/u,
+  );
+  assert.equal(
+    fs.existsSync(path.join(root, CHANGES_DIR, "app/30-thirty-from-pull-request.md.tmp")),
+    false,
+  );
+  // An abort refuses while adopt's edits are in tracked files; the documented undo: the folder back from the
+  // index, then the abort, then adopt's new files gone.
+  assert.throws(() => git("merge", "--abort"), /not uptodate/u);
+  git("checkout", "--", CHANGES_DIR);
+  git("merge", "--abort");
+  git("clean", "-fdq", "--", CHANGES_DIR);
+  assert.equal(git("status", "--porcelain"), "");
+  assert.equal(fs.existsSync(path.join(root, CHANGES_DIR)), false);
 });
