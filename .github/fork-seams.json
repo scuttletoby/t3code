@@ -228,7 +228,7 @@
       ]
     },
     "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts": {
-      "why": "MCP profiles part 2: a Claude thread's MCP profile is applied to its session (strict MCP mode or an allowlist of outside servers, from apps/server/src/fork/claudeMcpProfile.ts), is part of the live-query key, refuses the turn when it cannot be applied, and adds a PreToolUse hook (merged into the adapter's hooks) that refuses a call to a server outside the profile. Additions only; tested in apps/server/src/fork/claudeMcpProfile.adapter.test.ts.",
+      "why": "MCP profiles part 2: a Claude thread's MCP profile is applied to its session (strict MCP mode or an allowlist of outside servers, from apps/server/src/fork/claudeMcpProfile.ts), is part of the live-query key, refuses the turn when it cannot be applied, and adds a PreToolUse hook (merged into the adapter's hooks) that refuses a call to a server outside the profile. Additions only; tested in apps/server/src/fork/claudeMcpProfile.adapter.test.ts. Background wait (F7, #1094): each task_notification is recorded in the ended-task memory of apps/server/src/fork/backgroundWait.ts, so a later t3_background_wait on that task answers it under \"ended\"; tested in apps/server/src/fork/backgroundWait.test.ts.",
       "added": [
         "import * as ClaudeMcpProfile from \"../../fork/claudeMcpProfile.ts\";",
         "readonly mcpProfileOptions?: ClaudeMcpProfile.ClaudeMcpProfilePlan[\"options\"];",
@@ -240,15 +240,10 @@
         "const checkMcpProfile = ClaudeMcpProfile.checkClaudeSession(mcpProfile, mcpOverrides);",
         "mcpProfileOptions: mcpProfile.options,",
         "...input.mcpProfileOptions?.hooks,",
-        "Effect.tap(({ querySession }) => checkMcpProfile(querySession)),"
-      ],
-      "announced": {
-        "since": "2026-11-28",
-        "added": [
-          "import * as BackgroundWait from \"../../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
-          "yield* BackgroundWait.remember(input.nativeThreadId, message); // Fork: background wait (F7)"
-        ]
-      }
+        "Effect.tap(({ querySession }) => checkMcpProfile(querySession)),",
+        "import * as BackgroundWait from \"../../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
+        "yield* BackgroundWait.remember(input.nativeThreadId, message); // Fork: background wait (F7)"
+      ]
     },
     "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts": {
       "why": "MCP profiles part 5: each Codex thread gets its profile's outside MCP servers switched off in its own per-thread config (mcp_servers.<name>.enabled = false for every server Codex's config/read lists for the thread's folder that the profile leaves out, launch-argument servers included; T3's own entries stay), and a turn is refused, saying why and the fix, when the thread's live servers (mcpServerStatus/list) still include one outside its profile. The adapter's app-server client factory is wrapped by apps/server/src/fork/codexMcpProfile.ts; the overrides travel per request, so other threads on the shared app-server keep their own sets. Additions only; tested in apps/server/src/fork/codexMcpProfile.test.ts.",
@@ -259,15 +254,11 @@
     },
     "apps/server/src/orchestration-v2/ThreadManagementService.ts": {
       "why": "An awaited t3_background_wait on a task that already ended answers with that task under a new \"ended\" field (its status and summary), read from the ended-task memory the Claude adapter fills (fork/backgroundWait.ts), instead of refusing it unmatched (#1094, F7). Additions only.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-28",
-        "added": [
-          "import * as BackgroundWait from \"../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
-          "const ended = yield* BackgroundWait.read(providerThread, input.taskIds, matched); // Fork: background wait (F7)",
-          "if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)"
-        ]
-      }
+      "added": [
+        "import * as BackgroundWait from \"../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
+        "const ended = yield* BackgroundWait.read(providerThread, input.taskIds, matched); // Fork: background wait (F7)",
+        "if (ended.length > 0) return BackgroundWait.result(input.taskIds, matched, ended); // Fork: background wait (F7)"
+      ]
     },
     "apps/server/src/orchestration-v2/ProviderTurnStartService.ts": {
       "why": "MCP profiles part 2: a Claude turn its MCP profile refuses never reached Claude, like the other refusals in this list.",
@@ -373,15 +364,14 @@
       ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/tools.ts": {
-      "why": "t3_background_wait takes taskId as an alias of taskIds (its parameters decode either into the taskIds upstream's handler reads, so the handler is unchanged) and its result may carry the \"ended\" field (fork/backgroundWait.ts, #1094, F7). Additions only.",
-      "added": [],
+      "why": "t3_background_wait's result may carry the \"ended\" field: tasks that had already ended, with their status and summary (fork/backgroundWait.ts, #1094, F7). Still announced, not spent: the taskId alias of taskIds. Advertising it grows upstream's tool-list budget (agentContextBudget.json stays upstream's), and McpHttpServer refuses an argument it does not advertise. Additions only.",
+      "added": [
+        "import * as BackgroundWait from \"../../../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
+        ".setSuccess(BackgroundWait.Success) // Fork: background wait (F7)"
+      ],
       "announced": {
         "since": "2026-11-28",
-        "added": [
-          "import * as BackgroundWait from \"../../../fork/backgroundWait.ts\"; // Fork: background wait (F7)",
-          ".setParameters(BackgroundWait.Parameters) // Fork: background wait (F7)",
-          ".setSuccess(BackgroundWait.Success) // Fork: background wait (F7)"
-        ]
+        "added": [".setParameters(BackgroundWait.Parameters) // Fork: background wait (F7)"]
       }
     },
     "apps/server/src/mcp/toolkits/attachment/handlers.ts": {
