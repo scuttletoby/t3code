@@ -1,0 +1,5 @@
+- Change: A task delegated to a thread on this machine wakes its parent once per approval, secret card or pairing card it waits on (questions already did), and `GET /api/fork/prompt-mirror` lists what a parent's open tasks wait on, here and on linked machines (machine, kind, label, status; never a value), for read-only cards in the parent thread.
+- Why: Upstream woke a parent only for a local question; a child's approval or card sat unseen.
+- Setting: none
+- Default: always
+- PR: [#808](https://github.com/scuttletoby/t3code/issues/808)

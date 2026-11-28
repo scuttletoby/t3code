@@ -28,6 +28,8 @@ import * as HandoffService from "./handoff/HandoffService.ts";
 import * as McpProfileTurnCheck from "./mcpProfileTurnCheck.ts";
 import * as PullRequestWatchSlot from "./pullRequestWatchSlot.ts";
 import * as RemoteTaskPrompts from "./remoteTaskPrompts.ts";
+import * as LocalTaskPromptWakes from "./localTaskPromptWakes.ts";
+import * as PromptMirror from "./promptMirror.ts";
 import * as RemoteTaskPromptWakes from "./remoteTaskPromptWakes.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
 import * as StopFinishedChildren from "./stopFinishedChildren.ts";
@@ -118,6 +120,10 @@ export const layerRoutes = Layer.mergeAll(
   RemoteTaskPromptWakes.layer,
   // POST/GET /api/fork/delegate: the slot filler starts and counts a thread's children; a session token only.
   FillerDelegate.layer,
+  // A parent here whose task's thread here waits on an approval, secret or pairing card.
+  LocalTaskPromptWakes.layer,
+  // GET /api/fork/prompt-mirror: what a parent's open tasks wait on, here and on linked machines.
+  PromptMirror.layer,
 );
 
 /**

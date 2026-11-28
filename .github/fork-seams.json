@@ -502,7 +502,7 @@
       ]
     },
     "apps/web/src/components/ChatView.tsx": {
-      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts). A thread whose playtest session is on shows the Playtest chip with its End button in the composer's banners (playtest F5, #889): one hook call and its items spread into both banner lists (fork/playtest/usePlaytestChipItems.tsx). A thread whose next turn names no effort while the model policy is on shows a warning in the composer's banners (model policy, #876): one hook call and its items spread into both banner lists (fork/modelPolicy/useForkNoEffortItems.tsx).",
+      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts). A thread whose playtest session is on shows the Playtest chip with its End button in the composer's banners (playtest F5, #889): one hook call and its items spread into both banner lists (fork/playtest/usePlaytestChipItems.tsx). A thread whose next turn names no effort while the model policy is on shows a warning in the composer's banners (model policy, #876): one hook call and its items spread into both banner lists (fork/modelPolicy/useForkNoEffortItems.tsx). A parent thread shows what its open delegated tasks wait on as read-only banners the same way: one hook call reading GET /api/fork/prompt-mirror and its items spread into both lists (fork/promptMirror/useForkPromptMirrorItems.ts).",
       "added": [
         "import { useForkPlaytestItems } from \"./fork/playtest/usePlaytestChipItems\"; // Fork (playtest)",
         "const forkPlaytestItems = useForkPlaytestItems(routeThreadRef); // Fork (playtest)",
@@ -519,7 +519,11 @@
           "import { useForkHandoffWaitingItems } from \"./fork/handoff/useForkHandoffWaitingItems\"; // Fork (HO5)",
           "const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)",
           "...forkHandoffWaitingItems, // Fork (HO5)",
-          "...forkHandoffWaitingItems, // Fork (HO5)"
+          "...forkHandoffWaitingItems, // Fork (HO5)",
+          "import { useForkPromptMirrorItems } from \"./fork/promptMirror/useForkPromptMirrorItems\"; // Fork (prompt mirror)",
+          "const forkPromptMirrorItems = useForkPromptMirrorItems(routeThreadRef); // Fork (prompt mirror)",
+          "...forkPromptMirrorItems, // Fork (prompt mirror)",
+          "...forkPromptMirrorItems, // Fork (prompt mirror)"
         ]
       }
     },
