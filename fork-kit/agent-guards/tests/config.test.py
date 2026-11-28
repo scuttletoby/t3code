@@ -4,7 +4,7 @@ systemMessage the agent sees) and on stderr. Each hook reads only its own part, 
 
   python3 -I -B fork-kit/agent-guards/tests/config.test.py
 """
-import json, os, shutil, subprocess, sys, tempfile, unittest
+import json, os, shutil, subprocess, sys, tempfile, unittest, uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guards_fixture as fx  # noqa: E402
@@ -135,6 +135,19 @@ class Load(unittest.TestCase):
         self.assertEqual(settings, {h: config.defaults(h) for h in config.HOOKS})
         self.assertEqual(len(problems), 1)
 
+    def test_a_notice_is_said_once_a_session_or_every_time_when_it_cannot_be_marked(self):
+        ev = {'session_id': str(uuid.uuid4())}
+        self.assertTrue(config.first_notice('broken', ev, home=self.tmp))
+        self.assertFalse(config.first_notice('broken', ev, home=self.tmp))
+        self.assertTrue(config.first_notice('other', ev, home=self.tmp))
+        self.assertTrue(config.first_notice('broken', {}, home=self.tmp))
+        # the notices folder is a file: no marker can be made, so the notice shows every time
+        other = os.path.join(self.tmp, 'other-home')
+        os.makedirs(os.path.join(other, '.cache', 'agent-guards'))
+        open(os.path.join(other, '.cache', 'agent-guards', 'notices'), 'w').close()
+        for _ in range(2):
+            self.assertTrue(config.first_notice('broken', ev, home=other))
+
     def test_expand(self):
         self.assertEqual(config.expand('~/x/y', home='/h'), '/h/x/y')
         self.assertEqual(config.expand('/abs', home='/h'), '/abs')
@@ -159,7 +172,8 @@ class Hooks(unittest.TestCase):
         for hook in fx.wiring.HOOKS:
             for ev in (QUIET_EVENT, pre):
                 with self.subTest(hook=hook, event=ev['hook_event_name']):
-                    r = fx.run_hook(hook, ev, machine, env=self.env)
+                    # a new session each: the speed hooks say it once a session (#1151)
+                    r = fx.run_hook(hook, dict(ev, session_id=uuid.uuid4().hex), machine, env=self.env)
                     self.assertEqual(r.returncode, 0, r.stderr)
                     self.assertIn(f'{hook}: the machine file\'s "agent-guards" section cannot be used', r.stderr)
                     self.assertIn('built-in defaults used', r.stderr)

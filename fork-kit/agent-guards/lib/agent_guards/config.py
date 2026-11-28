@@ -20,12 +20,21 @@ problem in its answer (systemMessage, and additionalContext where the event take
                        "projects": [{"match": "github.com/owner/repo", "dirs": ["/srv/repo-facts"], "text": "",
                                      "name": "repo"}],
                        "records": [{"path": "/srv/records", "projectsDir": "projects",
-                                    "shared": ["machines", "orch", "shared"]}]}
+                                    "shared": ["machines", "orch", "shared"]}]},
+    "pollLoop":       {"enabled": true, "maxSleepSeconds": 120, "loopSleepSeconds": 5},
+    "readSize":       {"enabled": true, "maxChars": 20000},
+    "batchNudge":     {"enabled": true, "afterTurns": 3, "tailBytes": 1048576,
+                       "readOnlyTools": ["Read", "Grep", "Glob", "LS", "NotebookRead"],
+                       "readOnlyCommands": ["cat", "head", "tail", "sed", "grep", "ls", ...]}
   }
+
+The three speed hooks (pollLoop, readSize, batchNudge) differ in one way: a problem in their own part, or in the
+file, turns that hook off (it lets every call through and says so) instead of using the defaults, because they guard
+speed, not safety, and must never block work on a broken config. "enabled": false turns one off on purpose.
 
 Paths are absolute or start with "~/" (each user's own home). Plain Python 3 standard library.
 """
-import copy, os, re, sys
+import copy, hashlib, os, re, sys, time
 
 _kit = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 _common = os.path.join(_kit, 'common')
@@ -84,6 +93,27 @@ def _records(value):
     return None
 
 
+def _tools(value):
+    for v in value:
+        if not isinstance(v, str) or not re.match(r'^[A-Za-z][A-Za-z0-9_]{0,63}$', v):
+            return f'every entry must be a tool name (letters, digits, _), not {v!r}'
+    return None
+
+
+def _words(value):
+    for v in value:
+        if not isinstance(v, str) or not COMMAND_RE.match(v):
+            return f'every entry must be a command name (letters, digits, . _ + -), not {v!r}'
+    return None
+
+
+READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob', 'LS', 'NotebookRead']
+READ_ONLY_COMMANDS = ['cat', 'head', 'tail', 'sed', 'grep', 'egrep', 'fgrep', 'rg', 'ls', 'find', 'wc', 'stat', 'file',
+                      'tree', 'du', 'df', 'pwd', 'echo', 'printf', 'jq', 'awk', 'sort', 'uniq', 'cut', 'tr', 'nl',
+                      'diff', 'cmp', 'readlink', 'realpath', 'basename', 'dirname', 'which', 'type', 'column', 'less',
+                      'git', 'facts', 'true']
+
+
 def _scripts(value):
     for k, v in enumerate(value):
         p = _row_problem(k, v)
@@ -126,6 +156,22 @@ SPEC = {
         'indexChars': (int, 4000, _positive),
         'projects': (list, [], _projects),
         'records': (list, [], _records),
+    },
+    'pollLoop': {
+        'enabled': (bool, True, None),
+        'maxSleepSeconds': (int, 120, _positive),
+        'loopSleepSeconds': (int, 5, _positive),
+    },
+    'readSize': {
+        'enabled': (bool, True, None),
+        'maxChars': (int, 20000, _positive),
+    },
+    'batchNudge': {
+        'enabled': (bool, True, None),
+        'afterTurns': (int, 3, _positive),
+        'tailBytes': (int, 1048576, _positive),
+        'readOnlyTools': (list, READ_ONLY_TOOLS, _tools),
+        'readOnlyCommands': (list, READ_ONLY_COMMANDS, _words),
     },
 }
 HOOKS = tuple(SPEC)
@@ -287,6 +333,42 @@ def notice(name, problem, event, out=None):
         hso['additionalContext'] = (hso['additionalContext'] + ' ' + text) if hso.get('additionalContext') else text
         out['hookSpecificOutput'] = hso
     return out
+
+
+NOTICE_DIR = '~/.cache/agent-guards/notices'
+NOTICE_DAYS = 7
+
+
+def first_notice(text, event, home=None):
+    """True the first time a session sees `text` (a speed hook's config notice), False after: a broken machine file
+    costs the agent one notice per hook per session, not one on every call (#1151). A marker file per (session,
+    text) in ~/.cache/agent-guards/notices, made with O_EXCL, so two calls at once still say it once; markers older
+    than NOTICE_DAYS go when a new one is made. No session id, or a folder it cannot write: True (say it every
+    time rather than never)."""
+    sid = event.get('session_id') if isinstance(event, dict) else None
+    if not isinstance(sid, str) or not sid:
+        return True
+    folder = expand(NOTICE_DIR, home)
+    name = hashlib.sha256(f'{sid}\0{text}'.encode()).hexdigest()[:32]
+    try:
+        os.makedirs(folder, mode=0o700, exist_ok=True)   # a file there raises FileExistsError too: not "seen"
+    except OSError:
+        return True
+    try:
+        fd = os.open(os.path.join(folder, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return True
+    os.close(fd)
+    try:
+        old = time.time() - NOTICE_DAYS * 86400
+        for e in os.scandir(folder):
+            if e.is_file(follow_symlinks=False) and e.stat(follow_symlinks=False).st_mtime < old:
+                os.unlink(e.path)
+    except OSError:
+        pass
+    return True
 
 
 def warn(name, problem):

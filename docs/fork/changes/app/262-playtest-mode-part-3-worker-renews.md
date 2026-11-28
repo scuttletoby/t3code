@@ -1,0 +1,5 @@
+- Change: Playtest mode, part 3: the worker renews claims, ends idle, too-long and gone-thread sessions, finishes what a restart cut, and tells the thread once when T3 ended a session.
+- Why: A person tries an agent's unfinished work on a test target, round after round, no PR per round.
+- Setting: `server.playtest`, `projectOverride.playtest`
+- Default: off
+- PR: [#262](https://github.com/scuttletoby/t3code/pull/262)

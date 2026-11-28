@@ -1,7 +1,7 @@
 # About this fork
 
 Fork only. This page says what the fork is, how to install and update it, what it adds today and
-what is planned. Every change, one line each, is in [FORK_CHANGES.md](../../FORK_CHANGES.md); every
+what is planned. Every change, one file each, is listed from [FORK_CHANGES.md](../../FORK_CHANGES.md); every
 setting with its default is in [README.md](README.md).
 
 ## What it is
@@ -83,8 +83,9 @@ has no row yet (usage history, busy check, placement, thread roles): set it in `
 - Thread roles: which thread is the assistant and which is each project's orchestrator. Only you
   set them (**Make assistant** sets the assistant); the app does not show them yet. Settings file
   only (`threadRoles`).
-- Waiting on you: a page that lists the open owner questions of every project on every connected
-  server, read only. No menu leads to it yet: open `/owner-questions` in the app.
+- Waiting on you: the Issues entry lists the open owner questions of every project on every
+  connected server, read only. Settings → Fork → Issues page turns it off for upstream's Issues page
+  (on by default).
 
 **Playtesting**
 

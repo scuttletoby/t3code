@@ -1,0 +1,5 @@
+- Change: A chat file link can name the environment that holds the file: `/t3-environment/<environmentId>/<absolute path>`. A click downloads it through that environment's own connection and file-read check; a device not connected to it gets a message naming it. `t3_environment_read` tells agents the format (`fileLinks`).
+- Why: A file on another machine downloads from there instead of failing on this one.
+- Setting: none
+- Default: always
+- PR: [#1048](https://github.com/scuttletoby/t3code/pull/1048)

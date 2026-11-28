@@ -1,0 +1,5 @@
+- Change: Work panel, part 1: CI. With `workPanelEnabled` on, a thread's side panel shows, after its sub-agents, a queue line per repository (runs queued and running, the oldest queued) and the CI of each pull request linked to it or its sub-agents (queued, running, failed, passed on its head, with a link to the run), from one shared GitHub read per server at most once a minute that backs off on a low budget. A part with no answer says unknown.
+- Why: See CI and how full the queue is without opening GitHub.
+- Setting: `client.workPanelEnabled`
+- Default: off
+- PR: [#1136](https://github.com/scuttletoby/t3code/issues/1136)

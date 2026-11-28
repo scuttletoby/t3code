@@ -1,0 +1,5 @@
+- Change: Run records: one line per agent run that ends (model, effort, role, kind, estimate, times, end status, provider-reported tokens) in `<stateDir>/run-records/runs.jsonl`, append-only, and a weekly summary command.
+- Why: Later choices of model, effort and task size need what earlier runs cost and took.
+- Setting: none
+- Default: always (writes only its own files)
+- PR: [#588](https://github.com/scuttletoby/t3code/pull/588)

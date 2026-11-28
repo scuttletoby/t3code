@@ -2,7 +2,7 @@
   "//": "Upstream files with fork lines, and every line the fork may add to each (indentation and blank lines ignored). Checked by .github/scripts/fork-seam-check.cjs against the base branch's copy of this file; see docs/fork/updates.md. A new line is first announced in its entry (\"announced\": {\"since\": day, \"added\": [lines]}), then added by a later pull request that moves it to \"added\" (docs/fork/updates.md, Adding a seam line).",
   "files": {
     "packages/contracts/src/settings.ts": {
-      "why": "Fork settings live in forkSettings.ts; settings.ts takes them with one spread per struct (the client settings patch's spread is announced for the calm sidebar's toggle, which saves the first client fork setting). automaticUpdates stays inline: upstream's pending setting has the same name and place.",
+      "why": "Fork settings live in forkSettings.ts; settings.ts takes them with one spread per struct (the client settings patch's spread saves the client fork settings: the owner-questions page switch, the calm sidebar's toggle and the work panel's switch). automaticUpdates stays inline: upstream's pending setting has the same name and place.",
       "added": [
         "import * as ForkSettings from \"./forkSettings.ts\";",
         "export * from \"./forkSettings.ts\";",
@@ -18,23 +18,16 @@
         "* one when it lands (upstream defaults it on). A file saying `autoUpdateServer` is renamed on load.",
         "*/",
         "automaticUpdates: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),",
-        "automaticUpdates: Schema.optionalKey(Schema.Boolean),"
-      ],
-      "announced": {
-        "since": "2026-11-22",
-        "added": ["...ForkSettings.ForkClientSettingsPatchFields,"]
-      }
+        "automaticUpdates: Schema.optionalKey(Schema.Boolean),",
+        "...ForkSettings.ForkClientSettingsPatchFields,"
+      ]
     },
     "apps/web/src/routes/_chat.issues.tsx": {
       "why": "The Issues page swaps to the fork's owner-question page (Waiting on you, components/fork/ownerQuestions) while the fork setting ownerQuestionsPage is on (fork issue 828). One import and one spread after upstream's component line, so upstream's page files never change; announced with the page, added with the setting.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-22",
-        "added": [
-          "import { ForkIssuesRoute } from \"../components/fork/ownerQuestions/ForkIssuesRoute\"; // Fork (owner questions)",
-          "...ForkIssuesRoute, // Fork (owner questions): the fork page while ownerQuestionsPage is on"
-        ]
-      }
+      "added": [
+        "import { ForkIssuesRoute } from \"../components/fork/ownerQuestions/ForkIssuesRoute\"; // Fork (owner questions)",
+        "...ForkIssuesRoute, // Fork (owner questions): the fork page while ownerQuestionsPage is on"
+      ]
     },
     "apps/server/src/issue/IssueService.ts": {
       "why": "A project's .t3code/issues.json names the repositories its Issues page lists and its issue tools may write to, replacing the ones guessed from git remotes, so a fork checkout's upstream is neither listed nor writable (fork issue 887 row 2, owner decision in 830). One import and one pipe step after upstream's binding resolution; the file and its rule are in fork/issueRepos.ts, and a project without the file keeps upstream's guess.",
@@ -318,22 +311,15 @@
       ]
     },
     "apps/server/src/mcp/toolkits/project/handlers.ts": {
-      "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681); a launch that starts a run takes a slot from the agent slot gate, or is refused slots_full (fork/agentSlotRoutes.ts, #706). An agent's t3_thread_launch (from a calling thread) is checked against the model policy once its model is known, before the slot gate: refused in enforce when the launch names no model, a model in no row, or an effort off its row (fork/modelPolicyCheck.ts, #731).",
+      "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681); a launch that starts a run takes a slot from the agent slot gate, or is refused slots_full (fork/agentSlotRoutes.ts, #706); a delegated task a linked machine sends first passes this machine's usage pacing gate, and the launch runs with the model selection it gives back, its effort lowered by usagePacingLowerEffort (fork/linkedLaunchPacing.ts, #1081). An agent's t3_thread_launch (from a calling thread) is checked against the model policy once its model is known, before the slot gate: refused in enforce when the launch names no model, a model in no row, or an effort off its row (fork/modelPolicyCheck.ts, #731).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch",
-        "import { checkLaunchSlot } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
-        "yield* checkLaunchSlot(caller, { threadId, modelSelection, replaying, input, attachments }); // Fork: agent slots",
+        "import { launchGate } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots, linked pacing",
+        "...(yield* launchGate(caller, threadId, modelSelection, replaying, input, attachments)), // Fork: agent slots, linked pacing",
         "import * as ModelPolicyCheck from \"../../../fork/modelPolicyCheck.ts\"; // Fork: model policy",
         "yield* ModelPolicyCheck.checkLaunch(caller, modelSelection, input, replaying); // Fork: model policy"
-      ],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import { launchGate } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots, linked pacing",
-          "...(yield* launchGate(caller, threadId, modelSelection, replaying, input, attachments)), // Fork: agent slots, linked pacing"
-        ]
-      }
+      ]
     },
     "apps/server/src/scheduledTasks/ScheduledTaskService.ts": {
       "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot (a direct one is stored for the stored-delivery worker on its first refusal, so a restart keeps it; one whose task is saved while it waits is not started on its old copy, and the stored-delivery worker keeps its row and runs it again on the task as saved, #719); a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706). A save records the MCP profile of the thread that made it, and refuses a narrower thread's change that would let the task's runs get more than its own profile; a run that starts a new thread is refused when that thread would get more than the recorded profile (fork/scheduledTaskMcpProfile.ts, #699). The stored-delivery worker names its own delivery to keepStored, and a delivery it removes before its run (payload not prepared, prompt too long) leaves its place in line at once rather than at the sweep (fork/agentSlotRoutes.ts, #941).",
@@ -408,10 +394,10 @@
       ]
     },
     "apps/web/src/components/threadActionMenu.logic.ts": {
-      "why": "The thread menu gets \"Hand off now\" (handoff, HO5): one more menu id, one optional state field the menu's callers fill, and the item spread into the list; the item and its rules are in fork/handoff/handoffMenu.ts. The thread menu gets the MCP profile entry (MCP profile design PR 3): the thread's effective profile and, for a client that may change settings, the owner's pick or clear. One more menu id type, one optional state field the menu's callers fill, and the entry spread into the list before Copy; the entry and its rules are in fork/mcpProfile/threadMcpProfile.logic.ts.",
+      "why": "The thread menu gets \"Hand off now\" (handoff, HO5): one more menu id, one optional state field the menu's callers fill, and the item spread into the list; the item and its rules are in fork/handoff/handoffMenu.ts. The thread menu gets the MCP profile entry (MCP profile design PR 3): the thread's effective profile and, for a client that may change settings, the owner's pick or clear. One more menu id type, one optional state field the menu's callers fill, and the entry spread into the list before Copy; the entry and its rules are in fork/mcpProfile/threadMcpProfile.logic.ts. The thread menu gets Role (calm sidebar, #878 CAL4): one more menu id type, one optional state field the callers fill, and the entry spread in before Copy; the entry and its rules are in fork/calmSidebar/threadRoleMenu.logic.ts.",
       "added": [],
       "announced": {
-        "since": "2026-11-21",
+        "since": "2026-11-27",
         "added": [
           "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
           "| typeof ForkHandoffMenu.HAND_OFF_NOW; // Fork (HO5)",
@@ -420,15 +406,19 @@
           "import * as ForkMcpMenu from \"./fork/mcpProfile/threadMcpProfile.logic\"; // Fork (MCP profile)",
           "| ForkMcpMenu.McpProfileMenuId // Fork (MCP profile)",
           "readonly forkMcpProfile?: ForkMcpMenu.McpProfileMenuState | undefined; // Fork (MCP profile)",
-          "...ForkMcpMenu.mcpProfileMenuItems(state.forkMcpProfile), // Fork (MCP profile)"
+          "...ForkMcpMenu.mcpProfileMenuItems(state.forkMcpProfile), // Fork (MCP profile)",
+          "import * as ForkRoleMenu from \"./fork/calmSidebar/threadRoleMenu.logic\"; // Fork (calm sidebar)",
+          "| ForkRoleMenu.ThreadRoleMenuId // Fork (calm sidebar)",
+          "readonly forkThreadRole?: ForkRoleMenu.ThreadRoleMenuState | undefined; // Fork (calm sidebar)",
+          "...ForkRoleMenu.threadRoleMenuItems(state.forkThreadRole), // Fork (calm sidebar)"
         ]
       }
     },
     "apps/web/src/hooks/useThreadActionMenu.ts": {
-      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" before it builds the menu and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The thread menu's hook fills the MCP profile entry's state as it builds the menu and hands the entry's clicks to the fork, which saves that one thread's pick (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The state is read synchronously, so the menu still opens at once.",
+      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" before it builds the menu and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The thread menu's hook fills the MCP profile entry's state as it builds the menu and hands the entry's clicks to the fork, which saves that one thread's pick (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The state is read synchronously, so the menu still opens at once. The thread menu's hook fills the Role entry's state (read synchronously) and hands its picks to the fork, which saves one threadRoles pointer (calm sidebar, #878 CAL4; fork/calmSidebar/threadRoleMenu.ts).",
       "added": [],
       "announced": {
-        "since": "2026-11-21",
+        "since": "2026-11-27",
         "added": [
           "import * as ForkHandoffMenu from \"../components/fork/handoff/handoffMenu\"; // Fork (HO5)",
           "forkHandoff: await ForkHandoffMenu.readHandoffMenuState(threadRef), // Fork (HO5)",
@@ -436,15 +426,18 @@
           "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
           "import * as ForkMcp from \"../components/fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
           "forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)",
-          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, action)) return; // Fork (MCP profile)"
+          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, action)) return; // Fork (MCP profile)",
+          "import * as ForkRoles from \"../components/fork/calmSidebar/threadRoleMenu\"; // Fork (calm sidebar)",
+          "forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)",
+          "if (ForkRoles.runIfThreadRoleMenuAction(threadRef, action)) return; // Fork (calm sidebar)"
         ]
       }
     },
     "apps/web/src/components/Sidebar.tsx": {
-      "why": "The sidebar builds its own thread menu: it reads the handoff state for \"Hand off now\" before the menu opens (the menu is built in a callback that does not await) and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The sidebar builds its own thread menu: it fills the MCP profile entry's state and hands the entry's clicks to the fork, like the thread menu's hook (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts).",
+      "why": "The sidebar builds its own thread menu: it reads the handoff state for \"Hand off now\" before the menu opens (the menu is built in a callback that does not await) and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts). The sidebar builds its own thread menu: it fills the MCP profile entry's state and hands the entry's clicks to the fork, like the thread menu's hook (MCP profile design PR 3; fork/mcpProfile/threadMcpProfileMenu.ts). The calm sidebar (#878 CAL3, CAL4; fork/calmSidebar): one hook call; its list input spread after upstream's `threads:` (empty while calm is off); its top rows (role rows drawn with the list's own row, the Other threads group) spread first into the rows; a role row's thread for the menu, which the list no longer holds; and the menu's Role entry, filled and run like the MCP profile entry's.",
       "added": [],
       "announced": {
-        "since": "2026-11-21",
+        "since": "2026-11-27",
         "added": [
           "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
           "const forkHandoff = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
@@ -453,7 +446,27 @@
           "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)",
           "import * as ForkMcp from \"./fork/mcpProfile/threadMcpProfileMenu\"; // Fork (MCP profile)",
           "forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)",
-          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, clicked.value)) return; // Fork (MCP profile)"
+          "if (ForkMcp.runIfMcpProfileMenuAction(threadRef, clicked.value)) return; // Fork (MCP profile)",
+          "import * as ForkRoles from \"./fork/calmSidebar/threadRoleMenu\"; // Fork (calm sidebar)",
+          "import { useForkCalmSidebar } from \"./fork/calmSidebar/useForkCalmSidebar\"; // Fork (calm sidebar)",
+          "// Fork (calm sidebar): role rows on top, other threads folded (fork/calmSidebar).",
+          "const forkCalm = useForkCalmSidebar({ listedThreads, scopedProjectKeys, isSearchingThreads });",
+          "...forkCalm.sidebarInput(routeRowThreadKey), // Fork (calm sidebar)",
+          "forkCalm.roleThread(threadKey) ?? // Fork (calm sidebar): role rows are not in the list",
+          "forkThreadRole: ForkRoles.readThreadRoleMenuState(threadRef), // Fork (calm sidebar)",
+          "if (ForkRoles.runIfThreadRoleMenuAction(threadRef, clicked.value)) return; // Fork (calm sidebar)",
+          "...forkCalm.topRows(renderThreadRow), // Fork (calm sidebar)"
+        ]
+      }
+    },
+    "apps/web/src/components/chat/ChatHeader.tsx": {
+      "why": "The thread header shows the thread's role badge, Assistant or Orchestrator (calm sidebar, #878 CAL3): one import and one element after upstream's linked-environment badge, hidden while the title is renamed; the badge and its rule are in fork/calmSidebar/ForkThreadRoleBadge.tsx.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import { ForkThreadRoleBadge } from \"../fork/calmSidebar/ForkThreadRoleBadge\"; // Fork (calm sidebar)",
+          "{renamingTitle === null ? <ForkThreadRoleBadge threadRef={activeThreadRef} /> : null}"
         ]
       }
     },
@@ -653,53 +666,66 @@
       ]
     },
     "packages/contracts/src/rpc.ts": {
-      "why": "The work panel (fork issue 1136) reads one fork RPC, `fork.workPanel`, defined in the fork file forkWorkPanel.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket.",
-      "added": [],
+      "why": "The work panel (fork issue 1136) reads one fork RPC, `fork.workPanel`, defined in the fork file forkWorkPanel.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket. The Usage tab's fleet list (fork issue 1146) reads one fork RPC, `fork.fleetUsage`, defined in the fork file forkFleetUsage.ts: one import and one entry in upstream's RPC group, so the method gets upstream's transport, auth middleware and client typing without a second socket.",
+      "added": [
+        "import { WsForkWorkPanelRpc } from \"./forkWorkPanel.ts\"; // Fork (work panel)",
+        "WsForkWorkPanelRpc, // Fork (work panel)"
+      ],
       "announced": {
         "since": "2026-11-27",
         "added": [
-          "import { WsForkWorkPanelRpc } from \"./forkWorkPanel.ts\"; // Fork (work panel)",
-          "WsForkWorkPanelRpc, // Fork (work panel)"
+          "import { WsForkFleetUsageRpc } from \"./forkFleetUsage.ts\"; // Fork (fleet usage)",
+          "WsForkFleetUsageRpc, // Fork (fleet usage)"
         ]
       }
     },
     "apps/server/src/auth/RpcAuthorization.ts": {
-      "why": "Every RPC in the group declares its scope (RpcAuthorization.test.ts holds the map to the group): the work panel's `fork.workPanel` (fork issue 1136) is a read, like upstream's host resources read.",
-      "added": [],
+      "why": "Every RPC in the group declares its scope (RpcAuthorization.test.ts holds the map to the group): the work panel's `fork.workPanel` (fork issue 1136) is a read, like upstream's host resources read. The fleet usage read `fork.fleetUsage` (fork issue 1146) is a read, like upstream's host resources read.",
+      "added": ["\"fork.workPanel\": AuthOrchestrationReadScope, // Fork (work panel)"],
       "announced": {
         "since": "2026-11-27",
-        "added": ["\"fork.workPanel\": AuthOrchestrationReadScope, // Fork (work panel)"]
+        "added": ["\"fork.fleetUsage\": AuthOrchestrationReadScope, // Fork (fleet usage)"]
       }
     },
     "apps/server/src/observability/RpcInstrumentation.ts": {
-      "why": "Every RPC in the group names its span category: the work panel's `fork.workPanel` (fork issue 1136) is a server read.",
-      "added": [],
+      "why": "Every RPC in the group names its span category: the work panel's `fork.workPanel` (fork issue 1136) is a server read. The fleet usage read `fork.fleetUsage` (fork issue 1146) is a server read.",
+      "added": ["\"fork.workPanel\": \"server\", // Fork (work panel)"],
       "announced": {
         "since": "2026-11-27",
-        "added": ["\"fork.workPanel\": \"server\", // Fork (work panel)"]
+        "added": ["\"fork.fleetUsage\": \"server\", // Fork (fleet usage)"]
       }
     },
     "apps/server/src/ws.ts": {
-      "why": "The work panel's `fork.workPanel` handler (fork issue 1136) is one line that hands the request to the fork file fork/workPanel/workPanel.ts, which reads its own service only if it is there, so upstream's handler requirements and ws tests do not change.",
+      "why": "The work panel's `fork.workPanel` handler (fork issue 1136) is one line that hands the request to the fork file fork/workPanel/workPanel.ts, which reads its own service only if it is there, so upstream's handler requirements and ws tests do not change. The fleet usage handler `fork.fleetUsage` (fork issue 1146) is one line that hands the request to the fork file fork/fleetUsage/fleetUsage.ts, which reads each service it needs only if it is there, so upstream's handler requirements and ws tests do not change.",
+      "added": [
+        "import * as ForkWorkPanel from \"./fork/workPanel/workPanel.ts\"; // Fork (work panel)",
+        "\"fork.workPanel\": (input) => ForkWorkPanel.read(input), // Fork (work panel)"
+      ],
+      "announced": {
+        "since": "2026-11-27",
+        "added": [
+          "import * as ForkFleetUsage from \"./fork/fleetUsage/fleetUsage.ts\"; // Fork (fleet usage)",
+          "\"fork.fleetUsage\": (input) => ForkFleetUsage.read(input), // Fork (fleet usage)"
+        ]
+      }
+    },
+    "apps/web/src/components/usage/UsageLimitsPooled.tsx": {
+      "why": "The Usage tab's limits (fork issue 1146) get the fork's fleet list first: one import and one element at the top of upstream's list, which renders nothing while the server it is connected to has no linked machine (components/fork/fleetUsage).",
       "added": [],
       "announced": {
         "since": "2026-11-27",
         "added": [
-          "import * as ForkWorkPanel from \"./fork/workPanel/workPanel.ts\"; // Fork (work panel)",
-          "\"fork.workPanel\": (input) => ForkWorkPanel.read(input), // Fork (work panel)"
+          "import { ForkFleetUsage } from \"../fork/fleetUsage/ForkFleetUsage\"; // Fork (fleet usage)",
+          "<ForkFleetUsage now={now} />"
         ]
       }
     },
     "apps/web/src/components/chat/ThreadDetailsPanel.tsx": {
       "why": "The work panel (fork issue 1136) sits in the thread's side panel right after its sub-agents (ThreadRelationshipsPanel): one import and one element, which renders nothing while the client fork setting workPanelEnabled is off (components/fork/workPanel).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-27",
-        "added": [
-          "import { ForkWorkPanel } from \"../fork/workPanel/ForkWorkPanel\"; // Fork (work panel)",
-          "<ForkWorkPanel {...props} density={density} />"
-        ]
-      }
+      "added": [
+        "import { ForkWorkPanel } from \"../fork/workPanel/ForkWorkPanel\"; // Fork (work panel)",
+        "<ForkWorkPanel {...props} density={density} />"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -821,6 +847,10 @@
   ],
   "//lost": "Seam and pending files that lost upstream lines, counted from upstream (as fork-follow runs the check): \"lines\", the upstream lines not kept in order and indentation; \"gone\", those whose text is gone. Held exactly, like a ceiling; an unlisted file counts 0. Lower a count when a line comes back, and keep each one small: a count is not a set of lines, so a line counted here may move unseen, and in a pending file a pull request can put back one gone upstream line and delete another with both counts unchanged.",
   "lost": {
+    "vite.config.ts": {
+      "lines": 3,
+      "gone": 3
+    },
     "packages/shared/src/serverSettings.ts": {
       "lines": 1,
       "gone": 1

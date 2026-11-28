@@ -1,0 +1,5 @@
+- Change: Review rules, part 1: the setting for how this machine runs a review lens (runner, state question), off by default; `{"preset": "recommended"}` turns the fork's defaults on. A bad hand edit reads as off and is kept. Part 2: the `lens_start` tool starts the review lenses a head still needs, or (`afterCi`) once its CI passes; its children post with `lens_report`, which writes the lens line and posts only at the head read; neither is listed while off.
+- Why: The repo says what a pull request needs and CI enforces it; the machine says how reviews run.
+- Setting: `server.reviewRules`, `projectOverride.reviewRules`
+- Default: off
+- PR: [#291](https://github.com/scuttletoby/t3code/pull/291)

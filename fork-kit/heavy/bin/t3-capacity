@@ -1,13 +1,22 @@
 #!/usr/bin/python3 -IB
 """t3-capacity: may one more piece of work start here? A thin caller of `heavy facts` (lib/heavy_facts.py).
 
-  t3-capacity [--kind KIND] [MB]
+  t3-capacity [--kind KIND] [--long] [MB]
+  t3-capacity -h | --help
 
 MB alone (default 3072): do MB fit the free budget at pressure level "ok". --kind: does the capacity rule admit one
 piece of KIND (agent-writer, job-build, build, ...); with MB too, that piece declares MB (a floor of its cost), and
 the rule alone decides (its job floor too).
 
-Output, kept as the older t3-capacity had it so hooks and scripts that read it keep working:
+Output: ONE line (#1150), so nobody needs to pipe it to see the answer:
+  OK: free=<MB>MB need=<MB>MB available=<MB>MB swapfree=<MB>MB disk=<GB>GB
+  NOT OK: <why> (free=<MB>MB need=<MB>MB available=<MB>MB swapfree=<MB>MB disk=<GB>GB)
+with ` held=<MB>MB` after available= when reservations (reserve.d) hold memory back from this caller (--long names
+them), and ` notes=<n>` at the end when heavy facts has notes (--long shows them). It reads the reservations itself,
+so it needs no wrapper; a wrapper that prints a line of its own before it makes the output two lines. The
+available= and swapfree= values are the ones of the long output's first line, so a reader that takes them from the
+first line with available= in it reads the same numbers.
+--long: the older t3-capacity's output, for people and for scripts that read its lines:
   line 1   available=<MB>MB swapfree=<MB>MB load=<load>/<n>cores agents=<n> jobs=<n> waiting=<n> reserved=<MB>MB
            need=<MB>MB free=<MB>MB level=<level> tier=<tier> disk=<GB>GB   (available: after the reservations
            that hold back this caller; reserved: what admitted jobs and agents may still grow into, so available -
@@ -40,13 +49,15 @@ def facts_module():
 
 
 def main(argv):
-    kind, need, rest = None, None, list(argv)
+    kind, need, long, rest = None, None, False, list(argv)
     while rest:
         a = rest.pop(0)
         if a in ('-h', '--help'):
             print(__doc__.strip())
             return 0
-        if a.startswith('--kind'):
+        if a in ('-l', '--long'):
+            long = True
+        elif a.startswith('--kind'):
             if kind is not None or (a == '--kind' and not rest):
                 return usage()
             kind = rest.pop(0) if a == '--kind' else a.partition('=')[2]
@@ -65,9 +76,11 @@ def main(argv):
     if disk_why is not None:    # #982: the disk's reason first, the memory's after it when that is NOT OK too
         why = f'disk: {disk_why}' + ('' if verdict == 'free' else f'; {why}')
         verdict = 'busy' if verdict == 'free' else verdict
-    if d is None:
+    if not long:
+        print(short_line(verdict, why, d, need, disk))
+    elif d is None:
         print(f'available=0MB swapfree=0MB load=0/0cores need={need or 0}MB facts=unavailable {disk}')
-        lines = [f'NOT OK: {why} (not free)']
+        print(f'NOT OK: {why} (not free)')
     else:
         m, q, c = d['memory'], d['queue'], d['cpu']
         avail = max(0, (m['availableMb'] or 0) - (m['holdMb'] or 0))   # the rule's hold (all of it, not the
@@ -85,12 +98,24 @@ def main(argv):
         lines += [f'note: {n}' for n in d['notes']]
         lines.append('fits: ' + ' '.join(f'{k}={n}' for k, n in d['fits'].items()))
         lines.append('OK' if verdict == 'free' else f'NOT OK: {why}')
-    print('\n'.join(lines))
+        print('\n'.join(lines))
     if verdict == 'free':
         return 0
     if not sys.stdout.isatty():
         print(not_ok_line(), file=sys.stderr)
     return 1
+
+
+def short_line(verdict, why, d, need, disk):
+    """The one line (#1150): the answer first, then the numbers a reader needs (the long output's own values)."""
+    if d is None:
+        return f'NOT OK: {why} (not free; available=0MB swapfree=0MB need={need or 0}MB {disk})'
+    m = d['memory']
+    nums = (f'free={m["freeMb"]}MB need={need if need is not None else m["costMb"]}MB '
+            f'available={max(0, (m["availableMb"] or 0) - (m["holdMb"] or 0))}MB'
+            + (f' held={m["holdMb"]}MB' if m['holdMb'] else '') + f' swapfree={m["swapFreeMb"]}MB {disk}'
+            + (f' notes={len(d["notes"])}' if d['notes'] else ''))
+    return f'OK: {nums}' if verdict == 'free' else f'NOT OK: {why} ({nums})'
 
 
 def disk_answer():
@@ -133,7 +158,7 @@ def owed(r):
 
 
 def usage():
-    print('usage: t3-capacity [--kind KIND] [MB]', file=sys.stderr)
+    print('usage: t3-capacity [--kind KIND] [--long] [MB]  (t3-capacity --help says more)', file=sys.stderr)
     return 2
 
 

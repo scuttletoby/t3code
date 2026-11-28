@@ -1,0 +1,5 @@
+- Change: A pure capacity rule for "dynamic slots" (one budget per machine), with shared test cases. Not wired into anything yet.
+- Why: A later step replaces fixed agent counts with what the machine can take.
+- Setting: none
+- Default: not used
+- PR: [#203](https://github.com/scuttletoby/t3code/pull/203)

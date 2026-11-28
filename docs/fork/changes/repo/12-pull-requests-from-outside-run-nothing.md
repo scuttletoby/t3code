@@ -1,0 +1,5 @@
+- Change: Pull requests from outside run nothing; four outside-started upstream workflows and `issue-vouch.yml` are deleted and kept deleted.
+- Why: No code from an outside pull request runs with this repository's runners or tokens.
+- Setting: none
+- Default: always
+- PR: [#12](https://github.com/scuttletoby/t3code/pull/12), [#14](https://github.com/scuttletoby/t3code/pull/14), [#23](https://github.com/scuttletoby/t3code/pull/23)

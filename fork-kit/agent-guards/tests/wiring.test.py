@@ -51,7 +51,9 @@ class Entries(unittest.TestCase):
                                 for e, xs in wiring.hooks().items() for x in xs),
                          sorted([('PreToolUse', 'Write|Edit|MultiEdit', [5]), ('PreToolUse', 'Bash|Monitor', [10]),
                                  ('PreToolUse', 'Bash|Monitor', [10]),
+                                 ('PreToolUse', 'Bash', [5]), ('PreToolUse', 'Read', [5]),
                                  ('PostToolUse', 'Write|Edit|MultiEdit|Bash|Monitor', [5]),
+                                 ('PostToolUse', 'Read|Grep|Glob|LS|NotebookRead|Bash', [5]),
                                  ('UserPromptSubmit', None, [5]), ('Stop', None, [5, 5]),
                                  ('SessionStart', None, [5]), ('PreCompact', None, [5])]))
         for _e, _m, cmd in wiring.commands_in({'hooks': wiring.hooks()}):
@@ -211,7 +213,7 @@ class Check(unittest.TestCase):
     def test_the_kit_entries_pass(self):
         code, lines = self.run_check(self.settings)
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 14, '\n'.join(lines))
+        self.assertEqual(sum(ln.startswith('PASS') for ln in lines), 21, '\n'.join(lines))
         self.assertEqual(lines[-1], 'check: test settings: OK')
         # lens A nit: the hooks ran with HOME in check's own temporary folder; nothing (log, cache, state) is
         # written in the caller's HOME

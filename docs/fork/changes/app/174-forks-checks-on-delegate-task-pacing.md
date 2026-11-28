@@ -1,0 +1,5 @@
+- Change: The fork's checks on `delegate_task` (pacing, slots) sit behind one fork module.
+- Why: Fewer fork lines in upstream's code, so syncs conflict less. No change in behaviour.
+- Setting: none
+- Default: always
+- PR: [#174](https://github.com/scuttletoby/t3code/pull/174)

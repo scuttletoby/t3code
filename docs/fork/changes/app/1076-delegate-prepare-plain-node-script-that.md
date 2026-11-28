@@ -1,0 +1,5 @@
+- Change: Delegate prepare: a plain node script that clones or reuses a checkout, merges the base, runs the project's install commands and its baseline tests of the touched files, by `.t3code/prepare.json`, and writes the result to the checkout's git folder.
+- Why: A delegated agent should start on a merged, installed checkout and know which tests were red before its change.
+- Setting: none
+- Default: off until run by hand or from a project's worktree setup script
+- PR: [#1076](https://github.com/scuttletoby/t3code/pull/1076)

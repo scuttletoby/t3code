@@ -33,6 +33,7 @@ import { encodePendingTask } from "../scheduledTasks/webhookDedupe.ts";
 import type { WebhookRequest } from "../scheduledTasks/webhookTemplate.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
+import { checkLinkedLaunchPacing } from "./linkedLaunchPacing.ts";
 import { makeScheduledTaskMcpProfiles } from "./scheduledTaskMcpProfile.ts";
 
 type Refused = Extract<SlotGate.SlotAcquire, { readonly type: "refuse" }>;
@@ -153,32 +154,39 @@ const admitNamed = (
       : Effect.void,
   );
 
-export interface LaunchSlot {
-  readonly threadId: ThreadId;
-  readonly modelSelection: Pick<ModelSelection, "instanceId">;
-  /** A retry of an accepted launch: it starts nothing new, so it is not counted again. */
-  readonly replaying: boolean;
-  readonly input: { readonly message?: string | undefined };
-  readonly attachments: ReadonlyArray<unknown>;
+/** What `t3_thread_launch` gives its gate: the launch as asked. */
+interface LaunchInput {
+  readonly message?: string | undefined;
+  readonly delegatedFrom?: unknown;
+  readonly modelSelection?: unknown;
 }
 
 /**
- * `t3_thread_launch`, last before the launch: a launch that starts a run (a message or an
- * attachment) takes a slot on its model's instance, or is refused `slots_full`. `caller` is the
- * thread here that asks, if any; a launch from a linked machine or the owner's client has none.
- * The gate is the one the handlers were built with (none in a host that runs none).
+ * `t3_thread_launch`: a launch that starts a run takes a slot, or is refused `slots_full`; a replay
+ * is not counted again. A linked machine's delegated task is paced first (`linkedLaunchPacing.ts`);
+ * the result, spread over the launch, carries the effort the owner's setting lowered.
  */
-export const checkLaunchSlot = Effect.fn("AgentSlotRoutes.checkLaunchSlot")(function* (
+export const launchGate = Effect.fn("AgentSlotRoutes.launchGate")(function* (
   caller: { readonly id: ThreadId } | undefined,
-  launch: LaunchSlot,
-) {
-  if (launch.replaying) return;
-  if (launch.input.message === undefined && launch.attachments.length === 0) return;
+  threadId: ThreadId,
+  modelSelection: ModelSelection,
+  replaying: boolean,
+  input: LaunchInput,
+  attachments: ReadonlyArray<unknown>,
+): Effect.fn.Return<{ readonly modelSelection?: ModelSelection }, OrchestratorMcpFailure> {
+  if (replaying) return {};
+  if (input.message === undefined && attachments.length === 0) return {};
+  const lowered = yield* checkLinkedLaunchPacing({
+    modelSelection,
+    delegatedFrom: input.delegatedFrom,
+    namesModel: input.modelSelection !== undefined,
+  });
   yield* admitNamed(yield* Effect.serviceOption(SlotGate.SlotGate), {
     callerThreadId: caller?.id ?? null,
-    targetInstanceId: launch.modelSelection.instanceId,
-    childThreadId: launch.threadId,
+    targetInstanceId: modelSelection.instanceId,
+    childThreadId: threadId,
   });
+  return lowered === undefined ? {} : { modelSelection: lowered };
 });
 
 /** A message into an existing thread, as the gate is asked about it. */

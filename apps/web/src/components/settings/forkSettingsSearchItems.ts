@@ -268,6 +268,13 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     scope: "environment-defaults",
   },
   {
+    id: "work-panel",
+    title: "Work panel",
+    to: FORK_PAGE,
+    searchTerms: ["work panel workPanelEnabled ci checks queue runs side panel capacity"],
+    environmentOnly: true,
+  },
+  {
     id: "assistant",
     title: "Offer an assistant thread",
     to: FORK_PAGE,
@@ -282,5 +289,12 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["assistant thread role scratch make"],
     environmentOnly: true,
     scope: "environment-defaults",
+  },
+  {
+    id: "owner-questions-page",
+    title: "Issues opens Waiting on you",
+    to: FORK_PAGE,
+    searchTerms: ["issues owner questions waiting on you decision inbox page"],
+    environmentOnly: true,
   },
 ] as const;

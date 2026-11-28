@@ -248,7 +248,7 @@ def command_words(code):
 
 
 # What the real launcher has, which a change must keep or read with the security lens (launcher_tripwires).
-SYSTEMD_RUN_WORDS = 7   # the setting, its default, `tools` (2), and the three job units (start, check_net's two)
+SYSTEMD_RUN_WORDS = 8   # the setting, its default, `tools` (2), and the four units (start, check_net's three)
 TOOLS = ("  tools:1) printf 'SYSTEMD_RUN %s\\nSYSTEMCTL %s\\n' \"$(shown \"$SYSTEMD_RUN\")\" "
          "\"$(shown \"$SYSTEMCTL\")\" ;;\n")
 B_ANCHOR = '  b=$real\n  resolv_bind=$b:$resolv\n'

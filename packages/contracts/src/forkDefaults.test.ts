@@ -56,9 +56,11 @@ describe("fork setting defaults", () => {
 
   it("keeps every fork switch off by default but the read-only ones", () => {
     // Usage refresh reads usage; agent slots only observe by default (read only, never decide).
+    // The owner-questions page only changes which page Issues opens (the owner chose it on).
     expect(FORK_SETTING_DEFAULTS.filter((row) => !row.off).map(rowId)).toEqual([
       "server.agentSlots",
       "server.headlessUsageRefreshInterval",
+      "client.ownerQuestionsPage",
     ]);
   });
 });

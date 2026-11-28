@@ -1,0 +1,585 @@
+#!/usr/bin/python3 -IB
+"""Claude Code PreToolUse hook (Bash): refuse a command that waits on CI, a pull request or a background job by
+sleeping and checking again, or a `pkill -f` that kills its own shell. Part of fork-kit/agent-guards (README.md
+there: install, settings entry, the machine file's "agent-guards" section).
+
+Why: agents spent about 39% of their tool time in wait loops they wrote themselves (`for i in $(seq 1 40); do grep
+-q DONE "$F" && break; sleep 30; done`, `while ! gh pr checks 12; do sleep 60; done`, `sleep 300; gh run view`).
+Each loop overshoots the end by up to one sleep, it ends at the Bash timeout and is written again, and each new poll
+is a model turn that sends the whole context again. The host has wait tools that wake the agent instead.
+
+Refuses (a Bash call in the foreground) a loop that both checks such a state and sleeps, inside the same loop (its
+condition counts), when it waits long; or a check after long top-level sleeps:
+  a check   `gh run|pr|api|workflow|release ...`, curl/wget (to any URL: a GitHub one counts as a CI check), or a
+            look at a file or a process: ls, stat, find, pgrep, pidof, ps, kill -0, a file test (`[ -f x ]`,
+            `test -e`, `[[ -s x ]]`), and grep, rg, tail, head, cat, wc, jq when they do not read a pipe;
+  waits     a while or until loop with no counter waits without end when a round sleeps loopSleepSeconds (default
+            5) or more, and for a CI check with any sleep at all; a loop with rounds (`for x in a b c`, `$(seq 1
+            40)`, `{1..40}`, a counter test `[ $n -lt 3 ]` or `(( n < 3 ))`) when its sleeps add up to more than
+            maxSleepSeconds (default 120; a count it cannot read is one round); top-level sleeps over that, then a
+            check (`sleep 300; gh run view 1`);
+  or        `gh run watch`, `gh pr checks --watch`, and `watch -n N <check>` (a loop of N s rounds).
+Lets through: a retry loop (a command tried again after a sleep, with no check inside that loop, even when the same
+call reads a file before or after it), short waits (a loop of 1 s sleeps for a local server, a few rounds that stay
+under the limit), a sleep with no check after it, a counter test (`[ $n -lt 3 ]` is a bound, not a check), any
+command run in the background (`run_in_background`: the host wakes the agent when it ends), the Monitor tool (an
+until-condition there is the right way to wait for a file), and text that only names these (echo, a commit message,
+a heredoc into a file, a comment; a quoted "#1150" is no comment). Shell text handed on (`bash -c '..'`, `sh -c`,
+`sudo -u x bash -c`, `eval`, `bash <<EOF`, `cat <<EOF | bash`) is read the same way.
+Known gaps (misses, on purpose: a false refusal costs more): a count it cannot read (`$(seq 1 $N)`, `[ $n -lt $MAX
+]`, C-style `for ((..))`) is one round; a script file it does not open; a loop built with a function.
+Also refuses (foreground or background: F7, 107 calls in two weeks) a `pkill -f P`, `kill $(pgrep -f P)` or `pgrep -f
+P | xargs kill` whose pattern also matches this command's text: the host runs the command as `bash -c '<text>'`, so
+that shell's command line matches too, pkill spares only itself, and the shell dies (exit 143/144, nothing after it
+runs). Lets through -x, -A (--ignore-ancestors), -v, -F, no -f, and a pattern from a variable (not read: a gap).
+Settings (machine file, pollLoop): enabled (default true), maxSleepSeconds (120), loopSleepSeconds (5).
+Fail open: a broken settings part, a lib that cannot load, broken input or its own error lets the command run, with
+one line saying so. Exit 2 (refuse) only answers a wait it found. Tests: fork-kit/agent-guards/tests/poll-loop.test.py
+"""
+import json, math, os, re, shlex, sys
+
+NAME = 'poll-loop-guard'
+DEFAULTS = {'enabled': True, 'maxSleepSeconds': 120, 'loopSleepSeconds': 5}
+
+
+def _settings():
+    """(pollLoop settings, problem or None). A problem means the guard lets every call through (never blocks on a
+    broken config)."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        return config.load('pollLoop')
+    except BaseException as e:   # noqa: BLE001 - fail open
+        return dict(DEFAULTS), f'cannot load the kit\'s config code ({type(e).__name__}: {e})'
+
+
+OPS = ('&&', '||', ';;', '|&', '>>', '<<', ';', '&', '|', '(', ')', '<', '>', '\n')
+PUNCT = set('();<>|&\n')
+SEPARATORS = {'&&', '||', ';;', '|&', ';', '&', '|', '(', ')', '\n'}
+KEYWORDS = {'then', 'do', 'else', 'elif', 'if', '!', '{', '}', 'time'}
+# wrappers that run the command after them, with the options of theirs that take a value
+WRAPPERS = {'sudo': {'-u', '-g', '-C', '-D', '-h', '-p', '-r', '-t', '-U', '-T', '--user', '--group', '--host',
+                     '--prompt', '--chdir', '--role', '--type', '--other-user', '--command-timeout', '--close-from'},
+            'env': {'-u', '-C', '--unset', '--chdir'}, 'nice': {'-n', '--adjustment'},
+            'ionice': {'-c', '-n', '-p', '-P', '-u', '--class', '--classdata'}, 'stdbuf': {'-i', '-o', '-e'},
+            'timeout': {'-s', '-k', '--signal', '--kill-after'},
+            'nohup': set(), 'command': set(), 'builtin': set(), 'exec': {'-a'}, 'setsid': set(), 'heavy': set(),
+            'chronic': set(), 'unbuffer': set()}
+SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
+LOOKS = {'ls', 'stat', 'find', 'pgrep', 'pidof', 'ps'}            # always a look at a file or a process
+READERS = {'grep', 'egrep', 'fgrep', 'rg', 'tail', 'head', 'cat', 'wc', 'jq'}   # a look, unless they read a pipe
+TESTS = {'test', '[', '[['}
+FILE_TESTS = {'-e', '-f', '-s', '-d', '-p', '-r', '-w', '-x', '-L', '-h', '-S', '-b', '-c', '-N', '-O', '-G', '-nt',
+              '-ot', '-ef'}
+NUMBER_TESTS = {'-lt', '-le', '-gt', '-ge', '-eq', '-ne'}
+COUNTER_TESTS = {'-lt', '-le', '-gt', '-ge'}     # a counter; -eq/-ne test a status, never a bound
+GH_CHECKS = {'run', 'pr', 'api', 'workflow', 'release'}
+WATCH_FLAGS_WITH_VALUE = {'-n', '--interval', '-q', '--equexit', '-s', '--shell'}
+HEREDOC = re.compile(r'<<(-?)\s*(["\']?)([A-Za-z_][A-Za-z0-9_]*)\2')
+INTO_SHELL = re.compile(r'\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\b')
+COUNTER = re.compile(r'\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|[A-Za-z_][A-Za-z0-9_]*|-?\d+')
+DEPTH = 8
+# pkill/pgrep (procps): the options that take a value (short, then long without "=")
+KILL_SHORT_VALUE = set('gGPstuUFrqOd')
+KILL_LONG_VALUE = {'--signal', '--group', '--parent', '--pgroup', '--session', '--terminal', '--euid', '--uid',
+                   '--runstates', '--older', '--queue', '--ns', '--nslist', '--delimiter', '--cgroup', '--env',
+                   '--pidfile'}
+KILL_LONG_FLAG = {'--full': 'f', '--exact': 'x', '--ignore-ancestors': 'A', '--inverse': 'v', '--ignore-case': 'i'}
+SIGNALS = set('HUP INT QUIT ILL TRAP ABRT IOT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM STKFLT CHLD CONT STOP TSTP '
+              'TTIN TTOU URG XCPU XFSZ VTALRM PROF WINCH IO POLL PWR SYS'.split())
+POSIX_CLASSES = {'alpha': 'a-zA-Z', 'digit': '0-9', 'alnum': 'a-zA-Z0-9', 'upper': 'A-Z', 'lower': 'a-z',
+                 'space': r' \t\n\r\f\v', 'blank': r' \t', 'punct': r'!-/:-@\[-`{-~', 'xdigit': '0-9A-Fa-f',
+                 'word': r'\w', 'print': r' -~', 'graph': '!-~', 'cntrl': r'\x00-\x1f\x7f'}
+
+
+def kill_pattern(args):
+    """The -f pattern of a pkill/pgrep call that also matches the shell running it, as text, or None: no -f, no
+    pattern, a pattern from a variable, or -x/-A/-v/-F (these do not match their own shell the same way)."""
+    flags, pattern, args = set(), None, list(args)
+    if args and (args[0][1:].isdigit() or args[0][1:].upper().removeprefix('SIG') in SIGNALS) and args[0][:1] == '-':
+        args.pop(0)                                    # pkill -9 / -KILL / -SIGTERM
+    while args:
+        a = args.pop(0)
+        if a == '--':
+            pattern = pattern if pattern is not None else (args[0] if args else None)
+            break
+        if a.startswith('--'):
+            name = a.partition('=')[0]
+            flags.add(KILL_LONG_FLAG.get(name, ''))
+            if name == '--pidfile':
+                flags.add('F')
+            if name in KILL_LONG_VALUE and '=' not in a and args:
+                args.pop(0)
+        elif a.startswith('-') and len(a) > 1:
+            for k, c in enumerate(a[1:]):
+                flags.add(c)
+                if c in KILL_SHORT_VALUE:
+                    if k + 2 == len(a) and args:
+                        args.pop(0)
+                    break
+        elif pattern is None:
+            pattern = a
+    if 'f' not in flags or flags & {'x', 'A', 'v', 'F'} or not pattern or re.search(r'\$[\w{(@*#?!-]', pattern):
+        return None
+    return pattern, 'i' in flags
+
+
+def matches_own_shell(pattern, ignore_case, command):
+    """True when the ERE also matches the command line of the shell that runs this command: `bash -c '<text>'`
+    (the host hands the text to a shell; a quote in it may come out as '\\'')."""
+    import warnings
+    ere = re.sub(r'\[:(\w+):\]', lambda m: POSIX_CLASSES.get(m.group(1), m.group(0)), pattern)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            rx = re.compile(ere, re.S | (re.I if ignore_case else 0))
+    except (re.error, RecursionError, OverflowError):
+        return False                                    # a pattern we cannot read: not ours to judge
+    return any(rx.search(f'/bin/bash -c {text} ;') for text in (command, command.replace("'", "'\\''")))
+
+
+def strip_heredocs(text):
+    """The text without the bodies of heredocs that go to anything but a shell (a brief written to a file is text,
+    not commands); a heredoc into bash or sh (`bash <<EOF`, `cat <<EOF | bash`) keeps its body, read as commands."""
+    out, lines, i = [], text.split('\n'), 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for m in HEREDOC.finditer(line):
+            before = line[:m.start()].split()
+            if before and os.path.basename(before[-1]) in SHELLS or INTO_SHELL.search(line[m.end():]):
+                continue
+            tabs, delim = m.group(1), m.group(3)
+            while i < len(lines) and (lines[i].lstrip('\t') if tabs else lines[i]) != delim:
+                i += 1
+            i += 1
+    return '\n'.join(out)
+
+
+def strip_comments(text):
+    """The text without its shell comments: a # that starts a word, outside quotes, to the end of its line (a quoted
+    "#1150" is a word, not a comment)."""
+    out, i, n, quote, prev = [], 0, len(text), None, '\n'
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == '\\' and quote == '"' and i + 1 < n:
+                out.append(c + text[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c == '\\' and i + 1 < n:
+            out.append(c + text[i + 1])
+            prev = text[i + 1]
+            i += 2
+            continue
+        elif c in '\'"':
+            quote = c
+        elif c == '#' and prev in ' \t\n;&|()':
+            j = text.find('\n', i)
+            if j < 0:
+                break
+            i = j
+            continue
+        out.append(c)
+        prev = c
+        i += 1
+    return ''.join(out)
+
+
+def backticks(text):
+    """`cmd` as $(cmd), outside single quotes, so one reader handles both (an unquoted one splits into words)."""
+    out, quote, open_ = [], None, False
+    for k, c in enumerate(text):
+        if c == "'" and not open_ and quote != '"' and (k == 0 or text[k - 1] != '\\'):
+            quote = None if quote == "'" else "'"
+        elif c == '"' and quote != "'" and (k == 0 or text[k - 1] != '\\'):
+            quote = None if quote == '"' else '"'
+        elif c == '`' and quote != "'" and (k == 0 or text[k - 1] != '\\'):
+            out.append(')' if open_ else '$(')
+            open_ = not open_
+            continue
+        out.append(c)
+    return ''.join(out)
+
+
+def tokens(text):
+    lex = shlex.shlex(backticks(strip_comments(strip_heredocs(text))), posix=True, punctuation_chars='();<>|&\n')
+    lex.whitespace, lex.commenters, lex.whitespace_split = ' \t\r', '', True
+    out = []
+    for t in lex:
+        if t and set(t) <= PUNCT:
+            while t:
+                op = next(o for o in OPS + (t[0],) if t.startswith(o))
+                t = t[len(op):]
+                out.append(op)
+        else:
+            out.append(t)
+    return out
+
+
+def seconds(word, unknown):
+    if word == 'infinity':
+        return math.inf
+    m = re.fullmatch(r'(\d+(?:\.\d*)?|\.\d+)([smhd]?)', word)
+    if not m:
+        return unknown
+    return float(m.group(1)) * {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[m.group(2)]
+
+
+def rounds(words):
+    """The rounds of a for loop's list, or 1 when it cannot be counted."""
+    text = ' '.join(words)
+    m = re.fullmatch(r'\{(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?\}', text)
+    if m:
+        a, b, step = int(m.group(1)), int(m.group(2)), abs(int(m.group(3) or 1)) or 1
+        return abs(b - a) // step + 1
+    m = re.fullmatch(r'(?:\$ \( |`)seq (-?\d+)(?: (-?\d+))?(?: (-?\d+))?(?: \)|`)', text)
+    if m:
+        nums = [int(g) for g in m.groups() if g is not None]
+        a, step, b = (1, 1, nums[0]) if len(nums) == 1 else (nums[0], 1, nums[1]) if len(nums) == 2 else nums
+        return max(0, (b - a) // step + 1) if step else 1
+    if words and all(re.fullmatch(r'[A-Za-z0-9_.,:/+=@%-]+', w) for w in words):
+        return len(words)
+    return 1
+
+
+def frame(kind, n=1):
+    """One loop being read (or the top): its rounds, the sleep of one round, and the checks made inside it."""
+    return {'kind': kind, 'n': n, 'sleep': 0.0, 'ci': [], 'local': [], 'bound': None, 'cond': kind == 'while'}
+
+
+def substitutions(word):
+    """The command texts inside `$(...)` of one word (`"$(gh pr view 5 -q .state)"` is one word to the shell
+    reader, and its inside runs as commands; backticks are $(...) by then)."""
+    out, i = [], 0
+    while i < len(word):
+        if word.startswith('$(', i) and not word.startswith('$((', i):
+            depth, j = 1, i + 2
+            while j < len(word) and depth:
+                depth += {'(': 1, ')': -1}.get(word[j], 0)
+                j += 1
+            out.append(word[i + 2:j - 1] if not depth else word[i + 2:])
+            i = j
+        else:
+            i += 1
+    return out
+
+
+class Reading:
+    """What one command does. A wait is a loop that both sleeps and checks inside the same loop (its condition
+    counts), or a check after top-level sleeps. A check elsewhere in the command (an `ls` before a retry loop, a
+    `cat` of its log after it) does not make a retry loop a wait."""
+
+    def __init__(self, settings, text=''):
+        self.s = settings
+        self.text = text       # the whole command: the shell that runs it has this on its command line
+        self.found = []        # (what it checks, why it is a wait, 'ci' or 'local')
+        self.watch = []
+        self.kills = []        # the pkill/pgrep calls that also kill the shell running them
+        self.prev = None       # the command before this one (`pgrep -f x | xargs kill`)
+        self.into_kill = 0     # inside `kill $(...)`
+        self.top_slept = 0.0   # the plain sleeps at the top so far (not inside a loop)
+        self.stack = [frame('top')]
+
+    def read(self, text, depth=0):
+        if depth > DEPTH:
+            return
+        ts, base = tokens(text), len(self.stack)
+        i, at_cmd, piped = 0, True, False
+        while i < len(ts):
+            t = ts[i]
+            if t == '(' and i + 1 < len(ts) and ts[i + 1] == '(' and not (i and ts[i - 1].endswith('$')):
+                j = i + 2                      # (( n < 3 )): arithmetic; a comparison with a number bounds a loop
+                while j + 1 < len(ts) and not (ts[j] == ')' and ts[j + 1] == ')'):
+                    j += 1
+                inner = ts[i + 2:j]
+                if any(x in ('<', '>') for x in inner):
+                    self._bound([x.lstrip('=') for x in inner])
+                i, at_cmd, piped = j + 2, False, False
+                continue
+            if t in SEPARATORS:
+                at_cmd, piped = True, t in ('|', '|&')
+                i += 1
+                continue
+            if t in ('<', '>', '>>', '<<'):
+                i += 2
+                continue
+            if not at_cmd:
+                if t == '$' and i + 1 < len(ts) and ts[i + 1] == '(':
+                    at_cmd, piped = True, False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            word = os.path.basename(t) if '/' in t and not t.startswith('[') else t
+            if word == 'do' and self.stack[-1]['kind'] == 'while':
+                self.stack[-1]['cond'] = False         # the loop's own condition ends here
+            if word in KEYWORDS or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', t, re.S):
+                for inner in substitutions(t):         # p="$(gh pr checks 5)"
+                    self.read(inner, depth + 1)
+                i += 1
+                continue
+            if word == '$' and i + 1 < len(ts) and ts[i + 1] == '(':
+                i += 2
+                continue
+            if word in ('while', 'until'):
+                self.stack.append(frame('while', math.inf))
+                i += 1
+                continue
+            if word == 'for':
+                j = i + 1
+                while j < len(ts) and ts[j] not in ('in', 'do', ';', '\n'):
+                    j += 1
+                words = []
+                if j < len(ts) and ts[j] == 'in':
+                    j += 1
+                    while j < len(ts) and ts[j] not in (';', '\n', 'do'):
+                        words.append(ts[j])
+                        j += 1
+                self.stack.append(frame('for', rounds(words) if words else 1))
+                i = j
+                continue
+            if word == 'done' and len(self.stack) > base:
+                self._close()
+                i, at_cmd = i + 1, False
+                continue
+            args, j = [], i + 1
+            while j < len(ts) and ts[j] not in SEPARATORS:
+                args.append(ts[j])
+                j += 1
+            self._command(word, args, piped, depth)
+            i, at_cmd = j, False
+        while len(self.stack) > max(base, 1):
+            self._close()
+
+    def _in_loop(self):
+        return len(self.stack) > 1
+
+    def _sleep(self, amount):
+        if self._in_loop():
+            self.stack[-1]['sleep'] += amount
+        else:
+            self.top_slept += amount
+
+    def _check(self, kind, name):
+        if self._in_loop():
+            self.stack[-1][kind].append(name)
+        if self.top_slept > self.s['maxSleepSeconds']:
+            slept = 'without end' if math.isinf(self.top_slept) else f'{self.top_slept:g} s'
+            self.found.append((name, f'it sleeps {slept} first (more than {self.s["maxSleepSeconds"]} s), then '
+                                     'checks', kind))
+
+    def _bound(self, words):
+        """A counter test (`[ $n -lt 3 ]`, `(( n < 3 ))`) in a while/until loop's own condition (not its body: a
+        `[ "$p" -eq 0 ] && break` there is a status test) bounds that loop: its number is the rounds, one round when
+        it is not a plain number; a 0 is no bound (`[ $pending -gt 0 ]` waits for a count to drop)."""
+        f = self.stack[-1]
+        if f['kind'] != 'while' or not f['cond']:
+            return
+        nums = [abs(int(w)) for w in words if re.fullmatch(r'-?\d+', w)]
+        n = max(nums) if nums else 1
+        if n:
+            f['bound'] = max(f['bound'] or 0, n)
+
+    def _close(self):
+        f = self.stack.pop()
+        up = self.stack[-1]
+        n = f['bound'] if f['kind'] == 'while' and f['bound'] is not None else f['n']
+        checks = sorted(set(f['ci'] + f['local']))
+        kind = 'ci' if f['ci'] else 'local'
+        if checks and f['sleep'] > 0:
+            if math.isinf(n):
+                if f['sleep'] >= self.s['loopSleepSeconds'] or f['ci']:
+                    self.found.append((', '.join(checks), f'it loops with no end, sleeping {f["sleep"]:g} s a round',
+                                       kind))
+            elif f['sleep'] * n > self.s['maxSleepSeconds']:
+                total = 'without end' if math.isinf(f['sleep']) else f'{f["sleep"] * n:g} s'
+                self.found.append((', '.join(checks), f'its sleeps add up to {total} (more than '
+                                                      f'{self.s["maxSleepSeconds"]} s)', kind))
+        if len(self.stack) > 1:
+            up['sleep'] += f['sleep'] * n if f['sleep'] else 0
+        up['ci'] += f['ci']
+        up['local'] += f['local']
+
+    def _self_kill(self, word, args, tail=''):
+        found = kill_pattern(args)
+        if found and matches_own_shell(*found, self.text):
+            self.kills.append((f'{word} -f {shlex.quote(found[0])}{tail}', found[0]))
+
+    def _command(self, word, args, piped, depth):
+        """Notes the sleep and the checks of one simple command, and reads text it hands to a shell."""
+        while word in WRAPPERS:
+            takes = WRAPPERS[word]
+            while args and (args[0].startswith('-') or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', args[0], re.S)):
+                a = args.pop(0)
+                if a == '--':
+                    break
+                if a in takes and args:
+                    args.pop(0)
+            if word == 'timeout' and args:
+                args = args[1:]                # its duration
+            if not args:
+                return
+            word, args = os.path.basename(args[0]), args[1:]
+        prev, kills = self.prev, word == 'kill' and not {'-0', '-s0', '--signal=0'} & set(args)
+        if word not in SHELLS and word not in ('eval', 'watch'):
+            self.into_kill += kills                # kill $(pgrep -f x): that pgrep feeds a kill
+            for a in args:                         # [ "$(gh pr view 5 -q .state)" = OPEN ]: its inside runs too
+                if '$(' in a:
+                    for inner in substitutions(a):
+                        self.read(inner, depth + 1)
+            self.into_kill -= kills
+        self.prev = (word, args)
+        fed = prev and prev[0] == 'kill' and prev[1][-1:] == ['$'] and not {'-0', '-s0'} & set(prev[1])
+        if word == 'pkill' or (word == 'pgrep' and (self.into_kill or fed)):   # kill "$(pgrep ..)" / kill $(pgrep ..)
+            self._self_kill(word, args)
+        elif word == 'xargs' and piped and prev and prev[0] == 'pgrep' and \
+                any(os.path.basename(a) == 'kill' for a in args) and '-0' not in args:
+            self._self_kill('pgrep', prev[1], ' | xargs kill')
+        if word == 'sleep':
+            self._sleep(sum(seconds(a, self.s['loopSleepSeconds']) for a in args if not a.startswith('-')) or 0)
+        elif word in SHELLS:
+            for k, a in enumerate(args):
+                if re.fullmatch(r'-[a-z]*c[a-z]*', a) and k + 1 < len(args):
+                    self.read(args[k + 1], depth + 1)
+                    break
+        elif word == 'eval':
+            self.read(' '.join(args), depth + 1)
+        elif word == 'watch':              # `watch -n 60 gh pr checks 1`: a loop with its interval as the sleep
+            interval = 2.0
+            while args and args[0].startswith('-'):
+                a = args.pop(0)
+                if a in ('-n', '--interval') and args:
+                    interval = seconds(args.pop(0), interval)
+                elif a.startswith('--interval='):
+                    interval = seconds(a.partition('=')[2], interval)
+                elif re.fullmatch(r'-n\d+(?:\.\d*)?', a):
+                    interval = seconds(a[2:], interval)
+                elif a in WATCH_FLAGS_WITH_VALUE and args:
+                    args.pop(0)
+            if args:
+                self.stack.append(frame('while', math.inf))
+                self._sleep(interval)
+                self.read(' '.join(shlex.quote(a) if len(args) > 1 else a for a in args), depth + 1)
+                self._close()
+        elif word == 'gh':
+            sub = [a for a in args if not a.startswith('-')]
+            if sub and sub[0] in GH_CHECKS:
+                if sub[:2] == ['run', 'watch'] or (sub[:2] == ['pr', 'checks'] and
+                                                   any(a == '--watch' or a.startswith('--watch=') for a in args)):
+                    self.watch.append('gh ' + ' '.join(sub[:2]))
+                self._check('ci', 'gh ' + ' '.join(sub[:2]))
+        elif word in ('curl', 'wget'):
+            self._check('ci' if any('github.com' in a for a in args) else 'local', word)
+        elif word == 'kill':
+            if '-0' in args:
+                self._check('local', 'kill -0')
+        elif word in TESTS:
+            if any(a in FILE_TESTS for a in args):
+                self._check('local', word)
+            elif any(a in COUNTER_TESTS for a in args):
+                k = next(k for k, a in enumerate(args) if a in COUNTER_TESTS)
+                if k and k + 1 < len(args) and COUNTER.fullmatch(args[k - 1]) and COUNTER.fullmatch(args[k + 1]):
+                    self._bound([args[k - 1], args[k + 1]])
+        elif word in LOOKS or (word in READERS and not piped):
+            self._check('local', word)
+
+
+def verdict(command, settings, background=False):
+    """None, or (what it checks, why it counts as a wait, 'ci' or 'local'), or (the call, its pattern, 'kill') for a
+    pkill/pgrep that kills its own shell. A background command is only checked for that (the host wakes the agent
+    when it ends, so a wait there is fine; a self-kill is not)."""
+    r = Reading(settings, command)
+    r.read(command)
+    if r.kills:
+        return r.kills[0][0], r.kills[0][1], 'kill'
+    if background:
+        return None
+    if r.watch:
+        return ', '.join(sorted(set(r.watch))), 'it waits for CI to finish', 'ci'
+    if not r.found:
+        return None
+    return next((f for f in r.found if f[2] == 'ci'), r.found[0])
+
+
+def reason(what, why, kind, settings):
+    if kind == 'kill':
+        return (f'Refused by {NAME}: `{what}` also matches the shell that runs this command (its command line holds '
+                'this text), so it kills that shell: exit 143/144 and nothing after it runs. Make the pattern miss its '
+                "own text: bracket one letter (`pkill -f '[v]itest run'`, and don't name the process elsewhere in "
+                'the same command), or kill by PID (`kill "$(cat run.pid)"`). Not refused: -x, -A '
+                '(--ignore-ancestors), -F, or a pattern from a variable.')
+    way = ('To wait for CI or a pull request: push and stop (or watch_pull_request); you are told when it ends.'
+           if kind == 'ci' else
+           'To wait for a job, a file or a process: run the job with run_in_background and wait with '
+           't3_background_wait, or use Monitor with an until-condition; you are woken when it ends.')
+    return (f'Refused by {NAME}: this command waits by sleeping and checking again ({what}; {why}). Each new check '
+            f'is a model turn that sends the whole context again, and the loop overshoots the end. {way} Not '
+            'refused: a retry loop (a command tried again after a sleep, with no status check inside the loop), '
+            f'and short waits (under {settings["maxSleepSeconds"]} s of sleep in all, or under '
+            f'{settings["loopSleepSeconds"]} s a round in a local loop).')
+
+
+def _first(text, event):
+    """True when this session has not had this notice yet (the kit's lib; a lib that cannot load: always)."""
+    try:
+        from agent_guards import config
+        return config.first_notice(text, event)
+    except BaseException:   # noqa: BLE001
+        return True
+
+
+def _problem_out(problem, event):
+    text = (f'{NAME}: the machine file\'s "agent-guards" section cannot be used as written ({problem}); built-in '
+            f'defaults used for that part, and {NAME} lets every command through until it is fixed. Tell the owner; '
+            '`agent-guards self-check` names every problem.')
+    try:
+        sys.stderr.write(text + '\n')
+    except Exception:  # noqa: BLE001
+        pass
+    if not _first(text, event):
+        return
+    out = {'systemMessage': text}
+    if isinstance(event, dict) and event.get('hook_event_name') == 'PreToolUse':
+        out['hookSpecificOutput'] = {'hookEventName': 'PreToolUse', 'additionalContext': text}
+    print(json.dumps(out))
+
+
+def main(argv=None):
+    """Exit 2 with the reason on stderr refuses; 0 lets the command run; 1 (this guard failed) lets it run, loudly."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv:
+        sys.stderr.write(f'usage: {NAME} (hook: PreToolUse JSON on stdin; its settings entry: `agent-guards hooks`)\n')
+        return 1
+    event = None
+    try:
+        settings, problem = _settings()
+        event = json.loads(sys.stdin.read())
+        if problem:
+            _problem_out(problem, event)
+            return 0
+        if not settings['enabled'] or not isinstance(event, dict) or event.get('tool_name') != 'Bash':
+            return 0
+        ti = event.get('tool_input') or {}
+        command = ti.get('command')
+        if not isinstance(command, str):
+            return 0
+        try:
+            found = verdict(command, settings, ti.get('run_in_background') is True)
+        except ValueError:   # text a shell reader cannot split (an open quote): not ours to judge
+            return 0
+    except BaseException as e:   # noqa: BLE001 - fail open: this guards a habit, not an attack
+        sys.stderr.write(f'{NAME}: failed ({type(e).__name__}: {e}); the command is NOT checked and runs. '
+                         'Tell the owner if this repeats.\n')
+        return 1
+    if not found:
+        return 0
+    sys.stderr.write(reason(*found, settings) + '\n')
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

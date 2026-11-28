@@ -1,0 +1,5 @@
+- Change: A local, read-only "is T3 busy?" answer: `GET /api/fork/activity` on loopback, and `t3 __fork-report --base-dir <home> --activity`, which asks it and exits 0 only when nothing is working.
+- Why: A host quiet check reads T3's own turns and approvals instead of guessing from processes.
+- Setting: `server.activityProbe`
+- Default: off
+- PR: [#547](https://github.com/scuttletoby/t3code/pull/547)

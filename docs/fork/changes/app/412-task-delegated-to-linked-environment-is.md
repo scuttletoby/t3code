@@ -1,0 +1,5 @@
+- Change: A task delegated to a linked environment is still followed if the delegating call is cut off, and still delivers its reply when that environment runs another T3 version.
+- Why: Its parent was never told: the task stayed running here and its result never arrived.
+- Setting: none
+- Default: always
+- PR: [#412](https://github.com/scuttletoby/t3code/pull/412), [#540](https://github.com/scuttletoby/t3code/pull/540)

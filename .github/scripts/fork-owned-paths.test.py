@@ -3,12 +3,14 @@ how .github/workflows/fork-tests.yml uses them.
 
   script    the real script, run as the `changes` job runs it, in throw-away repositories with GitHub's merge commit:
             only a pull request whose every changed path is fork-owned prints fork_only=true and upstream's gates,
-            all false; a mixed change, a change to the list, the script, a workflow or a package file, a push, no
-            merge commit, an empty change and a broken list all print fork_only=false.
+            all false; a partly fork-owned change prints upstream's gates for its other paths alone (an unknown
+            one still runs every job); a change to the list, the script, a workflow or a package file, a push, no
+            merge commit, an empty change and a broken list all print fork_only=false and no gates.
   list      the real list: what it owns and what it must never own.
   workflow  fork-tests.yml: the step runs only on a pull request and not in a release run, every gate of `changes`
             takes its answer first, every app job's if: (evaluated as GitHub does) skips on a fork-only pull request
-            and runs on any other run, and no file an app job names is fork-owned.
+            and runs on any other run, a partly fork-owned pull request runs exactly the app jobs its other paths
+            need (path X runs job Y), and no file an app job names is fork-owned.
   result    fork_ci_result's own script, run as Actions runs it: a fork-only run passes with the app jobs skipped;
             a skip the gates do not explain still fails.
 
@@ -106,11 +108,23 @@ def run_script(change, event="pull_request", merge=True, base_files=None, list_t
         r = subprocess.run(["node", str(SCRIPT)], cwd=repo, env=env, capture_output=True, text=True)
         if r.returncode:
             return [f"exit {r.returncode}"], r.stderr
-        return r.stdout.split(), r.stderr
+        return r.stdout.splitlines(), r.stderr
 
 
 def fork_only(out):
     return out[0] == "fork_only=true"
+
+
+def gates_of(out):
+    return dict(line.split("=", 1) for line in out[1:])
+
+
+def runs_everything(out):
+    """No fork-only switch, and either no gates (the detector's own answer stands) or every app gate true."""
+    g = gates_of(out)
+    return out[0] == "fork_only=false" and (not g or (
+        list(g) == UPSTREAM_GATES and g["test_packages"] == ""
+        and all(g[k] == "true" for k in UPSTREAM_GATES if k not in ("test_packages", "mobile_native"))))
 
 
 out, err = run_script({"fork-ci/actions/x/x.py": "1\n", "fork-kit/desk/README.md": "y\n",
@@ -125,7 +139,6 @@ out, _ = run_script({"fork-ci/x.py": "1\n"}, base_files={"fork-ci/old name.py": 
 check("script: a fork-only change with a space in a path is fork-only", fork_only(out), str(out))
 
 for label, change, base in [
-    ("a mixed change (fork-ci/ and apps/web)", {"fork-ci/x.py": "1\n", "apps/web/src/a.ts": "1\n"}, None),
     ("a change to the list itself", {"fork-ci/x.py": "1\n", ".github/fork-owned-paths.txt": "fork-ci/\napps/\n"}, None),
     ("a change to the script", {".github/scripts/fork-owned-paths.cjs": "x\n"}, None),
     ("a change to fork-tests.yml", {".github/workflows/fork-tests.yml": "x\n"}, None),
@@ -140,13 +153,63 @@ for label, change, base in [
     ("a change to the gate's lens corpus", {"fork-ci/actions/pr-queue/testdata/lens-corpus.jsonl": "{}\n"}, None),
     ("a package.json inside fork-kit", {"fork-kit/x/package.json": "{}\n"}, None),
     ("a lock file", {"pnpm-lock.yaml": "x\n"}, None),
-    ("a file moved out of fork-ci/", {"fork-ci/a.ts": None, "packages/shared/src/a.ts": "a\n"}, {"fork-ci/a.ts": "a\n"}),
-    ("a file moved into fork-ci/ (an app file deleted)", {"apps/web/src/a.ts": None, "fork-ci/a.ts": "a\n"}, {"apps/web/src/a.ts": "a\n"}),
     ("a path deeper than a `*` (fork-*/x)", {".github/scripts/fork-x/y.py": "1\n"}, None),
     ("an empty change", {}, None),
 ]:
     out, err = run_script(change, base_files=base)
-    check(f"script: {label} runs every job (fork_only=false)", out == ["fork_only=false"], f"{out} {err}")
+    check(f"script: {label} runs every job (fork_only=false)", runs_everything(out), f"{out} {err}")
+    if not any(owned(list(change)).values()):
+        check(f"script: ... and, with no fork-owned path in it, prints no gates", out == ["fork_only=false"], f"{out}")
+
+# A partly fork-owned change: upstream's detector judges the other paths alone (each row: the change, then the gates
+# that must be true, then the ones that must be false). A path the detector does not know still runs every job.
+SERVER = {"fork-ci/actions/x/x.py": "1\n", ".github/fork-seams.json": "{}\n", "fork-kit/heavy/README.md": "x\n",
+          "apps/server/src/fork/a.ts": "1\n"}
+for label, change, on, off, *base in [
+    # A move lists the old and the new path (--no-renames): the app side still decides.
+    ("a file moved out of fork-ci/ into packages/shared", {"fork-ci/a.ts": None, "packages/shared/src/a.ts": "a\n"},
+     {"typecheck", "build", "test", "test_web", "test_server"}, {"rust"}, {"fork-ci/a.ts": "a\n"}),
+    ("a file moved into fork-ci/ (an apps/web file deleted)", {"apps/web/src/a.ts": None, "fork-ci/a.ts": "a\n"},
+     {"typecheck", "build", "test_web"}, {"rust"}, {"apps/web/src/a.ts": "a\n"}),
+    ("fork-ci/, fork-kit/, .github/fork-* and apps/server/src/fork/", SERVER,
+     {"typecheck", "build", "test", "test_server"}, {"test_web", "rust", "release_smoke", "desktop_launch", "mobile_native"}),
+    ("FORK_CHANGES.md, docs/ and apps/server", {"FORK_CHANGES.md": "x\n", "docs/fork/a.md": "x\n",
+                                                 ".github/fork-ci-tests.txt": "x\n", "apps/server/src/fork/a.ts": "1\n"},
+     {"typecheck", "build", "test_server"}, {"test_web", "rust", "release_smoke"}),
+    ("fork-ci/ and apps/web", {"fork-ci/x.py": "1\n", "apps/web/src/a.ts": "1\n"},
+     {"typecheck", "build", "test_web"}, {"test_server", "rust", "release_smoke", "mobile_native"}),
+    ("fork-kit/ and a Rust crate", {"fork-kit/heavy/README.md": "x\n", "native/resource-monitor/src/lib.rs": "x\n"},
+     {"rust", "test", "release_smoke"}, {"test_web", "test_server", "mobile_native"}),
+    ("fork-ci/ and a native mobile source", {"fork-ci/x.py": "1\n", "apps/mobile/ios/A.swift": "x\n"},
+     {"mobile_native"}, {"rust", "test_server"}),
+    ("fork-ci/ and only docs (upstream's inert paths)", {"fork-ci/x.py": "1\n", "docs/a.md": "x\n"},
+     set(), {"typecheck", "build", "test", "test_web", "test_server", "rust", "release_smoke", "mobile_native"}),
+]:
+    out, err = run_script(change, base_files=base[0] if base else None)
+    g = gates_of(out)
+    check(f"script: partly fork-owned ({label}) prints upstream's gates for the other paths",
+          out[0] == "fork_only=false" and list(g) == UPSTREAM_GATES
+          and all(g[k] == "true" for k in on) and all(g[k] == "false" for k in off), f"{out} {err}")
+    check(f"script: ... and says in the log which paths it left out", "Partly fork-owned" in err, err[-300:])
+out, _ = run_script(SERVER)
+check("script: partly fork-owned with apps/server tests only the packages the server change reaches",
+      gates_of(out).get("test_packages") not in ("", None), str(out))
+for label, extra in [("a path no package owns", {"newtopdir/a.txt": "x\n"}),
+                     ("a package.json", {"apps/web/package.json": "{}\n"}),
+                     ("fork-tests.yml", {".github/workflows/fork-tests.yml": "x\n"}),
+                     ("the review vectors the server test reads", {"fork-ci/actions/pr-queue/review.vectors.json": "{}\n"}),
+                     ("the runner routing (fork-fleet.py)", {".github/scripts/fork-fleet.py": "x\n"})]:
+    out, err = run_script({"fork-ci/x.py": "1\n", "fork-kit/heavy/README.md": "x\n", **extra})
+    check(f"script: partly fork-owned with {label} still runs every job", runs_everything(out), f"{out} {err}")
+
+# Fail closed: a workspace the detector cannot read keeps the detector's answer (no gates), never all false.
+r = subprocess.run(["node", "-e", "const m = require(process.argv[1]);"
+                    "for (const pk of [[], null]) { try { m.narrowedOutputs(['apps/web/src/a.ts'], pk ?? undefined);"
+                    " console.log('printed') } catch (e) { console.log('threw') } }"
+                    "try { m.narrowedOutputs([], [{ name: 'a', dir: 'a', hasTest: true, deps: [] }]); console.log('printed') }"
+                    " catch (e) { console.log('threw') }", str(SCRIPT)], capture_output=True, text=True)
+check("script: narrowing refuses an empty workspace and an empty path list (the caller then prints no gates)",
+      r.stdout.split()[0::2] == ["threw", "threw"] and r.stdout.split()[1] == "printed", r.stdout + r.stderr)
 
 out, err = run_script({"fork-ci/x.py": "1\n"}, event="push")
 check("script: a push to main with only fork-ci/ changes runs every job", out == ["fork_only=false"], f"{out} {err}")
@@ -166,11 +229,12 @@ with tempfile.TemporaryDirectory(prefix="fork-owned-paths-") as tmp:
 REAL = owned([
     "fork-ci/actions/pr-queue/pr_queue.py", "fork-kit/heavy/heavy", ".github/scripts/fork-fleet-walls.py",
     ".github/scripts/fork-fleet-walls/linux", ".github/scripts/fork_workflow_expr.py", ".github/fork-ci-tests.txt",
-    ".gitleaks.toml", "FORK_CHANGES.md",
+    ".gitleaks.toml", "FORK_CHANGES.md", "docs/fork/changes/app/1-a-change.md",
     # never
     ".github/fork-owned-paths.txt", ".github/scripts/fork-owned-paths.cjs", ".github/workflows/fork-tests.yml",
     ".github/workflows/fork-checks.yml", ".github/actions/ci-changes/action.yml", ".github/scripts/ci-changes.cjs",
     ".github/scripts/fork-fleet.py", ".github/scripts/fork-test-shards.cjs", ".github/scripts/fork-vitest-gc-check.cjs",
+    ".github/fork-test-seconds.json",
     ".github/fork-fleet.json", "fork-ci/package.json", "fork-kit/x/tsconfig.json", "package.json", "apps/web/src/a.ts",
     "docs/fork/README.md", "scripts/release-smoke.ts", "fork-ci", "fork-cix/a",
     "fork-ci/actions/pr-queue/review.vectors.json", "fork-ci/actions/pr-queue/testdata/lens-corpus.jsonl",
@@ -178,7 +242,7 @@ REAL = owned([
 want_owned = {p for p in REAL if p.startswith(("fork-ci/actions", "fork-kit/heavy")) and "/review.vectors" not in p
               and "/testdata/lens-corpus" not in p or p in {
     ".github/scripts/fork-fleet-walls.py", ".github/scripts/fork-fleet-walls/linux", ".github/scripts/fork_workflow_expr.py",
-    ".github/fork-ci-tests.txt", ".gitleaks.toml", "FORK_CHANGES.md"}}
+    ".github/fork-ci-tests.txt", ".gitleaks.toml", "FORK_CHANGES.md", "docs/fork/changes/app/1-a-change.md"}}
 check("list: the fork's own folders and scripts are fork-owned; the rest, and every NEVER path, are not",
       {p for p, v in REAL.items() if v} == want_owned, json.dumps({p: v for p, v in REAL.items() if v != (p in want_owned)}))
 check("list: NEVER wins over a line that owns everything under .github/",
@@ -197,13 +261,21 @@ changes = jobs["changes"]
 steps = {s.get("id"): s for s in changes["steps"] if s.get("id")}
 step = steps.get("fork_only", {})
 order = [s.get("id") for s in changes["steps"]]
-check("workflow: `changes` has the fork_only step, after the detector and before the routing",
-      "fork_only" in order and order.index("detect") < order.index("fork_only") < order.index("route"), str(order))
+check("workflow: `changes` has the fork_only step, after the detector and before the macOS lint rule and the routing",
+      "fork_only" in order and order.index("detect") < order.index("fork_only") < order.index("fork") < order.index("route"),
+      str(order))
 check("workflow: the step runs the script into the job's outputs",
       step.get("run", "").strip() == 'node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT"', step.get("run"))
 sparse = changes["steps"][0]["with"]["sparse-checkout"].split()
 check("workflow: `changes` checks out the list and the script",
       {"/.github/fork-owned-paths.txt", "/.github/scripts/fork-owned-paths.cjs", "/.github/scripts/ci-changes.cjs"} <= set(sparse))
+# The script reads the workspace (pnpm-workspace.yaml and each package's package.json) to narrow a partly fork-owned
+# change, here and in this test, which runs in the `workflows` job: both checkouts must hold those files.
+WORKSPACE = {"/pnpm-workspace.yaml", "/*/package.json", "/*/*/package.json"}
+check("workflow: `changes` checks out the workspace the script narrows with", WORKSPACE <= set(sparse), str(sparse))
+tests_sparse = jobs["workflows"]["steps"][0]["with"]["sparse-checkout"].split()
+check("workflow: `workflows`, which runs this test, checks out that workspace too", WORKSPACE <= set(tests_sparse),
+      str(sorted(WORKSPACE - set(tests_sparse))))
 
 
 def ctx(event, release=False, fork_only_out=None, detect=None, status="success", base="main"):
@@ -214,7 +286,25 @@ def ctx(event, release=False, fork_only_out=None, detect=None, status="success",
             "inputs": {"ref": "abc" if release else ""}, "status": status,
             "steps": {"fork_only": {"outputs": fork_only_out or {}}, "detect": {"outputs": detect or {}},
                       "release": {"outputs": {g: "true" for g in UPSTREAM_GATES} if release else {}},
-                      "fork": {"outputs": {"mobile_native": (detect or {}).get("mobile_native", "")}}}}
+                      "fork": {"outputs": {"mobile_native": fork_step(fork_only_out, detect) if not release else ""}}}}
+
+
+def fork_step(fork_only_out, detect, changed=""):
+    """The `fork` step (the macOS lint rule) run as Actions runs it: its env as `changes` evaluates it, `changed`
+    as the detector's list of changed paths. Returns its mobile_native output."""
+    step = steps["fork"]
+    m = re.fullmatch(r"\$\{\{ steps\.(\w+)\.outputs\.mobile_native \|\| steps\.(\w+)\.outputs\.mobile_native \}\}",
+                     step["env"]["DETECTED"])
+    if not m:
+        raise AssertionError(f"the fork step's DETECTED is not `a || b`: {step['env']['DETECTED']}")
+    pick = {"fork_only": fork_only_out or {}, "detect": detect or {}}
+    detected = pick[m.group(1)].get("mobile_native") or pick[m.group(2)].get("mobile_native") or ""
+    with tempfile.TemporaryDirectory(prefix="fork-owned-paths-fork-") as tmp:
+        pathlib.Path(tmp, "changed-paths").write_text(changed)
+        out = pathlib.Path(tmp, "out")
+        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]], check=True,
+                       env={"PATH": os.environ["PATH"], "DETECTED": detected, "RUNNER_TEMP": tmp, "GITHUB_OUTPUT": str(out)})
+        return dict(l.split("=", 1) for l in out.read_text().split())["mobile_native"]
 
 
 cond = step.get("if", "")
@@ -264,8 +354,26 @@ release = outputs(ctx("workflow_call", release=True, detect={}))
 check("workflow: a release run keeps every gate true", all(release.get(g) == "true" for g in UPSTREAM_GATES if g != "test_packages"),
       json.dumps(release))
 route_gates = steps.get("route", {}).get("env", {}).get("GATES", "")
-check("workflow: the runner routing gets the fork-only gates on a fork-only pull request",
-      "steps.fork_only.outputs.fork_only == 'true' && toJSON(steps.fork_only.outputs)" in route_gates, route_gates)
+check("workflow: the runner routing gets the fork_only step's gates whenever it printed them",
+      route_gates == "${{ steps.fork_only.outputs.typecheck && toJSON(steps.fork_only.outputs) || toJSON(steps.detect.outputs) }}",
+      route_gates)
+check("workflow: ... which it does exactly when it prints typecheck (with every other gate)",
+      "typecheck" in UPSTREAM_GATES and runs_everything(["fork_only=false"]), route_gates)
+
+# A partly fork-owned pull request: the script's gates for the other paths win over the detector's (all true here, as
+# the fork-owned paths made it run everything).
+NARROW_SERVER = {"fork_only": "false", "typecheck": "true", "build": "true", "desktop_launch": "false", "test": "true",
+                 "test_packages": "@t3tools/evals @t3tools/scripts", "test_web": "false", "test_server": "true",
+                 "rust": "false", "release_smoke": "false", "mobile_native": "false"}
+DETECT_ALL_MOBILE_OFF = {**DETECT_ALL, "mobile_native": "false"}
+narrow = outputs(ctx("pull_request", fork_only_out=NARROW_SERVER, detect=DETECT_ALL_MOBILE_OFF))
+check("workflow: on a partly fork-owned pull request the script's gates stand over the detector's",
+      all(narrow.get(g) == NARROW_SERVER[g] for g in UPSTREAM_GATES), json.dumps(narrow))
+check("workflow: the macOS lint rule still adds fork-tests.yml on top of the script's gates",
+      fork_step(NARROW_SERVER, DETECT_ALL_MOBILE_OFF, ".github/workflows/fork-tests.yml\nfork-ci/x.py\n") == "true"
+      and fork_step(NARROW_SERVER, DETECT_ALL_MOBILE_OFF, "fork-ci/x.py\n") == "false"
+      and fork_step({"fork_only": "false"}, {**DETECT_ALL, "mobile_native": "true"}, "apps/mobile/a.swift\n") == "true"
+      and fork_step({}, {}, "") == "", "fork step")
 
 # Jobs that run on a fork-only pull request: they test the fork's own files (Lint too: `vp check` formats and lints
 # every file, the fork's included, and knip reads .github/**/*.cjs; fork_checks_ran checks that fork-checks.yml ran).
@@ -290,7 +398,23 @@ ran_on_fork_only = [j for j in app_jobs if job_if(j, fo)]
 check("workflow: on a fork-only pull request every app job is skipped by its if:", not ran_on_fork_only,
       ", ".join(ran_on_fork_only))
 skipped_mixed = [j for j in app_jobs if not job_if(j, mixed)]
-check("workflow: on a mixed pull request every app job runs", not skipped_mixed, ", ".join(skipped_mixed))
+check("workflow: on a pull request the script prints no gates for, every app job runs", not skipped_mixed,
+      ", ".join(skipped_mixed))
+ran_narrow = sorted(j for j in app_jobs if job_if(j, {**narrow, "mobile_native": "false"}))
+check("workflow: a partly fork-owned server change runs Build, Test and Test Server, and skips Test Web, Rust, "
+      "Release Smoke and the macOS lint", ran_narrow == ["build", "test", "test_server"], ", ".join(ran_narrow))
+web_only = {**NARROW_SERVER, "test_web": "true", "test_server": "false", "test_packages": "@t3tools/scripts"}
+ran_web = sorted(j for j in app_jobs if job_if(j, web_only))
+check("workflow: a change the server does not depend on skips all eight Test Server shards at the job level",
+      "test_server" not in ran_web and "test_web" in ran_web, ", ".join(ran_web))
+ran_blank = [j for j in app_jobs if not job_if(j, {})]
+check("workflow: with no gate outputs at all (a broken `changes`), every app job's if: still runs it",
+      not ran_blank, ", ".join(ran_blank))
+ts_steps = jobs["test_server"]["steps"]
+check("workflow: Test Server's steps no longer re-run the detector (its job gate decides)",
+      not any("ci-changes" in str(st.get("uses", "")) for st in ts_steps)
+      and not any("steps.changes" in str(st.get("if", "")) for st in ts_steps),
+      ", ".join(str(st.get("if")) for st in ts_steps if st.get("if")))
 main_push = {**DETECT_ALL, "fork_only": "false"}
 skipped_push = [j for j in app_jobs if not job_if(j, main_push, event="push")]
 check("workflow: on a push to main every app job runs", not skipped_push, ", ".join(skipped_push))
@@ -341,6 +465,15 @@ code, text = result_run(mixed, set())
 check("result: a run with every job passed passes", code == 0 and "Fork-only" not in text, text[-300:])
 code, text = result_run(mixed, set(app_jobs))
 check("result: the app jobs skipped on a run that is not fork-only fails", code != 0, text[-300:])
+narrow_skipped = set(app_jobs) - {"build", "test", "test_server"}
+code, text = result_run(NARROW_SERVER, narrow_skipped)
+check("result: a partly fork-owned run with the app jobs its gates skip skipped passes, each with its reason",
+      code == 0 and "no reason: fails" not in text and "Fork-only" not in text, text[-600:])
+code, text = result_run(NARROW_SERVER, narrow_skipped | {"test_server"})
+check("result: ... but Test Server skipped while its gate is true fails", code != 0, text[-300:])
+code, text = result_run({**NARROW_SERVER, "test_server": "false"}, narrow_skipped | {"test_server"})
+check("result: Test Server skipped by its job gate passes, with its reason",
+      code == 0 and "affects nothing t3" in text, text[-600:])
 
 print(f"\n{len(failures)} failed" if failures else f"\nall passed: {len(oks)} ok, 0 skipped")
 sys.exit(1 if failures else 0)

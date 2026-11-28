@@ -1,6 +1,7 @@
 # Fork only: THE list of fork-owned paths, one pattern per line. A pull request whose every changed path is
 # fork-owned skips Fork tests' app jobs (Build, Test, Test Web, Test Server, Rust, Release Smoke, macOS lint):
-# none of them reads these files. Read by .github/scripts/fork-owned-paths.cjs (the `changes` job) and its test.
+# none of them reads these files. A pull request that also changes other paths gets upstream's detector's answer for
+# those other paths only (fork-owned ones left out), so it runs just the app jobs they affect. Read by .github/scripts/fork-owned-paths.cjs (the `changes` job) and its test.
 #
 #   folder/       everything under the folder
 #   a/fork-*.py   one file; `*` matches any characters but `/`
@@ -30,12 +31,15 @@ fork-kit/
 !.github/scripts/fork-fleet.py
 !.github/scripts/fork-ci-pressure.py
 !.github/scripts/fork-test-shards.cjs
+!.github/fork-test-seconds.json
 !.github/scripts/fork-vitest-gc-check.cjs
 !.github/fork-fleet.json
 !.github/fork-upstream-mobile-eas-preview-fork.yml
 
-# The fork's changes list; fork-changes-list.test.cjs (the `workflows` job) checks it against forkDefaults.ts.
+# The fork's changes list (the entry page and one file per change); fork-changes-list.test.cjs (the `workflows`
+# job) checks it against forkDefaults.ts.
 FORK_CHANGES.md
+docs/fork/changes/
 
 # The secret scan's settings; the `secrets` job runs on every pull request.
 .gitleaks.toml

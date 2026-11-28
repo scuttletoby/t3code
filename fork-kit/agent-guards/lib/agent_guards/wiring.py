@@ -11,7 +11,9 @@ first checks that the hook file is there, so a missing hook fails the way its ki
   capacity-pipe-guard,   fail OPEN: exit 1, which Claude Code shows as a hook error and then runs the call. These
   memory-index-guard,    guard mistakes, not attacks; refusing every call because a helper is gone would stop all
   bg-guard, agent-slots, work on the machine.
-  facts-hook
+  facts-hook, poll-loop-guard,
+  read-size-guard,
+  batch-nudge
 
 actions-disable-guard, capacity-pipe-guard and memory-index-guard run on every Bash call, so their entries start
 the hook through agent-guards-fast (FAST) when that file is there: it passes what the hook surely passes and runs the
@@ -20,7 +22,8 @@ the entry runs the hook file as before. Python starts with -S (no site: the hook
 
 The same entries go in the managed settings drop-in the installer writes (--settings) or, by hand, in any settings
 file (`agent-guards hooks`). Monitor runs shell text like Bash, so every hook that reads a command reads it for
-Monitor too.
+Monitor too, except poll-loop-guard: an until-condition in a Monitor is the right way to wait for a file, so it
+is wired for Bash only.
 """
 import json
 
@@ -30,7 +33,7 @@ MANAGED_DIR = '/etc/claude-code'                  # Claude Code's managed settin
 DROP_IN = f'{MANAGED_DIR}/managed-settings.d/{DROP_IN_NAME}'
 
 HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard', 'bg-guard', 'agent-slots',
-         'facts-hook')
+         'facts-hook', 'poll-loop-guard', 'read-size-guard', 'batch-nudge')
 CLOSED = {'actions-disable-guard'}               # a missing or failed hook refuses
 FAST = 'agent-guards-fast'                       # the fast path (bin/agent-guards-fast), linked beside the hooks
 FAST_HOOKS = ('actions-disable-guard', 'capacity-pipe-guard', 'memory-index-guard')   # run on every Bash call
@@ -41,13 +44,19 @@ WHAT_IS_LOST = {
     'bg-guard': 'hook skipped, background commands are NOT checked',
     'agent-slots': 'hook skipped, agent slots are NOT counted',
     'facts-hook': 'hook skipped, the state tables are NOT shown',
+    'poll-loop-guard': 'hook skipped, wait loops and self-kills are NOT checked',
+    'read-size-guard': 'hook skipped, Read sizes are NOT checked',
+    'batch-nudge': 'hook skipped, no batching hint',
 }
 # (event, matcher or None, [(hook, timeout)]): one settings entry each, in this order
 ENTRIES = (
     ('PreToolUse', 'Write|Edit|MultiEdit', [('memory-index-guard', 5)]),
     ('PreToolUse', 'Bash|Monitor', [('actions-disable-guard', 10)]),
     ('PreToolUse', 'Bash|Monitor', [('capacity-pipe-guard', 10)]),
+    ('PreToolUse', 'Bash', [('poll-loop-guard', 5)]),
+    ('PreToolUse', 'Read', [('read-size-guard', 5)]),
     ('PostToolUse', 'Write|Edit|MultiEdit|Bash|Monitor', [('memory-index-guard', 5)]),
+    ('PostToolUse', 'Read|Grep|Glob|LS|NotebookRead|Bash', [('batch-nudge', 5)]),
     ('UserPromptSubmit', None, [('agent-slots', 5)]),
     ('Stop', None, [('agent-slots', 5), ('bg-guard', 5)]),
     ('SessionStart', None, [('facts-hook', 5)]),

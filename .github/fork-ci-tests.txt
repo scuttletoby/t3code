@@ -51,7 +51,7 @@
 .github/scripts/fork-fleet-desk-key.test.py ~10s unittest
 .github/scripts/fork-fleet-desk-seed.test.py ~34s unittest
 .github/scripts/fork-fleet-desk.test.py ~9s unittest
-.github/scripts/fork-fleet.test.py ~136s unittest
+.github/scripts/fork-fleet.test.py ~141s unittest
 .github/scripts/fork-fleet-refresh.test.py ~59s unittest
 .github/scripts/fork-fleet-walls.test.py ~71s unittest
 .github/scripts/fork-fleet-walls-contract.test.py ~96s unittest
@@ -74,6 +74,7 @@
 .github/scripts/fork-seam-check.test.cjs ~23s
 .github/scripts/fork-temp-files.test.sh
 .github/scripts/fork-secret-scan.test.sh run by .github/workflows/fork-secret-scan.yml
+.github/scripts/fork-test-seconds.test.cjs
 .github/scripts/fork-test-shards.test.cjs
 .github/scripts/fork-tests-drift.test.cjs
 .github/scripts/fork-upstream-files-check.test.cjs
@@ -106,13 +107,17 @@ fork-ci/actions/weakened-tests/weakened_tests.test.py unittest
 fork-ci/laws/laws.test.py unittest
 fork-kit/agent-guards/tests/actions-disable.test.py ~45s unittest
 fork-kit/agent-guards/tests/agent-slots.test.py unittest
+fork-kit/agent-guards/tests/batch-nudge.test.py unittest
 fork-kit/agent-guards/tests/bg-guard.test.py unittest
 fork-kit/agent-guards/tests/capacity-pipe.test.py unittest
 fork-kit/agent-guards/tests/config.test.py unittest
 fork-kit/agent-guards/tests/facts.test.py unittest
 fork-kit/agent-guards/tests/fast.test.py ~25s unittest
 fork-kit/agent-guards/tests/install.test.py ~20s unittest
+fork-kit/agent-guards/tests/lens-packet.test.py unittest
 fork-kit/agent-guards/tests/memory-index.test.py unittest
+fork-kit/agent-guards/tests/poll-loop.test.py unittest
+fork-kit/agent-guards/tests/read-size.test.py unittest
 fork-kit/agent-guards/tests/wiring.test.py unittest
 fork-kit/cleaner/tests/compress.test.py ~15s unittest
 fork-kit/cleaner/tests/daily.test.py ~19s unittest

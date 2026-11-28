@@ -68,6 +68,7 @@ export * from "./assistant.ts";
 export * from "./forkEnvironmentFileLinks.ts";
 export * from "./forkFeatures.ts";
 export * from "./forkOwnerQuestions.ts";
+export * from "./forkWorkPanel.ts";
 export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
 export * from "./mcpProfileResolve.ts";
@@ -255,12 +256,25 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
 
 /**
  * The client settings' fork fields (stored on each device, not on the server). Their patch fields
- * (`ForkClientSettingsPatchFields`, spread into upstream's `ClientSettingsPatch`; the line is
- * announced in .github/fork-seams.json) come with the first change that saves one.
+ * are {@link ForkClientSettingsPatchFields}, spread into upstream's `ClientSettingsPatch`.
  */
 export const ForkClientSettingsFields = {
   /** Calm sidebar: role threads on top, every other thread folded into one group; off. */
   calmSidebarEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * Issues opens the fork's "Waiting on you" page (owner questions of every project); off gives
+   * upstream's Issues page back. On (owner decision, fork issue 828).
+   */
+  ownerQuestionsPage: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  /** Work panel: CI and capacity in a thread's side panel, next to its sub-agents; off. */
+  workPanelEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+};
+
+/** A client settings save's fork fields: left out keeps the stored value. */
+export const ForkClientSettingsPatchFields = {
+  calmSidebarEnabled: Schema.optionalKey(Schema.Boolean),
+  ownerQuestionsPage: Schema.optionalKey(Schema.Boolean),
+  workPanelEnabled: Schema.optionalKey(Schema.Boolean),
 };
 
 /** Fork settings a project may override; listed in `PROJECT_SCOPED_SERVER_SETTING_KEYS`. */

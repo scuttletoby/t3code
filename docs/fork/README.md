@@ -44,40 +44,42 @@ The defaults, "off" and "decided in" below come from one table in the code,
 (`packages/shared/src/forkDocs.test.ts`) fails when this table and that one differ, or a setting has
 no section below. "Off" means the default leaves the machine as upstream's would be.
 
-| Setting                                                                      | Default                                 | Off | Decided in                                               |
-| ---------------------------------------------------------------------------- | --------------------------------------- | --- | -------------------------------------------------------- |
-| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`                                 | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
-| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                                    | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
-| [`server.activityProbe`](#serveractivityprobe)                               | `false`                                 | yes | [#509](https://github.com/scuttletoby/t3code/issues/509) |
-| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                                    | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
-| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                                 | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                                    | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                                    | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`                      | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
-| [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}`             | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
-| [`server.placement`](#serverplacement)                                       | `{"mode":"off"}`                        | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
-| [`server.placementNeeds`](#serverplacementneeds)                             | `[]`                                    | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
-| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`                     | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                                | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
-| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                                    | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`                                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`                             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                                    | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpCarriedProfiles`](#servermcpcarriedprofiles)                     | `"apply"`                               | yes | [#640](https://github.com/scuttletoby/t3code/issues/640) |
-| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`                        | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
-| [`server.threadRoles`](#serverthreadroles)                                   | `{"assistant":null,"orchestrators":{}}` | yes | [#138](https://github.com/scuttletoby/t3code/issues/138) |
-| [`server.assistant`](#serverassistant)                                       | `{"enabled":false}`                     | yes | [#879](https://github.com/scuttletoby/t3code/issues/879) |
-| [`server.stopFinishedChildren`](#serverstopfinishedchildren)                 | `{"enabled":false}`                     | yes | [#925](https://github.com/scuttletoby/t3code/issues/925) |
-| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                                 | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                                 | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                                 | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
-| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                                 | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
-| [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                                 | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
-| [`client.calmSidebarEnabled`](#clientcalmsidebarenabled)                     | `false`                                 | yes | [#139](https://github.com/scuttletoby/t3code/issues/139) |
+| Setting                                                                      | Default                                 | Off | Decided in                                                 |
+| ---------------------------------------------------------------------------- | --------------------------------------- | --- | ---------------------------------------------------------- |
+| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`                                 | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)     |
+| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                                    | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)       |
+| [`server.activityProbe`](#serveractivityprobe)                               | `false`                                 | yes | [#509](https://github.com/scuttletoby/t3code/issues/509)   |
+| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                                    | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)     |
+| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                                 | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)     |
+| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                                    | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)     |
+| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)     |
+| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                                    | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)     |
+| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260)   |
+| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`                      | yes | [#291](https://github.com/scuttletoby/t3code/issues/291)   |
+| [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}`             | yes | [#268](https://github.com/scuttletoby/t3code/issues/268)   |
+| [`server.placement`](#serverplacement)                                       | `{"mode":"off"}`                        | yes | [#134](https://github.com/scuttletoby/t3code/issues/134)   |
+| [`server.placementNeeds`](#serverplacementneeds)                             | `[]`                                    | yes | [#134](https://github.com/scuttletoby/t3code/issues/134)   |
+| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`                     | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)     |
+| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                                | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)     |
+| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                                    | yes | [#145](https://github.com/scuttletoby/t3code/issues/145)   |
+| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`                                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145)   |
+| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`                             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145)   |
+| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                                    | yes | [#145](https://github.com/scuttletoby/t3code/issues/145)   |
+| [`server.mcpCarriedProfiles`](#servermcpcarriedprofiles)                     | `"apply"`                               | yes | [#640](https://github.com/scuttletoby/t3code/issues/640)   |
+| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`                        | yes | [#215](https://github.com/scuttletoby/t3code/issues/215)   |
+| [`server.threadRoles`](#serverthreadroles)                                   | `{"assistant":null,"orchestrators":{}}` | yes | [#138](https://github.com/scuttletoby/t3code/issues/138)   |
+| [`server.assistant`](#serverassistant)                                       | `{"enabled":false}`                     | yes | [#879](https://github.com/scuttletoby/t3code/issues/879)   |
+| [`server.stopFinishedChildren`](#serverstopfinishedchildren)                 | `{"enabled":false}`                     | yes | [#925](https://github.com/scuttletoby/t3code/issues/925)   |
+| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                                 | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)     |
+| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                                 | yes | [#260](https://github.com/scuttletoby/t3code/issues/260)   |
+| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                                 | yes | [#291](https://github.com/scuttletoby/t3code/issues/291)   |
+| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145)   |
+| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145)   |
+| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                                 | yes | [#215](https://github.com/scuttletoby/t3code/issues/215)   |
+| [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                                 | yes | [#134](https://github.com/scuttletoby/t3code/issues/134)   |
+| [`client.calmSidebarEnabled`](#clientcalmsidebarenabled)                     | `false`                                 | yes | [#139](https://github.com/scuttletoby/t3code/issues/139)   |
+| [`client.ownerQuestionsPage`](#clientownerquestionspage)                     | `true`                                  | no  | [#828](https://github.com/scuttletoby/t3code/issues/828)   |
+| [`client.workPanelEnabled`](#clientworkpanelenabled)                         | `false`                                 | yes | [#1136](https://github.com/scuttletoby/t3code/issues/1136) |
 
 For `waitFor`, `agentSlots`, `playtest` and `stopFinishedChildren` only the `enabled` switch is pinned, and for `handoff`
 and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
@@ -186,6 +188,13 @@ What happens when an agent starts a task with `delegate_task`. `"off"`: nothing,
 `"advise"`: the task starts as asked and the reply carries a note about the pace. `"enforce"`: a task
 on an account that is ahead of its pace moves to another account of the same provider, runs at a
 lower effort (`usagePacingLowerEffort`), or is refused for now and the agent asks again later.
+
+A `delegate_task` child that a linked machine sends here runs on this machine's accounts, so this
+machine's own setting decides it, before its agent slot, as for a task started here: the
+`usagePacingLowerEffort` step applies here, once, and the child starts at the lowered effort (an
+effort this machine's `modelPolicy` does not allow keeps the checked one). It never moves to another account: the reply does not offer one, as this machine cannot tell whether
+the project there allows it. A refusal has the code `usage_pacing_hold`, which the sending machine
+gets back as it is; the owner's own launches from a linked machine are not paced.
 
 Switch on: **Settings → Fork**, section Plan usage pacing, "Pace agents by plan usage", or in `settings.json`:
 `"usagePacingGate": "advise"` (try `advise` before `enforce`).
@@ -381,6 +390,19 @@ is part of the stored wait, so a restart before its delivery was written runs it
 idempotent. It runs at most 90 s per delivery (the delivery is tried again after that), so a slow
 GitHub or thread does not stall other waits. Like the gate, lens_start skips a review or inline
 comment that is not submitted yet, and dates an inline comment by when it was published.
+
+**`lens_report {pr, body}`** (T3 tool, in the same group, hidden and refused while review rules are
+off) is how a lens child posts its report. Only a thread lens_start started as a child (its newest
+record in `lens-children.json`) may call it, and only for a pull request that child reads. T3
+writes the first line, `lens: <lens> · reviewer: <model> · read at: <head>`, from that record and
+the model the child runs on, so a child never types a lens name or a sha. T3 posts the report as a
+new comment only while the pull request is open and still at that head, and only if the gate would
+read it as one valid read with a findings section; otherwise it refuses and says why. The report
+may not hold its own `lens:` or `read at` line, and it must fit `reportMaxChars` with T3's line.
+The same shared vectors (`written` in `review.vectors.json`) test this writer and the gate. A repeat
+finds the earlier comment and posts nothing new, including after a post whose answer was lost (the
+tool then says `failed`: call it again). One report posts at a time, so two calls at once post
+once. Nothing is stored.
 
 ### Slot filler route (`/api/fork/delegate`)
 
@@ -782,7 +804,8 @@ These routes start a new agent run and go through the same gate, with the same c
 - A call that asks another machine to start an agent (`delegate_task`, `t3_thread_launch` or
   `t3_thread_send` with an `environmentId`) is decided by that machine's gate, the one that would
   run the agent; this machine's gate is not asked. A machine on a build without this gate starts
-  it as before.
+  it as before. A `delegate_task` child is first paced there by that machine's
+  `usagePacingGate`, so a held task takes no slot.
 
 Only an agent caller is told it can wait for a slot (`wait_for`) and end its turn. A start with no
 caller here (another machine's call, a scheduled run) is told plainly what happened: the machine
@@ -1495,6 +1518,43 @@ other top-level threads fold into one closed group with a count of those waiting
 ([#139](https://github.com/scuttletoby/t3code/issues/139)). Off (the default): upstream's sidebar.
 It is a client setting, so each device chooses: calm on a phone, the full list on a desktop. A
 client settings file without it reads as off.
+
+### `client.ownerQuestionsPage`
+
+On (the default, the owner's decision in [#828](https://github.com/scuttletoby/t3code/issues/828)):
+the Issues entry opens **Waiting on you**, the open owner questions of every project on every
+connected server, instead of upstream's Issues page. Off: upstream's page. It changes which page the
+Issues entry opens, nothing else; upstream's page files stay as they are (one seam in
+`apps/web/src/routes/_chat.issues.tsx`). A client setting, so each device chooses; a client settings
+file without it reads as on. Settings → Fork → Issues page.
+
+### `client.workPanelEnabled`
+
+Turns on the work panel on this device
+([#1136](https://github.com/scuttletoby/t3code/issues/1136)): in a thread's side panel, right
+after its sub-agents, a CI part. It has one queue line per repository (workflow runs queued and
+running, and the oldest queued run's age and link; a re-run is dated by its own start), then each
+pull request linked to the thread or a thread under it: queued, running, failed and passed runs on
+its head (its watched commit, else the runs GitHub ties to it or its branch in its own repository),
+the oldest queued wait and a link to the run. These numbers come from one shared read per server
+(`fork.workPanel`, `apps/server/src/fork/workPanel`), kept only in memory. The server asks GitHub
+(with its `gh` login) at most once a minute in all, for every viewer and every repository, counted
+from each call's start; a viewer who leaves mid-call does not free the minute. The minute goes to
+the read that has waited longest among every repository any viewer asked for in the last five
+minutes, so two panels on different repositories share it. A call that takes over 45 seconds counts
+as no answer. Each repository is read three ways in turn: its latest 100 runs, and every queued and
+every running run, which also finds a re-run of an older run (GitHub's `queued` list leaves out a
+re-run that is `waiting` for an approval, `requested` or `pending`; outside the latest page, those
+are missed). So one panel's three repositories (those of the thread and its
+sub-agents with the most pull requests) are each read fully every nine minutes; with more
+repositories in view at once, a line goes unknown for part of each cycle. It waits for the budget's
+reset when less than a fifth of the rate limit is left or GitHub refuses a read for it, and 2, 4, 8
+and then 15 minutes when GitHub does not answer. Counts older than 10 minutes are not shown. A pull
+request the read has no runs for falls back to what the pull request watch saw (failed and passed
+checks, and whether checks are pending), then to its last sync. A part with no answer says unknown
+and why, never 0: also a machine that answered before and then fails, or whose last answer arrived
+more than three minutes ago; the ages count on from when the answer arrived. Only github.com repositories are read. Off (the
+default): upstream's side panel. A client settings file without it reads as off.
 
 ### A setting the fork removed
 
