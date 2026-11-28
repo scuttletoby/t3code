@@ -426,6 +426,12 @@ browser request (one with `Origin`) gets a plain `404`.
 - `GET /api/fork/delegate?parentThreadId=...` (`orchestration:read`) answers `{children,
   parentSettled}`: the parent's children (`taskId, title, status, live, environmentId, childThreadId,
   providerInstanceId, model`) and whether it was settled by hand.
+- `POST /api/fork/delegate/notify` `{parentThreadId, requestId, text}` (`orchestration:operate`) sends the
+  parent one message the way the wake is sent: queued after its active run, through the slot gate, once per
+  parent, request id and half hour (asking again with the same id never sends a second). `text` is trimmed and cut
+  to 1,500 characters. The slot filler's idle alarm uses it. It answers `200` `{state: "sent"}`, or
+  `{state: "refused", code, message}` with `404` (`parent_missing`), `409` (`slots_full`: no slot to give the
+  parent a run) or `400` (a bad body or no text).
 
 ### `server.modelPolicy`
 

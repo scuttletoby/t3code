@@ -2,7 +2,8 @@
 
 Fills free agent slots from a queue folder, by code: a timer runs `slot-filler` every minute, it counts the live
 children of one parent (orchestrator) thread per machine from T3 itself, and starts the highest-priority ready
-items until every machine is full. Part of fork issue #870 ("orchestrator logic as software, not prose").
+items until every machine is full. Slots that no queue item fits take standing work from a backlog folder, and
+slots that stay idle with nothing ready for them make the filler tell the parent. Part of fork issue #870 ("orchestrator logic as software, not prose").
 
 One file, Python 3 standard library only: `bin/slot-filler`. Tests: `python3 -I -B fork-kit/slot-filler/tests/filler.test.py`.
 
@@ -22,6 +23,9 @@ uses):
   again never starts a second one. One whose start was refused for good answers `request_rejected` (use a new id).
   A remote start also needs a parent run, so an idle parent takes one short wake turn per start (this uses usage).
   With `lookupOnly: true` it only answers what the id started (`not_found` when nothing yet), and never starts.
+- `POST /api/fork/delegate/notify` `{parentThreadId, requestId, text}` sends the parent one message the way the
+  wake is sent (queued after its run, once per request id and half hour, through the slot gate): `{state: "sent"}`
+  or `{state: "refused", code, message}`. The idle alarm uses it.
 - `GET /api/fork/delegate?parentThreadId=...` answers `{children, parentSettled}`: the parent's children
   `{taskId, title, status, live, environmentId, childThreadId, providerInstanceId, model}`, and whether the parent
   was settled by hand.
@@ -59,6 +63,10 @@ without printing it).
   field pins `pr-green` to one head.
 - `machines`: allowed machines, in order of preference (default: every machine in the config, in config order).
   `account`, `model`, `effort` default from the config's `defaults`.
+- `account` (in an item or in `defaults`): one account, or a list in order of preference, e.g.
+  `["claudeAgent_claude_annemette", "claudeAgent"]`. On each machine the filler uses the first account that passes
+  the usage rules below; when none does, the item waits and the log line gives each account's reason. The account
+  used is in the started record (`account`) and the log line ("started `<id>` on `<machine>` as `<account>`").
 - The task text is "Act as the `<kind>` sub-agent for this task. Read `<brief>` fully and do what it says. It is
   your whole brief." (`taskTemplate` changes it).
 
@@ -71,6 +79,37 @@ Lenses: `<queueDir>/lens-watch/<name>.json` `{"pr": n, "lenses": [{"lens": "code
 it") and queues one `lens` item pinned to that head, with role `review`. A new head is a new round; at most
 `maxRounds` rounds per lens. Delete the watch file when the PR is done.
 
+## Backlog
+
+`<backlogDir>/<id>.json` (default: `backlog/` next to the queue folder): standing items in the queue's format, plus
+
+- `repeat`: minutes. A repeating item stays in the folder and runs again: each run gets the id `<id>.r<n>`
+  (its record `started/<id>.r<n>.json`), and a new run starts only when the last one is no longer live in T3 and
+  `repeat` minutes have passed since it started. Without `repeat` the item is a one-off: it moves to
+  `started/<id>.json` like a queue item.
+- `expires`: an ISO UTC time; after it the item is not started (logged once, kept: delete it).
+
+Queue items always go first: the backlog only fills the slots that are still free after every ready queue item
+that fits was started. Within the backlog the order is the queue's (priority, then age). The same machine,
+account, usage and capacity rules apply, with the same request ids, markers and atomic move. A backlog item with
+the same id as a queue item is refused. Lens items never come from the backlog.
+
+## Idle alarm
+
+A machine is idle on a run when it has a free agent slot, its capacity check passes, at least one account
+(`defaults.account`, or `claudeAgent`) passes the usage rules there, and no ready queue or backlog item fits it (a
+ready item that waits only for an account's usage does not count as idle; nor do writer items when only lens or
+other slots are free). After `idleAlarm.passes` (3) idle runs in a row, the filler sends the parent one message
+through `POST /api/fork/delegate/notify`: "[slot filler] slots idle: `<machine>` `<free>/<max>` agents
+(`<free>/<max>` writers) free since T; ...; queue+backlog empty for those machines." It sends again at most every
+`idleAlarm.everyMinutes` (15) while that lasts, and logs every alarm, delivered or not ("idle alarm NOT
+delivered (...)": a T3 without the notify route, or no slot to wake the parent). A busy run, or full slots,
+restarts the count. `"idleAlarm": {"enabled": false}` turns it off. The state is in `stateDir/idle.json`.
+
+`slot-filler status` (read only) prints each machine's live agents and writers from T3, its free slots, the
+queue, backlog and in-flight counts, and an `idle:` line per idle machine (free slots, since when, the runs counted,
+the last alarm). It exits 1 when T3 does not answer (the rest is still printed).
+
 ## Config
 
 `--config` (default `~/.config/slot-filler/config.json`, or `$SLOT_FILLER_CONFIG`):
@@ -78,6 +117,8 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
 ```json
 {
   "queueDir": "~/queue",
+  "backlogDir": "~/backlog",
+  "idleAlarm": { "enabled": true, "passes": 3, "everyMinutes": 15 },
   "stateDir": "~/.local/state/slot-filler",
   "log": "~/.local/state/slot-filler/filler.log",
   "parentThreadId": "<orchestrator thread id>",
@@ -100,12 +141,45 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
         }
       }
     },
-    "spare": { "environmentId": "<linked environment id>", "maxAgents": 6, "maxWriters": 3 }
+    "spare": { "environmentId": "<linked environment id>", "maxAgents": 6, "maxWriters": 3 },
+    "wsl": {
+      "environmentId": "<linked environment id>",
+      "projectId": "<that machine's project id>",
+      "maxAgents": 2,
+      "maxWriters": 1
+    },
+    "mac": {
+      "environmentId": "<linked environment id>",
+      "projectId": "<that machine's project id>",
+      "worktreeIsolation": false,
+      "maxAgents": 2,
+      "maxWriters": 1
+    }
   }
 }
 ```
 
+A queue item for a linked machine names it and leaves out `isolation`, since the child runs in that project's
+checkout:
+
+```json
+{
+  "id": "fix-login-43",
+  "title": "Fix the login retry on Windows",
+  "kind": "writer",
+  "brief": "/abs/path/brief.md",
+  "machines": ["wsl", "mac"],
+  "account": ["claudeAgent"]
+}
+```
+
 - A machine without `environmentId` is the server's own machine.
+- `projectId`: the project the child runs in, sent as `target.projectId`. A linked machine needs it; without it,
+  T3 refuses the start ("Pass target.projectId").
+- `worktreeIsolation` (default: false when the machine has an `environmentId`, else true): whether T3 can give a
+  child its own worktree there. Set it to false for a project that is not a git checkout. An item with
+  `"isolation": "worktree"` is refused when it is read (logged once, kept) if one of the machines it names, or
+  every machine when it names none, has this false. When it names no machines, it runs only where this is true.
 - `inlineBrief` (default: true when the machine has an `environmentId`): the brief's text goes in the task
   text, since another machine cannot read this machine's files (at most 100,000 characters, else refused).
 - `capacity.<kind>` (or `default`): a command that must exit 0, or, with `free`, whose
@@ -148,7 +222,15 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
   logged as "<machine> backing off after N refusal(s) (last: code) until T", so a refusal the server checks after the
   wake does not wake the parent every minute, and a machine that keeps refusing does not hold back a free one. A
   wait more than 15 minutes ahead (the clock was set back) is cut to 15 minutes. A child on an environment no machine names still counts, under no machine.
-- **Meter missing or old:** that machine is skipped for that account, with a log line.
+- **Meter missing or old:** that machine is skipped for that account, with a log line; the item's next account,
+  if it names one, is tried there.
+- **An account fills during a start:** the intent marker records the account it asked with. A start that stopped
+  half-way, or got no clear answer, is asked again with the same request id on the same account, never moved to
+  the next one (it may have started there). A clear refusal (the server's usage guard: `usage_pacing_hold`)
+  removes the marker; after that machine's backoff the next run picks again from the list, so the next account is
+  used. The queue file is never rewritten: it keeps its list.
+- **Old queue files and markers:** an `account` string is a list of one; a marker from before account lists
+  holds the item with its string and is asked again as it was.
 - **Brief deleted:** the item is refused and kept until the brief is back.
 - **PR closed:** `pr-green` and `pr-merged` items wait with a log line ("closed without a merge"). Delete them
   by hand.
@@ -156,7 +238,15 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
 - **Parent handed over:** a parent settled by hand is taken as handed over to a new orchestrator. The run stops
   before it asks anything (left-over starts too) with "set parentThreadId to the orchestrator that runs now".
 - **Empty, broken or incomplete queue file:** refused with the reason, logged once, and kept.
-- **Missing queue folder, empty queue:** nothing to do.
+- **Missing queue folder, empty queue:** nothing to do. A missing backlog folder (an old config without
+  `backlogDir`) is an empty backlog; the filler never makes it.
+- **Backlog item killed half-way:** its marker records where it came from (`from`, and `keep` for a repeating
+  item). The next run asks again with the same request id and only finishes the move, so a one-off never starts
+  twice; a repeating item's run id `<id>.r<n>` is fixed until that run's record is written.
+- **Idle alarm runs again or stops half-way:** the time of an alarm is written to `idle.json` before the message
+  is sent, so a stop never sends a second one within 15 minutes (a stop before the send loses that one alarm; the
+  next comes 15 minutes later). Each alarm has its own request id (`idle-alarm:<time>`), so T3 sends it once.
+  `idle.json` is written only when it changes (the count stops at `passes`), so long idle runs write nothing.
 - **Recovery starts even if caps are now full:** the route's own slot gate still refuses it.
 
 ## Install
