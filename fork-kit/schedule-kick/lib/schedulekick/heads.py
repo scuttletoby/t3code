@@ -18,10 +18,14 @@ A sent head whose run does not show within LOST_MINUTES is reported once ("lost"
 and not sent again: something else is wrong (a dispatch GitHub took and dropped, or a pass stopped between
 recording and sending), and a loop would only hide it. A branch whose workflow file refuses the inputs (an older
 copy without `head`, or one without workflow_dispatch: PERMANENT) is recorded as refused for that commit and not
-sent again (alerted once); its next push brings the new file. Any other error, a 422 for a workflow that is
-switched off at that moment too, waits (5 minutes, doubling, at most an hour) and tries again; a rate limit pauses
-the tick (kick.py). Every attempt counts toward maxPerPass. Marks of a head missing from one snapshot (moved while
-GitHub answered, off the first page) are kept for MARK_DAYS, so it is not sent again when it comes back.
+sent again (alerted once); its next push brings the new file. Any other 422 is about that one commit too: that head
+alone waits (5 minutes, then 10) and is refused after HEAD_TRIES, while the heads after it go on in the same pass.
+Any other error is about the whole entry (a 422 for a workflow that is switched off at that moment, #517, a 5xx, no
+network, the login): the entry waits (5 minutes, doubling, at most an hour; the count is kept across passes whose
+GraphQL read works, and ends only with a pass that has no such error) and tries again; a rate limit pauses the tick
+(kick.py), and a REST budget under kick.py's minimum stops the dispatches of the pass. Every attempt counts toward
+maxPerPass. Marks of a head missing from one snapshot (moved while GitHub answered, off the first page) are kept
+for MARK_DAYS, so it is not sent again when it comes back.
 
 A head that has a run in any state counts as done: a run cancelled by hand, lost with its runner or stuck queued is
 never sent again here (fork-ci-rerun and the watch and sweep handle those), and a head run whose fork-checks run is
@@ -40,10 +44,13 @@ MAX_GRACE_MINUTES = 60
 PER_PASS = 3
 MAX_PER_PASS = 20
 MARK_DAYS = 7                   # a sent, lost or refused mark outlives its head's absence from a snapshot this long
+HEAD_TRIES = 3                  # a 422 about one commit (not PERMANENT, not ENTRY_WIDE): tries before it is refused
 # The dispatch refusals that cannot change for that commit: its workflow file has no `head` input, or no
 # workflow_dispatch. Any other refusal (a 422 "Cannot trigger a 'workflow_dispatch' on a disabled workflow" while
 # the workflow is switched off, #517) waits and tries again.
 PERMANENT = (re.compile(r'\bUnexpected inputs\b', re.I), re.compile(r"does not have 'workflow_dispatch' trigger", re.I))
+# The 422 that is about the workflow, not the commit: every head of the entry would get it, so the entry waits.
+ENTRY_WIDE = (re.compile(r'\bdisabled workflow\b', re.I),)
 
 QUERY = '''query($owner: String!, $name: String!) {
   rateLimit { remaining resetAt }
@@ -152,11 +159,18 @@ def permanent(e):
     return e.status == 422 and any(p.search(str(e)) for p in PERMANENT)
 
 
+def head_only(e):
+    """True for a dispatch refusal about that one commit that may still change (a 422, not ENTRY_WIDE): that head
+    waits on its own, the others go on."""
+    return e.status == 422 and not e.rate_limited and not any(p.search(str(e)) for p in ENTRY_WIDE)
+
+
 def reconcile(entry, api, state, now, parse_time, waiting_until, backoff, most, save=lambda: None,
-              limited=lambda e: None, alert=lambda text: None):
+              limited=lambda e: None, alert=lambda text: None, budget_low=lambda: False):
     """(result, message) for one heads entry; state['heads'][key] updated in place. save() writes the state (called
     before each dispatch, so a head is recorded as sent before it is sent); limited(e) on a rate limit (kick.py
-    pauses the tick); alert(text) for a head that is lost or refused (once each)."""
+    pauses the tick); alert(text) for a head that is lost or refused (once each); budget_low() true stops the
+    dispatches of this pass (the REST budget; kick.py then pauses)."""
     b = _bucket(state, entry.key)
     wait = waiting_until(b.get('retryAfter'), now)
     if wait is not None:
@@ -181,15 +195,20 @@ def reconcile(entry, api, state, now, parse_time, waiting_until, backoff, most, 
     keep_after = now - datetime.timedelta(days=MARK_DAYS)
     b['sent'] = {k: v for k, v in b['sent'].items()
                  if k in current or (parse_time(v.get('at')) or keep_after) > keep_after}
-    for k in ('failures', 'retryAfter', 'error'):
-        b.pop(k, None)
-    sent, lost, waiting, errors, tried = [], [], 0, [], 0
+    sent, lost, waiting, errors, tried, entry_error = [], [], 0, [], 0, False
     for h in heads:
         if h.has_run:
             b['seen'].pop(h.sha, None)
             continue
         mark = b['sent'].get(h.sha)
-        if mark is not None:
+        tries = 0
+        if mark is not None and mark.get('result') == 'retry':
+            # an earlier 422 about this commit alone: its own wait, then the next try (no new grace)
+            if waiting_until(mark.get('retryAfter'), now) is not None or tried >= entry.per_pass or budget_low():
+                waiting += 1
+                continue
+            tries = mark['tries'] if type(mark.get('tries')) is int and mark['tries'] > 0 else 1
+        elif mark is not None:
             at = parse_time(mark.get('at'))
             if mark.get('result') == 'dispatched' and at is not None \
                     and now - at >= datetime.timedelta(minutes=LOST_MINUTES):
@@ -198,14 +217,15 @@ def reconcile(entry, api, state, now, parse_time, waiting_until, backoff, most, 
                 alert(f'{entry.repo} {entry.workflow}: {h.what} {h.sha} ({h.branch}) was dispatched {LOST_MINUTES}+ '
                       'minutes ago and has no run: not sent again')
             continue
-        first = parse_time(b['seen'].get(h.sha))
-        if first is None or first > now:
-            b['seen'][h.sha] = iso(now)
-            waiting += 1
-            continue
-        if now - first < entry.grace or tried >= entry.per_pass:
-            waiting += 1
-            continue
+        else:
+            first = parse_time(b['seen'].get(h.sha))
+            if first is None or first > now:
+                b['seen'][h.sha] = iso(now)
+                waiting += 1
+                continue
+            if now - first < entry.grace or tried >= entry.per_pass or budget_low():
+                waiting += 1
+                continue
         tried += 1
         b['sent'][h.sha] = {'at': iso(now), 'branch': h.branch, 'result': 'dispatched'}
         save()
@@ -217,7 +237,25 @@ def reconcile(entry, api, state, now, parse_time, waiting_until, backoff, most, 
                 errors.append(f'{h.what} {h.sha[:12]} refused (not sent again): {e}')
                 alert(f'{entry.repo} {entry.workflow}: {h.what} {h.sha} ({h.branch}) refused, not sent again: {e}')
                 continue
-            del b['sent'][h.sha]
+            if head_only(e):
+                tries += 1
+                if tries >= HEAD_TRIES:
+                    b['sent'][h.sha] = {'at': iso(now), 'branch': h.branch, 'result': 'refused', 'tries': tries,
+                                        'error': str(e)[:300]}
+                    errors.append(f'{h.what} {h.sha[:12]} refused {tries} times (not sent again): {e}')
+                    alert(f'{entry.repo} {entry.workflow}: {h.what} {h.sha} ({h.branch}) refused {tries} times, '
+                          f'not sent again: {e}')
+                    continue
+                b['sent'][h.sha] = {'at': iso(now), 'branch': h.branch, 'result': 'retry', 'tries': tries,
+                                    'retryAfter': iso(now + min(backoff * 2 ** (tries - 1), most)),
+                                    'error': str(e)[:300]}
+                errors.append(f'{h.what} {h.sha[:12]} refused, tries again later ({tries} of {HEAD_TRIES}): {e}')
+                continue
+            if mark is not None:
+                b['sent'][h.sha] = mark         # a retry mark keeps its count; the entry's wait comes first
+            else:
+                del b['sent'][h.sha]
+            entry_error = True
             fail(state, entry.key, now, str(e), backoff, most)
             errors.append(f'{h.what} {h.sha[:12]}: {e}')
             if e.rate_limited:
@@ -225,6 +263,10 @@ def reconcile(entry, api, state, now, parse_time, waiting_until, backoff, most, 
             break
         sent.append(f'{h.what} {h.sha[:12]} ({h.branch})')
         b['seen'].pop(h.sha, None)
+    if not entry_error:
+        # a pass with no error about the whole entry ends its wait; one with an error kept counting (fail)
+        for k in ('failures', 'retryAfter', 'error'):
+            b.pop(k, None)
     parts = [f'{len(heads)} heads']
     if sent:
         parts.append('workflow_dispatch sent for ' + ', '.join(sent))

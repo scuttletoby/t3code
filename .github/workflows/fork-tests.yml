@@ -1663,7 +1663,9 @@ jobs:
       - name: Require every job to pass
         env:
           RESULTS: ${{ toJSON(needs) }}
-          RELEASE_RUN: ${{ inputs.ref != '' }}
+          # A release run (the secret scan may skip: the commit was scanned on its way to main). Not a head
+          # run on a pull request's branch: that is the pull request's run, and `secrets` runs there.
+          RELEASE_RUN: ${{ inputs.ref != '' && !(inputs.head && github.ref_name != github.event.repository.default_branch) }}
           OUTSIDE_PR: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
           echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'

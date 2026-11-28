@@ -332,6 +332,89 @@ class Heads(unittest.TestCase):
         self.assertEqual(self.sent(), [('feature-7', A), ('feature-7', A)])   # the failed one, then the retry
 
 
+    def test_dispatch_errors_back_off_doubling_across_successful_reads(self):
+        # the GraphQL read works each pass, the dispatch fails: the wait still doubles (5, 10, 20, 40 min)
+        self.api.answer = answer(prs=[pr(7, A)])
+        self.tick(NOW)
+        self.api.fail['dispatch'] = github.ApiError('HTTP 500', status=500)
+        for minutes in range(10, 75, 5):
+            self.tick(NOW + datetime.timedelta(minutes=minutes))
+        self.assertEqual(len(self.api.dispatches()), 4)                     # at 10, 15, 25 and 45
+        self.assertEqual(self.state()['heads'][f'heads {REPO} {WF}']['failures'], 4)
+
+    def test_a_backoff_ends_after_a_pass_without_errors(self):
+        self.api.answer = answer(prs=[pr(7, A)])
+        self.tick(NOW)
+        self.api.fail['dispatch'] = github.ApiError('HTTP 500', status=500)
+        self.tick(NOW + datetime.timedelta(minutes=10))
+        del self.api.fail['dispatch']
+        self.assertEqual(self.tick(NOW + datetime.timedelta(minutes=15))[0], 0)
+        self.assertNotIn('failures', self.state()['heads'][f'heads {REPO} {WF}'])
+
+    def test_one_heads_refusal_does_not_hold_up_the_others(self):
+        # a 422 about this one commit (here a workflow file on that branch GitHub cannot use): that head waits on its
+        # own (5, then 10 minutes), is refused after HEAD_TRIES and alerted once; the heads after it go on
+        self.api.answer = answer(prs=[pr(7, A), pr(8, B)])
+        self.tick(NOW)
+        self.api.fail_ref['feature-7'] = github.ApiError(
+            "HTTP 422 Workflow does not have 'inputs' that can be read at that ref", status=422)
+        code, out = self.tick(NOW + datetime.timedelta(minutes=10))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.sent(), [('feature-7', A), ('feature-8', B)])    # #8 in the same pass
+        self.api.answer = answer(prs=[pr(7, A), pr(8, B, runs=(PATH,))])       # #8's run shows
+        for minutes in range(15, 125, 5):
+            self.tick(NOW + datetime.timedelta(minutes=minutes))
+        self.assertEqual(self.sent(), [('feature-7', A), ('feature-8', B), ('feature-7', A), ('feature-7', A)])
+        bucket = self.state()['heads'][f'heads {REPO} {WF}']
+        self.assertEqual(bucket['sent'][A]['result'], 'refused')
+        self.assertNotIn('failures', bucket)                                # the entry itself never waited
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_one_heads_refusals_stay_within_max_per_pass(self):
+        self.api.answer = answer(main_runs=(), prs=[pr(n, f'{n:040x}') for n in range(1, 11)])
+        self.tick(NOW)
+        for n in range(1, 11):
+            self.api.fail_ref[f'feature-{n}'] = github.ApiError('HTTP 422 something about this ref', status=422)
+        self.tick(NOW + datetime.timedelta(minutes=10))
+        self.assertEqual(len(self.api.dispatches()), 3)
+
+    def test_a_low_rest_budget_stops_the_dispatches_of_a_pass(self):
+        self.api.answer = answer(main_runs=(), prs=[pr(7, A)])
+        self.tick(NOW)
+        self.api.after_dispatch = lambda: setattr(self.api, 'remaining', 50)
+        self.tick(NOW + datetime.timedelta(minutes=10))
+        self.assertEqual(self.sent(), [('main', MAIN)])                     # #7 waits for the budget
+        self.assertIn('pauseUntil', self.state())
+
+
+    def test_token_api_keeps_the_graphql_budget_out_of_the_rest_one(self):
+        # one REST answer (4999 left), then the GraphQL call's own headers (50 left): REST stays 4999
+        def opener(remaining, reset, body):
+            class R:
+                headers = {'x-ratelimit-remaining': str(remaining), 'x-ratelimit-reset': str(reset)}
+
+                def read(self, n):
+                    return json.dumps(body).encode()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            class Opener:
+                def open(self, req, timeout):
+                    return R()
+            return Opener()
+        api = github.TokenApi('t')
+        api.opener = opener(4999, 1800000000, None)
+        api.dispatch(REPO, WF, 'main', {})
+        api.opener = opener(50, 1800000600, {'data': {'repository': None}})
+        api.graphql(REPO, 'query', {})
+        self.assertEqual((api.remaining, api.reset), (4999, 1800000000))
+        self.assertEqual((api.graphql_remaining, api.graphql_reset), (50, 1800000600))
+
+
 class Config(unittest.TestCase):
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix='schedule-kick-heads-cfg-'))
@@ -378,13 +461,13 @@ class RedCheck(unittest.TestCase):
                           'Heads.test_a_head_without_a_run_is_sent_once_after_the_grace'),
             'trust: same repository only': ('heads', "if pr.get('isCrossRepository') is not False or",
                                             'if False and', 'Heads.test_a_pull_request_from_another_fork_is_never_sent'),
-            'sent once': ('heads', '        if mark is not None:\n', '        if False:\n',
+            'sent once': ('heads', '        elif mark is not None:\n', '        elif False:\n',
                           'Heads.test_a_head_is_sent_once_even_when_its_run_is_slow_to_show'),
             'recorded before the call': ('heads', '        save()\n', '',
                                          'Heads.test_the_head_is_recorded_as_sent_before_the_call'),
             'a run counts': ('heads', 'return True\n    total', 'return False\n    total',
                              'Heads.test_a_head_with_a_run_of_the_workflow_needs_nothing'),
-            'max per pass': ('heads', ' or tried >= entry.per_pass', '',
+            'max per pass': ('heads', 'entry.grace or tried >= entry.per_pass', 'entry.grace',
                              'Heads.test_at_most_max_per_pass_then_the_rest_on_later_passes'),
             'moved head skipped': ('heads', "commit.get('oid') != pr.get('headRefOid')", 'False',
                                    'Heads.test_a_head_that_moved_while_github_answered_waits_for_the_next_pass'),
@@ -405,6 +488,14 @@ class RedCheck(unittest.TestCase):
                                    'Heads.test_a_head_missing_from_one_snapshot_keeps_its_lost_mark'),
             'budgets apart': ('kick', "('GraphQL', 'graphql_remaining', 'graphql_reset')", "('GraphQL', 'remaining', 'reset')",
                               'Heads.test_a_rest_answer_after_the_graphql_call_does_not_hide_a_low_graphql_budget'),
+            'entry wait kept across a read': ('heads', '    if not entry_error:\n', '    if True:\n',
+                                              'Heads.test_dispatch_errors_back_off_doubling_across_successful_reads'),
+            "one head's refusal skips only it": ('heads', 'if head_only(e):', 'if False:',
+                                                 'Heads.test_one_heads_refusal_does_not_hold_up_the_others'),
+            'REST budget stops the dispatches': ('kick', 'and api.remaining < MIN_REMAINING),', 'and False),',
+                                                 'Heads.test_a_low_rest_budget_stops_the_dispatches_of_a_pass'),
+            'GraphQL headers kept apart': ('github', "dict(variables)}, GRAPHQL_BUDGET)", "dict(variables)})",
+                                           'Heads.test_token_api_keeps_the_graphql_budget_out_of_the_rest_one'),
             'graphql errors': ('github', '    if errors:\n        text', '    if False:\n        text',
                                'Heads.test_a_graphql_error_answer_is_an_error_not_an_empty_list'),
         })

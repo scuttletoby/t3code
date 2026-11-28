@@ -159,6 +159,15 @@ class KeepOn(unittest.TestCase):
         self.keep_on(NOW + datetime.timedelta(seconds=15))
         self.assertEqual([c[0] for c in self.api.calls], ['workflows', 'enable'])   # paused: no call
 
+    def test_a_low_budget_never_shortens_a_rate_limit_pause(self):
+        # retry-after 600 s, then the same answer's low budget with a reset in 60 s: the pause stays 600 s
+        self.api.workflow_rows = {REPO: rows(**{'fork-tests': 'disabled_manually', 'fork-follow': 'active'})}
+        self.api.fail['enable'] = github.ApiError('HTTP 403 rate limit', rate_limited=True, retry_after=600, status=403)
+        self.api.remaining, self.api.reset = 50, (NOW + datetime.timedelta(seconds=60)).timestamp()
+        self.keep_on()
+        with open(os.path.join(self.folder, 'keep-on.json')) as f:
+            self.assertEqual(json.load(f)['pauseUntil'], github.iso(NOW + datetime.timedelta(seconds=600)))
+
     def test_a_refused_config_leaves_no_old_ok_status(self):
         self.api.workflow_rows = {REPO: rows(**{'fork-tests': 'active', 'fork-follow': 'active'})}
         self.assertEqual(self.keep_on()[0], 0)
@@ -308,6 +317,9 @@ class RedCheck(unittest.TestCase):
                                      'KeepOn.test_a_rate_limit_on_turning_on_pauses_and_stops_the_pass'),
             'the alert line': ('keepon', 'ALERT {label}', '{label}',
                                'KeepOn.test_a_switched_off_target_is_turned_back_on_with_an_alert_line'),
+            'a pause is never shortened': ('kick', '    if current is not None and current > until:\n        return\n',
+                                           '',
+                                           'KeepOn.test_a_low_budget_never_shortens_a_rate_limit_pause'),
             'status code kept': ('github', 'retry_after, e.code) from None', 'retry_after) from None',
                                  'Clients.test_token_api_keeps_the_status_of_a_refusal'),
         })

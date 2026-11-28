@@ -143,10 +143,13 @@ GraphQL call and the dispatch, the new head is the one that is tested and gets t
 the pull request's own run, so it must never be weaker: fork-tests.yml's head run tests the pull request's merge
 commit, scans for secrets as that pull request's run and runs every job. A branch whose workflow file is older than
 the `head` input (HTTP 422 "Unexpected inputs") or has no `workflow_dispatch` refuses the dispatch for good: that
-commit is recorded as refused, alerted once and not sent again (its next push brings the new file). Any other 422,
-such as "Cannot trigger a 'workflow_dispatch' on a disabled workflow" while the workflow is switched off (#517),
-waits and tries again. With `ghAs` the App needs Actions write and read access to pull
-requests and contents.
+commit is recorded as refused, alerted once and not sent again (its next push brings the new file). Any other 422
+is about that one commit: that head alone waits (5 minutes, then 10) and after 3 refusals is recorded as refused and
+alerted once, while the heads after it go on in the same tick. "Cannot trigger a 'workflow_dispatch' on a disabled
+workflow" (switched off at that moment, #517), and every error that is not a 422, are about the whole entry: it
+waits (5 minutes, doubling, at most an hour) and tries again. That wait goes on counting across ticks whose GraphQL
+call works and ends only after a tick with no such error. Fewer than 100 REST calls left stops the dispatches of
+the tick. With `ghAs` the App needs Actions write and read access to pull requests and contents.
 
 | Case                                                     | What happens                                                                                                                        |
 | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
@@ -157,6 +160,7 @@ requests and contents.
 | A head force-pushed mid-pass                             | a pull request whose head moved while GitHub answered waits a tick; marks of heads gone stay 7 days                                 |
 | More check suites on a commit than read (50), none a run | not sent (cannot tell), with a note                                                                                                 |
 | API error                                                | that entry waits (5 minutes, doubling, at most an hour); a rate limit, or a low REST or GraphQL budget (each counted apart), pauses |
+| A 422 about one commit                                   | that head waits on its own (5, then 10 minutes), refused after 3; the heads after it go on                                          |
 
 Budget: one GraphQL call a tick per entry (a few points of the 5,000 an hour) plus at most `maxPerPass` dispatches.
 
@@ -172,7 +176,8 @@ never switches a workflow off (the GitHub client has no call that could), and it
 does not name. The token needs Actions write. Budget: one call per entry every 15 seconds (240 an hour) plus one
 per re-enable. `schedule-kick status --keep-on` prints the last pass. Runs again: an `active` workflow needs no call;
 two passes at once: the second does nothing (its own lock). Stopped after a re-enable, before the state is written:
-the next pass finds it on. A broken state file reads as empty. A rate limit pauses keep-on until GitHub's reset.
+the next pass finds it on. A broken state file reads as empty. A rate limit pauses keep-on until GitHub's reset
+(or `retry-after`); a low budget seen later in the same pass never shortens that pause.
 
 ## Late schedule runs
 

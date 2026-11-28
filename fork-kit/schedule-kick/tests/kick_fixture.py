@@ -27,6 +27,7 @@ class FakeApi:
         self.runs = {}              # (repo, workflow) -> [(created ISO, event, branch)]
         self.calls = []
         self.fail = {}              # 'list' | 'dispatch' -> ApiError to raise
+        self.fail_ref = {}          # branch -> ApiError a dispatch on that branch raises (one head's refusal)
         self.ignore_filter = False  # answer every run, as if GitHub ignored `created`
         self.remaining = None
         self.reset = None           # x-ratelimit-reset of the last answer (epoch seconds)
@@ -48,6 +49,8 @@ class FakeApi:
         self.calls.append(('dispatch', repo, workflow, ref, dict(inputs)))
         if 'dispatch' in self.fail:
             raise self.fail['dispatch']
+        if ref in self.fail_ref:
+            raise self.fail_ref[ref]
         self.add_run(repo, workflow, github.iso(self.github_now), 'workflow_dispatch', ref)
         if self.after_dispatch:
             self.after_dispatch()

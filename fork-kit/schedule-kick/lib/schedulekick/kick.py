@@ -487,10 +487,15 @@ def kick_one(entry, api, state, now):
 
 
 def pause(state, now, until=None):
-    """Every entry waits until GitHub's reset: PAUSE without one (or one already past), at most MAX_WAIT."""
+    """Every entry waits until GitHub's reset: PAUSE without one (or one already past), at most MAX_WAIT. A pause
+    already running that ends later stays (a retry-after, then the same answer's low budget with a nearer reset)."""
     if until is None or until <= now:
         until = now + PAUSE
-    state['pauseUntil'] = iso(min(until, now + MAX_WAIT))
+    until = min(until, now + MAX_WAIT)
+    current = waiting_until(state.get('pauseUntil'), now)
+    if current is not None and current > until:
+        return
+    state['pauseUntil'] = iso(until)
 
 
 def tick(cfg, state_dir, api, now=None, out=sys.stdout, err=sys.stderr, alert=None):
@@ -531,7 +536,9 @@ def _tick(cfg, folder, api, now, out, err, alert=None):
              lambda e, m: fail(state, e.key, now, m), e) for e in cfg.entries]
     jobs += [(h.key, f'{h.repo} {h.workflow} heads',
               lambda h=h: headsmod.reconcile(h, api, state, now, parse_time, waiting_until, BACKOFF, MAX_WAIT,
-                                             lambda: write_json(state_path, state), limited, heads_alert),
+                                             lambda: write_json(state_path, state), limited, heads_alert,
+                                             lambda: getattr(api, 'remaining', None) is not None
+                                             and api.remaining < MIN_REMAINING),
               lambda h, m: headsmod.fail(state, h.key, now, m, BACKOFF, MAX_WAIT), h) for h in cfg.heads]
     for key, label, work, on_fault, item in jobs:
         if paused is not None:
@@ -679,6 +686,8 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
         api = api_factory(cfg)
         return tick(cfg, state_dir, api, out=out, err=err)
     except ConfigError as e:
-        return refuse(str(e), None, err)
+        # after the config loaded (the login, the state folder): an old `ok: true` must not stay behind. A state
+        # folder that is itself refused cannot take the status either; refuse() says so and goes on.
+        return refuse(str(e), state_dir, err)
     except Exception as e:          # noqa: BLE001 - a broken tick must not leave an old `ok: true` behind
         return broken(e, state_dir, err)

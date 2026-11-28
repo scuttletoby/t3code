@@ -81,11 +81,16 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, f'redirect to {newurl} refused', headers, fp)
 
 
+REST_BUDGET = ('remaining', 'reset')
+GRAPHQL_BUDGET = ('graphql_remaining', 'graphql_reset')     # a budget of its own: never written into the REST one
+
+
 class TokenApi:
     def __init__(self, token, base=API, timeout=30):
         self.token, self.base, self.timeout = token, base, timeout
-        self.remaining = None       # x-ratelimit-remaining of the last answer
-        self.reset = None           # x-ratelimit-reset of the last answer (epoch seconds)
+        self.remaining = None       # x-ratelimit-remaining of the last REST answer
+        self.reset = None           # x-ratelimit-reset of the last REST answer (epoch seconds)
+        self.graphql_remaining = self.graphql_reset = None      # the same of the last GraphQL answer
         self.opener = urllib.request.build_opener(_NoRedirect)
 
     @staticmethod
@@ -95,7 +100,7 @@ class TokenApi:
             raise ValueError(f'an answer larger than {MAX_REPLY} bytes')
         return data.decode('utf-8', 'replace')
 
-    def _call(self, method, path, body=None):
+    def _call(self, method, path, body=None, budget=REST_BUDGET):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.base + path, data=data, method=method, headers={
             'Accept': 'application/vnd.github+json', 'Authorization': f'Bearer {self.token}',
@@ -103,11 +108,11 @@ class TokenApi:
             **({'Content-Type': 'application/json'} if data is not None else {})})
         try:
             with self.opener.open(req, timeout=self.timeout) as r:
-                self._limits(r.headers)
+                self._limits(r.headers, budget)
                 text = self._read(r)
                 return json.loads(text) if text.strip() else None
         except urllib.error.HTTPError as e:
-            self._limits(e.headers)
+            self._limits(e.headers, budget)
             headers = e.headers or {}
             detail = ''
             try:
@@ -123,15 +128,15 @@ class TokenApi:
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise ApiError(f'{method} {path}: {type(e).__name__}: {getattr(e, "reason", e)}') from None
 
-    def _limits(self, headers):
+    def _limits(self, headers, budget=REST_BUDGET):
         if not headers:
             return
         remaining = _number(headers.get('x-ratelimit-remaining'), MAX_RESET)
         if remaining is not None:
-            self.remaining = remaining
+            setattr(self, budget[0], remaining)
         reset = _number(headers.get('x-ratelimit-reset'), MAX_RESET)
         if reset is not None:
-            self.reset = reset
+            setattr(self, budget[1], reset)
 
     def runs_since(self, repo, workflow, ref, since, event=None):
         query = urllib.parse.urlencode({'created': f'>={iso(since)}', 'branch': ref, 'per_page': LIST_LIMIT,
@@ -153,8 +158,8 @@ class TokenApi:
                    {'ref': ref, 'inputs': dict(inputs)})
 
     def graphql(self, repo, query, variables):
-        return graphql_data(self._call('POST', '/graphql', {'query': query, 'variables': dict(variables)}),
-                            f'GraphQL for {repo}')
+        got = self._call('POST', '/graphql', {'query': query, 'variables': dict(variables)}, GRAPHQL_BUDGET)
+        return graphql_data(got, f'GraphQL for {repo}')
 
     def workflows(self, repo):
         got = self._call('GET', f'/repos/{repo}/actions/workflows?per_page={LIST_LIMIT}')

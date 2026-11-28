@@ -663,6 +663,21 @@ class Faults(Temp):
         self.assertEqual(kick.main(['status', '--state-dir', self.state_dir], out=out, err=io.StringIO()), 1)
         self.assertIn('the tick broke', json.loads(out.getvalue())['error'])
 
+    def test_a_config_error_after_the_config_loaded_leaves_no_old_ok_status(self):
+        # the login fails to open (a token file gone since the last tick): exit 2 and `status` says not ok
+        path = self.write_config()
+        self.assertEqual(kick.main(['tick', '--config', path, '--state-dir', self.state_dir],
+                                   api_factory=lambda cfg: self.api, out=io.StringIO(), err=io.StringIO()), 0)
+        self.assertTrue(self.status()['ok'])
+
+        def factory(cfg):
+            raise kick.ConfigError('token file /x: cannot read it')
+        code = kick.main(['tick', '--config', path, '--state-dir', self.state_dir], api_factory=factory,
+                         out=io.StringIO(), err=io.StringIO())
+        self.assertEqual(code, 2)
+        self.assertFalse(self.status()['ok'])
+        self.assertIn('token file /x', self.status()['error'])
+
     def test_a_huge_or_bad_rate_limit_reset_pauses_15_minutes(self):
         for reset in (10 ** 20, -1, 'soon'):
             with self.subTest(reset=reset):
@@ -913,6 +928,9 @@ class Command(Temp):
 
 
 MUTATIONS = {
+    'a config error after loading writes the status': (
+        'kick', '        return refuse(str(e), state_dir, err)\n', '        return refuse(str(e), None, err)\n',
+        'Faults.test_a_config_error_after_the_config_loaded_leaves_no_old_ok_status'),
     'same slot: no call': (
         'kick', "    if old.get('slot') == iso(slot) and old.get('cron') == entry.cron.line:", '    if False:',
         'Tick.test_first_tick_dispatches_once_then_runs_again_send_nothing_and_call_nothing'),
@@ -970,7 +988,7 @@ MUTATIONS = {
                                'Faults.test_a_huge_or_bad_rate_limit_reset_pauses_15_minutes'),
     'the backoff cap': ('kick', '    delay = min(BACKOFF * 2 ** min(failures - 1, 10), MAX_WAIT)',
                         '    delay = BACKOFF * 2 ** min(failures - 1, 10)', 'Faults.test_the_backoff_stops_at_one_hour'),
-    'the pause cap': ('kick', "    state['pauseUntil'] = iso(min(until, now + MAX_WAIT))", "    state['pauseUntil'] = iso(until)",
+    'the pause cap': ('kick', "    until = min(until, now + MAX_WAIT)\n", "",
                       'Faults.test_a_reset_far_ahead_pauses_one_hour_not_never'),
     'few calls left: until the reset': ('kick', "            pause(state, now, max(resets) if resets else None)",
                                         '            pause(state, now)',

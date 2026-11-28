@@ -5401,6 +5401,9 @@ for label, conc in {
 HEAD_RUN_EXPR = "${{ inputs.head == true }}"
 SECRETS_IF = ("${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && "
               "(inputs.ref == '' || (inputs.head && github.ref_name != github.event.repository.default_branch)) }}")
+# fork_ci_result lets `secrets` skip only in a release run: never in a head run on a pull request's branch, where
+# SECRETS_IF runs it (so a skip there is no reason to pass).
+RESULT_RELEASE = "${{ inputs.ref != '' && !(inputs.head && github.ref_name != github.event.repository.default_branch) }}"
 
 
 def head_run_problems(tests, scan):
@@ -5432,6 +5435,10 @@ def head_run_problems(tests, scan):
     if secrets.get("if") != SECRETS_IF or (secrets.get("with") or {}).get("head_ref") \
             != "${{ inputs.head && github.ref_name || '' }}":
         problems.append("fork-tests.yml: secrets: a head run on a pull request's branch does not scan as its run")
+    result = next((st for st in (jobs.get("fork_ci_result") or {}).get("steps") or []
+                   if st.get("name") == "Require every job to pass"), {})
+    if (result.get("env") or {}).get("RELEASE_RUN") != RESULT_RELEASE:
+        problems.append("fork-tests.yml: fork_ci_result: a head run on a pull request's branch may skip the secret scan")
     scan_inputs = ((scan.get(True) or scan.get("on") or {}).get("workflow_call") or {}).get("inputs") or {}
     if (scan_inputs.get("head_ref") or {}).get("default") != "":
         problems.append("fork-secret-scan.yml: no workflow_call input head_ref (default empty)")
@@ -5465,6 +5472,9 @@ for label, edit in {
     "a head run that skips the secret scan (ac72a7c)": lambda t, s, st: t["jobs"]["secrets"].__setitem__(
         "if", t["jobs"]["secrets"]["if"].replace(" || (inputs.head && github.ref_name != "
                                                   "github.event.repository.default_branch)", "")),
+    "a fork_ci_result that lets a head run skip the scan": lambda t, s, st: [
+        x.get("env", {}).__setitem__("RELEASE_RUN", "${{ inputs.ref != '' }}")
+        for x in t["jobs"]["fork_ci_result"]["steps"] if x.get("name") == "Require every job to pass"],
     "a head run's scan as a sweep": lambda t, s, st: [
         x.get("env", {}).__setitem__("EVENT_NAME", "${{ github.event_name }}")
         for j in s["jobs"].values() for x in j.get("steps") or [] if x.get("id") == "scan"],
