@@ -17,7 +17,9 @@ Each run (one at a time: a flock; a second run exits at once):
     the parent per machine (GET /api/fork/delegate), plus each start still without a clear answer;
  4. starts the ready items, highest priority first, on the first allowed machine with room: the machine's caps
     (agents, writers), its capacity command, and the account's usage meter (skipped at >= maxUsedPercent or when
-    older than maxAgeMinutes, as usage-guard does). Each start writes the intent marker first, then asks
+    older than maxAgeMinutes, as usage-guard does). An item (or the defaults) may name an ordered list of accounts:
+    the first one with usage left on that machine is used, and kept in the marker. Each start writes the intent
+    marker first, then asks
     POST /api/fork/delegate (the server's own delegate_task as the parent thread), then moves the item to started/
     with the task id, then removes the marker.
 Every decision is one log line; a waiting item is logged again only when its reason changes, so a run with nothing
@@ -82,6 +84,15 @@ class ConfigError(Exception):
     pass
 
 
+def account_list(a):
+    """The ordered accounts an "account" field names (a string or a non-empty list of strings), else None."""
+    if isinstance(a, str) and a:
+        return [a]
+    if isinstance(a, list) and a and all(isinstance(x, str) and x for x in a):
+        return list(a)
+    return None
+
+
 def load_config(path):
     try:
         c = read_json(path)
@@ -98,6 +109,8 @@ def load_config(path):
     c.setdefault('log', os.path.join(c['stateDir'], 'filler.log'))
     c.setdefault('defaults', {})
     c.setdefault('usage', {})
+    if 'account' in c['defaults'] and account_list(c['defaults']['account']) is None:
+        raise ConfigError(f'config {path}: "defaults.account" must be an account or a non-empty list of accounts')
     return c
 
 
@@ -283,6 +296,8 @@ class Filler:
         if machines is not None and (not isinstance(machines, list) or not machines
                                      or any(m not in self.cfg['machines'] for m in machines)):
             return None, f'"machines" must list names from the config ({", ".join(self.cfg["machines"])})'
+        if 'account' in it and account_list(it['account']) is None:
+            return None, '"account" must be an account or a non-empty list of accounts, in order of preference'
         return it, None
 
     # --- GitHub ----------------------------------------------------------------------------------------------
@@ -497,10 +512,25 @@ class Filler:
             return f'usage reading for {meter} is {age:.0f} min old'
         return None
 
+    def accounts(self, it):
+        return account_list(it.get('account') or self.cfg['defaults'].get('account') or 'claudeAgent')
+
+    def pick_account(self, name, it):
+        """(the first of the item's accounts with usage left on that machine, why the ones before it were skipped)
+        or (None, why none has)."""
+        model = it.get('model') or self.cfg['defaults'].get('model', 'claude-opus-5-5')
+        skipped = []
+        for account in self.accounts(it):
+            r = self.usage(name, account, model)
+            if r is None:
+                return account, '; '.join(skipped) or None
+            skipped.append(r)
+        return None, '; '.join(skipped)
+
     # --- start -----------------------------------------------------------------------------------------------
     def target(self, it, name):
         d = self.cfg['defaults']
-        target = {'providerInstanceId': it.get('account') or d.get('account', 'claudeAgent'),
+        target = {'providerInstanceId': self.accounts(it)[0],
                   'model': it.get('model') or d.get('model', 'claude-opus-5-5'),
                   'options': [{'id': 'effort', 'value': it.get('effort') or d.get('effort', 'high')}]}
         if self.cfg['machines'].get(name, {}).get('environmentId'):
@@ -595,16 +625,21 @@ class Filler:
         write_json(self.request_path(iid), req)
         return then
 
-    def start(self, it, name):
+    def start(self, it, name, account=None, skipped=None):
         """'started' | 'unknown' (no clear answer: the marker stays, pinned to its machine) | a refusal code |
-        raises ApiError (no answer: the marker stays, the next run asks again)."""
+        raises ApiError (no answer: the marker stays, the next run asks again). A new start runs as `account`
+        (picked by usage); a left-over marker keeps the account it asked with, so a retry never moves the request
+        id to another account."""
         mk = self.marker(it['id'])
         current = self.cfg['parentThreadId']
         if os.path.exists(mk):
             intent = read_json(mk)
         else:
             intent = {'requestId': self.request_of(it['id'], current)['requestId'], 'parentThreadId': current,
-                      'machine': name, 'at': iso(self.w.now()), 'item': it}
+                      'machine': name, 'at': iso(self.w.now()),
+                      'item': dict(it, account=account) if account else it}
+            if skipped:
+                intent['skipped'] = skipped
         parent = intent.get('parentThreadId') or current
         machine, rid = intent['machine'], intent['requestId']
         # A start left under another parent (a handover) is only looked up there, never started fresh.
@@ -660,7 +695,9 @@ class Filler:
             pass
         os.remove(self.marker(it['id']))
         self.forget_request(it['id'])
-        self.log(f'started {it["id"]} on {intent["machine"]}: task {ans["taskId"]} ({it["kind"]}, "{it["title"][:80]}")')
+        skipped = f' (skipped: {intent["skipped"]})' if intent.get('skipped') else ''
+        self.log(f'started {it["id"]} on {intent["machine"]} as {self.accounts(it)[0]}{skipped}: task {ans["taskId"]} '
+                 f'({it["kind"]}, "{it["title"][:80]}")')
 
     def forget_request(self, iid):
         try:
@@ -776,15 +813,18 @@ class Filler:
                 if backoff:
                     reasons.append(backoff)
                     continue
-                r = (self.room(name, it['kind'], counts) or self.capacity(name, it['kind'])
-                     or self.usage(name, it.get('account') or self.cfg['defaults'].get('account', 'claudeAgent'),
-                                   it.get('model') or self.cfg['defaults'].get('model', 'claude-opus-5-5')))
+                r = self.room(name, it['kind'], counts) or self.capacity(name, it['kind'])
+                account = skipped = None
+                if not r:
+                    account, skipped = self.pick_account(name, it)
+                    if account is None:
+                        r = skipped
                 if r:
                     reasons.append(r)
                     if self.room(name, 'other', counts):
                         full.add(name)
                     continue
-                got = self.start(it, name)
+                got = self.start(it, name, account, skipped)
                 if got == 'started':
                     counts.setdefault(name, {'agents': 0, 'writers': 0})['agents'] += 1
                     if it['kind'] == 'writer':

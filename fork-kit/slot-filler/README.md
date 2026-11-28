@@ -59,6 +59,10 @@ without printing it).
   field pins `pr-green` to one head.
 - `machines`: allowed machines, in order of preference (default: every machine in the config, in config order).
   `account`, `model`, `effort` default from the config's `defaults`.
+- `account` (in an item or in `defaults`): one account, or a list in order of preference, e.g.
+  `["claudeAgent_claude_annemette", "claudeAgent"]`. On each machine the filler uses the first account that passes
+  the usage rules below; when none does, the item waits and the log line gives each account's reason. The account
+  used is in the started record (`account`) and the log line ("started `<id>` on `<machine>` as `<account>`").
 - The task text is "Act as the `<kind>` sub-agent for this task. Read `<brief>` fully and do what it says. It is
   your whole brief." (`taskTemplate` changes it).
 
@@ -148,7 +152,15 @@ it") and queues one `lens` item pinned to that head, with role `review`. A new h
   logged as "<machine> backing off after N refusal(s) (last: code) until T", so a refusal the server checks after the
   wake does not wake the parent every minute, and a machine that keeps refusing does not hold back a free one. A
   wait more than 15 minutes ahead (the clock was set back) is cut to 15 minutes. A child on an environment no machine names still counts, under no machine.
-- **Meter missing or old:** that machine is skipped for that account, with a log line.
+- **Meter missing or old:** that machine is skipped for that account, with a log line; the item's next account,
+  if it names one, is tried there.
+- **An account fills during a start:** the intent marker records the account it asked with. A start that stopped
+  half-way, or got no clear answer, is asked again with the same request id on the same account, never moved to
+  the next one (it may have started there). A clear refusal (the server's usage guard: `usage_pacing_hold`)
+  removes the marker; after that machine's backoff the next run picks again from the list, so the next account is
+  used. The queue file is never rewritten: it keeps its list.
+- **Old queue files and markers:** an `account` string is a list of one; a marker from before account lists
+  holds the item with its string and is asked again as it was.
 - **Brief deleted:** the item is refused and kept until the brief is back.
 - **PR closed:** `pr-green` and `pr-merged` items wait with a log line ("closed without a merge"). Delete them
   by hand.

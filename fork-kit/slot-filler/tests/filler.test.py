@@ -440,6 +440,143 @@ class Usage(Base):
         self.assertEqual(self.started_ids(), ['w1'])
 
 
+class AccountFallback(Base):
+    """An item (or the defaults) may name an ordered list of accounts: the first with usage left on that machine is
+    used, by the same rules as the usage guard."""
+    ACCTS = ['claude-anne', 'claudeAgent']
+
+    def setUp(self):
+        super().setUp()
+        self.cfg['machines']['north']['maxAgents'] = 0
+        self.meter('claude-anne', 40)
+
+    def account_started(self, iid='w1'):
+        with open(os.path.join(self.q, 'started', iid + '.json')) as f:
+            return json.load(f)['account']
+
+    def test_a_full_first_account_falls_back_to_the_second(self):
+        self.meter('claude-anne', 95)
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts], ['claudeAgent'])
+        self.assertEqual(self.account_started(), 'claudeAgent')
+        line = [l for l in self.log_lines() if 'started w1' in l][0]
+        self.assertIn('on local as claudeAgent', line)
+        self.assertIn('claude-anne is full (5h 95%)', line)
+
+    def test_the_first_account_with_room_is_used_first(self):
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        self.assertEqual(self.w.api.starts[0]['task']['target']['providerInstanceId'], 'claude-anne')
+        self.assertEqual(self.account_started(), 'claude-anne')
+
+    def test_both_full_waits_and_says_why_once(self):
+        self.meter('claude-anne', 99)
+        self.meter('claudeAgent', 95)
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        line = [l for l in self.log_lines() if 'waiting w1' in l][0]
+        self.assertIn('claude-anne is full (5h 99%)', line)
+        self.assertIn('claudeAgent is full (5h 95%)', line)
+        lines = self.log_lines()
+        self.run_filler()                                   # runs again: nothing new, nothing written
+        self.assertEqual(self.log_lines(), lines)
+        self.meter('claudeAgent', 10)                       # the second frees up
+        self.run_filler()
+        self.assertEqual(self.account_started(), 'claudeAgent')
+
+    def test_stale_or_missing_data_on_the_first_uses_the_second(self):
+        self.meter('claude-anne', 10, age_min=91)
+        self.item('w1', account=self.ACCTS)
+        os.remove(os.path.join(self.caches, 'claude-anne.json'))
+        self.item('w2', account=['claude-gone', 'claude-anne', 'claudeAgent'])
+        self.meter('claude-anne', 10, age_min=91)
+        self.run_filler()
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts],
+                         ['claudeAgent', 'claudeAgent'])
+
+    def test_windows_of_another_family_or_past_resets_do_not_block_the_first(self):
+        self.meter('claude-anne', 0, windows=[
+            {'id': 'seven_day_fable', 'usedPercent': 100, 'resetsAt': '2026-11-25T00:00:00Z'},
+            {'id': 'five_hour', 'usedPercent': 99, 'resetsAt': '2026-11-21T11:00:00Z'}])
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        self.assertEqual(self.account_started(), 'claude-anne')
+
+    def test_a_single_string_and_a_default_list_keep_working(self):
+        self.item('w1', account='claudeAgent')
+        self.run_filler()
+        self.assertEqual(self.account_started(), 'claudeAgent')
+        self.meter('claude-anne', 96)
+        self.cfg['defaults']['account'] = self.ACCTS        # a machine default list; the item names none
+        self.item('w2')
+        self.run_filler()
+        self.assertEqual(self.account_started('w2'), 'claudeAgent')
+        self.meter('claude-anne', 10)
+        self.item('w3', kind='other')                       # two writers already hold the writer slots
+        self.run_filler()
+        self.assertEqual(self.account_started('w3'), 'claude-anne')
+
+    def test_a_remote_machine_skips_accounts_without_a_meter_there(self):
+        self.cfg['machines']['local']['maxAgents'] = 0
+        self.cfg['machines']['north']['maxAgents'] = 2
+        self.item('w1', account=self.ACCTS)
+        self.run_filler()
+        b = self.w.api.starts[0]['task']['target']
+        self.assertEqual((b['providerInstanceId'], b['environmentId']), ('claudeAgent', 'env-north'))
+
+    def test_bad_account_fields_are_refused(self):
+        for iid, acct in (('a1', []), ('a2', 5), ('a3', ['claudeAgent', '']), ('a4', [None])):
+            self.item(iid, account=acct)
+        self.run_filler()
+        self.assertEqual(self.w.api.starts, [])
+        for iid in ('a1', 'a2', 'a3', 'a4'):
+            self.assertTrue(any(f'refused {iid}.json: "account" must be' in l for l in self.log_lines()), iid)
+        cfg = dict(self.cfg, defaults={'account': []})
+        path = self.write('cfg.json', json.dumps(cfg))
+        with self.assertRaises(sf.ConfigError):
+            sf.load_config(path)
+
+    def test_a_start_cut_off_mid_way_asks_again_on_the_same_account(self):
+        self.item('w1', account=self.ACCTS)
+        self.w.api.crash_after_start = True
+        with self.assertRaises(Crash):
+            self.run_filler()
+        self.meter('claude-anne', 99)                       # the first fills while the answer was lost
+        self.w.now = lambda: NOW + datetime.timedelta(minutes=1)
+        self.run_filler()
+        self.assertEqual(len(self.w.api.by_request), 1)     # never a second task on the other account
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts],
+                         ['claude-anne', 'claude-anne'])
+        self.assertEqual(self.account_started(), 'claude-anne')
+
+    def test_a_first_account_refused_by_the_server_moves_to_the_second_after_its_wait(self):
+        self.item('w1', account=self.ACCTS)
+        self.w.api.refuse_next = [('usage_pacing_hold', 'claude-anne filled since the last reading')]
+        self.run_filler()
+        self.assertEqual(self.started_ids(), [])
+        self.meter('claude-anne', 99)
+        self.w.now = lambda: NOW + datetime.timedelta(seconds=61)
+        self.run_filler()
+        self.assertEqual([b['task']['target']['providerInstanceId'] for b in self.w.api.starts],
+                         ['claude-anne', 'claudeAgent'])
+        self.assertEqual(self.account_started(), 'claudeAgent')
+
+    def test_an_old_marker_without_a_chosen_account_still_recovers(self):
+        self.item('w1')
+        os.makedirs(os.path.join(self.state, 'inflight'))
+        with open(os.path.join(self.q, 'w1.json')) as f:
+            it = json.load(f)
+        sf.write_json(os.path.join(self.state, 'inflight', 'w1.json'),
+                      {'requestId': 'w1:1', 'parentThreadId': 'thread-orch', 'machine': 'local',
+                       'at': '2026-11-21T11:59:00Z', 'item': it})
+        self.run_filler()
+        self.assertEqual([b['requestId'] for b in self.w.api.starts], ['w1:1'])
+        self.assertEqual(self.w.api.starts[0]['task']['target']['providerInstanceId'], 'claudeAgent')
+        self.assertEqual(self.started_ids(), ['w1'])
+
+
 class ReadyWhen(Base):
     def setUp(self):
         super().setUp()
@@ -879,6 +1016,10 @@ MUTATIONS = {
     'broken files are refused': (
         "        if not text.strip():\n            return None, 'empty file'\n", "",
         'BrokenQueueFiles.test_empty_broken_and_incomplete_files_are_refused_and_kept'),
+    'account fallback': (
+        "            if r is None:\n                return account, '; '.join(skipped) or None\n",
+        "            if True:\n                return account, None\n",
+        'AccountFallback.test_a_full_first_account_falls_back_to_the_second'),
     'lens rounds': (
         "if len(rounds) >= int(lw.get('maxRounds', 2)):", "if False:",
         'Lenses.test_a_new_head_is_a_new_round_and_rounds_stop_at_the_limit'),
